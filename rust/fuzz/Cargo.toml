@@ -1,0 +1,109 @@
+[package]
+name = "cachekit-storage-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+[dependencies.cachekit-storage]
+path = ".."
+# Target pure Rust core without Python
+default-features = false
+features = ["compression", "checksum", "messagepack", "encryption"]
+
+# Prevent this from interfering with normal build
+[[bin]]
+name = "byte_storage_compress"
+path = "fuzz_targets/byte_storage_compress.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "byte_storage_decompress"
+path = "fuzz_targets/byte_storage_decompress.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_roundtrip"
+path = "fuzz_targets/encryption_roundtrip.rs"
+test = false
+doc = false
+
+# ByteStorage attack vector targets
+[[bin]]
+name = "byte_storage_corrupted_envelope"
+path = "fuzz_targets/byte_storage_corrupted_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "byte_storage_integer_overflow"
+path = "fuzz_targets/byte_storage_integer_overflow.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "byte_storage_checksum_collision"
+path = "fuzz_targets/byte_storage_checksum_collision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "byte_storage_empty_data"
+path = "fuzz_targets/byte_storage_empty_data.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "byte_storage_format_injection"
+path = "fuzz_targets/byte_storage_format_injection.rs"
+test = false
+doc = false
+
+# Encryption attack vector targets
+[[bin]]
+name = "encryption_key_derivation"
+path = "fuzz_targets/encryption_key_derivation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_nonce_reuse"
+path = "fuzz_targets/encryption_nonce_reuse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_truncated_ciphertext"
+path = "fuzz_targets/encryption_truncated_ciphertext.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_aad_injection"
+path = "fuzz_targets/encryption_aad_injection.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encryption_large_payload"
+path = "fuzz_targets/encryption_large_payload.rs"
+test = false
+doc = false
+
+# Integration target
+[[bin]]
+name = "integration_layered_security"
+path = "fuzz_targets/integration_layered_security.rs"
+test = false
+doc = false

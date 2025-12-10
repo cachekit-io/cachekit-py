@@ -1,0 +1,142 @@
+name: Security Fast
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast security checks (< 3 min) - parallel execution
+  cargo-audit:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: rustsec/audit-check@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  cargo-deny:
+    name: License & Supply Chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: EmbarkStudios/cargo-deny-action@v2
+
+  clippy-security:
+    name: Security Lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+
+    - name: Run Clippy security lints
+      run: |
+        cd rust
+        cargo clippy --no-default-features --features compression,checksum,messagepack,encryption \
+          -- -D warnings -W clippy::cargo -W clippy::pedantic
+
+  cargo-machete:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-binstall
+      uses: cargo-bins/cargo-binstall@main
+
+    - name: Install cargo-machete
+      run: cargo binstall --no-confirm cargo-machete
+
+    - name: Check for unused dependencies
+      run: |
+        cd rust
+        cargo machete
+
+  pip-audit:
+    name: Python Dependency CVEs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Cache Python virtual environment
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-py3.12-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+        restore-keys: |
+          venv-${{ runner.os }}-py3.12-
+
+    - name: Install dependencies
+      run: |
+        uv sync --group dev
+
+    - name: Run pip-audit
+      run: |
+        uv run pip-audit --desc --format json --output pip-audit-report.json
+
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pip-audit-report
+        path: pip-audit-report.json
+
+  # Summary job - fail if any check fails
+  security-fast-success:
+    name: Security Fast Success
+    runs-on: ubuntu-latest
+    needs: [cargo-audit, cargo-deny, clippy-security, cargo-machete, pip-audit]
+    if: always()
+    steps:
+    - name: Check all security checks passed
+      run: |
+        if [[ "${{ needs.cargo-audit.result }}" != "success" ]] || \
+           [[ "${{ needs.cargo-deny.result }}" != "success" ]] || \
+           [[ "${{ needs.clippy-security.result }}" != "success" ]] || \
+           [[ "${{ needs.cargo-machete.result }}" != "success" ]] || \
+           [[ "${{ needs.pip-audit.result }}" != "success" ]]; then
+          echo "❌ One or more security checks failed"
+          exit 1
+        fi
+        echo "✅ All fast security checks passed"

@@ -1,0 +1,125 @@
+name: Fuzzing Smoke Tests
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/fuzz-smoke.yml'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz Smoke Test (60s per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@nightly
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust/fuzz
+        cache-all-crates: true
+
+    - name: Install cargo-binstall
+      uses: cargo-bins/cargo-binstall@main
+
+    - name: Install cargo-fuzz
+      run: cargo binstall --no-confirm cargo-fuzz
+
+    - name: Run fuzzing smoke tests
+      id: fuzz
+      run: |
+        cd rust/fuzz
+
+        # Create artifacts directory
+        mkdir -p artifacts
+
+        # Define all fuzz targets
+        FUZZ_TARGETS=(
+          byte_storage_compress
+          byte_storage_decompress
+          encryption_roundtrip
+          byte_storage_corrupted_envelope
+          byte_storage_integer_overflow
+          byte_storage_checksum_collision
+          byte_storage_empty_data
+          byte_storage_format_injection
+          encryption_key_derivation
+          encryption_nonce_reuse
+          encryption_truncated_ciphertext
+          encryption_aad_injection
+          encryption_large_payload
+          integration_layered_security
+        )
+
+        # Run each target for 60 seconds
+        for target in "${FUZZ_TARGETS[@]}"; do
+          echo "Fuzzing $target (60s)..."
+
+          # Run fuzzing, capture exit code
+          if ! cargo +nightly fuzz run "$target" -- -max_total_time=60; then
+            echo "::warning::Fuzz target '$target' found potential issues"
+            # Continue to test other targets even if one fails
+            touch artifacts/.fuzz_failures
+          fi
+        done
+
+        # Check if any crashes were found
+        if find artifacts -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' | grep -q .; then
+          echo "::error::Fuzzing discovered crashes or errors. See artifacts for details."
+          exit 1
+        fi
+
+        echo "All fuzz targets completed without crashes"
+
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-crash-artifacts
+        path: rust/fuzz/artifacts/
+        retention-days: 30
+        if-no-files-found: warn
+
+    - name: Post fuzzing summary
+      if: always()
+      run: |
+        echo "## Fuzzing Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ -f rust/fuzz/artifacts/.fuzz_failures ]; then
+          echo "Status: Some fuzz targets found potential issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Count crashes by type
+          CRASHES=$(find rust/fuzz/artifacts -name 'crash-*' 2>/dev/null | wc -l || echo 0)
+          TIMEOUTS=$(find rust/fuzz/artifacts -name 'timeout-*' 2>/dev/null | wc -l || echo 0)
+          OOMS=$(find rust/fuzz/artifacts -name 'oom-*' 2>/dev/null | wc -l || echo 0)
+
+          echo "- Crashes: $CRASHES" >> $GITHUB_STEP_SUMMARY
+          echo "- Timeouts: $TIMEOUTS" >> $GITHUB_STEP_SUMMARY
+          echo "- OOM: $OOMS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check uploaded artifacts for crash details." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "Status: All fuzz targets passed (14 targets, 60s each)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "No crashes, timeouts, or OOM errors detected." >> $GITHUB_STEP_SUMMARY
+        fi

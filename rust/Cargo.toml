@@ -1,0 +1,85 @@
+[package]
+name = "cachekit-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["cachekit Contributors"]
+description = "High-performance storage engine for caching with compression and encryption"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/cachekit-io/cachekit-py"
+homepage = "https://github.com/cachekit-io/cachekit-py"
+readme = "../README.md"
+keywords = ["cache", "compression", "encryption", "python", "pyo3"]
+categories = ["caching", "compression", "cryptography"]
+
+[lib]
+name = "cachekit_storage"
+# cdylib for Python extension, rlib for Rust crates and security tools
+# Note: cdylib is always built, but #[pymodule] is gated behind python feature
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Compression, checksums, encryption (https://crates.io/crates/cachekit-core)
+cachekit-core = { version = "=0.1.0", features = ["compression", "checksum", "messagepack", "encryption"] }
+
+# Python integration - optional for Rust-only builds
+pyo3 = { workspace = true, optional = true }
+
+# Feature flags
+[features]
+default = ["python", "compression", "checksum", "messagepack", "encryption"]
+
+# Python bindings (optional - security tools can build without this)
+python = ["dep:pyo3"]
+
+# Core features (delegated to cachekit-core)
+compression = []
+checksum = []
+messagepack = []
+encryption = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+ctor = "0.4.2"
+pprof = { version = "0.15", features = ["criterion", "flamegraph", "protobuf-codec"] }
+iai-callgrind = "0.14"
+divan = "0.1"
+fastrand = "2.1"
+proptest = "1.4"
+
+# Benchmark configuration removed - obsolete benchmarks deleted during architectural evolution
+
+# [[example]]
+# name = "simd_demo"
+
+# [[example]]
+# name = "simd_perf_test"
+
+# [[example]]
+# name = "simd_demo_final"
+
+# Kani formal verification configuration
+# Provides mathematical proofs of memory safety for unsafe code and FFI boundaries
+[package.metadata.kani]
+# Default unwind depth for bounded model checking (balances time vs coverage)
+# Sufficient for byte_storage.rs which has no deep loops
+default-unwind = 10
+# Terse output format for CI readability (reduces noise, maintains actionable counterexamples)
+output-format = "terse"
+# Enable concrete playback for debugging (generates test cases from symbolic failures)
+concrete-playback = "print"
+# Verify standard library calls for complete soundness (required for FFI verification)
+enable-unstable = false
+# Use CaDiCaL SAT solver (default, production-tested)
+solver = "cadical"
+
+# Verification targets - Kani verifies these modules with cargo kani --tests
+[package.metadata.kani.unstable]
+stubbing = false
+
+# Lint configuration
+# Note: Release profile optimizations are defined in the workspace root Cargo.toml
+# with aggressive settings: fat LTO, codegen-units=1, opt-level=3, strip=true, panic=abort
+[lints.rust]
+# Suppress benign warnings about cfg(kani) which is set by Kani verifier
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

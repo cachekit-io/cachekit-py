@@ -1,0 +1,23 @@
+Fuzzing Crash Triage Report
+===========================
+Generated: 2025-11-07 00:47:38 UTC
+
+Summary
+-------
+Artifacts Directory: /Users/68824/code/27B/cachekit-workspace/cachekit/rust/fuzz/artifacts
+Unique Crashes: 0
+Regression Tests: /Users/68824/code/27B/cachekit-workspace/cachekit/rust/fuzz/regression_tests
+
+Crash Details
+-------------
+
+Next Steps
+----------
+1. Review crash details and stack traces
+2. Fix the identified bugs in the source code
+3. Run regression tests to verify fixes:
+   cd /Users/68824/code/27B/cachekit-workspace/cachekit/rust/fuzz && cargo test --test regression_*
+4. Re-run fuzzing to ensure no regressions:
+   make fuzz-quick
+
+For more information, see: /Users/68824/code/27B/cachekit-workspace/cachekit/rust/fuzz/README.md

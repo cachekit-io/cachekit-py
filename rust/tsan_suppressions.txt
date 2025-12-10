@@ -1,0 +1,58 @@
+# ThreadSanitizer Suppressions for cachekit Rust Layer
+#
+# Purpose: Suppress known false positives from PyO3/Python runtime
+# while maintaining detection of actual race conditions in cachekit code.
+#
+# Review Schedule: Quarterly (every 3 months) to validate suppressions
+# are still necessary and remove obsolete patterns.
+#
+# Usage: export TSAN_OPTIONS="suppressions=$PWD/rust/tsan_suppressions.txt"
+
+# ═══════════════════════════════════════════════════════════════════════
+# PyO3 Python Runtime False Positives
+# ═══════════════════════════════════════════════════════════════════════
+
+# PyO3 GIL handling triggers false positives
+# Rationale: PyO3's Python Global Interpreter Lock (GIL) synchronization
+# uses Python C API primitives that TSan cannot analyze correctly.
+# The GIL provides actual thread safety, but TSan sees unsynchronized access.
+# Reference: https://github.com/PyO3/pyo3/issues/1205
+race:pyo3::*
+
+# Python reference counting (Py_INCREF/Py_DECREF)
+# Rationale: Python's atomic reference counting uses custom atomic operations
+# that TSan cannot track. The Python runtime guarantees thread safety here.
+# Reference: Python C API documentation on reference counting
+race:Py_INCREF
+race:Py_DECREF
+
+# Python object allocation (PyObject_Malloc/PyObject_Free)
+# Rationale: Python's memory allocator uses internal locks that are
+# opaque to TSan. The allocator is thread-safe by design.
+race:PyObject_Malloc
+race:PyObject_Free
+
+# ═══════════════════════════════════════════════════════════════════════
+# NumPy C API False Positives
+# ═══════════════════════════════════════════════════════════════════════
+
+# NumPy array metadata access
+# Rationale: NumPy's internal array descriptor access is protected
+# by the GIL, but TSan cannot see this synchronization.
+# Reference: NumPy C API documentation
+race:PyArray_*
+
+# ═══════════════════════════════════════════════════════════════════════
+# IMPORTANT: NO CACHEKIT CODE SUPPRESSIONS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# DO NOT add suppressions for cachekit Rust code (byte_storage, encryption).
+# All race conditions in cachekit code are actual bugs that must be fixed.
+# Only PyO3/Python/NumPy runtime false positives are suppressed here.
+#
+# If TSan reports races in:
+# - cachekit_serializer::byte_storage::*
+# - cachekit_serializer::encryption::*
+# - Any other cachekit modules
+#
+# These are REAL BUGS. Fix the code, do not suppress.

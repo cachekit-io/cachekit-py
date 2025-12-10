@@ -1,0 +1,13 @@
+# Miri configuration for undefined behavior detection
+# MUST be at workspace root - Cargo only reads .cargo/config.toml from workspace root, not package directories
+
+# Environment variables for Miri execution
+[env]
+# Miri flags for comprehensive undefined behavior detection
+# -Zmiri-strict-provenance: Catches pointer provenance violations (use-after-free, invalid pointer arithmetic)
+# -Zmiri-symbolic-alignment-check: Detects alignment violations symbolically (not just concrete addresses)
+# These flags provide maximum UB detection without false positives
+MIRIFLAGS = "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+
+# NOTE: Do not set [target.'cfg(miri)'].runner - cargo miri handles this automatically
+# and it conflicts with rust-cache action's internal config options

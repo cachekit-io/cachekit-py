@@ -1,0 +1,432 @@
+"""Advanced tests for Redis configuration validation and edge cases."""
+
+import json
+import os
+import tempfile
+from unittest.mock import patch
+
+import pytest
+from pydantic import ValidationError
+
+from cachekit.config import (
+    CachekitConfig,
+    get_config,
+    load_config_from_dict,
+    load_config_from_env,
+    load_config_from_file,
+    reset_config,
+    set_global_config,
+)
+
+
+@pytest.mark.unit
+class TestCachekitConfigValidation:
+    """Test comprehensive configuration validation."""
+
+    def test_redis_url_validation_comprehensive(self, redis_config_factory):
+        """Test comprehensive Redis URL validation."""
+        # Valid URLs
+        valid_urls = [
+            "redis://localhost:6379",
+            "redis://user:pass@host:6379/1",
+            "redis://user:@host:6379",  # Empty password
+            "redis://host",  # No port or db
+            "redis://host:6379",  # No db
+            "redis://host/5",  # No port but with db
+            "redis://192.168.1.1:6379/0",  # IP address
+        ]
+
+        for url in valid_urls:
+            config = redis_config_factory(redis_url=url)
+            assert config.redis_url == url
+
+    def test_redis_url_validation_failures(self, redis_config_factory):
+        """Test Redis URL validation failures."""
+        invalid_cases = [
+            ("", "must be a non-empty string"),
+            ("not-redis://host", "must start with 'redis://'"),
+            ("redis://", "Invalid Redis URL format"),
+            ("redis://user@host", "must include ':'"),  # Username without password
+            ("redis://host:99999", "port 99999 must be between 1 and 65535"),
+            ("redis://host:abc", "Invalid port number: abc"),
+            ("redis://host/abc", "Invalid database number: abc"),
+            ("redis://host/-1", "database number -1 must be non-negative"),
+        ]
+
+        for url, expected_error in invalid_cases:
+            with pytest.raises(ValueError, match=expected_error):
+                redis_config_factory(redis_url=url)
+
+    def test_interdependent_fields_validation(self, redis_config_factory):
+        """Test interdependent field validation."""
+        # Test retry configuration - should not raise errors
+        config = redis_config_factory(
+            retry_on_timeout=False,
+            max_retries=5,  # Inconsistent but allowed
+        )
+        assert config.retry_on_timeout is False
+        assert config.max_retries == 5
+
+        # Test compression settings - should not raise errors
+        config = redis_config_factory(
+            enable_compression=False,
+            compression_level=9,  # Inconsistent but allowed
+        )
+        assert config.enable_compression is False
+        assert config.compression_level == 9
+
+        # Test long timeouts - should not raise errors but potentially problematic
+        config = redis_config_factory(
+            socket_timeout=400.0,  # > 300 seconds
+            socket_connect_timeout=70.0,  # > 60 seconds
+        )
+        assert config.socket_timeout == 400.0
+        assert config.socket_connect_timeout == 70.0
+
+    def test_repr_with_password_masking(self, redis_config_factory):
+        """Test __repr__ method with password masking."""
+        # Test with password in URL
+        config = redis_config_factory(redis_url="redis://user:secret123@host:6379/1")
+        repr_str = repr(config)
+        assert "secret123" not in repr_str
+        assert "****" in repr_str
+        assert "redis_url='redis://user:****@host:6379/1'" in repr_str
+
+        # Test without password
+        config = redis_config_factory(redis_url="redis://localhost:6379")
+        repr_str = repr(config)
+        assert "redis_url='redis://localhost:6379'" in repr_str
+        assert "****" not in repr_str
+
+    def test_str_with_password_masking(self, redis_config_factory):
+        """Test __str__ method with password masking."""
+        # Test with password in URL
+        config = redis_config_factory(redis_url="redis://user:secret123@host:6379/1")
+        str_repr = str(config)
+        assert "secret123" not in str_repr
+        assert "****" in str_repr
+        assert "redis_url=redis://user:****@host:6379/1" in str_repr
+
+        # Test without password
+        config = redis_config_factory(redis_url="redis://localhost:6379")
+        str_repr = str(config)
+        assert "redis_url=redis://localhost:6379" in str_repr
+        assert "****" not in str_repr
+
+    def test_get_safe_repr(self, redis_config_factory):
+        """Test get_safe_repr method."""
+        # Test with password in URL
+        config = redis_config_factory(redis_url="redis://user:secret123@host:6379/1")
+        safe_repr = config.get_safe_repr()
+        assert "secret123" not in str(safe_repr)
+        assert safe_repr["redis_url"] == "redis://user:****@host:6379/1"
+
+        # Test without password
+        config = redis_config_factory(redis_url="redis://localhost:6379")
+        safe_repr = config.get_safe_repr()
+        assert safe_repr["redis_url"] == "redis://localhost:6379"
+
+        # Ensure other fields are preserved
+        assert "default_ttl" in safe_repr
+        assert "max_chunk_size_mb" in safe_repr
+
+    def test_from_env_method(self):
+        """Test from_env class method."""
+        with patch.dict(
+            os.environ,
+            {
+                "CACHEKIT_REDIS_URL": "redis://env-host:6380/2",
+                "CACHEKIT_DEFAULT_TTL": "7200",
+                "CACHEKIT_ENABLE_COMPRESSION": "false",
+                "CACHEKIT_MAX_RETRIES": "5",
+            },
+        ):
+            config = CachekitConfig.from_env()
+            assert config.redis_url == "redis://env-host:6380/2"
+            assert config.default_ttl == 7200
+            assert config.enable_compression is False
+            assert config.max_retries == 5
+
+
+@pytest.mark.unit
+class TestConfigLoadingFunctions:
+    """Test configuration loading utility functions."""
+
+    def test_load_config_from_dict(self):
+        """Test loading config from dictionary."""
+        config_dict = {
+            "redis_url": "redis://dict-host:6379",
+            "default_ttl": 1800,
+            "max_chunk_size_mb": 100,
+            "enable_compression": False,
+        }
+
+        config = load_config_from_dict(config_dict)
+        assert config.redis_url == "redis://dict-host:6379"
+        assert config.default_ttl == 1800
+        assert config.max_chunk_size_mb == 100
+        assert config.enable_compression is False
+
+    def test_load_config_from_dict_invalid(self):
+        """Test loading config from invalid dictionary."""
+        invalid_dict = {
+            "redis_url": "invalid-url",
+            "default_ttl": -1,  # Invalid
+        }
+
+        with pytest.raises(ValidationError):
+            load_config_from_dict(invalid_dict)
+
+    def test_load_config_from_file_json(self):
+        """Test loading config from JSON file."""
+        config_data = {
+            "redis_url": "redis://file-host:6379",
+            "default_ttl": 2400,
+            "enable_compression": True,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            f.flush()
+
+            try:
+                config = load_config_from_file(f.name)
+                assert config.redis_url == "redis://file-host:6379"
+                assert config.default_ttl == 2400
+                assert config.enable_compression is True
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_file_yaml(self):
+        """Test loading config from YAML file."""
+        yaml_content = """
+redis_url: redis://yaml-host:6379
+default_ttl: 3000
+max_chunk_size_mb: 75
+enable_compression: false
+        """
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+
+            try:
+                config = load_config_from_file(f.name)
+                assert config.redis_url == "redis://yaml-host:6379"
+                assert config.default_ttl == 3000
+                assert config.max_chunk_size_mb == 75
+                assert config.enable_compression is False
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_file_unsupported_format(self):
+        """Test loading config from unsupported file format."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("not a config file")
+            f.flush()
+
+            try:
+                with pytest.raises(ValueError, match="Unsupported file format"):
+                    load_config_from_file(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_file_not_found(self):
+        """Test loading config from non-existent file."""
+        with pytest.raises(FileNotFoundError):
+            load_config_from_file("/non/existent/file.json")
+
+    def test_load_config_from_file_invalid_json(self):
+        """Test loading config from invalid JSON file."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("{ invalid json }")
+            f.flush()
+
+            try:
+                with pytest.raises(ValueError, match="Failed to parse JSON"):
+                    load_config_from_file(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_file_invalid_yaml(self):
+        """Test loading config from invalid YAML file."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("invalid: yaml: content: [")
+            f.flush()
+
+            try:
+                with pytest.raises(ValueError, match="Failed to parse YAML"):
+                    load_config_from_file(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_env_function(self, redis_config_factory):
+        """Test load_config_from_env function."""
+        with patch.dict(
+            os.environ,
+            {
+                "CACHEKIT_REDIS_URL": "redis://env-func-host:6379",
+                "CACHEKIT_DEFAULT_TTL": "4800",
+            },
+        ):
+            config = load_config_from_env()
+            assert config.redis_url == "redis://env-func-host:6379"
+            assert config.default_ttl == 4800
+
+    def test_global_config_management(self, redis_config_factory, monkeypatch):
+        """Test global config set/get/reset functionality."""
+        # Reset to clean state
+        reset_config()
+
+        # Ensure no env vars interfere with the test
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("CACHEKIT_DEFAULT_TTL", raising=False)
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_TTL", raising=False)
+
+        # Test setting global config
+        custom_config = redis_config_factory(redis_url="redis://global-host:6379", default_ttl=1200)
+        set_global_config(custom_config)
+
+        # Test getting global config
+        retrieved_config = get_config()
+        assert retrieved_config.redis_url == "redis://global-host:6379"
+        assert retrieved_config.default_ttl == 1200
+
+        # Test reset
+        reset_config()
+
+        # Clear env vars again to get true defaults
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("CACHEKIT_DEFAULT_TTL", raising=False)
+
+        default_config = get_config()
+        assert default_config.redis_url == "redis://localhost:6379"
+        assert default_config.default_ttl == 3600
+
+    def test_get_config_with_file(self):
+        """Test get_config with config file."""
+        # Reset global config state to ensure clean test
+        reset_config()
+
+        config_data = {
+            "redis_url": "redis://config-file-host:6379",
+            "default_ttl": 5400,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            f.flush()
+
+            try:
+                # Clear environment variables that might interfere
+                with patch.dict(os.environ, {}, clear=True):
+                    config = get_config(config_file=f.name)
+                    assert config.redis_url == "redis://config-file-host:6379"
+                    assert config.default_ttl == 5400
+            finally:
+                os.unlink(f.name)
+
+    def test_load_config_from_dict_thread_safety(self):
+        """Test thread-safe concurrent access to load_config_from_dict."""
+        import concurrent.futures
+
+        def load_config(i):
+            """Load config with unique redis_url to detect cross-contamination."""
+            config_dict = {
+                "redis_url": f"redis://thread-{i}:6379/{i}",
+                "default_ttl": 1000 + i,
+            }
+            return load_config_from_dict(config_dict)
+
+        # Run concurrent loads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(load_config, i) for i in range(10)]
+            results = [f.result() for f in futures]
+
+        # Verify all configs loaded correctly with no cross-contamination
+        assert len(results) == 10
+        for i, config in enumerate(results):
+            # Each config should have its own unique values
+            assert config.redis_url == f"redis://thread-{i}:6379/{i}"
+            assert config.default_ttl == 1000 + i
+
+
+@pytest.mark.unit
+class TestConfigEdgeCases:
+    """Test configuration edge cases and error conditions."""
+
+    def test_redis_url_edge_cases(self, redis_config_factory):
+        """Test edge cases in Redis URL validation."""
+        # Test URL with special characters in password
+        config = redis_config_factory(redis_url="redis://user:p@ss:w0rd@host:6379")
+        assert "p@ss:w0rd" not in repr(config)
+        assert "****" in repr(config)
+
+        # Test URL with encoded characters (should be decoded internally)
+        config = redis_config_factory(redis_url="redis://user:pass%40word@host:6379")
+        assert config.redis_url == "redis://user:pass@word@host:6379"  # %40 decoded to @
+
+    def test_compression_level_validation(self, redis_config_factory):
+        """Test compression level validation."""
+        # Valid levels
+        for level in range(1, 10):
+            config = redis_config_factory(compression_level=level)
+            assert config.compression_level == level
+
+        # Invalid levels
+        with pytest.raises(ValidationError):
+            redis_config_factory(compression_level=0)
+
+        with pytest.raises(ValidationError):
+            redis_config_factory(compression_level=10)
+
+    def test_field_validation_edge_cases(self, redis_config_factory):
+        """Test edge cases in field validation."""
+        # Test maximum values
+        config = redis_config_factory(
+            max_chunk_size_mb=1000,
+            connection_pool_size=100,
+            max_retries=10,
+            retry_delay_ms=5000,
+            early_refresh_ratio=1.0,
+            default_ttl=86400,  # 24 hours
+        )
+        assert config.max_chunk_size_mb == 1000
+        assert config.connection_pool_size == 100
+
+        # Test minimum values
+        config = redis_config_factory(
+            max_chunk_size_mb=1,
+            connection_pool_size=1,
+            socket_timeout=0.1,
+            socket_connect_timeout=0.1,
+            max_retries=0,
+            retry_delay_ms=1,
+            early_refresh_ratio=0.0,
+            default_ttl=1,
+        )
+        assert config.max_chunk_size_mb == 1
+        assert config.connection_pool_size == 1
+
+    def test_type_coercion(self):
+        """Test type coercion from strings."""
+        # Test with string values that should be coerced
+        with patch.dict(
+            os.environ,
+            {
+                "CACHEKIT_MAX_CHUNK_SIZE_MB": "75",
+                "CACHEKIT_SOCKET_TIMEOUT": "2.5",
+                "CACHEKIT_ENABLE_COMPRESSION": "false",
+                "CACHEKIT_EARLY_REFRESH_RATIO": "0.8",
+            },
+        ):
+            config = CachekitConfig()
+            assert isinstance(config.max_chunk_size_mb, int)
+            assert config.max_chunk_size_mb == 75
+            assert isinstance(config.socket_timeout, float)
+            assert config.socket_timeout == 2.5
+            assert isinstance(config.enable_compression, bool)
+            assert config.enable_compression is False
+            assert isinstance(config.early_refresh_ratio, float)
+            assert config.early_refresh_ratio == 0.8

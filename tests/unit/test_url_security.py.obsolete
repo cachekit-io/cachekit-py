@@ -1,0 +1,82 @@
+"""Unit tests for Redis URL security validation.
+
+Tests HIGH-02 security fix: Prevents command injection attacks via
+percent-encoded dangerous characters in Redis URLs.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from cachekit.config import CachekitConfig
+
+
+@pytest.mark.unit
+class TestRedisURLSecurity:
+    """Test Redis URL security validation (HIGH-02 fix)."""
+
+    def test_valid_redis_urls(self):
+        """Valid Redis URLs should pass validation."""
+        valid_urls = [
+            "redis://localhost:6379",
+            "redis://user:pass@localhost:6379",
+            "redis://:password@localhost:6379/0",
+            "redis://10.0.0.1:6379/1",
+            "redis://secure.redis.com:6380/1",
+        ]
+
+        for url in valid_urls:
+            config = CachekitConfig(redis_url=url)
+            assert config.redis_url == url
+
+    def test_percent_encoded_urls_rejected(self):
+        """Percent-encoded URLs should be rejected (HIGH-02 fix).
+
+        Attackers could bypass security checks by percent-encoding dangerous
+        characters like semicolons, pipes, and ampersands.
+        """
+        malicious_urls = [
+            "redis://localhost:6379%3Bcat%20/etc/passwd",  # %3B = ;
+            "redis://localhost:6379%7Cid",  # %7C = |
+            "redis://localhost:6379%26whoami",  # %26 = &
+            "redis://localhost:6379%60id%60",  # %60 = ` (backtick)
+            "redis://localhost:6379%24(whoami)",  # %24 = $ (command substitution)
+            # Note: redis://user%3Amalicious@localhost:6379 is VALID (colon in username is allowed)
+        ]
+
+        for url in malicious_urls:
+            with pytest.raises(ValidationError, match="potentially dangerous character"):
+                CachekitConfig(redis_url=url)
+
+    def test_dangerous_characters_rejected(self):
+        """URLs with dangerous characters should be rejected.
+
+        Direct injection attempts without encoding should also fail.
+        """
+        dangerous_urls = [
+            "redis://localhost:6379;cat /etc/passwd",
+            "redis://localhost:6379|id",
+            "redis://localhost:6379&whoami",
+            "redis://localhost:6379`id`",
+            "redis://localhost:6379$(whoami)",
+            "redis://localhost:6379\nGET *",
+        ]
+
+        for url in dangerous_urls:
+            with pytest.raises(ValueError, match="dangerous"):
+                CachekitConfig(redis_url=url)
+
+    def test_edge_cases(self):
+        """Edge cases in URL validation."""
+        # Empty URL should fail
+        with pytest.raises(ValueError):
+            CachekitConfig(redis_url="")
+
+        # Whitespace should fail
+        with pytest.raises(ValueError):
+            CachekitConfig(redis_url="   ")
+
+        # URL with only scheme should fail
+        with pytest.raises(ValueError):
+            CachekitConfig(redis_url="redis://")

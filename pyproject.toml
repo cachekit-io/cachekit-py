@@ -1,0 +1,199 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cachekit"
+version = "0.1.0"
+description = "Production-ready Redis caching for Python with intelligent reliability features"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "cachekit Contributors", email = "noreply@cachekit.io"}
+]
+maintainers = [
+    {name = "cachekit Contributors", email = "noreply@cachekit.io"}
+]
+keywords = [
+    "redis",
+    "cache",
+    "caching",
+    "decorator",
+    "rust",
+    "performance",
+    "reliability",
+    "production",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: System :: Distributed Computing",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+requires-python = ">=3.9"
+dependencies = [
+    # Core Redis functionality
+    "redis[hiredis]>=4.0.0",
+    # Configuration and validation
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    # Error handling
+    "tenacity>=8.0.0",
+    # Monitoring and observability
+    "prometheus-client>=0.22.1",
+    "psutil>=7.0.0",
+    # Serialization and hashing
+    "blake3>=1.0.5",
+    "msgpack>=1.1.2",
+    "orjson>=3.9.0",
+    "xxhash>=3.5.0",
+]
+
+[project.optional-dependencies]
+# User-facing optional features only - dev deps are in [dependency-groups]
+data = [
+    "numpy>=2.0.2",
+    "pandas>=1.3.0",
+    "pyarrow>=21.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/cachekit-io/cachekit-py"
+Documentation = "https://github.com/cachekit-io/cachekit-py#readme"
+Repository = "https://github.com/cachekit-io/cachekit-py.git"
+Issues = "https://github.com/cachekit-io/cachekit-py/issues"
+
+# Maturin configuration for Rust extensions
+[tool.maturin]
+python-source = "src"
+module-name = "cachekit._rust_serializer"
+features = ["pyo3/extension-module", "encryption"]
+strip = true
+include = ["LICENSE", "README.md"]
+
+# Ruff configuration
+[tool.ruff]
+line-length = 129
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "S",    # flake8-bandit (security)
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "UP007",  # Use X | Y for type unions (requires Python 3.10+)
+    "UP045",  # Use X | None instead of Optional[X] (requires Python 3.10+)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/**/*" = ["S101", "S105", "S110", "S112", "S311", "D", "F841", "N802"]
+"src/cachekit/logging.py" = ["S110"]  # Logging errors would create recursion
+"src/cachekit/monitoring/pool_monitor.py" = ["S110"]  # Monitoring errors should be silent
+"src/cachekit/reliability/async_metrics.py" = ["S101"]  # Internal invariant checks
+"src/cachekit/serializers/__init__.py" = ["S101"]  # Module-level validation
+"src/cachekit/serializers/default_serializer.py" = ["S110"]  # Fallback deserialization patterns
+
+[tool.ruff.lint.isort]
+known-first-party = ["cachekit"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# Pytest configuration
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+    "--strict-markers",
+    "--verbose",
+    "--basetemp=/tmp/pytest",
+    "--doctest-modules",              # Validate docstring examples
+    "--doctest-continue-on-failure",  # Report all doctest failures, not just first
+    "--markdown-docs",                # Validate markdown documentation examples
+]
+markers = [
+    "asyncio: Async tests using pytest-asyncio",
+    "critical: Critical path tests (fast, essential functionality)",
+    "integration: Integration tests (require Redis)",
+    "markdown-docs: Markdown documentation tests",
+    "performance: Performance benchmark tests",
+    "security: Security-critical edge case tests",
+    "slow: Slow tests that allocate large amounts of memory or take significant time",
+    "unit: Unit tests (fast, mocked dependencies)",
+]
+
+# Doctest configuration
+doctest_optionflags = [
+    "NORMALIZE_WHITESPACE",
+    "ELLIPSIS",
+]
+
+[dependency-groups]
+dev = [
+    # Testing
+    "fakeredis>=2.21.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-benchmark>=4.0.0",
+    "pytest-cov>=7.0.0",
+    "pytest-markdown-docs>=0.6.0",
+    "pytest-redis>=3.0.0",
+    # Code quality
+    "basedpyright>=1.32.1",
+    "ruff>=0.6.0",
+    # Utilities
+    "bashlex>=0.18",
+    "faker>=20.0.0",
+    "httpx>=0.28.1",
+    "hypothesis>=6.0.0",
+    "pip-audit>=2.7.0",
+    "psutil>=5.9.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.3",
+    # Data science support (for testing AutoSerializer with numpy/pandas)
+    "numpy>=2.0.2",
+    "pandas>=1.3.0",
+    "pyarrow>=21.0.0",
+]
+# Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
+fuzz = [
+    "atheris>=2.3.0",
+]
+
+# Override vulnerable transitive dependencies
+[tool.uv]
+constraint-dependencies = [
+    "urllib3>=2.6.0",
+    "fonttools>=4.60.2",
+    "werkzeug>=3.1.4",
+]

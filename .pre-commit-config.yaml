@@ -1,0 +1,50 @@
+# Pre-commit hooks for cachekit
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Python formatting and linting with ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.3
+    hooks:
+      - id: ruff
+        args: [--fix]
+        name: Ruff lint
+      - id: ruff-format
+        name: Ruff format
+
+  # Rust formatting and linting
+  - repo: local
+    hooks:
+      # Python type checking with basedpyright
+      - id: basedpyright
+        name: basedpyright
+        entry: uv run basedpyright src/
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: cargo-fmt
+        name: Cargo format
+        entry: bash -c 'cd rust && cargo fmt --check'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: Cargo clippy
+        entry: bash -c 'cd rust && cargo clippy -- -D warnings'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict

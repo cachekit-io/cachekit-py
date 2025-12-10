@@ -1,0 +1,39 @@
+{
+    "include": ["src"],
+    "exclude": [
+        "**/__pycache__",
+        "**/node_modules",
+        "**/.venv",
+        "**/venv",
+        "build",
+        "dist",
+        "target",
+        "tests"
+    ],
+
+    "typeCheckingMode": "standard",
+
+    "reportMissingTypeStubs": "warning",
+    "reportUnknownMemberType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownVariableType": "none",
+
+    "reportPrivateUsage": "warning",
+    "reportUnusedImport": "warning",
+    "reportUnusedVariable": "warning",
+    "reportDuplicateImport": "error",
+
+    "reportIncompatibleMethodOverride": "error",
+    "reportIncompatibleVariableOverride": "error",
+
+    "reportUnnecessaryIsInstance": "warning",
+    "reportUnnecessaryCast": "warning",
+    "reportUnnecessaryComparison": "warning",
+
+    "pythonVersion": "3.9",
+    "pythonPlatform": "Linux",
+
+    "stubPath": "typings",
+    "venvPath": ".",
+    "venv": ".venv"
+}

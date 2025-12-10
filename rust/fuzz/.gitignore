@@ -1,0 +1,24 @@
+# Fuzz corpus and artifacts
+# Corpus growth: allow initial seeds, ignore generated
+corpus/*/
+!corpus/*/.gitkeep
+
+# Artifacts: crashes, hangs, slow inputs
+artifacts/
+*.profdata
+*.profraw
+
+# Coverage reports
+coverage/
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Crash reports and triage output
+crash-*.txt
+deduplicated_crashes.txt
+minimized/
+
+# AFL++ specific
+afl_*/

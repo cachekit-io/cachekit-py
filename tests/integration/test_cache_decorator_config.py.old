@@ -1,0 +1,121 @@
+"""Integration tests for CacheConfig with cache decorator."""
+
+import pytest
+
+from cachekit import CacheConfig, cache
+
+
+@pytest.mark.integration
+class TestCacheDecoratorWithConfig:
+    """Test cache decorator with CacheConfig integration."""
+
+    def test_decorator_accepts_cache_config(self, redis_test_client):
+        """Test that decorator accepts CacheConfig parameter."""
+        call_count = 0
+        config = CacheConfig().with_ttl(300).with_namespace("test")
+
+        @cache(config=config)
+        def test_function(x):
+            nonlocal call_count
+            call_count += 1
+            return x * 2
+
+        # Function should still work
+        result1 = test_function(5)
+        assert result1 == 10
+        assert call_count == 1
+
+        # Second call should hit cache
+        result2 = test_function(5)
+        assert result2 == 10
+        assert call_count == 1  # Not incremented - cache hit
+
+    def test_config_object_takes_precedence(self, redis_test_client):
+        """Test that config object overrides legacy parameters."""
+        call_count = 0
+        config = CacheConfig().with_ttl(600)
+
+        # Config should override ttl parameter
+        @cache(config=config, ttl=300)
+        def test_function(x):
+            nonlocal call_count
+            call_count += 1
+            return x * 2
+
+        result1 = test_function(5)
+        assert result1 == 10
+        assert call_count == 1
+
+        # Cache hit (config TTL should apply)
+        result2 = test_function(5)
+        assert result2 == 10
+        assert call_count == 1
+
+    def test_chained_config(self, redis_test_client):
+        """Test complex chained configuration."""
+        call_count = 0
+        config = CacheConfig().with_ttl(900).with_namespace("api").safe()
+
+        @cache(config=config)
+        def complex_function(x):
+            nonlocal call_count
+            call_count += 1
+            return x**2
+
+        result1 = complex_function(4)
+        assert result1 == 16
+        assert call_count == 1
+
+        # Cache hit
+        result2 = complex_function(4)
+        assert result2 == 16
+        assert call_count == 1
+
+
+@pytest.mark.integration
+class TestBackwardCompatibility:
+    """Test that existing code still works."""
+
+    def test_legacy_parameters_still_work(self, redis_test_client):
+        """Test that legacy decorator parameters still work."""
+        call_count = 0
+
+        # Old style should still work
+        @cache(ttl=400, namespace="legacy")
+        def legacy_function(x):
+            nonlocal call_count
+            call_count += 1
+            return x + 10
+
+        result1 = legacy_function(5)
+        assert result1 == 15
+        assert call_count == 1
+
+        # Cache hit
+        result2 = legacy_function(5)
+        assert result2 == 15
+        assert call_count == 1
+
+
+@pytest.mark.unit
+class TestConfigConversion:
+    """Test configuration conversion to dict."""
+
+    def test_config_to_dict_conversion(self):
+        """Test that to_dict produces correct format."""
+        config = CacheConfig().with_ttl(500).with_namespace("test").fast()
+        d = config.to_dict()
+
+        # Check critical mappings
+        assert d["ttl"] == 500
+        assert d["namespace"] == "test"
+        assert d["fast_mode"] is True
+        assert d["circuit_breaker"] is False
+        assert d["adaptive_timeout"] is False
+        assert d["l1_enabled"] is True
+
+        # Verify config object state matches
+        assert config.ttl == 500
+        assert config.namespace == "test"
+        assert config.fast_mode is True
+        assert config.circuit_breaker is False

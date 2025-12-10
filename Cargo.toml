@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["rust"]
+exclude = ["rust/fuzz"]
+
+[workspace.dependencies]
+pyo3 = { version = "0.25", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+numpy = "0.25"
+
+# Performance dependencies
+rayon = "1.8"
+simd-json = "0.13"
+lz4 = "1.24"
+memmap2 = "0.9"
+
+[workspace.metadata.maturin]
+python-source = "src"
+
+# Aggressive optimization for release builds
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Build-time environment optimization
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
+
+# Optimize for size in development
+[profile.dev]
+opt-level = 1
+
+# Enable debug info for profiling - ENHANCED
+[profile.bench]
+opt-level = 3
+debug = true
+lto = "fat"
+
+# Profile-Guided Optimization - Generate profile data
+[profile.release-pgo-generate]
+inherits = "release"
+# PGO instrumentation adds overhead, disable some optimizations
+lto = false
+# Keep debug info for profiling
+debug = true
+
+# Profile-Guided Optimization - Use profile data
+[profile.release-pgo-use]
+inherits = "release"
+# Full LTO with profile data for maximum optimization
+lto = "fat"
+# Strip symbols for smaller binary
+strip = true
+# Maximum optimization with profile data
+opt-level = 3
+codegen-units = 1

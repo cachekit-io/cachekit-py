@@ -1,0 +1,102 @@
+# cargo-deny configuration for cachekit security policy
+# Enforces license compliance, vulnerability scanning, and dependency policy
+# See: https://embarkstudios.github.io/cargo-deny/
+
+# ═══════════════════════════════════════════════════════════════
+# GRAPH - Dependency Graph Configuration
+# ═══════════════════════════════════════════════════════════════
+[graph]
+# Target platforms for cachekit (cross-platform library)
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Use all features for comprehensive analysis
+all-features = true
+
+# ═══════════════════════════════════════════════════════════════
+# ADVISORIES - Vulnerability Scanning (RustSec Database)
+# ═══════════════════════════════════════════════════════════════
+[advisories]
+# Check all workspace crates for unmaintained dependencies
+unmaintained = "workspace"
+
+# No initial exemptions - all vulnerabilities must be addressed
+ignore = []
+
+# ═══════════════════════════════════════════════════════════════
+# LICENSES - License Policy Enforcement
+# ═══════════════════════════════════════════════════════════════
+[licenses]
+# High confidence threshold for license detection
+confidence-threshold = 0.8
+
+# Allowed licenses (MIT/Apache-2.0/BSD-3-Clause compatible with cachekit MIT license)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # LLVM runtime exception
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",  # Unicode License v3 (OSI approved, permissive)
+    "CC0-1.0",  # Public domain
+    "0BSD",  # BSD Zero Clause (very permissive)
+    "BSL-1.0",  # Boost Software License (very permissive, simpler than MIT)
+    "MPL-2.0",  # Mozilla Public License 2.0 (file-level copyleft, OSI approved)
+]
+
+# License exceptions for specific crates (use sparingly)
+# Format: { allow = ["LICENSE"], crate = "crate-name" }
+exceptions = []
+
+# ═══════════════════════════════════════════════════════════════
+# BANS - Dependency Policy Enforcement
+# ═══════════════════════════════════════════════════════════════
+[bans]
+# Deny multiple versions of the same crate (reduces binary size, prevents subtle bugs)
+multiple-versions = "deny"
+
+# Deny wildcard dependencies (e.g., "serde = *")
+wildcards = "deny"
+
+# Highlight all duplicate versions for review
+highlight = "all"
+
+# Ban specific crates (use-instead provides alternative)
+# Format: { crate = "name", reason = "explanation", use-instead = "alternative" }
+deny = []
+
+# Skip specific dependencies from multiple-version checks
+# Format: { crate = "name@version", reason = "explanation" }
+skip = [
+    # windows-sys versions diverge across the ecosystem (0.60.x vs 0.61.x)
+    # Safe to allow: Windows FFI bindings, no runtime state, maintained by Microsoft
+    { crate = "windows-sys@0.60.2", reason = "Transitive dep version mismatch with 0.61.x" },
+    # getrandom 0.2.x (ring) vs 0.3.x (newer ecosystem) - common split
+    # Safe: stateless RNG interface, both maintained
+    { crate = "getrandom@0.2.16", reason = "ring uses 0.2.x, newer deps use 0.3.x" },
+]
+
+# Skip crate trees entirely (e.g., frequently-updated foundational crates)
+# Format: { crate = "name", reason = "explanation" }
+skip-tree = []
+
+# ═══════════════════════════════════════════════════════════════
+# SOURCES - Source Registry Policy
+# ═══════════════════════════════════════════════════════════════
+[sources]
+# Deny unknown registry sources (prevent supply chain attacks)
+unknown-registry = "deny"
+
+# Deny unknown git sources (prevent malicious repos)
+unknown-git = "deny"
+
+# Only allow crates.io as the source registry
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git dependencies allowed (use crates.io releases for stability)
+allow-git = []

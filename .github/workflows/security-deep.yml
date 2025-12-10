@@ -1,0 +1,320 @@
+name: Security Deep
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM daily
+  workflow_dispatch:  # Allow manual triggers
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Deep security analysis (< 2 hours) - nightly scheduled
+  kani-verification:
+    name: Kani Formal Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Kani verification
+      uses: model-checking/kani-github-action@v1
+      with:
+        working-directory: rust
+        args: --tests --no-default-features --features compression,checksum,messagepack,encryption
+
+  fuzzing:
+    name: Extended Fuzzing (3 targets × 1h)
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install nightly Rust
+      run: |
+        rustup toolchain install nightly
+        rustup default nightly
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+
+    - name: Install cargo-binstall
+      uses: cargo-bins/cargo-binstall@main
+
+    - name: Install cargo-fuzz
+      run: cargo binstall --no-confirm cargo-fuzz
+
+    - name: Fuzz byte_storage_compress (1 hour)
+      run: |
+        cd rust
+        timeout 3600 cargo fuzz run byte_storage_compress --no-default-features --features compression,checksum || true
+
+    - name: Fuzz byte_storage_decompress (1 hour)
+      run: |
+        cd rust
+        timeout 3600 cargo fuzz run byte_storage_decompress --no-default-features --features compression,checksum || true
+
+    - name: Fuzz encryption_roundtrip (1 hour)
+      run: |
+        cd rust
+        timeout 3600 cargo fuzz run encryption_roundtrip --no-default-features --features encryption || true
+
+    - name: Check for crashes
+      run: |
+        cd rust/fuzz
+        CRASHES=$(find artifacts -name "crash-*" 2>/dev/null | wc -l)
+        if [ "$CRASHES" -gt 0 ]; then
+          echo "❌ Found $CRASHES crashes during fuzzing"
+          find artifacts -name "crash-*" -exec echo "Crash: {}" \;
+          exit 1
+        fi
+        echo "✅ No crashes found during fuzzing"
+
+    - name: Generate coverage report
+      run: |
+        cd rust
+        for target in byte_storage_compress byte_storage_decompress encryption_roundtrip; do
+          echo "=== Coverage for $target ==="
+          cargo fuzz coverage $target || true
+        done
+
+  atheris-fuzzing:
+    name: Atheris Python-Rust Fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+
+    - name: Cache Python virtual environment
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-py3.12-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+        restore-keys: |
+          venv-${{ runner.os }}-py3.12-
+
+    - name: Install dependencies
+      run: |
+        uv sync --group dev --group fuzz
+
+    - name: Run Atheris fuzz targets (10 min each)
+      run: |
+        for fuzz_target in tests/fuzzing/fuzz_*.py; do
+          if [ -f "$fuzz_target" ]; then
+            echo "Fuzzing $fuzz_target..."
+            timeout 10m uv run python "$fuzz_target" -max_total_time=600 || true
+          fi
+        done
+
+    - name: Upload crash corpus
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: atheris-crashes-${{ github.run_id }}
+        path: tests/fuzzing/corpus/
+
+    - name: Report fuzzing results
+      if: always()
+      run: |
+        if [ -d tests/fuzzing/corpus/ ] && [ "$(ls -A tests/fuzzing/corpus/ 2>/dev/null | grep -v '.gitignore')" ]; then
+          echo "⚠️  Crashes discovered during Atheris fuzzing!"
+          ls -lh tests/fuzzing/corpus/
+          exit 1
+        fi
+        echo "✅ No crashes discovered during Atheris fuzzing"
+
+  miri-full:
+    name: Miri Full Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install nightly Rust with Miri
+      run: |
+        rustup toolchain install nightly --component miri
+        rustup default nightly
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+
+    - name: Run full Miri test suite
+      run: |
+        cd rust
+        cargo miri test --no-default-features --features compression,checksum,messagepack,encryption
+
+  sanitizers:
+    name: Sanitizers (ASan, TSan, MSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, memory]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install nightly Rust
+      run: |
+        rustup toolchain install nightly
+        rustup default nightly
+
+    - name: Add source for MSan
+      if: matrix.sanitizer == 'memory'
+      run: rustup component add rust-src --toolchain nightly
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+        key: ${{ matrix.sanitizer }}
+
+    - name: Run AddressSanitizer
+      if: matrix.sanitizer == 'address'
+      env:
+        RUSTFLAGS: -Zsanitizer=address
+      run: |
+        cd rust
+        cargo +nightly test --lib --target x86_64-unknown-linux-gnu \
+          --no-default-features --features compression,checksum,messagepack,encryption
+
+    - name: Run ThreadSanitizer
+      if: matrix.sanitizer == 'thread'
+      env:
+        RUSTFLAGS: -Zsanitizer=thread
+        TSAN_OPTIONS: suppressions=${{ github.workspace }}/rust/tsan_suppressions.txt
+      run: |
+        cd rust
+        cargo +nightly test --lib --target x86_64-unknown-linux-gnu \
+          --no-default-features --features compression,checksum,messagepack,encryption
+
+    - name: Run MemorySanitizer
+      if: matrix.sanitizer == 'memory'
+      env:
+        RUSTFLAGS: -Zsanitizer=memory -Zsanitizer-memory-track-origins
+      run: |
+        cd rust
+        cargo +nightly test --lib --target x86_64-unknown-linux-gnu \
+          -Zbuild-std --no-default-features --features compression,checksum,messagepack,encryption
+
+  generate-security-report:
+    name: Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
+    if: always()
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Generate security report
+      run: |
+        mkdir -p reports/security
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        REPORT="reports/security/deep-analysis-$TIMESTAMP.md"
+
+        cat > "$REPORT" <<EOF
+        # Deep Security Analysis Report
+        Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        Workflow Run: ${{ github.run_id }}
+
+        ## Summary
+        - **Kani Verification**: ${{ needs.kani-verification.result }}
+        - **Extended Fuzzing**: ${{ needs.fuzzing.result }}
+        - **Atheris Python-Rust Fuzzing**: ${{ needs.atheris-fuzzing.result }}
+        - **Miri Full Suite**: ${{ needs.miri-full.result }}
+        - **Sanitizers**: ${{ needs.sanitizers.result }}
+
+        ## Results
+
+        ### Formal Verification (Kani)
+        Status: ${{ needs.kani-verification.result }}
+        - ByteStorage roundtrip properties
+        - Checksum integrity verification
+        - Decompression bomb protection
+        - Encryption roundtrip correctness
+        - Key derivation determinism
+
+        ### Fuzzing (3 hours total)
+        Status: ${{ needs.fuzzing.result }}
+        - byte_storage_compress (1 hour)
+        - byte_storage_decompress (1 hour)
+        - encryption_roundtrip (1 hour)
+
+        ### Undefined Behavior Detection (Miri)
+        Status: ${{ needs.miri-full.result }}
+        - Full test suite with strict provenance
+        - Symbolic alignment checking
+        - Memory leak detection
+
+        ### Runtime Sanitizers
+        Status: ${{ needs.sanitizers.result }}
+        - AddressSanitizer (memory errors)
+        - ThreadSanitizer (race conditions)
+        - MemorySanitizer (uninitialized memory)
+
+        ## Conclusion
+        $(if [[ "${{ needs.kani-verification.result }}" == "success" ]] && \
+             [[ "${{ needs.fuzzing.result }}" == "success" ]] && \
+             [[ "${{ needs.miri-full.result }}" == "success" ]] && \
+             [[ "${{ needs.sanitizers.result }}" == "success" ]]; then
+          echo "✅ All deep security checks passed"
+        else
+          echo "❌ One or more deep security checks failed"
+        fi)
+        EOF
+
+        cat "$REPORT"
+
+    - name: Archive security report
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-deep-report
+        path: reports/security/
+        retention-days: 90
+
+  # Summary job
+  security-deep-success:
+    name: Security Deep Success
+    runs-on: ubuntu-latest
+    needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
+    if: always()
+    steps:
+    - name: Check all deep security checks passed
+      run: |
+        if [[ "${{ needs.kani-verification.result }}" != "success" ]] || \
+           [[ "${{ needs.fuzzing.result }}" != "success" ]] || \
+           [[ "${{ needs.atheris-fuzzing.result }}" != "success" ]] || \
+           [[ "${{ needs.miri-full.result }}" != "success" ]] || \
+           [[ "${{ needs.sanitizers.result }}" != "success" ]]; then
+          echo "❌ One or more deep security checks failed"
+          echo "Kani: ${{ needs.kani-verification.result }}"
+          echo "Fuzzing: ${{ needs.fuzzing.result }}"
+          echo "Atheris: ${{ needs.atheris-fuzzing.result }}"
+          echo "Miri: ${{ needs.miri-full.result }}"
+          echo "Sanitizers: ${{ needs.sanitizers.result }}"
+          exit 1
+        fi
+        echo "✅ All deep security checks passed"
