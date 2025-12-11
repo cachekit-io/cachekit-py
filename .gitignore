@@ -56,7 +56,7 @@ coverage.xml
 
 # Rust
 target/
-Cargo.lock
+# Note: Cargo.lock is committed for reproducible builds (PyO3 extension = application)
 **/*.rs.bk
 *.pdb
 *.profraw
