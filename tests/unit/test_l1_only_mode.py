@@ -15,7 +15,7 @@ This test reproduces the bug from docs/getting-started.md doctest failure.
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 class TestL1OnlyModeBug:
@@ -361,6 +361,168 @@ class TestL1OnlyModeInvalidation:
             result3 = changing_func(1)
             assert result3 == 200
             assert call_count == 2, "Should have re-executed after invalidation"
+
+
+class TestDefaultBackendBehavior:
+    """
+    CRITICAL: Tests that @cache() WITHOUT backend=None DOES attempt provider lookup.
+
+    This is the regression test for the bug where we accidentally made ALL decorators
+    L1-only by checking `config.backend is None` (which is the default).
+    """
+
+    def test_default_cache_should_call_backend_provider(self):
+        """
+        @cache() without backend=None SHOULD call get_backend_provider().
+
+        This is the INVERSE of L1-only mode - verifies we didn't break default behavior.
+        """
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            # Make provider return a mock backend
+            mock_backend = MagicMock()
+            mock_provider.return_value.get_backend.return_value = mock_backend
+
+            @cache(ttl=60)  # NO backend=None - should use provider
+            def default_func() -> str:
+                return "result"
+
+            # Call the function - this should trigger provider lookup
+            default_func()
+
+            # Backend provider SHOULD have been called
+            mock_provider.return_value.get_backend.assert_called()
+
+    def test_cache_minimal_without_backend_none_should_call_provider(self):
+        """
+        @cache.minimal() without backend=None SHOULD call get_backend_provider().
+        """
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_backend = MagicMock()
+            mock_provider.return_value.get_backend.return_value = mock_backend
+
+            @cache.minimal(ttl=60)  # NO backend=None
+            def minimal_func() -> str:
+                return "result"
+
+            minimal_func()
+
+            # Backend provider SHOULD have been called
+            mock_provider.return_value.get_backend.assert_called()
+
+    def test_decorator_config_default_backend_should_call_provider(self):
+        """
+        DecoratorConfig() with default backend SHOULD call get_backend_provider().
+
+        This specifically tests that DecoratorConfig.backend defaulting to None
+        does NOT trigger L1-only mode (the bug we fixed).
+        """
+        from cachekit.config import DecoratorConfig
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_backend = MagicMock()
+            mock_provider.return_value.get_backend.return_value = mock_backend
+
+            # DecoratorConfig() has backend=None by DEFAULT - should NOT be L1-only
+            @cache(config=DecoratorConfig(ttl=60))
+            def config_func() -> str:
+                return "result"
+
+            config_func()
+
+            # Backend provider SHOULD have been called (default != explicit None)
+            mock_provider.return_value.get_backend.assert_called()
+
+    def test_explicit_backend_instance_should_be_used(self):
+        """
+        @cache(backend=explicit_backend) should use that backend, not provider.
+        """
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = RuntimeError("Should not be called!")
+
+            # Create an explicit mock backend
+            explicit_backend = MagicMock()
+            explicit_backend.get.return_value = None  # Cache miss
+
+            @cache(backend=explicit_backend, ttl=60)
+            def explicit_func() -> str:
+                return "result"
+
+            explicit_func()
+
+            # Provider should NOT be called - explicit backend provided
+            mock_provider.return_value.get_backend.assert_not_called()
+
+    def test_dev_and_test_presets_without_backend_none(self):
+        """
+        @cache.dev() and @cache.test() without backend=None SHOULD call provider.
+
+        Completes coverage for all intent presets.
+        """
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_backend = MagicMock()
+            mock_provider.return_value.get_backend.return_value = mock_backend
+
+            @cache.dev(ttl=60)
+            def dev_func() -> str:
+                return "dev"
+
+            @cache.test(ttl=60)
+            def test_func() -> str:
+                return "test"
+
+            dev_func()
+            test_func()
+
+            # Both should have triggered provider lookup
+            assert mock_provider.return_value.get_backend.call_count >= 2
+
+    def test_dev_and_test_presets_with_backend_none(self):
+        """
+        @cache.dev(backend=None) and @cache.test(backend=None) should be L1-only.
+
+        Completes L1-only coverage for all intent presets.
+        """
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = RuntimeError("Should not be called!")
+
+            dev_count = 0
+
+            @cache.dev(backend=None)
+            def dev_func() -> str:
+                nonlocal dev_count
+                dev_count += 1
+                return "dev"
+
+            test_count = 0
+
+            @cache.test(backend=None)
+            def test_func() -> str:
+                nonlocal test_count
+                test_count += 1
+                return "test"
+
+            # Execute twice each - should hit L1 cache
+            dev_func()
+            dev_func()
+            test_func()
+            test_func()
+
+            assert dev_count == 1, f"@cache.dev L1 miss - called {dev_count} times"
+            assert test_count == 1, f"@cache.test L1 miss - called {test_count} times"
+
+            # Provider should NEVER be called
+            mock_provider.return_value.get_backend.assert_not_called()
 
 
 class TestL1OnlyModeNoRedisWarnings:
