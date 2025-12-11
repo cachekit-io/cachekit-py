@@ -25,18 +25,18 @@ from cachekit import cache
 # Zero-config: automatic optimization (90% of use cases)
 @cache(backend=None)
 def expensive_function():
-    return compute_result()  # illustrative - not defined
+    return do_expensive_computation()
 
 # Intent-based optimization (9% of use cases)
+# These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key="a" * 64, backend=None)  # Security-critical: PII, medical, financial
+@cache.secure(master_key=secret_key, backend=None)  # Security-critical: PII, medical, financial (requires CACHEKIT_MASTER_KEY env var)
 
 # Manual control when needed (1% of use cases)
-# Use @cache.secure for encryption instead of passing master_key to @cache
 @cache(ttl=3600, namespace="custom", backend=None)
 def custom_function():
-    return special_computation()  # illustrative - not defined
+    return do_expensive_computation()
 ```
 
 **Architecture**: The `@cache` decorator uses intelligent profile selection (fast/safe/secure) or auto-detection to configure caching behavior, then delegates to the wrapper factory for actual caching implementation.
@@ -62,14 +62,15 @@ When you need explicit control over caching parameters, use `@cache()` with manu
 > [!TIP]
 > This decorator uses dependency injection to get the Redis client. You don't need to pass a `redis_client` parameter - just set the `REDIS_URL` or `CACHEKIT_REDIS_URL` environment variable.
 
-> [!NOTE]
-> **Performance Achievement (2025)**: Thread affinity optimization in connection pooling delivers 12.2% total CPU savings with 95%+ reduction in connection acquisition overhead.
+```python
+from cachekit import cache
+from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, TimeoutConfig, BackpressureConfig, MonitoringConfig
 
-```python notest
 @cache(
     ttl=3600,
     namespace=None,
     safe_mode=False,
+    backend=None,
     # Performance features
     refresh_ttl_on_get=False,
     ttl_refresh_threshold=0.5,
@@ -77,11 +78,11 @@ When you need explicit control over caching parameters, use `@cache()` with manu
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
     timeout=TimeoutConfig(enabled=True),
-    backpressure=BackpressureConfig(max_concurrent=100),
-    monitoring=MonitoringConfig(collect_stats=True, tracing_enabled=True),
+    backpressure=BackpressureConfig(max_concurrent_requests=100),
+    monitoring=MonitoringConfig(collect_stats=True, enable_tracing=True),
 )
 def your_function(args):
-    return expensive_computation(args)  # illustrative - not defined
+    return do_expensive_computation()
 ```
 
 #### Core Parameters
@@ -149,16 +150,15 @@ def test_cacheable_function():
 ```
 
 **Manual Configuration (fully supported):**
-```python notest
+```python
 from cachekit import cache
+from cachekit.config.nested import CircuitBreakerConfig, TimeoutConfig, BackpressureConfig, MonitoringConfig
 
 @cache(ttl=1800, namespace="analytics", backend=None)
 def explicit_function(dataset_id, filters=None):
-    return perform_analysis(dataset_id, filters)  # illustrative - not defined
+    return process_data(f"dataset_{dataset_id}")
 
 # Manual configuration with nested configs for reliability features
-from cachekit.config.nested import CircuitBreakerConfig, TimeoutConfig, BackpressureConfig, MonitoringConfig
-
 @cache(
     ttl=3600,
     namespace="critical_data",
@@ -166,10 +166,10 @@ from cachekit.config.nested import CircuitBreakerConfig, TimeoutConfig, Backpres
     circuit_breaker=CircuitBreakerConfig(enabled=True),
     timeout=TimeoutConfig(enabled=True),
     backpressure=BackpressureConfig(enabled=True),
-    monitoring=MonitoringConfig(collect_stats=True, structured_logging_enabled=True)
+    monitoring=MonitoringConfig(collect_stats=True, enable_structured_logging=True)
 )
 def critical_business_logic():
-    return compute_important_result()  # illustrative - not defined
+    return do_expensive_computation()
 
 # The decorator automatically connects to Redis using the environment variable
 ```
@@ -645,10 +645,8 @@ DefaultSerializer supports comprehensive Python types:
 
 ### Examples
 
-```python notest
+```python
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer, ArrowSerializer
-import pandas as pd
 
 # Default (MessagePack) - handles all common cases
 @cache(backend=None)
@@ -658,31 +656,42 @@ def default_function():
         'data': [1, 2, 3],
         'nested': {'key': 'value'}
     }
+```
 
-# Fast JSON serialization (API responses, webhooks)
-@cache(serializer=OrjsonSerializer(), backend=None)
-def get_api_response(endpoint: str):
-    return {"status": "success", "data": fetch_api(endpoint)}  # illustrative - not defined
+**Encryption examples** (require `CACHEKIT_MASTER_KEY` env var):
+```python notest
+from cachekit import cache
+from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
-# Zero-copy DataFrame caching (10K+ rows)
-@cache(serializer=ArrowSerializer(), backend=None)
-def get_large_dataset(date: str):
-    return pd.read_csv(f"data/{date}.csv")  # illustrative - file may not exist
-
-# Encrypted MessagePack (default - use @cache.secure preset)
-@cache.secure(master_key="a" * 64, backend=None)
+# Encrypted MessagePack (use @cache.secure preset)
+@cache.secure(master_key=secret_key, backend=None)
 def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 
 # Encrypted JSON (zero-knowledge API caching)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()))
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()), backend=None)
 def get_api_keys(tenant_id: str):
     return {"api_key": "sk_live_...", "webhook_secret": "whsec_..."}
+```
+
+**External data source examples** (require external services):
+```python notest
+import pandas as pd
+
+# Fast JSON serialization (API responses, webhooks)
+@cache(serializer=OrjsonSerializer(), backend=None)
+def get_api_response(endpoint: str):
+    return {"status": "success", "data": fetch_api(endpoint)}  # external API call
+
+# Zero-copy DataFrame caching (10K+ rows)
+@cache(serializer=ArrowSerializer(), backend=None)
+def get_large_dataset(date: str):
+    return pd.read_csv(f"data/{date}.csv")  # file I/O
 
 # Encrypted DataFrames (zero-knowledge ML features)
 @cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
 def get_patient_data(hospital_id: int):
-    return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
+    return pd.read_sql("SELECT * FROM patients", conn)  # database query
 ```
 
 ---
