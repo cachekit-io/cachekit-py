@@ -4,6 +4,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, TypeVar, Union
@@ -291,6 +292,8 @@ def create_cache_wrapper(
     collect_stats: bool = True,
     enable_tracing: bool = True,
     enable_structured_logging: bool = True,
+    # L1-only mode flag
+    _l1_only_mode: bool = False,
     **kwargs: Any,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
@@ -475,6 +478,19 @@ def create_cache_wrapper(
     # Pass l1_enabled for rate limit classification header
     _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
 
+    # L1-only mode: debug log if backend would have been available
+    # Helps developers understand that Redis config is being intentionally ignored
+    if _l1_only_mode:
+        redis_url = os.environ.get("REDIS_URL") or os.environ.get("CACHEKIT_REDIS_URL")
+        if redis_url:
+            # Truncate URL to avoid logging credentials
+            safe_url = redis_url.split("@")[-1] if "@" in redis_url else redis_url[:30]
+            _logger.debug(
+                "L1-only mode: %s using in-memory cache only (backend=None explicit), ignoring available Redis at %s",
+                function_identifier,
+                safe_url,
+            )
+
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:  # noqa: PLR0912
         # Bypass check (5-10μs savings)
@@ -496,7 +512,7 @@ def create_cache_wrapper(
 
         # Create tracing span for cache operation
         span_attributes = {
-            "cache.system": "redis",
+            "cache.system": "l1_memory" if _l1_only_mode else "redis",
             "cache.operation": "get",
             "cache.namespace": namespace or "default",
             "cache.serializer": serializer,
@@ -504,20 +520,73 @@ def create_cache_wrapper(
             "function.async": False,
         }
 
+        # Key generation - needed for both L1-only and L1+L2 modes
+        try:
+            if fast_mode:
+                # Minimal key generation - no string formatting overhead
+                from ..hash_utils import cache_key_hash
+
+                cache_namespace = namespace or "default"
+                args_kwargs_str = str(args) + str(kwargs)
+                cache_key = cache_namespace + ":" + func_hash + ":" + cache_key_hash(args_kwargs_str)
+            else:
+                cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
+        except Exception as e:
+            # Key generation failed - execute function without caching
+            features.handle_cache_error(
+                error=e,
+                operation="key_generation",
+                cache_key="<generation_failed>",
+                namespace=namespace or "default",
+                duration_ms=0.0,
+            )
+            reset_current_function_stats(token)
+            return func(*args, **kwargs)
+
+        # L1-ONLY MODE: Skip backend initialization entirely
+        # This is the fix for the sentinel problem: when backend=None is explicitly passed,
+        # we should NOT try to get a backend from the provider
+        if _l1_only_mode:
+            # L1-only mode: Check L1 cache, execute function on miss, store in L1
+            if _l1_cache and cache_key:
+                l1_found, l1_bytes = _l1_cache.get(cache_key)
+                if l1_found and l1_bytes:
+                    # L1 cache hit
+                    try:
+                        # Pass cache_key for AAD verification (required for encryption)
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                        _stats.record_l1_hit()
+                        reset_current_function_stats(token)
+                        return l1_value
+                    except Exception:
+                        # L1 deserialization failed - invalidate and continue
+                        _l1_cache.invalidate(cache_key)
+
+            # L1 cache miss - execute function and store in L1
+            _stats.record_miss()
+            try:
+                result = func(*args, **kwargs)
+                # Serialize and store in L1
+                try:
+                    # Pass cache_key for AAD binding (required for encryption)
+                    serialized_bytes = operation_handler.serialization_handler.serialize_data(
+                        result, args, kwargs, cache_key=cache_key
+                    )
+                    if _l1_cache and cache_key and serialized_bytes:
+                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                except Exception as e:
+                    # Serialization/storage failed but function succeeded - log and return result
+                    logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
+                return result
+            finally:
+                features.clear_correlation_id()
+                reset_current_function_stats(token)
+
+        # L1+L2 MODE: Original behavior with backend initialization
+        lock_key = f"{cache_key}:lock"
+
         with features.create_span("redis_cache", span_attributes) as span:
             try:
-                # Fast path key generation (30-50μs savings)
-                if fast_mode:
-                    # Minimal key generation - no string formatting overhead
-                    from ..hash_utils import cache_key_hash
-
-                    cache_namespace = namespace or "default"
-                    args_kwargs_str = str(args) + str(kwargs)
-                    cache_key = cache_namespace + ":" + func_hash + ":" + cache_key_hash(args_kwargs_str)
-                else:
-                    cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
-                lock_key = f"{cache_key}:lock"
-
                 # Add cache key to span attributes
                 if span:
                     features.set_span_attributes(span, {"cache.key": cache_key})
@@ -713,7 +782,7 @@ def create_cache_wrapper(
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
                 if _l1_cache and cache_key and serialized_bytes:
-                    _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl or ttl)
+                    _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
 
                 # Record successful cache set
                 set_duration_ms = (time.time() - start_time) * 1000
@@ -786,14 +855,6 @@ def create_cache_wrapper(
         token = set_current_function_stats(_stats)
 
         try:
-            # Guard clause: Circuit breaker check - fail fast if circuit is open
-            # This prevents cascading failures
-            if not features.should_allow_request():
-                # Circuit breaker fail-fast: raise exception immediately
-                raise BackendError(  # noqa: F823  # pyright: ignore[reportUnboundVariable]
-                    "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
-                )
-
             # Get cache key early for consistent usage - note this may fail for complex types
             cache_key = None
             func_start_time: float | None = None  # Initialize for exception handlers
@@ -820,6 +881,49 @@ def create_cache_wrapper(
                     duration_ms=0.0,
                 )
                 return await func(*args, **kwargs)
+
+            # L1-ONLY MODE: Skip backend initialization entirely
+            # This is the fix for the sentinel problem: when backend=None is explicitly passed,
+            # we should NOT try to get a backend from the provider
+            if _l1_only_mode:
+                # L1-only mode: Check L1 cache, execute function on miss, store in L1
+                if _l1_cache and cache_key:
+                    l1_found, l1_bytes = _l1_cache.get(cache_key)
+                    if l1_found and l1_bytes:
+                        # L1 cache hit
+                        try:
+                            # Pass cache_key for AAD verification (required for encryption)
+                            l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                            _stats.record_l1_hit()
+                            return l1_value
+                        except Exception:
+                            # L1 deserialization failed - invalidate and continue
+                            _l1_cache.invalidate(cache_key)
+
+                # L1 cache miss - execute function and store in L1
+                _stats.record_miss()
+                result = await func(*args, **kwargs)
+                # Serialize and store in L1
+                try:
+                    # Pass cache_key for AAD binding (required for encryption)
+                    serialized_bytes = operation_handler.serialization_handler.serialize_data(
+                        result, args, kwargs, cache_key=cache_key
+                    )
+                    if _l1_cache and cache_key and serialized_bytes:
+                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                except Exception as e:
+                    # Serialization/storage failed but function succeeded - log and return result
+                    logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
+                return result
+
+            # L1+L2 MODE: Original behavior with backend initialization
+            # Guard clause: Circuit breaker check - fail fast if circuit is open
+            # This prevents cascading failures
+            if not features.should_allow_request():
+                # Circuit breaker fail-fast: raise exception immediately
+                raise BackendError(  # noqa: F823  # pyright: ignore[reportUnboundVariable]
+                    "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
+                )
 
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
@@ -908,7 +1012,7 @@ def create_cache_wrapper(
                     if _l1_cache and cache_key and cached_data:
                         # cached_data is already serialized bytes from Redis
                         cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl or ttl)
+                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
 
                     # Handle TTL refresh if configured and threshold met
                     if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
@@ -969,7 +1073,7 @@ def create_cache_wrapper(
                                         cached_bytes = (
                                             cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                                         )
-                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl or ttl)
+                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
 
                                     return result
                             except Exception as e:
@@ -992,7 +1096,7 @@ def create_cache_wrapper(
                                         cached_bytes = (
                                             cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                                         )
-                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl or ttl)
+                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
 
                                     return result
                             except Exception:
@@ -1017,7 +1121,7 @@ def create_cache_wrapper(
                             await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
                                 cache_key,
                                 serialized_data,
-                                ttl=ttl or ttl,
+                                ttl=ttl,
                             )
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
@@ -1025,7 +1129,7 @@ def create_cache_wrapper(
                                 serialized_bytes = (
                                     serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
                                 )
-                                _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl or ttl)
+                                _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
 
                             # Record successful cache set
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1094,7 +1198,7 @@ def create_cache_wrapper(
                     await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
                         cache_key,
                         serialized_data,
-                        ttl=ttl or ttl,
+                        ttl=ttl,
                     )
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
@@ -1102,7 +1206,7 @@ def create_cache_wrapper(
                         serialized_bytes = (
                             serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
                         )
-                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl or ttl)
+                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
 
                     # Record successful cache set
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1144,11 +1248,15 @@ def create_cache_wrapper(
 
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
-        if _backend is None:
+
+        # L1-ONLY MODE: Skip backend lookup entirely
+        # This fixes the sentinel problem: when backend=None is explicitly passed,
+        # we should NOT try to get a backend from the provider
+        if not _l1_only_mode and _backend is None:
             try:
                 _backend = get_backend_provider().get_backend()
             except Exception as e:
-                # If backend creation fails, can't invalidate
+                # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", e)
 
         # Clear both L2 (backend) and L1 cache
@@ -1158,18 +1266,22 @@ def create_cache_wrapper(
         if _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
 
-        # Clear L2 cache via invalidator
-        if _backend:
+        # Clear L2 cache via invalidator (skip in L1-only mode)
+        if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
             invalidator.invalidate_cache(func, args, kwargs, namespace)
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
-        if _backend is None:
+
+        # L1-ONLY MODE: Skip backend lookup entirely
+        # This fixes the sentinel problem: when backend=None is explicitly passed,
+        # we should NOT try to get a backend from the provider
+        if not _l1_only_mode and _backend is None:
             try:
                 _backend = get_backend_provider().get_backend()
             except Exception as e:
-                # If backend creation fails, can't invalidate
+                # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", e)
 
         # Clear both L2 (backend) and L1 cache
@@ -1179,8 +1291,8 @@ def create_cache_wrapper(
         if _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
 
-        # Clear L2 cache via invalidator
-        if _backend:
+        # Clear L2 cache via invalidator (skip in L1-only mode)
+        if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
             await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
 

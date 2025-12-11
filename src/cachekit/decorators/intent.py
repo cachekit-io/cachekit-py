@@ -1,7 +1,6 @@
-"""Intent-based intelligent cache decorator interface.
+"""Intent-based cache decorator interface.
 
-Provides the new @cache decorator with automatic optimization and
-intent-based variants (@cache.minimal, @cache.production, @cache.secure, @cache.dev, @cache.test).
+Provides the @cache decorator with intent-based variants (@cache.minimal, @cache.production, @cache.secure, @cache.dev, @cache.test).
 """
 
 from __future__ import annotations
@@ -16,18 +15,22 @@ from .wrapper import create_cache_wrapper
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _apply_cache_logic(func: Callable[..., Any], decorator_config: DecoratorConfig) -> Callable[..., Any]:
+def _apply_cache_logic(
+    func: Callable[..., Any], decorator_config: DecoratorConfig, _l1_only_mode: bool = False
+) -> Callable[..., Any]:
     """Apply resolved configuration using the wrapper factory.
 
     Args:
         func: Function to wrap
         decorator_config: DecoratorConfig instance with all settings
+        _l1_only_mode: If True, backend=None was explicitly passed (L1-only mode).
+                       This prevents the wrapper from trying to get a backend from the provider.
 
     Returns:
         Wrapped function
     """
     # Use the wrapper factory with DecoratorConfig
-    return create_cache_wrapper(func, config=decorator_config)
+    return create_cache_wrapper(func, config=decorator_config, _l1_only_mode=_l1_only_mode)
 
 
 def cache(
@@ -101,7 +104,11 @@ def cache(
 
     def decorator(f: F) -> F:
         # Resolve backend at decorator application time
-        # Only if backend is explicitly provided in manual_overrides
+        # Track if backend=None was explicitly passed (L1-only mode)
+        # This is a sentinel problem: we need to distinguish between:
+        # 1. User passed @cache(backend=None) explicitly -> L1-only mode
+        # 2. User didn't pass backend at all -> should try provider
+        _explicit_l1_only = "backend" in manual_overrides and manual_overrides.get("backend") is None
         backend = manual_overrides.pop("backend", None)
 
         # Backward compatibility: map flattened l1_enabled to nested l1.enabled
@@ -150,8 +157,11 @@ def cache(
             # No intent specified - use default DecoratorConfig with overrides
             resolved_config = DecoratorConfig(backend=backend, **manual_overrides)
 
-        # Delegate to wrapper factory
-        return _apply_cache_logic(f, resolved_config)  # type: ignore[return-value]
+        # Delegate to wrapper factory with L1-only mode flag
+        # Note: _explicit_l1_only is ONLY set when backend=None was explicitly passed
+        # via manual_overrides. DecoratorConfig.backend defaults to None, but that
+        # should NOT trigger L1-only mode - it should fall back to the provider.
+        return _apply_cache_logic(f, resolved_config, _l1_only_mode=_explicit_l1_only)  # type: ignore[return-value]
 
     # Handle both @cache and @cache() syntax
     if func is None:
