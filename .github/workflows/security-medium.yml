@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  security-events: write  # Required for security tool integrations
 
 env:
   CARGO_TERM_COLOR: always
