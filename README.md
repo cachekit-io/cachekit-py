@@ -14,6 +14,17 @@ Production-ready Redis caching for Python with intelligent reliability features 
 
 ---
 
+> [!WARNING]
+> **Alpha Software** — cachekit is under active development. While we've been building and testing for ~6 months, the API is not yet stable and **breaking changes may occur** between releases. We're committed to making this library rock-solid, but we need your help!
+>
+> 🐛 **Found a bug?** Please [open an issue][issues-url] — even small ones help us improve.
+>
+> 💡 **Something feel off?** We want to hear about rough edges, confusing APIs, or missing features.
+>
+> Your feedback directly shapes the path to 1.0. Cheers!
+
+---
+
 ## Why cachekit?
 
 **Simple to use, production-ready out of the box.**
