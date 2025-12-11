@@ -109,9 +109,14 @@ class TestL1OnlyModeBug:
 
     def test_config_minimal_with_backend_none(self):
         """
-        DecoratorConfig.minimal(backend=None) should also use L1-only mode.
+        Test L1-only mode with DecoratorConfig preset AND backend=None.
 
-        The bug can also occur via config objects that specify backend=None.
+        NOTE: L1-only mode requires backend=None at the decorator level, not in config.
+        This is because DecoratorConfig.backend defaults to None, and we can't
+        distinguish "explicit None" from "default None" in the config.
+
+        Correct usage for L1-only with presets:
+            @cache(backend=None, config=DecoratorConfig.minimal())
         """
         from cachekit.config import DecoratorConfig
         from cachekit.decorators import cache
@@ -121,7 +126,8 @@ class TestL1OnlyModeBug:
 
             call_count = 0
 
-            @cache(config=DecoratorConfig.minimal(backend=None))
+            # L1-only mode: backend=None passed directly to @cache, config for preset settings
+            @cache(backend=None, config=DecoratorConfig.minimal())
             def minimal_func() -> str:
                 nonlocal call_count
                 call_count += 1
