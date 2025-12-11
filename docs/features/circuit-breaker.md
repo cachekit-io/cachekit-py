@@ -20,12 +20,12 @@ def get_data(key):
 
 Circuit breaker is enabled by default. No configuration needed:
 
-```python notest
+```python
 from cachekit import cache
 
 @cache(ttl=300, backend=None)  # Circuit breaker active
 def expensive_operation(x):
-    return compute(x)  # illustrative - not defined
+    return do_expensive_computation()
 
 # Redis working: Normal cache behavior
 result = expensive_operation(1)  # L1 hit or L2 hit or compute
@@ -36,7 +36,8 @@ result = expensive_operation(1)  # Returns stale/None instead of error
 ```
 
 **Configuration** (optional):
-```python notest
+```python
+from cachekit import cache
 from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(
@@ -45,11 +46,11 @@ from cachekit.config.nested import CircuitBreakerConfig
     circuit_breaker=CircuitBreakerConfig(
         enabled=True,  # Default: True
         failure_threshold=5,  # Open after 5 failures
-        timeout_seconds=30.0,  # Reset after 30s
+        recovery_timeout=30.0,  # Reset after 30s
     )
 )
 def operation(x):
-    return compute(x)  # illustrative - not defined
+    return do_expensive_computation()
 ```
 
 ---
@@ -140,7 +141,7 @@ def operation(x):
 ```python notest
 from cachekit.config.nested import CircuitBreakerConfig
 
-@cache(ttl=300, circuit_breaker=CircuitBreakerConfig(timeout_seconds=1.0), backend=None)
+@cache(ttl=300, circuit_breaker=CircuitBreakerConfig(recovery_timeout=1.0), backend=None)
 def problematic_function():
     # Problem: Circuit keeps cycling OPEN → HALF_OPEN → OPEN
     # Solution: Increase cooldown to 30-60 seconds
@@ -201,7 +202,7 @@ from cachekit.config.nested import CircuitBreakerConfig
     # Tune these based on your Redis reliability
     circuit_breaker=CircuitBreakerConfig(
         failure_threshold=10,  # Open after 10 failures
-        timeout_seconds=60.0,  # Wait 60s before retry
+        recovery_timeout=60.0,  # Wait 60s before retry
     )
 )
 def fetch_data(key):

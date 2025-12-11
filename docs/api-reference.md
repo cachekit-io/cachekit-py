@@ -105,7 +105,7 @@ def your_function(args):
 - **`circuit_breaker_config`** (`CircuitBreakerConfig | None`) - Custom circuit breaker configuration:
   - `failure_threshold` (`int`, default: `5`) - Failures before opening circuit
   - `success_threshold` (`int`, default: `3`) - Successes before closing circuit
-  - `timeout_seconds` (`float`, default: `30.0`) - Time before trying half-open state
+  - `recovery_timeout` (`float`, default: `30.0`) - Time before trying half-open state
   - `half_open_requests` (`int`, default: `3`) - Test requests allowed in half-open state
   - `excluded_exceptions` (`Tuple[type, ...]`) - Exceptions that don't trigger circuit breaker
 - **`adaptive_timeout`** (`bool`, default: `True`) - Enable dynamic timeout adjustment based on P95 latency
