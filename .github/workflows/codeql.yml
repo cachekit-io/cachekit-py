@@ -1,0 +1,100 @@
+# CodeQL Static Application Security Testing (SAST)
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning-for-a-repository
+#
+# Analyzes Python and Rust code for:
+# - Security vulnerabilities (injection, XSS, SSRF, etc.)
+# - Code quality issues
+# - Supply chain risks
+# - Common programming errors
+#
+# Results appear in GitHub Security tab and as PR annotations.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly deep scan on Sunday at 3am UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    # Manual trigger for ad-hoc security analysis
+
+permissions:
+  contents: read
+  security-events: write  # Required for uploading SARIF results
+  actions: read           # Required for workflow status
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - python
+          # Note: Rust support is limited in CodeQL
+          # We rely on cargo-audit, cargo-deny, and Miri for Rust security
+        # CodeQL language config
+        # https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#changing-the-languages-that-are-analyzed
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Python setup for accurate analysis
+      - name: Set up Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: matrix.language == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          # Install dependencies so CodeQL can analyze import resolution
+          pip install -e ".[data]" || pip install -e .
+
+      # Initialize CodeQL
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Use security-extended for maximum coverage
+          # Options: security-extended, security-and-quality
+          queries: security-extended
+          # Config file for custom queries (optional)
+          # config-file: .github/codeql/codeql-config.yml
+
+      # Autobuild attempts to build any compiled code
+      # For Python, this is largely a no-op but ensures imports resolve
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      # Run CodeQL analysis
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Upload SARIF to GitHub Security tab
+          upload: true
+          # Also output SARIF for artifact storage
+          output: sarif-results
+
+      # Archive SARIF for audit trail
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results
+          retention-days: 90
