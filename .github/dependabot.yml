@@ -1,0 +1,124 @@
+# Dependabot configuration for cachekit-py
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+registries:
+  # No private registries - all deps are public
+
+updates:
+  # ─────────────────────────────────────────────────────────────────────────
+  # GitHub Actions
+  # Keep CI/CD supply chain current
+  # ─────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "cachekit-io/maintainers"
+    # Group minor/patch updates to reduce PR noise
+    groups:
+      actions-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Python (pip/uv)
+  # ─────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    commit-message:
+      prefix: "chore"
+    labels:
+      - "dependencies"
+      - "python"
+    reviewers:
+      - "cachekit-io/maintainers"
+    # Ignore pre-releases unless explicitly opted in
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-prerelease"]
+    # Group by type to reduce PR noise
+    groups:
+      # Security-sensitive dependencies get individual PRs
+      # (not grouped - we want to review each)
+      python-dev:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "basedpyright"
+          - "faker"
+          - "hypothesis"
+        update-types:
+          - "minor"
+          - "patch"
+      python-runtime:
+        patterns:
+          - "redis*"
+          - "pydantic*"
+          - "tenacity"
+          - "prometheus-client"
+          - "psutil"
+        update-types:
+          - "minor"
+          - "patch"
+      python-serialization:
+        patterns:
+          - "blake3"
+          - "msgpack"
+          - "orjson"
+          - "xxhash"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Rust (Cargo)
+  # ─────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/rust"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    commit-message:
+      prefix: "chore"
+    labels:
+      - "dependencies"
+      - "rust"
+    reviewers:
+      - "cachekit-io/maintainers"
+      - "cachekit-io/security"  # Rust deps affect memory safety
+    # Security-critical crates get individual attention
+    # cachekit-core is pinned exactly, so dependabot won't touch it
+    groups:
+      rust-dev:
+        patterns:
+          - "criterion"
+          - "proptest"
+          - "divan"
+          - "fastrand"
+          - "iai-callgrind"
+          - "pprof"
+          - "ctor"
+        update-types:
+          - "minor"
+          - "patch"
