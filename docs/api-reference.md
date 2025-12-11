@@ -658,8 +658,8 @@ def default_function():
     }
 ```
 
-**Encryption examples** (require `CACHEKIT_MASTER_KEY` env var):
-```python notest
+**Encryption examples** (env var `CACHEKIT_MASTER_KEY` set in test fixtures):
+```python
 from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
@@ -669,7 +669,7 @@ def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 
 # Encrypted JSON (zero-knowledge API caching)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(secret_key)), backend=None)
 def get_api_keys(tenant_id: str):
     return {"api_key": "sk_live_...", "webhook_secret": "whsec_..."}
 ```

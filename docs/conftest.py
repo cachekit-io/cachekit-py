@@ -6,6 +6,7 @@ into all markdown code examples.
 """
 
 import logging
+import os
 import time
 
 try:
@@ -92,6 +93,8 @@ def pytest_markdown_docs_globals():
 
     # Secret key for encryption examples (test value only)
     secret_key = "a" * 64  # 32 bytes in hex
+    # Set env var so @cache.secure validation passes
+    os.environ["CACHEKIT_MASTER_KEY"] = secret_key
 
     globals_dict = {
         "cache": cache,
