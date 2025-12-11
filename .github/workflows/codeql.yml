@@ -26,6 +26,7 @@ permissions:
   contents: read
   security-events: write  # Required for uploading SARIF results
   actions: read           # Required for workflow status
+  checks: write           # Required for creating check runs
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
