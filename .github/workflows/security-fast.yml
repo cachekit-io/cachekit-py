@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  security-events: write  # Required for rustsec/audit-check SARIF upload
 
 env:
   CARGO_TERM_COLOR: always
