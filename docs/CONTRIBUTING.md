@@ -61,6 +61,7 @@ These functions are provided for documentation examples and return mock data:
 
 #### Configuration
 - `secret_key` - Test encryption key (value: `"a" * 64`)
+- `CACHEKIT_MASTER_KEY` - Environment variable set to `secret_key` (enables `@cache.secure` examples)
 
 ## Skipping Examples with `notest`
 
