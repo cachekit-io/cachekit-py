@@ -1,0 +1,65 @@
+# CODEOWNERS for cachekit-py
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# These owners will be requested for review when someone opens a pull request
+# that modifies code that they own. Order matters - last matching pattern wins.
+
+# Default: repository maintainers own everything
+*                               @cachekit-io/maintainers
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL SECURITY PATHS
+# These require security team review for any changes
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rust core - memory safety, FFI boundaries, cryptography
+/rust/                          @cachekit-io/maintainers @cachekit-io/security
+
+# Security-critical Python modules
+/src/cachekit/serializers/      @cachekit-io/maintainers @cachekit-io/security
+/src/cachekit/reliability/      @cachekit-io/maintainers @cachekit-io/security
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD AND RELEASE INFRASTRUCTURE
+# Changes here can compromise supply chain
+# ─────────────────────────────────────────────────────────────────────────────
+
+/.github/workflows/             @cachekit-io/maintainers @cachekit-io/security
+/.github/CODEOWNERS             @cachekit-io/maintainers
+/release-please-config.json     @cachekit-io/maintainers
+/.release-please-manifest.json  @cachekit-io/maintainers
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD AND DEPENDENCY CONFIGURATION
+# Supply chain attack surface
+# ─────────────────────────────────────────────────────────────────────────────
+
+/pyproject.toml                 @cachekit-io/maintainers
+/rust/Cargo.toml                @cachekit-io/maintainers @cachekit-io/security
+/rust/Cargo.lock                @cachekit-io/maintainers
+/.pre-commit-config.yaml        @cachekit-io/maintainers
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY DOCUMENTATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+/SECURITY.md                    @cachekit-io/maintainers @cachekit-io/security
+/.github/SECURITY.md            @cachekit-io/maintainers @cachekit-io/security
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCUMENTATION
+# Lower barrier - docs team can approve
+# ─────────────────────────────────────────────────────────────────────────────
+
+/docs/                          @cachekit-io/maintainers
+/README.md                      @cachekit-io/maintainers
+/CHANGELOG.md                   @cachekit-io/maintainers
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TESTS
+# Test changes generally safe, but fuzzing/security tests need security review
+# ─────────────────────────────────────────────────────────────────────────────
+
+/tests/                         @cachekit-io/maintainers
+/tests/security/                @cachekit-io/maintainers @cachekit-io/security
+/tests/fuzz/                    @cachekit-io/maintainers @cachekit-io/security
