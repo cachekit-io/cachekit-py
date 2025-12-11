@@ -135,6 +135,9 @@ def cache(
                 if backend is not None:
                     override_dict["backend"] = backend
                 resolved_config = replace(config, **override_dict)
+            # Check if config explicitly specifies backend=None (L1-only mode via config)
+            if not _explicit_l1_only and resolved_config.backend is None:
+                _explicit_l1_only = True
         # Intent-based presets (renamed per Task 6)
         elif _intent == "minimal":  # Renamed from "fast"
             resolved_config = DecoratorConfig.minimal(backend=backend, **manual_overrides)
