@@ -108,7 +108,7 @@ data = {"metrics": [1, 2, 3], "summary": "data"}
 ## What Can Go Wrong
 
 ### Size Limit Exceeded (Decompression Bomb)
-```python
+```python notest
 # Object too large
 huge_list = list(range(1_000_000_000))
 
@@ -120,7 +120,7 @@ def process(x):
 ```
 
 ### Unsupported Type
-```python
+```python notest
 # Custom class instance
 class CustomClass:
     def __init__(self, x):
@@ -134,7 +134,7 @@ def process():
 ```
 
 ### Compression Ineffective
-```python
+```python notest
 @cache(ttl=300)
 def process():
     # Return already-compressed data
