@@ -363,7 +363,7 @@ duration2 = time.time() - start
 print(f"Second call: {duration2:.3f}s, Result: {result2}")
 
 assert result1 == result2
-assert duration2 < 0.01  # Cache hit should be <10ms
+assert duration2 < 0.1  # Cache hit should be <100ms (generous for CI)
 print("Caching working correctly!")
 ```
 

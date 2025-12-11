@@ -177,7 +177,8 @@ def operation(x):
 ## How to Use It
 
 ### Basic Usage (Automatic)
-```python
+```python notest
+# Illustrative example - requires database connection
 @cache(ttl=3600)  # Adaptive timeout enabled
 def get_user(user_id):
     return db.query(user_id)

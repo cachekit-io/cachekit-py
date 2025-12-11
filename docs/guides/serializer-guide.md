@@ -405,7 +405,8 @@ def get_user(user_id: int) -> User:
 
 **Best practice** - Convert to dict before caching (explicit and efficient):
 
-```python
+```python notest
+# Illustrative example showing Pydantic model handling pattern
 from pydantic import BaseModel
 from cachekit import cache
 

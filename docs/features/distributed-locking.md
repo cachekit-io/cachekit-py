@@ -26,7 +26,8 @@ def expensive_query(key):
 
 Distributed locking enabled by default:
 
-```python
+```python notest
+# Illustrative example - requires database connection
 from cachekit import cache
 
 @cache(ttl=300)  # Locking active
