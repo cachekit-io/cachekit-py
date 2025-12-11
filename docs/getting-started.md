@@ -345,25 +345,25 @@ def cached_function():
 import time
 from cachekit import cache
 
-@cache(ttl=60)
+@cache(ttl=60, backend=None)  # L1-only (no Redis needed)
 def test_function(value):
-    time.sleep(1)  # Simulate expensive operation
+    time.sleep(0.1)  # Simulate expensive operation
     return f"processed_{value}"
 
-# First call - should take ~1 second
+# First call - executes function
 start = time.time()
 result1 = test_function("test")
 duration1 = time.time() - start
 print(f"First call: {duration1:.3f}s, Result: {result1}")
 
-# Second call - should be nearly instant
+# Second call - L1 cache hit
 start = time.time()
 result2 = test_function("test")
 duration2 = time.time() - start
 print(f"Second call: {duration2:.3f}s, Result: {result2}")
 
 assert result1 == result2
-assert duration2 < 0.1  # Cache hit should be <100ms (generous for CI)
+assert duration2 < duration1 / 2  # Cache hit should be much faster
 print("Caching working correctly!")
 ```
 
