@@ -22,5 +22,11 @@
       "changelog-path": "CHANGELOG.md"
     }
   },
-  "extra-files": ["rust/Cargo.toml"]
+  "extra-files": [
+    {
+      "type": "toml",
+      "path": "rust/Cargo.toml",
+      "jsonpath": "$.package.version"
+    }
+  ]
 }
