@@ -57,16 +57,18 @@ jobs:
     strategy:
       matrix:
         include:
-          # Native builds - maturin auto-discovers Python interpreters
+          # Linux builds - must specify interpreters explicitly (manylinux has 3.8+ but we support 3.9+)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          # macOS/Windows - uses setup-python (line 85-94) which only installs 3.9-3.13
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          # Cross-compilation - must specify Python versions explicitly
+          # aarch64 Linux cross-compilation - must specify Python versions explicitly
           # (cross containers don't have discoverable Python interpreters)
           # Uses manylinux_2_28 for modern GCC (fixes ring crate aarch64 build)
           - os: ubuntu-latest
