@@ -99,43 +99,21 @@ jobs:
         cd rust
         cargo miri test --lib --no-default-features --features encryption encryption
 
-  cargo-semver-checks:
-    name: API Stability
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Check for previous version
-      id: check-tag
-      run: |
-        if git describe --tags --abbrev=0 2>/dev/null; then
-          echo "has_tag=true" >> $GITHUB_OUTPUT
-        else
-          echo "⚠️ No previous version found - skipping semver check"
-          echo "has_tag=false" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Check for breaking changes
-      if: steps.check-tag.outputs.has_tag == 'true'
-      uses: obi1kenobi/cargo-semver-checks-action@v2
-      with:
-        manifest-path: rust/Cargo.toml
+  # Note: cargo-semver-checks removed - cachekit-rs is PyO3 bindings only,
+  # not a public Rust API. The actual Rust library (cachekit-core) is a
+  # separate crate published at https://crates.io/crates/cachekit-core
 
   # Summary job
   security-medium-success:
     name: Security Medium Success
     runs-on: ubuntu-latest
-    needs: [cargo-geiger, miri-subset, cargo-semver-checks]
+    needs: [cargo-geiger, miri-subset]
     if: always()
     steps:
     - name: Check all security checks passed
       run: |
         if [[ "${{ needs.cargo-geiger.result }}" != "success" ]] || \
-           [[ "${{ needs.miri-subset.result }}" != "success" ]] || \
-           [[ "${{ needs.cargo-semver-checks.result }}" != "success" ]]; then
+           [[ "${{ needs.miri-subset.result }}" != "success" ]]; then
           echo "❌ One or more medium security checks failed"
           exit 1
         fi
