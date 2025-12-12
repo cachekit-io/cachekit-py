@@ -68,9 +68,11 @@ jobs:
             target: x86_64-pc-windows-msvc
           # Cross-compilation - must specify Python versions explicitly
           # (cross containers don't have discoverable Python interpreters)
+          # Uses manylinux_2_28 for modern GCC (fixes ring crate aarch64 build)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            manylinux: "2_28"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -95,7 +97,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist ${{ matrix.interpreter }}
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux || 'auto' }}
           rust-toolchain: stable
 
       - uses: actions/upload-artifact@v4
