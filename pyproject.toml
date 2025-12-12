@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "cachekit"
 version = "0.1.0"
-description = "Production-ready Redis caching for Python with intelligent reliability features"
+description = "Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -23,9 +23,15 @@ keywords = [
     "performance",
     "reliability",
     "production",
+    "encryption",
+    "security",
+    "circuit-breaker",
+    "prometheus",
+    "messagepack",
+    "distributed-locking",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -40,6 +46,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Monitoring",
+    "Topic :: Security :: Cryptography",
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
@@ -75,6 +83,7 @@ Homepage = "https://github.com/cachekit-io/cachekit-py"
 Documentation = "https://github.com/cachekit-io/cachekit-py#readme"
 Repository = "https://github.com/cachekit-io/cachekit-py.git"
 Issues = "https://github.com/cachekit-io/cachekit-py/issues"
+Changelog = "https://github.com/cachekit-io/cachekit-py/blob/main/CHANGELOG.md"
 
 # Maturin configuration for Rust extensions
 [tool.maturin]
