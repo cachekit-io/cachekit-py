@@ -19,7 +19,8 @@
   "packages": {
     ".": {
       "package-name": "cachekit",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false
     }
   },
   "extra-files": [
