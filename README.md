@@ -168,7 +168,7 @@ def test_cached_function():
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
-- Pluggable backend abstraction (Redis, HTTP, DynamoDB, custom)
+- Pluggable backend abstraction (Redis, File, HTTP, DynamoDB, custom)
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.
