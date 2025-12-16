@@ -1,0 +1,39 @@
+# Codecov Configuration
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%  # Allow 2% coverage drop without failing
+    patch:
+      default:
+        target: 80%  # New code should have 80% coverage
+
+# Flag configuration for PR vs main coverage strategy
+flag_management:
+  default_rules:
+    carryforward: true  # Carry forward coverage from previous uploads
+    statuses:
+      - type: project
+      - type: patch
+
+  individual_flags:
+    # Full test suite (main branch only)
+    - name: full-python-3.12
+      carryforward: true
+      paths:
+        - src/cachekit/
+
+    # Critical tests (PRs) - carryforward from full coverage
+    - name: critical-python-3.12
+      carryforward: true
+      carryforward_mode: labels
+      paths:
+        - src/cachekit/
+
+comment:
+  layout: "header, diff, flags, components"
+  behavior: default
+  require_changes: true  # Only comment if coverage changed

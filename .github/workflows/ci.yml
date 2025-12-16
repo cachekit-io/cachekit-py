@@ -166,11 +166,24 @@ jobs:
       run: |
         uv sync --group dev
 
-    - name: Run critical tests with coverage
+    - name: Run critical tests (PRs)
+      if: github.event_name == 'pull_request'
       env:
         REDIS_URL: redis://localhost:6379
       run: |
         uv run pytest tests/critical/ -m "not slow" \
+          --cov=src/cachekit \
+          --cov-report=xml \
+          --cov-report=term \
+          --junitxml=junit.xml \
+          -o junit_family=legacy
+
+    - name: Run full test suite (main)
+      if: github.event_name == 'push'
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        uv run pytest tests/ -m "not slow" \
           --cov=src/cachekit \
           --cov-report=xml \
           --cov-report=term \
@@ -184,7 +197,7 @@ jobs:
         files: ./coverage.xml
         use_oidc: true
         fail_ci_if_error: false
-        flags: python-${{ matrix.python-version }}
+        flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
@@ -193,7 +206,7 @@ jobs:
         files: ./junit.xml
         report_type: test_results
         use_oidc: true
-        flags: python-${{ matrix.python-version }}
+        flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
         fail_ci_if_error: false
 
   # Markdown documentation tests
