@@ -116,6 +116,9 @@ jobs:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write  # Required for Codecov OIDC
     strategy:
       fail-fast: false
       matrix:
@@ -163,11 +166,35 @@ jobs:
       run: |
         uv sync --group dev
 
-    - name: Run critical tests
+    - name: Run critical tests with coverage
       env:
         REDIS_URL: redis://localhost:6379
       run: |
-        make test-critical
+        uv run pytest tests/critical/ -m "not slow" \
+          --cov=src/cachekit \
+          --cov-report=xml \
+          --cov-report=term \
+          --junitxml=junit.xml \
+          -o junit_family=legacy
+
+    - name: Upload coverage to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v5
+      with:
+        files: ./coverage.xml
+        use_oidc: true
+        fail_ci_if_error: false
+        flags: python-${{ matrix.python-version }}
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v5
+      with:
+        files: ./junit.xml
+        report_type: test_results
+        use_oidc: true
+        flags: python-${{ matrix.python-version }}
+        fail_ci_if_error: false
 
   # Markdown documentation tests
   test-docs:

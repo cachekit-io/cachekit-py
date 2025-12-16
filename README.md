@@ -8,6 +8,7 @@ Production-ready Redis caching for Python with intelligent reliability features 
 
 [![PyPI Version][pypi-badge]][pypi-url]
 [![Python Versions][python-badge]][pypi-url]
+[![codecov][codecov-badge]][codecov-url]
 [![License: MIT][license-badge]][license-url]
 
 </div>
@@ -382,3 +383,5 @@ MIT License - see [LICENSE][license-file-url] for details.
 [license-file-url]: LICENSE
 [github-url]: https://github.com/cachekit-io/cachekit-py
 [issues-url]: https://github.com/cachekit-io/cachekit-py/issues
+[codecov-badge]: https://codecov.io/github/cachekit-io/cachekit-py/graph/badge.svg
+[codecov-url]: https://codecov.io/github/cachekit-io/cachekit-py
