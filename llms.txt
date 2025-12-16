@@ -1,0 +1,38 @@
+# cachekit
+
+> Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance.
+
+cachekit provides intelligent caching with circuit breaker, distributed locking, Prometheus metrics, and zero-knowledge encryption. Designed for production workloads from simple decorators to complex multi-pod deployments.
+
+## Getting Started
+
+- [Quick Start](docs/QUICK_START.md): 5-minute guide to get started with cachekit
+- [Getting Started Guide](docs/getting-started.md): Progressive tutorial from basics to advanced usage
+- [Installation & Setup](README.md#quick-start): Installation instructions and basic configuration
+
+## Core Concepts
+
+- [Architecture Overview](docs/data-flow-architecture.md): L1+L2 dual-layer caching internals
+- [API Reference](docs/api-reference.md): Complete API documentation and decorator parameters
+- [Configuration Guide](docs/configuration.md): Environment variables and setup options
+
+## Features
+
+- [Serializer Guide](docs/guides/serializer-guide.md): Choose the right serializer for your data type
+- [Circuit Breaker](docs/features/circuit-breaker.md): Prevent cascading failures in distributed systems
+- [Distributed Locking](docs/features/distributed-locking.md): Prevent cache stampedes in multi-pod environments
+- [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM security for sensitive data
+- [Adaptive Timeouts](docs/features/adaptive-timeouts.md): Auto-tune timeouts based on system load
+- [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability and monitoring
+
+## Development
+
+- [Contributing Guide](CONTRIBUTING.md): Development guidelines and contribution process
+- [Development Setup](DEVELOPMENT.md): Local development environment setup
+- [Security Policy](SECURITY.md): Vulnerability reporting and security practices
+
+## Optional
+
+- [Performance Benchmarks](docs/performance.md): Detailed performance analysis and comparisons
+- [Troubleshooting Guide](docs/troubleshooting.md): Common issues and solutions
+- [Comparison with Alternatives](docs/comparison.md): vs. lru_cache, aiocache, cachetools
