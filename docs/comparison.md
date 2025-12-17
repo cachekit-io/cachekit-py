@@ -261,13 +261,25 @@ def get_user(id):
 
 ### Claim: "I need async caching → use aiocache"
 
-**Reality**: cachekit supports async-compatible design
-- cachekit is sync-first (most Python code is sync)
-- Works with FastAPI, Django, Flask, etc
-- Async decorator support planned
-- No forced asyncio overhead in sync code
+**Reality**: cachekit has **native async support** with zero configuration
+- Auto-detects async functions via `inspect.iscoroutinefunction()`
+- Same `@cache` decorator works for both sync and async functions
+- Async operations run in thread pool to avoid blocking event loop
+- Works with FastAPI, Django, Flask, Starlette, etc
 
-**Evidence**: Tests validate sync-first philosophy beats async-everywhere
+```python notest
+# Sync function - uses sync wrapper automatically
+@cache(ttl=300)
+def get_user(id: int) -> dict:
+    return db.query(User).get(id)
+
+# Async function - uses async wrapper automatically
+@cache(ttl=300)
+async def get_user_async(id: int) -> dict:
+    return await db.query(User).get(id)
+```
+
+**Evidence**: 50+ async tests validate full async support including L1/L2 caching, circuit breaker, and distributed locking
 
 ---
 

@@ -34,6 +34,25 @@ F = TypeVar("F", bound=Callable[..., Any])
 _logger = logging.getLogger(__name__)
 
 
+def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
+    """Callback for background TTL refresh tasks to handle errors.
+
+    This callback logs errors from fire-and-forget TTL refresh tasks
+    instead of letting them be silently dropped.
+
+    Args:
+        task: The completed asyncio Task
+        cache_key: The cache key being refreshed (for logging context)
+    """
+    try:
+        exc = task.exception()
+        if exc is not None:
+            _logger.debug("Background TTL refresh failed for %s: %s", cache_key, exc)
+    except asyncio.CancelledError:
+        # Task was cancelled (e.g., during shutdown) - this is expected, don't log
+        pass
+
+
 class CacheInfo(NamedTuple):
     """Cache statistics for a decorated function.
 
@@ -1019,8 +1038,9 @@ def create_cache_wrapper(
                         try:
                             remaining_ttl = await _backend.get_ttl(cache_key)
                             if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
-                                # Refresh TTL in background
-                                asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
+                                # Refresh TTL in background with error callback
+                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
+                                task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
                         except Exception as e:
                             # TTL refresh is optional, don't fail on error
                             _logger.debug("TTL refresh failed for %s: %s", cache_key, e)
@@ -1243,6 +1263,8 @@ def create_cache_wrapper(
                     features.record_duration(func_latency)
                 raise
         finally:
+            # Clear correlation ID after operation (matches sync wrapper)
+            features.clear_correlation_id()
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
