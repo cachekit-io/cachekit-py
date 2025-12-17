@@ -6,6 +6,7 @@ single-responsibility classes that are easier to test and maintain.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import sys
 import threading
@@ -1338,30 +1339,28 @@ class StandardCacheHandler:
             return False
 
     async def _with_backpressure_and_timeout_async(self, operation, *args, **kwargs):
-        """Execute async operation with backpressure control and adaptive timeout."""
-        if self.backpressure_controller:
-            # Apply backpressure control first
-            with self.backpressure_controller.acquire():
-                return await self._with_timeout_async(operation, *args, **kwargs)
-        else:
-            # No backpressure control, just apply timeout
-            return await self._with_timeout_async(operation, *args, **kwargs)
+        """Execute sync operation in thread pool with backpressure control.
 
-    async def _with_timeout_async(self, operation, *args, **kwargs):
-        """Execute async operation with timeout delegation to backend.
-
-        Timeout handling is delegated to the backend implementation via
-        TimeoutConfigurableBackend protocol.
+        Runs sync backend operations in a thread pool to avoid blocking the
+        event loop, while still applying backpressure control.
         """
-        # Execute operation directly - timeout handled by backend layer
-        return await operation(*args, **kwargs)
+
+        def execute_sync():
+            if self.backpressure_controller:
+                with self.backpressure_controller.acquire():
+                    return operation(*args, **kwargs)
+            return operation(*args, **kwargs)
+
+        return await asyncio.to_thread(execute_sync)
 
     async def get_async(self, key: str, refresh_ttl: Optional[int] = None) -> Optional[bytes]:
-        """Get value from cache asynchronously using backend."""
+        """Get value from cache asynchronously using backend.
+
+        Runs sync backend.get() in a thread pool to avoid blocking the event loop.
+        """
         try:
-            # Note: BaseBackend methods are sync (not async)
-            # We wrap in executor for async compatibility
-            value = self._with_backpressure_and_timeout(self.backend.get, key)
+            # Run sync backend operation in thread pool
+            value = await self._with_backpressure_and_timeout_async(self.backend.get, key)
 
             # Optionally refresh TTL if value exists and refresh_ttl provided
             # Uses graceful degradation (skips if backend doesn't support TTL inspection)
@@ -1377,15 +1376,17 @@ class StandardCacheHandler:
             return None
 
     async def set_async(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:
-        """Set value in cache asynchronously using backend."""
+        """Set value in cache asynchronously using backend.
+
+        Runs sync backend.set() in a thread pool to avoid blocking the event loop.
+        """
         # Ensure value is bytes
         if isinstance(value, str):
             value = value.encode("utf-8")
 
         try:
-            # Note: BaseBackend methods are sync (not async)
-            # We wrap in executor for async compatibility
-            self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
+            # Run sync backend operation in thread pool
+            await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
             get_logger().error(f"Backend error setting key {key}: {e}")
@@ -1395,11 +1396,13 @@ class StandardCacheHandler:
             return False
 
     async def delete_async(self, key: str) -> bool:
-        """Delete key from cache asynchronously using backend."""
+        """Delete key from cache asynchronously using backend.
+
+        Runs sync backend.delete() in a thread pool to avoid blocking the event loop.
+        """
         try:
-            # Note: BaseBackend methods are sync (not async)
-            # We wrap in executor for async compatibility
-            return self._with_backpressure_and_timeout(self.backend.delete, key)
+            # Run sync backend operation in thread pool
+            return await self._with_backpressure_and_timeout_async(self.backend.delete, key)
         except BackendError as e:
             get_logger().error(f"Backend error deleting key {key}: {e}")
             return False

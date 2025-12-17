@@ -11,17 +11,41 @@ Architecture:
 - Zero-copy optimization: Thread-local storage avoids locks on critical path
 """
 
+import asyncio
+import logging
 import threading
+from typing import Optional
 
 import redis
 import redis.asyncio as redis_async
 
 from cachekit.backends.redis.config import RedisBackendConfig
 
+_logger = logging.getLogger(__name__)
+
 # Global pool instances (shared across threads)
 _pool_instance = None
 _async_pool_instance = None
 _pool_lock = threading.Lock()
+
+# Async pool lock (created on first use to avoid event loop issues)
+_async_pool_lock: Optional[asyncio.Lock] = None
+
+
+def _get_async_pool_lock() -> asyncio.Lock:
+    """Get or create the async pool lock.
+
+    Creates the asyncio.Lock on first use to avoid event loop issues
+    when module is imported outside of async context.
+
+    Returns:
+        asyncio.Lock for protecting async pool initialization
+    """
+    global _async_pool_lock
+    if _async_pool_lock is None:
+        _async_pool_lock = asyncio.Lock()
+    return _async_pool_lock
+
 
 # Thread-local client cache for performance optimization
 _thread_local = threading.local()
@@ -67,6 +91,9 @@ async def get_async_redis_client() -> redis_async.Redis:
     Creates a global async connection pool on first call, then reuses it.
     Pool configuration comes from RedisBackendConfig (env: CACHEKIT_REDIS_URL).
 
+    Uses double-checked locking pattern with asyncio.Lock to prevent
+    race conditions where multiple coroutines could create separate pools.
+
     Returns:
         redis_async.Redis: Asynchronous Redis client
 
@@ -82,16 +109,20 @@ async def get_async_redis_client() -> redis_async.Redis:
     """
     global _async_pool_instance
 
+    # Double-checked locking pattern to prevent race conditions
     if _async_pool_instance is None:
-        # Get Redis-specific configuration
-        redis_config = RedisBackendConfig.from_env()
+        async with _get_async_pool_lock():
+            # Check again inside lock to prevent race
+            if _async_pool_instance is None:
+                # Get Redis-specific configuration
+                redis_config = RedisBackendConfig.from_env()
 
-        # Use URL-based connection
-        _async_pool_instance = redis_async.ConnectionPool.from_url(
-            redis_config.redis_url,
-            decode_responses=True,
-            max_connections=redis_config.connection_pool_size,
-        )
+                # Use URL-based connection
+                _async_pool_instance = redis_async.ConnectionPool.from_url(
+                    redis_config.redis_url,
+                    decode_responses=True,
+                    max_connections=redis_config.connection_pool_size,
+                )
 
     return redis_async.Redis(connection_pool=_async_pool_instance)
 
@@ -149,15 +180,24 @@ def reset_global_pool():
 
         >>> reset_global_pool()  # Safe to call even if no pools exist
     """
-    global _pool_instance, _async_pool_instance, _thread_local
+    global _pool_instance, _async_pool_instance, _async_pool_lock, _thread_local
     with _pool_lock:
         if _pool_instance:
             _pool_instance.disconnect()
         if _async_pool_instance:
-            # Async pool cleanup would need await, skip for now
-            pass
+            # Async pool disconnect() is a coroutine - schedule cleanup if event loop exists
+            try:
+                loop = asyncio.get_running_loop()
+                # Event loop running - schedule cleanup as task
+                loop.create_task(_async_pool_instance.disconnect())
+            except RuntimeError:
+                # No event loop running (sync context) - can't await
+                # Connection will be cleaned up when pool is garbage collected
+                _logger.debug("Async pool reset without event loop - relying on GC for cleanup")
         _pool_instance = None
         _async_pool_instance = None
+        # Reset async lock so it gets recreated fresh
+        _async_pool_lock = None
 
     # Reset thread-local cache
     if hasattr(_thread_local, "sync_client"):

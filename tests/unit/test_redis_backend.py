@@ -1,8 +1,16 @@
-"""Unit tests for RedisBackend implementation."""
+"""Unit tests for RedisBackend implementation.
+
+Includes:
+- Sync operations (get, set, delete, exists)
+- Client management
+- Error handling
+- Async pool lifecycle (Fix 2, 3 from async implementation bugs)
+"""
 
 from __future__ import annotations
 
-from unittest.mock import Mock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import redis
@@ -444,3 +452,328 @@ class TestRedisBackendErrorMessages:
             error_msg = str(error)
             assert "operation=get" in error_msg
             assert "cache:user:123" in error_msg
+
+
+# =============================================================================
+# Async Pool Lifecycle Tests
+# =============================================================================
+
+
+@pytest.mark.unit
+class TestAsyncPoolClosure:
+    """Test that async pool is properly closed in reset_global_pool().
+
+    Bug: Lines 156-158 had a comment "would need await, skip for now"
+    Fix: When event loop is running, schedule disconnect() as a task.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reset_global_pool_disconnects_async_pool_in_event_loop(self):
+        """reset_global_pool() should schedule disconnect() when event loop exists.
+
+        Bug: Lines 156-158 had a comment "would need await, skip for now"
+
+        Fix: When event loop is running, schedule disconnect() as a task.
+        """
+        from cachekit.backends.redis.client import reset_global_pool
+
+        # Create a mock async pool with async disconnect
+        mock_async_pool = MagicMock()
+        disconnect_called = False
+
+        async def mock_disconnect():
+            nonlocal disconnect_called
+            disconnect_called = True
+
+        mock_async_pool.disconnect = mock_disconnect
+
+        with patch(
+            "cachekit.backends.redis.client._async_pool_instance",
+            mock_async_pool,
+        ):
+            with patch("cachekit.backends.redis.client._pool_instance", None):
+                reset_global_pool()
+
+        # Allow task to run
+        await asyncio.sleep(0.01)
+
+        # Async pool disconnect should have been called via create_task
+        assert disconnect_called, "Async pool disconnect() should be scheduled when event loop exists"
+
+    def test_reset_global_pool_handles_no_event_loop(self):
+        """reset_global_pool() should handle case when no event loop is running.
+
+        When called from sync context, it should log and rely on GC for cleanup.
+        """
+        from cachekit.backends.redis.client import reset_global_pool
+
+        # Create a mock async pool
+        mock_async_pool = MagicMock()
+        mock_async_pool.disconnect = AsyncMock()
+
+        with patch(
+            "cachekit.backends.redis.client._async_pool_instance",
+            mock_async_pool,
+        ):
+            with patch("cachekit.backends.redis.client._pool_instance", None):
+                # Should NOT raise - handles missing event loop gracefully
+                reset_global_pool()
+
+        # In sync context without event loop, disconnect is NOT called
+        # (relies on GC instead)
+        # This is expected behavior
+
+
+@pytest.mark.unit
+class TestAsyncPoolRaceCondition:
+    """Test that async pool initialization is protected by a lock.
+
+    Bug: Lines 85-94 have no locking, allowing race conditions where
+    multiple pools are created and only the last one is kept.
+
+    Fix: Use asyncio.Lock() with double-checked locking pattern.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pool_creation_uses_single_pool(self):
+        """Concurrent calls to get_async_redis_client() should share one pool.
+
+        Bug: Lines 85-94 have no locking, allowing race conditions where
+        multiple pools are created and only the last one is kept.
+
+        Fix: Use asyncio.Lock() with double-checked locking pattern.
+        """
+        from cachekit.backends.redis import client as client_module
+
+        # Reset state
+        client_module._async_pool_instance = None
+
+        pools_created = []
+
+        # Track pool creation
+        def tracking_from_url(*args, **kwargs):
+            pool = MagicMock()
+            pools_created.append(pool)
+            return pool
+
+        with patch.object(
+            client_module.redis_async.ConnectionPool,
+            "from_url",
+            side_effect=tracking_from_url,
+        ):
+            with patch(
+                "cachekit.backends.redis.config.RedisBackendConfig.from_env",
+                return_value=MagicMock(redis_url="redis://localhost:6379", connection_pool_size=10),
+            ):
+                # Simulate concurrent access
+                async def get_client():
+                    return await client_module.get_async_redis_client()
+
+                # Launch multiple concurrent tasks
+                tasks = [get_client() for _ in range(10)]
+                clients = await asyncio.gather(*tasks)
+
+        # All clients should be created (10 of them)
+        assert len(clients) == 10
+
+        # But only ONE pool should be created (due to locking)
+        # Before fix: multiple pools created
+        # After fix: exactly 1 pool created
+        assert len(pools_created) == 1, f"Expected 1 pool, got {len(pools_created)} - race condition detected!"
+
+        # Cleanup
+        client_module._async_pool_instance = None
+
+    @pytest.mark.asyncio
+    async def test_async_lock_is_properly_initialized(self):
+        """The async pool lock should be created on first use."""
+        from cachekit.backends.redis.client import _get_async_pool_lock
+
+        # Get the lock
+        lock1 = _get_async_pool_lock()
+        lock2 = _get_async_pool_lock()
+
+        # Should return the same lock instance
+        assert lock1 is lock2
+        assert isinstance(lock1, asyncio.Lock)
+
+
+# =============================================================================
+# Sync Pool Lifecycle Tests
+# =============================================================================
+
+
+@pytest.mark.unit
+class TestSyncPoolCreation:
+    """Test sync pool creation and caching in get_redis_client().
+
+    Coverage targets:
+    - Lines 72-85: Sync pool creation with double-checked locking
+    - Lines 154-156: get_cached_sync_redis_client()
+    """
+
+    def test_get_redis_client_creates_pool_once(self):
+        """get_redis_client() should create pool only once (double-checked locking)."""
+        from cachekit.backends.redis import client as client_module
+
+        # Reset state
+        client_module._pool_instance = None
+
+        pools_created = []
+
+        def tracking_from_url(*args, **kwargs):
+            pool = MagicMock()
+            pools_created.append(pool)
+            return pool
+
+        with patch.object(
+            client_module.redis.ConnectionPool,
+            "from_url",
+            side_effect=tracking_from_url,
+        ):
+            with patch(
+                "cachekit.backends.redis.config.RedisBackendConfig.from_env",
+                return_value=MagicMock(redis_url="redis://localhost:6379", connection_pool_size=10),
+            ):
+                # Call multiple times
+                client1 = client_module.get_redis_client()
+                client2 = client_module.get_redis_client()
+                client3 = client_module.get_redis_client()
+
+        # All clients should be returned
+        assert client1 is not None
+        assert client2 is not None
+        assert client3 is not None
+
+        # But only ONE pool should be created
+        assert len(pools_created) == 1, f"Expected 1 pool, got {len(pools_created)}"
+
+        # Cleanup
+        client_module._pool_instance = None
+
+    def test_get_cached_redis_client_uses_thread_local(self):
+        """get_cached_redis_client() should cache client per thread."""
+        from cachekit.backends.redis import client as client_module
+
+        # Reset state
+        client_module._pool_instance = None
+        if hasattr(client_module._thread_local, "sync_client"):
+            delattr(client_module._thread_local, "sync_client")
+
+        with patch.object(
+            client_module.redis.ConnectionPool,
+            "from_url",
+            return_value=MagicMock(),
+        ):
+            with patch(
+                "cachekit.backends.redis.config.RedisBackendConfig.from_env",
+                return_value=MagicMock(redis_url="redis://localhost:6379", connection_pool_size=10),
+            ):
+                # First call creates client
+                client1 = client_module.get_cached_redis_client()
+
+                # Second call should return same instance
+                client2 = client_module.get_cached_redis_client()
+
+                assert client1 is client2, "Should return cached client instance"
+
+        # Cleanup
+        client_module._pool_instance = None
+        if hasattr(client_module._thread_local, "sync_client"):
+            delattr(client_module._thread_local, "sync_client")
+
+
+@pytest.mark.unit
+class TestAsyncCachedClient:
+    """Test get_cached_async_redis_client() function.
+
+    Coverage target: Line 169 - return await get_async_redis_client()
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_cached_async_redis_client_delegates(self):
+        """get_cached_async_redis_client() should delegate to get_async_redis_client()."""
+        from cachekit.backends.redis import client as client_module
+
+        # Reset state
+        client_module._async_pool_instance = None
+
+        with patch.object(
+            client_module.redis_async.ConnectionPool,
+            "from_url",
+            return_value=MagicMock(),
+        ):
+            with patch(
+                "cachekit.backends.redis.config.RedisBackendConfig.from_env",
+                return_value=MagicMock(redis_url="redis://localhost:6379", connection_pool_size=10),
+            ):
+                # Call the cached version (should delegate)
+                client = await client_module.get_cached_async_redis_client()
+
+                assert client is not None
+
+        # Cleanup
+        client_module._async_pool_instance = None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_async_redis_client_returns_same_pool(self):
+        """get_cached_async_redis_client() should return clients from the same pool."""
+        from cachekit.backends.redis import client as client_module
+
+        # Reset state
+        client_module._async_pool_instance = None
+
+        mock_pool = MagicMock()
+        with patch.object(
+            client_module.redis_async.ConnectionPool,
+            "from_url",
+            return_value=mock_pool,
+        ):
+            with patch(
+                "cachekit.backends.redis.config.RedisBackendConfig.from_env",
+                return_value=MagicMock(redis_url="redis://localhost:6379", connection_pool_size=10),
+            ):
+                client1 = await client_module.get_cached_async_redis_client()
+                client2 = await client_module.get_cached_async_redis_client()
+
+                # Both should use the same pool
+                assert client1.connection_pool is client2.connection_pool
+
+        # Cleanup
+        client_module._async_pool_instance = None
+
+
+@pytest.mark.unit
+class TestResetGlobalPoolAsyncLockReset:
+    """Test that reset_global_pool() also resets the async lock.
+
+    Coverage target: Line 204 - _async_pool_lock = None
+    """
+
+    def test_reset_global_pool_resets_async_lock(self):
+        """reset_global_pool() should reset the async lock for fresh state."""
+        from cachekit.backends.redis import client as client_module
+        from cachekit.backends.redis.client import reset_global_pool
+
+        # Force creation of the async lock
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            lock_before = client_module._get_async_pool_lock()
+            assert lock_before is not None
+            assert client_module._async_pool_lock is not None
+
+            # Reset should clear the lock
+            reset_global_pool()
+
+            # Lock should be None now
+            assert client_module._async_pool_lock is None
+
+            # Getting lock again should create a new one
+            lock_after = client_module._get_async_pool_lock()
+            assert lock_after is not None
+            # New lock should be different instance
+            assert lock_after is not lock_before
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
