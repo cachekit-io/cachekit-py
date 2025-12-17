@@ -15,8 +15,9 @@ Optional Dependencies:
 - Requires: pip install 'cachekit[data]' (includes pyarrow, pandas)
 
 Type Checking Note:
-Optional imports (pyarrow, pandas) are guarded at runtime by HAS_PYARROW, HAS_PANDAS flags.
-Type checker cannot statically verify these; suppressed via pyright config comments above.
+pandas is guarded at runtime by HAS_PANDAS flag. pyarrow is required at import time
+(module fails to load without it, enabling proper import guards in auto_serializer).
+Type checker cannot statically verify optional imports; suppressed via pyright config comments above.
 """
 
 from __future__ import annotations
@@ -38,15 +39,12 @@ except ImportError:
     HAS_PANDAS = False
     pd = None  # type: ignore[assignment]
 
-# Optional dependency: pyarrow
+# Required dependency: pyarrow (fail-fast at module level for import guard in auto_serializer)
 try:
     import pyarrow as pa
     import pyarrow.ipc  # noqa: F401 (used via pa.ipc.new_file and pa.ipc.open_file)
-
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
-    pa = None  # type: ignore[assignment]
+except ImportError as e:
+    raise ImportError("pyarrow is not installed. ArrowSerializer requires the [data] extra: pip install 'cachekit[data]'") from e
 
 # Standard dependency: xxhash (always available)
 import xxhash
@@ -124,13 +122,8 @@ class ArrowSerializer:
                 When False: No checksum (faster, use for @cache.minimal speed-first scenarios)
 
         Raises:
-            ImportError: If required optional dependencies are not installed
             ValueError: If return_format is not one of the valid options
         """
-        if not HAS_PYARROW:
-            raise ImportError(
-                "pyarrow is not installed. ArrowSerializer requires the [data] extra: pip install 'cachekit[data]'"
-            )
         if return_format not in ("pandas", "polars", "arrow"):
             raise ValueError(f"Invalid return_format: '{return_format}'. Valid options: 'pandas', 'polars', 'arrow'")
         self.return_format = return_format
