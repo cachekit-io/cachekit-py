@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.2.0"
+version = "0.2.1"
 description = "Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance"
 readme = "README.md"
 license = {text = "MIT"}
