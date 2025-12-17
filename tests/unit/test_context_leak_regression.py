@@ -618,9 +618,9 @@ def ttl_refresh_mock_backend():
     # Serialize the value - returns (bytes, SerializationMetadata)
     serializer = StandardSerializer()
     raw_bytes, metadata = serializer.serialize(42)
-    # Convert metadata to dict for wrap_for_redis (needs "format" key)
+    # Convert metadata to dict for wrap (needs "format" key)
     metadata_dict = metadata.to_dict()
-    wrapped_data = SerializationWrapper.wrap_for_redis(
+    wrapped_data = SerializationWrapper.wrap(
         data=raw_bytes,
         metadata=metadata_dict,  # Must include "format" key from actual metadata
         serializer_name="default",  # Match StandardSerializer
@@ -810,7 +810,7 @@ def backend_without_ttl():
     serializer = StandardSerializer()
     raw_bytes, metadata = serializer.serialize(42)
     metadata_dict = metadata.to_dict()
-    wrapped_data = SerializationWrapper.wrap_for_redis(
+    wrapped_data = SerializationWrapper.wrap(
         data=raw_bytes,
         metadata=metadata_dict,
         serializer_name="default",

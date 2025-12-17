@@ -17,9 +17,10 @@ repos:
   - repo: local
     hooks:
       # Python type checking with basedpyright
+      # Uses venv directly to avoid uv run modifying uv.lock
       - id: basedpyright
         name: basedpyright
-        entry: uv run basedpyright src/
+        entry: .venv/bin/basedpyright src/ --level error
         language: system
         types: [python]
         pass_filenames: false

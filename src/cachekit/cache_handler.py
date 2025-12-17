@@ -339,7 +339,7 @@ class CacheSerializationHandler:
     - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
 
     Modes:
-    - encryption=False: Direct serialization (plaintext in Redis)
+    - encryption=False: Direct serialization (plaintext in cache)
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (nil UUID)
     - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
 
@@ -602,7 +602,7 @@ class CacheSerializationHandler:
         kwargs: dict[str, Any] | None = None,
         cache_key: str = "",
     ) -> bytes:
-        """Serialize data for Redis storage with optional tenant context for encryption.
+        """Serialize data for cache storage with optional tenant context for encryption.
 
         Args:
             data: Data to serialize
@@ -612,7 +612,7 @@ class CacheSerializationHandler:
                       Required when encryption is enabled to prevent ciphertext substitution.
 
         Returns:
-            Serialized data wrapped for Redis storage
+            Serialized data wrapped for cache storage
 
         Raises:
             ValueError: If tenant extraction fails in multi-tenant mode (FAIL CLOSED)
@@ -685,7 +685,7 @@ class CacheSerializationHandler:
 
             # Convert metadata to dict if needed
             metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-            return SerializationWrapper.wrap_for_redis(serialized_data, metadata_dict, self._serializer_string_name)
+            return SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
         except ValueError:
             # Tenant extraction or cache_key missing - FAIL CLOSED (re-raise, don't catch)
             # This is a security violation: encryption requires valid tenant_id and cache_key
@@ -696,10 +696,10 @@ class CacheSerializationHandler:
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
 
     def deserialize_data(self, data: str | bytes, cache_key: str = "") -> Any:
-        """Deserialize data from Redis storage with cache_key verification.
+        """Deserialize data from cache storage with cache_key verification.
 
         Args:
-            data: Serialized data from Redis (may be encrypted)
+            data: Serialized data from cache (may be encrypted)
             cache_key: Cache key for AAD verification (SECURITY CRITICAL for encrypted data).
                       Required when data is encrypted to verify ciphertext binding.
 
@@ -743,8 +743,8 @@ class CacheSerializationHandler:
             True
         """
         try:
-            # Unwrap Redis data envelope
-            serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap_from_redis(data)
+            # Unwrap cache data envelope
+            serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
 
             # Convert metadata
             serialization_metadata = _get_cached_serializer_class("metadata", "cachekit.serializers.SerializationMetadata")
