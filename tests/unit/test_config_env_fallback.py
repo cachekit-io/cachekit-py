@@ -93,3 +93,52 @@ class TestRedisBackendConfigEnv:
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
         assert hasattr(cache_config, "default_ttl")
+
+
+class TestRedisUrlAliasChoicesPriority:
+    """Test AliasChoices priority for redis_url field.
+
+    The redis_url field uses AliasChoices to support both:
+    - CACHEKIT_REDIS_URL (namespaced, takes priority)
+    - REDIS_URL (standard 12-factor convention, fallback)
+    """
+
+    def test_only_redis_url_set(self, monkeypatch):
+        """REDIS_URL alone should work (12-factor convention)."""
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.setenv("REDIS_URL", "redis://generic:6379")
+
+        config = RedisBackendConfig()
+        assert config.redis_url == "redis://generic:6379"
+
+    def test_only_redis_url_via_from_env(self, monkeypatch):
+        """REDIS_URL works via from_env() factory method."""
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.setenv("REDIS_URL", "redis://factory:6379")
+
+        config = RedisBackendConfig.from_env()
+        assert config.redis_url == "redis://factory:6379"
+
+    def test_only_cachekit_redis_url_set(self, monkeypatch):
+        """CACHEKIT_REDIS_URL alone should work (namespaced)."""
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://cachekit:6379")
+
+        config = RedisBackendConfig()
+        assert config.redis_url == "redis://cachekit:6379"
+
+    def test_both_set_cachekit_wins(self, monkeypatch):
+        """CACHEKIT_REDIS_URL takes priority over REDIS_URL."""
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://cachekit-priority:6379")
+        monkeypatch.setenv("REDIS_URL", "redis://generic-fallback:6379")
+
+        config = RedisBackendConfig()
+        assert config.redis_url == "redis://cachekit-priority:6379"
+
+    def test_neither_set_uses_default(self, monkeypatch):
+        """Falls back to localhost:6379 when neither env var is set."""
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_URL", raising=False)
+
+        config = RedisBackendConfig()
+        assert config.redis_url == "redis://localhost:6379"
