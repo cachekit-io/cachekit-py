@@ -172,6 +172,9 @@ class DecoratorConfig:
         integrity_checking: Enable checksums for corruption detection (default: True)
                            All serializers use xxHash3-64 (8 bytes).
                            Set to False for @cache.minimal (speed-first, no integrity guarantee)
+        key: Custom key function for complex types. Receives (*args, **kwargs) and returns str.
+             Use for numpy arrays, DataFrames, or cross-language cache sharing.
+             Example: @cache(key=lambda arr: hashlib.blake2b(arr.tobytes()).hexdigest())
         refresh_ttl_on_get: Extend TTL on cache hit
         ttl_refresh_threshold: Minimum remaining TTL fraction (0.0-1.0) to trigger refresh
         backend: L2 backend (RedisBackend, HTTPBackend, None for L1-only)
@@ -183,12 +186,13 @@ class DecoratorConfig:
         encryption: Client-side encryption configuration
     """
 
-    # Core settings (5 fields)
+    # Core settings (6 fields)
     ttl: int | None = None
     namespace: str | None = None
     serializer: Union[str, SerializerProtocol] = "default"  # type: ignore[assignment]  # String name or protocol instance
     safe_mode: bool = False
     integrity_checking: bool = True  # Checksums for corruption detection (xxHash3-64 for all serializers)
+    key: Callable[..., str] | None = None  # Custom key function (escape hatch for complex types)
 
     # Performance (2 fields)
     refresh_ttl_on_get: bool = False
@@ -251,6 +255,7 @@ class DecoratorConfig:
             "namespace": self.namespace,
             "serializer": self.serializer,
             "safe_mode": self.safe_mode,
+            "key": self.key,
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,
             "backend": self.backend,
