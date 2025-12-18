@@ -20,7 +20,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Compression, checksums, encryption (https://crates.io/crates/cachekit-core)
-cachekit-core = { version = "=0.1.0", features = ["compression", "checksum", "messagepack", "encryption"] }
+cachekit-core = { version = "=0.1.1", features = ["compression", "checksum", "messagepack", "encryption"] }
 
 # Python integration - optional for Rust-only builds
 pyo3 = { workspace = true, optional = true }
