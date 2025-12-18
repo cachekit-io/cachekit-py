@@ -412,6 +412,15 @@ def create_cache_wrapper(
         deployment_uuid = config.encryption.deployment_uuid
         master_key = config.encryption.master_key
 
+        # Custom key function (escape hatch for complex types)
+        custom_key_func = config.key
+    else:
+        custom_key_func = None
+
+    # Re-scope custom_key_func for closure
+    if "custom_key_func" not in dir():
+        custom_key_func = None
+
     # Fast mode: Disable monitoring overhead, keep performance features
     use_circuit_breaker = circuit_breaker and not fast_mode
     use_adaptive_timeout = adaptive_timeout and not fast_mode
@@ -541,7 +550,13 @@ def create_cache_wrapper(
 
         # Key generation - needed for both L1-only and L1+L2 modes
         try:
-            if fast_mode:
+            # Custom key function takes priority (escape hatch for complex types)
+            if custom_key_func is not None:
+                custom_key = custom_key_func(*args, **kwargs)
+                if not isinstance(custom_key, str):
+                    raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
+                cache_key = f"{namespace or 'default'}:{custom_key}"
+            elif fast_mode:
                 # Minimal key generation - no string formatting overhead
                 from ..hash_utils import cache_key_hash
 
@@ -878,12 +893,17 @@ def create_cache_wrapper(
             cache_key = None
             func_start_time: float | None = None  # Initialize for exception handlers
             try:
-                # Fast key generation path (for simple types)
-                if fast_mode:
+                # Custom key function takes priority (escape hatch for complex types)
+                if custom_key_func is not None:
+                    custom_key = custom_key_func(*args, **kwargs)
+                    if not isinstance(custom_key, str):
+                        raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
+                    cache_key = f"{namespace or 'default'}:{custom_key}"
+                elif fast_mode:
                     # Ultra-fast key generation for hot paths (10-50μs savings)
                     from ..hash_utils import cache_key_hash
 
-                    cache_namespace = namespace or namespace or "default"
+                    cache_namespace = namespace or "default"
                     args_kwargs_str = str(args) + str(kwargs)
                     cache_key = cache_namespace + ":" + func_hash + ":" + cache_key_hash(args_kwargs_str)
                 else:
