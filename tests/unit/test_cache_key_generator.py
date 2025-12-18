@@ -669,3 +669,67 @@ class TestUnsupportedTypesWithGuidance:
         arr = np.zeros(200_000, dtype=np.float32)  # 800KB > 100KB limit
         with pytest.raises(TypeError, match="100,000"):
             key_generator._normalize(arr)
+
+
+class TestKeyNormalization:
+    """Tests for cache key string normalization."""
+
+    @pytest.fixture
+    def key_generator(self):
+        """Create a basic key generator instance."""
+        return CacheKeyGenerator()
+
+    def test_long_key_gets_shortened(self, key_generator):
+        """Keys exceeding MAX_KEY_LENGTH are shortened with hash."""
+
+        def func_with_very_long_name():
+            pass
+
+        # Create args that will generate a very long key
+        long_arg = "x" * 300  # This alone exceeds MAX_KEY_LENGTH (250)
+        key = key_generator.generate_key(func_with_very_long_name, (long_arg,), {})
+
+        # Key should be shortened to MAX_KEY_LENGTH or less
+        assert len(key) <= key_generator.MAX_KEY_LENGTH
+
+    def test_shortened_key_contains_prefix_and_hash(self, key_generator):
+        """Shortened keys contain readable prefix and hash for debugging."""
+
+        def my_func():
+            pass
+
+        # Generate key with very long namespace to force shortening
+        long_namespace = "a" * 300
+        key = key_generator.generate_key(my_func, (), {}, namespace=long_namespace)
+
+        # Should contain hash (32 hex chars after colon)
+        assert ":" in key
+        # Should be within limit
+        assert len(key) <= key_generator.MAX_KEY_LENGTH
+
+    def test_special_characters_replaced(self, key_generator):
+        """Spaces, newlines, carriage returns are replaced with underscores."""
+
+        def func():
+            pass
+
+        # These characters would be in the key via function name or args
+        key = key_generator.generate_key(func, ("hello world",), {})
+
+        # Key should not contain problematic characters
+        assert " " not in key
+        assert "\n" not in key
+        assert "\r" not in key
+
+    def test_deterministic_long_key_shortening(self, key_generator):
+        """Same long input produces same shortened key."""
+
+        def func():
+            pass
+
+        long_arg = "x" * 300
+
+        key1 = key_generator.generate_key(func, (long_arg,), {})
+        key2 = key_generator.generate_key(func, (long_arg,), {})
+
+        assert key1 == key2
