@@ -107,9 +107,10 @@ def _resolve_backend(explicit_backend: object = _UNSET) -> BaseBackend | None:
     if _default_backend is not None:
         return _default_backend
 
-    # Tier 3: Auto-create from REDIS_URL env var
-    redis_url = os.environ.get("REDIS_URL")
-    if redis_url:
+    # Tier 3: Auto-create from env var (CACHEKIT_REDIS_URL > REDIS_URL)
+    # Check if either env var is set as signal to create Redis backend
+    # Actual URL resolution handled by RedisBackendConfig via AliasChoices
+    if os.environ.get("CACHEKIT_REDIS_URL") or os.environ.get("REDIS_URL"):
         # Lazy import to avoid circular dependency
         from cachekit.backends.provider import CacheClientProvider
         from cachekit.backends.redis import RedisBackend
@@ -118,7 +119,7 @@ def _resolve_backend(explicit_backend: object = _UNSET) -> BaseBackend | None:
         # Inject client_provider explicitly (follows Dependency Injection Principle)
         container = DIContainer()
         client_provider = container.get(CacheClientProvider)
-        return RedisBackend(redis_url, client_provider=client_provider)
+        return RedisBackend(client_provider=client_provider)
 
     # No backend configured - fail fast with helpful message
     raise ConfigurationError(

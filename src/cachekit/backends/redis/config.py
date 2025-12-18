@@ -7,7 +7,7 @@ to maintain clean separation of concerns.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,7 +56,8 @@ class RedisBackendConfig(BaseSettings):
 
     redis_url: str = Field(
         default="redis://localhost:6379",
-        description="Redis connection URL",
+        validation_alias=AliasChoices("CACHEKIT_REDIS_URL", "REDIS_URL"),
+        description="Redis connection URL (env: CACHEKIT_REDIS_URL or REDIS_URL)",
     )
     connection_pool_size: int = Field(
         default=10,
@@ -76,7 +77,11 @@ class RedisBackendConfig(BaseSettings):
     def from_env(cls) -> RedisBackendConfig:
         """Create Redis configuration from environment variables.
 
-        Reads CACHEKIT_REDIS_URL, CACHEKIT_CONNECTION_POOL_SIZE, etc.
+        Priority (via AliasChoices): CACHEKIT_REDIS_URL > REDIS_URL > default
+
+        This allows standard 12-factor app conventions (REDIS_URL) while
+        supporting namespaced configuration (CACHEKIT_REDIS_URL) for
+        multi-service deployments.
 
         Returns:
             RedisBackendConfig instance loaded from environment
@@ -86,8 +91,11 @@ class RedisBackendConfig(BaseSettings):
 
             .. code-block:: bash
 
+                # Option 1: Namespaced (takes priority)
                 export CACHEKIT_REDIS_URL="redis://localhost:6379"
-                export CACHEKIT_CONNECTION_POOL_SIZE=20
+
+                # Option 2: Standard 12-factor convention
+                export REDIS_URL="redis://localhost:6379"
 
             .. code-block:: python
 
