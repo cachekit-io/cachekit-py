@@ -375,3 +375,51 @@ class TestPolarsSupport:
         # are detected via __arrow_c_stream__ interface (zero-copy).
         # We can't test this without polars installed, but the code path is covered.
         pass
+
+
+class TestImportGuard:
+    """Test module-level import guard for pyarrow dependency."""
+
+    def test_import_fails_without_pyarrow(self):
+        """ArrowSerializer module raises ImportError when pyarrow is not installed.
+
+        This tests the fail-fast import guard that enables auto_serializer.py
+        to correctly detect when ArrowSerializer is unavailable.
+        """
+        import builtins
+        import importlib
+        import sys
+
+        # Save original modules and import function
+        original_import = builtins.__import__
+        original_modules = {}
+
+        # Collect all modules we need to temporarily remove
+        modules_to_remove = [
+            key
+            for key in list(sys.modules.keys())
+            if key == "pyarrow" or key.startswith("pyarrow.") or key == "cachekit.serializers.arrow_serializer"
+        ]
+
+        for mod in modules_to_remove:
+            original_modules[mod] = sys.modules.pop(mod)
+
+        def blocking_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "pyarrow" or name.startswith("pyarrow."):
+                raise ImportError(f"No module named '{name}'")
+            return original_import(name, globals, locals, fromlist, level)
+
+        builtins.__import__ = blocking_import
+
+        try:
+            # Now importing arrow_serializer should fail with our custom message
+            with pytest.raises(ImportError) as exc_info:
+                importlib.import_module("cachekit.serializers.arrow_serializer")
+
+            assert "pyarrow is not installed" in str(exc_info.value)
+            assert "pip install 'cachekit[data]'" in str(exc_info.value)
+        finally:
+            # Restore everything
+            builtins.__import__ = original_import
+            for mod, module in original_modules.items():
+                sys.modules[mod] = module
