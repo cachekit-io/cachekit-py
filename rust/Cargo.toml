@@ -1,10 +1,10 @@
 [package]
 name = "cachekit-rs"
 version = "0.2.2"
-edition = "2024"
+edition = "2021"
 authors = ["cachekit Contributors"]
 description = "High-performance storage engine for caching with compression and encryption"
-rust-version = "1.91"
+rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/cachekit-io/cachekit-py"
 homepage = "https://github.com/cachekit-io/cachekit-py"
