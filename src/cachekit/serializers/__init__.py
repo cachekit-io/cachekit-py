@@ -212,7 +212,7 @@ def get_serializer_info() -> dict[str, dict[str, Any]]:
             }
             # Add method info if available
             if hasattr(instance, "get_info"):
-                info[name].update(instance.get_info())
+                info[name].update(instance.get_info())  # type: ignore[attr-defined]
         except ImportError as e:
             info[name] = {
                 "class": "ArrowSerializer" if name == "arrow" else "Unknown",
