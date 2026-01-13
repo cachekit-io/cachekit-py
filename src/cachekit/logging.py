@@ -7,6 +7,7 @@ that reduces overhead from 570% to <5% while maintaining functionality.
 import json
 import logging
 import os
+import platform
 import random
 import threading
 import time
@@ -170,7 +171,7 @@ class UltraOptimizedStructuredLogger:
 
         # Pre-computed values for performance
         self._sampling_threshold = int(SAMPLING_RATE * 100)
-        self._hostname = os.uname().nodename
+        self._hostname = platform.node()
         self._pid = os.getpid()
 
         # PII patterns to mask (pre-compiled for speed)

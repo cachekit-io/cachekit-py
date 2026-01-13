@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import logging
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cachekit._rust_serializer import ByteStorage
 
-from .arrow_serializer import ArrowSerializer
 from .auto_serializer import AutoSerializer
 from .base import (
     SerializationError,
@@ -16,7 +17,24 @@ from .encryption_wrapper import EncryptionWrapper
 from .orjson_serializer import OrjsonSerializer
 from .standard_serializer import StandardSerializer
 
+if TYPE_CHECKING:
+    from .arrow_serializer import ArrowSerializer
+
 logger = logging.getLogger(__name__)
+
+# Lazy import for optional ArrowSerializer (requires pyarrow from [data] extra)
+_ArrowSerializer: type | None = None
+
+
+def _get_arrow_serializer() -> type:
+    """Lazy-load ArrowSerializer. Raises ImportError if pyarrow not installed."""
+    global _ArrowSerializer
+    if _ArrowSerializer is None:
+        from .arrow_serializer import ArrowSerializer
+
+        _ArrowSerializer = ArrowSerializer
+    return _ArrowSerializer
+
 
 # Validate ByteStorage works correctly
 test_storage = ByteStorage("msgpack")
@@ -36,7 +54,7 @@ SERIALIZER_REGISTRY = {
     "auto": AutoSerializer,  # Python-specific types (NumPy, pandas, datetime optimization)
     "default": StandardSerializer,  # Language-agnostic MessagePack for multi-language caches
     "std": StandardSerializer,  # Explicit StandardSerializer alias
-    "arrow": ArrowSerializer,
+    "arrow": None,  # Lazy-loaded: requires pyarrow from [data] extra
     "orjson": OrjsonSerializer,
     "encrypted": EncryptionWrapper,  # AutoSerializer + AES-256-GCM encryption
 }
@@ -96,8 +114,13 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
                 f"@cache(serializer=MySerializer())"
             )
 
+        # Get serializer class (lazy-load arrow if needed)
+        if name == "arrow":
+            serializer_class = _get_arrow_serializer()
+        else:
+            serializer_class = SERIALIZER_REGISTRY[name]
+
         # Instantiate with integrity checking configuration
-        serializer_class = SERIALIZER_REGISTRY[name]
         if name in ("default", "std", "auto", "arrow", "orjson"):
             # All core serializers use enable_integrity_checking parameter
             serializer = serializer_class(enable_integrity_checking=enable_integrity_checking)
@@ -167,9 +190,9 @@ def get_available_serializers() -> dict[str, Any]:
 def benchmark_serializers() -> dict[str, Any]:
     """Get instantiated serializers for benchmarking."""
     serializers = {}
-    for name, cls in get_available_serializers().items():
+    for name in SERIALIZER_REGISTRY:
         try:
-            serializers[name] = cls()
+            serializers[name] = get_serializer(name)
         except Exception as e:
             logger.warning(f"Failed to instantiate {name} serializer: {e}")
     return serializers
@@ -178,26 +201,40 @@ def benchmark_serializers() -> dict[str, Any]:
 def get_serializer_info() -> dict[str, dict[str, Any]]:
     """Get information about available serializers."""
     info = {}
-    for name, cls in get_available_serializers().items():
+    for name in SERIALIZER_REGISTRY:
         try:
-            instance = cls()
+            instance = get_serializer(name)
             info[name] = {
-                "class": cls.__name__,
-                "module": cls.__module__,
+                "class": type(instance).__name__,
+                "module": type(instance).__module__,
                 "available": True,
-                "description": cls.__doc__ or "No description available",
+                "description": type(instance).__doc__ or "No description available",
             }
             # Add method info if available
             if hasattr(instance, "get_info"):
                 info[name].update(instance.get_info())
+        except ImportError as e:
+            info[name] = {
+                "class": "ArrowSerializer" if name == "arrow" else "Unknown",
+                "module": "cachekit.serializers.arrow_serializer",
+                "available": False,
+                "error": str(e),
+            }
         except Exception as e:
             info[name] = {
-                "class": cls.__name__,
-                "module": cls.__module__,
+                "class": "Unknown",
+                "module": "unknown",
                 "available": False,
                 "error": str(e),
             }
     return info
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy attribute access for optional ArrowSerializer."""
+    if name == "ArrowSerializer":
+        return _get_arrow_serializer()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Export the main interface
