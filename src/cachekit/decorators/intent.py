@@ -153,6 +153,9 @@ def cache(
             resolved_config = DecoratorConfig.dev(backend=backend, **manual_overrides)
         elif _intent == "test":
             resolved_config = DecoratorConfig.test(backend=backend, **manual_overrides)
+        elif _intent == "io":
+            # SaaS backend - ignore explicit backend param (io creates its own)
+            resolved_config = DecoratorConfig.io(**manual_overrides)
         else:
             # No intent specified - use default DecoratorConfig with overrides
             resolved_config = DecoratorConfig(backend=backend, **manual_overrides)
@@ -176,4 +179,5 @@ cache.production = functools.partial(cache, _intent="production")  # type: ignor
 cache.secure = functools.partial(cache, _intent="secure")  # type: ignore[attr-defined]
 cache.dev = functools.partial(cache, _intent="dev")  # type: ignore[attr-defined]
 cache.test = functools.partial(cache, _intent="test")  # type: ignore[attr-defined]
+cache.io = functools.partial(cache, _intent="io")  # type: ignore[attr-defined]  # SaaS backend
 # Note: L1-only mode requires explicit backend=None parameter (no preset decorator)

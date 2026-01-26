@@ -12,10 +12,12 @@ import warnings
 from pathlib import Path
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from cachekit.backends.base_config import BaseBackendConfig, inherit_config
 
 
-class FileBackendConfig(BaseSettings):
+class FileBackendConfig(BaseBackendConfig):
     """File-based backend configuration.
 
     Configuration for file-based cache storage with size limits, entry count limits,
@@ -56,11 +58,8 @@ class FileBackendConfig(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
+        **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_FILE_",
-        env_nested_delimiter="__",
-        case_sensitive=False,
-        extra="forbid",
-        populate_by_name=True,
     )
 
     cache_dir: Path = Field(

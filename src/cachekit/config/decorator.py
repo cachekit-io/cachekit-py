@@ -530,3 +530,68 @@ class DecoratorConfig:
             ),
             **kwargs,
         )
+
+    @classmethod
+    def io(cls, **kwargs: Any) -> DecoratorConfig:
+        """cachekit.io SaaS backend profile: HTTP-based caching via api.cachekit.io.
+
+        Use cases: Zero-infrastructure caching, edge caching, multi-region deployments
+        Features: Full L1+L2 caching, circuit breaker, production-grade reliability
+
+        Configuration via environment variables:
+            CACHEKIT_API_KEY: API key for authentication (required)
+            CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
+
+        Args:
+            **kwargs: Overrides (ttl, namespace, etc.)
+
+        Returns:
+            DecoratorConfig with CachekitIOBackend
+
+        Raises:
+            ConfigurationError: If CACHEKIT_API_KEY is not set
+
+        Example:
+            >>> import os
+            >>> os.environ["CACHEKIT_API_KEY"] = "ck_test_key"
+            >>> config = DecoratorConfig.io(ttl=300)
+            >>> config.ttl
+            300
+            >>> del os.environ["CACHEKIT_API_KEY"]  # cleanup
+        """
+        # Lazy import to avoid circular dependency and keep SaaS backend optional
+        from cachekit.backends.cachekitio import CachekitIOBackend
+
+        # Check for API key before creating backend
+        if not os.environ.get("CACHEKIT_API_KEY"):
+            raise ConfigurationError(
+                "CACHEKIT_API_KEY environment variable required for @cache.io\n\n"
+                "Set your API key:\n"
+                "  export CACHEKIT_API_KEY=ck_live_your_key_here\n\n"
+                "Get an API key at: https://app.cachekit.io"
+            )
+
+        # Create backend (loads config from environment)
+        backend = CachekitIOBackend()
+
+        # Use production-grade settings with SaaS backend
+        return cls(
+            backend=backend,
+            integrity_checking=True,
+            l1=L1CacheConfig(
+                enabled=True,
+                swr_enabled=True,
+                invalidation_enabled=True,
+                namespace_index=True,
+            ),
+            circuit_breaker=CircuitBreakerConfig(enabled=True),
+            timeout=TimeoutConfig(enabled=True),
+            backpressure=BackpressureConfig(enabled=True),
+            monitoring=MonitoringConfig(
+                collect_stats=True,
+                enable_tracing=True,
+                enable_structured_logging=True,
+                enable_prometheus_metrics=True,
+            ),
+            **kwargs,
+        )
