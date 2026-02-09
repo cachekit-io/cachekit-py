@@ -24,7 +24,7 @@ The SDK implements three layers of SSRF protection:
 
 All API URLs must use HTTPS. HTTP is rejected:
 
-```python
+```python notest
 from cachekit.backends.cachekitio import CachekitIOBackendConfig
 
 # ❌ Raises ValueError: API URL must use HTTPS protocol
@@ -38,7 +38,9 @@ config = CachekitIOBackendConfig(
 
 Requests to private/internal IP addresses are blocked:
 
-```python
+```python notest
+from cachekit.backends.cachekitio import CachekitIOBackendConfig
+
 # ❌ All of these raise ValueError: private/internal IP address
 
 # Cloud metadata (AWS, GCP, Azure)
@@ -77,7 +79,9 @@ config = CachekitIOBackendConfig(api_key="...", api_url="https://[::ffff:127.0.0
 
 Only known cachekit.io hostnames are allowed by default:
 
-```python
+```python notest
+from cachekit.backends.cachekitio import CachekitIOBackendConfig
+
 # ✅ Allowed (default)
 config = CachekitIOBackendConfig(api_key="...", api_url="https://api.cachekit.io")
 
@@ -96,6 +100,8 @@ config = CachekitIOBackendConfig(api_key="...", api_url="https://evil.com")
 For testing or self-hosted deployments, you can allow custom hostnames:
 
 ```python
+from cachekit.backends.cachekitio import CachekitIOBackendConfig
+
 # Via constructor
 config = CachekitIOBackendConfig(
     api_key="ck_test_xxx",
