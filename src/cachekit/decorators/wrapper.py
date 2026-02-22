@@ -1392,7 +1392,9 @@ def create_cache_wrapper(
         """Clear cache statistics and invalidate all cached entries."""
         _stats.clear()
         # Also invalidate actual cache entries
-        invalidate_cache() if not inspect.iscoroutinefunction(func) else ainvalidate_cache()
+        if inspect.iscoroutinefunction(func):
+            raise TypeError("cache_clear() cannot clear cache for async functions. Use 'await fn.ainvalidate_cache()' instead.")
+        invalidate_cache()
 
     if inspect.iscoroutinefunction(func):
         async_wrapper.invalidate_cache = ainvalidate_cache  # type: ignore[attr-defined]
