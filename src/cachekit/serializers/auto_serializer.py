@@ -131,6 +131,7 @@ def _auto_default(obj: Any) -> Any:
     - datetime/date/time → ISO-8601 strings
     - UUID → string representation
     - set/frozenset → list (with type marker for roundtrip)
+    - NumPy arrays → dict with binary data, shape, and dtype (nested in dicts/lists)
 
     Provides helpful errors for:
     - Pydantic models (suggest .model_dump())
@@ -162,6 +163,10 @@ def _auto_default(obj: Any) -> Any:
     if isinstance(obj, (set, frozenset)):
         return {"__set__": True, "value": list(obj), "frozen": isinstance(obj, frozenset)}
 
+    # NumPy array support (nested in dicts/lists via msgpack custom encoder)
+    if HAS_NUMPY and isinstance(obj, np.ndarray):
+        return {"__ndarray__": True, "data": obj.tobytes(), "shape": list(obj.shape), "dtype": str(obj.dtype)}
+
     # NEW: Helpful error detection for common unsupported types
     if _safe_hasattr(obj, "model_dump"):  # Pydantic BaseModel
         raise TypeError(PYDANTIC_ERROR_MESSAGE)
@@ -184,6 +189,7 @@ def _auto_object_hook(obj: Any) -> Any:
     - datetime/date/time from ISO-8601 strings
     - UUID from string representation
     - set/frozenset from list (type-safe roundtrip)
+    - NumPy arrays from binary data with shape and dtype
 
     Args:
         obj: Object from MessagePack decoder
@@ -231,6 +237,13 @@ def _auto_object_hook(obj: Any) -> Any:
                 return frozenset(value_list)
             else:
                 return set(value_list)
+
+        if obj.get("__ndarray__") is True:
+            if not HAS_NUMPY:
+                raise SerializationError("Cannot deserialize numpy array: numpy is not installed")
+            if "data" not in obj or "shape" not in obj or "dtype" not in obj:
+                raise SerializationError("Invalid ndarray format: missing required fields in cached data")
+            return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
 
     return obj
 
