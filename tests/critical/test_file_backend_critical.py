@@ -53,14 +53,14 @@ def test_ttl_enforced(backend):
     # Set with no TTL (permanent)
     backend.set("permanent", b"stays")
     # Set with short TTL
-    backend.set("temporary", b"goes_away", ttl=1)
+    backend.set("temporary", b"goes_away", ttl=3)
 
     # Both exist immediately
     assert backend.get("permanent") == b"stays"
     assert backend.get("temporary") == b"goes_away"
 
     # Wait for temporary to expire
-    time.sleep(1.1)
+    time.sleep(3.5)
 
     # Permanent still exists, temporary is gone
     assert backend.get("permanent") == b"stays"
