@@ -128,7 +128,10 @@ jobs:
 
     services:
       redis:
-        image: redis:7-alpine
+        image: redis@sha256:4bfd9eca23339865dc14fe75f6d9ae643f714924623978dd2798f1a673b08f43  # redis:7-alpine amd64
+        credentials:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
         ports:
           - 6379:6379
         options: >-
