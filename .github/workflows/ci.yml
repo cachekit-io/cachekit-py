@@ -116,7 +116,7 @@ jobs:
   # PRs: runs on GitHub-hosted runners (untrusted code never touches lab infra)
   test-critical:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ${{ github.event_name == 'push' && 'cachekit' || 'ubuntu-latest' }}
+    runs-on: cachekit
     timeout-minutes: 15
     permissions:
       contents: read
