@@ -9,6 +9,8 @@ This test suite validates:
 Requirements: 5.1, 5.2, 5.3
 """
 
+from __future__ import annotations
+
 import asyncio
 import time
 from unittest.mock import patch
@@ -32,11 +34,11 @@ class TestConsolidatedDecoratorFeatureCombinations:
 
         # Use intent-based presets instead of individual feature flags
         if use_preset == "minimal":
-            decorator = cache.minimal(ttl=300, namespace="feature_test")
+            decorator = cache.minimal(ttl=300, namespace="feature_test_minimal")
         elif use_preset == "production":
-            decorator = cache.production(ttl=300, namespace="feature_test")
+            decorator = cache.production(ttl=300, namespace="feature_test_production")
         else:
-            decorator = cache(ttl=300, namespace="feature_test")
+            decorator = cache(ttl=300, namespace="feature_test_default")
 
         @decorator
         def test_function(x: int) -> str:
@@ -95,11 +97,11 @@ class TestConsolidatedDecoratorFeatureCombinations:
 
         # Use intent-based presets instead of individual feature flags
         if use_preset == "minimal":
-            decorator = cache.minimal(ttl=300, namespace="async_feature_test")
+            decorator = cache.minimal(ttl=300, namespace="async_feature_test_minimal")
         elif use_preset == "production":
-            decorator = cache.production(ttl=300, namespace="async_feature_test")
+            decorator = cache.production(ttl=300, namespace="async_feature_test_production")
         else:
-            decorator = cache(ttl=300, namespace="async_feature_test")
+            decorator = cache(ttl=300, namespace="async_feature_test_default")
 
         @decorator
         async def async_test_function(x: int) -> str:
