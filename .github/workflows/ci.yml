@@ -112,9 +112,11 @@ jobs:
         cd rust && cargo clippy -- -D warnings
 
   # Critical test suite (parallel matrix)
+  # Push to main: runs on lab self-hosted runners (consistent perf, free minutes)
+  # PRs: runs on GitHub-hosted runners (untrusted code never touches lab infra)
   test-critical:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'push' && 'cachekit' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read

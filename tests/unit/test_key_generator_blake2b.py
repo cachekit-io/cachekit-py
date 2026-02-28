@@ -91,18 +91,36 @@ class TestBlake2bKeyGeneration:
         # Should complete within reasonable time
         assert blake2b_time < 1.0
 
-    def test_blake2b_with_numpy_arrays_raises_type_error(self):
-        """Test that NumPy arrays raise TypeError (fail fast)."""
+    def test_blake2b_with_numpy_arrays_supported(self):
+        """Test that 1D NumPy arrays with supported dtypes generate valid keys."""
 
         def test_func(arr):
             return arr.sum()
 
-        arr = np.arange(1000)
+        arr = np.arange(1000)  # 1D, int64, well under 100KB
         gen = CacheKeyGenerator()
 
-        # Should raise TypeError for unsupported type
-        with pytest.raises(TypeError, match="Unsupported type for cache key generation"):
-            gen.generate_key(test_func, (arr,), {})
+        # Constrained numpy arrays are now supported (round-table review 2025-12-18)
+        key = gen.generate_key(test_func, (arr,), {})
+        assert isinstance(key, str)
+        assert len(key) > 0
+
+        # Deterministic
+        key2 = gen.generate_key(test_func, (arr,), {})
+        assert key == key2
+
+    def test_blake2b_with_unsupported_numpy_arrays_raises(self):
+        """Test that numpy arrays violating constraints raise TypeError."""
+
+        def test_func(arr):
+            return arr.sum()
+
+        gen = CacheKeyGenerator()
+
+        # 2D array — not supported
+        arr_2d = np.arange(100).reshape(10, 10)
+        with pytest.raises(TypeError, match="Only 1D arrays supported"):
+            gen.generate_key(test_func, (arr_2d,), {})
 
     def test_blake2b_with_custom_objects(self):
         """Test Blake2b with basic objects that can be pickled."""
@@ -223,14 +241,14 @@ class TestBlake2bKeyGeneration:
         def test_func(data):
             return data
 
-        # Test datetime
+        # Test naive datetime (rejected for timezone ambiguity)
         import datetime
 
-        with pytest.raises(TypeError, match="Unsupported type"):
+        with pytest.raises(TypeError, match="Naive datetime not allowed"):
             gen.generate_key(test_func, (datetime.datetime.now(),), {})
 
-        # Test set
-        with pytest.raises(TypeError, match="Unsupported type"):
+        # Test set (rejected for non-deterministic sorting)
+        with pytest.raises(TypeError, match="set/frozenset not supported"):
             gen.generate_key(test_func, ({1, 2, 3},), {})
 
         # Test custom class
