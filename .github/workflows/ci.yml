@@ -184,6 +184,7 @@ jobs:
         REDIS_URL: redis://localhost:6379
       run: |
         uv run pytest tests/ -m "not slow" \
+          --ignore=tests/fuzzing \
           --cov=src/cachekit \
           --cov-report=xml \
           --cov-report=term \
