@@ -97,7 +97,7 @@ jobs:
         enable-cache: true
 
     - name: Set up Python
-      run: uv python install 3.12
+      run: uv python install 3.11
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
@@ -111,9 +111,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: .venv
-        key: venv-${{ runner.os }}-py3.12-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+        key: venv-${{ runner.os }}-py3.11-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
         restore-keys: |
-          venv-${{ runner.os }}-py3.12-
+          venv-${{ runner.os }}-py3.11-
 
     - name: Install dependencies
       run: |
@@ -183,8 +183,8 @@ jobs:
         rustup toolchain install nightly
         rustup default nightly
 
-    - name: Add source for MSan
-      if: matrix.sanitizer == 'memory'
+    - name: Add source for sanitizers
+      if: matrix.sanitizer == 'memory' || matrix.sanitizer == 'thread'
       run: rustup component add rust-src --toolchain nightly
 
     - name: Cache Rust dependencies
@@ -210,7 +210,7 @@ jobs:
       run: |
         cd rust
         cargo +nightly test --lib --target x86_64-unknown-linux-gnu \
-          --no-default-features --features compression,checksum,messagepack,encryption
+          -Zbuild-std --no-default-features --features compression,checksum,messagepack,encryption
 
     - name: Run MemorySanitizer
       if: matrix.sanitizer == 'memory'
