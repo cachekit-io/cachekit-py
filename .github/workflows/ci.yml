@@ -22,32 +22,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast version consistency check
-  version-check:
-    name: Version Sync
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Check Python ↔ Rust version consistency
-      run: |
-        PYTHON_VERSION=$(grep -E "^version = " pyproject.toml | head -1 | cut -d'"' -f2)
-        RUST_VERSION=$(grep -E "^version = " rust/Cargo.toml | head -1 | cut -d'"' -f2)
-
-        echo "Python: $PYTHON_VERSION"
-        echo "Rust: $RUST_VERSION"
-
-        if [ "$PYTHON_VERSION" != "$RUST_VERSION" ]; then
-          echo "❌ Version mismatch!"
-          exit 1
-        fi
-        echo "✅ Versions in sync: $PYTHON_VERSION"
-
-  # Fast format & lint checks (parallel)
+  # Lint, format, type check (runs on all events)
   quick-check:
     name: Format & Lint
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
@@ -79,42 +57,30 @@ jobs:
           venv-${{ runner.os }}-py${{ env.DEFAULT_PYTHON_VERSION }}-
 
     - name: Install dependencies (if not cached)
-      run: |
-        uv sync --group dev
+      run: uv sync --group dev
 
     - name: Check Python formatting
-      run: |
-        uv run ruff format --check .
+      run: uv run ruff format --check .
 
     - name: Lint Python
       if: success() || failure()
-      run: |
-        uv run ruff check .
-
-    - name: Scan Python dependencies for CVEs
-      if: success() || failure()
-      run: |
-        uv run pip-audit --desc
+      run: uv run ruff check .
 
     - name: Type check Python
       if: success() || failure()
-      run: |
-        uv run basedpyright --level error
+      run: uv run basedpyright --level error
 
     - name: Check Rust formatting
       if: success() || failure()
-      run: |
-        cd rust && cargo fmt --check
+      run: cd rust && cargo fmt --check
 
     - name: Lint Rust
       if: success() || failure()
-      run: |
-        cd rust && cargo clippy -- -D warnings
+      run: cd rust && cargo clippy -- -D warnings
 
-  # Critical test suite (parallel matrix)
-  # Push to main: runs on lab self-hosted runners (consistent perf, free minutes)
-  # PRs: runs on GitHub-hosted runners (untrusted code never touches lab infra)
-  test-critical:
+  # PR: single Python version, critical tests only
+  # Push: full matrix, full test suite
+  test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: cachekit
     timeout-minutes: 15
@@ -124,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ${{ github.event_name == 'push' && fromJSON('["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]') || fromJSON('["3.12"]') }}
 
     services:
       redis:
@@ -168,8 +134,7 @@ jobs:
           venv-${{ runner.os }}-py${{ matrix.python-version }}-
 
     - name: Install dependencies (if not cached)
-      run: |
-        uv sync --group dev
+      run: uv sync --group dev
 
     - name: Run critical tests (PRs)
       if: github.event_name == 'pull_request'
@@ -215,13 +180,23 @@ jobs:
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
         fail_ci_if_error: false
 
-  # Markdown documentation tests
-  test-docs:
-    name: Documentation Examples
-    runs-on: ubuntu-latest
+  # Version sync + doc tests (push to main only)
+  post-merge:
+    name: Post-Merge Checks
+    if: github.event_name == 'push'
+    runs-on: cachekit
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
+
+    - name: Check Python ↔ Rust version consistency
+      run: |
+        PYTHON_VERSION=$(grep -E "^version = " pyproject.toml | head -1 | cut -d'"' -f2)
+        RUST_VERSION=$(grep -E "^version = " rust/Cargo.toml | head -1 | cut -d'"' -f2)
+        if [ "$PYTHON_VERSION" != "$RUST_VERSION" ]; then
+          echo "Version mismatch: Python=$PYTHON_VERSION Rust=$RUST_VERSION"
+          exit 1
+        fi
 
     - name: Install uv
       uses: astral-sh/setup-uv@v3
@@ -239,36 +214,27 @@ jobs:
       with:
         workspaces: rust
 
-    - name: Cache Python virtual environment
-      uses: actions/cache@v4
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-py${{ env.DEFAULT_PYTHON_VERSION }}-${{ hashFiles('**/pyproject.toml', '**/uv.lock', 'rust/**/*.rs', 'rust/**/Cargo.toml') }}
-        restore-keys: |
-          venv-${{ runner.os }}-py${{ env.DEFAULT_PYTHON_VERSION }}-
-
     - name: Install dependencies (if not cached)
-      run: |
-        uv sync --group dev
+      run: uv sync --group dev
+
+    - name: Scan Python dependencies for CVEs
+      run: uv run pip-audit --desc
 
     - name: Run markdown documentation tests
-      run: |
-        make test-docs-examples
+      run: make test-docs-examples
 
   # Summary job (required for branch protection)
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [version-check, quick-check, test-critical, test-docs]
+    needs: [quick-check, test]
     if: always()
     steps:
     - name: Check all jobs succeeded
       run: |
-        if [[ "${{ needs.version-check.result }}" != "success" ]] || \
-           [[ "${{ needs.quick-check.result }}" != "success" ]] || \
-           [[ "${{ needs.test-critical.result }}" != "success" ]] || \
-           [[ "${{ needs.test-docs.result }}" != "success" ]]; then
-          echo "❌ One or more jobs failed"
+        if [[ "${{ needs.quick-check.result }}" != "success" ]] || \
+           [[ "${{ needs.test.result }}" != "success" ]]; then
+          echo "One or more jobs failed"
           exit 1
         fi
-        echo "✅ All CI checks passed"
+        echo "All CI checks passed"
