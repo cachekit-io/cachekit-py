@@ -30,19 +30,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install ${{ env.DEFAULT_PYTHON_VERSION }}
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
-
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
@@ -109,17 +96,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install ${{ matrix.python-version }}
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
@@ -134,7 +110,7 @@ jobs:
           venv-${{ runner.os }}-py${{ matrix.python-version }}-
 
     - name: Install dependencies (if not cached)
-      run: uv sync --group dev
+      run: uv sync --python ${{ matrix.python-version }} --group dev
 
     - name: Run critical tests (PRs)
       if: github.event_name == 'pull_request'
@@ -197,17 +173,6 @@ jobs:
           echo "Version mismatch: Python=$PYTHON_VERSION Rust=$RUST_VERSION"
           exit 1
         fi
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install ${{ env.DEFAULT_PYTHON_VERSION }}
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
