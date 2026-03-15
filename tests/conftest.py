@@ -146,8 +146,11 @@ if PYTEST_REDIS_AVAILABLE:
     redis_url = os.environ.get("REDIS_URL")
 
     if redis_url:
-        # CI environment - use external Redis service
-        redis_noproc = factories.redis_noproc(host="localhost", port=6379)
+        # CI environment - use external Redis service (parse host from REDIS_URL)
+        from urllib.parse import urlparse
+
+        _parsed = urlparse(redis_url)
+        redis_noproc = factories.redis_noproc(host=_parsed.hostname or "localhost", port=_parsed.port or 6379)
         redis_isolated = factories.redisdb("redis_noproc")
     else:
         # Local development - spawn Redis process

@@ -1,0 +1,14 @@
+# SaaS API Validation Testing Dependencies
+# These tests validate HTTP API correctness and data integrity
+
+# Testing Framework
+pytest>=7.4.0
+requests>=2.31.0
+pytest-xdist>=3.3.0  # For parallel test execution
+pytest-timeout>=2.1.0  # For test timeouts
+
+# Optional: cachekit library for SDK decorator tests
+# Uncomment if you want to test @cache.io decorator behavior:
+# --index-url https://pypi.cachekit.io/simple/
+# --extra-index-url https://pypi.org/simple/
+# cachekit[data]
