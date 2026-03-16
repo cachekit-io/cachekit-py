@@ -36,6 +36,7 @@ from cachekit.backends.base import (
     TimeoutConfigurableBackend,
     TTLInspectableBackend,
 )
+from cachekit.backends.base_config import BaseBackendConfig, inherit_config
 from cachekit.backends.errors import (
     BackendError,
     BackendErrorType,
@@ -45,6 +46,8 @@ from cachekit.backends.redis import RedisBackend
 
 __all__ = [
     "BaseBackend",
+    "BaseBackendConfig",
+    "inherit_config",
     "TTLInspectableBackend",
     "LockableBackend",
     "TimeoutConfigurableBackend",

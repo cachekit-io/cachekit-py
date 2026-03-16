@@ -68,6 +68,8 @@ dependencies = [
     "msgpack>=1.1.2",
     "orjson>=3.9.0",
     "xxhash>=3.5.0",
+    # HTTP client for SaaS backend (cachekit.io)
+    "httpx[http2]>=0.28.1",
 ]
 
 [project.optional-dependencies]

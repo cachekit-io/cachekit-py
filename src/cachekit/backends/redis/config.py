@@ -8,10 +8,12 @@ to maintain clean separation of concerns.
 from __future__ import annotations
 
 from pydantic import AliasChoices, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from cachekit.backends.base_config import BaseBackendConfig, inherit_config
 
 
-class RedisBackendConfig(BaseSettings):
+class RedisBackendConfig(BaseBackendConfig):
     """Redis-specific backend configuration.
 
     Configuration for Redis connection management, connection pooling,
@@ -47,11 +49,8 @@ class RedisBackendConfig(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
+        **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_",
-        env_nested_delimiter="__",
-        case_sensitive=False,
-        extra="forbid",
-        populate_by_name=True,
     )
 
     redis_url: str = Field(
