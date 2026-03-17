@@ -44,7 +44,7 @@ jobs:
           venv-${{ runner.os }}-py${{ env.DEFAULT_PYTHON_VERSION }}-
 
     - name: Install dependencies (if not cached)
-      run: uv sync --group dev
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
 
     - name: Check Python formatting
       run: uv run ruff format --check .
@@ -131,6 +131,7 @@ jobs:
       run: |
         uv run pytest tests/ -m "not slow" \
           --ignore=tests/fuzzing \
+          --ignore=tests/integration/saas \
           --cov=src/cachekit \
           --cov-report=xml \
           --cov-report=term \
@@ -180,7 +181,7 @@ jobs:
         workspaces: rust
 
     - name: Install dependencies (if not cached)
-      run: uv sync --group dev
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
 
     - name: Scan Python dependencies for CVEs
       run: uv run pip-audit --desc
