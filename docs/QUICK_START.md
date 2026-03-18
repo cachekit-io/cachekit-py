@@ -87,6 +87,26 @@ def get_ssn(user_id):
 </details>
 
 <details>
+<summary><strong>Cache on the Edge (cachekit.io)</strong></summary>
+
+<!-- notest -->
+```python
+# Set your API key
+import os
+os.environ["CACHEKIT_API_KEY"] = "ck_..."
+
+from cachekit import cache
+
+@cache.io(ttl=3600)
+def get_user(user_id):
+    return db.query(user_id)  # Cached at the edge via cachekit.io
+```
+
+> **cachekit.io is in closed alpha** — [request access](https://cachekit.io)
+
+</details>
+
+<details>
 <summary><strong>Custom Namespace</strong></summary>
 
 ```python
