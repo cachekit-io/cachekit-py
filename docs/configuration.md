@@ -8,7 +8,15 @@
 
 ## Backend Options
 
-cachekit supports multiple backend options:
+cachekit supports three backends. Pick the one that fits your infrastructure:
+
+| Backend | Best For | Required Config |
+|---------|----------|----------------|
+| Redis | Self-hosted, full control | `CACHEKIT_REDIS_URL` |
+| CachekitIO | Managed, zero-ops | `CACHEKIT_API_KEY` |
+| File | Local dev, testing | None |
+
+**Redis is the recommended default.** CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only.
 
 ### Redis Backend
 
@@ -24,6 +32,20 @@ def fetch_data():
 ```
 
 **Configuration:** See [Redis Environment Variables](#redis-connection-for-cachekitconfig) below.
+
+### CachekitIO Backend
+
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+
+Zero-ops managed caching via the cachekit.io SaaS API. No Redis to provision or maintain.
+
+**Configuration:** See [CachekitIO Configuration](#cachekitio-configuration) below.
+
+### File Backend
+
+File-based cache for local development and testing. No external services required.
+
+**Configuration:** See the [File Backend](#file-backend-environment-variables) section below.
 
 ---
 
@@ -57,6 +79,89 @@ LOG_LEVEL=INFO
 
 # Performance Testing
 REQUESTS_CA_BUNDLE=  # Unset to avoid SSL issues
+```
+
+---
+
+## CachekitIO Configuration
+
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+
+Configure the CachekitIO managed backend through environment variables. All fields use the `CACHEKIT_` prefix.
+
+### CachekitIO Environment Variables
+
+```bash
+# Required: API key for authentication (ck_live_... format)
+CACHEKIT_API_KEY=ck_live_your_key_here
+
+# Optional: API endpoint (default: https://api.cachekit.io)
+CACHEKIT_API_URL=https://api.cachekit.io
+
+# Optional: Request timeout in seconds (default: 5.0, must be > 0)
+CACHEKIT_TIMEOUT=5.0
+
+# Optional: Maximum retry attempts for transient errors (default: 3, minimum: 0)
+CACHEKIT_MAX_RETRIES=3
+
+# Optional: HTTP connection pool size (default: 10, must be > 0)
+CACHEKIT_CONNECTION_POOL_SIZE=10
+
+# Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
+# Only set to true when pointing at a private test server
+CACHEKIT_ALLOW_CUSTOM_HOST=false
+```
+
+### CachekitIO Field Reference
+
+| Variable | Type | Default | Required | Description |
+|----------|------|---------|----------|-------------|
+| `CACHEKIT_API_KEY` | `SecretStr` | — | Yes | API key (`ck_live_...`) for authentication |
+| `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
+| `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
+| `CACHEKIT_MAX_RETRIES` | `int` | `3` | No | Max retry attempts for transient errors |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool |
+| `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
+
+**Security notes:**
+- `CACHEKIT_API_URL` must use HTTPS. HTTP is rejected at startup.
+- Private/internal IP addresses are blocked (SSRF protection). This includes `10.x`, `172.16-31.x`, `192.168.x`, `127.x`, and link-local ranges.
+- `CACHEKIT_ALLOW_CUSTOM_HOST=true` disables the hostname allowlist. Only use with trusted configuration (e.g., a local test server running over HTTPS with a self-signed cert).
+
+### Using `@cache.io()`
+
+<!-- notest -->
+```python
+import os
+from cachekit import cache
+
+os.environ["CACHEKIT_API_KEY"] = "ck_live_your_key_here"
+
+# All production-grade features enabled: L1, circuit breaker, adaptive timeout, monitoring
+@cache.io(ttl=300)
+def fetch_data(user_id: int):
+    return expensive_api_call(user_id)
+```
+
+`@cache.io()` automatically creates a `CachekitIOBackend` from environment variables. It applies production-grade defaults (see the [intent preset table](#intent-presets) below).
+
+### File Backend Environment Variables
+
+```bash
+# Directory for cache files (default: system temp dir + /cachekit)
+CACHEKIT_FILE_CACHE_DIR=/tmp/cachekit
+
+# Maximum total cache size in MB (default: 1024, range: 1-1,000,000)
+CACHEKIT_FILE_MAX_SIZE_MB=1024
+
+# Maximum single value size in MB (default: 100, max: 50% of MAX_SIZE_MB)
+CACHEKIT_FILE_MAX_VALUE_MB=100
+
+# Maximum number of cache entries (default: 10000, range: 100-1,000,000)
+CACHEKIT_FILE_MAX_ENTRY_COUNT=10000
+
+# Lock acquisition timeout in seconds (default: 5.0, range: 0.5-30.0)
+CACHEKIT_FILE_LOCK_TIMEOUT_SECONDS=5.0
 ```
 
 ---
@@ -132,17 +237,24 @@ def test_function():
 @cache.secure(master_key="a" * 64, backend=None)
 def secure_function():
     pass
+
+# cachekit.io SaaS - production-grade via managed API (closed alpha)
+# Requires: CACHEKIT_API_KEY env var
+# @cache.io(ttl=300)
+# def io_function():
+#     pass
 ```
 
 **Feature Matrix by Intent:**
 
-| Intent | SWR | Invalidation | Namespace Index | Max Size |
-|--------|-----|--------------|-----------------|----------|
-| `minimal()` | ❌ | ❌ | ❌ | 100 MB |
-| `test()` | ❌ | ❌ | ❌ | 100 MB |
-| `dev()` | ✓ | ❌ | ❌ | 100 MB |
-| `production()` | ✓ | ✓ | ✓ | 100 MB |
-| `secure()` | ✓ | ✓ | ✓ | 100 MB |
+| Intent | SWR | Invalidation | Namespace Index | Max Size | Notes |
+|--------|-----|--------------|-----------------|----------|-------|
+| `minimal()` | ❌ | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
+| `test()` | ❌ | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
+| `dev()` | ✓ | ❌ | ❌ | 100 MB | Verbose logs, no Prometheus |
+| `production()` | ✓ | ✓ | ✓ | 100 MB | Full observability |
+| `secure()` | ✓ | ✓ | ✓ | 100 MB | AES-256-GCM encryption required |
+| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)) |
 
 ---
 
@@ -164,6 +276,17 @@ def secure_function():
 export CACHEKIT_REDIS_URL=redis://prod.example.com:6379/0
 export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 ```
+
+### CachekitIO Config is Separate
+
+`@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `CachekitConfig`. Redis URL precedence does not apply.
+
+| Decorator | Config Class | Key Variable |
+|-----------|-------------|--------------|
+| `@cache`, `@cache.production()`, etc. | `CachekitConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
+| `@cache.io()` | `CachekitIOBackendConfig` | `CACHEKIT_API_KEY` |
+
+Setting `REDIS_URL` has no effect on `@cache.io()`, and setting `CACHEKIT_API_KEY` has no effect on Redis-backed decorators.
 
 ## Common Configuration Patterns
 

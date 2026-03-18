@@ -185,7 +185,7 @@ See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for detai
 
 See [Serializer Guide](guides/serializer-guide.md) for decision matrix.
 
-## Redis L2 Backend Performance
+## L2 Backend (Redis) Performance
 
 **Local Redis (localhost):**
 - **Network RTT**: 1-2ms

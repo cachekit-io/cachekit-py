@@ -22,7 +22,9 @@
 
 | Version | Supported |
 |:--------|:---------:|
-| 0.1.x   | ✅        |
+| 0.4.x   | ✅        |
+| 0.3.x   | ✅        |
+| < 0.3   | ❌        |
 
 > [!NOTE]
 > As a young project, we maintain security support for the latest release only. Once we reach 1.0.0, we will establish a longer-term LTS policy.
@@ -178,6 +180,12 @@ All sensitive values are automatically masked:
 | Monitoring output | ✅ |
 
 **Implementation**: Uses `pydantic-settings` with `SecretStr` for automatic redaction.
+
+### SSRF Protection
+
+When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Side Request Forgery (SSRF) protection. Custom API URLs are blocked by default - only `api.cachekit.io` and its subdomains are permitted.
+
+See [SSRF Protection](docs/features/ssrf-protection.md) for full details, including custom host configuration for development environments.
 
 ---
 

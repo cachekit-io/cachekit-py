@@ -4,6 +4,12 @@
 
 Server-Side Request Forgery (SSRF) protection for the CachekitIO backend.
 
+## What This Means for @cache.io Users
+
+When you use `@cache.io`, the SDK connects to `api.cachekit.io` on your behalf. To prevent misuse, custom API URLs are blocked by default - only `api.cachekit.io` and its subdomains are allowed. If you need to point the SDK at a custom endpoint (staging, self-hosted, or testing), you must explicitly opt in via `allow_custom_host=True`.
+
+If you're seeing URL validation errors in your app, see the [Troubleshooting Guide](../troubleshooting.md) for common causes and fixes.
+
 ## Overview
 
 When using `CachekitIOBackend` to connect to the cachekit.io SaaS, the SDK includes built-in SSRF protection to prevent attackers from using your application to make requests to internal networks or cloud metadata endpoints.

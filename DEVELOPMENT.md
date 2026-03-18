@@ -126,6 +126,8 @@ cachekit/
 │   ├── decorators/             # @cache, @redis_cache
 │   ├── serializers/            # RawSerializer, EncryptionWrapper
 │   ├── backends/               # RedisBackend, CachekitIOBackend
+│   │   ├── redis/              # Redis backend implementation
+│   │   └── cachekitio/         # CachekitIO HTTP backend
 │   ├── reliability/            # Circuit breaker, backpressure
 │   └── monitoring/             # Prometheus metrics
 │

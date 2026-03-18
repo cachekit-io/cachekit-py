@@ -568,7 +568,7 @@ class DecoratorConfig:
                 "CACHEKIT_API_KEY environment variable required for @cache.io\n\n"
                 "Set your API key:\n"
                 "  export CACHEKIT_API_KEY=ck_live_your_key_here\n\n"
-                "Get an API key at: https://app.cachekit.io"
+                "Get an API key at: https://cachekit.io"
             )
 
         # Create backend (loads config from environment)

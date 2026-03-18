@@ -254,7 +254,7 @@ Other pods read from L2 (now populated)
 ```python
 @cache(ttl=300)  # Both enabled
 def operation(x):
-    # Redis down while holding lock
+    # L2 backend down while holding lock
     # Circuit breaker catches error
     # Lock TTL ensures lock eventually expires
     return compute(x)

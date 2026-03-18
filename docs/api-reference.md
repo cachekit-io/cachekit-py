@@ -47,6 +47,7 @@ def custom_function():
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
 - **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
 - **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
+- **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed alpha — [request access](https://cachekit.io))*
 - **`@cache`** - Auto-detection: Analyzes function name and signature to select optimal profile
 
 **Implementation Details:**
@@ -173,6 +174,51 @@ def critical_business_logic():
 
 # The decorator automatically connects to Redis using the environment variable
 ```
+
+### `@cache.io` — cachekit.io SaaS Backend
+
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+
+**Profile for zero-infrastructure caching** via the cachekit.io edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, adaptive timeout, L1 in-memory cache).
+
+#### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `CACHEKIT_API_KEY` | **Yes** | — | API key (`ck_live_...`) for authentication |
+| `CACHEKIT_API_URL` | No | `https://api.cachekit.io` | API endpoint override |
+| `CACHEKIT_TIMEOUT` | No | `5.0` | HTTP request timeout in seconds |
+| `CACHEKIT_MAX_RETRIES` | No | `3` | Maximum retry attempts for transient errors |
+
+#### Usage
+
+```python notest
+import os
+from cachekit import cache
+
+# Set your API key (or use environment variable)
+# export CACHEKIT_API_KEY=ck_live_your_key_here
+
+@cache.io(ttl=300)
+def get_product_catalog(category: str):
+    """Cached at the edge — no Redis needed."""
+    return fetch_products_from_db(category)
+
+@cache.io(ttl=3600, namespace="reference_data")
+def get_exchange_rates():
+    """Multi-region edge caching with automatic L1 (in-memory) layer."""
+    return fetch_exchange_rates_from_api()
+```
+
+#### Raises
+
+- **`ConfigurationError`**: If `CACHEKIT_API_KEY` is not set
+
+#### Notes
+
+- Inherits all production-grade reliability features: circuit breaker, adaptive timeout, backpressure, full monitoring
+- L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
+- Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods
 

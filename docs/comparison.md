@@ -39,6 +39,7 @@ Are you caching in Python?
 | **Rust Performance** | - | - | - | - | - | ✅ |
 | **Adaptive Timeouts** | - | - | - | - | - | ✅ |
 | **Pluggable Backends** | - | - | - | - | - | ✅ |
+| **Managed Cloud Backend** | - | - | - | - | - | ✅ |
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
@@ -257,7 +258,27 @@ def get_user(id):
 
 ---
 
-## Where Alternatives Claim to Win (But Don't)
+### 6. Managed Cloud Backend: No Redis Required
+
+**Scenario**: You want distributed caching without standing up or operating Redis infrastructure.
+
+**Why cachekit wins**:
+- **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
+- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext, never your data
+- **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
+
+```python notest
+from cachekit import cache
+
+# Uses cachekit.io as the L2 backend (CACHEKIT_API_KEY in environment)
+@cache.io(ttl=3600)
+def get_user_data(user_id: int) -> dict:
+    return fetch_from_db(user_id)
+```
+
+No other caching library offers a managed cloud backend with first-class decorator support.
+
+---
 
 ### Claim: "I need async caching → use aiocache"
 
@@ -510,6 +531,6 @@ A: Yes. Implement the BaseBackend protocol (~100 LOC) for custom storage (Dynamo
 
 **[Documentation](.)** · **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Security](../SECURITY.md)**
 
-*Last Updated: 2025-11-12 · cachekit v1.0+*
+*Last Updated: 2025-11-12 · cachekit v0.4.0+*
 
 </div>

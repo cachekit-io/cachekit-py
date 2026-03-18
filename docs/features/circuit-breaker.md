@@ -6,12 +6,12 @@
 
 ## TL;DR
 
-Circuit breaker prevents cascading failures when Redis is down. After N errors, circuit opens and returns stale cache/None instead of failing. Auto-recovers after cooldown.
+Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens and returns stale cache/None instead of failing. Auto-recovers after cooldown.
 
 ```python notest
 @cache(ttl=300, backend=None)  # Circuit breaker enabled by default
 def get_data(key):
-    return db.query(key)  # illustrative - If Redis fails, circuit breaker catches it
+    return db.query(key)  # illustrative - If backend fails, circuit breaker catches it
 ```
 
 ---
@@ -30,7 +30,7 @@ def expensive_operation(x):
 # Redis working: Normal cache behavior
 result = expensive_operation(1)  # L1 hit or L2 hit or compute
 
-# Redis down: Circuit breaker catches error
+# Backend down: Circuit breaker catches error
 # Behavior: Returns stale cache or None, app continues
 result = expensive_operation(1)  # Returns stale/None instead of error
 ```
@@ -68,8 +68,8 @@ def operation(x):
 **Example scenario**:
 ```
 Pod A tries to cache fetch at 12:00:00
-Redis working: CLOSED state, success
-Redis fails at 12:00:05
+Backend working: CLOSED state, success
+Backend fails at 12:00:05
 Requests 1-5: Errors accumulated
 Request 6: Circuit OPENS → returns None
 Requests 7-34: Circuit OPEN, returns None (no Redis calls)
@@ -82,20 +82,20 @@ Request 36: Normal operation resumes
 
 ## Why You'd Want It
 
-**Production scenario**: Service depends on Redis for caching. Redis pod crashes.
+**Production scenario**: Service depends on the L2 backend for caching. Backend becomes unavailable.
 
 **Without circuit breaker**:
 ```
-Redis is down
+Backend is down
 Cache decorator catches errors
-Caller gets exception: "ConnectionError: Redis unreachable"
+Caller gets exception: "ConnectionError: backend unreachable"
 Service crashes if error not handled by caller
 Cascades to dependent services
 ```
 
 **With circuit breaker**:
 ```
-Redis is down
+Backend is down
 Circuit breaker catches errors
 After N failures: Circuit OPENS
 Caller gets: None or stale cache (application choice)
@@ -152,7 +152,7 @@ def problematic_function():
 ```python
 @cache(ttl=300)  # 5 minute cache
 def get_data():
-    # Redis down for 6+ minutes
+    # Backend down for 6+ minutes
     # Circuit returns stale cache but TTL expired
     # Result: Returns None instead of cached data
     # Solution: Increase TTL or handle None gracefully
@@ -171,8 +171,8 @@ from cachekit import cache
 def get_user(user_id):
     return db.query(User).filter_by(id=user_id).first()  # illustrative - not defined
 
-# App continues working even if Redis is down
-user = get_user(123)  # None if Redis down AND no stale cache
+# App continues working even if backend is down
+user = get_user(123)  # None if backend down AND no stale cache
 ```
 
 ### With Graceful Fallback
@@ -184,7 +184,7 @@ def get_config(key):
 try:
     config = get_config("feature_flag")
     if config is None:
-        # Redis down or cache miss
+        # Backend down or cache miss
         config = get_default_config("feature_flag")  # illustrative - not defined
 except Exception as e:
     # Unexpected error
@@ -263,7 +263,7 @@ Redis error → Circuit opens after N failures
 ### Performance Impact
 - **CLOSED state**: ~10ns overhead per call (state check)
 - **OPEN state**: <1ns overhead per call (returns immediately)
-- **HALF_OPEN state**: Normal Redis latency (~2-7ms)
+- **HALF_OPEN state**: Normal L2 backend latency (~2-50ms)
 
 ---
 
@@ -275,7 +275,7 @@ Redis error → Circuit opens after N failures
 def fetch(key):
     # L2 miss → Distributed lock acquired
     # Only one pod calls fetch()
-    # If Redis fails → Circuit opens
+    # If L2 fails → Circuit opens
     # All pods get None (no cascade)
     return db.fetch(key)  # illustrative - not defined
 ```
@@ -285,7 +285,7 @@ def fetch(key):
 @cache.secure(master_key="a" * 64, ttl=300, backend=None)  # Both features enabled
 def fetch_sensitive(key):
     # Encryption happens before L2 write
-    # If Redis fails → Circuit opens
+    # If L2 fails → Circuit opens
     # Encryption/decryption code not involved
     return db.fetch(key)  # illustrative - not defined
 ```
