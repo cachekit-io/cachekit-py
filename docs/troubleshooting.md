@@ -229,6 +229,160 @@ python app.py
 
 ---
 
+## CachekitIO Backend Issues
+
+<details>
+<summary><strong>Can't Connect to cachekit.io</strong></summary>
+
+**Issue**: Requests to cachekit.io fail immediately or time out
+
+**What it means**:
+- API key not configured
+- Wrong endpoint URL
+- Network/firewall blocking outbound HTTPS
+
+**Solutions**:
+
+1. **Verify API key is set**:
+```bash
+echo $CACHEKIT_API_KEY
+# Should output your key — if blank, set it:
+export CACHEKIT_API_KEY=your_api_key_here
+```
+
+2. **Check the API URL**:
+```bash
+# Default — leave unset unless self-hosting
+echo $CACHEKIT_API_URL
+# Expected: unset or https://api.cachekit.io
+```
+
+3. **Test network connectivity**:
+```bash
+curl -sf https://api.cachekit.io/healthz
+# Should return 200 OK — if it hangs, check firewall/proxy
+```
+
+</details>
+
+<details>
+<summary><strong>401 Unauthorized</strong></summary>
+
+**Issue**: cachekit.io returns `401 Unauthorized`
+
+**What it means**:
+- API key is invalid, revoked, or expired
+- Key is set but doesn't match the project
+
+**Solutions**:
+
+1. **Confirm the key is correct**:
+```bash
+# Compare against the key shown in your cachekit.io dashboard
+echo $CACHEKIT_API_KEY
+```
+
+2. **Request a new key** at [cachekit.io](https://cachekit.io) and rotate:
+```bash
+export CACHEKIT_API_KEY=new_key_here
+```
+
+3. **Check for trailing whitespace or newlines** if the key was copy-pasted:
+```bash
+python -c "import os; k=os.getenv('CACHEKIT_API_KEY',''); print(repr(k))"
+# Key must not start/end with spaces or \n
+```
+
+</details>
+
+<details>
+<summary><strong>429 Rate Limited</strong></summary>
+
+**Issue**: cachekit.io returns `429 Too Many Requests`
+
+**What it means**:
+- Request rate exceeds your plan's limit
+- Burst traffic spike hitting per-second cap
+
+**Solutions**:
+
+1. **Reduce cache miss rate** (more hits = fewer upstream calls):
+```python
+# Increase TTL to reduce backend round-trips
+@cache(ttl=3600)  # 1-hour TTL instead of short TTL
+def expensive_query(id):
+    return fetch(id)
+```
+
+2. **The circuit breaker handles backoff automatically** — no manual retry logic needed. If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+
+3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
+
+</details>
+
+<details>
+<summary><strong>SSRF Rejection</strong></summary>
+
+**Issue**: Request rejected with SSRF protection error
+
+**What it means**:
+- A custom `CACHEKIT_API_URL` points to an internal/private host
+- SSRF protection blocks requests to non-allowlisted destinations
+- Only `api.cachekit.io` is permitted by default
+
+**Solutions**:
+
+1. **Use the default endpoint** (unset any custom URL):
+```bash
+unset CACHEKIT_API_URL
+```
+
+2. **If self-hosting**, confirm your host is correctly configured and reachable:
+```bash
+export CACHEKIT_API_URL=https://your-self-hosted-endpoint.example.com
+curl -sf $CACHEKIT_API_URL/healthz
+```
+
+3. **Never point `CACHEKIT_API_URL` at localhost or internal IPs** — these are blocked by SSRF protection regardless of environment.
+
+</details>
+
+<details>
+<summary><strong>Connection Timeout</strong></summary>
+
+**Issue**: Requests to cachekit.io hang and eventually time out
+
+**What it means**:
+- High network latency between your environment and api.cachekit.io
+- Timeout configured too low for your network conditions
+- Transient outage or overloaded backend
+
+**Solutions**:
+
+1. **Check configured timeout**:
+```bash
+echo $CACHEKIT_SOCKET_TIMEOUT
+echo $CACHEKIT_SOCKET_CONNECT_TIMEOUT
+```
+
+2. **Increase timeout for high-latency environments**:
+```bash
+export CACHEKIT_SOCKET_TIMEOUT=10.0
+export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
+```
+
+3. **Measure actual latency**:
+```bash
+curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
+    https://api.cachekit.io/healthz
+```
+
+4. **Circuit breaker will engage automatically** after repeated timeouts, allowing your application to continue running without blocking on the cache backend.
+
+</details>
+
+---
+
 ## Error Code Reference
 
 <details>
