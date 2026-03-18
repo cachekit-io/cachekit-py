@@ -473,6 +473,189 @@ def my_function():
 
 ---
 
+## CachekitIO HTTP Errors
+
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. Each HTTP response is classified into a `BackendErrorType` that drives circuit breaker and retry behavior.
+
+### E060: Authentication failure (401/403)
+
+**Message**: `Authentication failed: HTTP 401` or `Authentication failed: HTTP 403`
+
+**Error Code**: `BackendError` / `BackendErrorType.AUTHENTICATION`
+
+**Cause**:
+- API key is missing, invalid, or revoked
+- API key does not have permission for the requested operation
+
+**Behavior**: No retry. Alert ops immediately.
+
+**Solution**:
+```bash
+# Verify API key is set
+echo $CACHEKIT_API_KEY
+
+# Set a valid API key
+export CACHEKIT_API_KEY=ck_live_your_key_here
+```
+
+```python notest
+from cachekit import cache
+
+# API key can also be passed at decorator level
+@cache.io(ttl=300)
+def get_data():
+    return fetch()  # Requires valid CACHEKIT_API_KEY env var
+```
+
+---
+
+### E061: Rate limited (429)
+
+**Message**: `Rate limit exceeded`
+
+**Error Code**: `BackendError` / `BackendErrorType.TRANSIENT`
+
+**Cause**: Request volume exceeds the rate limit for the API key tier
+
+**Behavior**: TRANSIENT — auto-retry with exponential backoff. Circuit breaker counts toward failure threshold.
+
+**Solutions**:
+
+1. **Reduce request volume**: Increase TTL so cache hits serve more traffic:
+```python notest
+from cachekit import cache
+
+@cache.io(ttl=3600)  # Longer TTL reduces backend requests
+def get_data():
+    return fetch()
+```
+
+2. **Upgrade tier**: Increase plan limits at [cachekit.io](https://cachekit.io)
+
+3. **Review cache key design**: Overly granular keys cause unnecessary misses
+
+---
+
+### E062: Server error (5xx)
+
+**Message**: `Server error: HTTP 500` (or 502, 503, 504, etc.)
+
+**Error Code**: `BackendError` / `BackendErrorType.TRANSIENT`
+
+**Cause**: Transient server-side error at the CachekitIO API
+
+**Behavior**: TRANSIENT — auto-retry with backoff. If sustained, circuit breaker opens and function executes without caching.
+
+**What happens when circuit breaker opens**:
+```python
+@cache.io(ttl=300)
+def my_function():
+    return expensive_operation()
+
+# When server errors persist and circuit breaker opens:
+# - Function still executes: expensive_operation() runs
+# - Cache is bypassed: result is NOT cached
+# - No exception raised: caller gets result normally
+# - Warning is logged (if logging configured)
+```
+
+---
+
+### E063: Client error (4xx)
+
+**Message**: `Client error: HTTP 400` (or 404, 413, etc.)
+
+**Error Code**: `BackendError` / `BackendErrorType.PERMANENT`
+
+**Cause**: Malformed request — invalid cache key format, payload too large, or other client-side issue
+
+**Behavior**: PERMANENT — no retry. Check your cache key and payload.
+
+**Common causes and fixes**:
+```python notest
+from cachekit import cache
+
+# WRONG - cache key contains invalid characters
+@cache.io(ttl=300, key="my key with spaces")
+def get_data(user_id):
+    return fetch(user_id)
+
+# CORRECT - use valid key characters
+@cache.io(ttl=300, key="my_key_{user_id}")
+def get_data(user_id):
+    return fetch(user_id)
+```
+
+---
+
+### E064: Request timeout
+
+**Message**: `Request timeout: ...`
+
+**Error Code**: `BackendError` / `BackendErrorType.TIMEOUT`
+
+**Cause**: HTTP request to the CachekitIO API exceeded the configured timeout
+
+**Behavior**: TIMEOUT — configurable retry behavior. Circuit breaker counts toward failure threshold.
+
+**Solution**:
+```python notest
+from cachekit import cache
+
+# Increase timeout for slow network conditions
+@cache.io(ttl=300, timeout=10.0)  # seconds
+def get_data():
+    return fetch()
+```
+
+```bash
+# Or via environment variable
+export CACHEKIT_TIMEOUT=10.0
+```
+
+---
+
+### E065: Connection error
+
+**Message**: `Connection failed: ...`
+
+**Error Code**: `BackendError` / `BackendErrorType.TRANSIENT`
+
+**Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable
+
+**Behavior**: TRANSIENT — auto-retry with backoff. Circuit breaker opens after sustained failures, allowing function to execute without caching.
+
+**Solutions**:
+
+1. **Verify network connectivity**:
+```bash
+curl -I https://api.cachekit.io/health
+```
+
+2. **Check custom API URL** (if overridden):
+```bash
+echo $CACHEKIT_API_URL
+# Default: https://api.cachekit.io
+```
+
+3. **Check for proxy or firewall rules blocking outbound HTTPS to api.cachekit.io**
+
+---
+
+### CachekitIO error classification summary
+
+| HTTP Status / Exception | `BackendErrorType` | Auto-Retry | Circuit Breaker |
+|---|---|---|---|
+| 401, 403 | `AUTHENTICATION` | No | No |
+| 429 | `TRANSIENT` | Yes (backoff) | Yes |
+| 5xx | `TRANSIENT` | Yes (backoff) | Yes |
+| 4xx (other) | `PERMANENT` | No | No |
+| `TimeoutException` | `TIMEOUT` | Configurable | Yes |
+| `ConnectError`, `NetworkError` | `TRANSIENT` | Yes (backoff) | Yes |
+| Other | `UNKNOWN` | No | No |
+
+---
+
 ## Error Handling Best Practices
 
 ### Log errors for debugging
@@ -537,4 +720,4 @@ def monitored_function(x):
 
 ---
 
-**Last Updated**: 2025-11-13
+**Last Updated**: 2026-03-18
