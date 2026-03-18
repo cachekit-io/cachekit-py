@@ -4,7 +4,7 @@
 
 > **Complete visualization of the data path from user code to Redis and back**
 
-*Version: v0.2.0 (Backend Abstraction)*
+*Version: v0.4.0 (Multi-Backend)*
 
 ---
 
@@ -112,7 +112,8 @@ cachekit uses a hybrid Python-Rust architecture to provide enterprise-grade cach
 │                                                                             │
 │  Backend types:                                                             │
 │  • RedisBackend: Distributed Redis storage (default)                        │
-│  • Future: HTTPBackend, DynamoDBBackend, etc.                               │
+│  • CachekitIOBackend: Managed cloud storage via HTTP/2 (api.cachekit.io)    │
+│  • Future: DynamoDBBackend, etc.                                            │
 │                                                                             │
 │  RedisBackend internal flow:                                                │
 │  1. Get Redis client from CacheClientProvider                               │
@@ -355,10 +356,12 @@ def custom_function():
 | Profile | Circuit Breaker | Adaptive Timeout | L1 Cache | L2 Backend | Stats Collection | Use Case |
 |---------|----------------|------------------|----------|------------|------------------|----------|
 | **default** | ✓ | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
-| **fast** | ✗ | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
-| **safe** | ✓ | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
+| **minimal** | ✗ | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
+| **production** | ✓ | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
 | **secure** | ✓ | ✓ | ✗ | RedisBackend | ✓ | Encrypted sensitive data (L2-only) |
-| **l1-only** | ✓ | ✓ | ✓ | None | ✓ | Local development (no Redis) |
+| **dev** | ✗ | ✗ | ✓ | None | ✗ | Local development (no Redis) |
+| **test** | ✗ | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
+| **io** | ✓ | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
 
 ---
 
@@ -433,8 +436,7 @@ def _blake2b_pickle_hash(args, kwargs):
 ┌─────────────────────────────────────────┐
 │ L2 Backend (Pluggable Storage Layer)    │
 │ • RedisBackend (default)                │
-│ • HTTPBackend (future)                  │
-│ • DynamoDBBackend (future)              │
+│ • CachekitIOBackend (HTTP/2, managed)   │
 │ • Network call (~1-2ms latency)         │
 │ • Bytes-based protocol (BaseBackend)    │
 │ • Persistent across process restarts    │
@@ -472,7 +474,7 @@ See [Performance Guide](performance.md) for comprehensive benchmarks and compone
 
 ### Protocol-Based Design
 
-cachekit v0.2.0 introduces a pluggable backend layer using PEP 544 protocol-based abstraction. This enables custom storage backends beyond Redis.
+cachekit uses a pluggable backend layer using PEP 544 protocol-based abstraction. This enables custom storage backends beyond Redis.
 
 **BaseBackend Protocol:**
 ```python
