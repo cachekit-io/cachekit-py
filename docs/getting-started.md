@@ -11,6 +11,7 @@
 - [Quick Start with Redis](#-quick-start-with-redis)
 - [Progressive Disclosure](#-progressive-disclosure-choose-your-level)
 - [Installation](#-installation)
+- [Choose Your Backend](#-choose-your-backend)
 - [What Makes cachekit Different](#-what-makes-cachekit-different)
 - [Common Pitfalls](#-common-pitfalls-to-avoid)
 - [Configuration](#-configuration)
@@ -221,12 +222,78 @@ docker run -p 6379:6379 redis
 ### Environment Setup
 
 ```bash
-# Minimum required configuration
+# Redis (recommended default)
 export REDIS_URL="redis://localhost:6379"
 
-# Optional: explicit configuration
+# Optional: explicit Redis configuration
 export CACHEKIT_REDIS_URL="redis://localhost:6379"
 export CACHEKIT_CONNECTION_POOL_SIZE=20
+
+# CachekitIO Cloud (invite-only alpha)
+export CACHEKIT_API_KEY=ck_your_api_key
+```
+
+---
+
+## Choose Your Backend
+
+Three paths depending on your situation:
+
+| Backend | When to use | Setup effort |
+|:--------|:------------|:-------------|
+| **Redis** (recommended) | Production, existing infra, full control | Medium — run Redis yourself |
+| **CachekitIO Cloud** (alpha) | Skip Redis ops, managed edge caching | Low — API key only |
+| **File / L1-only** | Local dev, tests, no external deps | None |
+
+### Redis (Recommended)
+
+Self-hosted, full control. The default and recommended path. Everything in this guide applies.
+
+```bash
+docker run -p 6379:6379 redis
+export REDIS_URL="redis://localhost:6379"
+```
+
+```python
+from cachekit import cache
+
+@cache(ttl=3600)
+def get_user(user_id: int):
+    return fetch_from_db(user_id)
+```
+
+### CachekitIO Cloud
+
+> [!NOTE]
+> **cachekit.io is in closed alpha — [request access](https://cachekit.io)**
+
+Managed edge caching — no Redis to run. Set your API key and switch the decorator to `@cache.io()`.
+
+```bash
+# CachekitIO Cloud (invite-only alpha)
+export CACHEKIT_API_KEY=ck_your_api_key
+```
+
+```python notest
+from cachekit import cache
+
+@cache.io(ttl=3600)  # cachekit.io is in closed alpha — request access at https://cachekit.io
+def get_user(user_id: int):
+    return fetch_from_db(user_id)
+```
+
+Everything else — TTL, namespaces, serializers — works the same as with Redis. Swap `@cache` for `@cache.io()` and you're done.
+
+### File / L1-Only (Dev and Testing)
+
+No external dependencies. Pure in-process memory cache. Not suitable for multi-pod or production.
+
+```python
+from cachekit import cache
+
+@cache(ttl=60, backend=None)  # L1-only: in-memory, no Redis needed
+def get_user(user_id: int):
+    return fetch_from_db(user_id)
 ```
 
 ---
