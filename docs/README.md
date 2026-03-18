@@ -54,6 +54,21 @@ Progressive disclosure of cachekit features:
 
 ---
 
+### CachekitIO Cloud
+
+> [!NOTE]
+> CachekitIO is currently invite-only. [Join the waitlist](https://cachekit.io) to get access.
+
+Cache to the edge with `@cache.io` - no Redis to manage:
+
+| Step | Guide | What You Learn |
+|:----:|:------|:---------------|
+| 1 | [Getting Started](getting-started.md) | Basic `@cache.io` decorator |
+| 2 | [Configuration Guide](configuration.md) | `CACHEKIT_API_KEY` and connection setup |
+| 3 | [Backend Guide](guides/backend-guide.md) | CachekitIOBackend and multi-backend patterns |
+
+---
+
 ## Feature Guides
 
 ### Caching Strategies

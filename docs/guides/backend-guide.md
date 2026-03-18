@@ -106,6 +106,145 @@ def cached_function():
 - Connection pooling built-in
 - Supports large values (up to Redis limits)
 
+### CachekitIOBackend (Managed SaaS)
+
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+
+`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTP/2. It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
+
+**Setup**:
+
+```bash
+export CACHEKIT_API_KEY="ck_live_..."
+```
+
+**Basic usage** — loads config from environment:
+
+```python notest
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+backend = CachekitIOBackend()
+
+@cache(backend=backend)
+def cached_function(x):
+    return expensive_computation(x)
+```
+
+**Explicit configuration**:
+
+```python notest
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+backend = CachekitIOBackend(
+    api_url="https://api.cachekit.io",  # required if not using env
+    api_key="ck_live_...",              # required if not using env
+    timeout=5.0,                        # optional, default: 5.0 seconds
+)
+```
+
+**Convenience shorthand via `@cache.io()`**:
+
+```python notest
+from cachekit import cache
+
+# Equivalent to: @cache(backend=CachekitIOBackend())
+# @cache.io() creates its own CachekitIOBackend via DecoratorConfig.io()
+# and passes it as an explicit backend kwarg — Tier 1 resolution, not magic.
+@cache.io(ttl=300, namespace="my-app")
+def cached_function(x):
+    return expensive_computation(x)
+```
+
+**Health check**:
+
+```python notest
+backend = CachekitIOBackend()
+is_healthy, details = backend.health_check()
+# details: {"backend_type": "saas", "latency_ms": 12.4, "api_url": "...", "version": "..."}
+```
+
+**Async support** — all protocol methods have async counterparts:
+
+```python notest
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+backend = CachekitIOBackend()
+
+@cache(backend=backend)
+async def async_cached_function(x):
+    return await fetch_data(x)
+
+# Direct async calls also available:
+# await backend.get_async(key)
+# await backend.set_async(key, value, ttl=60)
+# await backend.delete_async(key)
+# await backend.exists_async(key)
+# is_healthy, details = await backend.health_check_async()
+```
+
+**Distributed locking** (async only):
+
+```python notest
+backend = CachekitIOBackend()
+
+lock_id = await backend.acquire_lock("my-lock", timeout=5)
+if lock_id:
+    try:
+        # do work
+        pass
+    finally:
+        await backend.release_lock("my-lock", lock_id)
+```
+
+**TTL inspection** (async only):
+
+```python notest
+backend = CachekitIOBackend()
+
+remaining = await backend.get_ttl("my-key")      # seconds remaining, or None
+refreshed = await backend.refresh_ttl("my-key", ttl=300)  # update TTL in place
+```
+
+**Timeout override** — returns a new instance:
+
+```python notest
+backend = CachekitIOBackend()
+fast_backend = backend.with_timeout(1.0)  # 1-second timeout variant
+```
+
+**Security**: The API URL is validated on construction — HTTPS required, private/internal IP addresses blocked. The default allowlist restricts connections to `api.cachekit.io` and `api.staging.cachekit.io`. Set `CACHEKIT_ALLOW_CUSTOM_HOST=true` to override (testing only).
+
+**Environment variables**:
+
+```bash
+CACHEKIT_API_KEY=ck_live_...          # Required — API key for authentication
+CACHEKIT_API_URL=https://api.cachekit.io  # Optional — defaults to api.cachekit.io
+CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
+```
+
+**When to use**:
+- Managed, zero-infrastructure caching
+- Multi-region distributed caching without operating Redis
+- Teams that want caching without DevOps overhead
+- Zero-knowledge architecture (compose with `@cache.secure` — see below)
+
+**When NOT to use**:
+- Sub-millisecond latency requirements — use Redis or L1 cache
+- Fully offline/air-gapped environments
+- Applications that cannot tolerate HTTP/2 dependency
+
+**Characteristics**:
+- Latency: ~10-50ms L2 (HTTP/2, region-dependent)
+- Sync and async support (hybrid client architecture)
+- Connection pooling built-in (default: 10 connections)
+- Automatic retries on transient errors (default: 3)
+- Distributed locking via server-side Durable Objects
+- TTL inspection and in-place refresh supported
+
+---
+
 ### FileBackend
 
 Store cache on the local filesystem with automatic LRU eviction:
@@ -215,9 +354,53 @@ Large values (1MB):
 - Read p99: ~13μs per operation
 ```
 
-### HTTPBackend
+## Encrypted SaaS Pattern (Zero-Knowledge)
 
-Store cache in HTTP API endpoints:
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+
+Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over managed SaaS storage. The backend stores opaque ciphertext — it never sees plaintext data or your master key.
+
+```python notest
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+# Required env: CACHEKIT_MASTER_KEY (hex, min 32 bytes) + CACHEKIT_API_KEY
+backend = CachekitIOBackend()
+
+@cache.secure(backend=backend, ttl=3600, namespace="sensitive-data")
+def get_user_profile(user_id: str) -> dict:
+    """Result is AES-256-GCM encrypted before storage.
+
+    Data flow:
+      serialize(result) -> encrypt(HKDF-derived key) -> PUT /v1/cache/{key}
+      GET /v1/cache/{key} -> decrypt() -> deserialize() -> return result
+
+    The cachekit.io API sees only encrypted bytes. Zero-knowledge.
+    """
+    return fetch_user_from_db(user_id)
+```
+
+**Why this matters**:
+- `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
+- Per-tenant key derivation via HKDF — cryptographic isolation between namespaces
+- The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
+- With `@cache.secure`: SaaS is out of scope for HIPAA/PCI (stores only ciphertext)
+- Without `@cache.secure`: SaaS stores plaintext, may be in compliance scope
+
+**Requirements**:
+
+```bash
+CACHEKIT_MASTER_KEY=<hex string, min 32 bytes>  # Never leaves the client
+CACHEKIT_API_KEY=ck_live_...
+```
+
+See [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md) for full details on key derivation and serialization format implications.
+
+## Custom Backend Examples
+
+### HTTPBackend Example
+
+A generic HTTP API backend — useful as a starting point for integrating cloud-based cache services (Cloudflare KV, Vercel KV, etc.). For managed cachekit.io storage, use `CachekitIOBackend` above instead.
 
 ```python notest
 from cachekit import cache
@@ -267,9 +450,9 @@ def api_cached_function():
 ```
 
 **When to use**:
+- Integrating a custom internal cache service with a non-standard API
 - Cloud-based cache services (Cloudflare KV, Vercel KV)
 - Microservices with dedicated cache service
-- Zero-knowledge caching (backend never sees plaintext)
 
 **Characteristics**:
 - Network latency: ~10-100ms per operation (network dependent)
@@ -408,12 +591,16 @@ When `@cache` is used without explicit `backend` parameter, resolution follows t
 ### 1. Explicit Backend Parameter (Highest Priority)
 
 ```python notest
-custom_backend = HTTPBackend("https://api.example.com")
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+custom_backend = CachekitIOBackend()
 
 @cache(backend=custom_backend)  # Uses custom backend explicitly
 def explicit_backend():
     return data()
 ```
+
+`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` and passes it as an explicit `backend` kwarg. No magic, just convenience.
 
 ### 2. Default RedisBackend (Middle Priority)
 
@@ -449,7 +636,8 @@ REDIS_URL=redis://localhost:6379/0
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
 | **File** | 100μs-5ms | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Production default |
-| **HTTP API** | 10-100ms | Cloud services, multi-region | Network dependent |
+| **CachekitIO** | ~10-50ms | Managed SaaS, zero-ops | HTTP/2, region-dependent; closed alpha |
+| **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
 | **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |
 | **Memcached** | 1-5ms | Alternative to Redis | No persistence |
 
@@ -469,11 +657,16 @@ REDIS_URL=redis://localhost:6379/0
 - You're building a typical web application
 - You require multi-process or distributed caching
 
-**Use HTTPBackend when**:
-- You're using a cloud cache service
-- Your cache needs to be globally distributed
-- You want to decouple cache from application
-- You're building a zero-knowledge caching system
+**Use CachekitIOBackend when** *(closed alpha — [request access](https://cachekit.io))*:
+- You want managed, zero-ops distributed caching
+- Multi-region caching without operating Redis
+- Building zero-knowledge architecture with `@cache.secure`
+- Team velocity matters more than absolute lowest latency
+
+**Use a custom HTTPBackend when**:
+- You're integrating a cloud cache service with a non-standard API
+- Your cache needs to be globally distributed via a custom service
+- You want to decouple cache from application with your own HTTP layer
 
 **Use DynamoDBBackend when**:
 - You're fully on AWS and serverless
@@ -532,6 +725,6 @@ def test_custom_backend():
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
-*Last Updated: 2025-12-02*
+*Last Updated: 2026-03-18*
 
 </div>
