@@ -2,9 +2,9 @@
 
 # cachekit
 
-> **Redis caching, batteries included**
+> **Python caching, batteries included**
 
-Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance.
+Production-ready caching for Python with intelligent reliability features and Rust-powered performance.
 
 [![PyPI Version][pypi-badge]][pypi-url]
 [![Python Versions][python-badge]][pypi-url]
@@ -65,7 +65,7 @@ Or with [uv][uv-url] (recommended):
 uv add cachekit
 ```
 
-### Setup
+### Setup (Redis — recommended default)
 
 ```bash
 # Run Redis locally or use your existing infrastructure
@@ -82,6 +82,33 @@ def expensive_api_call(user_id: int):
 
 > [!TIP]
 > No Redis? No worries! Use `@cache(backend=None)` for L1-only in-memory caching, like `lru_cache`, but with all the bells and whistles.
+
+### More Backends
+
+<details>
+<summary><strong>CachekitIO — Managed SaaS (Alpha)</strong></summary>
+
+```python notest
+import os
+from cachekit import cache
+
+# Set your CachekitIO API key
+# export CACHEKIT_API_KEY="your-api-key"  # pragma: allowlist secret
+
+@cache.io()  # Uses CachekitIO SaaS backend — no Redis to manage
+def expensive_api_call(user_id: int):
+    return fetch_user_data(user_id)
+```
+
+*cachekit.io is in closed alpha — [request access](https://cachekit.io) to get started.*
+
+</details>
+
+---
+
+> **CachekitIO Cloud (Alpha)**
+> Managed caching with zero infrastructure. L1+L2 caching, circuit breaker, and automatic failover — no Redis to manage.
+> *cachekit.io is in closed alpha — [request access](https://cachekit.io) to get started.*
 
 ---
 
@@ -106,14 +133,15 @@ def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
-| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` |
-|:--------|:----------------:|:-------------------:|:---------------:|
-| Circuit Breaker | - | ✅ | ✅ |
-| Adaptive Timeouts | - | ✅ | ✅ |
-| Monitoring | - | ✅ Full | ✅ Full |
-| Integrity Checking | - | ✅ Enabled | ✅ Enforced |
-| Encryption | - | - | ✅ Required |
-| **Use Case** | High throughput | Production reliability | Compliance/security |
+| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` | `@cache.io()` |
+|:--------|:----------------:|:-------------------:|:---------------:|:-------------:|
+| Circuit Breaker | - | ✅ | ✅ | ✅ |
+| Adaptive Timeouts | - | ✅ | ✅ | ✅ |
+| Monitoring | - | ✅ Full | ✅ Full | ✅ Full |
+| Integrity Checking | - | ✅ Enabled | ✅ Enforced | ✅ Enabled |
+| Encryption | - | - | ✅ Required | - |
+| Backend | Redis | Redis | Redis | CachekitIO SaaS |
+| **Use Case** | High throughput | Production reliability | Compliance/security | Managed cloud |
 
 <details>
 <summary><strong>Additional Presets</strong></summary>
@@ -146,8 +174,9 @@ def test_cached_function():
 │  │   Breaker   │  │  Timeouts   │  │      Locking        │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
-│  L1 Cache (In-Memory)  │  L2 Cache (Redis/Backend)         │
-│       ~50ns            │         ~2-7ms                     │
+│  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)     │
+│       ~50ns            │  Redis / CachekitIO / File         │
+│                        │         ~2-50ms                    │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
@@ -169,7 +198,7 @@ def test_cached_function():
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
-- Pluggable backend abstraction (Redis, File, HTTP, DynamoDB, custom)
+- Pluggable backend abstraction (Redis, CachekitIO, File, HTTP, DynamoDB, custom)
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.
@@ -317,6 +346,10 @@ print(expensive_func.cache_info())
 # Redis Connection (priority: CACHEKIT_REDIS_URL > REDIS_URL)
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
+
+# CachekitIO SaaS Backend (closed alpha — request access at cachekit.io)
+CACHEKIT_API_KEY="your-api-key"             # Required for @cache.io()  # pragma: allowlist secret
+CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
 
 # Optional Configuration
 CACHEKIT_DEFAULT_TTL=3600

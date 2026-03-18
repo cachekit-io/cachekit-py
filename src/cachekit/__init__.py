@@ -1,29 +1,31 @@
 r"""cachekit - Caching decorator for Python applications.
 
-A robust, production-ready Python library that provides intelligent Redis caching
+A robust, production-ready Python library that provides intelligent caching
 capabilities with advanced features like chunked data handling, multi-serialization
 support, distributed locking, and automatic corruption detection.
+
+Supports pluggable backends: Redis (default), CachekitIO SaaS, File, and custom.
 
 Key Features:
 - **Intelligent @cache decorator** with auto-detection and intent-based optimization
 - **Circuit breaker protection** against cascading failures
-- **Adaptive timeout adjustment** based on historical Redis latency patterns
-- **Backpressure control** to prevent Redis overload
+- **Adaptive timeout adjustment** based on historical backend latency patterns
+- **Backpressure control** to prevent backend overload
 - **Connection pooling** for optimized performance
 - **Health check methods** for comprehensive monitoring
 - **Structured logging** with correlation IDs and distributed tracing
 - **Statistics collection** for Prometheus metrics integration
 
 Architecture Overview:
-cachekit v0.1.0 provides a modular decorator architecture with intelligent
-auto-detection and intent-based optimization. The v0.1 architecture includes:
+cachekit provides a modular decorator architecture with intelligent
+auto-detection and intent-based optimization:
 
 - FeatureOrchestrator: Manages enterprise-grade reliability and monitoring features
 - Flexible configuration interface with intelligent auto-detection
 - Enhanced error handling with comprehensive safety checks
-- Streamlined connection management with optimized components
+- Pluggable backend abstraction (Redis, CachekitIO, File, custom)
 
-Born from production debugging of Redis caching failures:
+Born from production debugging of caching failures:
 - UTF-8 corruption prevention with intelligent binary data handling
 - Binary data magic byte detection and validation
 - Chunked storage for large objects with atomic operations
@@ -50,6 +52,10 @@ Example Usage:
     @cache.secure    # Security-critical functions
     def get_user_data(user_id: int) -> UserProfile:
         return db.fetch_user(user_id)
+
+    @cache.io()      # Managed SaaS backend (cachekit.io, closed alpha)
+    def get_remote_data(key: str):
+        return fetch_remote(key)
 
     # Manual configuration when needed (1% of use cases)
     @cache(ttl=3600, namespace="custom", circuit_breaker=True)
