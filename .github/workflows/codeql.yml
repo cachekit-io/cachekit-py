@@ -50,12 +50,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Python setup for accurate analysis
       - name: Set up Python
         if: matrix.language == 'python'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -68,7 +68,7 @@ jobs:
 
       # Initialize CodeQL
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@603b797f8b14b413fe025cd935a91c16c4782713 # v3
         with:
           languages: ${{ matrix.language }}
           # Use security-extended for maximum coverage
@@ -80,11 +80,11 @@ jobs:
       # Autobuild attempts to build any compiled code
       # For Python, this is largely a no-op but ensures imports resolve
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@603b797f8b14b413fe025cd935a91c16c4782713 # v3
 
       # Run CodeQL analysis
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@603b797f8b14b413fe025cd935a91c16c4782713 # v3
         with:
           category: "/language:${{ matrix.language }}"
           # Upload SARIF to GitHub Security tab
@@ -94,7 +94,7 @@ jobs:
 
       # Archive SARIF for audit trail
       - name: Upload SARIF artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codeql-sarif-${{ matrix.language }}
           path: sarif-results

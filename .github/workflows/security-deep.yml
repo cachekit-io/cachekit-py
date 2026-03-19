@@ -19,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Run Kani verification
-      uses: model-checking/kani-github-action@v1
+      uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1
       with:
         working-directory: rust
         args: --tests --no-default-features --features compression,checksum,messagepack,encryption
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 200
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Install nightly Rust
       run: |
@@ -40,7 +40,7 @@ jobs:
         rustup default nightly
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: rust
 
@@ -89,10 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v3
+      uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf # v3
       with:
         enable-cache: true
 
@@ -103,12 +103,12 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: rust
 
     - name: Cache Python virtual environment
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .venv
         key: venv-${{ runner.os }}-py3.11-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
@@ -130,7 +130,7 @@ jobs:
 
     - name: Upload crash corpus
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: atheris-crashes-${{ github.run_id }}
         path: tests/fuzzing/corpus/
@@ -150,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Install nightly Rust with Miri
       run: |
@@ -158,7 +158,7 @@ jobs:
         rustup default nightly
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: rust
 
@@ -176,7 +176,7 @@ jobs:
       matrix:
         sanitizer: [address, thread, memory]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Install nightly Rust
       run: |
@@ -188,7 +188,7 @@ jobs:
       run: rustup component add rust-src --toolchain nightly
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: rust
         key: ${{ matrix.sanitizer }}
@@ -227,7 +227,7 @@ jobs:
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Generate security report
       run: |
@@ -289,7 +289,7 @@ jobs:
         cat "$REPORT"
 
     - name: Archive security report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: security-deep-report
         path: reports/security/
