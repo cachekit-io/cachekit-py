@@ -77,14 +77,15 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
         >>> headers["X-CacheKit-L1-Status"]
         'disabled'
 
-        >>> # Graceful degradation with None
+        >>> # Graceful degradation with None (standalone usage)
         >>> headers = _inject_metrics_headers(None)
         >>> headers
-        {}
+        {'X-CacheKit-L1-Status': 'disabled'}
     """
-    # Graceful degradation: return empty dict if stats is None
+    # Graceful degradation: default to L1-Status: disabled if stats is None
+    # This ensures standalone usage with ck_sdk_* keys doesn't trigger 400 errors
     if stats is None:
-        return {}
+        return {"X-CacheKit-L1-Status": "disabled"}
 
     # Extract metrics from stats
     info = stats.get_info()
@@ -220,16 +221,14 @@ class CachekitIOBackend:
             called from within a @cache decorated function. If no stats available in
             context, headers are not injected (backward compatible).
         """
-        # Inject metrics headers if stats available in context
+        # Inject metrics headers (always — defaults to L1-Status: disabled when no stats)
         stats = get_current_function_stats()
-
-        if stats is not None:
-            metrics_headers = _inject_metrics_headers(stats)
-            # Merge with existing headers
-            if "headers" in kwargs:
-                kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
-            else:
-                kwargs["headers"] = metrics_headers
+        metrics_headers = _inject_metrics_headers(stats)
+        # Merge with existing headers
+        if "headers" in kwargs:
+            kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
+        else:
+            kwargs["headers"] = metrics_headers
 
         url = f"/v1/cache/{endpoint}"
         try:
@@ -272,16 +271,14 @@ class CachekitIOBackend:
             called from within a @cache decorated function. If no stats available in
             context, headers are not injected (backward compatible).
         """
-        # Inject metrics headers if stats available in context
+        # Inject metrics headers (always — defaults to L1-Status: disabled when no stats)
         stats = get_current_function_stats()
-
-        if stats is not None:
-            metrics_headers = _inject_metrics_headers(stats)
-            # Merge with existing headers
-            if "headers" in kwargs:
-                kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
-            else:
-                kwargs["headers"] = metrics_headers
+        metrics_headers = _inject_metrics_headers(stats)
+        # Merge with existing headers
+        if "headers" in kwargs:
+            kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
+        else:
+            kwargs["headers"] = metrics_headers
 
         url = f"/v1/cache/{endpoint}"
         try:
