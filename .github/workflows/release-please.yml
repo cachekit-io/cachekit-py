@@ -80,7 +80,7 @@ jobs:
             manylinux: "2_28"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # Use release-please tag or manual input tag
           ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
@@ -105,7 +105,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           rust-toolchain: stable
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist
@@ -116,7 +116,7 @@ jobs:
     if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
 
@@ -126,7 +126,7 @@ jobs:
           args: --out dist
           rust-toolchain: stable
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: sdist
           path: dist
@@ -140,13 +140,13 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
 
-      - uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: sdist
           path: dist
