@@ -602,17 +602,30 @@ def explicit_backend():
 
 `@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` and passes it as an explicit `backend` kwarg. No magic, just convenience.
 
-### 2. Default RedisBackend (Middle Priority)
+### 2. Module-Level Default Backend (Middle Priority)
 
-```python
-@cache()  # Automatically uses RedisBackend
-def implicit_redis():
+```python notest
+from cachekit import cache
+from cachekit.config.decorator import set_default_backend
+from cachekit.backends.file import FileBackend, FileBackendConfig
+
+# Set once at application startup
+file_backend = FileBackend(FileBackendConfig(cache_dir="/var/cache/myapp"))
+set_default_backend(file_backend)
+
+# All decorators now use file backend — no backend= needed
+@cache.minimal(ttl=300)
+def fast_lookup():
+    return data()
+
+@cache.production(ttl=600)
+def critical_function():
     return data()
 ```
 
-This uses RedisBackend configured with environment variables.
+Call `set_default_backend(None)` to clear the default. Works with any backend (Redis, File, CachekitIO, custom).
 
-### 3. Environment Variable Configuration (Lowest Priority)
+### 3. Environment Variable Auto-Detection (Lowest Priority)
 
 ```bash
 # Primary: CACHEKIT_REDIS_URL
@@ -622,10 +635,12 @@ CACHEKIT_REDIS_URL=redis://prod.example.com:6379/0
 REDIS_URL=redis://localhost:6379/0
 ```
 
+If no explicit backend and no module-level default, cachekit creates a RedisBackend from environment variables.
+
 **Resolution order**:
 1. Check for explicit `backend` parameter in `@cache(backend=...)`
-2. If not provided, create RedisBackend from environment variables
-3. Priority for Redis URL: CACHEKIT_REDIS_URL > REDIS_URL
+2. Check for module-level default via `set_default_backend()`
+3. Create RedisBackend from environment variables (CACHEKIT_REDIS_URL > REDIS_URL)
 
 ## Performance Considerations
 

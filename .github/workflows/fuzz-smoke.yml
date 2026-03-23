@@ -26,19 +26,21 @@ jobs:
     timeout-minutes: 20
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Install Rust nightly
-      uses: dtolnay/rust-toolchain@nightly
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # nightly
+        with:
+          toolchain: nightly
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         workspaces: rust/fuzz
         cache-all-crates: true
 
     - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@main
+      uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
 
     - name: Install cargo-fuzz
       run: cargo binstall --no-confirm cargo-fuzz
@@ -91,7 +93,7 @@ jobs:
 
     - name: Upload crash artifacts
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
         name: fuzz-crash-artifacts
         path: rust/fuzz/artifacts/

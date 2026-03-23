@@ -111,6 +111,13 @@ def cache(
         _explicit_l1_only = "backend" in manual_overrides and manual_overrides.get("backend") is None
         backend = manual_overrides.pop("backend", None)
 
+        # Tier 2 resolution: if no explicit backend and not L1-only mode,
+        # check module-level default set via set_default_backend()
+        if backend is None and not _explicit_l1_only:
+            from ..config.decorator import get_default_backend
+
+            backend = get_default_backend()
+
         # Backward compatibility: map flattened l1_enabled to nested l1.enabled
         if "l1_enabled" in manual_overrides:
             from cachekit.config.nested import L1CacheConfig

@@ -88,3 +88,50 @@ def test_health_check_returns_tuple(backend):
     assert "backend_type" in details
     assert details["backend_type"] == "file"
     assert "latency_ms" in details
+
+
+@pytest.mark.critical
+def test_intent_decorators_with_file_backend(tmp_path):
+    """Intent decorators work with explicit FileBackend."""
+    from cachekit import cache
+
+    fb = FileBackend(FileBackendConfig(cache_dir=tmp_path / "dec", max_size_mb=10, max_value_mb=5))
+    call_count = 0
+
+    @cache.minimal(ttl=300, backend=fb)
+    def compute(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return x * 2
+
+    assert compute(5) == 10
+    assert call_count == 1
+    assert compute(5) == 10
+    assert call_count == 1  # Cache hit
+
+
+@pytest.mark.critical
+def test_set_default_backend_with_file_backend(tmp_path):
+    """set_default_backend() is consulted when no explicit backend= provided."""
+    from cachekit import cache
+    from cachekit.config.decorator import get_default_backend, set_default_backend
+
+    fb = FileBackend(FileBackendConfig(cache_dir=tmp_path / "def", max_size_mb=10, max_value_mb=5))
+    original = get_default_backend()
+
+    try:
+        set_default_backend(fb)
+        call_count = 0
+
+        @cache.minimal(ttl=300)
+        def compute(x: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return x * 3
+
+        assert compute(4) == 12
+        assert call_count == 1
+        assert compute(4) == 12
+        assert call_count == 1  # Cache hit
+    finally:
+        set_default_backend(original)
