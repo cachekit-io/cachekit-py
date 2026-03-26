@@ -354,6 +354,87 @@ Large values (1MB):
 - Read p99: ~13μs per operation
 ```
 
+---
+
+### MemcachedBackend
+
+> Requires: `pip install cachekit[memcached]`
+
+Store cache in Memcached with consistent hashing across multiple servers:
+
+```python notest
+from cachekit.backends.memcached import MemcachedBackend, MemcachedBackendConfig
+from cachekit import cache
+
+# Use default configuration (127.0.0.1:11211)
+backend = MemcachedBackend()
+
+@cache(backend=backend)
+def cached_function():
+    return expensive_computation()
+```
+
+**Configuration via environment variables**:
+
+```bash
+# Server list (JSON array format)
+export CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'
+
+# Timeouts
+export CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0    # Default: 2.0 seconds
+export CACHEKIT_MEMCACHED_TIMEOUT=1.0             # Default: 1.0 seconds
+
+# Connection pool
+export CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 per server
+export CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2
+
+# Optional key prefix
+export CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"     # Default: "" (none)
+```
+
+**Configuration via Python**:
+
+```python notest
+from cachekit.backends.memcached import MemcachedBackend, MemcachedBackendConfig
+
+config = MemcachedBackendConfig(
+    servers=["mc1:11211", "mc2:11211", "mc3:11211"],
+    connect_timeout=1.0,
+    timeout=0.5,
+    max_pool_size=20,
+    key_prefix="myapp:",
+)
+
+backend = MemcachedBackend(config)
+```
+
+**When to use**:
+- Hot in-memory caching with sub-millisecond reads
+- Shared cache across multiple processes/pods (like Redis but simpler)
+- High-throughput read-heavy workloads
+- Applications already using Memcached infrastructure
+
+**When NOT to use**:
+- Need persistence (Memcached is volatile — data lost on restart)
+- Need distributed locking (use Redis instead)
+- Need TTL inspection/refresh (Memcached doesn't support it)
+- Cache values exceed 1MB (Memcached default slab limit)
+
+**Characteristics**:
+- Latency: 1-5ms per operation (network-dependent)
+- Throughput: Very high (multi-threaded C server)
+- TTL support: Yes (max 30 days)
+- Cross-process: Yes (shared across pods)
+- Persistence: No (volatile memory only)
+- Consistent hashing: Yes (via pymemcache HashClient)
+
+**Limitations**:
+1. **No persistence**: All data is in-memory. Server restart = data loss.
+2. **No locking**: No distributed lock support (use Redis for stampede prevention).
+3. **30-day TTL maximum**: TTLs exceeding 30 days are automatically clamped.
+4. **1MB value limit**: Default Memcached slab size limits values to ~1MB.
+5. **No TTL inspection**: Cannot query remaining TTL on a key.
+
 ## Encrypted SaaS Pattern (Zero-Knowledge)
 
 > *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
@@ -671,6 +752,12 @@ If no explicit backend and no module-level default, cachekit creates a RedisBack
 - You need persistence options
 - You're building a typical web application
 - You require multi-process or distributed caching
+
+**Use MemcachedBackend when**:
+- Hot in-memory caching with very high throughput
+- Simple key-value caching without persistence needs
+- Existing Memcached infrastructure you want to reuse
+- Read-heavy workloads where sub-5ms latency is sufficient
 
 **Use CachekitIOBackend when** *(closed alpha — [request access](https://cachekit.io))*:
 - You want managed, zero-ops distributed caching

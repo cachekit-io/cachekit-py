@@ -79,6 +79,9 @@ data = [
     "pandas>=1.3.0",
     "pyarrow>=21.0.0",
 ]
+memcached = [
+    "pymemcache>=4.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/cachekit-io/cachekit-py"
@@ -205,6 +208,7 @@ dev = [
     "pytest-cov>=7.0.0",
     "pytest-markdown-docs>=0.6.0",
     "pytest-redis>=3.0.0",
+    "pymemcache>=4.0.0",
     # Code quality
     "basedpyright>=1.32.1",
     "ruff>=0.6.0",
