@@ -113,6 +113,42 @@ class TestBasicOperations:
         result = backend.exists("mykey")
         assert result is False
 
+    def test_get_raises_backend_error_on_failure(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
+        """Test get wraps exceptions in BackendError."""
+        from cachekit.backends.errors import BackendError
+
+        mock_hash_client.get.side_effect = ConnectionError("refused")
+        with pytest.raises(BackendError) as exc_info:
+            backend.get("key")
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+
+    def test_set_raises_backend_error_on_failure(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
+        """Test set wraps exceptions in BackendError."""
+        from cachekit.backends.errors import BackendError
+
+        mock_hash_client.set.side_effect = ConnectionError("refused")
+        with pytest.raises(BackendError) as exc_info:
+            backend.set("key", b"val", ttl=60)
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+
+    def test_delete_raises_backend_error_on_failure(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
+        """Test delete wraps exceptions in BackendError."""
+        from cachekit.backends.errors import BackendError
+
+        mock_hash_client.delete.side_effect = ConnectionError("refused")
+        with pytest.raises(BackendError) as exc_info:
+            backend.delete("key")
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+
+    def test_exists_raises_backend_error_on_failure(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
+        """Test exists wraps exceptions in BackendError."""
+        from cachekit.backends.errors import BackendError
+
+        mock_hash_client.get.side_effect = ConnectionError("refused")
+        with pytest.raises(BackendError) as exc_info:
+            backend.exists("key")
+        assert exc_info.value.error_type == BackendErrorType.TRANSIENT
+
 
 @pytest.mark.unit
 class TestTTLBehavior:
@@ -300,3 +336,22 @@ class TestHealthCheck:
         assert isinstance(details["latency_ms"], float)
         assert "error" in details
         assert details["configured_servers"] == 1
+
+
+@pytest.mark.unit
+class TestLazyImport:
+    """Test __getattr__ lazy import in backends/__init__.py."""
+
+    def test_lazy_import_memcached_backend(self) -> None:
+        """Test MemcachedBackend can be imported via lazy __getattr__."""
+        from cachekit.backends import MemcachedBackend
+
+        assert MemcachedBackend is not None
+        assert callable(MemcachedBackend)
+
+    def test_lazy_import_unknown_raises_attribute_error(self) -> None:
+        """Test unknown attribute raises AttributeError."""
+        import cachekit.backends
+
+        with pytest.raises(AttributeError, match="has no attribute"):
+            _ = cachekit.backends.NoSuchBackend  # type: ignore[attr-defined]
