@@ -105,6 +105,13 @@ class MemcachedBackendConfig(BaseBackendConfig):
         for server in v:
             if ":" not in server:
                 raise ValueError(f"Server address must be in 'host:port' format, got: {server!r}")
+            _, port_str = server.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                raise ValueError(f"Port must be numeric, got: {server!r}") from None
+            if not (1 <= port <= 65535):
+                raise ValueError(f"Port must be 1-65535, got {port} in {server!r}")
         return v
 
     @classmethod

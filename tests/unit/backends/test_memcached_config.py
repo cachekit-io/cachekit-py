@@ -214,6 +214,25 @@ class TestMemcachedBackendConfigValidation:
         errors = exc_info.value.errors()
         assert any("host:port" in str(e) for e in errors)
 
+    def test_servers_rejects_non_numeric_port(self):
+        """Test that servers rejects non-numeric port."""
+        with pytest.raises(ValidationError) as exc_info:
+            MemcachedBackendConfig(servers=["mc1:abc"])
+        errors = exc_info.value.errors()
+        assert any("numeric" in str(e).lower() for e in errors)
+
+    def test_servers_rejects_port_out_of_range(self):
+        """Test that servers rejects port outside 1-65535."""
+        with pytest.raises(ValidationError) as exc_info:
+            MemcachedBackendConfig(servers=["mc1:0"])
+        errors = exc_info.value.errors()
+        assert any("1-65535" in str(e) for e in errors)
+
+        with pytest.raises(ValidationError) as exc_info:
+            MemcachedBackendConfig(servers=["mc1:70000"])
+        errors = exc_info.value.errors()
+        assert any("1-65535" in str(e) for e in errors)
+
     def test_extra_fields_rejected(self):
         """Test that extra fields are rejected due to extra='forbid'."""
         with pytest.raises(ValidationError) as exc_info:

@@ -165,7 +165,7 @@ class MemcachedBackend:
         start = time.perf_counter()
         try:
             # HashClient has no stats() — probe with a harmless get
-            self._client.get("__cachekit_health__")
+            self._client.get(self._prefixed_key("__cachekit_health__"))
             elapsed_ms = (time.perf_counter() - start) * 1000
             return (
                 True,

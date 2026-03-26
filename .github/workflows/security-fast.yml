@@ -118,7 +118,9 @@ jobs:
 
     - name: Run pip-audit
       run: |
-        uv run pip-audit --desc --format json --output pip-audit-report.json
+        # GHSA-5239-wwwm-4pmq: pygments ReDoS in AdlLexer (dev-only, no fix available)
+        uv run pip-audit --desc --format json --output pip-audit-report.json \
+          --ignore-vuln GHSA-5239-wwwm-4pmq
 
     - name: Upload report
       if: always()
