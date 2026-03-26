@@ -675,7 +675,7 @@ def create_cache_wrapper(
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                 try:
-                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes)
+                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                     features.set_operation_context("l1_get", duration_ms=0.001)
                     features.record_success()
@@ -970,7 +970,7 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes)
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                         features.set_operation_context("l1_get", duration_ms=0.001)
                         features.record_success()
@@ -1032,7 +1032,7 @@ def create_cache_wrapper(
 
                 if cached_data is not None:
                     # Deserialize the cached data
-                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                    result = operation_handler.serialization_handler.deserialize_data(cached_data, cache_key=cache_key)
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1106,7 +1106,9 @@ def create_cache_wrapper(
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
                                     # Another request filled the cache while we waited
-                                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                                    result = operation_handler.serialization_handler.deserialize_data(
+                                        cached_data, cache_key=cache_key
+                                    )
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1129,7 +1131,9 @@ def create_cache_wrapper(
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
                                     # Cache was populated while waiting - use it
-                                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                                    result = operation_handler.serialization_handler.deserialize_data(
+                                        cached_data, cache_key=cache_key
+                                    )
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
