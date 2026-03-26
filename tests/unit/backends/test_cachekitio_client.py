@@ -4,7 +4,7 @@ Tests for backends/cachekitio/client.py covering:
 - Thread-local caching (same client returned on repeated calls)
 - Client configuration (base_url, timeout, Authorization header)
 - Cleanup via close_sync_client() and close_async_client()
-- reset_global_client() clears all thread-local references
+- reset_global_client() clears thread-local references
 - New client created after reset
 """
 
