@@ -16,6 +16,8 @@ from pydantic import ValidationError
 
 from cachekit.backends.file.config import FileBackendConfig
 
+pytestmark = pytest.mark.unit
+
 
 class TestFileBackendConfigDefaults:
     """Test default configuration values."""

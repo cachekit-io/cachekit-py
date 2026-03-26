@@ -1,11 +1,11 @@
 """Pytest configuration for critical path tests.
 
-Override autouse fixtures that aren't needed for FileBackend/MemcachedBackend tests.
+Override autouse fixtures that aren't needed for non-Redis backend tests.
 """
 
 
 def pytest_runtest_setup(item):
-    """Skip redis setup for file backend and cachekitio metrics tests."""
+    """Skip redis setup for non-Redis backend critical tests."""
     skip_redis = (
         "file_backend" in item.nodeid
         or "cachekitio_metrics" in item.nodeid

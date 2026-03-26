@@ -9,6 +9,8 @@ from cachekit.backends.cachekitio.config import (
     is_private_ip,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestIsPrivateIP:
     """Tests for is_private_ip function."""
