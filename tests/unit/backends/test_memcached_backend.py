@@ -280,28 +280,18 @@ class TestHealthCheck:
 
     def test_healthy_returns_true_with_details(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test health_check returns (True, details) when server responds."""
-        mock_hash_client.stats.return_value = {("127.0.0.1", 11211): {"pid": "1234"}}
+        mock_hash_client.get.return_value = None  # health probe uses get()
         is_healthy, details = backend.health_check()
 
         assert is_healthy is True
         assert details["backend_type"] == "memcached"
         assert "latency_ms" in details
         assert isinstance(details["latency_ms"], float)
-        assert details["servers"] == 1
         assert details["configured_servers"] == 1
-
-    def test_unhealthy_on_empty_stats(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
-        """Test health_check returns (False, ...) when no servers respond."""
-        mock_hash_client.stats.return_value = {}
-        is_healthy, details = backend.health_check()
-
-        assert is_healthy is False
-        assert details["backend_type"] == "memcached"
-        assert details["servers"] == 0
 
     def test_unhealthy_on_exception(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test health_check returns (False, details) on exception."""
-        mock_hash_client.stats.side_effect = ConnectionError("Connection refused")
+        mock_hash_client.get.side_effect = ConnectionError("Connection refused")
         is_healthy, details = backend.health_check()
 
         assert is_healthy is False
@@ -309,5 +299,4 @@ class TestHealthCheck:
         assert "latency_ms" in details
         assert isinstance(details["latency_ms"], float)
         assert "error" in details
-        assert details["servers"] == 0
         assert details["configured_servers"] == 1

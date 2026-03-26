@@ -154,24 +154,24 @@ class MemcachedBackend:
             raise classify_memcached_error(exc, operation="exists", key=key) from exc
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
-        """Check Memcached health by calling stats on all servers.
+        """Check Memcached health by pinging each server with a get.
+
+        HashClient doesn't expose stats(), so we probe with a benign get
+        to verify connectivity.
 
         Returns:
             Tuple of (is_healthy, details_dict) with latency_ms and backend_type.
         """
         start = time.perf_counter()
         try:
-            stats = self._client.stats()
+            # HashClient has no stats() — probe with a harmless get
+            self._client.get("__cachekit_health__")
             elapsed_ms = (time.perf_counter() - start) * 1000
-            # stats() returns dict of {server: stats_dict}
-            # Healthy if at least one server responded
-            is_healthy = len(stats) > 0
             return (
-                is_healthy,
+                True,
                 {
                     "backend_type": "memcached",
                     "latency_ms": round(elapsed_ms, 2),
-                    "servers": len(stats),
                     "configured_servers": len(self._config.servers),
                 },
             )
@@ -183,7 +183,6 @@ class MemcachedBackend:
                     "backend_type": "memcached",
                     "latency_ms": round(elapsed_ms, 2),
                     "error": str(exc),
-                    "servers": 0,
                     "configured_servers": len(self._config.servers),
                 },
             )

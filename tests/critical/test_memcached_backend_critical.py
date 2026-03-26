@@ -99,7 +99,7 @@ def test_health_check_returns_tuple(backend):
     assert details["backend_type"] == "memcached"
     assert "latency_ms" in details
     assert isinstance(details["latency_ms"], float)
-    assert details["servers"] == 1
+    assert details["configured_servers"] == 1
 
 
 @pytest.mark.critical
