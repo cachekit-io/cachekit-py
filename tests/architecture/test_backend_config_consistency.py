@@ -18,6 +18,7 @@ import pytest
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
+from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 
 # All backend config classes that must follow the pattern
@@ -25,6 +26,7 @@ BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     RedisBackendConfig,
     FileBackendConfig,
     CachekitIOBackendConfig,
+    MemcachedBackendConfig,
 ]
 
 # Required model_config settings from BaseBackendConfig
