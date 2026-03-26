@@ -3,7 +3,13 @@
 These tests cover core MemcachedBackend functionality with mocked pymemcache:
 - Basic get/set/delete roundtrips
 - exists() checks
-- health_check() implementation
+- health_check() implementation (healthy + unhealthy)
+- Error path coverage (all operations raise BackendError)
+- Key prefix application
+- TTL clamping to 30-day max
+- Error classification (all pymemcache exception types)
+- Lazy import via __getattr__
+- Config validation edge cases
 - Intent decorator integration
 - Default backend integration
 
@@ -13,12 +19,15 @@ Marked with @pytest.mark.critical for fast CI runs.
 
 from __future__ import annotations
 
+import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.backend import MemcachedBackend
-from cachekit.backends.memcached.config import MemcachedBackendConfig
+from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
+from cachekit.backends.memcached.error_handler import classify_memcached_error
 
 
 @pytest.fixture
@@ -100,6 +109,157 @@ def test_health_check_returns_tuple(backend):
     assert "latency_ms" in details
     assert isinstance(details["latency_ms"], float)
     assert details["configured_servers"] == 1
+
+
+@pytest.mark.critical
+def test_health_check_unhealthy(mock_hash_client):
+    """health_check() returns (False, ...) when server is down."""
+    mock_hash_client.get.side_effect = ConnectionError("refused")
+    backend = MemcachedBackend(MemcachedBackendConfig())
+    is_healthy, details = backend.health_check()
+
+    assert is_healthy is False
+    assert "error" in details
+    assert details["backend_type"] == "memcached"
+
+
+@pytest.mark.critical
+def test_error_paths_raise_backend_error(mock_hash_client):
+    """All operations wrap exceptions in BackendError."""
+    backend = MemcachedBackend(MemcachedBackendConfig())
+
+    # get error path
+    mock_hash_client.get.side_effect = ConnectionError("refused")
+    with pytest.raises(BackendError):
+        backend.get("key")
+
+    # set error path
+    mock_hash_client.set.side_effect = ConnectionError("refused")
+    with pytest.raises(BackendError):
+        backend.set("key", b"val", ttl=60)
+
+    # delete error path
+    mock_hash_client.delete.side_effect = ConnectionError("refused")
+    with pytest.raises(BackendError):
+        backend.delete("key")
+
+    # exists error path (uses get internally)
+    with pytest.raises(BackendError):
+        backend.exists("key")
+
+
+@pytest.mark.critical
+def test_key_prefix_applied(mock_hash_client):
+    """Key prefix is prepended to all operations."""
+    backend = MemcachedBackend(MemcachedBackendConfig(key_prefix="app:"))
+    mock_hash_client.get.return_value = b"data"
+    backend.get("mykey")
+    mock_hash_client.get.assert_called_with("app:mykey")
+
+
+@pytest.mark.critical
+def test_ttl_clamped_to_30_day_max(mock_hash_client):
+    """TTL exceeding 30 days is clamped, not rejected."""
+    backend = MemcachedBackend(MemcachedBackendConfig())
+    huge_ttl = MAX_MEMCACHED_TTL + 86400  # 31 days
+    backend.set("key", b"val", ttl=huge_ttl)
+    mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL)
+
+
+@pytest.mark.critical
+def test_ttl_none_and_zero_mean_no_expiry(mock_hash_client):
+    """TTL=None and TTL=0 both pass expire=0 (no expiry)."""
+    backend = MemcachedBackend(MemcachedBackendConfig())
+
+    backend.set("k1", b"v1", ttl=None)
+    mock_hash_client.set.assert_called_with("k1", b"v1", expire=0)
+
+    backend.set("k2", b"v2", ttl=0)
+    mock_hash_client.set.assert_called_with("k2", b"v2", expire=0)
+
+
+@pytest.mark.critical
+def test_error_classification_all_types():
+    """classify_memcached_error covers timeout, transient, permanent, unknown."""
+    from pymemcache.exceptions import (
+        MemcacheClientError,
+        MemcacheServerError,
+        MemcacheUnexpectedCloseError,
+    )
+
+    # Timeout
+    err = classify_memcached_error(socket.timeout("timed out"), operation="get")
+    assert err.error_type == BackendErrorType.TIMEOUT
+
+    # Transient — connection close
+    err = classify_memcached_error(MemcacheUnexpectedCloseError(), operation="get")
+    assert err.error_type == BackendErrorType.TRANSIENT
+
+    # Transient — server error
+    err = classify_memcached_error(MemcacheServerError("error"), operation="set")
+    assert err.error_type == BackendErrorType.TRANSIENT
+
+    # Transient — ConnectionError
+    err = classify_memcached_error(ConnectionError("refused"), operation="get")
+    assert err.error_type == BackendErrorType.TRANSIENT
+
+    # Permanent — client error
+    err = classify_memcached_error(MemcacheClientError("bad key"), operation="set")
+    assert err.error_type == BackendErrorType.PERMANENT
+
+    # Unknown — fallback
+    err = classify_memcached_error(RuntimeError("weird"), operation="get")
+    assert err.error_type == BackendErrorType.UNKNOWN
+
+
+@pytest.mark.critical
+def test_lazy_import_memcached_backend():
+    """MemcachedBackend is importable via lazy __getattr__ in backends/__init__."""
+    from cachekit.backends import MemcachedBackend as LazyMB
+
+    assert LazyMB is MemcachedBackend
+
+
+@pytest.mark.critical
+def test_lazy_import_unknown_raises():
+    """Unknown attribute on backends package raises AttributeError."""
+    import cachekit.backends
+
+    with pytest.raises(AttributeError, match="has no attribute"):
+        _ = cachekit.backends.NoSuchBackend  # type: ignore[attr-defined]
+
+
+@pytest.mark.critical
+def test_config_validates_port():
+    """Config rejects non-numeric and out-of-range ports."""
+    from pydantic import ValidationError
+
+    # Empty server list
+    with pytest.raises(ValidationError):
+        MemcachedBackendConfig(servers=[])
+
+    # No colon (missing port)
+    with pytest.raises(ValidationError):
+        MemcachedBackendConfig(servers=["localhost"])
+
+    # Non-numeric port
+    with pytest.raises(ValidationError):
+        MemcachedBackendConfig(servers=["mc1:abc"])
+
+    # Port out of range
+    with pytest.raises(ValidationError):
+        MemcachedBackendConfig(servers=["mc1:0"])
+
+    with pytest.raises(ValidationError):
+        MemcachedBackendConfig(servers=["mc1:70000"])
+
+
+@pytest.mark.critical
+def test_config_from_env():
+    """from_env() returns a valid config with defaults."""
+    config = MemcachedBackendConfig.from_env()
+    assert config.servers == ["127.0.0.1:11211"]
+    assert config.connect_timeout == 2.0
 
 
 @pytest.mark.critical
