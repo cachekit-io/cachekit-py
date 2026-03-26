@@ -25,7 +25,6 @@ def get_session_id() -> str:
         Session ID is a valid UUID format:
 
         >>> import uuid
-        >>> reset_session_id()  # Start fresh
         >>> session_id = get_session_id()
         >>> uuid.UUID(session_id)  # Validates UUID format  # doctest: +ELLIPSIS
         UUID('...')
@@ -41,26 +40,3 @@ def get_session_id() -> str:
     if _session_id is None:
         _session_id = str(uuid.uuid4())
     return _session_id
-
-
-def reset_session_id() -> None:
-    """Reset session ID (primarily for testing).
-
-    Forces a new session ID to be generated on the next get_session_id() call.
-
-    Examples:
-        Reset generates new session ID:
-
-        >>> old_id = get_session_id()
-        >>> reset_session_id()
-        >>> new_id = get_session_id()
-        >>> old_id != new_id
-        True
-
-        Safe to call multiple times:
-
-        >>> reset_session_id()
-        >>> reset_session_id()  # No error
-    """
-    global _session_id
-    _session_id = None
