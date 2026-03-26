@@ -428,7 +428,6 @@ def create_cache_wrapper(
     use_collect_stats = collect_stats and not fast_mode
     # use_enable_tracing = enable_tracing and not fast_mode  # Not used after CacheConfig removal
     use_enable_structured_logging = enable_structured_logging and not fast_mode
-    use_pipelined = pipelined  # Keep enabled: pipelining reduces network roundtrips
 
     # Initialize handler components
     # Pre-compute function hash at decoration time (50-200μs savings)
@@ -492,7 +491,6 @@ def create_cache_wrapper(
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
-    _use_pipelined = use_pipelined
 
     # FIX: Initialize L1 cache if enabled
     _l1_cache = get_l1_cache(namespace or "default") if l1_enabled else None
@@ -617,7 +615,6 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
 
         # L1+L2 MODE: Original behavior with backend initialization
-        lock_key = f"{cache_key}:lock"
 
         with features.create_span("redis_cache", span_attributes) as span:
             try:
