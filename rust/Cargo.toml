@@ -1,6 +1,6 @@
 [package]
 name = "cachekit-rs"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 authors = ["cachekit Contributors"]
 description = "High-performance storage engine for caching with compression and encryption"
