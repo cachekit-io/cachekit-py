@@ -30,6 +30,7 @@ Choose your storage backend:
 | [File](backends/file.md) | Local filesystem, zero dependencies |
 | [Memcached](backends/memcached.md) | High-throughput, consistent hashing |
 | [CachekitIO](backends/cachekitio.md) | Managed SaaS, zero infrastructure |
+| [L1-Only (None)](backends/none.md) | In-memory only, no external services |
 | [Custom](backends/custom.md) | Implement your own backend |
 
 ## Serializers

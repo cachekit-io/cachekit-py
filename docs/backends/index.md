@@ -2,7 +2,7 @@
 
 # Backend Guide
 
-Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis (default), File (local), Memcached, and CachekitIO (managed SaaS). You can also implement custom backends for any key-value store.
+Pluggable L2 cache storage for cachekit. Four backends are included out of the box — Redis (default), File (local), Memcached, and CachekitIO (managed SaaS). You can also run in [L1-only mode](none.md) with `backend=None`, or implement custom backends for any key-value store.
 
 ## Overview
 
