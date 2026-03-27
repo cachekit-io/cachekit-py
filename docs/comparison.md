@@ -516,7 +516,7 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 2. **Multi-pod?** Read [Circuit Breaker](features/circuit-breaker.md) + [Distributed Locking](features/distributed-locking.md)
 3. **Need encryption?** See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md)
 4. **Want metrics?** Check out [Prometheus Metrics](features/prometheus-metrics.md)
-5. **Performance critical?** Review [Serializer Guide](guides/serializer-guide.md)
+5. **Performance critical?** Review [Serializer Guide](serializers/index.md)
 
 ## See Also
 

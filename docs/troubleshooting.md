@@ -120,7 +120,7 @@ def get_user(user_id: int) -> dict:
     return user.model_dump()  # Explicit conversion
 ```
 
-   **Why not auto-detect Pydantic models?** See [Serializer Guide - Caching Pydantic Models](guides/serializer-guide.md#caching-pydantic-models) for the detailed rationale.
+   **Why not auto-detect Pydantic models?** See [Serializer Guide - Caching Pydantic Models](serializers/pydantic.md) for the detailed rationale.
 
 5. **Check what serializer is installed**:
 ```python notest

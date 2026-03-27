@@ -820,8 +820,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 - [Performance Guide](performance.md) - Real latency measurements and optimization strategies
 - [Comparison Guide](comparison.md) - How cachekit's architecture compares to alternatives
-- [Backend Guide](guides/backend-guide.md) - Implement custom storage backends
-- [Serializer Guide](guides/serializer-guide.md) - Choose the right data format
+- [Backend Guide](backends/index.md) - Implement custom storage backends
+- [Serializer Guide](serializers/index.md) - Choose the right data format
 - [Circuit Breaker](features/circuit-breaker.md) - Failure protection mechanism
 - [Distributed Locking](features/distributed-locking.md) - Cache stampede prevention
 

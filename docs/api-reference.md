@@ -786,7 +786,7 @@ For error examples and handling patterns, see [Troubleshooting Guide](troublesho
 
 cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Built-in backends include Redis, CachekitIO, File, and Memcached. You can also implement custom backends for any key-value store.
 
-For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](guides/backend-guide.md)**.
+For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](backends/index.md)**.
 
 ### Backend Resolution Priority
 
@@ -829,7 +829,7 @@ def local_only_cache():
 
 **Note**: L1-only mode is process-local and not shared across pods/workers. Use for development or single-process applications only.
 
-For complete backend implementation details, see [Backend Guide - BaseBackend Protocol](guides/backend-guide.md#basebackend-protocol) and [Backend Guide - Custom Implementation](guides/backend-guide.md#custom-backend-implementation).
+For complete backend implementation details, see [Backend Guide - BaseBackend Protocol](backends/index.md#basebackend-protocol) and [Backend Guide - Custom Implementation](backends/custom.md).
 
 
 ## Environment Variables
@@ -957,8 +957,8 @@ def get_reference_data(): ...
 ## See Also
 
 ### Related Guides
-- [Serializer Guide](guides/serializer-guide.md) - Choose the right serializer for your data types
-- [Backend Guide](guides/backend-guide.md) - Custom storage backend implementation
+- [Serializer Guide](serializers/index.md) - Choose the right serializer for your data types
+- [Backend Guide](backends/index.md) - Custom storage backend implementation
 - [Configuration Guide](configuration.md) - Environment variable setup and tuning
 - [Troubleshooting Guide](troubleshooting.md) - Debugging and error solutions
 - [Error Codes](error-codes.md) - Complete error code reference

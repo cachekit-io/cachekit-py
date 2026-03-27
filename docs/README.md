@@ -65,7 +65,7 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 |:----:|:------|:---------------|
 | 1 | [Getting Started](getting-started.md) | Basic `@cache.io` decorator |
 | 2 | [Configuration Guide](configuration.md) | `CACHEKIT_API_KEY` and connection setup |
-| 3 | [Backend Guide](guides/backend-guide.md) | CachekitIOBackend and multi-backend patterns |
+| 3 | [Backend Guide](backends/index.md) | CachekitIOBackend and multi-backend patterns |
 
 ---
 
@@ -75,8 +75,8 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 
 | Guide | Description |
 |:------|:------------|
-| [Serializer Guide](guides/serializer-guide.md) | Choose the right serializer for your data |
-| [Backend Guide](guides/backend-guide.md) | Storage backends (Redis, CachekitIO, File, Memcached, custom) |
+| [Serializer Guide](serializers/index.md) | Choose the right serializer for your data |
+| [Backend Guide](backends/index.md) | Storage backends (Redis, CachekitIO, File, Memcached, custom) |
 
 <details>
 <summary><strong>Serializer Options</strong></summary>
@@ -132,7 +132,7 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 <summary><strong>Cache JSON API responses</strong></summary>
 
 1. Read [Quick Start](QUICK_START.md) - basic usage
-2. Check [Serializer Guide](guides/serializer-guide.md) - OrjsonSerializer for JSON
+2. Check [Serializer Guide](serializers/index.md) - OrjsonSerializer for JSON
 
 </details>
 
@@ -148,7 +148,7 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 <summary><strong>Cache DataFrames or ML features</strong></summary>
 
 1. Read [Quick Start](QUICK_START.md) - basic setup
-2. Check [Serializer Guide](guides/serializer-guide.md) - ArrowSerializer
+2. Check [Serializer Guide](serializers/index.md) - ArrowSerializer
 
 </details>
 
@@ -172,7 +172,7 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 <details>
 <summary><strong>Build a custom backend</strong></summary>
 
-1. Read [Backend Guide](guides/backend-guide.md) - protocol and examples
+1. Read [Backend Guide](backends/index.md) - protocol and examples
 2. Review [Data Flow Architecture](data-flow-architecture.md) - understand integration points
 
 </details>
@@ -234,6 +234,23 @@ docs/
 ├── performance.md                    # Benchmarks
 ├── comparison.md                     # vs. alternatives
 │
+├── backends/
+│   ├── index.md                     # Backend overview
+│   ├── redis.md                     # Redis backend
+│   ├── file.md                      # File backend
+│   ├── memcached.md                 # Memcached backend
+│   ├── cachekitio.md                # CachekitIO SaaS backend
+│   └── custom.md                    # Custom backend guide
+│
+├── serializers/
+│   ├── index.md                     # Serializer overview
+│   ├── default.md                   # Default (MessagePack)
+│   ├── orjson.md                    # OrjsonSerializer
+│   ├── arrow.md                     # ArrowSerializer
+│   ├── encryption.md                # Encryption wrapper
+│   ├── pydantic.md                  # Pydantic models
+│   └── custom.md                    # Custom serializer
+│
 ├── features/
 │   ├── circuit-breaker.md            # Failure protection
 │   ├── adaptive-timeouts.md          # Timeout tuning
@@ -243,8 +260,8 @@ docs/
 │   └── rust-serialization.md         # Rust integration
 │
 └── guides/
-    ├── serializer-guide.md           # Choose serializer
-    └── backend-guide.md              # Custom backends
+    ├── serializer-guide.md           # Redirect → serializers/
+    └── backend-guide.md              # Redirect → backends/
 ```
 
 ---

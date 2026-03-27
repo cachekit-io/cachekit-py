@@ -305,7 +305,7 @@ def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```
 
-Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](guides/backend-guide.md) for multi-server configuration.
+Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](backends/index.md) for multi-server configuration.
 
 ### File / L1-Only (Dev and Testing)
 
@@ -606,8 +606,8 @@ for i in range(3):
 | Guide | Description |
 |:------|:------------|
 | [Configuration Guide](configuration.md) | Detailed configuration and tuning |
-| [Serializer Guide](guides/serializer-guide.md) | Choose the right serializer |
-| [Backend Guide](guides/backend-guide.md) | Custom storage backends |
+| [Serializer Guide](serializers/index.md) | Choose the right serializer |
+| [Backend Guide](backends/index.md) | Custom storage backends |
 | [Circuit Breaker](features/circuit-breaker.md) | Failure protection |
 | [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) | Client-side encryption |
 | [Prometheus Metrics](features/prometheus-metrics.md) | Production observability |

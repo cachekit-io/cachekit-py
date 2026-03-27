@@ -136,7 +136,7 @@ def get_feed(user_id):
 | [API Reference](api-reference.md) | Complete decorator parameters |
 | [Configuration Guide](configuration.md) | Environment variable setup |
 | [Troubleshooting Guide](troubleshooting.md) | Common errors and solutions |
-| [Backend Guide](guides/backend-guide.md) | Custom storage backends |
+| [Backend Guide](backends/index.md) | Custom storage backends |
 
 ---
 

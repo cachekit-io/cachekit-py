@@ -126,8 +126,8 @@ def get_user_ssn(user_id):
 def operation(x):
     return sensitive_data(x)  # illustrative - sensitive_data not defined
 
-# Error: "cache.secure requires master_key parameter"
-# Solution: @cache.secure(ttl=300, master_key="a" * 64, backend=None)
+# Error: "cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable"
+# Solution: Set CACHEKIT_MASTER_KEY env var, or pass master_key= explicitly
 ```
 
 ### Invalid Key Format
@@ -457,7 +457,7 @@ export default {
 - [Comparison Guide](../comparison.md) - Only cachekit has zero-knowledge encryption
 - [Security Policy](../../SECURITY.md)
 - [Multi-Tenant Encryption](../getting-started.md#multi-tenant)
-- [Serializer Guide](../guides/serializer-guide.md) - Encryption with custom serializers
+- [Serializer Guide](../serializers/index.md) - Encryption with custom serializers
 - [Performance Benchmarks](../../tests/performance/test_encryption_overhead.py) - Evidence-based overhead measurements
 
 ---

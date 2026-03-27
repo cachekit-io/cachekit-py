@@ -80,7 +80,7 @@ Faster due to smaller serialization overhead. Same component ratios.
 - **Speedup**: **5.0x slower** than Arrow
 
 > [!IMPORTANT]
-> Use ArrowSerializer for DataFrames with 10K+ rows (see [Serializer Guide](guides/serializer-guide.md)).
+> Use ArrowSerializer for DataFrames with 10K+ rows (see [Serializer Guide](serializers/index.md)).
 
 ## L1 Cache Component Profiling
 
@@ -183,7 +183,7 @@ See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for detai
 - **Lower overhead for small data**: Faster than Arrow for <1K rows
 - **Integrated compression**: LZ4 + xxHash3-64 checksums (Rust layer)
 
-See [Serializer Guide](guides/serializer-guide.md) for decision matrix.
+See [Serializer Guide](serializers/index.md) for decision matrix.
 
 ## L2 Backend (Redis) Performance
 
@@ -479,7 +479,7 @@ Total speedup:          5.0x
 - [Data Flow Architecture](data-flow-architecture.md) - Component breakdown and latency sources
 - [Comparison Guide](comparison.md) - Performance vs. other libraries
 - [Configuration Guide](configuration.md) - Tuning for your environment
-- [Serializer Guide](guides/serializer-guide.md) - Serialization performance characteristics
+- [Serializer Guide](serializers/index.md) - Serialization performance characteristics
 - [API Reference](api-reference.md) - All configurable parameters
 
 ---
