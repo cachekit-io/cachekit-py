@@ -19,14 +19,13 @@ The backend stores opaque ciphertext only. The master key never leaves the clien
 
 ## Basic Usage
 
-```python notest
+```python
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer, ArrowSerializer
-import pandas as pd
+from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
 # Encrypted JSON (API responses, webhooks, session data)
 # Note: EncryptionWrapper requires CACHEKIT_MASTER_KEY env var or master_key param
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key="a" * 64), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex("a" * 64)), backend=None)
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_...",
@@ -34,16 +33,22 @@ def get_api_keys(tenant_id: str):
         "tenant_id": tenant_id
     }
 
-# Encrypted DataFrames (patient data, ML features)
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key="a" * 64), backend=None)
-def get_patient_records(hospital_id: int):
-    # illustrative - conn not defined
-    return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
-
 # Encrypted MessagePack (default - use @cache.secure preset)
-@cache.secure(master_key="a" * 64, backend=None)
+@cache.secure(master_key=bytes.fromhex("a" * 64), backend=None)
 def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
+```
+
+Encryption works with any serializer — including DataFrames:
+
+```python notest
+from cachekit import cache
+from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+
+# Encrypted DataFrames (patient data, ML features)
+@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex("a" * 64)), backend=None)
+def get_patient_records(hospital_id: int):
+    return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
 ```
 
 ## Composability
@@ -68,7 +73,7 @@ from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 # Client-side: Encrypt before sending to remote backend
 @cache(
     backend="https://cache.example.com/api",
-    serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key="a" * 64)
+    serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex("a" * 64))
 )
 def get_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}
