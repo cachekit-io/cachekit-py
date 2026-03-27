@@ -784,7 +784,7 @@ For error examples and handling patterns, see [Troubleshooting Guide](troublesho
 
 ## Backend Abstraction
 
-cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. While Redis is the default, you can implement custom backends for HTTP APIs, DynamoDB, file storage, or any key-value store.
+cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Built-in backends include Redis, CachekitIO, File, and Memcached. You can also implement custom backends for any key-value store.
 
 For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](guides/backend-guide.md)**.
 

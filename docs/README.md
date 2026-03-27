@@ -76,7 +76,7 @@ Cache to the edge with `@cache.io` - no Redis to manage:
 | Guide | Description |
 |:------|:------------|
 | [Serializer Guide](guides/serializer-guide.md) | Choose the right serializer for your data |
-| [Backend Guide](guides/backend-guide.md) | Custom storage backends (Redis, HTTP, DynamoDB) |
+| [Backend Guide](guides/backend-guide.md) | Storage backends (Redis, CachekitIO, File, Memcached, custom) |
 
 <details>
 <summary><strong>Serializer Options</strong></summary>

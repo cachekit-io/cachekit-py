@@ -6,7 +6,7 @@ Implement custom storage backends for L2 cache beyond the default Redis.
 
 ## Overview
 
-cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. While Redis is the default, you can implement custom backends for HTTP APIs, DynamoDB, file storage, or any key-value store.
+cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Four backends are included: Redis (default), CachekitIO (managed SaaS), File (local storage), and Memcached (optional). You can also implement custom backends for any key-value store.
 
 **Key insight**: Backends are completely optional. If you don't specify a backend, cachekit uses RedisBackend with your configured Redis connection.
 

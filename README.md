@@ -104,6 +104,26 @@ def expensive_api_call(user_id: int):
 
 </details>
 
+<details>
+<summary><strong>Memcached — Optional</strong></summary>
+
+```python notest
+from cachekit import cache
+from cachekit.backends.memcached import MemcachedBackend
+
+# pip install cachekit[memcached]
+
+backend = MemcachedBackend()  # Defaults to 127.0.0.1:11211
+
+@cache(backend=backend)
+def expensive_api_call(user_id: int):
+    return fetch_user_data(user_id)
+```
+
+*Requires: `pip install cachekit[memcached]` or `uv add cachekit[memcached]`*
+
+</details>
+
 ---
 
 > **CachekitIO Cloud (Alpha)**
@@ -175,8 +195,8 @@ def test_cached_function():
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │  L1 Cache (In-Memory)  │  L2 Cache (Pluggable Backend)     │
-│       ~50ns            │  Redis / CachekitIO / File         │
-│                        │         ~2-50ms                    │
+│       ~50ns            │  Redis / CachekitIO / File /      │
+│                        │  Memcached    ~2-50ms             │
 ├─────────────────────────────────────────────────────────────┤
 │                    Rust Core (PyO3)                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
@@ -198,7 +218,7 @@ def test_cached_function():
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
-- Pluggable backend abstraction (Redis, CachekitIO, File, HTTP, DynamoDB, custom)
+- Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.
@@ -350,6 +370,12 @@ REDIS_URL="redis://localhost:6379"           # Fallback
 # CachekitIO SaaS Backend (closed alpha — request access at cachekit.io)
 CACHEKIT_API_KEY="your-api-key"             # Required for @cache.io()  # pragma: allowlist secret
 CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
+
+# Memcached Backend (optional: pip install cachekit[memcached])
+CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'  # Default: 127.0.0.1:11211
+CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0                   # Default: 2.0 seconds
+CACHEKIT_MEMCACHED_TIMEOUT=1.0                            # Default: 1.0 seconds
+CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)
 
 # Optional Configuration
 CACHEKIT_DEFAULT_TTL=3600

@@ -8,15 +8,16 @@
 
 ## Backend Options
 
-cachekit supports three backends. Pick the one that fits your infrastructure:
+cachekit supports four backends. Pick the one that fits your infrastructure:
 
 | Backend | Best For | Required Config |
 |---------|----------|----------------|
 | Redis | Self-hosted, full control | `CACHEKIT_REDIS_URL` |
 | CachekitIO | Managed, zero-ops | `CACHEKIT_API_KEY` |
 | File | Local dev, testing | None |
+| Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 
-**Redis is the recommended default.** CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only.
+**Redis is the recommended default.** CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
 
 ### Redis Backend
 
@@ -46,6 +47,14 @@ Zero-ops managed caching via the cachekit.io SaaS API. No Redis to provision or 
 File-based cache for local development and testing. No external services required.
 
 **Configuration:** See the [File Backend](#file-backend-environment-variables) section below.
+
+### Memcached Backend
+
+> Requires: `pip install cachekit[memcached]`
+
+High-throughput in-memory caching with consistent hashing across multiple servers.
+
+**Configuration:** See the [Memcached Backend](#memcached-backend-environment-variables) section below.
 
 ---
 
@@ -162,6 +171,26 @@ CACHEKIT_FILE_MAX_ENTRY_COUNT=10000
 
 # Lock acquisition timeout in seconds (default: 5.0, range: 0.5-30.0)
 CACHEKIT_FILE_LOCK_TIMEOUT_SECONDS=5.0
+```
+
+### Memcached Backend Environment Variables
+
+> Requires: `pip install cachekit[memcached]` or `uv add cachekit[memcached]`
+
+```bash
+# Server list (JSON array format, default: ["127.0.0.1:11211"])
+CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'
+
+# Timeouts
+CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0    # Default: 2.0 seconds (range: 0.1-30.0)
+CACHEKIT_MEMCACHED_TIMEOUT=1.0             # Default: 1.0 seconds (range: 0.1-30.0)
+
+# Connection pool
+CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 per server (range: 1-100)
+CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2 (range: 0-10)
+
+# Optional key prefix for namespace isolation
+CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"     # Default: "" (none)
 ```
 
 ---

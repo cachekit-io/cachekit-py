@@ -30,7 +30,7 @@ cachekit uses a hybrid Python-Rust architecture to provide enterprise-grade cach
 > [!TIP]
 > **Architecture Principles:**
 > - **L1 + L2 Caching**: In-memory bytes cache (L1) + pluggable backend storage (L2) for optimal performance
-> - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, HTTP, DynamoDB, etc.)
+> - **Backend Abstraction**: Protocol-based L2 backend layer (Redis, CachekitIO, File, Memcached, custom)
 > - **Bytes-Only Storage**: L1 stores serialized bytes (encrypted or plaintext msgpack), not Python objects
 > - **Security First**: Decompression bomb protection, checksum validation, size limits, encrypted-at-rest
 > - **Performance Optimized**: Thread affinity, connection pooling, pre-cached serializers
@@ -492,7 +492,7 @@ class BaseBackend(Protocol):
 - **Bytes-only interface**: Language-agnostic, no Python-specific types
 - **Stateless operations**: No connection management in protocol
 - **Simple and focused**: Four operations only (get/set/delete/exists)
-- **Works for any backend**: Redis, HTTP, DynamoDB, local file storage, etc.
+- **Works for any backend**: Redis, CachekitIO, File, Memcached, custom implementations
 
 ### RedisBackend (Default Implementation)
 
