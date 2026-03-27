@@ -512,7 +512,7 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 **Previous**: [Performance Guide](performance.md) - Real benchmarks and optimization
 **Previous Alternative**: [Data Flow Architecture](data-flow-architecture.md) - System design details
 
-1. **Single-process?** Start with [Quick Start](QUICK_START.md)
+1. **Single-process?** Start with [Getting Started](getting-started.md)
 2. **Multi-pod?** Read [Circuit Breaker](features/circuit-breaker.md) + [Distributed Locking](features/distributed-locking.md)
 3. **Need encryption?** See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md)
 4. **Want metrics?** Check out [Prometheus Metrics](features/prometheus-metrics.md)

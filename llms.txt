@@ -154,8 +154,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 ## Documentation
 
 ### Getting Started
-- [Quick Start](docs/QUICK_START.md): 5-minute setup guide
-- [Getting Started Guide](docs/getting-started.md): Progressive tutorial
+- [Getting Started](docs/getting-started.md): Progressive tutorial from basics to advanced
 - [API Reference](docs/api-reference.md): Complete decorator API
 
 ### Backends

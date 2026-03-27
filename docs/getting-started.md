@@ -590,7 +590,7 @@ for i in range(3):
 
 | Direction | Resource |
 |:----------|:---------|
-| **Previous** | [Quick Start](QUICK_START.md) - 5-minute intro |
+| **Previous** | [Documentation Home](README.md) |
 | **Next** | [API Reference](api-reference.md) - Complete decorator parameters |
 
 ### Deep Dives
