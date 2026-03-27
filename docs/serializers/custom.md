@@ -54,7 +54,7 @@ class CustomSerializer:
 
 Pass your serializer instance directly to the `@cache` decorator:
 
-```python
+```python notest
 # Use custom serializer
 @cache(serializer=CustomSerializer())
 def my_function():
@@ -65,7 +65,7 @@ There is no global registration required — serializer instances are passed per
 
 If you want to use a string alias (like `"custom"`) instead of passing an instance, you can register it in the serializer registry at import time:
 
-```python
+```python notest
 from cachekit.serializers import _registry  # internal, subject to change
 
 _registry["custom"] = CustomSerializer
