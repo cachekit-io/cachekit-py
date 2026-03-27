@@ -1,6 +1,6 @@
 **[Home](README.md)** › **Architecture** › **Comparison**
 
-# Competitive Comparison Guide
+# How cachekit Compares
 
 > **cachekit vs Alternatives**
 
@@ -47,7 +47,7 @@ Are you caching in Python?
 
 ---
 
-## Why cachekit Wins Everywhere
+## Feature Breakdown by Use Case
 
 ### 1. Single-Process Apps: `@cache(backend=None)` Beats lru_cache
 
@@ -78,7 +78,7 @@ def expensive_computation(x: int) -> dict:
     return {"result": x * 2, "computed_at": datetime.now()}
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `functools.lru_cache`: No TTL, no metrics, no upgrade path. Rewrite required.
 - `cachetools`: More complex (choose TTLCache/LRUCache/etc), less ergonomic, no upgrade path.
 
@@ -142,7 +142,7 @@ sequenceDiagram
     Note over L2,Lock: Lock ONLY on L2 miss<br/>Prevents 1000 pods → 1 pod<br/>executing expensive function
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `aiocache`: L2-only (every hit is 2-7ms network), no circuit breaker, no locking
 - `redis-cache`: Minimal features, no encryption, no metrics
 - `dogpile.cache`: More complex API, heavier dependencies
@@ -174,7 +174,7 @@ def compute(x):
 # CACHEKIT_MASTER_KEY=hex_encoded_key
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`: Locked to in-memory, no scaling path
 - `aiocache`: Locked to Redis/Memcached, async-only
 - `dogpile.cache`: Locked to configured backend, heavier setup
@@ -218,7 +218,7 @@ def get_data(key):
     return fetch_data(key)
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`/`cachetools`: No failure handling
 - `aiocache`: No circuit breaker, manual locking complex
 - `dogpile.cache`: Lock implementation is complex, heavy API
@@ -250,7 +250,7 @@ def get_user(id):
 # Grafana dashboards available
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`: No metrics at all
 - `cachetools`: No metrics integration
 - `aiocache`: Requires custom instrumentation
@@ -400,7 +400,6 @@ All competitive claims validated by automated tests:
 **Test Suite**: `pytest tests/competitive/ -v`
 - 62 assertions validating competitor behavior
 - Tests against real libraries (not mocks)
-- Evidence: [docs/validation/VALIDATION_LOG.md](validation/VALIDATION_LOG.md)
 
 **Example validation**:
 ```python
@@ -529,8 +528,6 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 
 <div align="center">
 
-**[Documentation](.)** · **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Security](../SECURITY.md)**
-
-*Last Updated: 2025-11-12 · cachekit v0.4.0+*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>

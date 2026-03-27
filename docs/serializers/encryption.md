@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **Encryption Wrapper**
+**[Home](../README.md)** › **[Serializers](index.md)** › **Encryption Wrapper**
 
 # Encryption Wrapper
 
@@ -99,7 +99,15 @@ Encryption adds minimal overhead:
 ## See Also
 
 - [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md) — Full encryption docs: key management, per-tenant isolation, nonce handling, compliance
-- [DefaultSerializer](./default.md) — General-purpose inner serializer
-- [OrjsonSerializer](./orjson.md) — JSON inner serializer
-- [ArrowSerializer](./arrow.md) — DataFrame inner serializer
+- [DefaultSerializer](default.md) — General-purpose inner serializer
+- [OrjsonSerializer](orjson.md) — JSON inner serializer
+- [ArrowSerializer](arrow.md) — DataFrame inner serializer
 - [Configuration Guide](../configuration.md) — CACHEKIT_MASTER_KEY setup
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

@@ -1,8 +1,10 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **DefaultSerializer**
+**[Home](../README.md)** › **[Serializers](index.md)** › **StandardSerializer**
 
 # Default Serializer (MessagePack)
 
-The **DefaultSerializer** is cachekit's general-purpose serializer. It is used automatically when no serializer is specified on a `@cache` decorator. It combines MessagePack encoding with optional LZ4 compression and xxHash3-64 integrity checksums via cachekit's Rust ByteStorage layer.
+The **StandardSerializer** is cachekit's general-purpose serializer. It is used automatically when no serializer is specified on a `@cache` decorator. It combines MessagePack encoding with optional LZ4 compression and xxHash3-64 integrity checksums via cachekit's Rust ByteStorage layer.
+
+The registry alias for this serializer is `"default"` (and `"auto"`). The class name is `StandardSerializer`.
 
 ## Overview
 
@@ -21,12 +23,12 @@ The **DefaultSerializer** is cachekit's general-purpose serializer. It is used a
 
 ## Basic Usage
 
-DefaultSerializer is used automatically — no configuration needed:
+StandardSerializer is used automatically — no configuration needed:
 
 ```python
 from cachekit import cache
 
-# DefaultSerializer is used automatically (no configuration needed)
+# StandardSerializer is used automatically (no configuration needed)
 @cache
 def get_user_data(user_id: int):
     return {
@@ -39,16 +41,16 @@ def get_user_data(user_id: int):
 
 ## Registration Aliases
 
-DefaultSerializer can be referenced by multiple aliases when configuring serializers:
+StandardSerializer can be referenced by alias when configuring serializers:
 
 | Alias | Resolves To |
 |-------|-------------|
-| `"auto"` | DefaultSerializer |
-| `"default"` | DefaultSerializer |
-| `"std"` | StandardSerializer (language-agnostic MessagePack variant) |
+| `"default"` | StandardSerializer — language-agnostic MessagePack |
+| `"std"` | StandardSerializer — explicit alias |
+| `"auto"` | AutoSerializer — Python-specific types (NumPy, pandas, datetime) |
 
 > [!NOTE]
-> `StandardSerializer` (`"std"`) is a language-agnostic variant of the default serializer designed for cross-language interoperability (Python/PHP/JavaScript). It omits NumPy and DataFrame auto-detection in favor of strict MessagePack compatibility.
+> `"auto"` resolves to `AutoSerializer`, which adds Python-specific type detection (NumPy arrays, pandas DataFrames, datetime). `"default"` / `"std"` resolves to `StandardSerializer`, a language-agnostic MessagePack variant designed for cross-language interoperability. Both are based on MessagePack + Rust ByteStorage.
 
 ## Type Support Matrix
 
@@ -73,7 +75,7 @@ DefaultSerializer can be referenced by multiple aliases when configuring seriali
 
 ## Compression and Integrity
 
-DefaultSerializer automatically handles:
+StandardSerializer automatically handles:
 - **LZ4 compression** — fast compression reducing storage footprint (~30% smaller than raw msgpack)
 - **xxHash3-64 checksums** — integrity verification on deserialization
 
@@ -102,8 +104,16 @@ def get_large_dict():
 
 ## See Also
 
-- [OrjsonSerializer](./orjson.md) — JSON-optimized alternative for API/web data
-- [ArrowSerializer](./arrow.md) — DataFrame-optimized for large data science workloads
-- [Encryption Wrapper](./encryption.md) — Add zero-knowledge encryption to DefaultSerializer
-- [Caching Pydantic Models](./pydantic.md) — Patterns for working with Pydantic
+- [OrjsonSerializer](orjson.md) — JSON-optimized alternative for API/web data
+- [ArrowSerializer](arrow.md) — DataFrame-optimized for large data science workloads
+- [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to StandardSerializer
+- [Caching Pydantic Models](pydantic.md) — Patterns for working with Pydantic
 - [Performance Guide](../performance.md) — Real serialization benchmarks
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

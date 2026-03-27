@@ -12,13 +12,13 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 
 | Serializer | Speed | Best For |
 |-----------|-------|----------|
-| [DefaultSerializer](./default.md) | Fast | General Python objects, mixed types, binary data |
-| [OrjsonSerializer](./orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
-| [ArrowSerializer](./arrow.md) | Very Fast (DataFrames) | Large pandas/polars DataFrames (10K+ rows) |
-| [EncryptionWrapper](./encryption.md) | Adds ~3-5 μs | Zero-knowledge caching, GDPR/HIPAA/PCI-DSS compliance |
-| [Custom Serializers](./custom.md) | Varies | Specialized data types not covered above |
+| [DefaultSerializer](default.md) | Fast | General Python objects, mixed types, binary data |
+| [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
+| [ArrowSerializer](arrow.md) | Very Fast (DataFrames) | Large pandas/polars DataFrames (10K+ rows) |
+| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching, GDPR/HIPAA/PCI-DSS compliance |
+| [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
-For caching Pydantic models, see [Caching Pydantic Models](./pydantic.md).
+For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 ## Decision Matrix
 
@@ -103,12 +103,12 @@ def get_user_data_v2(user_id):
 
 ## Serializer Pages
 
-- [DefaultSerializer (MessagePack)](./default.md) — General-purpose, handles all Python types
-- [OrjsonSerializer](./orjson.md) — JSON-optimized, 2-5x faster than stdlib json
-- [ArrowSerializer](./arrow.md) — DataFrame-optimized, 6-23x faster for large DataFrames
-- [Encryption Wrapper](./encryption.md) — Wraps any serializer for zero-knowledge caching
-- [Caching Pydantic Models](./pydantic.md) — Patterns and pitfalls for Pydantic model caching
-- [Custom Serializers](./custom.md) — Implement your own via SerializerProtocol
+- [DefaultSerializer (MessagePack)](default.md) — General-purpose, handles all Python types
+- [OrjsonSerializer](orjson.md) — JSON-optimized, 2-5x faster than stdlib json
+- [ArrowSerializer](arrow.md) — DataFrame-optimized, 6-23x faster for large DataFrames
+- [Encryption Wrapper](encryption.md) — Wraps any serializer for zero-knowledge caching
+- [Caching Pydantic Models](pydantic.md) — Patterns and pitfalls for Pydantic model caching
+- [Custom Serializers](custom.md) — Implement your own via SerializerProtocol
 
 ## See Also
 
@@ -117,3 +117,11 @@ def get_user_data_v2(user_id):
 - [Configuration Guide](../configuration.md) - Environment variable setup
 - [Performance Guide](../performance.md) - Real serialization benchmarks
 - [Troubleshooting Guide](../troubleshooting.md) - Serialization error solutions
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

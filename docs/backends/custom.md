@@ -2,13 +2,13 @@
 
 # Custom Backends
 
-Implement any key-value store as a cachekit backend by satisfying the `BaseBackend` protocol. Four methods. No inheritance required.
+Implement any key-value store as a cachekit backend by satisfying the `BaseBackend` protocol. Five methods. No inheritance required.
 
 ## Implementation Guide
 
 ### Step 1: Implement Protocol
 
-Create a class that implements all 4 required methods:
+Create a class that implements all 5 required methods:
 
 ```python notest
 from typing import Optional
@@ -35,6 +35,13 @@ class CustomBackend:
 
     def exists(self, key: str) -> bool:
         return self.client.contains(key)
+
+    def health_check(self) -> tuple[bool, dict]:
+        try:
+            self.client.ping()
+            return True, {"backend_type": "custom", "latency_ms": 0}
+        except Exception as e:
+            return False, {"backend_type": "custom", "error": str(e)}
 ```
 
 ### Step 2: Error Handling
@@ -235,7 +242,5 @@ def test_custom_backend():
 <div align="center">
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
-
-*Last Updated: 2026-03-18*
 
 </div>

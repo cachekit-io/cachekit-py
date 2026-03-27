@@ -8,15 +8,15 @@
 
 ## Table of Contents
 
-- [Quick Start with Redis](#-quick-start-with-redis)
-- [Progressive Disclosure](#-progressive-disclosure-choose-your-level)
-- [Installation](#-installation)
-- [Choose Your Backend](#-choose-your-backend)
-- [What Makes cachekit Different](#-what-makes-cachekit-different)
-- [Common Pitfalls](#-common-pitfalls-to-avoid)
-- [Configuration](#-configuration)
-- [Testing Your Setup](#-testing-your-setup)
-- [Troubleshooting](#-troubleshooting)
+- [Quick Start with Redis](#quick-start-with-redis)
+- [Progressive Disclosure](#progressive-disclosure-choose-your-level)
+- [Installation](#installation)
+- [Choose Your Backend](#choose-your-backend)
+- [What Makes cachekit Different](#what-makes-cachekit-different)
+- [Common Pitfalls](#common-pitfalls-to-avoid)
+- [Configuration](#configuration)
+- [Testing Your Setup](#testing-your-setup)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -345,10 +345,10 @@ result = critical_function()  # Works even if Redis is offline
 
 | Optimization | Impact | Focus |
 |:-------------|:------:|:------|
-| Connection pooling | **50%** improvement | We focus here |
-| Network calls | 1-2ms | We accept this |
+| Connection pooling | **50%** improvement | cachekit focuses here |
+| Network calls | 1-2ms | Accepted tradeoff |
 | Serialization | 50-200μs | Already fast enough |
-| SIMD hashing | 0.077% improvement | We removed this |
+| SIMD hashing | 0.077% improvement | Removed (not worth it) |
 
 ---
 

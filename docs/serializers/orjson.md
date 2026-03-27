@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **OrjsonSerializer**
+**[Home](../README.md)** › **[Serializers](index.md)** › **OrjsonSerializer**
 
 # OrjsonSerializer
 
@@ -164,7 +164,15 @@ OrjsonSerializer vs DefaultSerializer (msgpack):
 
 ## See Also
 
-- [DefaultSerializer](./default.md) — General-purpose alternative with binary data support
-- [ArrowSerializer](./arrow.md) — DataFrame-optimized serializer
-- [Encryption Wrapper](./encryption.md) — Add zero-knowledge encryption to OrjsonSerializer
+- [DefaultSerializer](default.md) — General-purpose alternative with binary data support
+- [ArrowSerializer](arrow.md) — DataFrame-optimized serializer
+- [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to OrjsonSerializer
 - [Performance Guide](../performance.md) — Full benchmark comparisons
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

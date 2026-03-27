@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **Caching Pydantic Models**
+**[Home](../README.md)** › **[Serializers](index.md)** › **Caching Pydantic Models**
 
 # Caching Pydantic Models
 
@@ -167,6 +167,14 @@ def get_user(user_id: int) -> dict:
 
 ## See Also
 
-- [DefaultSerializer](./default.md) — The serializer used when caching dicts from `model_dump()`
-- [Custom Serializers](./custom.md) — Implement SerializerProtocol for specialized handling
+- [DefaultSerializer](default.md) — The serializer used when caching dicts from `model_dump()`
+- [Custom Serializers](custom.md) — Implement SerializerProtocol for specialized handling
 - [API Reference](../api-reference.md) — Serializer parameters and options
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

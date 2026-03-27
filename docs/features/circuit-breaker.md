@@ -2,7 +2,7 @@
 
 # Circuit Breaker - Prevent Cascading Failures
 
-**Version**: cachekit v1.0+
+**Available since v0.3.0**
 
 ## TL;DR
 
@@ -107,11 +107,12 @@ No cascading failures
 
 ## Why You Might Not Want It
 
-**Scenarios where circuit breaker adds overhead**:
-
-1. **Perfect Redis reliability** (99.9999% uptime): Overhead with no benefit
-2. **Designed-to-fail cache** (failures expected): May mask bugs
-3. **High-volume, low-margin calls**: Cooldown delay might matter
+> [!NOTE]
+> Scenarios where circuit breaker adds overhead without benefit:
+>
+> 1. **Highly reliable backend** (failures truly exceptional): Overhead with no benefit
+> 2. **Designed-to-fail cache** (failures expected): May mask bugs
+> 3. **High-volume, low-margin calls**: Cooldown delay might matter
 
 **Mitigation**: Disable if not needed:
 ```python notest
@@ -331,7 +332,7 @@ A: Reduce failure threshold or increase cooldown. Investigate why Redis is faili
 A: That's correct behavior. Circuit breaker prevents errors, not cache hits. Handle None gracefully.
 
 **Q: Want to disable circuit breaker for testing**
-A: Pass `circuit_breaker_enabled=False` or set env: `CACHEKIT_CIRCUIT_BREAKER_ENABLED=false`
+A: Pass `circuit_breaker=CircuitBreakerConfig(enabled=False)`.
 
 ---
 
@@ -346,6 +347,6 @@ A: Pass `circuit_breaker_enabled=False` or set env: `CACHEKIT_CIRCUIT_BREAKER_EN
 
 <div align="center">
 
-*Last Updated: 2025-12-02 · ✅ Feature implemented and tested*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
 </div>

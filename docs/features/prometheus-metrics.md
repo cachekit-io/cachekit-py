@@ -2,7 +2,7 @@
 
 # Prometheus Metrics - Observability Built-In
 
-**Version**: cachekit v1.0+
+**Available since v0.3.0**
 
 ## TL;DR
 
@@ -206,28 +206,45 @@ avg(rate(cachekit_lock_wait_duration_seconds[5m]))
 ### Enable/Disable Metrics
 ```python notest
 from cachekit import cache
+from cachekit.config.nested import MonitoringConfig
 
 @cache(
     ttl=300,
-    metrics_enabled=True,  # Default: True
+    monitoring=MonitoringConfig(enable_prometheus_metrics=True),  # Default: True
 )
 def operation(x):
     return compute(x)
 ```
 
-### Disable Metrics Globally
-```bash
-export CACHEKIT_METRICS_ENABLED=false
-```
-
-### Custom Metric Prefix
+### Disable Metrics
 ```python notest
-# Default: "cachekit_"
-@cache(ttl=300, metrics_prefix="myapp_cache_")
+from cachekit import cache
+from cachekit.config.nested import MonitoringConfig
+
+@cache(
+    ttl=300,
+    monitoring=MonitoringConfig(enable_prometheus_metrics=False),
+)
 def operation(x):
     return compute(x)
+```
 
-# Produces: myapp_cache_hits_total, etc
+### Disable All Observability
+```python notest
+from cachekit import cache
+from cachekit.config.nested import MonitoringConfig
+
+@cache(
+    ttl=300,
+    monitoring=MonitoringConfig(
+        collect_stats=False,
+        enable_tracing=False,
+        enable_structured_logging=False,
+        enable_prometheus_metrics=False,
+    ),
+)
+def operation(x):
+    return compute(x)
 ```
 
 ---
@@ -281,6 +298,6 @@ A: Prometheus retention is configurable (default 15 days)
 
 <div align="center">
 
-*Last Updated: 2025-12-02 · ✅ Feature implemented and tested*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
 </div>

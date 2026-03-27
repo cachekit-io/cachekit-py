@@ -2,7 +2,7 @@
 
 # Zero-Knowledge Encryption - Client-Side Security
 
-**Version**: cachekit v1.0+
+**Available since v0.3.0**
 
 ## TL;DR
 
@@ -120,6 +120,9 @@ def get_user_ssn(user_id):
 ## What Can Go Wrong
 
 ### Missing Master Key
+> [!WARNING]
+> `cache.secure` requires a master key. Omitting it raises a `ConfigurationError` at decoration time, not at call time.
+
 ```python notest
 # Forget to set master_key parameter
 @cache.secure(ttl=300)  # Missing master_key!
@@ -322,7 +325,8 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 - ⚠️  Key management plan required
 - ⚠️  Regular key rotation required
 
-**NOT legal advice. Consult compliance team.**
+> [!CAUTION]
+> NOT legal advice. Consult your compliance team before making claims about regulatory compliance.
 
 ---
 
@@ -464,6 +468,6 @@ export default {
 
 <div align="center">
 
-*Last Updated: 2025-12-02 · ✅ Feature implemented, security-audited, production-ready*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
 </div>

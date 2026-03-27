@@ -2,11 +2,11 @@
 
 # Performance Guide
 
-> **cachekit delivers sub-millisecond cache operations with production-validated latency characteristics**
+> **Sub-millisecond cache operations, measured and benchmarked**
 
 ---
 
-## Executive Summary
+## Key Numbers
 
 > [!TIP]
 > **Key numbers (p95 latency):**
@@ -364,22 +364,6 @@ if not found:
 
 **Reality check:** Lock overhead (250ns) is 0.1% of total latency (242μs). Not worth optimizing unless you have extreme concurrency (100+ threads).
 
-## Conservative Marketing Claims
-
-Based on validated measurements, you can confidently claim:
-
-✅ **"Sub-microsecond L1 cache hits"** (500ns for bytes lookup)
-✅ **"Sub-millisecond decorator overhead for realistic payloads"** (242μs for 10KB dicts)
-✅ **"8-20x faster than Redis with L1 cache"** (242μs vs 2-5ms)
-✅ **"Concurrent-safe with minimal lock contention"** (<100μs under 10 threads)
-✅ **"AES-256-GCM encryption with <3% overhead"** (1.03x measured)
-✅ **"5-10x faster DataFrame serialization with Arrow"** (validated for 10K+ rows)
-
-❌ **Don't claim:**
-- "Nanosecond cache hits" (misleading - that's only raw dict lookup, not user experience)
-- "Zero overhead" (decorator + serialization have measurable cost)
-- "Linear scalability" (lock contention exists, but manageable)
-
 ## Performance Regression Testing
 
 **Baseline targets** (fail CI if exceeded):
@@ -486,8 +470,6 @@ Total speedup:          5.0x
 
 <div align="center">
 
-**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)** · **[Security](../SECURITY.md)**
-
-*Last Updated: 2025-12-02*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>

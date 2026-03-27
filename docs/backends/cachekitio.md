@@ -205,6 +205,4 @@ See [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md) for fu
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
-*Last Updated: 2026-03-18*
-
 </div>

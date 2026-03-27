@@ -6,7 +6,7 @@ Pluggable L2 cache storage for cachekit. Four backends are included out of the b
 
 ## Overview
 
-cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. The `BaseBackend` protocol defines a minimal synchronous interface — four methods — that any backend must implement to be compatible with cachekit.
+cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. The `BaseBackend` protocol defines a minimal synchronous interface — five methods — that any backend must implement to be compatible with cachekit.
 
 **Key insight**: Backends are completely optional. If you don't specify a backend, cachekit uses RedisBackend with your configured Redis connection.
 
@@ -69,6 +69,18 @@ class BaseBackend(Protocol):
 
         Returns:
             True if key exists, False otherwise
+
+        Raises:
+            BackendError: If backend operation fails
+        """
+        ...
+
+    def health_check(self) -> tuple[bool, dict]:
+        """Check backend health status.
+
+        Returns:
+            Tuple of (is_healthy, details_dict)
+            Details must include 'latency_ms' and 'backend_type'
 
         Raises:
             BackendError: If backend operation fails
@@ -178,10 +190,10 @@ Call `set_default_backend(None)` to clear the default. Works with any backend (R
 
 ```bash
 # Primary: CACHEKIT_REDIS_URL
-CACHEKIT_REDIS_URL=redis://prod.example.com:6379/0
+CACHEKIT_REDIS_URL=redis://prod.example.com:6379
 
 # Fallback: REDIS_URL
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://localhost:6379
 ```
 
 If no explicit backend and no module-level default, cachekit creates a RedisBackend from environment variables.
@@ -227,7 +239,5 @@ If no explicit backend and no module-level default, cachekit creates a RedisBack
 <div align="center">
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
-
-*Last Updated: 2026-03-18*
 
 </div>

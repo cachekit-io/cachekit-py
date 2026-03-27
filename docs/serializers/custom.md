@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **Custom Serializers**
+**[Home](../README.md)** › **[Serializers](index.md)** › **Custom Serializers**
 
 # Custom Serializers
 
@@ -113,8 +113,16 @@ def get_user(user_id: int) -> dict:
 
 ## See Also
 
-- [DefaultSerializer](./default.md) — General-purpose built-in serializer
-- [OrjsonSerializer](./orjson.md) — JSON-optimized built-in serializer
-- [ArrowSerializer](./arrow.md) — DataFrame-optimized built-in serializer
-- [Caching Pydantic Models](./pydantic.md) — Patterns for Pydantic model caching
+- [DefaultSerializer](default.md) — General-purpose built-in serializer
+- [OrjsonSerializer](orjson.md) — JSON-optimized built-in serializer
+- [ArrowSerializer](arrow.md) — DataFrame-optimized built-in serializer
+- [Caching Pydantic Models](pydantic.md) — Patterns for Pydantic model caching
 - [API Reference](../api-reference.md) — SerializationMetadata fields and options
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

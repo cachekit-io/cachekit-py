@@ -20,14 +20,37 @@ def cached_function():
 
 RedisBackend reads `REDIS_URL` or `CACHEKIT_REDIS_URL` from the environment automatically. No configuration needed for the common case.
 
-## Environment Variables
+## Configuration via Environment Variables
 
 ```bash
-CACHEKIT_REDIS_URL=redis://prod.example.com:6379/0  # Primary
-REDIS_URL=redis://localhost:6379/0                  # Fallback
+CACHEKIT_REDIS_URL=redis://prod.example.com:6379  # Primary
+REDIS_URL=redis://localhost:6379                  # Fallback
 ```
 
-`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and no explicit backend is configured, cachekit will attempt to connect to `redis://localhost:6379/0`.
+`CACHEKIT_REDIS_URL` takes precedence over `REDIS_URL`. If neither is set and no explicit backend is configured, cachekit will attempt to connect to `redis://localhost:6379`.
+
+## Configuration via Python
+
+```python notest
+from cachekit.backends.redis import RedisBackend
+from cachekit.backends.redis.config import RedisBackendConfig
+
+config = RedisBackendConfig(
+    redis_url="redis://prod.example.com:6379",
+    connection_pool_size=25,
+    socket_keepalive=True,
+    disable_hiredis=False,
+)
+
+backend = RedisBackend(config)
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `redis_url` | `redis://localhost:6379` | Redis connection URL |
+| `connection_pool_size` | `10` | Maximum connections in the pool |
+| `socket_keepalive` | `True` | Enable TCP keepalive for connections |
+| `disable_hiredis` | `False` | Use pure Python parser instead of hiredis |
 
 ## When to Use
 
@@ -53,6 +76,13 @@ REDIS_URL=redis://localhost:6379/0                  # Fallback
 - Persistence: Yes (RDB/AOF, server-configured)
 - Distributed locking: Yes
 
+## Limitations
+
+1. **Network dependency**: Every L2 operation requires a network round-trip. Use L1 cache to mitigate (enabled by default).
+2. **Redis instance required**: Unlike FileBackend, RedisBackend requires a running Redis server.
+3. **No TTL inspection**: The base RedisBackend does not expose remaining TTL on cached keys.
+4. **Connection pool exhaustion**: Under very high concurrency, the connection pool (`connection_pool_size=10`) can become a bottleneck. Increase via config or env var.
+
 ## See Also
 
 - [Backend Guide](index.md) — Backend comparison and resolution priority
@@ -65,7 +95,5 @@ REDIS_URL=redis://localhost:6379/0                  # Fallback
 <div align="center">
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
-
-*Last Updated: 2026-03-18*
 
 </div>

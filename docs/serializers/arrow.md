@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](./index.md)** › **ArrowSerializer**
+**[Home](../README.md)** › **[Serializers](index.md)** › **ArrowSerializer**
 
 # ArrowSerializer
 
@@ -225,8 +225,16 @@ If polars is not installed and `return_format="polars"` is specified, an `Import
 
 ## See Also
 
-- [DefaultSerializer](./default.md) — Better choice for DataFrames under 1K rows
-- [OrjsonSerializer](./orjson.md) — JSON-optimized for API data
-- [Encryption Wrapper](./encryption.md) — Add zero-knowledge encryption to ArrowSerializer
+- [DefaultSerializer](default.md) — Better choice for DataFrames under 1K rows
+- [OrjsonSerializer](orjson.md) — JSON-optimized for API data
+- [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to ArrowSerializer
 - [Performance Guide](../performance.md) — Full benchmark comparisons
 - [Troubleshooting Guide](../troubleshooting.md) — Serialization error solutions
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

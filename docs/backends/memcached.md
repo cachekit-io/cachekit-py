@@ -114,6 +114,4 @@ backend = MemcachedBackend(config)
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
-*Last Updated: 2026-03-23*
-
 </div>

@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **L1 Cache Invalidation**
+**[Home](../README.md)** › **Features** › **L1 Cache Invalidation**
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
@@ -441,3 +441,11 @@ else:
 - [Getting Started](../getting-started.md) - Quick start guide
 - [Zero-Knowledge Encryption](zero-knowledge-encryption.md) - Secure caching
 - [API Reference](../api-reference.md) - All decorator parameters
+
+---
+
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
+
+</div>

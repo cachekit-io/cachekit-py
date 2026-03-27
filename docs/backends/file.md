@@ -127,6 +127,4 @@ Large values (1MB):
 
 **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
-*Last Updated: 2026-03-18*
-
 </div>
