@@ -237,12 +237,13 @@ export CACHEKIT_API_KEY=ck_your_api_key
 
 ## Choose Your Backend
 
-Three paths depending on your situation:
+Four paths depending on your situation:
 
 | Backend | When to use | Setup effort |
 |:--------|:------------|:-------------|
 | **Redis** (recommended) | Production, existing infra, full control | Medium — run Redis yourself |
 | **CachekitIO Cloud** (alpha) | Skip Redis ops, managed edge caching | Low — API key only |
+| **Memcached** (optional) | High-throughput, existing Memcached infra | Low — `pip install cachekit[memcached]` |
 | **File / L1-only** | Local dev, tests, no external deps | None |
 
 ### Redis (Recommended)
@@ -283,6 +284,28 @@ def get_user(user_id: int):
 ```
 
 Everything else — TTL, namespaces, serializers — works the same as with Redis. Swap `@cache` for `@cache.io()` and you're done.
+
+### Memcached (Optional)
+
+High-throughput in-memory caching with consistent hashing. No persistence — data is lost on restart.
+
+```bash
+pip install cachekit[memcached]
+# Default: connects to 127.0.0.1:11211
+```
+
+```python notest
+from cachekit import cache
+from cachekit.backends.memcached import MemcachedBackend
+
+backend = MemcachedBackend()
+
+@cache(backend=backend, ttl=3600)
+def get_user(user_id: int):
+    return fetch_from_db(user_id)
+```
+
+Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](guides/backend-guide.md) for multi-server configuration.
 
 ### File / L1-Only (Dev and Testing)
 

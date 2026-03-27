@@ -155,7 +155,7 @@ sequenceDiagram
 
 **Why cachekit wins**:
 - **Same code**: `@cache` decorator works with or without Redis
-- **Pluggable backends**: Redis included, but can add Memcached, DynamoDB, HTTP, etc.
+- **Pluggable backends**: Redis, CachekitIO, File, Memcached built-in, plus custom protocol
 - **Graceful degradation**: Redis down? L1 cache serves, app continues
 - **No vendor lock-in**: Backend protocol is documented, implement your own
 
@@ -503,7 +503,7 @@ A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrat
 A: Circuit breaker catches errors, returns stale cache or None, app continues working.
 
 **Q: Can I use my own backend?**
-A: Yes. Implement the BaseBackend protocol (~100 LOC) for custom storage (DynamoDB, HTTP, Memcached, etc).
+A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.
 
 ---
 
