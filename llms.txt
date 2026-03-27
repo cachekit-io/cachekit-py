@@ -2,38 +2,190 @@
 
 > Production-ready caching for Python with intelligent reliability features, pluggable backends, and Rust-powered performance.
 
-cachekit provides intelligent caching with circuit breaker, distributed locking, Prometheus metrics, and zero-knowledge encryption. Supports multiple backends including Redis, Memcached, File, and CachekitIO (managed edge cache). Designed for production workloads from simple decorators to complex multi-pod deployments.
+cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 4 built-in backends (Redis, Memcached, File, CachekitIO) plus custom backends via the BaseBackend protocol.
 
-## Getting Started
+## Quick Start
 
-- [Quick Start](docs/QUICK_START.md): 5-minute guide to get started with cachekit
-- [Getting Started Guide](docs/getting-started.md): Progressive tutorial from basics to advanced usage
-- [Installation & Setup](README.md#quick-start): Installation instructions and basic configuration
+```python
+from cachekit import cache
 
-## Core Concepts
+@cache                    # Uses Redis backend by default
+def get_user(user_id: int):
+    return db.fetch(user_id)
 
-- [Architecture Overview](docs/data-flow-architecture.md): L1+L2 dual-layer caching internals
-- [API Reference](docs/api-reference.md): Complete API documentation and decorator parameters
-- [Configuration Guide](docs/configuration.md): Environment variables and setup options
+@cache.minimal            # Speed-critical: no reliability overhead
+def get_price(symbol: str):
+    return fetch_price(symbol)
 
-## Features
+@cache.production         # Reliability-critical: circuit breaker + adaptive timeouts
+def process_payment(amount):
+    return gateway.charge(amount)
 
-- [Serializer Guide](docs/serializers/index.md): Choose the right serializer for your data type
-- [Backend Guide](docs/backends/index.md): Multi-backend architecture (Redis, Memcached, File, CachekitIO managed edge cache, custom)
-- [Circuit Breaker](docs/features/circuit-breaker.md): Prevent cascading failures in distributed systems
-- [Distributed Locking](docs/features/distributed-locking.md): Prevent cache stampedes in multi-pod environments
-- [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM security for sensitive data
-- [Adaptive Timeouts](docs/features/adaptive-timeouts.md): Auto-tune timeouts based on system load
-- [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability and monitoring
+@cache.secure             # Security-critical: client-side AES-256-GCM encryption
+def get_patient(id: int):
+    return db.fetch_patient(id)
+```
 
-## Development
+## Backends
 
-- [Contributing Guide](CONTRIBUTING.md): Development guidelines and contribution process
-- [Development Setup](DEVELOPMENT.md): Local development environment setup
-- [Security Policy](SECURITY.md): Vulnerability reporting and security practices
+4 built-in backends, all implementing the BaseBackend protocol (get/set/delete/exists/health_check):
 
-## Optional
+| Backend | Install | Use Case | Latency |
+|---------|---------|----------|---------|
+| **Redis** (default) | included | Production, distributed | 1-7ms |
+| **Memcached** | `pip install cachekit[memcached]` | High-throughput, existing infra | 1-5ms |
+| **File** | included | Single-machine, zero-dependency | 1-10ms |
+| **CachekitIO** | included | Managed SaaS, zero infrastructure | 10-50ms |
 
-- [Performance Benchmarks](docs/performance.md): Detailed performance analysis and comparisons
-- [Troubleshooting Guide](docs/troubleshooting.md): Common issues and solutions
-- [Comparison with Alternatives](docs/comparison.md): vs. lru_cache, aiocache, cachetools
+### Redis (default)
+```python
+# Configure via environment:
+# REDIS_URL=redis://localhost:6379  (or CACHEKIT_REDIS_URL)
+
+@cache
+def cached_fn():
+    return data
+```
+
+### Memcached
+```python
+from cachekit.backends.memcached import MemcachedBackend, MemcachedBackendConfig
+
+# Environment: CACHEKIT_MEMCACHED_SERVERS=mc1:11211,mc2:11211
+config = MemcachedBackendConfig(servers=["mc1:11211", "mc2:11211"])
+backend = MemcachedBackend(config)
+
+@cache(backend=backend)
+def cached_fn():
+    return data
+```
+
+### File
+```python
+from cachekit.backends.file import FileBackend, FileBackendConfig
+
+config = FileBackendConfig(cache_dir="/tmp/cache", max_size_mb=500)
+backend = FileBackend(config)
+
+@cache(backend=backend)
+def cached_fn():
+    return data
+```
+
+### CachekitIO (Managed SaaS)
+```python
+# Environment: CACHEKIT_API_KEY=your-api-key
+
+@cache.io()  # Uses CachekitIO SaaS backend
+def cached_fn():
+    return data
+```
+
+### Custom Backend
+Implement the BaseBackend protocol:
+```python
+class MyBackend:
+    def get(self, key: str) -> bytes | None: ...
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None: ...
+    def delete(self, key: str) -> bool: ...
+    def exists(self, key: str) -> bool: ...
+    def health_check(self) -> tuple[bool, dict]: ...
+```
+
+## Intent Presets
+
+| Preset | Circuit Breaker | Adaptive Timeouts | Monitoring | Encryption |
+|--------|:-:|:-:|:-:|:-:|
+| `@cache` / `@cache.minimal` | - | - | - | - |
+| `@cache.production` | Yes | Yes | Full | - |
+| `@cache.secure` | Yes | Yes | Full | AES-256-GCM |
+| `@cache.io()` | Yes | Yes | Full | - |
+| `@cache.dev` | - | - | Verbose | - |
+| `@cache.test` | - | - | - | - |
+
+## Serializers
+
+| Serializer | Speed | Use Case |
+|------------|:-----:|----------|
+| **DefaultSerializer** | Fast | General Python types, NumPy, Pandas (MessagePack + LZ4) |
+| **OrjsonSerializer** | Fastest | JSON APIs (2-5x faster than stdlib) |
+| **ArrowSerializer** | Fastest | Large DataFrames (6-23x faster for 10K+ rows) |
+| **EncryptionWrapper** | Fast | Wraps any serializer with AES-256-GCM |
+
+```python
+from cachekit.serializers import OrjsonSerializer
+
+@cache.production(serializer=OrjsonSerializer())
+def get_api_data():
+    return api.fetch()
+```
+
+## Configuration
+
+All configuration via environment variables with `CACHEKIT_` prefix:
+
+```bash
+# Redis
+CACHEKIT_REDIS_URL=redis://localhost:6379
+CACHEKIT_DEFAULT_TTL=3600
+
+# Memcached
+CACHEKIT_MEMCACHED_SERVERS=mc1:11211,mc2:11211
+CACHEKIT_MEMCACHED_KEY_PREFIX=myapp:
+
+# File
+CACHEKIT_FILE_CACHE_DIR=/tmp/cache
+CACHEKIT_FILE_MAX_SIZE_MB=500
+
+# CachekitIO
+CACHEKIT_API_KEY=your-api-key
+CACHEKIT_API_URL=https://api.cachekit.io
+
+# Encryption
+CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
+```
+
+## L1+L2 Dual-Layer Cache
+
+- L1: In-memory (~50ns) — per-process, no network
+- L2: Backend (1-50ms) — shared across processes
+- L1 backfill on L2 hit, automatic invalidation
+
+## Documentation
+
+### Getting Started
+- [Quick Start](docs/QUICK_START.md): 5-minute setup guide
+- [Getting Started Guide](docs/getting-started.md): Progressive tutorial
+- [API Reference](docs/api-reference.md): Complete decorator API
+
+### Backends
+- [Backend Overview](docs/backends/index.md): Comparison and selection guide
+- [Redis](docs/backends/redis.md): Production default
+- [File](docs/backends/file.md): Local filesystem caching
+- [Memcached](docs/backends/memcached.md): High-throughput caching
+- [CachekitIO](docs/backends/cachekitio.md): Managed SaaS backend
+- [Custom Backends](docs/backends/custom.md): Implement BaseBackend
+
+### Serializers
+- [Serializer Overview](docs/serializers/index.md): Decision matrix
+- [Default (MessagePack)](docs/serializers/default.md): General-purpose
+- [OrjsonSerializer](docs/serializers/orjson.md): Fast JSON
+- [ArrowSerializer](docs/serializers/arrow.md): DataFrame-optimized
+- [Encryption Wrapper](docs/serializers/encryption.md): AES-256-GCM
+- [Pydantic Models](docs/serializers/pydantic.md): Caching Pydantic objects
+- [Custom Serializers](docs/serializers/custom.md): SerializerProtocol
+
+### Features
+- [Circuit Breaker](docs/features/circuit-breaker.md): Cascading failure prevention
+- [Distributed Locking](docs/features/distributed-locking.md): Cache stampede prevention
+- [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM
+- [Adaptive Timeouts](docs/features/adaptive-timeouts.md): Auto-tune to system load
+- [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability
+- [Architecture](docs/data-flow-architecture.md): L1+L2 internals
+
+### Development
+- [Configuration](docs/configuration.md): Environment variables reference
+- [Contributing](CONTRIBUTING.md): Development guidelines
+- [Performance](docs/performance.md): Benchmarks and analysis
+- [Troubleshooting](docs/troubleshooting.md): Common issues
+- [Comparison](docs/comparison.md): vs lru_cache, aiocache, cachetools
