@@ -220,7 +220,8 @@ version = "0.14.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgpack" },
-    { name = "requests" },
+    { name = "requests", version = "2.32.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "requests", version = "2.33.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/58/3a/0cbeb04ea57d2493f3ec5a069a117ab467f85e4a10017c6d854ddcbff104/cachecontrol-0.14.3.tar.gz", hash = "sha256:73e7efec4b06b20d9267b441c1f733664f989fb8688391b670ca812d70795d11", size = 28985, upload-time = "2025-04-30T16:45:06.135Z" }
 wheels = [
@@ -235,7 +236,7 @@ filecache = [
 
 [[package]]
 name = "cachekit"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
@@ -261,6 +262,9 @@ data = [
     { name = "pyarrow", version = "21.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "pyarrow", version = "22.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
+memcached = [
+    { name = "pymemcache" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -279,6 +283,7 @@ dev = [
     { name = "psutil" },
     { name = "pyarrow", version = "21.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "pyarrow", version = "22.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "pymemcache" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-benchmark" },
@@ -287,6 +292,7 @@ dev = [
     { name = "pytest-redis" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "requests", version = "2.33.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "ruff" },
 ]
 fuzz = [
@@ -306,11 +312,12 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'data'", specifier = ">=21.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
+    { name = "pymemcache", marker = "extra == 'memcached'", specifier = ">=4.0.0" },
     { name = "redis", extras = ["hiredis"], specifier = ">=4.0.0" },
     { name = "tenacity", specifier = ">=8.0.0" },
     { name = "xxhash", specifier = ">=3.5.0" },
 ]
-provides-extras = ["data"]
+provides-extras = ["data", "memcached"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -325,6 +332,7 @@ dev = [
     { name = "pip-audit", specifier = ">=2.7.0" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "pyarrow", specifier = ">=21.0.0" },
+    { name = "pymemcache", specifier = ">=4.0.0" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },
     { name = "pytest-benchmark", specifier = ">=4.0.0" },
@@ -333,6 +341,7 @@ dev = [
     { name = "pytest-redis", specifier = ">=3.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "requests", marker = "python_full_version >= '3.10'", specifier = ">=2.33.0" },
     { name = "ruff", specifier = ">=0.6.0" },
 ]
 fuzz = [{ name = "atheris", specifier = ">=2.3.0" }]
@@ -1678,7 +1687,8 @@ dependencies = [
     { name = "pip-requirements-parser" },
     { name = "platformdirs", version = "4.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "platformdirs", version = "4.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-    { name = "requests" },
+    { name = "requests", version = "2.32.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "requests", version = "2.33.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "rich" },
     { name = "toml" },
 ]
@@ -2098,6 +2108,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pymemcache"
+version = "4.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/b6/4541b664aeaad025dfb8e851dcddf8e25ab22607e674dd2b562ea3e3586f/pymemcache-4.0.0.tar.gz", hash = "sha256:27bf9bd1bbc1e20f83633208620d56de50f14185055e49504f4f5e94e94aff94", size = 70176, upload-time = "2022-10-17T16:53:07.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/ba/2f7b22d8135b51c4fefb041461f8431e1908778e6539ff5af6eeaaee367a/pymemcache-4.0.0-py2.py3-none-any.whl", hash = "sha256:f507bc20e0dc8d562f8df9d872107a278df049fa496805c1431b926f3ddd0eab", size = 60772, upload-time = "2022-10-17T16:53:04.388Z" },
+]
+
+[[package]]
 name = "pyparsing"
 version = "3.2.5"
 source = { registry = "https://pypi.org/simple" }
@@ -2321,15 +2340,38 @@ hiredis = [
 name = "requests"
 version = "2.32.5"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.10'",
+]
 dependencies = [
-    { name = "certifi" },
-    { name = "charset-normalizer" },
-    { name = "idna" },
-    { name = "urllib3" },
+    { name = "certifi", marker = "python_full_version < '3.10'" },
+    { name = "charset-normalizer", marker = "python_full_version < '3.10'" },
+    { name = "idna", marker = "python_full_version < '3.10'" },
+    { name = "urllib3", marker = "python_full_version < '3.10'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf", size = 134517, upload-time = "2025-08-18T20:46:02.573Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6", size = 64738, upload-time = "2025-08-18T20:46:00.542Z" },
+]
+
+[[package]]
+name = "requests"
+version = "2.33.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12'",
+    "python_full_version == '3.11.*'",
+    "python_full_version == '3.10.*'",
+]
+dependencies = [
+    { name = "certifi", marker = "python_full_version >= '3.10'" },
+    { name = "charset-normalizer", marker = "python_full_version >= '3.10'" },
+    { name = "idna", marker = "python_full_version >= '3.10'" },
+    { name = "urllib3", marker = "python_full_version >= '3.10'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/34/64/8860370b167a9721e8956ae116825caff829224fbca0ca6e7bf8ddef8430/requests-2.33.0.tar.gz", hash = "sha256:c7ebc5e8b0f21837386ad0e1c8fe8b829fa5f544d8df3b2253bff14ef29d7652", size = 134232, upload-time = "2026-03-25T15:10:41.586Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/5d/c814546c2333ceea4ba42262d8c4d55763003e767fa169adc693bd524478/requests-2.33.0-py3-none-any.whl", hash = "sha256:3324635456fa185245e24865e810cecec7b4caf933d7eb133dcde67d48cee69b", size = 65017, upload-time = "2026-03-25T15:10:40.382Z" },
 ]
 
 [[package]]

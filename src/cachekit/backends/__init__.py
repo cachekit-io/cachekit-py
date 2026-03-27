@@ -1,8 +1,8 @@
 """Backend storage abstraction for cachekit.
 
 This module provides protocol-based abstraction for L2 backend storage with
-dependency injection pattern. Backends can be Redis, HTTP, DynamoDB, or any
-key-value store.
+dependency injection pattern. Backends can be Redis, HTTP, DynamoDB, Memcached,
+or any key-value store.
 
 Public API:
     - BaseBackend: Core protocol (5 methods: get, set, delete, exists, health_check)
@@ -14,6 +14,7 @@ Public API:
     - BackendErrorType: Error classification enum
     - CapabilityNotAvailableError: Exception for missing optional capabilities
     - RedisBackend: Redis implementation (default)
+    - MemcachedBackend: Memcached implementation (requires pymemcache)
 
 Usage:
     >>> from cachekit.backends import BaseBackend, RedisBackend, BackendError
@@ -56,6 +57,7 @@ __all__ = [
     "BackendErrorType",
     "CapabilityNotAvailableError",
     "RedisBackend",
+    "MemcachedBackend",
 ]
 
 
@@ -95,3 +97,12 @@ class BackendProvider(Protocol):
             >>> backend.set("key", b"value", ttl=60)  # doctest: +SKIP
         """
         ...
+
+
+def __getattr__(name: str):
+    """Lazy import for optional backends (pymemcache may not be installed)."""
+    if name == "MemcachedBackend":
+        from cachekit.backends.memcached import MemcachedBackend
+
+        return MemcachedBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
