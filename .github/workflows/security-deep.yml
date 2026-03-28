@@ -2,7 +2,7 @@ name: Security Deep
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 2 AM daily
+    - cron: '0 15 * * *'  # 2 AM AEDT (UTC+11)
   workflow_dispatch:  # Allow manual triggers
 
 permissions:
@@ -11,12 +11,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RUSTUP_HOME: /tmp/rustup
+  CARGO_HOME: /tmp/cargo
 
 jobs:
   # Deep security analysis (< 2 hours) - nightly scheduled
   kani-verification:
     name: Kani Formal Verification
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -28,27 +30,17 @@ jobs:
         args: --tests --no-default-features --features compression,checksum,messagepack,encryption
 
   fuzzing:
-    name: Extended Fuzzing (3 targets × 1h)
-    runs-on: ubuntu-latest
+    name: Extended Fuzzing (3 targets x 1h)
+    runs-on: cachekit-lean
     timeout-minutes: 200
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Install nightly Rust
+    - name: Install nightly Rust + cargo-fuzz
       run: |
         rustup toolchain install nightly
         rustup default nightly
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-
-    - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
-
-    - name: Install cargo-fuzz
-      run: cargo binstall --no-confirm cargo-fuzz
+        cargo install cargo-fuzz --locked
 
     - name: Fuzz byte_storage_compress (1 hour)
       run: |
@@ -70,11 +62,11 @@ jobs:
         cd rust/fuzz
         CRASHES=$(find artifacts -name "crash-*" 2>/dev/null | wc -l)
         if [ "$CRASHES" -gt 0 ]; then
-          echo "❌ Found $CRASHES crashes during fuzzing"
+          echo "Found $CRASHES crashes during fuzzing"
           find artifacts -name "crash-*" -exec echo "Crash: {}" \;
           exit 1
         fi
-        echo "✅ No crashes found during fuzzing"
+        echo "No crashes found during fuzzing"
 
     - name: Generate coverage report
       run: |
@@ -86,39 +78,15 @@ jobs:
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
-    runs-on: ubuntu-latest
+    runs-on: cachekit-lean
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf # v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install 3.11
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-        with:
-          toolchain: stable
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-
-    - name: Cache Python virtual environment
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-py3.11-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
-        restore-keys: |
-          venv-${{ runner.os }}-py3.11-
-
     - name: Install dependencies
       run: |
+        rustup toolchain install stable
+        rustup default stable
         uv sync --group dev --group fuzz
 
     - name: Run Atheris fuzz targets (10 min each)
@@ -141,15 +109,15 @@ jobs:
       if: always()
       run: |
         if [ -d tests/fuzzing/corpus/ ] && [ "$(ls -A tests/fuzzing/corpus/ 2>/dev/null | grep -v '.gitignore')" ]; then
-          echo "⚠️  Crashes discovered during Atheris fuzzing!"
+          echo "Crashes discovered during Atheris fuzzing!"
           ls -lh tests/fuzzing/corpus/
           exit 1
         fi
-        echo "✅ No crashes discovered during Atheris fuzzing"
+        echo "No crashes discovered during Atheris fuzzing"
 
   miri-full:
     name: Miri Full Suite
-    runs-on: ubuntu-latest
+    runs-on: cachekit-lean
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -159,11 +127,6 @@ jobs:
         rustup toolchain install nightly --component miri
         rustup default nightly
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-
     - name: Run full Miri test suite
       run: |
         cd rust
@@ -171,7 +134,7 @@ jobs:
 
   sanitizers:
     name: Sanitizers (ASan, TSan, MSan)
-    runs-on: ubuntu-latest
+    runs-on: cachekit-lean
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -188,12 +151,6 @@ jobs:
     - name: Add source for sanitizers
       if: matrix.sanitizer == 'memory' || matrix.sanitizer == 'thread'
       run: rustup component add rust-src --toolchain nightly
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-        key: ${{ matrix.sanitizer }}
 
     - name: Run AddressSanitizer
       if: matrix.sanitizer == 'address'
@@ -282,9 +239,9 @@ jobs:
              [[ "${{ needs.fuzzing.result }}" == "success" ]] && \
              [[ "${{ needs.miri-full.result }}" == "success" ]] && \
              [[ "${{ needs.sanitizers.result }}" == "success" ]]; then
-          echo "✅ All deep security checks passed"
+          echo "All deep security checks passed"
         else
-          echo "❌ One or more deep security checks failed"
+          echo "One or more deep security checks failed"
         fi)
         EOF
 
@@ -311,7 +268,7 @@ jobs:
            [[ "${{ needs.atheris-fuzzing.result }}" != "success" ]] || \
            [[ "${{ needs.miri-full.result }}" != "success" ]] || \
            [[ "${{ needs.sanitizers.result }}" != "success" ]]; then
-          echo "❌ One or more deep security checks failed"
+          echo "One or more deep security checks failed"
           echo "Kani: ${{ needs.kani-verification.result }}"
           echo "Fuzzing: ${{ needs.fuzzing.result }}"
           echo "Atheris: ${{ needs.atheris-fuzzing.result }}"
@@ -319,4 +276,4 @@ jobs:
           echo "Sanitizers: ${{ needs.sanitizers.result }}"
           exit 1
         fi
-        echo "✅ All deep security checks passed"
+        echo "All deep security checks passed"
