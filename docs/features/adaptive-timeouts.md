@@ -2,17 +2,17 @@
 
 # Adaptive Timeouts - Auto-Tune to Infrastructure
 
-**Version**: cachekit v1.0+
+**Available since v0.3.0**
 
 ## TL;DR
 
-Adaptive timeouts auto-adjust to Redis latency (P99). If Redis is slow today, timeout increases automatically. No need to tune timeout constants for different environments.
+Adaptive timeouts auto-adjust to Redis latency (P95). If Redis is slow today, the timeout increases automatically. No need to tune timeout constants for different environments.
 
 ```python
 @cache(ttl=300)  # Adaptive timeout enabled by default
 def get_data(key):
-    # If Redis P99 latency is 10ms → timeout auto-sets to 30ms (3x)
-    # If Redis P99 latency is 100ms → timeout auto-sets to 300ms (3x)
+    # If Redis P95 latency is 10ms → timeout auto-sets to 15ms (P95 * 1.5x buffer)
+    # If Redis P95 latency is 100ms → timeout auto-sets to 150ms
     return db.query(key)
 ```
 
@@ -20,7 +20,7 @@ def get_data(key):
 
 ## Quick Start
 
-Adaptive timeout enabled by default:
+Adaptive timeout is enabled by default:
 
 ```python notest
 from cachekit import cache
@@ -29,18 +29,25 @@ from cachekit import cache
 def expensive_query(x):
     return db.query(x)
 
-# Monitors Redis P99 latency automatically
+# Monitors Redis P95 latency automatically
 # Adjusts timeout based on observed latency
 result = expensive_query(1)
 ```
 
 **Configuration** (optional):
 ```python notest
+from cachekit.config.nested import TimeoutConfig
+
 @cache(
     ttl=300,
-    adaptive_timeout_enabled=True,  # Default: True
-    timeout_base_milliseconds=100,  # Minimum timeout (default: 100ms)
-    timeout_multiplier=3.0,  # Timeout = P99 * 3 (default: 3x)
+    timeout=TimeoutConfig(
+        enabled=True,       # Default: True
+        initial=1.0,        # Initial timeout in seconds (default: 1.0s)
+        min=0.1,            # Minimum timeout in seconds (default: 0.1s)
+        max=5.0,            # Maximum timeout in seconds (default: 5.0s)
+        percentile=95.0,    # Target percentile (default: P95)
+        window_size=1000,   # Sliding window size (default: 1000 requests)
+    )
 )
 def operation(x):
     return compute(x)
@@ -52,18 +59,18 @@ def operation(x):
 
 **Timeout calculation**:
 ```
-Observe Redis latencies over last N requests
-Calculate P99 (99th percentile)
-Set timeout = P99 * timeout_multiplier
+Observe Redis latencies over last N requests (sliding window)
+Calculate P95 (95th percentile)
+Set timeout = P95 * 1.5  (fixed 50% safety buffer)
 
 Example:
 Redis is slow today:
-  P99 latency: 100ms
-  Timeout: 100ms * 3 = 300ms (gives 3x buffer)
+  P95 latency: 100ms
+  Timeout: 100ms * 1.5 = 150ms
 
 Redis is fast:
-  P99 latency: 10ms
-  Timeout: 10ms * 3 = 30ms (tight timeout)
+  P95 latency: 10ms
+  Timeout: 10ms * 1.5 = 15ms
 
 Auto-adjusts throughout day without code change
 ```
@@ -80,6 +87,8 @@ Timeout automatically adjusts to:
 - Network conditions (congestion, etc)
 ```
 
+**Cold start**: Until at least 10 samples are collected, the system uses a conservative default of `initial * 2` seconds.
+
 ---
 
 ## Why You'd Want It
@@ -88,7 +97,7 @@ Timeout automatically adjusts to:
 
 Without adaptive timeout:
 ```python notest
-@cache(ttl=300, timeout_milliseconds=50)  # Static timeout
+@cache(ttl=300, timeout=TimeoutConfig(enabled=False, initial=0.05))  # Static 50ms
 def get_data():
     # Off-peak: Redis is fast (10ms), timeout is 50ms (fine)
     # Peak hours: Redis is slow (100ms), timeout is 50ms (too short!)
@@ -102,8 +111,8 @@ With adaptive timeout:
 ```python
 @cache(ttl=300)  # Adaptive
 def get_data():
-    # Off-peak: P99 = 10ms, timeout auto = 30ms (snappy)
-    # Peak: P99 = 100ms, timeout auto = 300ms (generous)
+    # Off-peak: P95 = 10ms, timeout auto = 15ms (snappy)
+    # Peak: P95 = 100ms, timeout auto = 150ms (generous)
     # Automatically adjusts without code change
     return fetch_data()
 ```
@@ -121,14 +130,16 @@ def get_data():
 **Scenarios where adaptive timeout doesn't help**:
 
 1. **Static load**: Redis always same latency (no variation)
-2. **High variance**: P99 doesn't match actual latency distribution
+2. **High variance**: P95 doesn't match actual latency distribution
 3. **Catastrophic failure**: Redis crashed (timeout doesn't help)
 
 **Mitigation**: Static timeout with circuit breaker (better match):
 ```python notest
-@cache(ttl=300, adaptive_timeout_enabled=False, timeout_milliseconds=500)
+from cachekit.config.nested import TimeoutConfig
+
+@cache(ttl=300, timeout=TimeoutConfig(enabled=False, initial=0.5))
 def get_data():
-    # Or: Use circuit breaker for failure handling
+    # Static 500ms timeout, circuit breaker handles outages
     return fetch_data()
 ```
 
@@ -136,7 +147,7 @@ def get_data():
 
 ## What Can Go Wrong
 
-### P99 Biased by Slow Queries
+### P95 Biased by Slow Queries
 ```python
 @cache(ttl=300)
 def operation(x):
@@ -147,21 +158,22 @@ def operation(x):
         # Takes 10ms
         return fast_compute(x)
 
-# P99 calculation sees: [10ms, 10ms, ..., 10s]
-# P99 = 10s
-# Timeout = 30s (very loose)
-# Problem: Most queries are fast but timeout is slow
+# P95 calculation sees: [10ms, 10ms, ..., 10s]
+# P95 = 10s
+# Timeout = 15s (very loose)
+# Problem: Most queries are fast but timeout is very slow
 # Solution: Break slow queries into separate cached function
 ```
 
 ### Timeout Constantly Changing
 ```python
 # Load pattern very volatile
-# P99 changes by 100x per minute
-# Timeout thrashes: 30ms → 300ms → 30ms → 300ms
+# P95 changes by 100x per minute
+# Timeout thrashes: 15ms → 150ms → 15ms → 150ms
 
 # Problem: Unstable system
-# Solution: Increase timeout_multiplier (more buffer) or use static timeout
+# Solution: Increase TimeoutConfig(max=...) for a larger ceiling,
+#           or use a static timeout
 ```
 
 ### Redis Completely Down
@@ -178,7 +190,6 @@ def operation(x):
 
 ### Basic Usage (Automatic)
 ```python notest
-# Illustrative example - requires database connection
 @cache(ttl=3600)  # Adaptive timeout enabled
 def get_user(user_id):
     return db.query(user_id)
@@ -189,20 +200,28 @@ user = get_user(123)
 
 ### Tuning for Your Infrastructure
 ```python notest
-# If you want tighter timeouts (aggressive)
+from cachekit.config.nested import TimeoutConfig
+
+# Tight bounds (low-latency infrastructure)
 @cache(
     ttl=3600,
-    timeout_base_milliseconds=50,  # Minimum 50ms
-    timeout_multiplier=2.0,  # Timeout = P99 * 2 (less buffer)
+    timeout=TimeoutConfig(
+        min=0.05,    # 50ms minimum
+        initial=0.5, # 500ms initial
+        max=2.0,     # 2s maximum
+    )
 )
 def operation(x):
     return compute(x)
 
-# If you want looser timeouts (conservative)
+# Conservative bounds (variable latency infrastructure)
 @cache(
     ttl=3600,
-    timeout_base_milliseconds=500,  # Minimum 500ms
-    timeout_multiplier=5.0,  # Timeout = P99 * 5 (more buffer)
+    timeout=TimeoutConfig(
+        min=0.5,     # 500ms minimum
+        initial=2.0, # 2s initial
+        max=10.0,    # 10s maximum
+    )
 )
 def operation(x):
     return compute(x)
@@ -210,10 +229,11 @@ def operation(x):
 
 ### Disabling Adaptive Timeout
 ```python notest
+from cachekit.config.nested import TimeoutConfig
+
 @cache(
     ttl=3600,
-    adaptive_timeout_enabled=False,
-    timeout_milliseconds=500,  # Static 500ms
+    timeout=TimeoutConfig(enabled=False, initial=0.5),  # Static 500ms
 )
 def operation(x):
     return compute(x)
@@ -223,54 +243,55 @@ def operation(x):
 
 ## Technical Deep Dive
 
-### P99 Calculation
-```python
-import numpy
+### P95 Calculation
 
-# Collect latencies from last N requests
-latencies = [10, 12, 9, 8, 11]  # milliseconds
+The actual algorithm, from `AdaptiveTimeout.get_timeout()`:
 
-# Calculate percentile
-# P99 = value where 99% of latencies are below
-p99 = numpy.percentile(latencies, 99)
+```python notest
+# Collect latencies from last 1000 requests (sliding window)
+latencies = [0.010, 0.012, 0.009, 0.011]  # seconds
 
-# Example: [5, 10, 15, 20, 25, ..., 995, 1000]
-# P99 = 990ms (99% below, 1% above)
+# Calculate P95 from sorted durations
+sorted_durations = sorted(latencies)
+index = int(len(sorted_durations) * 95.0 / 100)
+p95 = sorted_durations[index]
 
-# Set timeout
-timeout_multiplier = 3.0
-timeout = p99 * timeout_multiplier  # 990ms * 3.0 = 2970ms
+# Add 50% buffer (fixed, not configurable)
+timeout = p95 * 1.5
+
+# Apply min/max bounds
+timeout = max(min_timeout, min(timeout, max_timeout))
 ```
+
+Until at least 10 samples are collected, the timeout falls back to `min_timeout * 2`.
 
 ### Window Size
 ```
-Observation window: Last 1000 requests (configurable)
-Update frequency: Every 100 requests
-Advantages:
-  - Responsive to changes (updated frequently)
-  - Stable (100-request window, not 1-request)
-  - Reasonable memory (1000-request circular buffer)
+Observation window: Last 1000 requests (configurable via window_size)
+Minimum samples before adapting: 10 requests
+Memory: Circular buffer, bounded at window_size entries
 ```
 
 ### Percentile Choice
 ```
-Why P99 and not P50/P95/P999?
+Why P95 and not P50/P99/P999?
 
 P50 (median):
   - Too aggressive, timeouts too tight
   - 50% of requests close to timeout
 
-P95:
-  - Close to P99, middle ground
+P95 (default):
+  - Industry standard for "typical worst case"
+  - Catches most slow requests
+  - Top 5% still might timeout (acceptable)
 
 P99:
-  - Industry standard
-  - Catches most slow requests
-  - Top 1% still might timeout (acceptable)
+  - Looser, more buffer
+  - Suitable for latency-sensitive workloads
+  - Configure via: TimeoutConfig(percentile=99.0)
 
 P999:
-  - Too loose, timeouts very long
-  - Outlier queries control behavior
+  - Too loose, outlier queries dominate
 ```
 
 ---
@@ -291,9 +312,8 @@ def get_data():
 ```python
 @cache(ttl=300)  # Both enabled
 def get_data():
-    # Distributed locking timeout is separate from Redis timeout
-    # Adaptive timeout only affects Redis operations
-    # Lock timeout is static (configurable separately)
+    # Lock acquisition uses AdaptiveTimeoutManager (separate from general timeout)
+    # Lock-specific timeout adjusts based on lock contention and operation duration
     return fetch_data()
 ```
 
@@ -303,55 +323,63 @@ def get_data():
 
 ### Metrics Available
 ```prometheus
-cachekit_redis_latency_p99_milliseconds{function="get_user"}
-  # P99 latency (basis for timeout)
+cachekit_adaptive_timeout_adjustments{namespace="get_user"}
+  # How often the adaptive timeout changed
 
-cachekit_timeout_milliseconds{function="get_user"}
-  # Current adaptive timeout
+circuit_breaker_state{namespace="get_user"}
+  # Circuit breaker state (proxy for timeout-related failures)
 
-cachekit_timeout_exceeded_total{function="get_user"}
-  # How often timeout was exceeded
+cache_operations_total{operation="get", status="error", namespace="get_user"}
+  # Error count (includes timeouts)
 ```
 
 ### Debugging Timeout Issues
 ```python notest
-from cachekit import get_cache_metrics
+from cachekit.reliability.adaptive_timeout import AdaptiveTimeout
 
-metrics = get_cache_metrics("get_user")
-print(f"P99 latency: {metrics.redis_p99_ms}ms")
-print(f"Current timeout: {metrics.timeout_ms}ms")
-print(f"Timeouts exceeded: {metrics.timeout_exceeded}")
+# Inspect the timeout calculator state
+timeout_calc = AdaptiveTimeout(percentile=95.0)
+# After recording durations...
+current_timeout = timeout_calc.get_timeout()
+print(f"Current adaptive timeout: {current_timeout:.3f}s")
 
-# If timeout_exceeded is high:
-# → Increase timeout_multiplier
-# → Or increase timeout_base_milliseconds
+# If timeouts are too aggressive:
+# → Increase TimeoutConfig(max=...) for a higher ceiling
+# → Or widen TimeoutConfig(min=...) for a larger floor
+
+# If system is always using the cold-start default:
+# → Not enough traffic (need 10+ samples)
+# → Consider a manual initial value: TimeoutConfig(initial=0.5)
 ```
 
 ---
 
 ## Troubleshooting
 
-**Q: Getting "timeout exceeded" errors**
-A: Increase `timeout_multiplier` or `timeout_base_milliseconds`
+**Q: Getting backend timeout errors**
+A: Increase `TimeoutConfig(max=...)` to allow a higher ceiling, or increase `TimeoutConfig(initial=...)` for a more generous starting point.
 
 **Q: Timeout constantly changing**
-A: Increase `timeout_multiplier` for more stability
+A: System load is volatile. Consider a higher `max` value as a stable ceiling.
 
 **Q: Want to disable adaptive timeout**
-A: Set `adaptive_timeout_enabled=False` and specify static `timeout_milliseconds`
+A: Set `timeout=TimeoutConfig(enabled=False, initial=0.5)` for a static 500ms timeout.
+
+**Q: Timeout seems stuck at the same value**
+A: You probably have fewer than 10 samples recorded. The system uses `initial * 2` until enough data accumulates.
 
 ---
 
 ## See Also
 
 - [Circuit Breaker](circuit-breaker.md) - Catches timeout failures
-- [Distributed Locking](distributed-locking.md) - Has separate timeout
-- [Prometheus Metrics](prometheus-metrics.md) - Monitor adaptive timeout
+- [Distributed Locking](distributed-locking.md) - Has separate lock-specific adaptive timeout
+- [Prometheus Metrics](prometheus-metrics.md) - Monitor reliability features
 
 ---
 
 <div align="center">
 
-*Last Updated: 2025-12-02 · ✅ Feature implemented and tested*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](../README.md)**
 
 </div>

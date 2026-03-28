@@ -8,15 +8,15 @@
 
 ## Table of Contents
 
-- [Quick Start with Redis](#-quick-start-with-redis)
-- [Progressive Disclosure](#-progressive-disclosure-choose-your-level)
-- [Installation](#-installation)
-- [Choose Your Backend](#-choose-your-backend)
-- [What Makes cachekit Different](#-what-makes-cachekit-different)
-- [Common Pitfalls](#-common-pitfalls-to-avoid)
-- [Configuration](#-configuration)
-- [Testing Your Setup](#-testing-your-setup)
-- [Troubleshooting](#-troubleshooting)
+- [Quick Start with Redis](#quick-start-with-redis)
+- [Progressive Disclosure](#progressive-disclosure-choose-your-level)
+- [Installation](#installation)
+- [Choose Your Backend](#choose-your-backend)
+- [What Makes cachekit Different](#what-makes-cachekit-different)
+- [Common Pitfalls](#common-pitfalls-to-avoid)
+- [Configuration](#configuration)
+- [Testing Your Setup](#testing-your-setup)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -305,7 +305,7 @@ def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```
 
-Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](guides/backend-guide.md) for multi-server configuration.
+Everything else — TTL, namespaces, serializers — works the same as with Redis. See the [Backend Guide](backends/README.md) for multi-server configuration.
 
 ### File / L1-Only (Dev and Testing)
 
@@ -345,10 +345,10 @@ result = critical_function()  # Works even if Redis is offline
 
 | Optimization | Impact | Focus |
 |:-------------|:------:|:------|
-| Connection pooling | **50%** improvement | We focus here |
-| Network calls | 1-2ms | We accept this |
+| Connection pooling | **50%** improvement | cachekit focuses here |
+| Network calls | 1-2ms | Accepted tradeoff |
 | Serialization | 50-200μs | Already fast enough |
-| SIMD hashing | 0.077% improvement | We removed this |
+| SIMD hashing | 0.077% improvement | Removed (not worth it) |
 
 ---
 
@@ -590,7 +590,7 @@ for i in range(3):
 
 | Direction | Resource |
 |:----------|:---------|
-| **Previous** | [Quick Start](QUICK_START.md) - 5-minute intro |
+| **Previous** | [Documentation Home](README.md) |
 | **Next** | [API Reference](api-reference.md) - Complete decorator parameters |
 
 ### Deep Dives
@@ -606,8 +606,8 @@ for i in range(3):
 | Guide | Description |
 |:------|:------------|
 | [Configuration Guide](configuration.md) | Detailed configuration and tuning |
-| [Serializer Guide](guides/serializer-guide.md) | Choose the right serializer |
-| [Backend Guide](guides/backend-guide.md) | Custom storage backends |
+| [Serializer Guide](serializers/README.md) | Choose the right serializer |
+| [Backend Guide](backends/README.md) | Custom storage backends |
 | [Circuit Breaker](features/circuit-breaker.md) | Failure protection |
 | [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) | Client-side encryption |
 | [Prometheus Metrics](features/prometheus-metrics.md) | Production observability |

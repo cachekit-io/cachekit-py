@@ -74,15 +74,15 @@ def safe_computation(data):
 
 **Solutions**:
 
-1. **For custom objects**, use appropriate serializer:
+1. **For custom objects**, convert to a supported type before caching:
 ```python notest
 from cachekit import cache
-from cachekit.serializers import PickleSerializer
 
-# Pickle supports arbitrary Python objects
-@cache(serializer=PickleSerializer())
+# Convert to dict before caching
+@cache
 def get_custom_object():
-    return MyCustomClass()
+    obj = MyCustomClass()
+    return obj.__dict__  # or use obj.to_dict() / dataclasses.asdict(obj)
 ```
 
 2. **For DataFrames**, use ArrowSerializer:
@@ -120,7 +120,7 @@ def get_user(user_id: int) -> dict:
     return user.model_dump()  # Explicit conversion
 ```
 
-   **Why not auto-detect Pydantic models?** See [Serializer Guide - Caching Pydantic Models](guides/serializer-guide.md#caching-pydantic-models) for the detailed rationale.
+   **Why not auto-detect Pydantic models?** See [Serializer Guide - Caching Pydantic Models](serializers/pydantic.md) for the detailed rationale.
 
 5. **Check what serializer is installed**:
 ```python notest
@@ -495,13 +495,14 @@ def get_timestamp():
 **Solution**:
 ```python notest
 from cachekit import cache
-from cachekit.serializers import PickleSerializer
+from cachekit.serializers import OrjsonSerializer
 import datetime
 
-# Use PickleSerializer for complex types
-@cache(serializer=PickleSerializer(), backend=None)
+# OrjsonSerializer handles datetime natively (converts to ISO-8601 string)
+@cache(serializer=OrjsonSerializer(), backend=None)
 def get_timestamp():
-    return datetime.datetime.now()
+    return {"ts": datetime.datetime.now()}
+```
 ```
 
 </details>
@@ -675,9 +676,9 @@ print(f"Cache key: {key}")
 <summary><strong>Test serializer independently</strong></summary>
 
 ```python notest
-from cachekit.serializers import DefaultSerializer
+from cachekit.serializers import StandardSerializer
 
-serializer = DefaultSerializer()
+serializer = StandardSerializer()
 
 # Test serialization
 data = {"key": "value"}
@@ -705,6 +706,6 @@ print(f"Decoded matches: {decoded == data}")
 
 <div align="center">
 
-*Last Updated: 2025-12-02*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>

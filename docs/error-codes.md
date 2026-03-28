@@ -280,15 +280,15 @@ def get_timestamp():
 
 **Solutions**:
 
-1. **For complex Python objects**, use PickleSerializer:
+1. **For datetime objects**, use OrjsonSerializer (native datetime support):
 ```python notest
 from cachekit import cache
-from cachekit.serializers import PickleSerializer
+from cachekit.serializers import OrjsonSerializer
 import datetime
 
-@cache(serializer=PickleSerializer())
+@cache(serializer=OrjsonSerializer())
 def get_timestamp():
-    return datetime.datetime.now()  # Works
+    return {"ts": datetime.datetime.now()}  # Converts to ISO-8601 string
 ```
 
 2. **For DataFrames**, use ArrowSerializer:
@@ -547,7 +547,7 @@ def get_data():
 **Behavior**: TRANSIENT — auto-retry with backoff. If sustained, circuit breaker opens and function executes without caching.
 
 **What happens when circuit breaker opens**:
-```python
+```python notest
 @cache.io(ttl=300)
 def my_function():
     return expensive_operation()
@@ -720,4 +720,8 @@ def monitored_function(x):
 
 ---
 
-**Last Updated**: 2026-03-18
+<div align="center">
+
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
+
+</div>

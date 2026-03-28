@@ -88,36 +88,52 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int`, default: `3600`) - Cache time-to-live in seconds
-- **`namespace`** (`str`, optional) - Cache key prefix for organization
-- **`safe_mode`** (`bool`, default: `False`) - Enable additional safety checks
+- **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
+- **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
+- **`safe_mode`** (`bool`, default: `False`) - Enable fail-open behavior (cache failures return `None` instead of raising)
+- **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
+- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection
+- **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
 
 #### Performance Parameters
 
-- **`pipelined`** (`bool`, default: `True`) - Enable pipelined Redis operations for 50% fewer round trips
-- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on cache hits when below threshold to prevent cache stampedes
-- **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Percentage of TTL remaining to trigger refresh (0.5 = refresh when 50% expired)
-- **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache for fast access (~242μs for 10KB payloads, 8-20x faster than Redis)
-- **`fast_mode`** (`bool`, default: `False`) - Enable fast mode to disable monitoring overhead (equivalent to using @cache.minimal)
+- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on cache hits when below threshold
+- **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
+- **`l1`** (`L1CacheConfig`, default: `L1CacheConfig()`) - L1 in-memory cache configuration
 
 #### Reliability Parameters
 
-- **`circuit_breaker`** (`bool`, default: `True`) - Enable circuit breaker protection against cascading failures
-- **`circuit_breaker_config`** (`CircuitBreakerConfig | None`) - Custom circuit breaker configuration:
+- **`circuit_breaker`** (`CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration:
+  - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
   - `failure_threshold` (`int`, default: `5`) - Failures before opening circuit
   - `success_threshold` (`int`, default: `3`) - Successes before closing circuit
-  - `recovery_timeout` (`float`, default: `30.0`) - Time before trying half-open state
+  - `recovery_timeout` (`int`, default: `30`) - Seconds before attempting recovery
   - `half_open_requests` (`int`, default: `3`) - Test requests allowed in half-open state
-  - `excluded_exceptions` (`Tuple[type, ...]`) - Exceptions that don't trigger circuit breaker
-- **`adaptive_timeout`** (`bool`, default: `True`) - Enable dynamic timeout adjustment based on P95 latency
-- **`backpressure`** (`bool`, default: `True`) - Enable request rate limiting to prevent overload
-- **`max_concurrent_requests`** (`int`, default: `100`) - Maximum concurrent requests before rejecting
+  - `excluded_exceptions` (`tuple[type[Exception], ...]`, default: `()`) - Exceptions that don't trigger circuit breaker
+- **`timeout`** (`TimeoutConfig`, default: `TimeoutConfig()`) - Adaptive timeout configuration:
+  - `enabled` (`bool`, default: `True`) - Enable adaptive timeout
+  - `initial` (`float`, default: `1.0`) - Initial timeout in seconds
+  - `min` (`float`, default: `0.1`) - Minimum timeout in seconds
+  - `max` (`float`, default: `5.0`) - Maximum timeout in seconds
+  - `window_size` (`int`, default: `1000`) - Sliding window size for percentile calculation
+  - `percentile` (`float`, default: `95.0`) - Target percentile for timeout calculation
+- **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
+  - `enabled` (`bool`, default: `True`) - Enable backpressure protection
+  - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
+  - `queue_size` (`int`, default: `1000`) - Queue size for waiting requests
+  - `timeout` (`float`, default: `0.1`) - Seconds to wait in queue before giving up
 
 #### Monitoring Parameters
 
-- **`collect_stats`** (`bool`, default: `True`) - Enable statistics collection
-- **`enable_tracing`** (`bool`, default: `True`) - Enable OpenTelemetry tracing
-- **`enable_structured_logging`** (`bool`, default: `True`) - Enable structured logging with correlation IDs
+- **`monitoring`** (`MonitoringConfig`, default: `MonitoringConfig()`) - Observability configuration:
+  - `collect_stats` (`bool`, default: `True`) - Collect cache hit/miss statistics
+  - `enable_tracing` (`bool`, default: `True`) - Enable distributed tracing
+  - `enable_structured_logging` (`bool`, default: `True`) - Enable structured JSON logging
+  - `enable_prometheus_metrics` (`bool`, default: `True`) - Export Prometheus metrics
+
+#### Encryption Parameters
+
+- **`encryption`** (`EncryptionConfig`, default: `EncryptionConfig()`) - Client-side encryption configuration (use `@cache.secure` preset instead of configuring directly)
 
 #### Returns
 - Cached function result or fresh computation result
@@ -310,7 +326,7 @@ orchestrator = FeatureOrchestrator(
 ```
 
 **Key Components:**
-- **FeatureOrchestrator**: Manages enterprise-grade features (circuit breaker, adaptive timeout, backpressure, statistics, logging)
+- **FeatureOrchestrator**: Manages reliability features (circuit breaker, adaptive timeout, backpressure, statistics, logging)
 - **CachedRedisClientProvider**: Thread-local Redis client caching for performance
 - **Configuration Caching**: LRU cached configuration objects to eliminate overhead
 
@@ -318,7 +334,7 @@ orchestrator = FeatureOrchestrator(
 
 ### Internal Reliability Components
 
-These components work behind the scenes to provide enterprise-grade reliability:
+These components work behind the scenes to provide reliability features:
 
 #### `AsyncMetricsCollector`
 Non-blocking metrics collection system that prevents performance degradation:
@@ -409,7 +425,6 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
 | AutoSerializer | ✅ | ❌ | ❌ | ❌ | ❌ | Python-only with NumPy/pandas/UUID |
 | OrjsonSerializer | ✅ | ✅ | ✅ | ✅ | ✅ | JSON-native data (same as StandardSerializer) |
 | ArrowSerializer | ✅ | ❌ | ✅ | ✅ | ✅ | DataFrames (NOT PHP compatible) |
-| PickleSerializer | ✅ | ❌ | ❌ | ❌ | ❌ | Python-only objects (security risk) |
 
 > [!WARNING]
 > - **ArrowSerializer is NOT PHP-compatible** - Use StandardSerializer or OrjsonSerializer for PHP
@@ -595,19 +610,19 @@ def get_user_data_v2(user_id):
 
 ### `CachekitConfig`
 
-Configuration class for Redis connection and caching behavior. Based on `pydantic-settings` for automatic environment variable loading.
+Configuration class for backend-agnostic cache settings. Based on `pydantic-settings` for automatic environment variable loading with the `CACHEKIT_` prefix. Redis connection settings (URL, pool size, timeouts) live on `RedisBackendConfig`, not here.
 
 **Key Fields:**
-- **`redis_url`** (`str`, default: `"redis://localhost:6379"`) - Redis connection URL (env: `CACHEKIT_REDIS_URL` or `REDIS_URL`)
-- **`connection_pool_size`** (`int`, default: `10`) - Maximum connections in Redis pool (env: `CACHEKIT_CONNECTION_POOL_SIZE`)
-- **`socket_timeout`** (`float`, default: `1.0`) - Socket timeout in seconds (env: `CACHEKIT_SOCKET_TIMEOUT`)
-- **`socket_connect_timeout`** (`float`, default: `1.0`) - Connection timeout in seconds
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`enable_compression`** (`bool`, default: `True`) - Enable LZ4 compression (env: `CACHEKIT_ENABLE_COMPRESSION`)
+- **`compression_level`** (`int`, default: `6`) - Zlib compression level 1–9 (env: `CACHEKIT_COMPRESSION_LEVEL`)
 - **`max_chunk_size_mb`** (`int`, default: `50`) - Maximum cache chunk size in MB (env: `CACHEKIT_MAX_CHUNK_SIZE_MB`)
-- **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache
-- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB
-- **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection
+- **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
+- **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
+- **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
+- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
+- **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
+- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` (env: `CACHEKIT_MASTER_KEY`)
 
 **Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
 
@@ -628,117 +643,6 @@ config = CachekitConfig(
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
 
-
-## Serialization Options
-
-### Available Serializers
-
-cachekit provides pluggable serializers for different use cases:
-
-#### `DefaultSerializer` (MessagePack - Default)
-Efficient binary serialization with optional compression:
-- Efficient binary format (faster than JSON)
-- Supports standard Python types (dict, list, str, int, float, bool, None)
-- Optional LZ4 compression for large payloads (3-5x reduction)
-- Optional xxHash3-64 checksums for data integrity
-- Secure - no pickle vulnerabilities
-
-#### `OrjsonSerializer` (Fast JSON)
-Rust-powered JSON serialization:
-- **2-5x faster** than stdlib json
-- Human-readable JSON format
-- Cross-language compatible
-- Best for API responses, webhooks, session data
-
-#### `ArrowSerializer` (DataFrames)
-Zero-copy DataFrame serialization:
-- **6-23x faster** for large DataFrames (10K+ rows)
-- Supports pandas and polars
-- Best for data science workloads
-
-#### `EncryptionWrapper` (Zero-Knowledge Caching)
-Client-side AES-256-GCM encryption that wraps **any serializer**:
-- Wraps DefaultSerializer, OrjsonSerializer, or ArrowSerializer
-- Per-tenant key derivation for multi-tenant environments
-- GDPR/HIPAA/PCI-DSS compliant - backend never sees plaintext
-- Client-side encryption before storage
-- True zero-knowledge caching architecture
-- **Minimal overhead**: 2.5% for DataFrames, 3-5 μs for JSON/MessagePack
-
-**Parameters**:
-- `serializer`: Any SerializerProtocol (defaults to DefaultSerializer)
-- `master_key`: 256-bit master key for encryption (bytes)
-- `tenant_id`: Tenant identifier for key isolation (str)
-- `enable_encryption`: Toggle encryption (bool, default: True)
-
-### Supported Data Types
-
-DefaultSerializer supports comprehensive Python types:
-
-| Data Type | DefaultSerializer | EncryptionWrapper |
-|-----------|---------------|---------------------|
-| **Basic Types** (int, float, str, bool, None) | ✅ | ✅ |
-| **Collections** (list, dict) | ✅ | ✅ |
-| **Tuples** | ⚠️ (converts to list) | ⚠️ (converts to list) |
-| **Sets** | ✅ | ✅ |
-| **Pandas DataFrames** | ✅ | ✅ |
-| **NumPy Arrays** | ✅ | ✅ |
-| **Datetime Objects** | ✅ | ✅ |
-| **Custom Classes** | ⚠️ (limited support) | ⚠️ (limited support) |
-| **Special Floats** (inf, nan) | ✅ | ✅ |
-
-**Note**: Tuples are converted to lists during serialization (MessagePack limitation). For better type preservation in specific use cases, planned serializer plugins (v1.0+) will provide alternatives.
-
-### Examples
-
-```python
-from cachekit import cache
-
-# Default (MessagePack) - handles all common cases
-@cache(backend=None)
-def default_function():
-    return {
-        'coords': (10.5, 20.3),  # Note: tuple converted to list on retrieval
-        'data': [1, 2, 3],
-        'nested': {'key': 'value'}
-    }
-```
-
-**Encryption examples** (env var `CACHEKIT_MASTER_KEY` set in test fixtures):
-```python
-from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
-
-# Encrypted MessagePack (use @cache.secure preset)
-@cache.secure(master_key=secret_key, backend=None)
-def get_user_ssn(user_id: int):
-    return {"ssn": "123-45-6789", "dob": "1990-01-01"}
-
-# Encrypted JSON (zero-knowledge API caching)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(secret_key)), backend=None)
-def get_api_keys(tenant_id: str):
-    return {"api_key": "sk_live_...", "webhook_secret": "whsec_..."}
-```
-
-**External data source examples** (require external services):
-```python notest
-import pandas as pd
-
-# Fast JSON serialization (API responses, webhooks)
-@cache(serializer=OrjsonSerializer(), backend=None)
-def get_api_response(endpoint: str):
-    return {"status": "success", "data": fetch_api(endpoint)}  # external API call
-
-# Zero-copy DataFrame caching (10K+ rows)
-@cache(serializer=ArrowSerializer(), backend=None)
-def get_large_dataset(date: str):
-    return pd.read_csv(f"data/{date}.csv")  # file I/O
-
-# Encrypted DataFrames (zero-knowledge ML features)
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
-def get_patient_data(hospital_id: int):
-    return pd.read_sql("SELECT * FROM patients", conn)  # database query
-```
 
 ---
 
@@ -786,7 +690,7 @@ For error examples and handling patterns, see [Troubleshooting Guide](troublesho
 
 cachekit uses a protocol-based backend abstraction (PEP 544) that allows pluggable storage backends for L2 cache. Built-in backends include Redis, CachekitIO, File, and Memcached. You can also implement custom backends for any key-value store.
 
-For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](guides/backend-guide.md)**.
+For comprehensive backend guide with examples and implementation patterns, see **[Backend Guide](backends/README.md)**.
 
 ### Backend Resolution Priority
 
@@ -829,7 +733,7 @@ def local_only_cache():
 
 **Note**: L1-only mode is process-local and not shared across pods/workers. Use for development or single-process applications only.
 
-For complete backend implementation details, see [Backend Guide - BaseBackend Protocol](guides/backend-guide.md#basebackend-protocol) and [Backend Guide - Custom Implementation](guides/backend-guide.md#custom-backend-implementation).
+For complete backend implementation details, see [Backend Guide - BaseBackend Protocol](backends/README.md#basebackend-protocol) and [Backend Guide - Custom Implementation](backends/custom.md).
 
 
 ## Environment Variables
@@ -839,11 +743,8 @@ cachekit is configured through environment variables. For detailed setup and tro
 ### Standard Configuration
 
 ```bash
-# Redis Connection (for CachekitConfig)
+# Redis Connection (configured on RedisBackend, not CachekitConfig)
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
-CACHEKIT_CONNECTION_POOL_SIZE=10
-CACHEKIT_SOCKET_TIMEOUT=1.0
-CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
 # Cache Behavior
 CACHEKIT_DEFAULT_TTL=3600
@@ -892,12 +793,12 @@ def typed_function(data: dict[str, Any]) -> str | int | None:
 
 The library exposes comprehensive metrics (enabled by default):
 
-- `redis_cache_operations_total` - Operation counts by operation, status, serializer, namespace
-- `redis_cache_operation_duration_seconds` - Latency histograms with optimized buckets
-- `redis_circuit_breaker_state` - Circuit breaker state per namespace (0=closed, 1=open, 2=half-open)
-- `redis_connection_pool_utilization` - Pool usage ratio (0.0-1.0)
-- `redis_connection_pool_usage` - Detailed pool statistics (created, available, in_use)
-- `redis_serialization_fallbacks_total` - Serializer fallback tracking
+- `cachekit_cache_operations_total` - Operation counts by operation, status, serializer, namespace
+- `cachekit_cache_operation_duration_seconds` - Latency histograms with optimized buckets
+- `cachekit_circuit_breaker_state` - Circuit breaker state per namespace (0=closed, 1=open, 2=half-open)
+- `cachekit_connection_pool_utilization` - Pool usage ratio (0.0-1.0)
+- `cachekit_connection_pool_usage` - Detailed pool statistics (created, available, in_use)
+- `cachekit_serialization_fallbacks_total` - Serializer fallback tracking
 
 ### Structured Logging
 
@@ -918,9 +819,8 @@ Pre-built Grafana dashboards available in `/monitoring/grafana/`:
 
 ### Connection Management
 ```python
-# Connection pooling is automatically enabled
-# Configure via environment variables:
-# CACHEKIT_CONNECTION_POOL_SIZE=50
+# Connection pooling is automatically enabled on RedisBackend
+# Configure pool size via RedisBackendConfig or the backend's environment variables
 ```
 
 ### Namespace Organization
@@ -957,8 +857,8 @@ def get_reference_data(): ...
 ## See Also
 
 ### Related Guides
-- [Serializer Guide](guides/serializer-guide.md) - Choose the right serializer for your data types
-- [Backend Guide](guides/backend-guide.md) - Custom storage backend implementation
+- [Serializer Guide](serializers/README.md) - Choose the right serializer for your data types
+- [Backend Guide](backends/README.md) - Custom storage backend implementation
 - [Configuration Guide](configuration.md) - Environment variable setup and tuning
 - [Troubleshooting Guide](troubleshooting.md) - Debugging and error solutions
 - [Error Codes](error-codes.md) - Complete error code reference

@@ -432,7 +432,7 @@ MIT License - see [LICENSE][license-file-url] for details.
 [comparison-url]: docs/comparison.md
 [getting-started-url]: docs/getting-started.md
 [api-reference-url]: docs/api-reference.md
-[serializer-guide-url]: docs/guides/serializer-guide.md
+[serializer-guide-url]: docs/serializers/index.md
 [circuit-breaker-url]: docs/features/circuit-breaker.md
 [distributed-locking-url]: docs/features/distributed-locking.md
 [prometheus-url]: docs/features/prometheus-metrics.md

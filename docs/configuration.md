@@ -4,6 +4,9 @@
 
 > **Configure cachekit through environment variables and decorator parameters**
 
+> [!NOTE]
+> This is the canonical reference for all cachekit environment variables.
+
 ---
 
 ## Backend Options
@@ -139,8 +142,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 
 ### Using `@cache.io()`
 
-<!-- notest -->
-```python
+```python notest
 import os
 from cachekit import cache
 
@@ -553,6 +555,6 @@ export CACHEKIT_CONNECTION_POOL_SIZE=20  # Default is 10
 
 <div align="center">
 
-*Last Updated: 2025-12-02*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>

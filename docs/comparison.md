@@ -1,6 +1,6 @@
 **[Home](README.md)** › **Architecture** › **Comparison**
 
-# Competitive Comparison Guide
+# How cachekit Compares
 
 > **cachekit vs Alternatives**
 
@@ -31,23 +31,33 @@ Are you caching in Python?
 | Feature | lru_cache | cachetools | aiocache | redis-cache | dogpile.cache | **cachekit** |
 |:--------|:---------:|:----------:|:--------:|:-----------:|:-------------:|:------------:|
 | **L1-only mode** | ✅ | ✅ | - | - | - | ✅ |
+| **Unhashable args** (list/dict) | - | - | ✅ | - | - | ✅ |
+| **Async support** | Broken¹ | - | ✅ | - | - | ✅ |
+| **TTL support** | - | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Multi-pod** | - | - | ✅ | ✅ | ✅ | ✅ |
 | **Circuit Breaker** | - | - | - | - | Partial | ✅ |
 | **Distributed Locking** | - | - | - | - | ✅ | ✅ |
 | **Zero-Knowledge Encryption** | - | - | - | - | - | ✅ |
 | **Prometheus Metrics** | - | - | - | - | - | ✅ |
-| **Rust Performance** | - | - | - | - | - | ✅ |
-| **Adaptive Timeouts** | - | - | - | - | - | ✅ |
 | **Pluggable Backends** | - | - | - | - | - | ✅ |
 | **Managed Cloud Backend** | - | - | - | - | - | ✅ |
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> cachekit's MessagePack serialization converts tuples to lists during Redis roundtrip, like JSON-based competitors. Pluggable serializers (v1.0+) will provide options with better type preservation.
+> **Type preservation**: The default serializer (MessagePack/`StandardSerializer`) converts tuples to lists and frozensets to lists — this is consistent across all backends and modes, and ensures cross-language SDK compatibility (Rust, TypeScript, PHP).
+>
+> **If you need type preservation**, use `serializer='auto'`:
+> ```python
+> @cache(serializer='auto', ttl=300)
+> def fn(): return (1, 2, 3)  # tuple preserved on cache hit
+> ```
+> `AutoSerializer` preserves tuples, sets, frozensets, datetime, UUID, and Decimal through serialization via type markers. The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/README.md) for details.
+>
+> ¹ `lru_cache` on async functions caches the coroutine object, not the result. The second `await` raises `RuntimeError`. See [#77](https://github.com/cachekit-io/cachekit-py/issues/77).
 
 ---
 
-## Why cachekit Wins Everywhere
+## Feature Breakdown by Use Case
 
 ### 1. Single-Process Apps: `@cache(backend=None)` Beats lru_cache
 
@@ -55,11 +65,13 @@ Are you caching in Python?
 
 > [!TIP]
 > **Why cachekit wins:**
-> - Same ~50ns performance (in-memory L1 cache)
 > - TTL support (lru_cache only has maxsize)
-> - Efficient MessagePack serialization (faster than JSON)
+> - **Unhashable arguments**: Cache functions that take lists, dicts, nested structures — lru_cache and cachetools raise `TypeError`
+> - **Async support**: Same `@cache` decorator works on async functions (lru_cache breaks on async)
 > - Prometheus metrics built-in (zero setup)
 > - **Zero code changes to upgrade**: Remove `backend=None` → distributed at any time
+>
+> **Tradeoff**: The default serializer converts tuples to lists for cross-language compatibility. Use `serializer='auto'` to preserve Python types (tuples, sets, frozensets). See note above.
 
 ```python notest
 # Single-process, local development
@@ -78,9 +90,9 @@ def expensive_computation(x: int) -> dict:
     return {"result": x * 2, "computed_at": datetime.now()}
 ```
 
-**Why competitors lose**:
-- `functools.lru_cache`: No TTL, no metrics, no upgrade path. Rewrite required.
-- `cachetools`: More complex (choose TTLCache/LRUCache/etc), less ergonomic, no upgrade path.
+**Limitations of alternatives**:
+- `functools.lru_cache`: No TTL, no metrics, no upgrade path. Crashes on unhashable args (lists, dicts). Breaks on async functions (caches coroutine, not result).
+- `cachetools`: More complex (choose TTLCache/LRUCache/etc), less ergonomic, no upgrade path. Crashes on unhashable args.
 
 ---
 
@@ -142,7 +154,7 @@ sequenceDiagram
     Note over L2,Lock: Lock ONLY on L2 miss<br/>Prevents 1000 pods → 1 pod<br/>executing expensive function
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `aiocache`: L2-only (every hit is 2-7ms network), no circuit breaker, no locking
 - `redis-cache`: Minimal features, no encryption, no metrics
 - `dogpile.cache`: More complex API, heavier dependencies
@@ -174,7 +186,7 @@ def compute(x):
 # CACHEKIT_MASTER_KEY=hex_encoded_key
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`: Locked to in-memory, no scaling path
 - `aiocache`: Locked to Redis/Memcached, async-only
 - `dogpile.cache`: Locked to configured backend, heavier setup
@@ -218,7 +230,7 @@ def get_data(key):
     return fetch_data(key)
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`/`cachetools`: No failure handling
 - `aiocache`: No circuit breaker, manual locking complex
 - `dogpile.cache`: Lock implementation is complex, heavy API
@@ -250,7 +262,7 @@ def get_user(id):
 # Grafana dashboards available
 ```
 
-**Why competitors lose**:
+**Limitations of alternatives**:
 - `lru_cache`: No metrics at all
 - `cachetools`: No metrics integration
 - `aiocache`: Requires custom instrumentation
@@ -282,25 +294,33 @@ No other caching library offers a managed cloud backend with first-class decorat
 
 ### Claim: "I need async caching → use aiocache"
 
-**Reality**: cachekit has **native async support** with zero configuration
-- Auto-detects async functions via `inspect.iscoroutinefunction()`
-- Same `@cache` decorator works for both sync and async functions
-- Async operations run in thread pool to avoid blocking event loop
-- Works with FastAPI, Django, Flask, Starlette, etc
+**Reality**: cachekit has **native async support** with zero configuration — and unlike `lru_cache`, it actually works.
+
+> [!WARNING]
+> **`lru_cache` on async functions is broken.** It caches the coroutine object, not the result. The second `await` raises `RuntimeError: cannot reuse already awaited coroutine`. This is a well-known Python footgun.
 
 ```python notest
-# Sync function - uses sync wrapper automatically
-@cache(ttl=300)
-def get_user(id: int) -> dict:
-    return db.query(User).get(id)
+# lru_cache on async — BROKEN
+@lru_cache(maxsize=128)
+async def fn(x): return x * 2
 
-# Async function - uses async wrapper automatically
-@cache(ttl=300)
-async def get_user_async(id: int) -> dict:
-    return await db.query(User).get(id)
+await fn(1)  # Works
+await fn(1)  # RuntimeError: cannot reuse already awaited coroutine
+
+# cachekit on async — works correctly
+@cache(backend=None, ttl=300)
+async def fn(x): return x * 2
+
+await fn(1)  # Works — returns 2
+await fn(1)  # Works — returns 2 (from cache)
 ```
 
-**Evidence**: 50+ async tests validate full async support including L1/L2 caching, circuit breaker, and distributed locking
+cachekit auto-detects async functions and wraps them correctly. Same `@cache` decorator for both sync and async.
+
+> [!NOTE]
+> Async cache management uses `await fn.ainvalidate_cache()` instead of `fn.cache_clear()`. See [#76](https://github.com/cachekit-io/cachekit-py/issues/76).
+
+**Evidence**: `tests/competitive/test_head_to_head.py::TestAsyncSupport` — verified against real lru_cache behavior
 
 ---
 
@@ -395,25 +415,20 @@ def expensive_operation(x):
 
 ## Validation Evidence
 
-All competitive claims validated by automated tests:
+All competitive claims validated by automated tests against real libraries (not mocks):
 
-**Test Suite**: `pytest tests/competitive/ -v`
-- 62 assertions validating competitor behavior
-- Tests against real libraries (not mocks)
-- Evidence: [docs/validation/VALIDATION_LOG.md](validation/VALIDATION_LOG.md)
+**Head-to-Head Suite**: `pytest tests/competitive/test_head_to_head.py -v`
+- 50 tests across 10 data type categories and 7 behavioral dimensions
+- Tests against `functools.lru_cache`, `cachetools`, `aiocache`
+- Covers: primitives, collections, special floats, binary data, rich types, unhashable arguments, TTL, cache management, concurrency (10 threads), async support, edge cases
 
-**Example validation**:
-```python
-def test_aiocache_json_tuple_conversion_problem():
-    """Validate aiocache loses tuple types through JSON serialization"""
-    original = (1, "hello", 3.14)
-    # aiocache behavior: JSON serialization
-    result = json.loads(json.dumps(original))
-    assert isinstance(result, list)  # FAILS - tuple is list now
+**Key verified findings**:
+- `lru_cache` and `cachetools` crash on unhashable args (`TypeError`) — cachekit handles them
+- `lru_cache` on async functions caches the coroutine, not the result (`RuntimeError` on second await) — no stdlib fix as of Python 3.12+
+- cachekit serializes in all modes (including L1-only) — tuples become lists via MessagePack
+- All libraries handle primitives, bytes, datetime, Decimal, UUID, Enum identically in-memory
 
-    # Note: cachekit's MessagePack also converts tuples to lists through
-    # Redis roundtrip, but is still faster than JSON for most data
-```
+**Legacy Suite**: `pytest tests/competitive/ -v` (includes older assertion-based tests)
 
 ---
 
@@ -512,11 +527,11 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 **Previous**: [Performance Guide](performance.md) - Real benchmarks and optimization
 **Previous Alternative**: [Data Flow Architecture](data-flow-architecture.md) - System design details
 
-1. **Single-process?** Start with [Quick Start](QUICK_START.md)
+1. **Single-process?** Start with [Getting Started](getting-started.md)
 2. **Multi-pod?** Read [Circuit Breaker](features/circuit-breaker.md) + [Distributed Locking](features/distributed-locking.md)
 3. **Need encryption?** See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md)
 4. **Want metrics?** Check out [Prometheus Metrics](features/prometheus-metrics.md)
-5. **Performance critical?** Review [Serializer Guide](guides/serializer-guide.md)
+5. **Performance critical?** Review [Serializer Guide](serializers/README.md)
 
 ## See Also
 
@@ -529,8 +544,6 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 
 <div align="center">
 
-**[Documentation](.)** · **[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Security](../SECURITY.md)**
-
-*Last Updated: 2025-11-12 · cachekit v0.4.0+*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>

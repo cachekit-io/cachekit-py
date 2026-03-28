@@ -25,7 +25,7 @@
 
 ## Overview
 
-cachekit uses a hybrid Python-Rust architecture to provide enterprise-grade caching with intelligent reliability features. Data flows through multiple layers, each optimized for specific performance and reliability goals.
+cachekit uses a hybrid Python-Rust architecture to provide production caching with built-in reliability. Data flows through multiple layers, each optimized for specific performance and reliability goals.
 
 > [!TIP]
 > **Architecture Principles:**
@@ -820,8 +820,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 - [Performance Guide](performance.md) - Real latency measurements and optimization strategies
 - [Comparison Guide](comparison.md) - How cachekit's architecture compares to alternatives
-- [Backend Guide](guides/backend-guide.md) - Implement custom storage backends
-- [Serializer Guide](guides/serializer-guide.md) - Choose the right data format
+- [Backend Guide](backends/README.md) - Implement custom storage backends
+- [Serializer Guide](serializers/README.md) - Choose the right data format
 - [Circuit Breaker](features/circuit-breaker.md) - Failure protection mechanism
 - [Distributed Locking](features/distributed-locking.md) - Cache stampede prevention
 
@@ -829,8 +829,6 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 <div align="center">
 
-**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)** · **[Security](../SECURITY.md)**
-
-*Last Updated: 2025-12-02*
+**[GitHub Issues](https://github.com/cachekit-io/cachekit-py/issues)** · **[Documentation](README.md)**
 
 </div>
