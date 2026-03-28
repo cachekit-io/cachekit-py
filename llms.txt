@@ -181,6 +181,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Adaptive Timeouts](docs/features/adaptive-timeouts.md): Auto-tune to system load
 - [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability
 - [Architecture](docs/data-flow-architecture.md): L1+L2 internals
+- [Protocol Specification](https://github.com/cachekit-io/protocol): Cross-SDK wire format, key format, encryption spec (separate repo)
 
 ### Development
 - [Configuration](docs/configuration.md): Environment variables reference

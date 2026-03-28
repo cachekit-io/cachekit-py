@@ -233,6 +233,7 @@ def test_custom_backend():
 ## See Also
 
 - [Backend Guide](README.md) — Backend comparison and resolution priority
+- [Protocol Specification](https://github.com/cachekit-io/protocol) — Wire format, key format, and encryption spec for cross-SDK backend implementations
 - [CachekitIO Backend](cachekitio.md) — Managed SaaS backend (no custom implementation needed)
 - [Redis Backend](redis.md) — Default production backend
 - [API Reference](../api-reference.md) — Decorator parameters

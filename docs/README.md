@@ -63,6 +63,7 @@ Choose how data is stored:
 | Document | Description |
 |:---------|:------------|
 | [Data Flow Architecture](data-flow-architecture.md) | L1+L2 dual-layer caching internals |
+| [Protocol Specification][protocol] | Cross-SDK wire format, key format, encryption (separate repo) |
 | [Performance](performance.md) | Benchmarks and optimization |
 | [Comparison](comparison.md) | vs. lru\_cache, aiocache, cachetools |
 | [Error Codes](error-codes.md) | Error reference |
@@ -98,3 +99,6 @@ docs/
 ├── performance.md                    # Benchmarks
 └── comparison.md                     # vs. alternatives
 ```
+
+<!-- Reference Links -->
+[protocol]: https://github.com/cachekit-io/protocol

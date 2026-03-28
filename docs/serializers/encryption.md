@@ -99,6 +99,7 @@ Encryption adds minimal overhead:
 ## See Also
 
 - [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md) — Full encryption docs: key management, per-tenant isolation, nonce handling, compliance
+- [Encryption Protocol Spec](https://github.com/cachekit-io/protocol/blob/main/spec/encryption.md) — AAD v0x03, HKDF parameters, nonce format (cross-SDK reference)
 - [DefaultSerializer](default.md) — General-purpose inner serializer
 - [OrjsonSerializer](orjson.md) — JSON inner serializer
 - [ArrowSerializer](arrow.md) — DataFrame inner serializer
