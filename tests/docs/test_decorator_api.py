@@ -73,11 +73,19 @@ class TestAllDocumentedPresetsWork:
             result = test_func()
             assert result == "test", f"Preset {preset} broke function execution"
 
-    def test_secure_preset_requires_master_key(self):
-        """@cache.secure requires master_key parameter."""
-        # Verify secure preset exists but requires master_key
-        with pytest.raises(ValueError, match="master_key"):
+    def test_secure_preset_requires_master_key(self, monkeypatch):
+        """@cache.secure requires master_key parameter or env var."""
+        from cachekit.config.singleton import reset_settings
 
-            @cache.secure
-            def test_func():
-                return "test"
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        try:
+            # Verify secure preset exists but requires master_key
+            with pytest.raises(ValueError, match="master_key"):
+
+                @cache.secure
+                def test_func():
+                    return "test"
+        finally:
+            reset_settings()

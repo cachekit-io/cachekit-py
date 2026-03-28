@@ -124,13 +124,40 @@ class TestIntentBasedSecure:
         assert config.monitoring.collect_stats is True
         assert config.monitoring.enable_tracing is True
 
-    def test_secure_decorator_requires_master_key(self):
-        """@cache.secure decorator requires master_key parameter."""
-        with pytest.raises(ValueError, match="master_key"):
+    def test_secure_decorator_requires_master_key(self, monkeypatch):
+        """@cache.secure raises when no master_key param AND no env var."""
+        from cachekit.config.singleton import reset_settings
 
-            @cache.secure(backend=None)  # Missing master_key in secure context
-            def secure_func():
-                pass
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        try:
+            with pytest.raises(ValueError, match="master_key"):
+
+                @cache.secure(backend=None)  # No master_key param, no env var
+                def secure_func():
+                    pass
+        finally:
+            reset_settings()
+
+    def test_secure_decorator_reads_master_key_from_env(self, monkeypatch):
+        """@cache.secure falls back to CACHEKIT_MASTER_KEY env var (issue #69)."""
+        from cachekit.config.singleton import reset_settings
+
+        test_key = "ab" * 32  # 64 hex chars = 32 bytes
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", test_key)
+        reset_settings()  # Force re-read from env
+
+        try:
+
+            @cache.secure(backend=None, ttl=300)
+            def secure_from_env(x: int) -> int:
+                return x * 2
+
+            # Should NOT raise - master_key resolved from env
+            assert secure_from_env is not None
+        finally:
+            reset_settings()
 
     def test_secure_decorator_with_tenant_extractor(self):
         """Secure preset supports multi-tenant extraction."""
