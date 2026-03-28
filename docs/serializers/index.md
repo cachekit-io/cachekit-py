@@ -12,7 +12,8 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 
 | Serializer | Speed | Best For |
 |-----------|-------|----------|
-| [DefaultSerializer](default.md) | Fast | General Python objects, mixed types, binary data |
+| [DefaultSerializer](default.md) | Fast | General Python objects, cross-language SDK interop |
+| [AutoSerializer](auto.md) | Fast | Python-only — preserves sets, frozensets, datetime, UUID, NumPy, pandas |
 | [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | Very Fast (DataFrames) | Large pandas/polars DataFrames (10K+ rows) |
 | [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching, GDPR/HIPAA/PCI-DSS compliance |
@@ -24,7 +25,8 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 | Use Case | Recommended Serializer | Reason |
 |----------|----------------------|--------|
-| General Python objects | DefaultSerializer | Broad type support, efficient |
+| General Python objects | DefaultSerializer | Broad type support, cross-language safe |
+| Python-only with type preservation | AutoSerializer | Preserves sets, frozensets, datetime, UUID, NumPy |
 | JSON-heavy data | OrjsonSerializer | 2-5x faster than stdlib json |
 | API response caching | OrjsonSerializer | JSON-native, human-readable |
 | Web session data | OrjsonSerializer | Fast JSON, cross-language |

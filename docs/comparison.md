@@ -44,7 +44,14 @@ Are you caching in Python?
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> **Type preservation**: cachekit serializes data via MessagePack in all modes (including L1-only with `backend=None`). This means tuples become lists and frozensets become lists. `lru_cache` and `cachetools` store raw Python objects and preserve types perfectly. This is a deliberate tradeoff — consistent serialization behavior regardless of backend, at the cost of type fidelity for tuple/set types. See [#73](https://github.com/cachekit-io/cachekit-py/issues/73).
+> **Type preservation**: The default serializer (MessagePack/`StandardSerializer`) converts tuples to lists and frozensets to lists — this is consistent across all backends and modes, and ensures cross-language SDK compatibility (Rust, TypeScript, PHP).
+>
+> **If you need type preservation**, use `serializer='auto'`:
+> ```python
+> @cache(serializer='auto', ttl=300)
+> def fn(): return (1, 2, 3)  # tuple preserved on cache hit
+> ```
+> `AutoSerializer` preserves tuples, sets, frozensets, datetime, UUID, and Decimal through serialization via type markers. The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/index.md) for details.
 >
 > ¹ `lru_cache` on async functions caches the coroutine object, not the result. The second `await` raises `RuntimeError`. See [#77](https://github.com/cachekit-io/cachekit-py/issues/77).
 
@@ -64,7 +71,7 @@ Are you caching in Python?
 > - Prometheus metrics built-in (zero setup)
 > - **Zero code changes to upgrade**: Remove `backend=None` → distributed at any time
 >
-> **Tradeoff**: cachekit serializes via MessagePack even in L1-only mode, so tuples become lists. `lru_cache` stores raw Python objects. If type preservation matters more than the features above, use `lru_cache`.
+> **Tradeoff**: The default serializer converts tuples to lists for cross-language compatibility. Use `serializer='auto'` to preserve Python types (tuples, sets, frozensets). See note above.
 
 ```python notest
 # Single-process, local development

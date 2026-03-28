@@ -40,7 +40,8 @@ Choose how data is stored:
 | Guide | Description |
 |:------|:------------|
 | [Serializer Overview](serializers/index.md) | Decision matrix |
-| [Default (MessagePack)](serializers/default.md) | General-purpose with LZ4 compression |
+| [Default (MessagePack)](serializers/default.md) | Cross-language, general-purpose |
+| [Auto (Python types)](serializers/auto.md) | Preserves sets, datetime, UUID, NumPy |
 | [OrjsonSerializer](serializers/orjson.md) | Fast JSON (2-5x faster) |
 | [ArrowSerializer](serializers/arrow.md) | DataFrames (6-23x faster) |
 | [Encryption](serializers/encryption.md) | AES-256-GCM wrapper |
