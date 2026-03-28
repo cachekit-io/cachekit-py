@@ -6,6 +6,8 @@ import pytest
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 
+pytestmark = pytest.mark.unit
+
 
 def _response(status_code: int) -> httpx.Response:
     return httpx.Response(status_code=status_code, request=httpx.Request("GET", "http://test"))

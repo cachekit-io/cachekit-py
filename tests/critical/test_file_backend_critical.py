@@ -19,7 +19,7 @@ from cachekit.backends.file.config import FileBackendConfig
 
 
 @pytest.fixture
-def backend(tmp_path, monkeypatch):
+def backend(tmp_path):
     """Create FileBackend instance for testing.
 
     Uses tmp_path fixture to isolate cache directory per test.
