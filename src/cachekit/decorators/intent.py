@@ -148,11 +148,17 @@ def cache(
         elif _intent == "production":  # Renamed from "safe"
             resolved_config = DecoratorConfig.production(backend=backend, **manual_overrides)
         elif _intent == "secure":
-            # Extract master_key from manual_overrides (required for secure preset)
+            # Extract master_key from manual_overrides, fall back to env var via settings
             master_key = manual_overrides.pop("master_key", None)
             tenant_extractor = manual_overrides.pop("tenant_extractor", None) or None
             if not master_key:
-                raise ValueError("cache.secure requires master_key parameter")
+                from cachekit.config.singleton import get_settings
+
+                settings_key = get_settings().master_key
+                if settings_key:
+                    master_key = settings_key.get_secret_value()
+            if not master_key:
+                raise ValueError("cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable")
             resolved_config = DecoratorConfig.secure(
                 master_key=master_key, tenant_extractor=tenant_extractor, backend=backend, **manual_overrides
             )
