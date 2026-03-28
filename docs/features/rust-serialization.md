@@ -5,7 +5,7 @@
 **Available since v0.3.0**
 
 > [!NOTE]
-> This page describes the Rust-powered ByteStorage layer. For the pluggable serializer system (MessagePack, Arrow, Orjson, Pydantic), see **[Serializers](../serializers/index.md)**.
+> This page describes the Rust-powered ByteStorage layer. For the pluggable serializer system (MessagePack, Arrow, Orjson, Pydantic), see **[Serializers](../serializers/README.md)**.
 
 ---
 
@@ -109,7 +109,7 @@ All serializers pass through the same ByteStorage pipeline (LZ4 + Blake3 + optio
 A: Don't cache objects >100MB. Break into smaller pieces.
 
 **Q: Type not serializable**
-A: Choose a serializer that supports your type. See [Serializers](../serializers/index.md).
+A: Choose a serializer that supports your type. See [Serializers](../serializers/README.md).
 
 **Q: "Decryption failed: authentication tag verification failed"**
 A: Key mismatch or data corruption. Check `CACHEKIT_MASTER_KEY` hasn't changed. See [Zero-Knowledge Encryption](zero-knowledge-encryption.md).
@@ -121,7 +121,7 @@ A: Expected for already-compressed or random data. Overhead is negligible.
 
 ## See Also
 
-- [Serializers](../serializers/index.md) - Choose the right serializer for your data
+- [Serializers](../serializers/README.md) - Choose the right serializer for your data
 - [Zero-Knowledge Encryption](zero-knowledge-encryption.md) - AES-256-GCM client-side encryption
 - [Performance Guide](../performance.md) - Benchmarks and tuning
 

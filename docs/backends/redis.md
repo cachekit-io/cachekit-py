@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **Redis Backend**
+**[Home](../README.md)** › **[Backends](README.md)** › **Redis Backend**
 
 # Redis Backend
 
@@ -85,7 +85,7 @@ backend = RedisBackend(config)
 
 ## See Also
 
-- [Backend Guide](index.md) — Backend comparison and resolution priority
+- [Backend Guide](README.md) — Backend comparison and resolution priority
 - [Memcached Backend](memcached.md) — Alternative in-memory shared backend
 - [CachekitIO Backend](cachekitio.md) — Managed SaaS alternative to self-hosted Redis
 - [Configuration Guide](../configuration.md) — Full environment variable reference

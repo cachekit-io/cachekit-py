@@ -2,7 +2,7 @@
 
 > **This guide has moved to individual topic pages for easier navigation.**
 
-See the [Serializer Documentation](../serializers/index.md) for an overview.
+See the [Serializer Documentation](../serializers/README.md) for an overview.
 
 ## Individual Serializers
 

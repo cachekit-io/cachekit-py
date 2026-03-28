@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **Caching Pydantic Models**
+**[Home](../README.md)** › **[Serializers](README.md)** › **Caching Pydantic Models**
 
 # Caching Pydantic Models
 

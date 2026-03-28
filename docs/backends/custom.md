@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **Custom Backends**
+**[Home](../README.md)** › **[Backends](README.md)** › **Custom Backends**
 
 # Custom Backends
 
@@ -232,7 +232,7 @@ def test_custom_backend():
 
 ## See Also
 
-- [Backend Guide](index.md) — Backend comparison and resolution priority
+- [Backend Guide](README.md) — Backend comparison and resolution priority
 - [CachekitIO Backend](cachekitio.md) — Managed SaaS backend (no custom implementation needed)
 - [Redis Backend](redis.md) — Default production backend
 - [API Reference](../api-reference.md) — Decorator parameters

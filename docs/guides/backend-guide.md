@@ -2,7 +2,7 @@
 
 > **This guide has moved to individual topic pages for easier navigation.**
 
-See the [Backend Documentation](../backends/index.md) for an overview.
+See the [Backend Documentation](../backends/README.md) for an overview.
 
 ## Individual Backends
 

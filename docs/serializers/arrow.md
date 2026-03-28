@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **ArrowSerializer**
+**[Home](../README.md)** › **[Serializers](README.md)** › **ArrowSerializer**
 
 # ArrowSerializer
 

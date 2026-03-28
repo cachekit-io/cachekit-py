@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **L1-Only Mode (No Backend)**
+**[Home](../README.md)** › **[Backends](README.md)** › **L1-Only Mode (No Backend)**
 
 # L1-Only Mode (`backend=None`)
 
@@ -98,7 +98,7 @@ No API changes. No code rewrite. Same decorator, same function signature.
 
 ## See Also
 
-- [Backend Overview](index.md) — Backend comparison and resolution priority
+- [Backend Overview](README.md) — Backend comparison and resolution priority
 - [Redis](redis.md) — Shared distributed cache (upgrade from L1-only)
 - [Getting Started](../getting-started.md) — Progressive tutorial
 

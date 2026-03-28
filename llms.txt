@@ -158,7 +158,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [API Reference](docs/api-reference.md): Complete decorator API
 
 ### Backends
-- [Backend Overview](docs/backends/index.md): Comparison and selection guide
+- [Backend Overview](docs/backends/README.md): Comparison and selection guide
 - [Redis](docs/backends/redis.md): Production default
 - [File](docs/backends/file.md): Local filesystem caching
 - [Memcached](docs/backends/memcached.md): High-throughput caching
@@ -166,7 +166,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Custom Backends](docs/backends/custom.md): Implement BaseBackend
 
 ### Serializers
-- [Serializer Overview](docs/serializers/index.md): Decision matrix
+- [Serializer Overview](docs/serializers/README.md): Decision matrix
 - [Default (MessagePack)](docs/serializers/default.md): General-purpose
 - [OrjsonSerializer](docs/serializers/orjson.md): Fast JSON
 - [ArrowSerializer](docs/serializers/arrow.md): DataFrame-optimized

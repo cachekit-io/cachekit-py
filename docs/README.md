@@ -25,7 +25,7 @@ Choose your storage backend:
 
 | Guide | Description |
 |:------|:------------|
-| [Backend Overview](backends/index.md) | Comparison and selection guide |
+| [Backend Overview](backends/README.md) | Comparison and selection guide |
 | [Redis](backends/redis.md) | Production default, connection pooling |
 | [File](backends/file.md) | Local filesystem, zero dependencies |
 | [Memcached](backends/memcached.md) | High-throughput, consistent hashing |
@@ -39,7 +39,7 @@ Choose how data is stored:
 
 | Guide | Description |
 |:------|:------------|
-| [Serializer Overview](serializers/index.md) | Decision matrix |
+| [Serializer Overview](serializers/README.md) | Decision matrix |
 | [Default (MessagePack)](serializers/default.md) | Cross-language, general-purpose |
 | [Auto (Python types)](serializers/auto.md) | Preserves sets, datetime, UUID, NumPy |
 | [OrjsonSerializer](serializers/orjson.md) | Fast JSON (2-5x faster) |
@@ -79,17 +79,19 @@ docs/
 ├── troubleshooting.md                # Error solutions
 │
 ├── backends/
-│   ├── index.md                     # Backend overview
-│   ├── redis.md, file.md            # Built-in backends
-│   ├── memcached.md, cachekitio.md  # Optional backends
-│   └── custom.md                    # Custom backend guide
+│   ├── README.md                    # Backend overview (auto-rendered)
+│   ├── redis.md, file.md           # Built-in backends
+│   ├── memcached.md, cachekitio.md # Optional backends
+│   ├── none.md                     # L1-only mode
+│   └── custom.md                   # Custom backend guide
 │
 ├── serializers/
-│   ├── index.md                     # Serializer overview
-│   ├── default.md, orjson.md        # Built-in serializers
-│   ├── arrow.md, encryption.md      # Specialized serializers
-│   ├── pydantic.md                  # Pydantic patterns
-│   └── custom.md                    # Custom serializer
+│   ├── README.md                    # Serializer overview (auto-rendered)
+│   ├── default.md, auto.md         # Built-in serializers
+│   ├── orjson.md, arrow.md         # Specialized serializers
+│   ├── encryption.md               # AES-256-GCM wrapper
+│   ├── pydantic.md                 # Pydantic patterns
+│   └── custom.md                   # Custom serializer
 │
 ├── features/                         # Feature deep dives
 ├── data-flow-architecture.md         # How it works

@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **StandardSerializer**
+**[Home](../README.md)** › **[Serializers](README.md)** › **StandardSerializer**
 
 # Default Serializer (MessagePack)
 

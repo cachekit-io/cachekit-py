@@ -461,7 +461,7 @@ export default {
 - [Comparison Guide](../comparison.md) - Only cachekit has zero-knowledge encryption
 - [Security Policy](../../SECURITY.md)
 - [Multi-Tenant Encryption](../getting-started.md#multi-tenant)
-- [Serializer Guide](../serializers/index.md) - Encryption with custom serializers
+- [Serializer Guide](../serializers/README.md) - Encryption with custom serializers
 - [Performance Benchmarks](../../tests/performance/test_encryption_overhead.py) - Evidence-based overhead measurements
 
 ---

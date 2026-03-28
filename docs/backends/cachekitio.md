@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **CachekitIO Backend**
+**[Home](../README.md)** › **[Backends](README.md)** › **CachekitIO Backend**
 
 # CachekitIO Backend
 
@@ -194,7 +194,7 @@ See [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md) for fu
 
 ## See Also
 
-- [Backend Guide](index.md) — Backend comparison and resolution priority
+- [Backend Guide](README.md) — Backend comparison and resolution priority
 - [Redis Backend](redis.md) — Self-hosted alternative for lower latency
 - [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md) — Client-side encryption details
 - [Configuration Guide](../configuration.md) — Full environment variable reference

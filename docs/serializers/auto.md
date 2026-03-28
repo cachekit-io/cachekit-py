@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **AutoSerializer**
+**[Home](../README.md)** › **[Serializers](README.md)** › **AutoSerializer**
 
 # AutoSerializer
 
@@ -103,7 +103,7 @@ AutoSerializer explicitly rejects types it can't handle safely:
 
 - [Default Serializer (StandardSerializer)](default.md) — Cross-language MessagePack
 - [ArrowSerializer](arrow.md) — Optimized for large DataFrames
-- [Serializer Overview](index.md) — Decision matrix
+- [Serializer Overview](README.md) — Decision matrix
 
 ---
 

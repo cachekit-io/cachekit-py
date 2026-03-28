@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **Encryption Wrapper**
+**[Home](../README.md)** › **[Serializers](README.md)** › **Encryption Wrapper**
 
 # Encryption Wrapper
 

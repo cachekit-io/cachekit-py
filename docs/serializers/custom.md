@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Serializers](index.md)** › **Custom Serializers**
+**[Home](../README.md)** › **[Serializers](README.md)** › **Custom Serializers**
 
 # Custom Serializers
 

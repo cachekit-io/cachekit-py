@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **Memcached Backend**
+**[Home](../README.md)** › **[Backends](README.md)** › **Memcached Backend**
 
 # Memcached Backend
 
@@ -103,7 +103,7 @@ backend = MemcachedBackend(config)
 
 ## See Also
 
-- [Backend Guide](index.md) — Backend comparison and resolution priority
+- [Backend Guide](README.md) — Backend comparison and resolution priority
 - [Redis Backend](redis.md) — Persistent shared caching with locking support
 - [File Backend](file.md) — Single-process local caching without infrastructure
 - [Configuration Guide](../configuration.md) — Full environment variable reference

@@ -1,4 +1,4 @@
-**[Home](../README.md)** › **[Backends](index.md)** › **File Backend**
+**[Home](../README.md)** › **[Backends](README.md)** › **File Backend**
 
 # File Backend
 
@@ -116,7 +116,7 @@ Large values (1MB):
 
 ## See Also
 
-- [Backend Guide](index.md) — Backend comparison and resolution priority
+- [Backend Guide](README.md) — Backend comparison and resolution priority
 - [Redis Backend](redis.md) — Multi-process shared caching
 - [Memcached Backend](memcached.md) — Multi-process in-memory caching
 - [Configuration Guide](../configuration.md) — Full environment variable reference

@@ -51,7 +51,7 @@ Are you caching in Python?
 > @cache(serializer='auto', ttl=300)
 > def fn(): return (1, 2, 3)  # tuple preserved on cache hit
 > ```
-> `AutoSerializer` preserves tuples, sets, frozensets, datetime, UUID, and Decimal through serialization via type markers. The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/index.md) for details.
+> `AutoSerializer` preserves tuples, sets, frozensets, datetime, UUID, and Decimal through serialization via type markers. The tradeoff: Python-only (other language SDKs won't understand the type markers). See [Serializer Guide](serializers/README.md) for details.
 >
 > ¹ `lru_cache` on async functions caches the coroutine object, not the result. The second `await` raises `RuntimeError`. See [#77](https://github.com/cachekit-io/cachekit-py/issues/77).
 
@@ -531,7 +531,7 @@ A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement
 2. **Multi-pod?** Read [Circuit Breaker](features/circuit-breaker.md) + [Distributed Locking](features/distributed-locking.md)
 3. **Need encryption?** See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md)
 4. **Want metrics?** Check out [Prometheus Metrics](features/prometheus-metrics.md)
-5. **Performance critical?** Review [Serializer Guide](serializers/index.md)
+5. **Performance critical?** Review [Serializer Guide](serializers/README.md)
 
 ## See Also
 
