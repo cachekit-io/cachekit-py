@@ -73,31 +73,16 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
                 single_tenant_mode=True,
             )
 
-    def test_default_alias_accepted(self, monkeypatch):
-        """'default' serializer name is accepted with encryption=True."""
+    @pytest.mark.parametrize("alias", ["default", "std"])
+    def test_alias_accepted_with_encryption(self, monkeypatch, alias):
+        """Default serializer aliases are accepted with encryption=True."""
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.config.singleton import reset_settings
 
         reset_settings()
         try:
             handler = CacheSerializationHandler(
-                serializer_name="default",
-                encryption=True,
-                single_tenant_mode=True,
-            )
-            assert handler.encryption is True
-        finally:
-            reset_settings()
-
-    def test_std_alias_accepted(self, monkeypatch):
-        """'std' serializer name is accepted with encryption=True."""
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
-        from cachekit.config.singleton import reset_settings
-
-        reset_settings()
-        try:
-            handler = CacheSerializationHandler(
-                serializer_name="std",
+                serializer_name=alias,
                 encryption=True,
                 single_tenant_mode=True,
             )
@@ -112,8 +97,6 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
         so we only verify the guard itself doesn't raise ConfigurationError.
         The downstream ValueError from the registry is a separate issue.
         """
-        # The guard checks `not in ("default", "std", "standard")` — 'standard' should NOT
-        # raise ConfigurationError. We verify no ConfigurationError is raised.
         try:
             CacheSerializationHandler(
                 serializer_name="standard",
@@ -122,9 +105,8 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
             )
         except ConfigurationError:
             pytest.fail("'standard' should pass the ConfigurationError guard")
-        except Exception:
-            # Other errors (ValueError from registry, etc.) are acceptable —
-            # the ConfigurationError guard is what we're testing here.
+        except ValueError:
+            # Expected — 'standard' passes the guard but isn't in SERIALIZER_REGISTRY
             pass
 
 
