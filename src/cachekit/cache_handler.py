@@ -335,6 +335,19 @@ class CacheSerializationHandler:
                     "Choose multi-tenant (tenant_extractor) OR single-tenant (single_tenant_mode=True)."
                 )
 
+            # Encryption requires StandardSerializer (MessagePack) for cross-SDK interop
+            if isinstance(serializer_name, str) and serializer_name not in ("default", "std", "standard"):
+                raise ConfigurationError(
+                    f"Encryption requires 'default' serializer for cross-language interop, "
+                    f"got serializer='{serializer_name}'. EncryptionWrapper uses StandardSerializer "
+                    f"(MessagePack) internally for cross-SDK compatibility."
+                )
+            elif not isinstance(serializer_name, str):
+                raise ConfigurationError(
+                    "Encryption requires 'default' serializer for cross-language interop. "
+                    "Custom serializer instances cannot be used with encryption."
+                )
+
             # Generate deterministic deployment UUID for single-tenant mode
             if self.single_tenant_mode:
                 self._deployment_uuid_value = self._get_deterministic_deployment_uuid(provided_uuid=self.deployment_uuid)
@@ -549,15 +562,13 @@ class CacheSerializationHandler:
                     # Multi-tenant mode: MUST extract tenant_id
                     # If extraction fails, ValueError bubbles up (FAIL CLOSED - no fallback)
                     tenant_id = self.tenant_extractor.extract(args, kwargs)
-                elif self.single_tenant_mode:
+                else:
                     # MEDIUM-02: Single-tenant mode with deterministic UUID
                     # Uses cached deployment UUID (generated in __init__)
+                    # Constructor guarantees single_tenant_mode=True here (validated in __init__)
                     if self._deployment_uuid_value is None:
                         raise RuntimeError("deployment_uuid should be set in __init__ for single-tenant mode")
                     tenant_id = self._deployment_uuid_value
-                else:
-                    # Defensive fallback (should not happen due to validation in __init__)
-                    tenant_id = "00000000-0000-0000-0000-000000000000"
 
                 # CRITICAL-03 FIX: Use cached EncryptionWrapper to prevent 360K key copies/hour
                 # Gets cached instance (thread-safe LRU, maxsize=256) instead of creating new one
@@ -656,7 +667,11 @@ class CacheSerializationHandler:
             if metadata.encrypted:
                 # Data is encrypted - use cached EncryptionWrapper for decryption
                 # CRITICAL-03 FIX: Use cached instance instead of creating new one
-                tenant_id = metadata.tenant_id if metadata.tenant_id else "00000000-0000-0000-0000-000000000000"
+                if not metadata.tenant_id:
+                    raise SerializationError(
+                        "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
+                    )
+                tenant_id = metadata.tenant_id
                 serializer = self._get_cached_encryption_wrapper(tenant_id)
 
                 # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
