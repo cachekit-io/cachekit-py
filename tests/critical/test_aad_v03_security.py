@@ -29,7 +29,6 @@ def encryption_wrapper(master_key: bytes) -> EncryptionWrapper:
     return EncryptionWrapper(
         master_key=master_key,
         tenant_id="test-tenant",
-        enable_encryption=True,
     )
 
 
@@ -158,7 +157,6 @@ class TestCiphertextSubstitutionAttackPrevention:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="shared-tenant",  # Same tenant for attacker and victim
-            enable_encryption=True,
         )
 
         # Attacker creates malicious data
@@ -186,7 +184,6 @@ class TestCiphertextSubstitutionAttackPrevention:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
 
         test_data = {"secret": "shared_secret_value"}
@@ -213,7 +210,6 @@ class TestCiphertextSubstitutionAttackPrevention:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
 
         # Attempting to serialize without cache_key must raise error
@@ -270,7 +266,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
 
         with pytest.raises(TypeError) as exc_info:
@@ -289,7 +284,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
 
         with pytest.raises(TypeError) as exc_info:
@@ -306,7 +300,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
 
         with pytest.raises((ValueError, TypeError)) as exc_info:
@@ -324,7 +317,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
         test_data = {"message": "Hello"}
         cache_key = "cache:user:123:\u4e2d\u6587:\U0001f600"  # Contains Chinese and emoji
@@ -343,7 +335,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
         test_data = {"email": "user@example.com"}
         cache_key = "cache:{user}@domain.com#123$tag"
@@ -362,7 +353,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
         test_data = {"data": "value"}
         # 10KB cache key (extreme but should work)
@@ -383,7 +373,6 @@ class TestCacheKeyEdgeCases:
         wrapper = EncryptionWrapper(
             master_key=master_key,
             tenant_id="test-tenant",
-            enable_encryption=True,
         )
         test_data = {"data": "value"}
         cache_key = "   "  # Three spaces

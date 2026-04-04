@@ -82,20 +82,19 @@ class EncryptionWrapper:
             ...
         EncryptionError: Decryption failed: ...
 
-        Encryption cannot be disabled (security invariant):
+        Encryption is always enabled (no opt-out):
 
-        >>> EncryptionWrapper(enable_encryption=False)  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        EncryptionError: EncryptionWrapper requires encryption. ...
+        >>> EncryptionWrapper(master_key=b"a" * 32).is_encryption_enabled
+        True
     """
+
+    __slots__ = ("tenant_id", "serializer", "encryptor", "tenant_keys", "encryption_key_fingerprint")
 
     def __init__(
         self,
         serializer: Optional[SerializerProtocol] = None,
         master_key: Optional[bytes] = None,
         tenant_id: str = "default",
-        enable_encryption: bool = True,
     ):
         """Initialize encryption wrapper.
 
@@ -104,10 +103,8 @@ class EncryptionWrapper:
                            Defaults to StandardSerializer (cross-language MessagePack).
             master_key: 256-bit master key for encryption. If None, reads from environment.
             tenant_id: Tenant identifier for key isolation
-            enable_encryption: Whether to enable encryption (can disable for testing)
         """
         self.tenant_id = tenant_id
-        self.enable_encryption = enable_encryption
 
         # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
         # compatibility. Encrypted data may be shared across SDKs via secrets manager,
@@ -119,18 +116,14 @@ class EncryptionWrapper:
 
             self.serializer = StandardSerializer()
 
-        # Initialize encryption components (Optional - only set if encryption enabled)
+        # Initialize encryption components
         self.encryptor: Optional[ZeroKnowledgeEncryptor] = None
-        self.tenant_keys: Optional[Any] = None  # TenantKeys from Rust
+        self.tenant_keys: Optional[Any] = None
         self.encryption_key_fingerprint: Optional[str] = None
 
-        # Setup encryption
-        if self.enable_encryption:
-            self._setup_encryption(master_key)
-        else:
-            raise EncryptionError(
-                "EncryptionWrapper requires encryption. If you don't need encryption, use StandardSerializer directly."
-            )
+        # Setup encryption — mandatory. EncryptionWrapper without encryption
+        # is a security misconfiguration, not a valid operating mode.
+        self._setup_encryption(master_key)
 
     def _setup_encryption(self, master_key: Optional[bytes]) -> None:
         """Setup encryption components with key derivation."""
@@ -220,11 +213,7 @@ class EncryptionWrapper:
         except Exception as e:
             raise SerializationError(f"Serialization failed: {e}") from e
 
-        # If encryption is disabled, return raw data with modified metadata
-        if not self.enable_encryption:
-            return raw_data, raw_metadata
-
-        # SECURITY: Validate cache_key type and value when encryption is enabled
+        # SECURITY: Validate cache_key type and value
         if not isinstance(cache_key, str):
             raise TypeError(
                 f"cache_key must be a string, got {type(cache_key).__name__}. "
@@ -329,15 +318,11 @@ class EncryptionWrapper:
                 "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
             )
 
-        # Verify encryption is available
-        if not self.enable_encryption:
-            raise EncryptionError("Received encrypted data but encryption is disabled")
-
-        # Encryption is enabled - encryptor and tenant_keys must be initialized
+        # Verify encryptor and tenant_keys are initialized
         if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
+            raise RuntimeError("Encryptor must be initialized")
         if self.tenant_keys is None:
-            raise RuntimeError("Tenant keys must be initialized when encryption is enabled")
+            raise RuntimeError("Tenant keys must be initialized")
 
         # Verify tenant match for security
         if metadata.tenant_id != self.tenant_id:
@@ -528,14 +513,14 @@ class EncryptionWrapper:
 
     @property
     def is_encryption_enabled(self) -> bool:
-        """Check if encryption is currently enabled.
+        """Always True — EncryptionWrapper requires encryption.
 
         Examples:
             >>> wrapper = EncryptionWrapper(master_key=b"e" * 32)
             >>> wrapper.is_encryption_enabled
             True
         """
-        return self.enable_encryption
+        return True
 
     @property
     def hardware_acceleration_enabled(self) -> bool:
@@ -548,10 +533,8 @@ class EncryptionWrapper:
             >>> isinstance(wrapper.hardware_acceleration_enabled, bool)
             True
         """
-        if not self.enable_encryption:
-            return False
         if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
+            raise RuntimeError("Encryptor must be initialized")
         return self.encryptor.hardware_acceleration_enabled()
 
     def get_encryption_info(self) -> dict[str, Any]:
@@ -575,11 +558,8 @@ class EncryptionWrapper:
             >>> "key_fingerprint" in info  # Fingerprint included (safe to log)
             True
         """
-        if not self.enable_encryption:
-            return {"enabled": False, "reason": "Encryption disabled or not available"}
-
         if self.encryption_key_fingerprint is None:
-            raise RuntimeError("Key fingerprint must be set when encryption is enabled")
+            raise RuntimeError("Key fingerprint must be set")
 
         return {
             "enabled": True,
