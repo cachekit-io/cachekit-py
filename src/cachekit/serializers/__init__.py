@@ -56,7 +56,7 @@ SERIALIZER_REGISTRY = {
     "std": StandardSerializer,  # Explicit StandardSerializer alias
     "arrow": None,  # Lazy-loaded: requires pyarrow from [data] extra
     "orjson": OrjsonSerializer,
-    "encrypted": EncryptionWrapper,  # AutoSerializer + AES-256-GCM encryption
+    "encrypted": EncryptionWrapper,  # StandardSerializer + AES-256-GCM encryption
 }
 
 

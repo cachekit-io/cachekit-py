@@ -17,7 +17,6 @@ from typing import Any, Optional
 from cachekit._rust_serializer import ZeroKnowledgeEncryptor, derive_tenant_keys
 from cachekit.config import get_settings
 
-from .auto_serializer import AutoSerializer
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
 
 logger = logging.getLogger(__name__)
@@ -83,12 +82,12 @@ class EncryptionWrapper:
             ...
         EncryptionError: Decryption failed: ...
 
-        Encryption disabled mode (for testing):
+        Encryption cannot be disabled (security invariant):
 
-        >>> unencrypted_wrapper = EncryptionWrapper(enable_encryption=False)
-        >>> raw_data, raw_meta = unencrypted_wrapper.serialize({"test": 1}, cache_key="")
-        >>> raw_meta.encrypted
-        False
+        >>> EncryptionWrapper(enable_encryption=False)  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        EncryptionError: EncryptionWrapper requires encryption. ...
     """
 
     def __init__(
@@ -102,7 +101,7 @@ class EncryptionWrapper:
 
         Args:
             serializer: Any SerializerProtocol implementation to wrap with encryption.
-                           Defaults to AutoSerializer (MessagePack + compression).
+                           Defaults to StandardSerializer (cross-language MessagePack).
             master_key: 256-bit master key for encryption. If None, reads from environment.
             tenant_id: Tenant identifier for key isolation
             enable_encryption: Whether to enable encryption (can disable for testing)
@@ -110,19 +109,28 @@ class EncryptionWrapper:
         self.tenant_id = tenant_id
         self.enable_encryption = enable_encryption
 
-        # Initialize base serializer (defaults to AutoSerializer for backward compatibility)
-        self.serializer = serializer if serializer is not None else AutoSerializer()
+        # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
+        # compatibility. Encrypted data may be shared across SDKs via secrets manager,
+        # so the wire format must be language-agnostic.
+        if serializer is not None:
+            self.serializer = serializer
+        else:
+            from cachekit.serializers.standard_serializer import StandardSerializer
+
+            self.serializer = StandardSerializer()
 
         # Initialize encryption components (Optional - only set if encryption enabled)
         self.encryptor: Optional[ZeroKnowledgeEncryptor] = None
         self.tenant_keys: Optional[Any] = None  # TenantKeys from Rust
         self.encryption_key_fingerprint: Optional[str] = None
 
-        # Setup encryption if enabled
+        # Setup encryption
         if self.enable_encryption:
             self._setup_encryption(master_key)
         else:
-            logger.warning("Encryption disabled - using AutoSerializer only. Data will NOT be encrypted!")
+            raise EncryptionError(
+                "EncryptionWrapper requires encryption. If you don't need encryption, use StandardSerializer directly."
+            )
 
     def _setup_encryption(self, master_key: Optional[bytes]) -> None:
         """Setup encryption components with key derivation."""
@@ -526,9 +534,6 @@ class EncryptionWrapper:
             >>> wrapper = EncryptionWrapper(master_key=b"e" * 32)
             >>> wrapper.is_encryption_enabled
             True
-            >>> disabled = EncryptionWrapper(enable_encryption=False)
-            >>> disabled.is_encryption_enabled
-            False
         """
         return self.enable_encryption
 
@@ -569,12 +574,6 @@ class EncryptionWrapper:
             'ring (Rust)'
             >>> "key_fingerprint" in info  # Fingerprint included (safe to log)
             True
-
-            Encryption disabled - minimal info:
-
-            >>> disabled = EncryptionWrapper(enable_encryption=False)
-            >>> disabled.get_encryption_info()
-            {'enabled': False, 'reason': 'Encryption disabled or not available'}
         """
         if not self.enable_encryption:
             return {"enabled": False, "reason": "Encryption disabled or not available"}
