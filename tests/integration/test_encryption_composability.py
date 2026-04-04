@@ -18,8 +18,8 @@ class TestEncryptionWrapperComposability:
         """32-byte master key for testing."""
         return b"a" * 32
 
-    def test_encryption_wrapper_with_auto_serializer(self, master_key):
-        """EncryptionWrapper with AutoSerializer (MessagePack) works."""
+    def test_encryption_wrapper_with_default_serializer(self, master_key):
+        """EncryptionWrapper with default StandardSerializer (MessagePack) works."""
         wrapper = EncryptionWrapper(master_key=master_key, tenant_id="test-tenant")
 
         data = {"user": "alice", "ssn": "123-45-6789"}

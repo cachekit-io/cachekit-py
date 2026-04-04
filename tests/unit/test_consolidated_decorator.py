@@ -649,8 +649,8 @@ class TestErrorHandlingAndGracefulDegradation:
         assert "namespace" in health_status
         assert "components" in health_status
 
-    def test_serialization_fallback_behavior(self, redis_test_client):
-        """Test serialization fallback when preferred serializer fails."""
+    def test_default_serialization_behavior(self, redis_test_client):
+        """Test that default serializer handles standard data types."""
 
         @cache(ttl=300, serializer="default")
         def function_with_serialization():

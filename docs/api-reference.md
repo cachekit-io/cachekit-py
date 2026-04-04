@@ -70,7 +70,6 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, TimeoutC
 @cache(
     ttl=3600,
     namespace=None,
-    safe_mode=False,
     backend=None,
     # Performance features
     refresh_ttl_on_get=False,
@@ -90,7 +89,6 @@ def your_function(args):
 
 - **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
-- **`safe_mode`** (`bool`, default: `False`) - Enable fail-open behavior (cache failures return `None` instead of raising)
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection
 - **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`

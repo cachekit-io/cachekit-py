@@ -124,10 +124,7 @@ class TestAiocacheComparison:
 
         UNIQUE ADVANTAGE vs aiocache (and most competitors).
         """
-
-        # @cache.secure enables encryption
-        # Requires CACHEKIT_MASTER_KEY environment variable
-        # This is validated in tests/critical/test_aad_v03_security.py
+        pytest.skip("Validated in tests/critical/test_aad_v03_security.py")
 
     def test_cachekit_has_prometheus_metrics(self):
         """

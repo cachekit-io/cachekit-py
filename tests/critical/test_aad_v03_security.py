@@ -192,13 +192,21 @@ class TestCiphertextSubstitutionAttackPrevention:
         test_data = {"secret": "shared_secret_value"}
 
         # Encrypt same data with different cache_keys
-        ciphertext_1, _ = wrapper.serialize(test_data, cache_key="cache:key:1")
+        ciphertext_1, meta_1 = wrapper.serialize(test_data, cache_key="cache:key:1")
         ciphertext_2, _ = wrapper.serialize(test_data, cache_key="cache:key:2")
 
         # Ciphertext should be different because:
         # 1. Different nonces (random)
         # 2. Different AAD (includes cache_key) -> different auth tag
         assert ciphertext_1 != ciphertext_2, "Same data encrypted with different keys must produce different ciphertext"
+
+        # Verify AAD binding: decrypting with correct key works
+        result = wrapper.deserialize(ciphertext_1, meta_1, cache_key="cache:key:1")
+        assert result == test_data
+
+        # Verify AAD binding: decrypting with WRONG key fails authentication
+        with pytest.raises(EncryptionError):
+            wrapper.deserialize(ciphertext_1, meta_1, cache_key="cache:key:2")
 
     def test_encryption_without_cache_key_is_blocked(self, master_key: bytes):
         """Encryption must be blocked if cache_key is not provided."""

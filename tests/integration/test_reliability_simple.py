@@ -99,29 +99,6 @@ class TestReliabilitySimple:
             # Falls back to executing the function
             assert result2 == {"result": 40}
 
-    @pytest.mark.skip(reason="fail_closed only applies to circuit breaker states")
-    def test_fail_closed_strategy(self, redis_client):
-        """Test fail_closed strategy raises exceptions."""
-
-        @cache(namespace="fail_closed")
-        def fail_closed_func(x):
-            return x
-
-        # Normal operation
-        result = fail_closed_func("test")
-        assert result == "test"
-
-        # With Redis failure - should raise
-        from cachekit.cache_handler import CacheOperationHandler
-
-        with patch.object(
-            CacheOperationHandler,
-            "get_cached_value",
-            side_effect=ConnectionError("Test error"),
-        ):
-            with pytest.raises(ConnectionError, match="Test error"):
-                fail_closed_func("error")
-
     @pytest.mark.skip(reason="Mocking Redis failure is complex due to connection pool")
     def test_health_check_with_redis_failure(self, redis_client):
         """Test health check when Redis is down."""
