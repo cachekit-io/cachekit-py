@@ -284,7 +284,6 @@ def create_cache_wrapper(
     deployment_uuid: str | None = None,
     master_key: str | None = None,
     # Performance features
-    pipelined: bool = True,
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
     fast_mode: bool = False,
@@ -329,7 +328,6 @@ def create_cache_wrapper(
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
                         If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
                         Must be deterministic (same across restarts) to decrypt cached data.
-        pipelined: Enable Redis pipelining for performance
         refresh_ttl_on_get: Refresh TTL on cache hit
         ttl_refresh_threshold: Refresh when TTL below this fraction
         fast_mode: Disable monitoring for maximum performance
@@ -437,8 +435,7 @@ def create_cache_wrapper(
         enable_integrity_checking=integrity_checking,
     )
 
-    # Create cache handler strategy based on pipelined parameter
-    # Will be initialized with actual Redis client when first used
+    # Create cache handler strategy (initialized with actual Redis client when first used)
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
@@ -629,7 +626,6 @@ def create_cache_wrapper(
                     _backend = get_backend_provider().get_backend()
 
                 # Setup cache handler strategy on first use with adaptive timeout
-                # Note: Both pipelined and non-pipelined use StandardCacheHandler for now
                 handler = StandardCacheHandler(
                     _backend,
                     timeout_provider=features.get_timeout,
