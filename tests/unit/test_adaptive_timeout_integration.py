@@ -6,11 +6,11 @@ from cachekit import cache
 from cachekit.cache_handler import StandardCacheHandler
 from cachekit.config import DecoratorConfig
 from cachekit.config.nested import TimeoutConfig
-from cachekit.decorators import DecoratorFeatures
+from cachekit.decorators import FeatureOrchestrator
 from cachekit.reliability.adaptive_timeout import AdaptiveTimeout
 
-# Note: DecoratorFeatures is maintained for backward compatibility
-# New code should use: from cachekit.decorator.feature_orchestrator import FeatureOrchestrator
+# Note: FeatureOrchestrator is the primary class for decorator feature management
+# Direct import: from cachekit.decorators import FeatureOrchestrator
 
 
 class TestAdaptiveTimeoutIntegration:
@@ -21,15 +21,15 @@ class TestAdaptiveTimeoutIntegration:
         # Track features instance
         features_instance = None
 
-        # Patch DecoratorFeatures to capture instance
-        original_init = DecoratorFeatures.__init__
+        # Patch FeatureOrchestrator to capture instance
+        original_init = FeatureOrchestrator.__init__
 
         def patched_init(self, *args, **kwargs):
             nonlocal features_instance
             original_init(self, *args, **kwargs)
             features_instance = self
 
-        DecoratorFeatures.__init__ = patched_init
+        FeatureOrchestrator.__init__ = patched_init
 
         try:
 
@@ -59,20 +59,20 @@ class TestAdaptiveTimeoutIntegration:
             assert timeout > 0
 
         finally:
-            DecoratorFeatures.__init__ = original_init
+            FeatureOrchestrator.__init__ = original_init
 
     def test_adaptive_timeout_disabled(self):
         """Test that adaptive timeout can be disabled."""
         features_instance = None
 
-        original_init = DecoratorFeatures.__init__
+        original_init = FeatureOrchestrator.__init__
 
         def patched_init(self, *args, **kwargs):
             nonlocal features_instance
             original_init(self, *args, **kwargs)
             features_instance = self
 
-        DecoratorFeatures.__init__ = patched_init
+        FeatureOrchestrator.__init__ = patched_init
 
         try:
 
@@ -90,7 +90,7 @@ class TestAdaptiveTimeoutIntegration:
             assert features_instance.get_timeout() == 5.0
 
         finally:
-            DecoratorFeatures.__init__ = original_init
+            FeatureOrchestrator.__init__ = original_init
 
     def test_cache_handler_uses_timeout_provider(self, mock_backend):
         """Test that StandardCacheHandler uses the timeout provider."""

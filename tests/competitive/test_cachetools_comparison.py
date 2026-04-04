@@ -57,16 +57,6 @@ class TestCachetoolsComparison:
         assert isinstance(result, tuple)
         assert result == (1, "hello", 3.14)
 
-    def test_cachetools_single_process_only(self):
-        """
-        CLAIM: cachetools is primarily single-process (dict-based).
-
-        This is TRUE. While cachetools has Memcached backend, it's not the
-        default and requires additional setup.
-        """
-
-        # cachetools default is dict-based, single-process
-
     def test_cachekit_single_and_multi_pod(self):
         """
         CLAIM: cachekit supports both single-process and multi-pod.
@@ -94,21 +84,6 @@ class TestCachetoolsComparison:
         result = get_distributed(1)
         assert result == "value_1"
 
-    def test_cachetools_manual_ttl_management(self):
-        """
-        CLAIM: cachetools requires TTLCache wrapper for TTL support.
-
-        This is TRUE. Not built into decorator pattern.
-
-        cachetools:
-            TTLCache(maxsize=128, ttl=300)
-
-        cachekit:
-            @cache(ttl=300)
-        """
-
-        # cachetools requires explicit TTLCache setup
-
     def test_cachekit_ttl_is_default(self):
         """
         CLAIM: cachekit has TTL built into decorator with sensible defaults.
@@ -122,15 +97,6 @@ class TestCachetoolsComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_cachetools_no_circuit_breaker(self):
-        """
-        CLAIM: cachetools has no circuit breaker.
-
-        This is TRUE. Cache failures propagate to caller.
-        """
-
-        # cachetools has no circuit breaker
 
     def test_cachekit_has_circuit_breaker(self):
         """
@@ -146,15 +112,6 @@ class TestCachetoolsComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachetools_no_distributed_locking(self):
-        """
-        CLAIM: cachetools has no distributed locking.
-
-        This is TRUE. No cache stampede prevention across instances.
-        """
-
-        # cachetools has no distributed locking
-
     def test_cachekit_has_distributed_locking(self):
         """
         CLAIM: cachekit has distributed locking for cache stampede prevention.
@@ -169,33 +126,6 @@ class TestCachetoolsComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachetools_no_encryption(self):
-        """
-        CLAIM: cachetools has no encryption support.
-
-        This is TRUE.
-        """
-
-        # cachetools has no encryption
-
-    def test_cachekit_has_encryption(self):
-        """
-        CLAIM: cachekit has zero-knowledge encryption (AES-256-GCM).
-
-        This is TRUE.
-        """
-
-        # @cache.secure enables encryption
-
-    def test_cachetools_no_metrics(self):
-        """
-        CLAIM: cachetools has no built-in Prometheus metrics.
-
-        This is TRUE. Must implement custom instrumentation.
-        """
-
-        # cachetools has no metrics integration
-
     def test_cachekit_has_metrics(self):
         """
         CLAIM: cachekit has built-in Prometheus metrics.
@@ -209,20 +139,6 @@ class TestCachetoolsComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_cachetools_complexity_four_stars(self):
-        """
-        CLAIM: cachetools has moderate complexity (⭐⭐⭐⭐ in comparison table).
-
-        This is TRUE. Multiple cache types, region config, manual setup.
-
-        EVIDENCE:
-        - TTLCache, LRUCache, LFUCache, RRCache, WeightedCache
-        - Region pattern for shared caches
-        - Memcached backend requires extra config
-        """
-
-        # cachetools has ~5 different cache implementations to choose from
 
     def test_cachekit_simplicity_two_stars(self):
         """
@@ -243,19 +159,6 @@ class TestCachetoolsComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachetools_memcached_backend_option(self):
-        """
-        CLAIM: cachetools has Memcached backend for multi-pod.
-
-        This is TRUE. But not default and requires setup.
-
-        cachetools approach:
-        - Default: dict (single-process)
-        - Multi-pod: add Memcached backend (extra work)
-        """
-
-        # cachetools requires different configuration for Memcached
-
     def test_cachekit_redis_default_for_multi_pod(self):
         """
         CLAIM: cachekit has Redis as default L2 backend for multi-pod.
@@ -269,15 +172,6 @@ class TestCachetoolsComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_cachetools_no_rust_acceleration(self):
-        """
-        CLAIM: cachetools is pure Python, no Rust acceleration.
-
-        This is TRUE.
-        """
-
-        # cachetools is pure Python
 
     def test_cachekit_has_rust_acceleration(self):
         """
@@ -296,19 +190,6 @@ class TestCachetoolsComparison:
 
 class TestCompetitiveEvidenceCachetools:
     """Document evidence for competitive claims about cachetools."""
-
-    def test_evidence_maturity_complexity_tradeoff(self):
-        """
-        EVIDENCE for Requirement 0 AC-2:
-
-        Maturity: cachetools is mature and battle-tested.
-        Complexity: cachetools requires choosing cache type (TTL, LRU, LFU, RR, etc).
-
-        cachekit trades some maturity (newer) for simplicity (one decorator).
-        """
-
-        # cachetools requires explicit cache type selection
-        # cachekit: @cache with defaults works
 
     def test_evidence_single_vs_multi_pod(self):
         """

@@ -30,7 +30,7 @@ class TestReliabilityFallback:
     def test_fallback_on_redis_error(self, redis_client):
         """Test fallback when Redis fails."""
 
-        @cache(namespace="fallback", safe_mode=True)
+        @cache(namespace="fallback")
         def fallback_func(x):
             return f"computed_{x}"
 
@@ -67,7 +67,7 @@ class TestReliabilityFallback:
         def my_fallback(*args, **kwargs):
             return {"fallback": True, "args": args, "kwargs": kwargs}
 
-        @cache(namespace="custom", safe_mode=True)
+        @cache(namespace="custom")
         def custom_func(x, y=10):
             return {"result": x + y}
 
@@ -80,9 +80,9 @@ class TestReliabilityFallback:
         from cachekit.cache_handler import CacheOperationHandler
 
         with patch.object(CacheOperationHandler, "get_cached_value", side_effect=TimeoutError()):
-            # With safe_mode=True, function should execute normally
+            # Function should execute normally on cache failure
             result2 = custom_func(10, y=30)
-            # With safe_mode=True, it falls back to executing the function
+            # Falls back to executing the function
             assert result2 == {"result": 40}
 
     @pytest.mark.skip(reason="fail_closed only applies to circuit breaker states")

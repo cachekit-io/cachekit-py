@@ -10,7 +10,7 @@ from cachekit import cache
 from cachekit.cache_handler import StandardCacheHandler
 from cachekit.config import DecoratorConfig
 from cachekit.config.nested import BackpressureConfig
-from cachekit.decorators import DecoratorFeatures
+from cachekit.decorators import FeatureOrchestrator
 from cachekit.reliability import BackpressureController
 
 
@@ -22,15 +22,15 @@ class TestBackpressureIntegration:
         # Track features instance
         features_instance = None
 
-        # Patch DecoratorFeatures to capture instance
-        original_init = DecoratorFeatures.__init__
+        # Patch FeatureOrchestrator to capture instance
+        original_init = FeatureOrchestrator.__init__
 
         def patched_init(self, *args, **kwargs):
             nonlocal features_instance
             original_init(self, *args, **kwargs)
             features_instance = self
 
-        DecoratorFeatures.__init__ = patched_init
+        FeatureOrchestrator.__init__ = patched_init
 
         try:
 
@@ -51,20 +51,20 @@ class TestBackpressureIntegration:
             assert features_instance.backpressure.max_concurrent == 50
 
         finally:
-            DecoratorFeatures.__init__ = original_init
+            FeatureOrchestrator.__init__ = original_init
 
     def test_backpressure_controller_disabled(self):
         """Test that backpressure controller is not created when disabled."""
         features_instance = None
 
-        original_init = DecoratorFeatures.__init__
+        original_init = FeatureOrchestrator.__init__
 
         def patched_init(self, *args, **kwargs):
             nonlocal features_instance
             original_init(self, *args, **kwargs)
             features_instance = self
 
-        DecoratorFeatures.__init__ = patched_init
+        FeatureOrchestrator.__init__ = patched_init
 
         try:
 
@@ -81,7 +81,7 @@ class TestBackpressureIntegration:
             assert features_instance.backpressure is None
 
         finally:
-            DecoratorFeatures.__init__ = original_init
+            FeatureOrchestrator.__init__ = original_init
 
     def test_cache_handler_uses_backpressure_controller(self, mock_backend):
         """Test that StandardCacheHandler uses the backpressure controller."""

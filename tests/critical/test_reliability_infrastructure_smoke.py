@@ -26,9 +26,7 @@ from cachekit.reliability.error_classification import BackendErrorClassifier
 from cachekit.reliability.metrics_collection import (
     AsyncMetricsCollector,
     MetricsCollector,
-    clear_metrics,
     get_async_metrics_collector,
-    record_async_metric,
 )
 
 if TYPE_CHECKING:
@@ -87,17 +85,6 @@ class TestMetricsCollectorSmoke:
         assert labeled is not None
         assert labeled.name == "test_metric"
         assert labeled._labels == {"operation": "get", "status": "success"}
-
-    def test_clear_metrics_doesnt_crash(self):
-        """SMOKE: Clearing metrics doesn't crash."""
-        collector = MetricsCollector("test_counter")
-        collector.inc()
-
-        # Should not raise
-        clear_metrics()
-
-        # Metrics should be cleared
-        assert collector.get() == 0
 
 
 @pytest.mark.critical
@@ -222,19 +209,6 @@ class TestAsyncMetricsCollectorSmoke:
 
         # Cleanup
         collector1.shutdown()
-
-    def test_record_async_metric_without_crash(self):
-        """SMOKE: Record async metric function doesn't crash."""
-        # Should not raise
-        record_async_metric("counter", "test_metric", 1.0, {"foo": "bar"})
-        record_async_metric("histogram", "test_duration", 1.5)
-        record_async_metric("gauge", "test_gauge", 42.0)
-
-        # Give worker time to process
-        time.sleep(0.1)
-
-        # Cleanup
-        get_async_metrics_collector().shutdown()
 
 
 @pytest.mark.critical

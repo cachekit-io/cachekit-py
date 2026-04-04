@@ -198,8 +198,7 @@ class TestCiphertextSubstitutionAttackPrevention:
         # Ciphertext should be different because:
         # 1. Different nonces (random)
         # 2. Different AAD (includes cache_key) -> different auth tag
-        # Note: We can't compare exact bytes (random nonce), but we verify decryption fails with wrong key
-        # This is implicitly tested by test_wrong_cache_key_fails_authentication
+        assert ciphertext_1 != ciphertext_2, "Same data encrypted with different keys must produce different ciphertext"
 
     def test_encryption_without_cache_key_is_blocked(self, master_key: bytes):
         """Encryption must be blocked if cache_key is not provided."""

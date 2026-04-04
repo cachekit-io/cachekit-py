@@ -64,17 +64,6 @@ class TestAiocacheComparison:
         assert isinstance(result, tuple), f"cachekit returns {type(result)}"
         assert result == (1, "hello", 3.14)
 
-    def test_aiocache_no_l1_cache(self):
-        """
-        CLAIM: aiocache is L2-only (no in-process L1 cache).
-
-        This is TRUE. aiocache goes to Redis for every cache hit.
-        Performance cost: ~2-7ms per cache hit (network roundtrip).
-        """
-
-        # aiocache doesn't have L1 in-process cache
-        # Every hit requires Redis lookup (network latency)
-
     def test_cachekit_has_l1_l2(self):
         """
         CLAIM: cachekit has L1 (in-process) + L2 (Redis) dual-layer cache.
@@ -99,15 +88,6 @@ class TestAiocacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_aiocache_no_circuit_breaker(self):
-        """
-        CLAIM: aiocache has no circuit breaker for fault tolerance.
-
-        This is TRUE. If Redis fails, aiocache errors propagate to caller.
-        """
-
-        # aiocache doesn't have circuit breaker
-
     def test_cachekit_has_circuit_breaker(self):
         """
         CLAIM: cachekit has built-in circuit breaker for reliability.
@@ -121,15 +101,6 @@ class TestAiocacheComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_aiocache_no_distributed_locking(self):
-        """
-        CLAIM: aiocache has no distributed locking.
-
-        This is TRUE. Multiple instances could trigger cache stampede.
-        """
-
-        # aiocache doesn't prevent cache stampedes across instances
 
     def test_cachekit_has_distributed_locking(self):
         """
@@ -145,15 +116,6 @@ class TestAiocacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_aiocache_no_encryption(self):
-        """
-        CLAIM: aiocache has no encryption support.
-
-        This is TRUE. aiocache doesn't provide encryption at application layer.
-        """
-
-        # aiocache doesn't have encryption
-
     def test_cachekit_has_zero_knowledge_encryption(self):
         """
         CLAIM: cachekit has zero-knowledge encryption (AES-256-GCM).
@@ -165,15 +127,7 @@ class TestAiocacheComparison:
 
         # @cache.secure enables encryption
         # Requires CACHEKIT_MASTER_KEY environment variable
-
-    def test_aiocache_no_prometheus_metrics(self):
-        """
-        CLAIM: aiocache has no built-in Prometheus metrics.
-
-        This is TRUE. Must implement custom instrumentation.
-        """
-
-        # aiocache doesn't provide Prometheus integration
+        # This is validated in tests/critical/test_aad_v03_security.py
 
     def test_cachekit_has_prometheus_metrics(self):
         """
@@ -188,15 +142,6 @@ class TestAiocacheComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_aiocache_static_timeouts(self):
-        """
-        CLAIM: aiocache uses static timeout configuration.
-
-        This is TRUE. timeout parameter is fixed throughout execution.
-        """
-
-        # aiocache has timeout parameter but it's static
 
     def test_cachekit_adaptive_timeouts(self):
         """
@@ -213,15 +158,6 @@ class TestAiocacheComparison:
 
         result = get_data(1)
         assert result == "value_1"
-
-    def test_aiocache_locked_to_redis(self):
-        """
-        CLAIM: aiocache backend is locked to Redis (or Memcached).
-
-        This is TRUE. Can't extend to custom backends easily.
-        """
-
-        # aiocache supports Redis/Memcached but not extensible protocol
 
     def test_cachekit_pluggable_backend_protocol(self):
         """
