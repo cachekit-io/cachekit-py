@@ -168,7 +168,6 @@ class DecoratorConfig:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
                    Default: "default" (MessagePack+LZ4+xxHash3-64 via Rust)
-        safe_mode: Enable fail-open behavior (cache failures return None instead of raising)
         integrity_checking: Enable checksums for corruption detection (default: True)
                            All serializers use xxHash3-64 (8 bytes).
                            Set to False for @cache.minimal (speed-first, no integrity guarantee)
@@ -186,11 +185,10 @@ class DecoratorConfig:
         encryption: Client-side encryption configuration
     """
 
-    # Core settings (6 fields)
+    # Core settings (5 fields)
     ttl: int | None = None
     namespace: str | None = None
     serializer: Union[str, SerializerProtocol] = "default"  # type: ignore[assignment]  # String name or protocol instance
-    safe_mode: bool = False
     integrity_checking: bool = True  # Checksums for corruption detection (xxHash3-64 for all serializers)
     key: Callable[..., str] | None = None  # Custom key function (escape hatch for complex types)
 
@@ -254,7 +252,6 @@ class DecoratorConfig:
             "ttl": self.ttl,
             "namespace": self.namespace,
             "serializer": self.serializer,
-            "safe_mode": self.safe_mode,
             "key": self.key,
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,

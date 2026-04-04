@@ -4,13 +4,12 @@ This package contains the refactored decorator implementation split into
 focused, single-responsibility modules following SOLID principles.
 """
 
-# Import the main decorator functions for backward compatibility
+# Import the main decorator functions
 from ..config import DecoratorConfig
-from .main import DecoratorFeatures, FeatureOrchestrator, cache
+from .main import FeatureOrchestrator, cache
 
 __all__ = [
     "DecoratorConfig",
-    "DecoratorFeatures",
     "FeatureOrchestrator",
     "cache",
 ]

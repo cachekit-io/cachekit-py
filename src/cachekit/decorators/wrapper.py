@@ -172,16 +172,6 @@ class _FunctionStats:
         self.session_id: str | None = None  # Lazy-initialized on first access
         self.l1_enabled = l1_enabled  # Rate limit classification flag
 
-    def record_hit(self, source: str):
-        """Record a cache hit from L1 or L2 (DEPRECATED - use record_l1_hit/record_l2_hit)."""
-        with self._lock:
-            self._hits += 1
-            if source == "l1":
-                self._l1_hits += 1
-            elif source == "l2":
-                self._l2_hits += 1
-            self._last_operation_at = time.time()
-
     def record_l1_hit(self):
         """Record an L1 (in-memory) cache hit."""
         with self._lock:
@@ -285,7 +275,6 @@ def create_cache_wrapper(
     config: Any = None,  # DecoratorConfig | None (avoid circular import)
     ttl: int | None = None,
     namespace: str | None = None,
-    safe_mode: bool = False,
     # Serialization & Security
     serializer: Union[str, SerializerProtocol] = "default",  # type: ignore[name-defined]
     integrity_checking: bool = True,
@@ -324,7 +313,6 @@ def create_cache_wrapper(
         func: Function to wrap with caching
         ttl: Cache time-to-live in seconds (None = no expiration)
         namespace: Cache key namespace prefix
-        safe_mode: Enable safe mode (deprecated, use reliability features)
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
@@ -380,7 +368,6 @@ def create_cache_wrapper(
         # Override all parameters from DecoratorConfig
         ttl = config.ttl if ttl is None else ttl
         namespace = config.namespace if namespace is None else namespace
-        # safe_mode is deprecated, not extracted from config
         serializer = config.serializer
         integrity_checking = config.integrity_checking
         refresh_ttl_on_get = config.refresh_ttl_on_get
