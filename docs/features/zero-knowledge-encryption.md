@@ -251,7 +251,7 @@ data_b = get_user_data(123)  # Same user_id, different tenant, different encrypt
 ### Key Rotation Pattern
 ```python notest
 # Gradual key rotation (for zero-downtime)
-@cache.secure(ttl=3600, master_key="a" * 64, key_rotation_enabled=True, backend=None)
+@cache.secure(ttl=3600, master_key="a" * 64, backend=None)
 def get_data(x):
     return sensitive_data(x)  # illustrative - sensitive_data not defined
 
@@ -339,7 +339,7 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 | Serializer | Plain | Encrypted | Overhead | Relative |
 |------------|-------|-----------|----------|----------|
 | **JSON** (OrjsonSerializer) | 0.75 μs | 4.25 μs | +3.50 μs | +467% |
-| **MessagePack** (DefaultSerializer) | 3.21 μs | 6.54 μs | +3.33 μs | +104% |
+| **MessagePack** (StandardSerializer) | 3.21 μs | 6.54 μs | +3.33 μs | +104% |
 | **DataFrames** (ArrowSerializer, 1000 rows) | 731.67 μs | 749.75 μs | +18.08 μs | **+2.5%** |
 
 **Key insights**:

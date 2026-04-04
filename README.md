@@ -227,7 +227,7 @@ def test_cached_function():
 
 | Serializer | Speed | Use Case |
 |:-----------|:-----:|:---------|
-| **DefaultSerializer** | ★★★★☆ | General Python types, NumPy, Pandas |
+| **StandardSerializer** | ★★★★☆ | General Python types, NumPy, Pandas |
 | **OrjsonSerializer** | ★★★★★ | JSON APIs (2-5x faster than stdlib) |
 | **ArrowSerializer** | ★★★★★ | Large DataFrames (6-23x faster for 10K+ rows) |
 | **EncryptionWrapper** | ★★★★☆ | Wraps any serializer with AES-256-GCM |
@@ -349,7 +349,7 @@ print(expensive_func.cache_info())
 
 | Feature | Description |
 |:--------|:------------|
-| [Serializer Guide][serializer-guide-url] | ArrowSerializer vs DefaultSerializer benchmarks |
+| [Serializer Guide][serializer-guide-url] | ArrowSerializer vs StandardSerializer benchmarks |
 | [Circuit Breaker][circuit-breaker-url] | Prevent cascading failures |
 | [Distributed Locking][distributed-locking-url] | Cache stampede prevention |
 | [Prometheus Metrics][prometheus-url] | Built-in observability |

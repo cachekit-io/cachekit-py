@@ -100,8 +100,8 @@ OrjsonSerializer handles JSON-compatible types plus extended types:
 - `dataclass` → dict (requires `OPT_PASSTHROUGH_DATACLASS`)
 
 **NOT supported** (raises `TypeError`):
-- `bytes` → use `DefaultSerializer` instead
-- Custom classes → use `DefaultSerializer` or implement `__dict__`
+- `bytes` → use `StandardSerializer` instead
+- Custom classes → use `StandardSerializer` or implement `__dict__`
 - `set`, `frozenset` → convert to `list` first
 
 **Type checking example:**
@@ -119,7 +119,7 @@ try:
     serializer.serialize({"binary": b"data"})
 except TypeError as e:
     print(e)
-    # "OrjsonSerializer only supports JSON types. Use DefaultSerializer for binary data."
+    # "OrjsonSerializer only supports JSON types. Use StandardSerializer for binary data."
 ```
 
 ## Performance Comparison
@@ -132,7 +132,7 @@ OrjsonSerializer vs stdlib json (measured):
 | Simple dict (10 keys) | 0.05ms | 0.10ms | **2.0x** |
 | Large flat dict (10K keys) | 2.5ms | 7.0ms | **2.8x** |
 
-OrjsonSerializer vs DefaultSerializer (msgpack):
+OrjsonSerializer vs StandardSerializer (msgpack):
 
 | Metric | orjson | msgpack+LZ4 | Note |
 |--------|--------|-------------|------|
@@ -148,7 +148,7 @@ OrjsonSerializer vs DefaultSerializer (msgpack):
 - Human-readable cache inspection needed
 - Trading ~30% more storage for JSON compatibility
 
-**When to prefer DefaultSerializer:**
+**When to prefer StandardSerializer:**
 - Maximum compression needed
 - Binary data (bytes, images, etc.)
 - Non-JSON types (custom objects)
@@ -156,15 +156,15 @@ OrjsonSerializer vs DefaultSerializer (msgpack):
 
 **Limitations:**
 - JSON-compatible types only (dict, list, str, int, float, bool, None)
-- NO binary data (bytes will raise TypeError) → use DefaultSerializer
-- NO arbitrary Python objects → use DefaultSerializer
+- NO binary data (bytes will raise TypeError) → use StandardSerializer
+- NO arbitrary Python objects → use StandardSerializer
 - Output is ~20-50% larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
 
 ---
 
 ## See Also
 
-- [DefaultSerializer](default.md) — General-purpose alternative with binary data support
+- [StandardSerializer](default.md) — General-purpose alternative with binary data support
 - [ArrowSerializer](arrow.md) — DataFrame-optimized serializer
 - [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to OrjsonSerializer
 - [Performance Guide](../performance.md) — Full benchmark comparisons

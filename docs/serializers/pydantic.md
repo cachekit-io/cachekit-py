@@ -2,7 +2,7 @@
 
 # Caching Pydantic Models
 
-**Issue:** Pydantic models are not directly serializable by DefaultSerializer. This is intentional.
+**Issue:** Pydantic models are not directly serializable by StandardSerializer. This is intentional.
 
 ## Why Pydantic Models Aren't Auto-Detected
 
@@ -167,7 +167,7 @@ def get_user(user_id: int) -> dict:
 
 ## See Also
 
-- [DefaultSerializer](default.md) — The serializer used when caching dicts from `model_dump()`
+- [StandardSerializer](default.md) — The serializer used when caching dicts from `model_dump()`
 - [Custom Serializers](custom.md) — Implement SerializerProtocol for specialized handling
 - [API Reference](../api-reference.md) — Serializer parameters and options
 

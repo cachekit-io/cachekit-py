@@ -327,7 +327,7 @@ orchestrator = FeatureOrchestrator(
 
 **Key Components:**
 - **FeatureOrchestrator**: Manages reliability features (circuit breaker, adaptive timeout, backpressure, statistics, logging)
-- **CachedRedisClientProvider**: Thread-local Redis client caching for performance
+- **Thread-Local Client Caching**: `get_cached_redis_client()` in `cachekit.backends.redis.client` provides thread-local Redis client reuse for performance
 - **Configuration Caching**: LRU cached configuration objects to eliminate overhead
 
 **Architecture Note**: The implementation uses `FeatureOrchestrator` for better separation of concerns and improved modularity.
@@ -356,11 +356,10 @@ Intelligent error categorization for circuit breaker decisions:
 - Prevents application errors from triggering circuit breaker
 - Enables targeted recovery strategies
 
-#### `CachedRedisClientProvider`
-Thread-local Redis client caching:
+#### `get_cached_redis_client()`
+Thread-local Redis client caching (`cachekit.backends.redis.client`):
 - Eliminates repeated client creation overhead
-- Thread-safe client reuse
-- 28% performance improvement in benchmarks
+- Thread-safe client reuse via `threading.local`
 
 ### Async Function Caching
 

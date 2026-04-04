@@ -49,7 +49,7 @@ class OrjsonSerializer:
     Limitations:
     - JSON-only: No binary data, custom objects, or complex types
     - No DataFrame optimization (use ArrowSerializer)
-    - No NumPy optimization (use DefaultSerializer)
+    - No NumPy optimization (use StandardSerializer)
 
     Protocol Compliance:
         serialize(obj) -> tuple[bytes, SerializationMetadata]
