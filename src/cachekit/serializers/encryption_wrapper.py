@@ -116,13 +116,9 @@ class EncryptionWrapper:
 
             self.serializer = StandardSerializer()
 
-        # Initialize encryption components
-        self.encryptor: Optional[ZeroKnowledgeEncryptor] = None
-        self.tenant_keys: Optional[Any] = None
-        self.encryption_key_fingerprint: Optional[str] = None
-
         # Setup encryption — mandatory. EncryptionWrapper without encryption
         # is a security misconfiguration, not a valid operating mode.
+        # _setup_encryption sets: self.encryptor, self.tenant_keys, self.encryption_key_fingerprint
         self._setup_encryption(master_key)
 
     def _setup_encryption(self, master_key: Optional[bytes]) -> None:
@@ -147,16 +143,13 @@ class EncryptionWrapper:
 
         # Derive tenant-specific keys with domain separation
         try:
-            self.tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
-            if self.tenant_keys is None:
-                raise RuntimeError("Key derivation failed")
+            tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
+            if tenant_keys is None:
+                raise RuntimeError("Key derivation returned None")
+            self.tenant_keys = tenant_keys
 
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()
-            if self.encryption_key_fingerprint is None:
-                raise RuntimeError("Fingerprint generation failed")
-            if self.encryptor is None:
-                raise RuntimeError("Encryptor initialization failed")
 
             logger.info(
                 f"Encryption initialized for tenant '{self.tenant_id}' "
@@ -224,14 +217,6 @@ class EncryptionWrapper:
                 "cache_key is required when encryption is enabled. "
                 "AAD v0x03 requires cache_key binding to prevent ciphertext substitution attacks."
             )
-
-        # Encryption is enabled - encryptor and tenant_keys must be initialized
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
-        if self.tenant_keys is None:
-            raise RuntimeError("Tenant keys must be initialized when encryption is enabled")
-        if self.encryption_key_fingerprint is None:
-            raise RuntimeError("Key fingerprint must be set when encryption is enabled")
 
         # Encrypt the serialized data
         try:
@@ -317,12 +302,6 @@ class EncryptionWrapper:
                 "cache_key is required to decrypt data. "
                 "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
             )
-
-        # Verify encryptor and tenant_keys are initialized
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized")
-        if self.tenant_keys is None:
-            raise RuntimeError("Tenant keys must be initialized")
 
         # Verify tenant match for security
         if metadata.tenant_id != self.tenant_id:
@@ -533,8 +512,6 @@ class EncryptionWrapper:
             >>> isinstance(wrapper.hardware_acceleration_enabled, bool)
             True
         """
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized")
         return self.encryptor.hardware_acceleration_enabled()
 
     def get_encryption_info(self) -> dict[str, Any]:
@@ -558,9 +535,6 @@ class EncryptionWrapper:
             >>> "key_fingerprint" in info  # Fingerprint included (safe to log)
             True
         """
-        if self.encryption_key_fingerprint is None:
-            raise RuntimeError("Key fingerprint must be set")
-
         return {
             "enabled": True,
             "tenant_id": self.tenant_id,
