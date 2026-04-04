@@ -7,7 +7,6 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
-import functools
 import sys
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Union, runtime_checkable
@@ -21,9 +20,7 @@ else:
 from cachekit.backends.base import BackendError, BaseBackend, TTLInspectableBackend
 from cachekit.backends.provider import (
     BackendProviderInterface,
-    CacheClientProvider,
     DefaultBackendProvider,
-    DefaultCacheClientProvider,
     DefaultLoggerProvider,
     LoggerProvider,
 )
@@ -38,17 +35,11 @@ if TYPE_CHECKING:
 
 # Global DI container instance with default registrations
 container = DIContainer()
-container.register(CacheClientProvider, DefaultCacheClientProvider)
 container.register(LoggerProvider, DefaultLoggerProvider)
 container.register(BackendProviderInterface, DefaultBackendProvider)
 
 # Dependencies are injected at runtime, not module load time
 # This ensures test isolation works properly with DI
-
-
-def get_client_provider():
-    """Get the current CacheClientProvider from DI container."""
-    return container.get(CacheClientProvider)
 
 
 def get_logger_provider():
@@ -159,31 +150,6 @@ def _get_cached_serializer_class(serializer_name: str, import_path: str):
             raise
 
 
-@functools.lru_cache(maxsize=128)
-def _get_cached_utility_function(import_path: str):
-    """Thread-safe cached import of utility functions (like serialize_for_redis).
-
-    Uses functools.lru_cache for automatic thread-safe caching of utility functions.
-    These functions are imported less frequently than serializer classes but still
-    benefit from caching to avoid repeated import overhead.
-
-    Args:
-        import_path: Full import path (e.g., 'cachekit.serializers.serialize_for_redis')
-
-    Returns:
-        Cached utility function
-    """
-    try:
-        module_path, function_name = import_path.rsplit(".", 1)
-        module = __import__(module_path, fromlist=[function_name])
-        function = getattr(module, function_name)
-        get_logger().debug(f"Cached utility import: {import_path}")
-        return function
-    except (ImportError, AttributeError) as e:
-        get_logger().warning(f"Failed to import utility function {import_path}: {e}")
-        raise
-
-
 def _get_cached_serializer_instance(
     serializer: Union[str, SerializerProtocol], enable_integrity_checking: bool = True
 ) -> SerializerProtocol:  # type: ignore[name-defined]
@@ -249,85 +215,6 @@ def _get_cached_serializer_instance(
         # Cache the instance
         _serializer_instance_cache[cache_key] = instance
         return instance
-
-
-class SerializerFactory:
-    """Factory class responsible for creating serializer instances.
-
-    Note: Encryption is now a separate layer (not a serializer type).
-    Use encryption=True parameter instead of serializer="encrypted".
-
-    Current serializers:
-    - DefaultSerializer (default): MessagePack + LZ4 compression + xxHash3-64 checksums
-    - ArrowSerializer (arrow): Apache Arrow IPC for DataFrames
-    - OrjsonSerializer (orjson): High-performance JSON serialization
-    """
-
-    @staticmethod
-    def create_serializer(serializer: str = "default", data_sample: Any = None):
-        """Create serializer instance based on type.
-
-        Args:
-            serializer: Requested serializer type ("default", "arrow", "orjson")
-            data_sample: Optional data sample (unused)
-
-        Returns:
-            Serializer instance
-
-        Raises:
-            ValueError: If unknown serializer is requested
-
-        Note:
-            For encryption, use encryption=True parameter (not serializer="encrypted").
-            Encryption is a wrapper layer, not a peer serializer.
-        """
-        from cachekit.serializers import SERIALIZER_REGISTRY
-
-        if serializer in SERIALIZER_REGISTRY:
-            try:
-                serializer_class = SERIALIZER_REGISTRY[serializer]
-                return serializer_class()
-            except (ImportError, RuntimeError) as e:
-                raise RuntimeError(
-                    f"{serializer} serializer not available: {e}. Please ensure dependencies are installed."
-                ) from e
-        else:
-            valid_options = ", ".join(SERIALIZER_REGISTRY.keys())
-            raise ValueError(
-                f"Unknown serializer: '{serializer}'. "
-                f"Valid options: {valid_options}. "
-                f"For encryption, use encryption=True parameter (not serializer='encrypted')."
-            )
-
-    @staticmethod
-    def validate_serializer_for_data(serializer_name: str, data: Any) -> bool:
-        """Validate if a serializer can handle specific data.
-
-        Args:
-            serializer_name: Name of the serializer to test
-            data: Data to validate against
-
-        Returns:
-            True if serializer can handle the data, False otherwise
-        """
-        from cachekit.serializers import SERIALIZER_REGISTRY
-
-        return serializer_name in SERIALIZER_REGISTRY
-
-    @staticmethod
-    def get_compatibility_report(data: Any) -> str:
-        """Get a detailed compatibility report for data across all serializers.
-
-        Args:
-            data: Data to analyze
-
-        Returns:
-            Human-readable compatibility report
-        """
-        from cachekit.serializers import SERIALIZER_REGISTRY
-
-        serializers = ", ".join(SERIALIZER_REGISTRY.keys())
-        return f"Data type {type(data).__name__} - Compatible with: {serializers}"
 
 
 class CacheSerializationHandler:

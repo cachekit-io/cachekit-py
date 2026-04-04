@@ -802,15 +802,3 @@ class AutoSerializer:
 
 # Default instance for convenience
 auto_serializer = AutoSerializer()
-
-
-# Convenience functions
-def serialize(obj: Any) -> bytes:
-    """Serialize object using auto serializer."""
-    data, _metadata = auto_serializer.serialize(obj)
-    return data
-
-
-def deserialize(data: bytes) -> Any:
-    """Deserialize data using auto serializer."""
-    return auto_serializer.deserialize(data)

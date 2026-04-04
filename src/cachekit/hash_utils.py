@@ -66,27 +66,3 @@ def cache_key_hash(args_kwargs_str: str) -> str:
         32-character hex hash for cache key uniqueness
     """
     return fast_hash(args_kwargs_str, digest_size=16)
-
-
-def content_checksum(content: Union[str, bytes]) -> str:
-    """Content integrity checksum.
-
-    Args:
-        content: Content to checksum
-
-    Returns:
-        64-character hex hash for integrity validation
-    """
-    return secure_hash(content, digest_size=32)
-
-
-def short_fingerprint(data: str) -> str:
-    """Short fingerprint for IDs/identifiers.
-
-    Args:
-        data: Data to fingerprint
-
-    Returns:
-        16-character hex hash for short identifiers
-    """
-    return fast_hash(data, digest_size=8)
