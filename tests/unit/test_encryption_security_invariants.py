@@ -177,3 +177,35 @@ class TestDeserializeDataMissingTenantId:
                 handler.deserialize_data(blob, cache_key="any:key")
         finally:
             reset_settings()
+
+
+class TestEncryptedRoundTrip:
+    """Cover serialize_data/deserialize_data success paths with encryption enabled."""
+
+    def test_single_tenant_encrypt_decrypt_roundtrip(self, monkeypatch):
+        """Full round-trip through CacheSerializationHandler with encryption.
+
+        Covers:
+        - serialize_data lines 559-578 (encryption branch, single-tenant UUID)
+        - deserialize_data lines 667-678 (encrypted metadata with valid tenant_id)
+        """
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            handler = CacheSerializationHandler(
+                serializer_name="default",
+                encryption=True,
+                single_tenant_mode=True,
+            )
+
+            data = {"user_id": 42, "email": "test@example.com"}
+            cache_key = "cache:user:42:profile"
+
+            serialized = handler.serialize_data(data, cache_key=cache_key)
+            recovered = handler.deserialize_data(serialized, cache_key=cache_key)
+
+            assert recovered == data
+        finally:
+            reset_settings()
