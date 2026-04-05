@@ -68,6 +68,7 @@ class TestEncryptionWrapperExplicitSerializer:
         custom = StandardSerializer()
         wrapper = EncryptionWrapper(serializer=custom, master_key=b"a" * 32)
         assert wrapper.serializer is custom
+        assert wrapper.is_encryption_enabled is True
 
     def test_default_serializer_created_when_none(self):
         """When serializer=None (default), a fresh StandardSerializer is created."""
