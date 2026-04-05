@@ -26,24 +26,6 @@ def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
     return blake3.blake3(data).hexdigest()[: digest_size * 2]
 
 
-def secure_hash(data: Union[str, bytes], digest_size: int = 32) -> str:
-    """Secure hash using BLAKE3 - for content integrity.
-
-    Args:
-        data: String or bytes to hash
-        digest_size: Output size in bytes (default: 32 = 64 hex chars)
-
-    Returns:
-        Hex string of specified length
-
-    Use for: Content checksums, data integrity validation
-    """
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-
-    return blake3.blake3(data).hexdigest()[: digest_size * 2]
-
-
 def function_hash(func_name: str) -> str:
     """Standardized function identifier hash.
 

@@ -107,7 +107,7 @@ class MyBackend:
 
 | Serializer | Speed | Use Case |
 |------------|:-----:|----------|
-| **DefaultSerializer** | Fast | General Python types, NumPy, Pandas (MessagePack + LZ4) |
+| **StandardSerializer** | Fast | General Python types, NumPy, Pandas (MessagePack + LZ4) |
 | **OrjsonSerializer** | Fastest | JSON APIs (2-5x faster than stdlib) |
 | **ArrowSerializer** | Fastest | Large DataFrames (6-23x faster for 10K+ rows) |
 | **EncryptionWrapper** | Fast | Wraps any serializer with AES-256-GCM |

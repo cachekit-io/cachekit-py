@@ -124,7 +124,7 @@ cachekit/
 │
 ├── src/cachekit/
 │   ├── decorators/             # @cache, @redis_cache
-│   ├── serializers/            # RawSerializer, EncryptionWrapper
+│   ├── serializers/            # StandardSerializer, EncryptionWrapper
 │   ├── backends/               # RedisBackend, CachekitIOBackend
 │   │   ├── redis/              # Redis backend implementation
 │   │   └── cachekitio/         # CachekitIO HTTP backend
