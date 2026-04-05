@@ -14,7 +14,7 @@ import pytest
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.validation import ConfigurationError
 from cachekit.serializers.base import SerializationError
-from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 from cachekit.serializers.orjson_serializer import OrjsonSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -24,6 +24,40 @@ from cachekit.serializers.wrapper import SerializationWrapper
 def setup_di_for_redis_isolation():
     """Override root conftest's Redis isolation."""
     yield
+
+
+class TestEncryptionWrapperSetupErrors:
+    """Cover _setup_encryption error branches when master_key comes from settings."""
+
+    def test_no_master_key_in_settings_raises(self, monkeypatch):
+        """EncryptionError when master_key=None and settings has no key."""
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        monkeypatch.delenv("REDIS_CACHE_MASTER_KEY", raising=False)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            with pytest.raises(EncryptionError, match="Master key required"):
+                EncryptionWrapper(master_key=None)
+        finally:
+            reset_settings()
+
+    def test_malformed_hex_key_raises(self, monkeypatch):
+        """EncryptionError when settings master_key is invalid hex."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "not_valid_hex!!!")
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            with pytest.raises(EncryptionError, match="Invalid master key format"):
+                EncryptionWrapper(master_key=None)
+        finally:
+            reset_settings()
+
+    def test_short_master_key_raises(self):
+        """EncryptionError when master_key is shorter than 32 bytes."""
+        with pytest.raises(EncryptionError, match="at least 32 bytes"):
+            EncryptionWrapper(master_key=b"too_short")
 
 
 class TestEncryptionWrapperExplicitSerializer:
