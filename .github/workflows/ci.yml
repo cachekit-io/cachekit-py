@@ -112,12 +112,12 @@ jobs:
     - name: Install dependencies (if not cached)
       run: uv sync --python ${{ matrix.python-version }} --group dev
 
-    - name: Run critical tests (PRs)
+    - name: Run tests (PRs)
       if: github.event_name == 'pull_request'
       env:
         REDIS_URL: redis://localhost:6379
       run: |
-        uv run pytest tests/critical/ -m "not slow" \
+        uv run pytest tests/unit/ tests/critical/ -m "not slow" \
           --cov=src/cachekit \
           --cov-report=xml \
           --cov-report=term \
