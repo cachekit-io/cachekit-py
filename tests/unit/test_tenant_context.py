@@ -55,7 +55,7 @@ class TestArgumentNameExtractor:
                 {"account_id": "770fa622-041d-63f6-c938-668877662222"},
                 "770fa622-041d-63f6-c938-668877662222",
             ),
-            ("client_id", {"client_id": str(uuid.uuid4())}, None),  # Will use generated UUID
+            ("client_id", {"client_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901"}, None),  # Will use generated UUID
         ],
     )
     def test_extract_various_arg_names(self, arg_name, kwargs, expected_uuid):
@@ -278,8 +278,8 @@ class TestContextVarExtractor:
             "550e8400-e29b-41d4-a716-446655440000",
             "660f9511-f30c-52e5-b827-557766551111",
             "770fa622-041d-63f6-c938-668877662222",
-            str(uuid.uuid4()),
-            str(uuid.uuid4()),
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
         ],
     )
     def test_extract_various_uuids(self, tenant_uuid):
@@ -328,10 +328,10 @@ class TestUUIDFormatValidation:
         [
             "550e8400-e29b-41d4-a716-446655440000",  # Standard UUID4
             "00000000-0000-0000-0000-000000000000",  # Nil UUID
-            str(uuid.uuid4()),  # Generated UUID4
-            str(uuid.uuid1()),  # UUID1
-            str(uuid.uuid3(uuid.NAMESPACE_DNS, "test")),  # UUID3
-            str(uuid.uuid5(uuid.NAMESPACE_DNS, "test")),  # UUID5
+            "c3d4e5f6-a7b8-9012-cdef-123456789abc",  # Fixed UUID4
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",  # Fixed UUID1-style
+            str(uuid.uuid3(uuid.NAMESPACE_DNS, "test")),  # UUID3 (deterministic)
+            str(uuid.uuid5(uuid.NAMESPACE_DNS, "test")),  # UUID5 (deterministic)
         ],
     )
     def test_validate_valid_uuid_formats(self, valid_uuid):

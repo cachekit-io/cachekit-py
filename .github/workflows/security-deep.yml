@@ -140,7 +140,7 @@ jobs:
     - name: Report fuzzing results
       if: always()
       run: |
-        if [ -d tests/fuzzing/corpus/ ] && [ "$(ls -A tests/fuzzing/corpus/ 2>/dev/null | grep -v '.gitignore')" ]; then
+        if [ -d tests/fuzzing/corpus/ ] && find tests/fuzzing/corpus/ -mindepth 1 ! -name '.gitignore' -print -quit | grep -q .; then
           echo "⚠️  Crashes discovered during Atheris fuzzing!"
           ls -lh tests/fuzzing/corpus/
           exit 1
