@@ -5,7 +5,7 @@ Uses AES-256-GCM for authenticated encryption with per-tenant key isolation.
 
 Architectural Note:
     EncryptionWrapper is a Decorator pattern implementation, not a serialization format.
-    It wraps any SerializerProtocol (AutoSerializer, OrjsonSerializer, ArrowSerializer)
+    It wraps any SerializerProtocol (StandardSerializer, OrjsonSerializer, ArrowSerializer)
     and adds an encryption layer. This enables zero-knowledge caching where the backend
     never sees plaintext, regardless of data type (JSON, DataFrames, MessagePack, etc.).
 """
@@ -42,7 +42,7 @@ class EncryptionWrapper:
     - Hardware-accelerated via ring library
     - Per-tenant cryptographic isolation
     - Domain separation for security
-    - Works with ANY serializer (AutoSerializer, OrjsonSerializer, ArrowSerializer)
+    - Works with ANY serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
 
     Security Model:
     - Storage backend never sees plaintext
@@ -161,9 +161,9 @@ class EncryptionWrapper:
 
         Args:
             obj: Object to serialize and encrypt
-            cache_key: Cache key for AAD binding (SECURITY CRITICAL for encryption).
+            cache_key: Cache key for AAD binding (SECURITY CRITICAL).
                       Prevents ciphertext substitution attacks (Protocol v1.0.1, Section 5.6).
-                      Empty string allowed only when encryption is disabled.
+                      Must be a non-empty string; raises ValueError if empty.
 
         Returns:
             Tuple of (encrypted_data, metadata_with_encryption_info)
