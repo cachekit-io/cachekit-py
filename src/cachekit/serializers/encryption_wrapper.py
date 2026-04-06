@@ -197,13 +197,7 @@ class EncryptionWrapper:
                 ...
             TypeError: cache_key must be a string...
         """
-        # First serialize with base serializer
-        try:
-            raw_data, raw_metadata = self.serializer.serialize(obj)
-        except Exception as e:
-            raise SerializationError(f"Serialization failed: {e}") from e
-
-        # SECURITY: Validate cache_key type and value
+        # SECURITY: Validate cache_key type and value before any work
         if not isinstance(cache_key, str):
             raise TypeError(
                 f"cache_key must be a string, got {type(cache_key).__name__}. "
@@ -214,6 +208,12 @@ class EncryptionWrapper:
                 "cache_key is required when encryption is enabled. "
                 "AAD v0x03 requires cache_key binding to prevent ciphertext substitution attacks."
             )
+
+        # Serialize with base serializer
+        try:
+            raw_data, raw_metadata = self.serializer.serialize(obj)
+        except Exception as e:
+            raise SerializationError(f"Serialization failed: {e}") from e
 
         # Encrypt the serialized data
         try:
@@ -247,9 +247,8 @@ class EncryptionWrapper:
         Args:
             data: Encrypted data to deserialize
             metadata: Serialization metadata with encryption info
-            cache_key: Cache key for AAD verification (SECURITY CRITICAL for encryption).
+            cache_key: Cache key for AAD verification (SECURITY CRITICAL).
                       Must match the cache_key used during encryption.
-                      Empty string allowed only when data is not encrypted.
 
         Returns:
             Deserialized object
