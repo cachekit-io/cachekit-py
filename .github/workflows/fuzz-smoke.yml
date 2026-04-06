@@ -103,25 +103,27 @@ jobs:
     - name: Post fuzzing summary
       if: always()
       run: |
-        echo "## Fuzzing Smoke Test Results" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## Fuzzing Smoke Test Results"
+          echo ""
 
-        if [ -f rust/fuzz/artifacts/.fuzz_failures ]; then
-          echo "Status: Some fuzz targets found potential issues" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f rust/fuzz/artifacts/.fuzz_failures ]; then
+            echo "Status: Some fuzz targets found potential issues"
+            echo ""
 
-          # Count crashes by type
-          CRASHES=$(find rust/fuzz/artifacts -name 'crash-*' 2>/dev/null | wc -l || echo 0)
-          TIMEOUTS=$(find rust/fuzz/artifacts -name 'timeout-*' 2>/dev/null | wc -l || echo 0)
-          OOMS=$(find rust/fuzz/artifacts -name 'oom-*' 2>/dev/null | wc -l || echo 0)
+            # Count crashes by type
+            CRASHES=$(find rust/fuzz/artifacts -name 'crash-*' 2>/dev/null | wc -l || echo 0)
+            TIMEOUTS=$(find rust/fuzz/artifacts -name 'timeout-*' 2>/dev/null | wc -l || echo 0)
+            OOMS=$(find rust/fuzz/artifacts -name 'oom-*' 2>/dev/null | wc -l || echo 0)
 
-          echo "- Crashes: $CRASHES" >> $GITHUB_STEP_SUMMARY
-          echo "- Timeouts: $TIMEOUTS" >> $GITHUB_STEP_SUMMARY
-          echo "- OOM: $OOMS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Check uploaded artifacts for crash details." >> $GITHUB_STEP_SUMMARY
-        else
-          echo "Status: All fuzz targets passed (14 targets, 60s each)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "No crashes, timeouts, or OOM errors detected." >> $GITHUB_STEP_SUMMARY
-        fi
+            echo "- Crashes: ${CRASHES}"
+            echo "- Timeouts: ${TIMEOUTS}"
+            echo "- OOM: ${OOMS}"
+            echo ""
+            echo "Check uploaded artifacts for crash details."
+          else
+            echo "Status: All fuzz targets passed (14 targets, 60s each)"
+            echo ""
+            echo "No crashes, timeouts, or OOM errors detected."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
