@@ -143,10 +143,7 @@ class EncryptionWrapper:
 
         # Derive tenant-specific keys with domain separation
         try:
-            tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
-            if tenant_keys is None:
-                raise RuntimeError("Key derivation returned None")
-            self.tenant_keys = tenant_keys
+            self.tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
 
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()
