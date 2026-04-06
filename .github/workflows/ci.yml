@@ -118,6 +118,7 @@ jobs:
         REDIS_URL: redis://localhost:6379
       run: |
         uv run pytest tests/unit/ tests/critical/ -m "not slow" \
+          -n auto \
           --cov=src/cachekit \
           --cov-report=xml \
           --cov-report=term \
@@ -130,6 +131,7 @@ jobs:
         REDIS_URL: redis://localhost:6379
       run: |
         uv run pytest tests/ -m "not slow" \
+          -n auto \
           --ignore=tests/fuzzing \
           --ignore=tests/integration/saas \
           --cov=src/cachekit \
