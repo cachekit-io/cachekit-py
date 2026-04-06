@@ -118,7 +118,6 @@ jobs:
         REDIS_URL: redis://localhost:6379
       run: |
         uv run pytest tests/unit/ tests/critical/ -m "not slow" \
-          --ignore=tests/unit/test_encryption_config_validation.py \
           --ignore=tests/unit/test_reliability_fallback.py \
           --cov=src/cachekit \
           --cov-report=xml \

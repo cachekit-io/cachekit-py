@@ -12,9 +12,22 @@ import logging
 import pytest
 
 from cachekit.config import ConfigurationError, validate_encryption_config
+from cachekit.config.singleton import reset_settings
 
 # Mark all tests in this module as unit tests
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """Reset settings singleton before and after each test.
+
+    validate_encryption_config() reads from the pydantic-settings singleton.
+    Without resetting, monkeypatch.setenv changes are invisible to get_settings().
+    """
+    reset_settings()
+    yield
+    reset_settings()
 
 
 class TestEncryptionConfigValidation:
