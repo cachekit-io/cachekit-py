@@ -5,7 +5,7 @@
 repos:
   # Python formatting and linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.3
+    rev: c60c980e561ed3e73101667fe8365c609d19a438  # v0.15.9  # pragma: allowlist secret
     hooks:
       - id: ruff
         args: [--fix]
@@ -41,13 +41,13 @@ repos:
 
   # GitHub Actions workflow linting
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.7
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # v1.7.12  # pragma: allowlist secret
     hooks:
       - id: actionlint
 
   # General file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # v6.0.0  # pragma: allowlist secret
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -59,7 +59,7 @@ repos:
   # Secret scanning - prevent credential leaks
   # Uses Yelp's detect-secrets with high entropy detection
   - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.5.0
+    rev: 01886c8a910c64595c47f186ca1ffc0b77fa5458  # v1.5.0  # pragma: allowlist secret
     hooks:
       - id: detect-secrets
         args:
