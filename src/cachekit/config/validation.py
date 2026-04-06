@@ -60,10 +60,8 @@ def validate_encryption_config(encryption: bool = False) -> None:
         return
 
     # Get master key from pydantic-settings (handles env vars properly)
-    from cachekit.config.singleton import get_settings, reset_settings
+    from cachekit.config.singleton import get_settings
 
-    # Reset settings to pick up any environment changes (important for testing)
-    reset_settings()
     settings = get_settings()
     master_key = settings.master_key.get_secret_value() if settings.master_key else None
 

@@ -115,7 +115,7 @@ try:
     serializer.serialize({"key": "value"})
 except TypeError as e:
     print(e)
-    # "ArrowSerializer only supports DataFrames. Use DefaultSerializer for dict types."
+    # "ArrowSerializer only supports DataFrames. Use StandardSerializer for dict types."
 ```
 
 ## Performance Benchmarks
@@ -143,7 +143,7 @@ Real-world performance benchmarks (measured on M1 Mac):
 | 100K rows | 4.06ms | 39.04ms | **9.6x** |
 
 > [!NOTE]
-> ArrowSerializer shines for DataFrames with 10K+ rows. For smaller data (< 1K rows), DefaultSerializer has lower overhead.
+> ArrowSerializer shines for DataFrames with 10K+ rows. For smaller data (< 1K rows), StandardSerializer has lower overhead.
 
 For comprehensive performance analysis including decorator overhead, concurrent access, and encryption impact, see [Performance Guide](../performance.md).
 
@@ -225,7 +225,7 @@ If polars is not installed and `return_format="polars"` is specified, an `Import
 
 ## See Also
 
-- [DefaultSerializer](default.md) — Better choice for DataFrames under 1K rows
+- [StandardSerializer](default.md) — Better choice for DataFrames under 1K rows
 - [OrjsonSerializer](orjson.md) — JSON-optimized for API data
 - [Encryption Wrapper](encryption.md) — Add zero-knowledge encryption to ArrowSerializer
 - [Performance Guide](../performance.md) — Full benchmark comparisons

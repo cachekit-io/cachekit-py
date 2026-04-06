@@ -132,7 +132,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  STEP 6: DESERIALIZATION (Bytes → Python Objects)                           │
 │  File: src/cachekit/cache_handler.py (_deserialize_bytes)                   │
-│  File: src/cachekit/serializers/default_serializer.py                       │
+│  File: src/cachekit/serializers/standard_serializer.py                       │
 │  File: rust/src/byte_storage.rs                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  _deserialize_bytes(data: bytes) → Python object                            │
@@ -140,7 +140,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  Decrypt-at-read-time flow:                                                 │
 │  1. If encryption_wrapper set: decrypt bytes → plaintext msgpack bytes      │
 │  2. If not set: pass through (already plaintext msgpack bytes)              │
-│  3. DefaultSerializer.deserialize(msgpack_bytes, metadata)                  │
+│  3. StandardSerializer.deserialize(msgpack_bytes, metadata)                  │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
 │  │ Path 1: NumPy ULTRA-FAST (Direct Binary)                   │             │
@@ -223,10 +223,10 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  STEP 14: SERIALIZATION (Python Objects → Redis)                            │
-│  File: src/cachekit/serializers/default_serializer.py                       │
+│  File: src/cachekit/serializers/standard_serializer.py                       │
 │  File: rust/src/byte_storage.rs                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  DefaultSerializer.serialize(result) → (bytes, metadata)                    │
+│  StandardSerializer.serialize(result) → (bytes, metadata)                    │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────┐             │
 │  │ Path 1: NumPy ULTRA-OPTIMIZED (Skip Rust!)                 │             │
@@ -559,24 +559,24 @@ def observability_function():
 
 ## Serialization Path
 
-**Files:** `src/cachekit/serializers/default_serializer.py`, `rust/src/byte_storage.rs`
+**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/byte_storage.rs`
 
 cachekit v0.1.0 uses only:
 
-1. **DefaultSerializer** (`"raw"`, default)
+1. **StandardSerializer** (`"raw"`, default)
    - MessagePack for Python objects
    - ByteStorage (Rust) for compression + checksums
    - Ultra-optimized NumPy path (bypasses Rust)
 
 2. **EncryptionWrapper** (`"encrypted"`)
-   - Wraps DefaultSerializer
+   - Wraps StandardSerializer
    - AES-256-GCM client-side encryption
 
 ### Serialization Paths
 
 #### Path 1: NumPy ULTRA-OPTIMIZED
 
-**File:** `default_serializer.py`, lines 190-206
+**File:** `standard_serializer.py`, lines 190-206
 
 ```python notest
 import numpy as np
@@ -681,7 +681,7 @@ except BackendError as e:
 
 ## Deserialization Path
 
-**Files:** `src/cachekit/serializers/default_serializer.py`, `rust/src/byte_storage.rs`
+**Files:** `src/cachekit/serializers/standard_serializer.py`, `rust/src/byte_storage.rs`
 
 ### Deserialization Flow
 
@@ -805,7 +805,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 - `src/cachekit/backends/__init__.py` - Backend exports
 
 **Serialization Layer:**
-- `src/cachekit/serializers/default_serializer.py` - DefaultSerializer (MessagePack + ByteStorage)
+- `src/cachekit/serializers/standard_serializer.py` - StandardSerializer (MessagePack + ByteStorage)
 - `src/cachekit/serializers/encryption_wrapper.py` - EncryptionWrapper (AES-256-GCM)
 - `rust/src/byte_storage.rs` - Rust ByteStorage (LZ4 + xxHash3-64)
 - `rust/src/encryption/` - Rust encryption module

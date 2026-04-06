@@ -121,37 +121,6 @@ def get_all_metrics() -> dict[str, dict[str, Any]]:
         return dict(_metrics_data)
 
 
-def clear_metrics():
-    """Clear all metrics (useful for testing).
-
-    Examples:
-        >>> counter = MetricsCollector("to_clear")
-        >>> counter.inc()
-        >>> clear_metrics()
-        >>> counter.get()
-        0
-    """
-    with _metrics_lock:
-        _metrics_data.clear()
-        _metrics_timestamps.clear()
-
-
-# Compatibility aliases for legacy code
-def record_cache_operation(operation: str, status: str, namespace: str = "default"):
-    """Record a cache operation."""
-    cache_operations.inc({"operation": operation, "status": status, "namespace": namespace})
-
-
-def record_circuit_breaker_state(state: str, namespace: str = "default"):
-    """Record circuit breaker state change."""
-    circuit_breaker_state.set(1.0 if state == "OPEN" else 0.0, {"state": state, "namespace": namespace})
-
-
-def record_timeout_adjustment(adjustment_type: str, value: float, namespace: str = "default"):
-    """Record adaptive timeout adjustment."""
-    adaptive_timeout_adjustments.inc({"type": adjustment_type, "namespace": namespace})
-
-
 # Async metrics collector class
 class AsyncMetricsCollector:
     """Async metrics collector for high-performance scenarios.
@@ -423,29 +392,3 @@ def get_async_metrics_collector() -> AsyncMetricsCollector:
         with _collector_lock:
             _global_async_collector._start_worker()
     return _global_async_collector
-
-
-def record_async_metric(metric_type: str, name: str, value: float = 1.0, labels: Optional[dict[str, str]] = None):
-    """Record an async metric with proper type handling.
-
-    Args:
-        metric_type: Type of metric ("counter", "histogram", "gauge")
-        name: Metric name
-        value: Metric value
-        labels: Optional labels dictionary
-    """
-    collector = get_async_metrics_collector()
-
-    try:
-        if metric_type == "counter":
-            collector.record_counter(name, labels, value)
-        elif metric_type == "histogram":
-            collector.record_histogram(name, value, labels)
-        elif metric_type == "gauge":
-            collector.record_gauge(name, value, labels)
-        else:
-            logger.warning(f"Unknown metric type: {metric_type}")
-            # Fallback to operation recording
-            collector.record_operation(name, value, labels)
-    except Exception as e:
-        logger.error(f"Failed to record async metric {name}: {e}")

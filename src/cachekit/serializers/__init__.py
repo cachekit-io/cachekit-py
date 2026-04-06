@@ -56,7 +56,7 @@ SERIALIZER_REGISTRY = {
     "std": StandardSerializer,  # Explicit StandardSerializer alias
     "arrow": None,  # Lazy-loaded: requires pyarrow from [data] extra
     "orjson": OrjsonSerializer,
-    "encrypted": EncryptionWrapper,  # AutoSerializer + AES-256-GCM encryption
+    "encrypted": EncryptionWrapper,  # StandardSerializer + AES-256-GCM encryption
 }
 
 
@@ -139,45 +139,6 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
         return serializer
 
 
-# Simplified functions using StandardSerializer as default
-def serialize(data: Any) -> bytes:
-    """Serialize data using StandardSerializer (language-agnostic MessagePack).
-
-    For Python-specific types (NumPy, pandas), use get_serializer("auto") instead.
-
-    Args:
-        data: Python object to serialize (must be language-universal type)
-
-    Returns:
-        Serialized bytes
-
-    See Also:
-        get_serializer("default"): Cached instance with full control over integrity checking
-        get_serializer("auto"): AutoSerializer for Python-specific types
-    """
-    serializer = StandardSerializer()
-    serialized_data, _ = serializer.serialize(data)
-    return serialized_data
-
-
-def deserialize(data: bytes) -> Any:
-    """Deserialize data using StandardSerializer (language-agnostic MessagePack).
-
-    For Python-specific deserialization, use get_serializer("auto") instead.
-
-    Args:
-        data: Serialized bytes (MessagePack format with optional ByteStorage envelope)
-
-    Returns:
-        Deserialized Python object
-
-    See Also:
-        get_serializer("default"): Cached instance with full control over integrity checking
-        get_serializer("auto"): AutoSerializer for Python-specific types
-    """
-    return StandardSerializer().deserialize(data)
-
-
 def get_available_serializers() -> dict[str, Any]:
     """Get all available serializer classes.
 
@@ -254,8 +215,6 @@ __all__ = [
     "SERIALIZER_REGISTRY",
     # Utility functions
     "benchmark_serializers",
-    "deserialize",
     "get_available_serializers",
     "get_serializer_info",
-    "serialize",
 ]

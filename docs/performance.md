@@ -242,7 +242,7 @@ def get_large_dataset(date: str):
 
 **For everything else:**
 ```python
-@cache  # DefaultSerializer (msgpack) is fine
+@cache  # StandardSerializer (msgpack) is fine
 def get_user_config(user_id: int):
     return {"settings": {...}, "preferences": {...}}
 ```
@@ -337,14 +337,14 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 **Mitigations:**
 - **This is acceptable:** 35μs is negligible compared to function execution time
-- **For ultra-low-latency:** Use direct `CacheHandler` API (bypasses decorator)
+- **For ultra-low-latency:** Use direct `StandardCacheHandler` API (bypasses decorator)
 - **Batch queries:** Amortize decorator overhead across multiple items
 
 **Example (advanced):**
 ```python notest
-from cachekit.cache_handler import CacheHandler
+from cachekit.cache_handler import StandardCacheHandler
 
-handler = CacheHandler(backend=redis_backend)
+handler = StandardCacheHandler(backend=redis_backend)
 
 # Direct cache access (no decorator overhead)
 found, value = handler.get("my_key")

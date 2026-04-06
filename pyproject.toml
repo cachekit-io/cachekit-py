@@ -129,7 +129,7 @@ ignore = [
 "src/cachekit/monitoring/pool_monitor.py" = ["S110"]  # Monitoring errors should be silent
 "src/cachekit/reliability/async_metrics.py" = ["S101"]  # Internal invariant checks
 "src/cachekit/serializers/__init__.py" = ["S101"]  # Module-level validation
-"src/cachekit/serializers/default_serializer.py" = ["S110"]  # Fallback deserialization patterns
+"src/cachekit/serializers/standard_serializer.py" = ["S110"]  # Fallback deserialization patterns
 
 [tool.ruff.lint.isort]
 known-first-party = ["cachekit"]

@@ -180,7 +180,6 @@ class TestBackwardCompatibility:
             ttl=600,
             namespace="legacy_test",
             serializer="default",
-            safe_mode=True,
         )
         def legacy_function(x):
             return f"legacy_{x}"
@@ -650,23 +649,15 @@ class TestErrorHandlingAndGracefulDegradation:
         assert "namespace" in health_status
         assert "components" in health_status
 
-    def test_serialization_fallback_behavior(self, redis_test_client):
-        """Test serialization fallback when preferred serializer fails."""
+    def test_default_serialization_behavior(self, redis_test_client):
+        """Test that default serializer handles standard data types."""
 
-        @cache(ttl=300, serializer="default", safe_mode=False)
+        @cache(ttl=300, serializer="default")
         def function_with_serialization():
             return {"complex": "data", "with": ["nested", "structures"]}
 
         result = function_with_serialization()
         assert result == {"complex": "data", "with": ["nested", "structures"]}
-
-        # Test safe mode
-        @cache(ttl=300, safe_mode=True)
-        def function_with_safe_mode():
-            return {"safe": "data"}
-
-        result2 = function_with_safe_mode()
-        assert result2 == {"safe": "data"}
 
     @pytest.mark.asyncio
     async def test_async_error_handling(self, redis_test_client):

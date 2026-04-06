@@ -5,7 +5,7 @@ Uses AES-256-GCM for authenticated encryption with per-tenant key isolation.
 
 Architectural Note:
     EncryptionWrapper is a Decorator pattern implementation, not a serialization format.
-    It wraps any SerializerProtocol (AutoSerializer, OrjsonSerializer, ArrowSerializer)
+    It wraps any SerializerProtocol (StandardSerializer, OrjsonSerializer, ArrowSerializer)
     and adds an encryption layer. This enables zero-knowledge caching where the backend
     never sees plaintext, regardless of data type (JSON, DataFrames, MessagePack, etc.).
 """
@@ -17,7 +17,6 @@ from typing import Any, Optional
 from cachekit._rust_serializer import ZeroKnowledgeEncryptor, derive_tenant_keys
 from cachekit.config import get_settings
 
-from .auto_serializer import AutoSerializer
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
 
 logger = logging.getLogger(__name__)
@@ -43,7 +42,7 @@ class EncryptionWrapper:
     - Hardware-accelerated via ring library
     - Per-tenant cryptographic isolation
     - Domain separation for security
-    - Works with ANY serializer (AutoSerializer, OrjsonSerializer, ArrowSerializer)
+    - Works with ANY serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
 
     Security Model:
     - Storage backend never sees plaintext
@@ -83,46 +82,44 @@ class EncryptionWrapper:
             ...
         EncryptionError: Decryption failed: ...
 
-        Encryption disabled mode (for testing):
+        Encryption is always enabled (no opt-out):
 
-        >>> unencrypted_wrapper = EncryptionWrapper(enable_encryption=False)
-        >>> raw_data, raw_meta = unencrypted_wrapper.serialize({"test": 1}, cache_key="")
-        >>> raw_meta.encrypted
-        False
+        >>> EncryptionWrapper(master_key=b"a" * 32).is_encryption_enabled
+        True
     """
+
+    __slots__ = ("tenant_id", "serializer", "encryptor", "tenant_keys", "encryption_key_fingerprint")
 
     def __init__(
         self,
         serializer: Optional[SerializerProtocol] = None,
         master_key: Optional[bytes] = None,
         tenant_id: str = "default",
-        enable_encryption: bool = True,
     ):
         """Initialize encryption wrapper.
 
         Args:
             serializer: Any SerializerProtocol implementation to wrap with encryption.
-                           Defaults to AutoSerializer (MessagePack + compression).
+                           Defaults to StandardSerializer (cross-language MessagePack).
             master_key: 256-bit master key for encryption. If None, reads from environment.
             tenant_id: Tenant identifier for key isolation
-            enable_encryption: Whether to enable encryption (can disable for testing)
         """
         self.tenant_id = tenant_id
-        self.enable_encryption = enable_encryption
 
-        # Initialize base serializer (defaults to AutoSerializer for backward compatibility)
-        self.serializer = serializer if serializer is not None else AutoSerializer()
-
-        # Initialize encryption components (Optional - only set if encryption enabled)
-        self.encryptor: Optional[ZeroKnowledgeEncryptor] = None
-        self.tenant_keys: Optional[Any] = None  # TenantKeys from Rust
-        self.encryption_key_fingerprint: Optional[str] = None
-
-        # Setup encryption if enabled
-        if self.enable_encryption:
-            self._setup_encryption(master_key)
+        # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
+        # compatibility. Encrypted data may be shared across SDKs via secrets manager,
+        # so the wire format must be language-agnostic.
+        if serializer is not None:
+            self.serializer = serializer
         else:
-            logger.warning("Encryption disabled - using AutoSerializer only. Data will NOT be encrypted!")
+            from cachekit.serializers.standard_serializer import StandardSerializer
+
+            self.serializer = StandardSerializer()
+
+        # Setup encryption — mandatory. EncryptionWrapper without encryption
+        # is a security misconfiguration, not a valid operating mode.
+        # _setup_encryption sets: self.encryptor, self.tenant_keys, self.encryption_key_fingerprint
+        self._setup_encryption(master_key)
 
     def _setup_encryption(self, master_key: Optional[bytes]) -> None:
         """Setup encryption components with key derivation."""
@@ -147,15 +144,9 @@ class EncryptionWrapper:
         # Derive tenant-specific keys with domain separation
         try:
             self.tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
-            if self.tenant_keys is None:
-                raise RuntimeError("Key derivation failed")
 
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()
-            if self.encryption_key_fingerprint is None:
-                raise RuntimeError("Fingerprint generation failed")
-            if self.encryptor is None:
-                raise RuntimeError("Encryptor initialization failed")
 
             logger.info(
                 f"Encryption initialized for tenant '{self.tenant_id}' "
@@ -170,9 +161,9 @@ class EncryptionWrapper:
 
         Args:
             obj: Object to serialize and encrypt
-            cache_key: Cache key for AAD binding (SECURITY CRITICAL for encryption).
+            cache_key: Cache key for AAD binding (SECURITY CRITICAL).
                       Prevents ciphertext substitution attacks (Protocol v1.0.1, Section 5.6).
-                      Empty string allowed only when encryption is disabled.
+                      Must be a non-empty string; raises ValueError if empty.
 
         Returns:
             Tuple of (encrypted_data, metadata_with_encryption_info)
@@ -206,17 +197,7 @@ class EncryptionWrapper:
                 ...
             TypeError: cache_key must be a string...
         """
-        # First serialize with base serializer
-        try:
-            raw_data, raw_metadata = self.serializer.serialize(obj)
-        except Exception as e:
-            raise SerializationError(f"Serialization failed: {e}") from e
-
-        # If encryption is disabled, return raw data with modified metadata
-        if not self.enable_encryption:
-            return raw_data, raw_metadata
-
-        # SECURITY: Validate cache_key type and value when encryption is enabled
+        # SECURITY: Validate cache_key type and value before any work
         if not isinstance(cache_key, str):
             raise TypeError(
                 f"cache_key must be a string, got {type(cache_key).__name__}. "
@@ -228,13 +209,11 @@ class EncryptionWrapper:
                 "AAD v0x03 requires cache_key binding to prevent ciphertext substitution attacks."
             )
 
-        # Encryption is enabled - encryptor and tenant_keys must be initialized
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
-        if self.tenant_keys is None:
-            raise RuntimeError("Tenant keys must be initialized when encryption is enabled")
-        if self.encryption_key_fingerprint is None:
-            raise RuntimeError("Key fingerprint must be set when encryption is enabled")
+        # Serialize with base serializer
+        try:
+            raw_data, raw_metadata = self.serializer.serialize(obj)
+        except Exception as e:
+            raise SerializationError(f"Serialization failed: {e}") from e
 
         # Encrypt the serialized data
         try:
@@ -268,9 +247,8 @@ class EncryptionWrapper:
         Args:
             data: Encrypted data to deserialize
             metadata: Serialization metadata with encryption info
-            cache_key: Cache key for AAD verification (SECURITY CRITICAL for encryption).
+            cache_key: Cache key for AAD verification (SECURITY CRITICAL).
                       Must match the cache_key used during encryption.
-                      Empty string allowed only when data is not encrypted.
 
         Returns:
             Deserialized object
@@ -320,16 +298,6 @@ class EncryptionWrapper:
                 "cache_key is required to decrypt data. "
                 "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
             )
-
-        # Verify encryption is available
-        if not self.enable_encryption:
-            raise EncryptionError("Received encrypted data but encryption is disabled")
-
-        # Encryption is enabled - encryptor and tenant_keys must be initialized
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
-        if self.tenant_keys is None:
-            raise RuntimeError("Tenant keys must be initialized when encryption is enabled")
 
         # Verify tenant match for security
         if metadata.tenant_id != self.tenant_id:
@@ -520,17 +488,14 @@ class EncryptionWrapper:
 
     @property
     def is_encryption_enabled(self) -> bool:
-        """Check if encryption is currently enabled.
+        """Always True — EncryptionWrapper requires encryption.
 
         Examples:
             >>> wrapper = EncryptionWrapper(master_key=b"e" * 32)
             >>> wrapper.is_encryption_enabled
             True
-            >>> disabled = EncryptionWrapper(enable_encryption=False)
-            >>> disabled.is_encryption_enabled
-            False
         """
-        return self.enable_encryption
+        return True
 
     @property
     def hardware_acceleration_enabled(self) -> bool:
@@ -543,10 +508,6 @@ class EncryptionWrapper:
             >>> isinstance(wrapper.hardware_acceleration_enabled, bool)
             True
         """
-        if not self.enable_encryption:
-            return False
-        if self.encryptor is None:
-            raise RuntimeError("Encryptor must be initialized when encryption is enabled")
         return self.encryptor.hardware_acceleration_enabled()
 
     def get_encryption_info(self) -> dict[str, Any]:
@@ -569,19 +530,7 @@ class EncryptionWrapper:
             'ring (Rust)'
             >>> "key_fingerprint" in info  # Fingerprint included (safe to log)
             True
-
-            Encryption disabled - minimal info:
-
-            >>> disabled = EncryptionWrapper(enable_encryption=False)
-            >>> disabled.get_encryption_info()
-            {'enabled': False, 'reason': 'Encryption disabled or not available'}
         """
-        if not self.enable_encryption:
-            return {"enabled": False, "reason": "Encryption disabled or not available"}
-
-        if self.encryption_key_fingerprint is None:
-            raise RuntimeError("Key fingerprint must be set when encryption is enabled")
-
         return {
             "enabled": True,
             "tenant_id": self.tenant_id,

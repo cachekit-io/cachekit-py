@@ -57,12 +57,12 @@ EncryptionWrapper works with **any** serializer:
 
 | Inner Serializer | Use Case |
 |-----------------|---------|
-| DefaultSerializer (default) | Encrypted general-purpose objects |
+| StandardSerializer (default) | Encrypted cross-language MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
 | Custom serializers | Any data type with encryption |
 
-The `@cache.secure` preset uses EncryptionWrapper with DefaultSerializer automatically.
+EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
 
 ## Zero-Knowledge Caching
 
@@ -99,7 +99,7 @@ Encryption adds minimal overhead:
 ## See Also
 
 - [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md) — Full encryption docs: key management, per-tenant isolation, nonce handling, compliance
-- [DefaultSerializer](default.md) — General-purpose inner serializer
+- [StandardSerializer](default.md) — General-purpose inner serializer
 - [OrjsonSerializer](orjson.md) — JSON inner serializer
 - [ArrowSerializer](arrow.md) — DataFrame inner serializer
 - [Configuration Guide](../configuration.md) — CACHEKIT_MASTER_KEY setup

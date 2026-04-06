@@ -65,7 +65,7 @@ class SerializerProtocol(Protocol):
             SerializationError: If serialization fails
 
         Examples:
-            >>> serializer = DefaultSerializer()  # doctest: +SKIP
+            >>> serializer = StandardSerializer()  # doctest: +SKIP
             >>> data, metadata = serializer.serialize({"key": "value"})  # doctest: +SKIP
             >>> isinstance(data, bytes)  # doctest: +SKIP
             True
@@ -91,7 +91,7 @@ class SerializerProtocol(Protocol):
             TypeError: If data format doesn't match this serializer
 
         Examples:
-            >>> serializer = DefaultSerializer()  # doctest: +SKIP
+            >>> serializer = StandardSerializer()  # doctest: +SKIP
             >>> data, _ = serializer.serialize({"key": "value"})  # doctest: +SKIP
             >>> obj = serializer.deserialize(data)  # doctest: +SKIP
             >>> obj == {"key": "value"}  # doctest: +SKIP
@@ -104,10 +104,10 @@ class SerializerType(str, Enum):
     """Available serialization strategies (user-facing API).
 
     USER-FACING: Defines which serializer **implementation** to use.
-    Example: serializer=SerializerType.DEFAULT → instantiate DefaultSerializer class
+    Example: serializer=SerializerType.DEFAULT → instantiate StandardSerializer class
 
     This is separate from encryption (which is a security layer on top).
-    Example: serializer="default", encryption=True → DefaultSerializer wrapped with EncryptionWrapper
+    Example: serializer="default", encryption=True → StandardSerializer wrapped with EncryptionWrapper
 
     Examples:
         >>> SerializerType.DEFAULT.value
@@ -126,7 +126,7 @@ class SerializationFormat(Enum):
     """Wire format of serialized data (internal metadata).
 
     INTERNAL: Describes what **format** the bytes are actually in (for deserialization hints).
-    Example: DefaultSerializer produces SerializationFormat.MSGPACK (MessagePack wire format)
+    Example: StandardSerializer produces SerializationFormat.MSGPACK (MessagePack wire format)
 
     Why separate from SerializerType?
     - SerializerType = which class to instantiate (API choice)
@@ -145,8 +145,8 @@ class SerializationFormat(Enum):
         True
     """
 
-    MSGPACK = "msgpack"  # MessagePack wire format (produced by DefaultSerializer)
-    # Note: DefaultSerializer = MessagePack + LZ4 compression + xxHash3-64 checksums (via ByteStorage wrapper)
+    MSGPACK = "msgpack"  # MessagePack wire format (produced by StandardSerializer)
+    # Note: StandardSerializer = MessagePack + LZ4 compression + xxHash3-64 checksums (via ByteStorage wrapper)
     ORJSON = "orjson"  # Orjson JSON wire format (produced by OrjsonSerializer)
     ARROW = "arrow"  # Apache Arrow IPC wire format (produced by ArrowSerializer)
 

@@ -113,7 +113,7 @@ def get_user(user_id: int) -> dict:
 
 ## See Also
 
-- [DefaultSerializer](default.md) — General-purpose built-in serializer
+- [StandardSerializer](default.md) — General-purpose built-in serializer
 - [OrjsonSerializer](orjson.md) — JSON-optimized built-in serializer
 - [ArrowSerializer](arrow.md) — DataFrame-optimized built-in serializer
 - [Caching Pydantic Models](pydantic.md) — Patterns for Pydantic model caching

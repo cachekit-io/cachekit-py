@@ -89,12 +89,6 @@ class TestProductionPreset:
         assert config.ttl == 600
         assert config.circuit_breaker.enabled is True
 
-    def test_production_with_safe_mode_override(self) -> None:
-        """Test production preset with safe_mode override."""
-        config = DecoratorConfig.production(safe_mode=True)
-        assert config.safe_mode is True
-        assert config.circuit_breaker.enabled is True
-
 
 @pytest.mark.unit
 class TestSecurePreset:
@@ -232,12 +226,10 @@ class TestPresetKwargsOverrides:
             ttl=300,
             namespace="test",
             serializer="msgpack",
-            safe_mode=True,
         )
         assert config.ttl == 300
         assert config.namespace == "test"
         assert config.serializer == "msgpack"
-        assert config.safe_mode is True
         assert config.circuit_breaker.enabled is False  # Preset behavior preserved
 
     def test_production_multiple_overrides(self) -> None:

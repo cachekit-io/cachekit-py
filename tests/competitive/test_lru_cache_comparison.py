@@ -322,19 +322,6 @@ class TestLruCacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachekit_has_encryption(self):
-        """
-        CLAIM: cachekit has zero-knowledge encryption support.
-
-        This is TRUE. Data encrypted client-side with AES-256-GCM.
-        """
-
-        # Note: Requires CACHEKIT_MASTER_KEY environment variable
-        # @cache.secure enables encryption
-        # This is tested in separate encryption test suite
-
-        # This claim is validated in separate tests
-
     def test_performance_baseline_comparison(self):
         """
         CLAIM: cachekit L1-only mode (~50ns) is comparable to lru_cache.

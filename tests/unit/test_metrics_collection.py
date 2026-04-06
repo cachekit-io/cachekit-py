@@ -8,7 +8,6 @@ from cachekit.reliability.metrics_collection import (
     AsyncMetricsCollector,
     PrometheusMetricsRegistry,
     get_async_metrics_collector,
-    record_async_metric,
 )
 
 
@@ -247,18 +246,6 @@ class TestGlobalMetricsCollector:
 
         assert collector1 is collector2
         assert collector1._worker_thread.is_alive()
-
-    def test_record_async_metric_convenience_function(self):
-        """Test the convenience function for recording metrics."""
-        # Test different metric types
-        record_async_metric("counter", "test_async_counter", 1.0, {"test": "label"})
-        record_async_metric("histogram", "test_async_histogram", 0.5, {"test": "label"})
-        record_async_metric("gauge", "test_async_gauge", 0.75, {"test": "label"})
-
-        # Test unknown metric type
-        with patch("cachekit.reliability.metrics_collection.logger") as mock_logger:
-            record_async_metric("unknown", "test_unknown", 1.0)
-            mock_logger.warning.assert_called_once()
 
     def test_worker_thread_auto_restart(self):
         """Test that global collector auto-restarts worker thread."""

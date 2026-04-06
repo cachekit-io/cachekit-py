@@ -172,16 +172,6 @@ class _FunctionStats:
         self.session_id: str | None = None  # Lazy-initialized on first access
         self.l1_enabled = l1_enabled  # Rate limit classification flag
 
-    def record_hit(self, source: str):
-        """Record a cache hit from L1 or L2 (DEPRECATED - use record_l1_hit/record_l2_hit)."""
-        with self._lock:
-            self._hits += 1
-            if source == "l1":
-                self._l1_hits += 1
-            elif source == "l2":
-                self._l2_hits += 1
-            self._last_operation_at = time.time()
-
     def record_l1_hit(self):
         """Record an L1 (in-memory) cache hit."""
         with self._lock:
@@ -285,7 +275,6 @@ def create_cache_wrapper(
     config: Any = None,  # DecoratorConfig | None (avoid circular import)
     ttl: int | None = None,
     namespace: str | None = None,
-    safe_mode: bool = False,
     # Serialization & Security
     serializer: Union[str, SerializerProtocol] = "default",  # type: ignore[name-defined]
     integrity_checking: bool = True,
@@ -295,7 +284,6 @@ def create_cache_wrapper(
     deployment_uuid: str | None = None,
     master_key: str | None = None,
     # Performance features
-    pipelined: bool = True,
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
     fast_mode: bool = False,
@@ -324,7 +312,6 @@ def create_cache_wrapper(
         func: Function to wrap with caching
         ttl: Cache time-to-live in seconds (None = no expiration)
         namespace: Cache key namespace prefix
-        safe_mode: Enable safe mode (deprecated, use reliability features)
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
@@ -341,7 +328,6 @@ def create_cache_wrapper(
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
                         If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
                         Must be deterministic (same across restarts) to decrypt cached data.
-        pipelined: Enable Redis pipelining for performance
         refresh_ttl_on_get: Refresh TTL on cache hit
         ttl_refresh_threshold: Refresh when TTL below this fraction
         fast_mode: Disable monitoring for maximum performance
@@ -380,7 +366,6 @@ def create_cache_wrapper(
         # Override all parameters from DecoratorConfig
         ttl = config.ttl if ttl is None else ttl
         namespace = config.namespace if namespace is None else namespace
-        # safe_mode is deprecated, not extracted from config
         serializer = config.serializer
         integrity_checking = config.integrity_checking
         refresh_ttl_on_get = config.refresh_ttl_on_get
@@ -428,7 +413,6 @@ def create_cache_wrapper(
     use_collect_stats = collect_stats and not fast_mode
     # use_enable_tracing = enable_tracing and not fast_mode  # Not used after CacheConfig removal
     use_enable_structured_logging = enable_structured_logging and not fast_mode
-    use_pipelined = pipelined  # Keep enabled: pipelining reduces network roundtrips
 
     # Initialize handler components
     # Pre-compute function hash at decoration time (50-200μs savings)
@@ -451,8 +435,7 @@ def create_cache_wrapper(
         enable_integrity_checking=integrity_checking,
     )
 
-    # Create cache handler strategy based on pipelined parameter
-    # Will be initialized with actual Redis client when first used
+    # Create cache handler strategy (initialized with actual Redis client when first used)
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
@@ -492,7 +475,6 @@ def create_cache_wrapper(
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
-    _use_pipelined = use_pipelined
 
     # FIX: Initialize L1 cache if enabled
     _l1_cache = get_l1_cache(namespace or "default") if l1_enabled else None
@@ -617,7 +599,6 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
 
         # L1+L2 MODE: Original behavior with backend initialization
-        lock_key = f"{cache_key}:lock"
 
         with features.create_span("redis_cache", span_attributes) as span:
             try:
@@ -645,7 +626,6 @@ def create_cache_wrapper(
                     _backend = get_backend_provider().get_backend()
 
                 # Setup cache handler strategy on first use with adaptive timeout
-                # Note: Both pipelined and non-pipelined use StandardCacheHandler for now
                 handler = StandardCacheHandler(
                     _backend,
                     timeout_provider=features.get_timeout,
@@ -675,7 +655,7 @@ def create_cache_wrapper(
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                 try:
-                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes)
+                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                     features.set_operation_context("l1_get", duration_ms=0.001)
                     features.record_success()
@@ -970,7 +950,7 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes)
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                         features.set_operation_context("l1_get", duration_ms=0.001)
                         features.record_success()
@@ -1032,7 +1012,7 @@ def create_cache_wrapper(
 
                 if cached_data is not None:
                     # Deserialize the cached data
-                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                    result = operation_handler.serialization_handler.deserialize_data(cached_data, cache_key=cache_key)
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1106,7 +1086,9 @@ def create_cache_wrapper(
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
                                     # Another request filled the cache while we waited
-                                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                                    result = operation_handler.serialization_handler.deserialize_data(
+                                        cached_data, cache_key=cache_key
+                                    )
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1129,7 +1111,9 @@ def create_cache_wrapper(
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
                                     # Cache was populated while waiting - use it
-                                    result = operation_handler.serialization_handler.deserialize_data(cached_data)
+                                    result = operation_handler.serialization_handler.deserialize_data(
+                                        cached_data, cache_key=cache_key
+                                    )
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1155,7 +1139,9 @@ def create_cache_wrapper(
 
                         # Serialize and cache the result
                         try:
-                            serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs)
+                            serialized_data = operation_handler.serialization_handler.serialize_data(
+                                result, args, kwargs, cache_key=cache_key
+                            )
 
                             # Store in Redis with TTL
                             await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
@@ -1232,7 +1218,9 @@ def create_cache_wrapper(
 
                 # Serialize and cache the result
                 try:
-                    serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs)
+                    serialized_data = operation_handler.serialization_handler.serialize_data(
+                        result, args, kwargs, cache_key=cache_key
+                    )
 
                     # Store in Redis with TTL
                     await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]

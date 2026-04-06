@@ -34,7 +34,6 @@ class TestDecoratorConfigDefaults:
         assert config.ttl is None
         assert config.namespace is None
         assert config.serializer == "default"
-        assert config.safe_mode is False
 
     def test_performance_defaults(self) -> None:
         """Test performance field defaults."""
@@ -137,12 +136,11 @@ class TestDecoratorConfigToDict:
 
     def test_to_dict_core_fields(self) -> None:
         """Test to_dict() includes core fields."""
-        config = DecoratorConfig(ttl=300, namespace="test", serializer="msgpack", safe_mode=True)
+        config = DecoratorConfig(ttl=300, namespace="test", serializer="msgpack")
         d = config.to_dict()
         assert d["ttl"] == 300
         assert d["namespace"] == "test"
         assert d["serializer"] == "msgpack"
-        assert d["safe_mode"] is True
 
     def test_to_dict_performance_fields(self) -> None:
         """Test to_dict() includes performance fields."""
@@ -244,7 +242,6 @@ class TestDecoratorConfigToDict:
             ttl=600,
             namespace="prod",
             serializer="msgpack",
-            safe_mode=True,
             refresh_ttl_on_get=True,
             ttl_refresh_threshold=0.8,
             backend=None,
@@ -261,7 +258,6 @@ class TestDecoratorConfigToDict:
         assert d["ttl"] == 600
         assert d["namespace"] == "prod"
         assert d["serializer"] == "msgpack"
-        assert d["safe_mode"] is True
 
         # Performance
         assert d["refresh_ttl_on_get"] is True

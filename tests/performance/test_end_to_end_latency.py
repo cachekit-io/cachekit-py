@@ -313,54 +313,5 @@ async def test_async_decorator_cache_hit() -> None:
     print(f"  P95:    {p95:>10.1f} ns ({p95 / 1000:>6.2f} μs)")
 
 
-# =============================================================================
-# 7. SUMMARY ANALYSIS
-# =============================================================================
-
-
-@pytest.mark.performance
-def test_performance_path_summary() -> None:
-    """Summary of all code paths and bottleneck analysis."""
-
-    print("\n" + "=" * 80)
-    print("PERFORMANCE PATH SUMMARY")
-    print("=" * 80)
-    print("""
-Expected latency ranges (from profiling):
-
-L1 Cache (pure):                450-500ns p95
-├─ Lock acquisition:            250ns (55%)
-├─ Dict lookup:                 125ns (27%)
-├─ TTL check:                   208ns (45%)
-└─ LRU move:                    125ns (27%)
-
-Decorator + L1 hit:              ???ns p95 (MEASURE THIS)
-├─ Decorator overhead:           ???ns
-├─ Argument processing:          ???ns
-├─ Function lookup:              ???ns
-└─ L1 cache:                     450ns
-
-Decorator + L1 miss:             ???ns p95 (MEASURE THIS)
-├─ Decorator overhead:           ???ns
-├─ Cache miss detection:         200ns
-├─ Function execution:           VARIABLE (depends on function)
-├─ Serialization (msgpack):      ???ns (MEASURE THIS)
-└─ L1 population:                500ns
-
-Redis L2 hit (L1 disabled):      1,000-10,000ns p95 (MEASURE THIS)
-├─ Decorator overhead:           ???ns
-├─ Redis network RTT:            1,000-3,000ns (if local)
-├─ Deserialization:              ???ns (MEASURE THIS)
-└─ L1 population:                500ns
-
-MEASUREMENT PRIORITIES:
-1. Get decorator overhead isolated
-2. Compare with/without serialization
-3. Measure L2 backend latency (network factor)
-4. Profile async overhead
-5. Encryption impact (if enabled)
-""")
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -133,12 +133,6 @@ class TestREADMEClaims:
 
         assert sys.version_info >= (3, 9), "README.md:230 - Python 3.9+ requirement failed"
 
-    def test_redis_version_requirement(self):
-        """README.md:231 - Verify Redis version requirement is documented."""
-        # README claims Redis 5.0+ at line 231
-        # We validate the claim is present by checking the requirement exists
-        assert True, "README.md:231 - Redis 5.0+ requirement documented"
-
 
 @pytest.mark.critical
 class TestAPIReferenceClaims:
@@ -193,7 +187,6 @@ class TestAPIReferenceClaims:
         config = DecoratorConfig(
             ttl=3600,
             namespace="test",
-            safe_mode=False,
             refresh_ttl_on_get=False,
             ttl_refresh_threshold=0.5,
             circuit_breaker=CircuitBreakerConfig(enabled=True),

@@ -569,13 +569,3 @@ def mask_sensitive_patterns(data: str) -> str:
     )
 
     return data
-
-
-def setup_correlation_tracking():
-    """Setup correlation tracking - compatibility function."""
-    pass
-
-
-def setup_distributed_tracing():
-    """Setup distributed tracing - compatibility function."""
-    pass

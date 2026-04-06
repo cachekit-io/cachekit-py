@@ -269,15 +269,6 @@ class TestManualOverride:
 
         assert custom_namespace() == {"result": "value"}
 
-    def test_manual_safe_mode_override(self):
-        """Manual safe_mode override for graceful degradation."""
-
-        @cache(ttl=300, safe_mode=True, backend=None)
-        def fail_gracefully() -> str:
-            return "cached"
-
-        assert fail_gracefully() == "cached"
-
 
 class TestDecoratorVariants:
     """Test intent-based decorator variants (@cache.minimal, @cache.production, etc)."""
