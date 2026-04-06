@@ -131,20 +131,20 @@ class TestResolveBackendTier3:
     @patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"})
     def test_redis_url_auto_creates_backend(self) -> None:
         """Test REDIS_URL env var auto-creates RedisBackend."""
-        resolved = _resolve_backend()
-
-        # Lazy import to match actual implementation
         from cachekit.backends.redis import RedisBackend
+
+        with patch("cachekit.di.DIContainer.get", return_value=MagicMock()):
+            resolved = _resolve_backend()
 
         assert isinstance(resolved, RedisBackend)
 
     @patch.dict(os.environ, {"REDIS_URL": "redis://custom-host:6380/2"})
     def test_redis_url_custom_url(self) -> None:
         """Test REDIS_URL with custom host/port/db."""
-        resolved = _resolve_backend()
-
-        # Lazy import to match actual implementation
         from cachekit.backends.redis import RedisBackend
+
+        with patch("cachekit.di.DIContainer.get", return_value=MagicMock()):
+            resolved = _resolve_backend()
 
         assert isinstance(resolved, RedisBackend)
 
@@ -229,10 +229,10 @@ class TestResolveBackendPriority:
     @patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"})
     def test_tier3_only_when_no_tier1_or_tier2(self) -> None:
         """Test REDIS_URL only used when no explicit or module default."""
-        # Tier 3 (REDIS_URL) used
-        resolved = _resolve_backend()
-
         from cachekit.backends.redis import RedisBackend
+
+        with patch("cachekit.di.DIContainer.get", return_value=MagicMock()):
+            resolved = _resolve_backend()
 
         assert isinstance(resolved, RedisBackend)
 

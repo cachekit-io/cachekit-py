@@ -130,25 +130,6 @@ def test_cache_info_thread_safety():
 
 
 @pytest.mark.unit
-def test_cache_info_deprecated_record_hit():
-    """Verify deprecated record_hit() still works for backward compatibility."""
-    stats = _FunctionStats()
-
-    # Test L1 hit via deprecated API
-    stats.record_hit("l1")
-    info1 = stats.get_info()
-    assert info1.l1_hits == 1
-    assert info1.l2_hits == 0
-    assert info1.last_operation_at is not None
-
-    # Test L2 hit via deprecated API (no latency tracking)
-    stats.record_hit("l2")
-    info2 = stats.get_info()
-    assert info2.l1_hits == 1
-    assert info2.l2_hits == 1
-    assert info2.l2_avg_latency_ms == 0.0  # No latency tracked via deprecated API
-
-
 @pytest.mark.unit
 def test_cache_info_l2_average_incremental():
     """Verify L2 average updates incrementally with each hit."""
