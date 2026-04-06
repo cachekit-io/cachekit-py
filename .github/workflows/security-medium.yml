@@ -27,8 +27,8 @@ jobs:
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-        with:
-          toolchain: stable
+      with:
+        toolchain: stable
 
     - name: Install cargo-binstall
       uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
