@@ -137,11 +137,17 @@ jobs:
       env:
         REDIS_URL: redis://localhost:6379
       run: |
-        uv run pytest tests/ -m "not slow" \
+        uv run pytest tests/unit/ -m "not slow" \
           -n auto \
-          --ignore=tests/fuzzing \
+          --cov=src/cachekit \
+          --cov-report=xml \
+          --cov-report=term \
+          --junitxml=junit-unit.xml \
+          -o junit_family=legacy
+        uv run pytest tests/critical/ tests/integration/ -m "not slow" \
           --ignore=tests/integration/saas \
           --cov=src/cachekit \
+          --cov-append \
           --cov-report=xml \
           --cov-report=term \
           --junitxml=junit.xml \
