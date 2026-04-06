@@ -1,0 +1,27 @@
+{
+  "active": false,
+  "session_id": "current",
+  "iteration": 2,
+  "max_iterations": 5,
+  "pr_number": 83,
+  "repo": "cachekit-io/cachekit-py",
+  "skip_nitpicks": false,
+  "stale_comments": {},
+  "history": [
+    {
+      "iteration": 1,
+      "comments_received": 6,
+      "comments_resolved": 6,
+      "comments_deferred": 0,
+      "commit_sha": "c68b7e8"
+    },
+    {
+      "iteration": 2,
+      "comments_received": 0,
+      "comments_resolved": 0,
+      "comments_deferred": 0,
+      "commit_sha": "c68b7e8",
+      "note": "CodeRabbit paused reviews due to commit volume. 2 stale comments from April 4 already fixed."
+    }
+  ]
+}
