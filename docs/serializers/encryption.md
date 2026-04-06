@@ -57,13 +57,12 @@ EncryptionWrapper works with **any** serializer:
 
 | Inner Serializer | Use Case |
 |-----------------|---------|
-| AutoSerializer (default) | Encrypted Python objects with type preservation |
-| StandardSerializer | Encrypted cross-language MessagePack data |
+| StandardSerializer (default) | Encrypted cross-language MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
 | Custom serializers | Any data type with encryption |
 
-EncryptionWrapper defaults to AutoSerializer, which enables Python-specific optimizations (NumPy, pandas, sets, datetime). The `@cache.secure` preset uses this default.
+EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
 
 ## Zero-Knowledge Caching
 

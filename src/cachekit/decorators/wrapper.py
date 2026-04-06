@@ -1139,7 +1139,9 @@ def create_cache_wrapper(
 
                         # Serialize and cache the result
                         try:
-                            serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs)
+                            serialized_data = operation_handler.serialization_handler.serialize_data(
+                                result, args, kwargs, cache_key=cache_key
+                            )
 
                             # Store in Redis with TTL
                             await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
@@ -1216,7 +1218,9 @@ def create_cache_wrapper(
 
                 # Serialize and cache the result
                 try:
-                    serialized_data = operation_handler.serialization_handler.serialize_data(result, args, kwargs)
+                    serialized_data = operation_handler.serialization_handler.serialize_data(
+                        result, args, kwargs, cache_key=cache_key
+                    )
 
                     # Store in Redis with TTL
                     await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]

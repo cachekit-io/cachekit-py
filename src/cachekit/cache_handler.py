@@ -313,7 +313,8 @@ class CacheSerializationHandler:
 
         # Extract string name for metadata storage (for protocol instances, use class name)
         if isinstance(serializer_name, str):
-            self._serializer_string_name = serializer_name
+            # Canonicalize aliases to prevent envelope mismatch on deserialize
+            self._serializer_string_name = "default" if serializer_name in ("std", "standard") else serializer_name
         else:
             # Protocol instance - use class name for metadata
             self._serializer_string_name = type(serializer_name).__name__
