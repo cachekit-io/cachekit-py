@@ -625,6 +625,14 @@ def create_cache_wrapper(
                 if _backend is None:
                     _backend = get_backend_provider().get_backend()
 
+                # No backend configured → degrade to L1-only (function executes with L1 cache)
+                if _backend is None:
+                    raise BackendError(
+                        "No backend configured — running with L1 cache only. "
+                        "Set CACHEKIT_API_KEY, CACHEKIT_REDIS_URL, or other backend env vars to enable L2.",
+                        error_type=BackendErrorType.PERMANENT,
+                    )
+
                 # Setup cache handler strategy on first use with adaptive timeout
                 handler = StandardCacheHandler(
                     _backend,
@@ -989,6 +997,10 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
+
+            # No backend configured → degrade gracefully (function runs without L2 caching)
+            if _backend is None:
+                return await func(*args, **kwargs)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

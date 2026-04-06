@@ -5,6 +5,15 @@ implementations for dependency injection. Follows protocol-based design
 for maximum flexibility and testing capability.
 """
 
+from __future__ import annotations
+
+import logging
+import os
+
+from cachekit.config.validation import ConfigurationError
+
+logger = logging.getLogger(__name__)
+
 
 class CacheClientProvider:
     """Abstract interface for Redis client providers."""
@@ -102,32 +111,157 @@ class DefaultCacheClientProvider(CacheClientProvider):
 
 
 class DefaultBackendProvider(BackendProviderInterface):
-    """Default backend provider using Redis backend.
+    """Default backend provider with environment-based auto-detection.
 
-    Creates RedisBackendProvider singleton with connection pooling.
-    Delegates to RedisBackendProvider.get_backend() for per-request wrappers.
+    Resolves the cache backend from CACHEKIT_-prefixed environment variables.
+    Raises ConfigurationError if multiple CACHEKIT_-prefixed backend variables
+    are set simultaneously (ambiguous configuration).
 
-    For single-tenant deployments (default), sets tenant_context to "default".
-    For multi-tenant deployments, tenant_context must be set externally.
+    Priority (first match wins):
+        1. CACHEKIT_API_KEY         → CachekitIOBackend
+        2. CACHEKIT_REDIS_URL       → RedisBackend
+        3. CACHEKIT_MEMCACHED_SERVERS → MemcachedBackend
+        4. CACHEKIT_FILE_CACHE_DIR  → FileBackend
+        5. REDIS_URL (no prefix)    → RedisBackend (12-factor fallback)
+        6. Nothing set              → None (L1-only)
+
+    Conflict rules:
+        - Multiple CACHEKIT_-prefixed backend vars → ConfigurationError
+        - Non-prefixed REDIS_URL never conflicts (different intent signal)
+
+    Unchanged behavior:
+        - Explicit backend= parameter always takes precedence
+        - set_default_backend() always takes precedence
     """
+
+    # Environment variables that signal a specific CACHEKIT backend
+    _CACHEKIT_BACKEND_VARS: dict[str, str] = {
+        "CACHEKIT_API_KEY": "CachekitIO",
+        "CACHEKIT_REDIS_URL": "Redis",
+        "CACHEKIT_MEMCACHED_SERVERS": "Memcached",
+        "CACHEKIT_FILE_CACHE_DIR": "File",
+    }
 
     def __init__(self):
         self._provider = None
+        self._resolved = False
 
     def get_backend(self):
-        """Get per-request backend instance from singleton provider."""
+        """Get backend instance via environment auto-detection.
+
+        Returns:
+            Backend instance, or None if no backend is configured (L1-only).
+
+        Raises:
+            ConfigurationError: If multiple CACHEKIT_-prefixed backend variables are set.
+        """
+        if not self._resolved:
+            self._provider = self._resolve_provider()
+            self._resolved = True
+
         if self._provider is None:
-            from cachekit.backends.redis.config import RedisBackendConfig
-            from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
-
-            redis_config = RedisBackendConfig.from_env()
-            self._provider = RedisBackendProvider(redis_url=redis_config.redis_url)
-
-            # Set default tenant for single-tenant mode (if not already set)
-            if tenant_context.get() is None:
-                tenant_context.set("default")
-
+            return None
         return self._provider.get_backend()
+
+    def _resolve_provider(self):
+        """Auto-detect backend provider from environment variables.
+
+        Returns:
+            Backend provider instance, or None for L1-only.
+
+        Raises:
+            ConfigurationError: If multiple CACHEKIT_-prefixed backend variables are set.
+        """
+        # Detect all CACHEKIT_-prefixed backend signals
+        detected = {var: label for var, label in self._CACHEKIT_BACKEND_VARS.items() if os.environ.get(var)}
+
+        # Conflict: 2+ CACHEKIT_-prefixed backend vars is ambiguous
+        if len(detected) > 1:
+            vars_str = ", ".join(f"{var} ({label})" for var, label in sorted(detected.items()))
+            raise ConfigurationError(
+                f"Ambiguous backend configuration: multiple CACHEKIT_ backend variables set: {vars_str}\n\n"
+                "Set exactly one CACHEKIT_ backend variable, or use explicit backend= parameter."
+            )
+
+        # Single CACHEKIT_-prefixed var detected
+        if detected:
+            var = next(iter(detected))
+            return self._create_provider(var)
+
+        # Fallback: non-prefixed REDIS_URL (12-factor convention, never conflicts)
+        if os.environ.get("REDIS_URL"):
+            return self._create_redis_provider()
+
+        # Nothing configured → L1-only
+        logger.debug("No backend environment variables detected — L1-only mode")
+        return None
+
+    def _create_provider(self, env_var: str):
+        """Create the appropriate backend provider for the given env var."""
+        if env_var == "CACHEKIT_API_KEY":
+            return self._create_cachekitio_provider()
+        if env_var == "CACHEKIT_REDIS_URL":
+            return self._create_redis_provider()
+        if env_var == "CACHEKIT_MEMCACHED_SERVERS":
+            return self._create_memcached_provider()
+        if env_var == "CACHEKIT_FILE_CACHE_DIR":
+            return self._create_file_provider()
+        raise ConfigurationError(f"Unknown backend env var: {env_var}")  # pragma: no cover
+
+    def _create_cachekitio_provider(self):
+        """Create CachekitIO backend (wraps in a simple provider)."""
+        from cachekit.backends.cachekitio import CachekitIOBackend
+
+        backend = CachekitIOBackend()
+        return _StaticBackendProvider(backend)
+
+    def _create_redis_provider(self):
+        """Create Redis backend provider with tenant context."""
+        from cachekit.backends.redis.config import RedisBackendConfig
+        from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+
+        redis_config = RedisBackendConfig.from_env()
+        provider = RedisBackendProvider(redis_url=redis_config.redis_url)
+
+        # Set default tenant for single-tenant mode (if not already set)
+        if tenant_context.get() is None:
+            tenant_context.set("default")
+
+        return provider
+
+    def _create_memcached_provider(self):
+        """Create Memcached backend."""
+        from cachekit.backends.memcached import MemcachedBackend
+        from cachekit.backends.memcached.config import MemcachedBackendConfig
+
+        config = MemcachedBackendConfig.from_env()
+        backend = MemcachedBackend(config)
+        return _StaticBackendProvider(backend)
+
+    def _create_file_provider(self):
+        """Create File backend."""
+        from cachekit.backends.file import FileBackend
+        from cachekit.backends.file.config import FileBackendConfig
+
+        config = FileBackendConfig.from_env()
+        backend = FileBackend(config)
+        return _StaticBackendProvider(backend)
+
+
+class _StaticBackendProvider:
+    """Wraps a pre-created backend instance as a provider.
+
+    Used for backends that don't have their own provider class
+    (CachekitIO, Memcached, File). Unlike RedisBackendProvider which
+    creates per-request wrappers, these backends are stateless enough
+    to share a single instance.
+    """
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    def get_backend(self):
+        return self._backend
 
 
 __all__ = [
