@@ -14,6 +14,7 @@ This test reproduces the bug from docs/getting-started.md doctest failure.
 
 from __future__ import annotations
 
+import os
 import time
 from unittest.mock import MagicMock, patch
 
@@ -229,17 +230,27 @@ class TestL1OnlyModeBug:
             assert production_call_count == 1, f"@cache.production L1 miss - called {production_call_count} times"
 
             # Test @cache.secure(master_key="...", backend=None)
+            # validate_encryption_config() checks CACHEKIT_MASTER_KEY env var
+            # independently of the inline master_key param, so we must set it.
             secure_call_count = 0
+            old_key = os.environ.get("CACHEKIT_MASTER_KEY")
+            os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64
+            try:
 
-            @cache.secure(master_key="a" * 64, backend=None)
-            def secure_func() -> str:
-                nonlocal secure_call_count
-                secure_call_count += 1
-                return "secure"
+                @cache.secure(master_key="a" * 64, backend=None)
+                def secure_func() -> str:
+                    nonlocal secure_call_count
+                    secure_call_count += 1
+                    return "secure"
 
-            assert secure_func() == "secure"
-            assert secure_func() == "secure"
-            assert secure_call_count == 1, f"@cache.secure L1 miss - called {secure_call_count} times"
+                assert secure_func() == "secure"
+                assert secure_func() == "secure"
+                assert secure_call_count == 1, f"@cache.secure L1 miss - called {secure_call_count} times"
+            finally:
+                if old_key is None:
+                    os.environ.pop("CACHEKIT_MASTER_KEY", None)
+                else:
+                    os.environ["CACHEKIT_MASTER_KEY"] = old_key
 
             # Backend provider should NEVER have been called for any preset
             mock_provider.return_value.get_backend.assert_not_called()
