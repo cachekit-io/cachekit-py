@@ -2,6 +2,8 @@
 
 # cachekit
 
+[![gitcgr](https://gitcgr.com/badge/cachekit-io/cachekit-py.svg)](https://gitcgr.com/cachekit-io/cachekit-py)
+
 > **Python caching, batteries included**
 
 Production-ready caching for Python with intelligent reliability features and Rust-powered performance.
