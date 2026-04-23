@@ -21,11 +21,15 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    - name: Install Kani verifier
+      run: |
+        cargo install --locked kani-verifier
+        cargo kani setup
+
     - name: Run Kani verification
-      uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1
-      with:
-        working-directory: rust
-        args: --tests --no-default-features --features compression,checksum,messagepack,encryption
+      run: |
+        cd rust
+        cargo kani --tests --no-default-features --features compression,checksum,messagepack,encryption
 
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
@@ -100,9 +104,9 @@ jobs:
       run: uv python install 3.11
 
     - name: Set up Rust
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-      with:
-        toolchain: stable
+      run: |
+        rustup toolchain install stable
+        rustup default stable
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

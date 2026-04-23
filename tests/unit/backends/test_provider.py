@@ -5,7 +5,7 @@ Tests for backends/provider.py covering:
 - SimpleLogger all logging methods
 - DefaultLoggerProvider
 - DefaultCacheClientProvider (sync and async)
-- DefaultBackendProvider with lazy initialization and tenant context
+- DefaultBackendProvider with environment-based auto-detection
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from cachekit.backends.provider import (
     LoggerProvider,
     SimpleLogger,
 )
+from cachekit.config.validation import ConfigurationError
 
 
 @pytest.mark.unit
@@ -252,139 +253,224 @@ class TestDefaultCacheClientProvider:
 
 @pytest.mark.unit
 class TestDefaultBackendProvider:
-    """Test DefaultBackendProvider lazy initialization and tenant context."""
+    """Test DefaultBackendProvider initialization state."""
 
     def test_init_provider_is_none(self) -> None:
-        """Test __init__ sets _provider to None."""
+        """Test __init__ sets _provider to None and _resolved to False."""
         provider = DefaultBackendProvider()
 
         assert provider._provider is None
+        assert provider._resolved is False
 
-    def test_get_backend_lazy_initialization(self) -> None:
-        """Test get_backend creates provider on first call."""
+
+@pytest.mark.unit
+class TestDefaultBackendProviderAutoDetect:
+    """Test DefaultBackendProvider environment-based auto-detection."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Remove all backend env vars before each test."""
+        for var in (
+            "CACHEKIT_API_KEY",
+            "CACHEKIT_REDIS_URL",
+            "CACHEKIT_MEMCACHED_SERVERS",
+            "CACHEKIT_FILE_CACHE_DIR",
+            "REDIS_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_auto_detect_cachekitio_from_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_API_KEY → CachekitIOBackend."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+
         provider = DefaultBackendProvider()
+        with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_backend_class:
+            mock_backend = mock.MagicMock()
+            mock_backend_class.return_value = mock_backend
 
+            result = provider.get_backend()
+
+            assert result is mock_backend
+            mock_backend_class.assert_called_once()
+
+    def test_auto_detect_redis_from_cachekit_redis_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_REDIS_URL → RedisBackend via RedisBackendProvider."""
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://myhost:6379")
+
+        provider = DefaultBackendProvider()
         with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
             with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
                 with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+                    mock_config = mock.MagicMock()
+                    mock_config.redis_url = "redis://myhost:6379"
+                    mock_config_class.from_env.return_value = mock_config
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+                    mock_backend = mock.MagicMock()
+                    mock_provider = mock.MagicMock()
+                    mock_provider.get_backend.return_value = mock_backend
+                    mock_provider_class.return_value = mock_provider
 
                     mock_context.get.return_value = None
 
-                    backend = provider.get_backend()
+                    result = provider.get_backend()
 
-                    assert backend is mock_backend_instance
-                    mock_config_class.from_env.assert_called_once()
-                    mock_provider_class.assert_called_once_with(redis_url="redis://localhost:6379")
+                    assert result is mock_backend
 
-    def test_get_backend_uses_cached_provider(self) -> None:
-        """Test get_backend reuses provider on subsequent calls."""
+    def test_auto_detect_memcached_from_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_MEMCACHED_SERVERS → MemcachedBackend."""
+        monkeypatch.setenv("CACHEKIT_MEMCACHED_SERVERS", '["mc1:11211"]')
+
         provider = DefaultBackendProvider()
+        with mock.patch("cachekit.backends.memcached.MemcachedBackend") as mock_backend_class:
+            with mock.patch("cachekit.backends.memcached.config.MemcachedBackendConfig") as mock_config_class:
+                mock_config = mock.MagicMock()
+                mock_config_class.from_env.return_value = mock_config
+                mock_backend = mock.MagicMock()
+                mock_backend_class.return_value = mock_backend
 
+                result = provider.get_backend()
+
+                assert result is mock_backend
+
+    def test_auto_detect_file_from_cache_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_FILE_CACHE_DIR → FileBackend."""
+        monkeypatch.setenv("CACHEKIT_FILE_CACHE_DIR", "/var/cache/test-cache")
+
+        provider = DefaultBackendProvider()
+        with mock.patch("cachekit.backends.file.FileBackend") as mock_backend_class:
+            with mock.patch("cachekit.backends.file.config.FileBackendConfig") as mock_config_class:
+                mock_config = mock.MagicMock()
+                mock_config_class.from_env.return_value = mock_config
+                mock_backend = mock.MagicMock()
+                mock_backend_class.return_value = mock_backend
+
+                result = provider.get_backend()
+
+                assert result is mock_backend
+
+    def test_fallback_redis_url_no_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """REDIS_URL (no CACHEKIT_ prefix) → RedisBackend as 12-factor fallback."""
+        monkeypatch.setenv("REDIS_URL", "redis://fallback:6379")
+
+        provider = DefaultBackendProvider()
         with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
             with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
                 with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+                    mock_config = mock.MagicMock()
+                    mock_config.redis_url = "redis://fallback:6379"
+                    mock_config_class.from_env.return_value = mock_config
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+                    mock_backend = mock.MagicMock()
+                    mock_provider = mock.MagicMock()
+                    mock_provider.get_backend.return_value = mock_backend
+                    mock_provider_class.return_value = mock_provider
 
                     mock_context.get.return_value = None
 
-                    # First call
-                    backend1 = provider.get_backend()
+                    result = provider.get_backend()
 
-                    # Second call
-                    backend2 = provider.get_backend()
+                    assert result is mock_backend
 
-                    # Should use cached provider
-                    assert backend1 is mock_backend_instance
-                    assert backend2 is mock_backend_instance
-                    # RedisBackendProvider should only be instantiated once
-                    mock_provider_class.assert_called_once()
-
-    def test_get_backend_sets_default_tenant_on_init(self) -> None:
-        """Test get_backend sets default tenant context if not already set."""
+    def test_no_env_vars_returns_none(self) -> None:
+        """No backend env vars set → None (L1-only mode)."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        result = provider.get_backend()
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+        assert result is None
 
-                    # Tenant context is None initially
-                    mock_context.get.return_value = None
+    def test_conflict_api_key_and_cachekit_redis_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_API_KEY + CACHEKIT_REDIS_URL → ConfigurationError."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://localhost:6379")
 
-                    provider.get_backend()
-
-                    # Should set default tenant
-                    mock_context.set.assert_called_once_with("default")
-
-    def test_get_backend_skips_tenant_setup_if_already_set(self) -> None:
-        """Test get_backend doesn't override existing tenant context."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with pytest.raises(ConfigurationError, match="Ambiguous backend configuration"):
+            provider.get_backend()
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+    def test_conflict_api_key_and_memcached_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_API_KEY + CACHEKIT_MEMCACHED_SERVERS → ConfigurationError."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+        monkeypatch.setenv("CACHEKIT_MEMCACHED_SERVERS", '["mc1:11211"]')
 
-                    # Tenant context is already set
-                    mock_context.get.return_value = "existing-tenant"
-
-                    provider.get_backend()
-
-                    # Should NOT call set
-                    mock_context.set.assert_not_called()
-
-    def test_get_backend_multiple_calls_no_tenant_override(self) -> None:
-        """Test that subsequent calls don't reset tenant context."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with pytest.raises(ConfigurationError, match="Ambiguous backend configuration"):
+            provider.get_backend()
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+    def test_conflict_redis_and_file_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_REDIS_URL + CACHEKIT_FILE_CACHE_DIR → ConfigurationError."""
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://localhost:6379")
+        monkeypatch.setenv("CACHEKIT_FILE_CACHE_DIR", "/var/cache/test-cache")
 
-                    # First call - tenant is None
-                    mock_context.get.return_value = None
-                    provider.get_backend()
+        provider = DefaultBackendProvider()
 
-                    # Second call - tenant was set by first call
-                    mock_context.get.return_value = "default"
-                    provider.get_backend()
+        with pytest.raises(ConfigurationError, match="Ambiguous backend configuration"):
+            provider.get_backend()
 
-                    # Should only set once (on first call)
-                    mock_context.set.assert_called_once_with("default")
+    def test_conflict_three_backends_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Three CACHEKIT_ backend vars → ConfigurationError listing all."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://localhost:6379")
+        monkeypatch.setenv("CACHEKIT_MEMCACHED_SERVERS", '["mc1:11211"]')
+
+        provider = DefaultBackendProvider()
+
+        with pytest.raises(ConfigurationError, match="multiple CACHEKIT_ backend variables set"):
+            provider.get_backend()
+
+    def test_no_conflict_api_key_with_plain_redis_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CACHEKIT_API_KEY + REDIS_URL (no prefix) → CachekitIO wins, no error."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+        monkeypatch.setenv("REDIS_URL", "redis://fallback:6379")
+
+        provider = DefaultBackendProvider()
+        with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_backend_class:
+            mock_backend = mock.MagicMock()
+            mock_backend_class.return_value = mock_backend
+
+            # Should NOT raise — REDIS_URL (no prefix) doesn't conflict
+            result = provider.get_backend()
+
+            assert result is mock_backend
+
+    def test_provider_caches_after_first_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Provider resolution runs once, subsequent calls use cached result."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+
+        provider = DefaultBackendProvider()
+        with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_backend_class:
+            mock_backend = mock.MagicMock()
+            mock_backend_class.return_value = mock_backend
+
+            result1 = provider.get_backend()
+            result2 = provider.get_backend()
+
+            assert result1 is result2
+            # CachekitIOBackend constructor called only once
+            mock_backend_class.assert_called_once()
+
+    def test_none_result_cached(self) -> None:
+        """None result (L1-only) is cached — don't re-detect on every call."""
+        provider = DefaultBackendProvider()
+
+        result1 = provider.get_backend()
+        result2 = provider.get_backend()
+
+        assert result1 is None
+        assert result2 is None
+        assert provider._resolved is True
+
+    def test_error_message_includes_conflicting_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ConfigurationError message lists the conflicting variables and their backends."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_abc123")
+        monkeypatch.setenv("CACHEKIT_FILE_CACHE_DIR", "/var/cache/test")
+
+        provider = DefaultBackendProvider()
+
+        with pytest.raises(ConfigurationError, match="CACHEKIT_API_KEY.*CachekitIO") as exc_info:
+            provider.get_backend()
+
+        assert "CACHEKIT_FILE_CACHE_DIR" in str(exc_info.value)
+        assert "File" in str(exc_info.value)
