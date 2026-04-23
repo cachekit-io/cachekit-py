@@ -103,8 +103,8 @@ class TestSaaSHeaderInjection:
         """Verify graceful degradation when stats is None."""
         headers = _inject_metrics_headers(None)
 
-        # Should return empty dict, not raise error
-        assert headers == {}
+        # Should return L1-Status: disabled for standalone usage, not raise error
+        assert headers == {"X-CacheKit-L1-Status": "disabled"}
         assert isinstance(headers, dict)
 
 
@@ -257,9 +257,9 @@ class TestEndToEndSaaSBackend:
 
     def test_backend_graceful_handling_missing_stats(self):
         """Verify backend gracefully handles missing stats."""
-        # When stats is None, should return empty dict, not raise
+        # When stats is None, should return L1-Status: disabled for standalone usage
         headers = _inject_metrics_headers(None)
-        assert headers == {}
+        assert headers == {"X-CacheKit-L1-Status": "disabled"}
         assert isinstance(headers, dict)
 
     def test_metrics_headers_immutable_after_call(self):
@@ -372,9 +372,9 @@ class TestObservabilityEdgeCases:
         multiple users each decorate the same function). Without per-instance session IDs,
         different wrappers would collide and cause 'counters_decreased' validation errors.
         """
-        stats1 = _FunctionStats()
-        stats2 = _FunctionStats()
-        stats3 = _FunctionStats()
+        stats1 = _FunctionStats(function_identifier="module.func_a")
+        stats2 = _FunctionStats(function_identifier="module.func_b")
+        stats3 = _FunctionStats(function_identifier="module.func_c")
 
         headers1 = _inject_metrics_headers(stats1)
         headers2 = _inject_metrics_headers(stats2)
@@ -494,8 +494,8 @@ class TestBackwardCompatibility:
 
         # Should have single parameter 'stats'
         assert "stats" in params
-        # Should accept None
-        assert _inject_metrics_headers(None) == {}
+        # Should accept None and return L1-Status: disabled
+        assert _inject_metrics_headers(None) == {"X-CacheKit-L1-Status": "disabled"}
 
     def test_cache_info_all_fields_present(self):
         """Verify CacheInfo has all expected fields."""
