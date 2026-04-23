@@ -1,4 +1,4 @@
-"""Integration tests for SaaS observability - headers injection end-to-end."""
+"""Unit tests for SaaS observability - header injection and session ID logic."""
 
 from __future__ import annotations
 
