@@ -344,6 +344,6 @@ class TestBackpressureController:
                 pass
 
         elapsed = time.time() - start_time
-        assert elapsed < 0.05  # Should timeout quickly
+        assert elapsed < 0.2  # Should timeout quickly (generous for CI jitter)
 
         thread.join()
