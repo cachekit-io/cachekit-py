@@ -372,8 +372,10 @@ class TestProductionWarnings:
         warning_messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
         assert len(warning_messages) > 0, f"Expected warning for ENV={env_name}"
 
-        # Warning should mention security
-        has_security_warning = any("SECURITY" in msg.upper() or "WARNING" in msg.upper() for msg in warning_messages)
+        # Warning should mention env var key usage
+        has_security_warning = any(
+            "environment variable" in msg.lower() or "secrets management" in msg.lower() for msg in warning_messages
+        )
         assert has_security_warning
 
     def test_no_production_warning_for_dev_env(self, monkeypatch, caplog):

@@ -37,29 +37,20 @@ jobs:
         cargo geiger --output-format Json > geiger-report.json
         cat geiger-report.json
 
-    - name: Check unsafe ratio (< 5%)
+    - name: Check unsafe in cachekit-rs (must be zero)
       run: |
         cd rust
-        # Parse total and unsafe counts from geiger JSON
-        TOTAL_FUNCS=$(jq '[.packages[].package.functions.safe + .packages[].package.functions.unsafe] | add' geiger-report.json)
-        UNSAFE_FUNCS=$(jq '[.packages[].package.functions.unsafe] | add' geiger-report.json)
-
-        if [ "$TOTAL_FUNCS" -eq 0 ]; then
-          echo "⚠️ No functions found in geiger report"
-          exit 0
-        fi
-
-        UNSAFE_RATIO=$(echo "scale=4; $UNSAFE_FUNCS / $TOTAL_FUNCS * 100" | bc)
-
-        echo "Total functions: $TOTAL_FUNCS"
-        echo "Unsafe functions: $UNSAFE_FUNCS"
-        echo "Unsafe ratio: $UNSAFE_RATIO%"
-
-        if (( $(echo "$UNSAFE_RATIO > 5.0" | bc -l) )); then
-          echo "❌ Unsafe ratio ($UNSAFE_RATIO%) exceeds 5% threshold"
+        UNSAFE_FUNCS=$(jq '.packages[] | select(.package.id.name == "cachekit-rs") | .unsafety.used.functions.unsafe_' geiger-report.json)
+        if [ -z "$UNSAFE_FUNCS" ]; then
+          echo "cachekit-rs not found in geiger report"
           exit 1
         fi
-        echo "✅ Unsafe ratio ($UNSAFE_RATIO%) is within acceptable limits"
+        echo "cachekit-rs unsafe functions: $UNSAFE_FUNCS"
+        if [ "$UNSAFE_FUNCS" -ne 0 ]; then
+          echo "cachekit-rs has $UNSAFE_FUNCS unsafe functions — must be zero"
+          exit 1
+        fi
+        echo "cachekit-rs has zero unsafe functions"
 
     - name: Archive geiger report
       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
