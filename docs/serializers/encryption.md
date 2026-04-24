@@ -19,7 +19,8 @@ The backend stores opaque ciphertext only. The master key never leaves the clien
 
 ## Basic Usage
 
-```python
+```python notest
+# notest: @cache.secure validation requires CACHEKIT_MASTER_KEY before conftest runs
 from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 

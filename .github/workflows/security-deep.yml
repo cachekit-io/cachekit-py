@@ -2,7 +2,7 @@ name: Security Deep
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 2 AM daily
+    - cron: '0 20 * * *'  # 20:00 UTC = 7 AM AEDT next day
   workflow_dispatch:  # Allow manual triggers
 
 permissions:
@@ -16,20 +16,27 @@ jobs:
   # Deep security analysis (< 2 hours) - nightly scheduled
   kani-verification:
     name: Kani Formal Verification
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    - name: Ensure stable toolchain
+      run: rustup toolchain install stable
+
+    - name: Install Kani
+      run: |
+        cargo +stable install --locked kani-verifier --version 0.67.0
+        cargo-kani setup
+
     - name: Run Kani verification
-      uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1
-      with:
-        working-directory: rust
-        args: --tests --no-default-features --features compression,checksum,messagepack,encryption
+      run: |
+        cd rust
+        cargo-kani --tests --no-default-features --features compression,checksum,messagepack,encryption
 
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 200
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -38,11 +45,6 @@ jobs:
       run: |
         rustup toolchain install nightly
         rustup default nightly
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
 
     - name: Install cargo-binstall
       uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
@@ -86,36 +88,10 @@ jobs:
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf # v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install 3.11
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-      with:
-        toolchain: stable
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-
-    - name: Cache Python virtual environment
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-py3.11-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
-        restore-keys: |
-          venv-${{ runner.os }}-py3.11-
 
     - name: Install dependencies
       run: |
@@ -149,7 +125,7 @@ jobs:
 
   miri-full:
     name: Miri Full Suite
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -159,11 +135,6 @@ jobs:
         rustup toolchain install nightly --component miri
         rustup default nightly
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-
     - name: Run full Miri test suite
       run: |
         cd rust
@@ -171,7 +142,7 @@ jobs:
 
   sanitizers:
     name: Sanitizers (ASan, TSan, MSan)
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -188,12 +159,6 @@ jobs:
     - name: Add source for sanitizers
       if: matrix.sanitizer == 'memory' || matrix.sanitizer == 'thread'
       run: rustup component add rust-src --toolchain nightly
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
-        key: ${{ matrix.sanitizer }}
 
     - name: Run AddressSanitizer
       if: matrix.sanitizer == 'address'
@@ -225,7 +190,7 @@ jobs:
 
   generate-security-report:
     name: Generate Security Report
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
     steps:

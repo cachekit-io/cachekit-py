@@ -6,7 +6,8 @@ The default L2 backend. Connects to Redis via environment variable or explicit c
 
 ## Basic Usage
 
-```python
+```python notest
+# notest: RedisBackend() requires DI container setup not available in doc tests
 from cachekit.backends import RedisBackend
 from cachekit import cache
 

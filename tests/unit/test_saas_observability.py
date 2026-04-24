@@ -1,4 +1,4 @@
-"""Integration tests for SaaS observability - headers injection end-to-end."""
+"""Unit tests for SaaS observability - header injection and session ID logic."""
 
 from __future__ import annotations
 
@@ -103,8 +103,8 @@ class TestSaaSHeaderInjection:
         """Verify graceful degradation when stats is None."""
         headers = _inject_metrics_headers(None)
 
-        # Should return empty dict, not raise error
-        assert headers == {}
+        # Should return L1-Status: disabled for standalone usage, not raise error
+        assert headers == {"X-CacheKit-L1-Status": "disabled"}
         assert isinstance(headers, dict)
 
 
@@ -257,9 +257,9 @@ class TestEndToEndSaaSBackend:
 
     def test_backend_graceful_handling_missing_stats(self):
         """Verify backend gracefully handles missing stats."""
-        # When stats is None, should return empty dict, not raise
+        # When stats is None, should return L1-Status: disabled for standalone usage
         headers = _inject_metrics_headers(None)
-        assert headers == {}
+        assert headers == {"X-CacheKit-L1-Status": "disabled"}
         assert isinstance(headers, dict)
 
     def test_metrics_headers_immutable_after_call(self):
@@ -365,16 +365,16 @@ class TestObservabilityEdgeCases:
         # Should round to 0.333
         assert headers["X-CacheKit-L1-Hit-Rate"] == "0.333"
 
-    def test_session_unique_per_stats_instance(self):
-        """Verify each _FunctionStats instance has its own unique session ID.
+    def test_session_unique_per_function_identifier(self):
+        """Verify distinct function_identifiers produce distinct session IDs.
 
-        This is critical for multi-wrapper scenarios (e.g., Locust load testing where
-        multiple users each decorate the same function). Without per-instance session IDs,
-        different wrappers would collide and cause 'counters_decreased' validation errors.
+        Session IDs are composed as "{process_uuid}:{function_identifier}", so uniqueness
+        is per function_identifier. This matters for multi-wrapper scenarios where different
+        decorated functions must not share session state.
         """
-        stats1 = _FunctionStats()
-        stats2 = _FunctionStats()
-        stats3 = _FunctionStats()
+        stats1 = _FunctionStats(function_identifier="module.func_a")
+        stats2 = _FunctionStats(function_identifier="module.func_b")
+        stats3 = _FunctionStats(function_identifier="module.func_c")
 
         headers1 = _inject_metrics_headers(stats1)
         headers2 = _inject_metrics_headers(stats2)
@@ -494,8 +494,8 @@ class TestBackwardCompatibility:
 
         # Should have single parameter 'stats'
         assert "stats" in params
-        # Should accept None
-        assert _inject_metrics_headers(None) == {}
+        # Should accept None and return L1-Status: disabled
+        assert _inject_metrics_headers(None) == {"X-CacheKit-L1-Status": "disabled"}
 
     def test_cache_info_all_fields_present(self):
         """Verify CacheInfo has all expected fields."""

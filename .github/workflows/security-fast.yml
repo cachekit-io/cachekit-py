@@ -24,7 +24,7 @@ jobs:
   # Fast security checks (< 3 min) - parallel execution
   cargo-audit:
     name: Vulnerability Scan
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -35,30 +35,23 @@ jobs:
 
   cargo-deny:
     name: License & Supply Chain
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+    - name: Install cargo-deny
+      run: cargo install --locked cargo-deny
+
+    - name: Run cargo-deny
+      run: cargo deny --all-features check
 
   clippy-security:
     name: Security Lints
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-      with:
-        toolchain: stable
-        components: clippy
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        workspaces: rust
 
     - name: Run Clippy security lints
       run: |
@@ -68,15 +61,10 @@ jobs:
 
   cargo-machete:
     name: Unused Dependencies
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-      with:
-        toolchain: stable
 
     - name: Install cargo-binstall
       uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
@@ -91,26 +79,10 @@ jobs:
 
   pip-audit:
     name: Python Dependency CVEs
-    runs-on: ubuntu-latest
+    runs-on: cachekit
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf # v3
-      with:
-        enable-cache: true
-
-    - name: Set up Python
-      run: uv python install 3.12
-
-    - name: Cache Python virtual environment
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-py3.12-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
-        restore-keys: |
-          venv-${{ runner.os }}-py3.12-
 
     - name: Install dependencies
       run: |
@@ -119,8 +91,10 @@ jobs:
     - name: Run pip-audit
       run: |
         # GHSA-5239-wwwm-4pmq: pygments ReDoS in AdlLexer (dev-only, no fix available)
+        # GHSA-58qw-9mgm-455v: pip tar/zip confusion (pip itself, no fix available)
         uv run pip-audit --desc --format json --output pip-audit-report.json \
-          --ignore-vuln GHSA-5239-wwwm-4pmq
+          --ignore-vuln GHSA-5239-wwwm-4pmq \
+          --ignore-vuln GHSA-58qw-9mgm-455v
 
     - name: Upload report
       if: always()
