@@ -235,6 +235,10 @@ class TestL1OnlyModeBug:
             secure_call_count = 0
             old_key = os.environ.get("CACHEKIT_MASTER_KEY")
             os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64
+            # Reset settings singleton so it picks up the env var
+            from cachekit.config.singleton import reset_settings
+
+            reset_settings()
             try:
 
                 @cache.secure(master_key="a" * 64, backend=None)
@@ -251,6 +255,7 @@ class TestL1OnlyModeBug:
                     os.environ.pop("CACHEKIT_MASTER_KEY", None)
                 else:
                     os.environ["CACHEKIT_MASTER_KEY"] = old_key
+                reset_settings()
 
             # Backend provider should NEVER have been called for any preset
             mock_provider.return_value.get_backend.assert_not_called()
