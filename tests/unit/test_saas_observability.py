@@ -365,12 +365,12 @@ class TestObservabilityEdgeCases:
         # Should round to 0.333
         assert headers["X-CacheKit-L1-Hit-Rate"] == "0.333"
 
-    def test_session_unique_per_stats_instance(self):
-        """Verify each _FunctionStats instance has its own unique session ID.
+    def test_session_unique_per_function_identifier(self):
+        """Verify distinct function_identifiers produce distinct session IDs.
 
-        This is critical for multi-wrapper scenarios (e.g., Locust load testing where
-        multiple users each decorate the same function). Without per-instance session IDs,
-        different wrappers would collide and cause 'counters_decreased' validation errors.
+        Session IDs are composed as "{process_uuid}:{function_identifier}", so uniqueness
+        is per function_identifier. This matters for multi-wrapper scenarios where different
+        decorated functions must not share session state.
         """
         stats1 = _FunctionStats(function_identifier="module.func_a")
         stats2 = _FunctionStats(function_identifier="module.func_b")

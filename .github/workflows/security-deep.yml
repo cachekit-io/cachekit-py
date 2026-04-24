@@ -21,9 +21,12 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    - name: Ensure stable toolchain
+      run: rustup toolchain install stable
+
     - name: Install Kani
       run: |
-        cargo +stable install --locked kani-verifier
+        cargo +stable install --locked kani-verifier --version 0.67.0
         cargo-kani setup
 
     - name: Run Kani verification
