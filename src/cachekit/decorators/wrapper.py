@@ -445,7 +445,7 @@ def create_cache_wrapper(
     # Validate encryption configuration if encryption is enabled
     from ..config import validate_encryption_config
 
-    validate_encryption_config(encryption)
+    validate_encryption_config(encryption, master_key=master_key)
 
     # Note: L1 cache + encryption is supported.
     # L1 stores encrypted bytes (not plaintext), decryption happens at read time only.

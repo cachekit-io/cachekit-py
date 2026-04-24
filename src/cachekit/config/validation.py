@@ -30,13 +30,15 @@ class ConfigurationError(Exception):
     pass
 
 
-def validate_encryption_config(encryption: bool = False) -> None:
+def validate_encryption_config(encryption: bool = False, master_key: str | None = None) -> None:
     """Validate encryption configuration when encryption is enabled.
 
-    Checks that CACHEKIT_MASTER_KEY is set via pydantic-settings when encryption=True.
+    Checks for a master key: first from the explicit parameter, then from
+    CACHEKIT_MASTER_KEY env var via pydantic-settings.
 
     Args:
         encryption: Whether encryption is enabled. If False, no validation.
+        master_key: Explicit master key (hex string). Takes precedence over env var.
 
     Raises:
         ConfigurationError: If encryption config is invalid
@@ -59,33 +61,36 @@ def validate_encryption_config(encryption: bool = False) -> None:
     if not encryption:
         return
 
-    # Get master key from pydantic-settings (handles env vars properly)
-    from cachekit.config.singleton import get_settings
+    # Resolve master key: explicit param > env var via settings
+    resolved_key = master_key
+    if not resolved_key:
+        from cachekit.config.singleton import get_settings
 
-    settings = get_settings()
-    master_key = settings.master_key.get_secret_value() if settings.master_key else None
+        settings = get_settings()
+        resolved_key = settings.master_key.get_secret_value() if settings.master_key else None
 
-    # Check if master_key is set
-    if not master_key:
+    if not resolved_key:
         raise ConfigurationError(
-            "CACHEKIT_MASTER_KEY environment variable required when encryption=True. "
+            "Master key required when encryption=True. Either pass master_key= "
+            "or set CACHEKIT_MASTER_KEY environment variable. "
             "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
         )
 
-    # Production environment warning - check via settings (already loaded above)
-    # Check deployment indicators
-    if not settings.dev_mode:
-        logger.warning(
-            "🔒 SECURITY WARNING: Master key loaded from environment variable in PRODUCTION. "
-            "Environment variables are NOT secure key storage. "
-            "For production deployments, use secrets management system: "
-            "HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, or Google Secret Manager. "
-            "KMS integration planned for future release."
-        )
+    # Production environment warning when key came from env var (not inline)
+    if not master_key:
+        from cachekit.config.singleton import get_settings
+
+        settings = get_settings()
+        if not settings.dev_mode:
+            logger.warning(
+                "Master key loaded from environment variable. "
+                "For production, use a secrets management system "
+                "(HashiCorp Vault, AWS Secrets Manager, etc.)."
+            )
 
     # Validate key format and length
     try:
-        key_bytes = bytes.fromhex(master_key)
+        key_bytes = bytes.fromhex(resolved_key)
         if len(key_bytes) < 32:
             raise ConfigurationError(
                 f"CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). "
