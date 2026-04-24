@@ -17,8 +17,8 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Weekly deep scan on Sunday at 3am UTC
-    - cron: "0 3 * * 0"
+    # Weekly deep scan: 20:00 UTC Sunday = 7 AM AEDT Monday
+    - cron: "0 20 * * 0"
   workflow_dispatch:
     # Manual trigger for ad-hoc security analysis
 

@@ -2,7 +2,7 @@ name: Security Deep
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 2 AM daily
+    - cron: '0 20 * * *'  # 20:00 UTC = 7 AM AEDT next day
   workflow_dispatch:  # Allow manual triggers
 
 permissions:
