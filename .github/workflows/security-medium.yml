@@ -41,6 +41,10 @@ jobs:
       run: |
         cd rust
         UNSAFE_FUNCS=$(jq '.packages[] | select(.package.id.name == "cachekit-rs") | .unsafety.used.functions.unsafe_' geiger-report.json)
+        if [ -z "$UNSAFE_FUNCS" ]; then
+          echo "cachekit-rs not found in geiger report"
+          exit 1
+        fi
         echo "cachekit-rs unsafe functions: $UNSAFE_FUNCS"
         if [ "$UNSAFE_FUNCS" -ne 0 ]; then
           echo "cachekit-rs has $UNSAFE_FUNCS unsafe functions — must be zero"
