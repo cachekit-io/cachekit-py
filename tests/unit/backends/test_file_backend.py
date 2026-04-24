@@ -936,14 +936,14 @@ class TestErrorPaths:
         key = "exists_expired"
         value = b"value"
 
-        # Set with 1 second TTL
-        backend.set(key, value, ttl=1)
+        # Set with 2 second TTL (1s too tight under CI load)
+        backend.set(key, value, ttl=2)
 
         # Verify it exists
         assert backend.exists(key) is True
 
         # Wait for expiration
-        time.sleep(1.5)
+        time.sleep(2.5)
 
         # exists should return False and delete the file
         result = backend.exists(key)

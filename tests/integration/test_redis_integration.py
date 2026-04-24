@@ -136,19 +136,19 @@ class TestRedisIntegration:
     def test_concurrent_access(self):
         """Concurrent access with distributed locking (async required)."""
         call_count = 0
-        lock = asyncio.Lock()
-
-        @cache(ttl=300)
-        async def thread_safe_func(key):
-            nonlocal call_count
-            async with lock:
-                call_count += 1
-                count = call_count
-            await asyncio.sleep(0.1)  # Simulate work
-            return f"result_{key}_{count}"
 
         async def run_concurrent_requests():
-            # Run concurrent requests using asyncio.gather
+            lock = asyncio.Lock()  # Must create inside running loop (Python 3.9 compat)
+
+            @cache(ttl=300)
+            async def thread_safe_func(key):
+                nonlocal call_count
+                async with lock:
+                    call_count += 1
+                    count = call_count
+                await asyncio.sleep(0.1)  # Simulate work
+                return f"result_{key}_{count}"
+
             tasks = [thread_safe_func("shared") for _ in range(10)]
             return await asyncio.gather(*tasks)
 
