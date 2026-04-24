@@ -165,7 +165,12 @@ jobs:
       run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
 
     - name: Scan Python dependencies for CVEs
-      run: uv run pip-audit --desc
+      run: |
+        # GHSA-5239-wwwm-4pmq: pygments ReDoS in AdlLexer (dev-only, no fix available)
+        # GHSA-58qw-9mgm-455v: pip tar/zip confusion (pip itself, no fix available)
+        uv run pip-audit --desc \
+          --ignore-vuln GHSA-5239-wwwm-4pmq \
+          --ignore-vuln GHSA-58qw-9mgm-455v
 
     - name: Run markdown documentation tests
       run: make test-docs-examples
