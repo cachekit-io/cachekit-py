@@ -46,7 +46,7 @@ from cachekit import cache
 # Cache a connection pool (same instance reused)
 @cache.local()
 def get_database_client(host: str):
-    return SQLAlchemy.create_engine(f"postgresql://{host}/mydb")
+    return sqlalchemy.create_engine(f"postgresql://{host}/mydb")
 
 # First call: creates client
 db1 = get_database_client("localhost")
@@ -71,7 +71,9 @@ def get_model(model_name: str):
 
 **Critical**: Cached objects are returned by reference. Mutations affect all callers.
 
-```python notest
+```python
+from cachekit import cache
+
 @cache.local()
 def get_config_dict():
     return {"timeout": 30, "retries": 3}
@@ -80,20 +82,22 @@ config1 = get_config_dict()
 config1["timeout"] = 999  # Mutation!
 
 config2 = get_config_dict()
-print(config2["timeout"])  # Prints 999, not 30
+assert config2["timeout"] == 999  # 999, not 30 — same object!
 ```
 
 **Fix**: Copy if you need to mutate:
 
-```python notest
+```python
 import copy
+from cachekit import cache
 
 @cache.local()
-def get_config_dict():
+def get_safe_config():
     return {"timeout": 30, "retries": 3}
 
-config = copy.copy(get_config_dict())  # Shallow copy
-config["timeout"] = 999  # Safe mutation
+config = copy.copy(get_safe_config())  # Shallow copy
+config["timeout"] = 999  # Safe — original unchanged
+assert get_safe_config()["timeout"] == 30
 ```
 
 ---
@@ -102,17 +106,19 @@ config["timeout"] = 999  # Safe mutation
 
 **Same args = same object**:
 
-```python notest
+```python
+from cachekit import cache
+
 @cache.local()
 def get_client(api_key: str):
-    return APIClient(api_key=api_key)
+    return {"key": api_key, "session": object()}
 
 client_a = get_client("key123")
 client_b = get_client("key123")
 assert client_a is client_b  # True (identity check)
 
 client_c = get_client("key456")
-assert client_a is not client_c  # False (different args)
+assert client_a is not client_c  # Different args, different object
 ```
 
 **Feature for connection reuse**:
@@ -167,28 +173,39 @@ Function call with args A
 
 All cachekit decorators expose the same cache management interface:
 
-```python notest
+```python
+from cachekit import cache
+
 @cache.local(ttl=300)
 def get_client(api_key: str):
-    return Client(api_key)
+    return {"key": api_key}
 
-# Get cache statistics
+get_client("key1")  # miss
+get_client("key1")  # hit
+
 info = get_client.cache_info()
-print(info)  # CacheInfo(hits=10, misses=5, maxsize=256, currsize=3)
+assert info.hits == 1
+assert info.misses == 1
+assert info.maxsize == 256
+assert info.currsize == 1
 
-# Invalidate specific cache entry
-get_client.invalidate_cache("my-api-key")
+get_client.invalidate_cache("key1")  # Remove specific entry
+assert get_client.cache_info().currsize == 0
 
-# Clear all cached entries
-get_client.cache_clear()
+get_client("key2")
+get_client.cache_clear()  # Remove all entries
+assert get_client.cache_info().currsize == 0
 
-# Access original function (bypasses cache)
-raw_result = get_client.__wrapped__("my-api-key")
+raw = get_client.__wrapped__("key3")  # Bypass cache
+assert get_client.cache_info().currsize == 0  # Not cached
+```
 
-# Async variant
+Async variant:
+
+```python notest
 @cache.local()
 async def get_async_client(api_key: str):
-    return await AsyncClient(api_key)
+    return await create_client(api_key)
 
 await get_async_client.ainvalidate_cache("my-api-key")
 ```
