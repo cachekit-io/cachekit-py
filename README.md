@@ -153,15 +153,15 @@ def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
-| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` | `@cache.io()` |
-|:--------|:----------------:|:-------------------:|:---------------:|:-------------:|
-| Circuit Breaker | - | ✅ | ✅ | ✅ |
-| Adaptive Timeouts | - | ✅ | ✅ | ✅ |
-| Monitoring | - | ✅ Full | ✅ Full | ✅ Full |
-| Integrity Checking | - | ✅ Enabled | ✅ Enforced | ✅ Enabled |
-| Encryption | - | - | ✅ Required | - |
-| Backend | Redis | Redis | Redis | CachekitIO SaaS |
-| **Use Case** | High throughput | Production reliability | Compliance/security | Managed cloud |
+| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` | `@cache.io()` | `@cache.local()` |
+|:--------|:----------------:|:-------------------:|:---------------:|:-------------:|:----------------:|
+| Circuit Breaker | - | ✅ | ✅ | ✅ | - |
+| Adaptive Timeouts | - | ✅ | ✅ | ✅ | - |
+| Monitoring | - | ✅ Full | ✅ Full | ✅ Full | ✅ Basic |
+| Integrity Checking | - | ✅ Enabled | ✅ Enforced | ✅ Enabled | - |
+| Encryption | - | - | ✅ Required | - | - |
+| Backend | Redis | Redis | Redis | CachekitIO SaaS | In-process |
+| **Use Case** | High throughput | Production reliability | Compliance/security | Managed cloud | Opaque objects |
 
 <details>
 <summary><strong>Additional Presets</strong></summary>

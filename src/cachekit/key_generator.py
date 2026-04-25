@@ -40,6 +40,7 @@ class CacheKeyGenerator:
         "auto": "a",  # AutoSerializer (Python-specific, NumPy/pandas)
         "orjson": "o",  # OrjsonSerializer (JSON-based)
         "arrow": "w",  # ArrowSerializer (columnar format, w=arroW)
+        "local": "l",  # Reference caching (no serialization)
     }
 
     def __init__(self):

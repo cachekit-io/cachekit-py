@@ -11,6 +11,7 @@ def pytest_runtest_setup(item):
         or "cachekitio_metrics" in item.nodeid
         or "memcached_backend" in item.nodeid
         or "secure_env_fallback" in item.nodeid
+        or "local_cache_works" in item.nodeid
     )
     if skip_redis:
         # Remove autouse redis fixtures for tests that don't need Redis
