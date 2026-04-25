@@ -809,19 +809,21 @@ class TestErrorPaths:
         """Test get deletes expired files."""
         key = "expired_key"
         value = b"expired_value"
+        now = time.time()
 
-        # Set with 1 second TTL
+        # Set with 1 second TTL at real time
         backend.set(key, value, ttl=1)
 
         # Verify it exists
         assert backend.get(key) == value
 
-        # Wait for expiration
-        time.sleep(1.5)
+        # Advance time past TTL instead of sleeping (no CI flake)
+        import unittest.mock
 
-        # get should return None and delete the expired file
-        result = backend.get(key)
-        assert result is None
+        with unittest.mock.patch("cachekit.backends.file.backend.time") as mock_time:
+            mock_time.time.return_value = now + 10  # 10s in the future
+            result = backend.get(key)
+            assert result is None
 
         # File should be deleted
         file_path = backend._key_to_path(key)
@@ -935,19 +937,20 @@ class TestErrorPaths:
         """Test exists returns False and deletes expired file."""
         key = "exists_expired"
         value = b"value"
+        now = time.time()
 
-        # Set with 2 second TTL (1s too tight under CI load)
-        backend.set(key, value, ttl=2)
+        backend.set(key, value, ttl=1)
 
         # Verify it exists
         assert backend.exists(key) is True
 
-        # Wait for expiration
-        time.sleep(2.5)
+        # Advance time past TTL instead of sleeping (no CI flake)
+        import unittest.mock
 
-        # exists should return False and delete the file
-        result = backend.exists(key)
-        assert result is False
+        with unittest.mock.patch("cachekit.backends.file.backend.time") as mock_time:
+            mock_time.time.return_value = now + 10
+            result = backend.exists(key)
+            assert result is False
 
         file_path = backend._key_to_path(key)
         assert not os.path.exists(file_path)
