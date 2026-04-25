@@ -1,0 +1,50 @@
+name: Attestation Health Check
+
+on:
+  schedule:
+    - cron: '23 3 * * 1'  # Weekly Monday 3:23am UTC
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Verify Latest Release Attestations
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Get latest release tag
+        id: release
+        run: |
+          TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          if [ -z "$TAG" ]; then
+            echo "No releases found, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify attestations
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          echo "Verifying attestations for ${{ steps.release.outputs.tag }}"
+          gh attestation list --repo ${{ github.repository }} --limit 1 | grep -q "." || {
+            echo "::error::No attestations found for latest release"
+            exit 1
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Open issue on failure
+        if: failure()
+        run: |
+          gh issue create \
+            --repo ${{ github.repository }} \
+            --title "Attestation verification failed for ${{ steps.release.outputs.tag }}" \
+            --body "Weekly attestation health check failed. Verify that the release workflow produced valid attestations." \
+            --label "bug"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

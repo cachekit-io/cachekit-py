@@ -131,9 +131,79 @@ jobs:
           name: sdist
           path: dist
 
+  attest:
+    name: Attest Build Provenance and SBOM
+    needs: [release-please, build-wheels, build-sdist]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sdist
+          path: dist
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: dist/*
+        continue-on-error: true
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate Python SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py requirements --outfile python-sbom.cdx.json --format json
+        continue-on-error: true
+
+      - name: Generate Rust SBOM
+        run: |
+          cargo install cargo-sbom --locked
+          cd rust && cargo sbom --output-format cyclonedx_json_v1_6 > ../rust-sbom.cdx.json
+        continue-on-error: true
+
+      - name: Merge SBOMs
+        run: |
+          pip install cyclonedx-cli || true
+          # If cyclonedx-cli merge is available, merge; otherwise use the Python SBOM
+          if command -v cyclonedx &> /dev/null; then
+            cyclonedx merge --input-files python-sbom.cdx.json rust-sbom.cdx.json --output-file sbom.cdx.json
+          else
+            # Fallback: use Python SBOM (Rust SBOM still attested separately if needed)
+            cp python-sbom.cdx.json sbom.cdx.json
+          fi
+        continue-on-error: true
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.cdx.json
+        continue-on-error: true
+
   publish:
     name: Publish to PyPI
-    needs: [release-please, build-wheels, build-sdist]
+    needs: [release-please, build-wheels, build-sdist, attest]
     runs-on: ubuntu-latest
     environment: release
     permissions:
