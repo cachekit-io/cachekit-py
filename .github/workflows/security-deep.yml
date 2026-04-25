@@ -46,11 +46,8 @@ jobs:
         rustup toolchain install nightly
         rustup default nightly
 
-    - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
-
     - name: Install cargo-fuzz
-      run: cargo binstall --no-confirm cargo-fuzz
+      run: cargo install --locked cargo-fuzz
 
     - name: Fuzz byte_storage_compress (1 hour)
       run: |

@@ -9,10 +9,11 @@ becomes unhealthy. These tests validate the state machine logic that protects
 the application from overwhelming a struggling Redis instance.
 """
 
-import time
+from datetime import timedelta
 
 import pytest
 import redis
+import time_machine
 
 from cachekit.reliability.circuit_breaker import (
     CircuitBreaker,
@@ -56,21 +57,22 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Force circuit to OPEN state
-        for _ in range(3):
-            breaker.record_failure()
-        assert breaker.state == CircuitState.OPEN
+        with time_machine.travel(0, tick=False) as traveller:
+            # Force circuit to OPEN state
+            for _ in range(3):
+                breaker.record_failure()
+            assert breaker.state == CircuitState.OPEN
 
-        # Should reject immediately (before timeout)
-        assert not breaker.should_attempt_call(), "Should reject before timeout"
-        assert breaker.state == CircuitState.OPEN
+            # Should reject immediately (before timeout)
+            assert not breaker.should_attempt_call(), "Should reject before timeout"
+            assert breaker.state == CircuitState.OPEN
 
-        # Wait for timeout to expire
-        time.sleep(0.15)
+            # Advance past timeout
+            traveller.shift(timedelta(seconds=0.2))
 
-        # Next request should transition to HALF_OPEN
-        assert breaker.should_attempt_call(), "Should allow test request after timeout"
-        assert breaker.state == CircuitState.HALF_OPEN, "Should transition to HALF_OPEN"
+            # Next request should transition to HALF_OPEN
+            assert breaker.should_attempt_call(), "Should allow test request after timeout"
+            assert breaker.state == CircuitState.HALF_OPEN, "Should transition to HALF_OPEN"
 
     def test_half_open_to_closed_after_success_threshold(self):
         """CRITICAL: Circuit closes after success_threshold successes in HALF_OPEN."""
@@ -82,26 +84,27 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Force to OPEN then HALF_OPEN
-        for _ in range(3):
-            breaker.record_failure()
-        assert breaker.state == CircuitState.OPEN
+        with time_machine.travel(0, tick=False) as traveller:
+            # Force to OPEN then HALF_OPEN
+            for _ in range(3):
+                breaker.record_failure()
+            assert breaker.state == CircuitState.OPEN
 
-        time.sleep(0.15)
-        breaker.should_attempt_call()  # Transition to HALF_OPEN
-        assert breaker.state == CircuitState.HALF_OPEN
+            traveller.shift(timedelta(seconds=0.2))
+            breaker.should_attempt_call()  # Transition to HALF_OPEN
+            assert breaker.state == CircuitState.HALF_OPEN
 
-        # Record successes up to threshold - 1
-        for i in range(2):
+            # Record successes up to threshold - 1
+            for i in range(2):
+                breaker.record_success()
+                assert breaker.state == CircuitState.HALF_OPEN, f"Should stay HALF_OPEN at {i + 1} successes"
+                assert breaker.success_count == i + 1
+
+            # One more success should close the circuit
             breaker.record_success()
-            assert breaker.state == CircuitState.HALF_OPEN, f"Should stay HALF_OPEN at {i + 1} successes"
-            assert breaker.success_count == i + 1
-
-        # One more success should close the circuit
-        breaker.record_success()
-        assert breaker.state == CircuitState.CLOSED, "Circuit should CLOSE after success threshold"
-        assert breaker.success_count == 0, "Success count should reset"
-        assert breaker.failure_count == 0, "Failure count should reset"
+            assert breaker.state == CircuitState.CLOSED, "Circuit should CLOSE after success threshold"
+            assert breaker.success_count == 0, "Success count should reset"
+            assert breaker.failure_count == 0, "Failure count should reset"
 
     def test_half_open_to_open_on_failure(self):
         """CRITICAL: Any failure in HALF_OPEN immediately returns to OPEN."""
@@ -112,22 +115,23 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Force to OPEN then HALF_OPEN
-        for _ in range(3):
+        with time_machine.travel(0, tick=False) as traveller:
+            # Force to OPEN then HALF_OPEN
+            for _ in range(3):
+                breaker.record_failure()
+            traveller.shift(timedelta(seconds=0.2))
+            breaker.should_attempt_call()  # Transition to HALF_OPEN
+            assert breaker.state == CircuitState.HALF_OPEN
+
+            # Record some successes
+            breaker.record_success()
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.success_count == 1
+
+            # Single failure should reopen circuit
             breaker.record_failure()
-        time.sleep(0.15)
-        breaker.should_attempt_call()  # Transition to HALF_OPEN
-        assert breaker.state == CircuitState.HALF_OPEN
-
-        # Record some successes
-        breaker.record_success()
-        assert breaker.state == CircuitState.HALF_OPEN
-        assert breaker.success_count == 1
-
-        # Single failure should reopen circuit
-        breaker.record_failure()
-        assert breaker.state == CircuitState.OPEN, "Should return to OPEN on any HALF_OPEN failure"
-        assert breaker.success_count == 0, "Success count should reset"
+            assert breaker.state == CircuitState.OPEN, "Should return to OPEN on any HALF_OPEN failure"
+            assert breaker.success_count == 0, "Success count should reset"
 
     def test_closed_state_with_intermittent_failures(self):
         """CRITICAL: Circuit stays CLOSED with intermittent failures below threshold."""
@@ -156,22 +160,23 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Force to OPEN then HALF_OPEN
-        for _ in range(3):
-            breaker.record_failure()
-        time.sleep(0.15)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Force to OPEN then HALF_OPEN
+            for _ in range(3):
+                breaker.record_failure()
+            traveller.shift(timedelta(seconds=0.2))
 
-        # First request should be allowed
-        assert breaker.should_attempt_call(), "First HALF_OPEN request should be allowed"
-        assert breaker.state == CircuitState.HALF_OPEN
+            # First request should be allowed
+            assert breaker.should_attempt_call(), "First HALF_OPEN request should be allowed"
+            assert breaker.state == CircuitState.HALF_OPEN
 
-        # Second request should be rejected (limit reached)
-        assert not breaker.should_attempt_call(), "Second request should be rejected (limit=1)"
+            # Second request should be rejected (limit reached)
+            assert not breaker.should_attempt_call(), "Second request should be rejected (limit=1)"
 
-        # After completing the first request successfully, circuit should close
-        breaker.record_success()
-        # Note: With success_threshold=3 (default), we need 3 successes to close
-        # So we stay in HALF_OPEN, but permits are reset
+            # After completing the first request successfully, circuit should close
+            breaker.record_success()
+            # Note: With success_threshold=3 (default), we need 3 successes to close
+            # So we stay in HALF_OPEN, but permits are reset
 
     def test_excluded_exceptions_dont_count_as_failures(self):
         """CRITICAL: Excluded error types don't trigger circuit breaker via call() method."""
@@ -317,48 +322,49 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        failure_count = {"value": 0}
-        lock = threading.Lock()
+        with time_machine.travel(0, tick=False) as traveller:
+            failure_count = {"value": 0}
+            lock = threading.Lock()
 
-        def record_failures():
-            """Record failures concurrently."""
-            for _ in range(5):
-                breaker.record_failure()
-                with lock:
-                    failure_count["value"] += 1
+            def record_failures():
+                """Record failures concurrently."""
+                for _ in range(5):
+                    breaker.record_failure()
+                    with lock:
+                        failure_count["value"] += 1
 
-        # Launch multiple threads recording failures
-        threads = [threading.Thread(target=record_failures) for _ in range(3)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            # Launch multiple threads recording failures
+            threads = [threading.Thread(target=record_failures) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-        # Total failures: 3 threads * 5 failures = 15 failures
-        assert failure_count["value"] == 15
-        # Circuit should be OPEN (threshold is 10)
-        assert breaker.state == CircuitState.OPEN
+            # Total failures: 3 threads * 5 failures = 15 failures
+            assert failure_count["value"] == 15
+            # Circuit should be OPEN (threshold is 10)
+            assert breaker.state == CircuitState.OPEN
 
-        # Wait for timeout and test concurrent HALF_OPEN transitions
-        time.sleep(0.15)
+            # Wait for timeout and test concurrent HALF_OPEN transitions
+            traveller.shift(timedelta(seconds=0.2))
 
-        allowed_count = {"value": 0}
+            allowed_count = {"value": 0}
 
-        def attempt_half_open():
-            """Attempt requests during HALF_OPEN state."""
-            if breaker.should_attempt_call():
-                with lock:
-                    allowed_count["value"] += 1
+            def attempt_half_open():
+                """Attempt requests during HALF_OPEN state."""
+                if breaker.should_attempt_call():
+                    with lock:
+                        allowed_count["value"] += 1
 
-        # Only half_open_requests (1 by default) should be allowed
-        threads = [threading.Thread(target=attempt_half_open) for _ in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            # Only half_open_requests (1 by default) should be allowed
+            threads = [threading.Thread(target=attempt_half_open) for _ in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-        # Due to thread safety, only the configured number should be allowed
-        assert allowed_count["value"] == 1, "Only half_open_requests should be allowed concurrently"
+            # Due to thread safety, only the configured number should be allowed
+            assert allowed_count["value"] == 1, "Only half_open_requests should be allowed concurrently"
 
     def test_circuit_breaker_async_call_success(self):
         """CRITICAL: call_async method works with successful async functions."""

@@ -89,7 +89,8 @@ class TestRedisIntegration:
         assert call_count == 1
 
         # Wait for expiration
-        time.sleep(1.5)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(4)
 
         # Now should execute again
         result3 = short_lived()

@@ -1,11 +1,12 @@
 """Unit tests for circuit breaker components."""
 
 import threading
-import time
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 import redis
+import time_machine
 
 from cachekit.reliability.circuit_breaker import (
     CacheOperationMetrics,
@@ -212,25 +213,26 @@ class TestCircuitBreaker:
         config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Open the circuit
-        def failing_operation():
-            raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Open the circuit
+            def failing_operation():
+                raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            with pytest.raises(BackendError):
+                breaker.call(failing_operation)
 
-        assert breaker.state == CircuitState.OPEN
+            assert breaker.state == CircuitState.OPEN
 
-        # Wait for timeout
-        time.sleep(0.15)
+            # Advance past timeout
+            traveller.shift(timedelta(seconds=0.2))
 
-        # Next request should transition to HALF_OPEN and be allowed
-        def successful_operation():
-            return "success"
+            # Next request should transition to HALF_OPEN and be allowed
+            def successful_operation():
+                return "success"
 
-        result = breaker.call(successful_operation)
-        assert result == "success"
-        assert breaker.state == CircuitState.HALF_OPEN
+            result = breaker.call(successful_operation)
+            assert result == "success"
+            assert breaker.state == CircuitState.HALF_OPEN
 
     def test_half_open_to_closed_after_successes(self):
         """Test transition from HALF_OPEN to CLOSED after success threshold."""
@@ -244,29 +246,30 @@ class TestCircuitBreaker:
         )
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Open the circuit
-        def failing_operation():
-            raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Open the circuit
+            def failing_operation():
+                raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            with pytest.raises(BackendError):
+                breaker.call(failing_operation)
 
-        # Wait and transition to HALF_OPEN
-        time.sleep(0.15)
+            # Advance past timeout to trigger HALF_OPEN
+            traveller.shift(timedelta(seconds=0.2))
 
-        def successful_operation():
-            return "success"
+            def successful_operation():
+                return "success"
 
-        # First success in HALF_OPEN
-        result = breaker.call(successful_operation)
-        assert result == "success"
-        assert breaker.state == CircuitState.HALF_OPEN
-        assert breaker.success_count == 1
+            # First success in HALF_OPEN
+            result = breaker.call(successful_operation)
+            assert result == "success"
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert breaker.success_count == 1
 
-        # Second success should close circuit
-        result = breaker.call(successful_operation)
-        assert result == "success"
-        assert breaker.state == CircuitState.CLOSED
+            # Second success should close circuit
+            result = breaker.call(successful_operation)
+            assert result == "success"
+            assert breaker.state == CircuitState.CLOSED
 
     def test_half_open_to_open_on_failure(self):
         """Test transition from HALF_OPEN back to OPEN on failure."""
@@ -275,21 +278,22 @@ class TestCircuitBreaker:
         config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Open the circuit
-        def failing_operation():
-            raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Open the circuit
+            def failing_operation():
+                raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            with pytest.raises(BackendError):
+                breaker.call(failing_operation)
 
-        # Wait and transition to HALF_OPEN
-        time.sleep(0.15)
+            # Advance past timeout to trigger HALF_OPEN
+            traveller.shift(timedelta(seconds=0.2))
 
-        # Any failure in HALF_OPEN should immediately reopen circuit
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            # Any failure in HALF_OPEN should immediately reopen circuit
+            with pytest.raises(BackendError):
+                breaker.call(failing_operation)
 
-        assert breaker.state == CircuitState.OPEN
+            assert breaker.state == CircuitState.OPEN
 
     def test_half_open_permit_limiting(self):
         """Test that HALF_OPEN state limits concurrent requests."""
@@ -298,29 +302,30 @@ class TestCircuitBreaker:
         config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Open the circuit
-        def failing_operation():
-            raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Open the circuit
+            def failing_operation():
+                raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            with pytest.raises(BackendError):
+                breaker.call(failing_operation)
 
-        # Wait for timeout
-        time.sleep(0.15)
+            # Advance past timeout
+            traveller.shift(timedelta(seconds=0.2))
 
-        # First request should be allowed (transitions to HALF_OPEN)
-        slow_operation = MagicMock(return_value="success")
-        result = breaker.call(slow_operation)
-        assert result == "success"
-        assert breaker.state == CircuitState.HALF_OPEN
+            # First request should be allowed (transitions to HALF_OPEN)
+            slow_operation = MagicMock(return_value="success")
+            result = breaker.call(slow_operation)
+            assert result == "success"
+            assert breaker.state == CircuitState.HALF_OPEN
 
-        # Additional requests should be rejected (no more permits)
-        fast_operation = MagicMock()
-        with pytest.raises(BackendError) as exc_info:
-            breaker.call(fast_operation)
+            # Additional requests should be rejected (no more permits)
+            fast_operation = MagicMock()
+            with pytest.raises(BackendError) as exc_info:
+                breaker.call(fast_operation)
 
-        assert "Circuit breaker is OPEN" in str(exc_info.value)
-        fast_operation.assert_not_called()
+            assert "Circuit breaker is OPEN" in str(exc_info.value)
+            fast_operation.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_async_call_functionality(self):
@@ -392,48 +397,49 @@ class TestCircuitBreaker:
         config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
         breaker = CircuitBreaker(config, namespace="test")
 
-        # Open the circuit first
-        def failing_operation():
-            raise redis.ConnectionError("Connection failed")
+        with time_machine.travel(0, tick=False) as traveller:
+            # Open the circuit first
+            def failing_operation():
+                raise redis.ConnectionError("Connection failed")
 
-        with pytest.raises(redis.ConnectionError):
-            breaker.call(failing_operation)
+            with pytest.raises(redis.ConnectionError):
+                breaker.call(failing_operation)
 
-        assert breaker.state == CircuitState.OPEN
+            assert breaker.state == CircuitState.OPEN
 
-        # Wait for timeout
-        time.sleep(0.15)
+            # Advance past timeout
+            traveller.shift(timedelta(seconds=0.2))
 
-        results = []
-        errors = []
+            results = []
+            errors = []
 
-        def thread_operation():
-            try:
+            def thread_operation():
+                try:
 
-                def operation():
-                    return "success"
+                    def operation():
+                        return "success"
 
-                result = breaker.call(operation)
-                results.append(result)
-            except Exception as e:
-                errors.append(e)
+                    result = breaker.call(operation)
+                    results.append(result)
+                except Exception as e:
+                    errors.append(e)
 
-        # Start multiple threads - only one should get through in HALF_OPEN
-        threads = []
-        for _ in range(5):
-            thread = threading.Thread(target=thread_operation)
-            threads.append(thread)
-            thread.start()
+            # Start multiple threads - only one should get through in HALF_OPEN
+            threads = []
+            for _ in range(5):
+                thread = threading.Thread(target=thread_operation)
+                threads.append(thread)
+                thread.start()
 
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
 
-        # Exactly one should succeed (the one that got the permit)
-        # Others should fail with circuit breaker error
-        assert len(results) == 1
-        assert results[0] == "success"
-        assert len(errors) == 4
+            # Exactly one should succeed (the one that got the permit)
+            # Others should fail with circuit breaker error
+            assert len(results) == 1
+            assert results[0] == "success"
+            assert len(errors) == 4
 
     def test_reset_functionality(self):
         """Test manual reset functionality."""

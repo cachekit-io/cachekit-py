@@ -33,11 +33,12 @@ import enum
 import math
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
 import pytest
+import time_machine
 from cachetools import TTLCache, cached
 
 from cachekit import cache
@@ -560,25 +561,27 @@ class TestTTLBehavior:
         """cachekit supports TTL with decorator parameter."""
         call_count = 0
 
-        @cache(backend=None, ttl=2)
-        def fn(x):
-            nonlocal call_count
-            call_count += 1
-            return x * 2
+        with time_machine.travel(0, tick=False) as traveller:
 
-        fn(1)
-        first_count = call_count
+            @cache(backend=None, ttl=2)
+            def fn(x):
+                nonlocal call_count
+                call_count += 1
+                return x * 2
 
-        fn(1)
-        # May or may not cache depending on L1 implementation details
-        second_count = call_count
+            fn(1)
+            first_count = call_count
 
-        time.sleep(2.5)  # Wait for TTL
-        fn(1)
-        # After TTL expiry, function MUST re-execute
-        assert call_count > second_count, "Function should re-execute after TTL expires"
+            fn(1)
+            # May or may not cache depending on L1 implementation details
+            second_count = call_count
 
-        fn.cache_clear()
+            traveller.shift(timedelta(seconds=3))  # Advance clock past TTL
+            fn(1)
+            # After TTL expiry, function MUST re-execute
+            assert call_count > second_count, "Function should re-execute after TTL expires"
+
+            fn.cache_clear()
 
 
 class TestCacheManagement:

@@ -164,7 +164,8 @@ class TestTTLExpiry:
         """Key should disappear after TTL seconds."""
         backend.set("ephemeral", b"gone_soon", ttl=1)
         assert backend.get("ephemeral") == b"gone_soon"
-        time.sleep(1.5)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(3)
         assert backend.get("ephemeral") is None
 
     def test_key_alive_before_ttl(self, backend: MemcachedBackend) -> None:

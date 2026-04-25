@@ -66,11 +66,8 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e # main
-
     - name: Install cargo-machete
-      run: cargo binstall --no-confirm cargo-machete
+      run: cargo install --locked cargo-machete
 
     - name: Check for unused dependencies
       run: |
