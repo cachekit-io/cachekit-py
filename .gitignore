@@ -89,3 +89,13 @@ coverage.json
 .wrangler/
 dist-linux/
 .dist-linux-build/
+
+# AI agent configs (never commit to public repos)
+CLAUDE.md
+AGENTS.md
+.claude/
+.caliber/
+CALIBER_LEARNINGS.md
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
