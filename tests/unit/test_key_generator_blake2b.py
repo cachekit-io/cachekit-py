@@ -212,6 +212,7 @@ class TestBlake2bKeyGeneration:
             "auto": "a",
             "orjson": "o",
             "arrow": "w",
+            "local": "l",
         }
 
         assert gen.SERIALIZER_CODES == expected_codes
