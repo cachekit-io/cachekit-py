@@ -136,7 +136,7 @@ assert client_a is not client_c  # Different args, different object
 
 Cached objects are held strongly until eviction:
 
-```
+```text
 Function call with args A
   ↓
 [Check cache]

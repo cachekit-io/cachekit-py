@@ -101,7 +101,12 @@ class ObjectCache:
             key: Cache key.
             value: Python object to store (no serialisation performed).
             ttl: Time-to-live in seconds (must be >= 1).
+
+        Raises:
+            ValueError: If ttl is less than 1.
         """
+        if ttl < 1:
+            raise ValueError(f"ttl must be >= 1, got {ttl}")
         expires_at = time.monotonic() + ttl
         with self._lock:
             # If key already present, update in-place and move to end
@@ -115,7 +120,7 @@ class ObjectCache:
                 self._evict_to_make_room()
 
             self._store[key] = (value, expires_at)
-            self._store.move_to_end(key)
+            # No move_to_end needed — OrderedDict.__setitem__ appends new keys to end
 
     def delete(self, key: str) -> bool:
         """Remove a single entry from the cache.

@@ -53,6 +53,10 @@ def create_local_wrapper(
     namespace: str | None = kwargs.get("namespace", None)  # type: ignore[assignment]
     key: Callable[..., str] | None = kwargs.get("key", None)  # type: ignore[assignment]
 
+    if not isinstance(ttl, int):
+        raise TypeError(f"ttl must be an int, got {type(ttl).__name__}")
+    if not isinstance(max_entries, int):
+        raise TypeError(f"max_entries must be an int, got {type(max_entries).__name__}")
     if ttl < 1:
         raise ValueError(f"ttl must be >= 1, got {ttl}")
     if max_entries < 1:

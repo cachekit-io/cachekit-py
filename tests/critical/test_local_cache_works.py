@@ -9,7 +9,6 @@ No Redis required — pure in-process object cache.
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
 
@@ -61,14 +60,19 @@ class TestLocalCacheBasic:
 
     def test_invalidate_cache(self):
         """Per-key invalidation removes entry."""
+        call_count = 0
 
         @cache.local(ttl=60)
         def greet(name):
-            return f"hello {name} {time.monotonic()}"
+            nonlocal call_count
+            call_count += 1
+            return f"hello {name} #{call_count}"
 
         result1 = greet("alice")
+        assert call_count == 1
         greet.invalidate_cache("alice")
         result2 = greet("alice")
+        assert call_count == 2
         assert result1 != result2  # Re-executed after invalidation
 
     def test_cache_clear(self):

@@ -67,7 +67,7 @@ class CacheKeyGenerator:
             kwargs: Keyword arguments passed to the function
             namespace: Optional namespace prefix for the key
             integrity_checking: Whether integrity checking is enabled (ByteStorage vs plain MessagePack)
-            serializer_type: Serializer type code ("std", "auto", "orjson", "arrow")
+            serializer_type: Serializer type code ("std", "auto", "orjson", "arrow", "local")
 
         Returns:
             A consistent string key for caching

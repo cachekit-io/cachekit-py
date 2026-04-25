@@ -15,35 +15,35 @@ class TestLocalWrapperRejectedParams:
     """Parameters that @cache.local() must explicitly reject."""
 
     def test_backend_rejected(self) -> None:
-        with pytest.raises(TypeError, match="@cache.local()"):
+        with pytest.raises(TypeError, match=r"@cache\.local\(\)"):
 
             @cache.local(backend=object())
             def fn() -> None:
                 pass
 
     def test_serializer_rejected(self) -> None:
-        with pytest.raises(TypeError, match="@cache.local()"):
+        with pytest.raises(TypeError, match=r"@cache\.local\(\)"):
 
             @cache.local(serializer="std")
             def fn() -> None:
                 pass
 
     def test_encryption_rejected(self) -> None:
-        with pytest.raises(TypeError, match="@cache.local()"):
+        with pytest.raises(TypeError, match=r"@cache\.local\(\)"):
 
             @cache.local(encryption=True)
             def fn() -> None:
                 pass
 
     def test_master_key_rejected(self) -> None:
-        with pytest.raises(TypeError, match="@cache.local()"):
+        with pytest.raises(TypeError, match=r"@cache\.local\(\)"):
 
             @cache.local(master_key="abc")
             def fn() -> None:
                 pass
 
     def test_integrity_checking_rejected(self) -> None:
-        with pytest.raises(TypeError, match="@cache.local()"):
+        with pytest.raises(TypeError, match=r"@cache\.local\(\)"):
 
             @cache.local(integrity_checking=True)
             def fn() -> None:
@@ -127,15 +127,18 @@ class TestLocalWrapperAsync:
         await afn(5)  # miss again — re-computed
         assert call_count == 2
 
-    def test_cache_clear_on_async_does_not_raise(self) -> None:
-        """cache_clear() on an async-wrapped function must not raise TypeError."""
+    async def test_cache_clear_on_async_does_not_raise(self) -> None:
+        """cache_clear() on an async-wrapped function must not raise TypeError and must clear state."""
 
         @cache.local()
         async def afn(x: int) -> int:
             return x
 
-        # Must not raise
-        afn.cache_clear()
+        await afn(1)  # populate
+        assert afn.cache_info().currsize == 1
+
+        afn.cache_clear()  # must not raise
+        assert afn.cache_info().currsize == 0
 
 
 @pytest.mark.unit

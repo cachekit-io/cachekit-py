@@ -110,8 +110,10 @@ def cache(
         if _intent == "local":
             if config is not None:
                 raise TypeError(
-                    "@cache.local() stores object references in-process — encryption "
-                    "requires serialization to bytes. For encrypted caching, use @cache.secure()."
+                    "@cache.local() does not accept config=. DecoratorConfig configures "
+                    "backends, serialization, and encryption — none of which apply to "
+                    "in-process reference caching. Pass parameters directly: "
+                    "@cache.local(ttl=300, max_entries=256)"
                 )
             from .local_wrapper import create_local_wrapper
 
