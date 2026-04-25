@@ -107,7 +107,8 @@ class TestLruCacheComparison:
         assert result == "value_1"
 
         # Wait for TTL to expire
-        time.sleep(1.2)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(3)
 
         # Data should be expired (in production with Redis)
         # Note: Exact behavior depends on Redis persistence

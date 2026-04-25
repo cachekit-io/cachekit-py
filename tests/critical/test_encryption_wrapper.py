@@ -622,7 +622,8 @@ class TestEncryptionWrapperFunctionality(RedisIsolationMixin):
         assert call_count == 1
 
         # Wait for TTL expiration
-        time.sleep(1.5)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(3)
 
         # After TTL - cache miss
         result3 = get_short_ttl_data(1)

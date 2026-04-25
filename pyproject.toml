@@ -227,6 +227,7 @@ dev = [
     "pandas>=1.3.0",
     "pyarrow>=21.0.0",
     "pytest-xdist>=3.8.0",
+    "time-machine>=2.19.0",
 ]
 # Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
 fuzz = [

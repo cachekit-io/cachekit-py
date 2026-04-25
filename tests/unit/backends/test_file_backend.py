@@ -17,10 +17,12 @@ import errno
 import os
 import struct
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+import time_machine
 
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.file.backend import (
@@ -809,19 +811,16 @@ class TestErrorPaths:
         """Test get deletes expired files."""
         key = "expired_key"
         value = b"expired_value"
-        now = time.time()
 
-        # Set with 1 second TTL at real time
-        backend.set(key, value, ttl=1)
+        with time_machine.travel(0, tick=False) as traveller:
+            # Set with 1 second TTL at frozen time
+            backend.set(key, value, ttl=1)
 
-        # Verify it exists
-        assert backend.get(key) == value
+            # Verify it exists
+            assert backend.get(key) == value
 
-        # Advance time past TTL instead of sleeping (no CI flake)
-        import unittest.mock
-
-        with unittest.mock.patch("cachekit.backends.file.backend.time") as mock_time:
-            mock_time.time.return_value = now + 10  # 10s in the future
+            # Advance clock 10s past TTL
+            traveller.shift(timedelta(seconds=10))
             result = backend.get(key)
             assert result is None
 
@@ -937,18 +936,15 @@ class TestErrorPaths:
         """Test exists returns False and deletes expired file."""
         key = "exists_expired"
         value = b"value"
-        now = time.time()
 
-        backend.set(key, value, ttl=1)
+        with time_machine.travel(0, tick=False) as traveller:
+            backend.set(key, value, ttl=1)
 
-        # Verify it exists
-        assert backend.exists(key) is True
+            # Verify it exists
+            assert backend.exists(key) is True
 
-        # Advance time past TTL instead of sleeping (no CI flake)
-        import unittest.mock
-
-        with unittest.mock.patch("cachekit.backends.file.backend.time") as mock_time:
-            mock_time.time.return_value = now + 10
+            # Advance clock 10s past TTL
+            traveller.shift(timedelta(seconds=10))
             result = backend.exists(key)
             assert result is False
 

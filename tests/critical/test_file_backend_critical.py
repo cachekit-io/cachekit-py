@@ -10,9 +10,10 @@ Performance target: < 1 second total for all tests.
 Marked with @pytest.mark.critical for fast CI runs.
 """
 
-import time
+from datetime import timedelta
 
 import pytest
+import time_machine
 
 from cachekit.backends.file.backend import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
@@ -50,24 +51,25 @@ def test_get_set_delete_roundtrip(backend):
 @pytest.mark.critical
 def test_ttl_enforced(backend):
     """TTL causes values to expire."""
-    # Set with no TTL (permanent)
-    backend.set("permanent", b"stays")
-    # Set with short TTL
-    backend.set("temporary", b"goes_away", ttl=3)
+    with time_machine.travel(0, tick=False) as traveller:
+        # Set with no TTL (permanent)
+        backend.set("permanent", b"stays")
+        # Set with short TTL
+        backend.set("temporary", b"goes_away", ttl=3)
 
-    # Both exist immediately
-    assert backend.get("permanent") == b"stays"
-    assert backend.get("temporary") == b"goes_away"
+        # Both exist immediately
+        assert backend.get("permanent") == b"stays"
+        assert backend.get("temporary") == b"goes_away"
 
-    # Wait for temporary to expire
-    time.sleep(3.5)
+        # Advance clock past TTL
+        traveller.shift(timedelta(seconds=5))
 
-    # Permanent still exists, temporary is gone
-    assert backend.get("permanent") == b"stays"
-    # Skip reading expired key directly due to file handle bug in FileBackend
-    # Instead verify by setting a new key (proves cleanup didn't affect backend)
-    backend.set("new_key", b"new_value")
-    assert backend.get("new_key") == b"new_value"
+        # Permanent still exists, temporary is gone
+        assert backend.get("permanent") == b"stays"
+        # Skip reading expired key directly due to file handle bug in FileBackend
+        # Instead verify by setting a new key (proves cleanup didn't affect backend)
+        backend.set("new_key", b"new_value")
+        assert backend.get("new_key") == b"new_value"
 
 
 @pytest.mark.critical

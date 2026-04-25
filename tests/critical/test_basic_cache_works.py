@@ -174,7 +174,8 @@ class TestBasicCacheWorks(RedisIsolationMixin):
         assert call_count == 1
 
         # Wait for TTL to expire
-        time.sleep(1.5)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(3)
 
         # Third call should execute function again (cache expired)
         result3 = time_sensitive_data()

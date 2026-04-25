@@ -45,7 +45,8 @@ class TestCacheReliability(RedisIsolationMixin):
         assert call_count == 1
 
         # Wait for TTL to expire
-        time.sleep(1.2)
+        # Server-side TTL — must sleep (time-machine can't mock Redis/Memcached clock)
+        time.sleep(3)
 
         # Third call should get fresh data after expiration
         result3 = time_sensitive_function("data")
