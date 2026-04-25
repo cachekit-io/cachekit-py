@@ -1,6 +1,7 @@
 """Intent-based cache decorator interface.
 
-Provides the @cache decorator with intent-based variants (@cache.minimal, @cache.production, @cache.secure, @cache.dev, @cache.test).
+Provides the @cache decorator with intent-based variants (@cache.minimal, @cache.production,
+@cache.secure, @cache.dev, @cache.test, @cache.local).
 """
 
 from __future__ import annotations
@@ -103,6 +104,21 @@ def cache(
     """
 
     def decorator(f: F) -> F:
+        # LOCAL INTENT: short-circuit before any DecoratorConfig resolution.
+        # Must be first — backend pop and l1_enabled mapping below would
+        # silently consume kwargs that create_local_wrapper must reject.
+        if _intent == "local":
+            if config is not None:
+                raise TypeError(
+                    "@cache.local() does not accept config=. DecoratorConfig configures "
+                    "backends, serialization, and encryption — none of which apply to "
+                    "in-process reference caching. Pass parameters directly: "
+                    "@cache.local(ttl=300, max_entries=256)"
+                )
+            from .local_wrapper import create_local_wrapper
+
+            return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
+
         # Resolve backend at decorator application time
         # Track if backend=None was explicitly passed (L1-only mode)
         # This is a sentinel problem: we need to distinguish between:
@@ -193,4 +209,5 @@ cache.secure = functools.partial(cache, _intent="secure")  # type: ignore[attr-d
 cache.dev = functools.partial(cache, _intent="dev")  # type: ignore[attr-defined]
 cache.test = functools.partial(cache, _intent="test")  # type: ignore[attr-defined]
 cache.io = functools.partial(cache, _intent="io")  # type: ignore[attr-defined]  # SaaS backend
+cache.local = functools.partial(cache, _intent="local")  # type: ignore[attr-defined]
 # Note: L1-only mode requires explicit backend=None parameter (no preset decorator)
