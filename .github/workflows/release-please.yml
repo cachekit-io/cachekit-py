@@ -14,7 +14,7 @@ on:
           - 'false'
           - 'true'
       release_tag:
-        description: 'Tag to release (e.g., cachekit-v0.1.0)'
+        description: 'Tag to release (e.g., v0.6.0)'
         required: false
         type: string
 
@@ -54,13 +54,26 @@ jobs:
     needs: release-please
     if: github.event.inputs.force_release == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
     steps:
-      - name: Require release_tag for force_release
+      - name: Validate release_tag
+        id: validate
         run: |
-          if [ -z "${{ github.event.inputs.release_tag }}" ]; then
-            echo "::error::force_release requires release_tag to be set (e.g., cachekit-v0.6.0)"
+          TAG="${{ github.event.inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::force_release requires release_tag (e.g., v0.6.0)"
             exit 1
           fi
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release_tag must match vX.Y.Z (got: $TAG)"
+            exit 1
+          fi
+          if ! git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "::error::tag $TAG does not exist on remote"
+            exit 1
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build-wheels:
     name: Build wheels (${{ matrix.target }})
@@ -96,7 +109,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # Use release-please tag or manual input tag
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       # Python setup required for native builds (macOS/Windows) to discover interpreters
       # Linux uses Docker containers which have Python pre-installed
@@ -131,7 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
@@ -146,7 +159,7 @@ jobs:
 
   attest:
     name: Attest Build Provenance and SBOM
-    needs: [release-please, build-wheels, build-sdist]
+    needs: [release-please, validate-inputs, build-wheels, build-sdist]
     if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -173,7 +186,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
