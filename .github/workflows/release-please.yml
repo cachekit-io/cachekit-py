@@ -59,8 +59,9 @@ jobs:
     steps:
       - name: Validate release_tag
         id: validate
+        env:
+          TAG: ${{ github.event.inputs.release_tag }}
         run: |
-          TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$TAG" ]; then
             echo "::error::force_release requires release_tag (e.g., v0.6.0)"
             exit 1
