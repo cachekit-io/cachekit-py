@@ -187,11 +187,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-<<<<<<< HEAD
           ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
-=======
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
->>>>>>> 2ba2354 (ci: allow force_release to flow through attest and publish jobs)
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
