@@ -14,7 +14,7 @@ on:
           - 'false'
           - 'true'
       release_tag:
-        description: 'Tag to release (e.g., cachekit-v0.1.0)'
+        description: 'Tag to release (e.g., v0.6.0)'
         required: false
         type: string
 
@@ -49,11 +49,38 @@ jobs:
           config-file: release-please-config.json
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
+  validate-inputs:
+    name: Validate Release Inputs
+    needs: release-please
+    if: github.event.inputs.force_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+    steps:
+      - name: Validate release_tag
+        id: validate
+        env:
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::force_release requires release_tag (e.g., v0.6.0)"
+            exit 1
+          fi
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release_tag must match vX.Y.Z (got: $TAG)"
+            exit 1
+          fi
+          if ! git ls-remote --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" | grep -q .; then
+            echo "::error::tag $TAG does not exist on remote"
+            exit 1
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build-wheels:
     name: Build wheels (${{ matrix.target }})
-    needs: release-please
-    # Run if: release-please created a release OR manual dispatch with force_release
-    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
+    needs: [release-please, validate-inputs]
+    # Run if: release-please created a release OR manual dispatch with force_release (validate-inputs ensures release_tag is set)
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     strategy:
       matrix:
         include:
@@ -83,7 +110,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # Use release-please tag or manual input tag
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       # Python setup required for native builds (macOS/Windows) to discover interpreters
       # Linux uses Docker containers which have Python pre-installed
@@ -112,13 +139,13 @@ jobs:
 
   build-sdist:
     name: Build source distribution
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
+    needs: [release-please, validate-inputs]
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name || github.event.inputs.release_tag }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
@@ -133,8 +160,8 @@ jobs:
 
   attest:
     name: Attest Build Provenance and SBOM
-    needs: [release-please, build-wheels, build-sdist]
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: [release-please, validate-inputs, build-wheels, build-sdist]
+    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -160,7 +187,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -168,7 +195,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal
 
       - name: Generate Python SBOM
         run: |
@@ -204,6 +231,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [release-please, build-wheels, build-sdist, attest]
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
