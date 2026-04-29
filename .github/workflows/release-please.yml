@@ -168,7 +168,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal
 
       - name: Generate Python SBOM
         run: |
