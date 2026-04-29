@@ -49,11 +49,24 @@ jobs:
           config-file: release-please-config.json
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
+  validate-inputs:
+    name: Validate Release Inputs
+    needs: release-please
+    if: github.event.inputs.force_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require release_tag for force_release
+        run: |
+          if [ -z "${{ github.event.inputs.release_tag }}" ]; then
+            echo "::error::force_release requires release_tag to be set (e.g., cachekit-v0.6.0)"
+            exit 1
+          fi
+
   build-wheels:
     name: Build wheels (${{ matrix.target }})
-    needs: release-please
-    # Run if: release-please created a release OR manual dispatch with force_release
-    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
+    needs: [release-please, validate-inputs]
+    # Run if: release-please created a release OR manual dispatch with force_release (validate-inputs ensures release_tag is set)
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     strategy:
       matrix:
         include:
@@ -112,8 +125,8 @@ jobs:
 
   build-sdist:
     name: Build source distribution
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
+    needs: [release-please, validate-inputs]
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -204,6 +217,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [release-please, build-wheels, build-sdist, attest]
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
