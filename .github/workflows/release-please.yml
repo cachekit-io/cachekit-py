@@ -69,7 +69,7 @@ jobs:
             echo "::error::release_tag must match vX.Y.Z (got: $TAG)"
             exit 1
           fi
-          if ! git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+          if ! git ls-remote --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" | grep -q .; then
             echo "::error::tag $TAG does not exist on remote"
             exit 1
           fi
