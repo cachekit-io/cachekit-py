@@ -66,10 +66,7 @@ def test_ttl_enforced(backend):
 
         # Permanent still exists, temporary is gone
         assert backend.get("permanent") == b"stays"
-        # Skip reading expired key directly due to file handle bug in FileBackend
-        # Instead verify by setting a new key (proves cleanup didn't affect backend)
-        backend.set("new_key", b"new_value")
-        assert backend.get("new_key") == b"new_value"
+        assert backend.get("temporary") is None
 
 
 @pytest.mark.critical
