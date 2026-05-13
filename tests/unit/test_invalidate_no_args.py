@@ -217,6 +217,79 @@ class TestInvalidateNoArgsWithL2Backend:
         expensive("world")
         assert call_count == 4
 
+    @pytest.mark.asyncio
+    async def test_async_file_backend_partial_failure_retains_keys(self, tmp_path):
+        """Async: if L2 delete fails, the key stays tracked for retry."""
+        from unittest.mock import patch
+
+        call_count = 0
+        backend = FileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=256))
+
+        @cache(backend=backend, ttl=300, namespace="test_async_file_partial_fail")
+        async def expensive(query: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"result_{call_count}"
+
+        await expensive("hello")
+        assert call_count == 1
+
+        with patch.object(backend, "delete", side_effect=Exception("disk error")):
+            await expensive.ainvalidate_cache()
+
+        # L2 delete failed → key still tracked. Second attempt with healthy backend:
+        await expensive.ainvalidate_cache()
+
+        await expensive("hello")
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_file_backend_invalidate_with_specific_args(self, tmp_path):
+        """Async: ainvalidate_cache(specific_args) clears only that entry from L2."""
+        call_count = 0
+        backend = FileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=256))
+
+        @cache(backend=backend, ttl=300, namespace="test_async_file_specific_args")
+        async def expensive(query: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"result_{call_count}"
+
+        await expensive("hello")
+        await expensive("world")
+        assert call_count == 2
+
+        await expensive.ainvalidate_cache("hello")
+
+        await expensive("hello")
+        assert call_count == 3  # recalculated
+        await expensive("world")
+        assert call_count == 3  # still cached
+
+    @pytest.mark.asyncio
+    async def test_async_file_backend_invalidate_no_args_clears_l2(self, tmp_path):
+        """Async ainvalidate_cache() with no args should clear L2 entries via FileBackend."""
+        call_count = 0
+        backend = FileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=256))
+
+        @cache(backend=backend, ttl=300, namespace="test_async_file_l2_invalidate")
+        async def expensive(query: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"result_{call_count}"
+
+        await expensive("hello")
+        await expensive("world")
+        assert call_count == 2
+
+        await expensive.ainvalidate_cache()
+
+        await expensive("hello")
+        await expensive("world")
+        assert call_count == 4, (
+            f"Expected 4 calls after async invalidation, got {call_count}. L2 entries survived ainvalidate_cache() with no args."
+        )
+
 
 @pytest.mark.unit
 class TestInvalidateNoArgsCrossFunctionIsolation:
