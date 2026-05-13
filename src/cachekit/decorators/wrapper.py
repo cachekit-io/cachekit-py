@@ -1311,7 +1311,9 @@ def create_cache_wrapper(
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
         if not args and not kwargs and _func_has_params:
-            for key in _cached_keys:
+            # Snapshot prevents RuntimeError if another thread adds during iteration
+            keys_snapshot = set(_cached_keys)
+            for key in keys_snapshot:
                 if _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
@@ -1320,7 +1322,8 @@ def create_cache_wrapper(
                         _backend.delete(key)
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", key, e)
-            _cached_keys.clear()
+                        continue  # keep key tracked for retry
+                _cached_keys.discard(key)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
@@ -1350,7 +1353,8 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            for key in _cached_keys:
+            keys_snapshot = set(_cached_keys)
+            for key in keys_snapshot:
                 if _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
@@ -1359,7 +1363,8 @@ def create_cache_wrapper(
                         _backend.delete(key)
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", key, e)
-            _cached_keys.clear()
+                        continue
+                _cached_keys.discard(key)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
