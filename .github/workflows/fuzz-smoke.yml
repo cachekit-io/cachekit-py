@@ -14,6 +14,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Avoid EXDEV "cross-device link" errors on ephemeral runners where
+  # hostPath cache and overlay are on different filesystems
+  RUSTUP_HOME: /tmp/rustup
+  CARGO_HOME: /tmp/cargo
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
