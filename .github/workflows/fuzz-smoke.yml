@@ -73,6 +73,8 @@ jobs:
           fi
         done
 
+        echo "target_count=${#FUZZ_TARGETS[@]}" >> "$GITHUB_OUTPUT"
+
         # Check if any crashes were found
         if find artifacts -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' | grep -q .; then
           echo "::error::Fuzzing discovered crashes or errors. See artifacts for details."
@@ -112,7 +114,7 @@ jobs:
             echo ""
             echo "Check uploaded artifacts for crash details."
           else
-            echo "Status: All fuzz targets passed (14 targets, 60s each)"
+            echo "Status: All fuzz targets passed (${{ steps.fuzz.outputs.target_count }} targets, 60s each)"
             echo ""
             echo "No crashes, timeouts, or OOM errors detected."
           fi
