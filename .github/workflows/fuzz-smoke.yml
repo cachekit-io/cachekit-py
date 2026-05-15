@@ -61,19 +61,15 @@ jobs:
           encryption_key_derivation
         )
 
-        # Run each target for 60 seconds
         for target in "${FUZZ_TARGETS[@]}"; do
-          echo "Fuzzing $target (60s)..."
+          echo "Fuzzing $target..."
 
-          # Run fuzzing, capture exit code
           if ! cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60; then
             echo "::warning::Fuzz target '$target' found potential issues"
             # Continue to test other targets even if one fails
             touch artifacts/.fuzz_failures
           fi
         done
-
-        echo "target_count=${#FUZZ_TARGETS[@]}" >> "$GITHUB_OUTPUT"
 
         # Check if any crashes were found
         if find artifacts -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' | grep -q .; then
@@ -91,31 +87,3 @@ jobs:
         path: rust/fuzz/artifacts/
         retention-days: 30
         if-no-files-found: warn
-
-    - name: Post fuzzing summary
-      if: always()
-      run: |
-        {
-          echo "## Fuzzing Smoke Test Results"
-          echo ""
-
-          if [ -f rust/fuzz/artifacts/.fuzz_failures ]; then
-            echo "Status: Some fuzz targets found potential issues"
-            echo ""
-
-            # Count crashes by type
-            CRASHES=$(find rust/fuzz/artifacts -name 'crash-*' 2>/dev/null | wc -l || echo 0)
-            TIMEOUTS=$(find rust/fuzz/artifacts -name 'timeout-*' 2>/dev/null | wc -l || echo 0)
-            OOMS=$(find rust/fuzz/artifacts -name 'oom-*' 2>/dev/null | wc -l || echo 0)
-
-            echo "- Crashes: ${CRASHES}"
-            echo "- Timeouts: ${TIMEOUTS}"
-            echo "- OOM: ${OOMS}"
-            echo ""
-            echo "Check uploaded artifacts for crash details."
-          else
-            echo "Status: All fuzz targets passed (${{ steps.fuzz.outputs.target_count }} targets, 60s each)"
-            echo ""
-            echo "No crashes, timeouts, or OOM errors detected."
-          fi
-        } >> "$GITHUB_STEP_SUMMARY"
