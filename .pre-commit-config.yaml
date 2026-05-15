@@ -39,6 +39,25 @@ repos:
         files: \.rs$
         pass_filenames: false
 
+  # Block internal development artifacts from public repo
+  - repo: local
+    hooks:
+      - id: check-no-internal-docs
+        name: Block internal docs from public repo
+        entry: .hooks/check-no-internal-docs.sh
+        language: script
+        files: |
+          (?x)^(
+            docs/superpowers/|
+            \.spec-workflow/specs/|
+            strategy/|
+            tooling/sessions/|
+            sessions/tasks/|
+            CALIBER_LEARNINGS\.md$|
+            \.caliber/
+          )
+        pass_filenames: true
+
   # GitHub Actions workflow linting
   - repo: https://github.com/rhysd/actionlint
     rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # v1.7.12  # pragma: allowlist secret

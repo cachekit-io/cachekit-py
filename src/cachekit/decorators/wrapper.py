@@ -484,6 +484,16 @@ def create_cache_wrapper(
     # Generated lazily on first use or regenerated after cache_clear()
     function_identifier = f"{func.__module__}.{func.__qualname__}"
 
+    # Detect whether the wrapped function accepts parameters.
+    # Used to distinguish "invalidate the zero-arg entry" from "invalidate ALL entries".
+    _func_has_params = bool(inspect.signature(func).parameters)
+
+    # Track all cache keys written by this function (for no-args invalidation).
+    # When invalidate_cache() is called with no args on a parameterized function,
+    # we need to clear ALL entries — but key normalization (hashing of long keys)
+    # makes prefix matching unreliable. Tracking actual keys is simple and correct.
+    _cached_keys: set[str] = set()
+
     # Create stats tracker (session ID will be lazy-initialized on first use)
     # Pass l1_enabled for rate limit classification header
     _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
@@ -590,6 +600,7 @@ def create_cache_wrapper(
                     )
                     if _l1_cache and cache_key and serialized_bytes:
                         _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                        _cached_keys.add(cache_key)
                 except Exception as e:
                     # Serialization/storage failed but function succeeded - log and return result
                     logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
@@ -797,6 +808,7 @@ def create_cache_wrapper(
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
                 if _l1_cache and cache_key and serialized_bytes:
                     _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                _cached_keys.add(cache_key)
 
                 # Record successful cache set
                 set_duration_ms = (time.time() - start_time) * 1000
@@ -930,6 +942,7 @@ def create_cache_wrapper(
                     )
                     if _l1_cache and cache_key and serialized_bytes:
                         _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                        _cached_keys.add(cache_key)
                 except Exception as e:
                     # Serialization/storage failed but function succeeded - log and return result
                     logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
@@ -1032,6 +1045,7 @@ def create_cache_wrapper(
                         # cached_data is already serialized bytes from Redis
                         cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                         _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
+                        _cached_keys.add(cache_key)
 
                     # Handle TTL refresh if configured and threshold met
                     if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
@@ -1096,6 +1110,7 @@ def create_cache_wrapper(
                                             cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                                         )
                                         _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
+                                        _cached_keys.add(cache_key)
 
                                     return result
                             except Exception as e:
@@ -1121,6 +1136,7 @@ def create_cache_wrapper(
                                             cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                                         )
                                         _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
+                                        _cached_keys.add(cache_key)
 
                                     return result
                             except Exception:
@@ -1156,6 +1172,7 @@ def create_cache_wrapper(
                                     serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
                                 )
                                 _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                            _cached_keys.add(cache_key)
 
                             # Record successful cache set
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1235,6 +1252,7 @@ def create_cache_wrapper(
                             serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
                         )
                         _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                    _cached_keys.add(cache_key)
 
                     # Record successful cache set
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1289,14 +1307,32 @@ def create_cache_wrapper(
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", e)
 
-        # Clear both L2 (backend) and L1 cache
+        # Fix #59: When called with no args on a parameterized function,
+        # invalidate ALL cached entries for this function.
+        # Without this, it generates a key for zero-arg call (never cached) → no-op.
+        if not args and not kwargs and _func_has_params:
+            # Snapshot prevents RuntimeError if another thread adds during iteration
+            keys_snapshot = set(_cached_keys)
+            for key in keys_snapshot:
+                if _l1_cache:
+                    _l1_cache.invalidate(key)
+                if _backend and not _l1_only_mode:
+                    invalidator.set_backend(_backend)
+                    try:
+                        _backend.delete(key)
+                    except Exception as e:
+                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        continue  # keep key tracked for retry
+                _cached_keys.discard(key)
+            return
+
+        # Single-key invalidation (specific args provided, or zero-param function)
         cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
-        # Clear L1 cache first
         if _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
+        _cached_keys.discard(cache_key)
 
-        # Clear L2 cache via invalidator (skip in L1-only mode)
         if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
             invalidator.invalidate_cache(func, args, kwargs, namespace)
@@ -1314,12 +1350,29 @@ def create_cache_wrapper(
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", e)
 
-        # Clear both L2 (backend) and L1 cache
+        # Fix #59: When called with no args on a parameterized function,
+        # invalidate ALL cached entries for this function.
+        if not args and not kwargs and _func_has_params:
+            keys_snapshot = set(_cached_keys)
+            for key in keys_snapshot:
+                if _l1_cache:
+                    _l1_cache.invalidate(key)
+                if _backend and not _l1_only_mode:
+                    invalidator.set_backend(_backend)
+                    try:
+                        _backend.delete(key)
+                    except Exception as e:
+                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        continue
+                _cached_keys.discard(key)
+            return
+
+        # Single-key invalidation (specific args provided, or zero-param function)
         cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
-        # Clear L1 cache first
         if _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
+        _cached_keys.discard(cache_key)
 
         # Clear L2 cache via invalidator (skip in L1-only mode)
         if _backend and not _l1_only_mode:
