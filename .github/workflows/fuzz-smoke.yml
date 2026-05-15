@@ -33,7 +33,12 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Install Rust nightly
-      run: rustup toolchain install nightly
+      run: |
+        # Pin nightly to avoid breakage from rustix vs bleeding-edge nightly.
+        # cargo-fuzz 0.13.1 → rustix uses reserved `rustc_layout_scalar_valid_range_*`
+        # attributes that nightly 1.97.0+ rejects. Pin to last known-good nightly.
+        rustup toolchain install nightly-2026-05-10
+        rustup default nightly-2026-05-10
 
     - name: Install cargo-fuzz
       run: cargo install --locked cargo-fuzz
