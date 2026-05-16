@@ -52,6 +52,7 @@ _serializer_lock = Lock()
 # This allows passing enable_integrity_checking parameter during instantiation
 SERIALIZER_REGISTRY = {
     "auto": AutoSerializer,  # Python-specific types (NumPy, pandas, datetime optimization)
+    "pythonic": AutoSerializer,  # Alias — preserves Python types (tuples, sets, frozensets, datetime, UUID)
     "default": StandardSerializer,  # Language-agnostic MessagePack for multi-language caches
     "std": StandardSerializer,  # Explicit StandardSerializer alias
     "arrow": None,  # Lazy-loaded: requires pyarrow from [data] extra
@@ -121,7 +122,7 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
             serializer_class = SERIALIZER_REGISTRY[name]
 
         # Instantiate with integrity checking configuration
-        if name in ("default", "std", "auto", "arrow", "orjson"):
+        if name in ("default", "std", "auto", "pythonic", "arrow", "orjson"):
             # All core serializers use enable_integrity_checking parameter
             serializer = serializer_class(enable_integrity_checking=enable_integrity_checking)
         else:

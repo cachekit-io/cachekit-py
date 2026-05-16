@@ -124,6 +124,26 @@ def _safe_hasattr(obj: Any, attr: str) -> bool:
         return False
 
 
+def _wrap_tuples(obj: Any) -> Any:
+    """Recursively wrap tuples in type markers before msgpack encoding.
+
+    Msgpack natively serializes tuples as arrays (same as lists), so the
+    ``default`` callback is never called for them. This pre-processor
+    converts tuples to ``{"__tuple__": True, "value": [...]}`` markers
+    that ``_auto_object_hook`` restores on deserialization.
+
+    Only affects tuples — all other types pass through unchanged and are
+    handled by msgpack's ``default`` callback (``_auto_default``).
+    """
+    if isinstance(obj, tuple):
+        return {"__tuple__": True, "value": [_wrap_tuples(x) for x in obj]}
+    if isinstance(obj, list):
+        return [_wrap_tuples(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _wrap_tuples(v) for k, v in obj.items()}
+    return obj
+
+
 def _auto_default(obj: Any) -> Any:
     """Custom encoder for types not natively supported by MessagePack.
 
@@ -225,6 +245,14 @@ def _auto_object_hook(obj: Any) -> Any:
                 return UUID(value)
             except (ValueError, TypeError) as e:
                 raise SerializationError(f"Invalid UUID format in cached data: {value}") from e
+
+        if obj.get("__tuple__") is True:
+            if "value" not in obj:
+                raise SerializationError("Invalid tuple format: missing 'value' field in cached data")
+            value_list = obj["value"]
+            if not isinstance(value_list, list):
+                raise SerializationError(f"Invalid tuple format: expected list, got {type(value_list).__name__}")
+            return tuple(value_list)
 
         if obj.get("__set__") is True:
             if "value" not in obj:
@@ -748,6 +776,8 @@ class AutoSerializer:
 
     def _serialize_msgpack(self, obj: Any) -> bytes:
         """Serialize general object with MessagePack."""
+        # Pre-process tuples into markers (msgpack natively flattens them to lists)
+        obj = _wrap_tuples(obj)
         msgpack_data = msgpack.packb(obj, **self._msgpack_pack_opts)
 
         if self.enable_integrity_checking:
