@@ -102,32 +102,79 @@ class DefaultCacheClientProvider(CacheClientProvider):
 
 
 class DefaultBackendProvider(BackendProviderInterface):
-    """Default backend provider using Redis backend.
+    """Auto-detecting backend provider based on environment variables.
 
-    Creates RedisBackendProvider singleton with connection pooling.
-    Delegates to RedisBackendProvider.get_backend() for per-request wrappers.
+    Resolution priority (first match wins):
+        1. CACHEKIT_API_KEY       → CachekitIOBackend
+        2. CACHEKIT_REDIS_URL     → RedisBackend
+        3. CACHEKIT_MEMCACHED_SERVERS → MemcachedBackend
+        4. CACHEKIT_FILE_CACHE_DIR    → FileBackend
+        5. REDIS_URL (fallback)   → RedisBackend
 
     For single-tenant deployments (default), sets tenant_context to "default".
     For multi-tenant deployments, tenant_context must be set externally.
     """
 
     def __init__(self):
-        self._provider = None
+        self._backend = None
 
     def get_backend(self):
-        """Get per-request backend instance from singleton provider."""
-        if self._provider is None:
+        """Get backend instance, auto-detected from environment on first call."""
+        if self._backend is None:
+            self._backend = self._resolve_backend()
+        return self._backend
+
+    def _resolve_backend(self):
+        """Resolve backend from environment variables (priority order)."""
+        import logging
+        import os
+
+        logger = logging.getLogger(__name__)
+
+        api_key = os.environ.get("CACHEKIT_API_KEY")
+        redis_url = os.environ.get("CACHEKIT_REDIS_URL")
+        memcached_servers = os.environ.get("CACHEKIT_MEMCACHED_SERVERS")
+        file_cache_dir = os.environ.get("CACHEKIT_FILE_CACHE_DIR")
+        redis_url_fallback = os.environ.get("REDIS_URL")
+
+        if api_key:
+            if redis_url or redis_url_fallback:
+                logger.warning("Both CACHEKIT_API_KEY and Redis URL configured; using CachekitIO (higher priority)")
+            from cachekit.backends.cachekitio import CachekitIOBackend
+
+            return CachekitIOBackend()  # reads from env via pydantic-settings
+
+        if redis_url or redis_url_fallback:
             from cachekit.backends.redis.config import RedisBackendConfig
             from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
 
             redis_config = RedisBackendConfig.from_env()
-            self._provider = RedisBackendProvider(redis_url=redis_config.redis_url)
-
-            # Set default tenant for single-tenant mode (if not already set)
+            provider = RedisBackendProvider(redis_url=redis_config.redis_url)
             if tenant_context.get() is None:
                 tenant_context.set("default")
+            return provider.get_backend()
 
-        return self._provider.get_backend()
+        if memcached_servers:
+            from cachekit.backends.memcached import MemcachedBackend
+
+            return MemcachedBackend()  # reads from env via pydantic-settings
+
+        if file_cache_dir:
+            from cachekit.backends.file import FileBackend, FileBackendConfig
+
+            config = FileBackendConfig.from_env()
+            return FileBackend(config)
+
+        # No backend env vars found — fall back to Redis (will fail at connection time
+        # with a clear error if no Redis is available)
+        from cachekit.backends.redis.config import RedisBackendConfig
+        from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+
+        redis_config = RedisBackendConfig.from_env()
+        provider = RedisBackendProvider(redis_url=redis_config.redis_url)
+        if tenant_context.get() is None:
+            tenant_context.set("default")
+        return provider.get_backend()
 
 
 __all__ = [
