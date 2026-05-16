@@ -20,6 +20,7 @@ from ..cache_handler import (
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
+from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 
 # Config import removed - using direct DecoratorConfig integration
@@ -479,6 +480,10 @@ def create_cache_wrapper(
     # FIX: Initialize L1 cache if enabled
     _l1_cache = get_l1_cache(namespace or "default") if l1_enabled else None
 
+    # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
+    # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
+    _object_cache: ObjectCache | None = ObjectCache(max_entries=256) if _l1_only_mode else None
+
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
     # Generated lazily on first use or regenerated after cache_clear()
@@ -569,41 +574,21 @@ def create_cache_wrapper(
             reset_current_function_stats(token)
             return func(*args, **kwargs)
 
-        # L1-ONLY MODE: Skip backend initialization entirely
-        # This is the fix for the sentinel problem: when backend=None is explicitly passed,
-        # we should NOT try to get a backend from the provider
-        if _l1_only_mode:
-            # L1-only mode: Check L1 cache, execute function on miss, store in L1
-            if _l1_cache and cache_key:
-                l1_found, l1_bytes = _l1_cache.get(cache_key)
-                if l1_found and l1_bytes:
-                    # L1 cache hit
-                    try:
-                        # Pass cache_key for AAD verification (required for encryption)
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
-                        _stats.record_l1_hit()
-                        reset_current_function_stats(token)
-                        return l1_value
-                    except Exception:
-                        # L1 deserialization failed - invalidate and continue
-                        _l1_cache.invalidate(cache_key)
+        # L1-ONLY MODE: Store raw Python objects (no serialization).
+        # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
+        if _l1_only_mode and _object_cache:
+            found, cached_value = _object_cache.get(cache_key)
+            if found:
+                _stats.record_l1_hit()
+                reset_current_function_stats(token)
+                return cached_value
 
-            # L1 cache miss - execute function and store in L1
+            # Cache miss - execute function and store raw result
             _stats.record_miss()
             try:
                 result = func(*args, **kwargs)
-                # Serialize and store in L1
-                try:
-                    # Pass cache_key for AAD binding (required for encryption)
-                    serialized_bytes = operation_handler.serialization_handler.serialize_data(
-                        result, args, kwargs, cache_key=cache_key
-                    )
-                    if _l1_cache and cache_key and serialized_bytes:
-                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
-                        _cached_keys.add(cache_key)
-                except Exception as e:
-                    # Serialization/storage failed but function succeeded - log and return result
-                    logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
+                _object_cache.put(cache_key, result, ttl=ttl or 300)
+                _cached_keys.add(cache_key)
                 return result
             finally:
                 features.clear_correlation_id()
@@ -913,39 +898,19 @@ def create_cache_wrapper(
                 )
                 return await func(*args, **kwargs)
 
-            # L1-ONLY MODE: Skip backend initialization entirely
-            # This is the fix for the sentinel problem: when backend=None is explicitly passed,
-            # we should NOT try to get a backend from the provider
-            if _l1_only_mode:
-                # L1-only mode: Check L1 cache, execute function on miss, store in L1
-                if _l1_cache and cache_key:
-                    l1_found, l1_bytes = _l1_cache.get(cache_key)
-                    if l1_found and l1_bytes:
-                        # L1 cache hit
-                        try:
-                            # Pass cache_key for AAD verification (required for encryption)
-                            l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
-                            _stats.record_l1_hit()
-                            return l1_value
-                        except Exception:
-                            # L1 deserialization failed - invalidate and continue
-                            _l1_cache.invalidate(cache_key)
+            # L1-ONLY MODE: Store raw Python objects (no serialization).
+            # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
+            if _l1_only_mode and _object_cache:
+                found, cached_value = _object_cache.get(cache_key)
+                if found:
+                    _stats.record_l1_hit()
+                    return cached_value
 
-                # L1 cache miss - execute function and store in L1
+                # Cache miss - execute function and store raw result
                 _stats.record_miss()
                 result = await func(*args, **kwargs)
-                # Serialize and store in L1
-                try:
-                    # Pass cache_key for AAD binding (required for encryption)
-                    serialized_bytes = operation_handler.serialization_handler.serialize_data(
-                        result, args, kwargs, cache_key=cache_key
-                    )
-                    if _l1_cache and cache_key and serialized_bytes:
-                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
-                        _cached_keys.add(cache_key)
-                except Exception as e:
-                    # Serialization/storage failed but function succeeded - log and return result
-                    logger().debug(f"L1-only mode: serialization/storage failed for {cache_key}: {e}")
+                _object_cache.put(cache_key, result, ttl=ttl or 300)
+                _cached_keys.add(cache_key)
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
@@ -1314,7 +1279,9 @@ def create_cache_wrapper(
             # Snapshot prevents RuntimeError if another thread adds during iteration
             keys_snapshot = set(_cached_keys)
             for key in keys_snapshot:
-                if _l1_cache:
+                if _object_cache:
+                    _object_cache.delete(key)
+                elif _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
                     invalidator.set_backend(_backend)
@@ -1329,7 +1296,9 @@ def create_cache_wrapper(
         # Single-key invalidation (specific args provided, or zero-param function)
         cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
-        if _l1_cache and cache_key:
+        if _object_cache and cache_key:
+            _object_cache.delete(cache_key)
+        elif _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
         _cached_keys.discard(cache_key)
 
@@ -1355,7 +1324,9 @@ def create_cache_wrapper(
         if not args and not kwargs and _func_has_params:
             keys_snapshot = set(_cached_keys)
             for key in keys_snapshot:
-                if _l1_cache:
+                if _object_cache:
+                    _object_cache.delete(key)
+                elif _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
                     invalidator.set_backend(_backend)
@@ -1370,7 +1341,9 @@ def create_cache_wrapper(
         # Single-key invalidation (specific args provided, or zero-param function)
         cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
-        if _l1_cache and cache_key:
+        if _object_cache and cache_key:
+            _object_cache.delete(cache_key)
+        elif _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
         _cached_keys.discard(cache_key)
 
@@ -1432,9 +1405,12 @@ def create_cache_wrapper(
     def cache_clear() -> None:
         """Clear cache statistics and invalidate all cached entries."""
         _stats.clear()
-        # Also invalidate actual cache entries
-        if inspect.iscoroutinefunction(func):
-            raise TypeError("cache_clear() cannot clear cache for async functions. Use 'await fn.ainvalidate_cache()' instead.")
+        # In L1-only mode, invalidation is synchronous (no backend I/O needed)
+        # so cache_clear() works for both sync and async functions.
+        if inspect.iscoroutinefunction(func) and not _l1_only_mode:
+            raise TypeError(
+                "cache_clear() cannot clear cache for async functions with a backend. Use 'await fn.ainvalidate_cache()' instead."
+            )
         invalidate_cache()
 
     if inspect.iscoroutinefunction(func):
