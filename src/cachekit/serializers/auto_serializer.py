@@ -9,6 +9,7 @@ Auto-detects and optimizes:
 - datetime/date/time (ISO-8601)
 - UUID (string representation)
 - set/frozenset (type-safe roundtrip)
+- tuple (recursive type-safe roundtrip)
 
 Uses MessagePack as the default format with graceful degradation for optional dependencies.
 
@@ -73,7 +74,7 @@ ORM_ERROR_MESSAGE = (
 
 CUSTOM_CLASS_ERROR_MESSAGE = (
     "AutoSerializer does not support custom classes. "
-    "Supported types: dict, list, str, int, float, bool, None, bytes, "
+    "Supported types: dict, list, tuple, str, int, float, bool, None, bytes, "
     "datetime, date, time, UUID, set, frozenset, NumPy arrays, pandas DataFrames.\n"
     "Options:\n"
     "  1. Convert to dict manually\n"
