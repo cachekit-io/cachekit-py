@@ -1,4 +1,4 @@
-"""Unit tests for AutoSerializer new type support (UUID, set, frozenset).
+"""Unit tests for AutoSerializer new type support (UUID, set, frozenset, tuple).
 
 Tests:
 - UUID serialization roundtrip
@@ -559,3 +559,97 @@ class TestAutoSerializerPropertyBased:
         result1 = serializer.deserialize(bytes1)
         result2 = serializer.deserialize(bytes2)
         assert result1 == result2
+
+
+class TestAutoSerializerTuple:
+    """Test tuple preservation through AutoSerializer roundtrip."""
+
+    def test_simple_tuple_roundtrip(self):
+        serializer = AutoSerializer()
+        data = (1, 2, 3)
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, tuple)
+        assert result == (1, 2, 3)
+
+    def test_nested_tuple_roundtrip(self):
+        serializer = AutoSerializer()
+        data = (1, (2, 3), (4, (5, 6)))
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, tuple)
+        assert isinstance(result[1], tuple)
+        assert isinstance(result[2][1], tuple)
+        assert result == (1, (2, 3), (4, (5, 6)))
+
+    def test_empty_tuple_roundtrip(self):
+        serializer = AutoSerializer()
+        data = ()
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, tuple)
+        assert result == ()
+
+    def test_tuple_in_dict(self):
+        serializer = AutoSerializer()
+        data = {"key": (1, 2), "other": "value"}
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result["key"], tuple)
+        assert result["key"] == (1, 2)
+
+    def test_tuple_in_list(self):
+        serializer = AutoSerializer()
+        data = [(1, 2), (3, 4)]
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result[0], tuple)
+        assert isinstance(result[1], tuple)
+
+    def test_tuple_with_set_and_datetime(self):
+        """Tuple containing other special types that use _auto_default."""
+        from datetime import datetime
+
+        serializer = AutoSerializer()
+        data = (1, {2, 3}, datetime(2025, 1, 1))
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, tuple)
+        assert isinstance(result[1], set)
+        assert isinstance(result[2], datetime)
+
+    def test_list_preserved_as_list_not_tuple(self):
+        """Lists must stay as lists — only tuples get markers."""
+        serializer = AutoSerializer()
+        data = [1, 2, 3]
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, list)
+
+    def test_malformed_tuple_marker_missing_value(self):
+        """Malformed __tuple__ marker raises SerializationError."""
+        import msgpack
+
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        bad_data = msgpack.packb({"__tuple__": True})
+        with pytest.raises(SerializationError, match="missing 'value' field"):
+            serializer.deserialize(bad_data)
+
+    def test_malformed_tuple_marker_wrong_value_type(self):
+        """__tuple__ marker with non-list value raises SerializationError."""
+        import msgpack
+
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        bad_data = msgpack.packb({"__tuple__": True, "value": "not a list"})
+        with pytest.raises(SerializationError, match="expected list"):
+            serializer.deserialize(bad_data)
+
+
+class TestPythonicSerializerAlias:
+    """Test 'pythonic' alias for AutoSerializer."""
+
+    def test_pythonic_returns_auto_serializer(self):
+        from cachekit.serializers import get_serializer
+
+        s = get_serializer("pythonic")
+        assert isinstance(s, AutoSerializer)
