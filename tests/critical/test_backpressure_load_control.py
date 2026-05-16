@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from cachekit.reliability.load_control import BackpressureController
+from tests.utils.timing_helper import ThreadGate, TimingHelper
 
 pytestmark = pytest.mark.critical
 
@@ -38,7 +39,7 @@ class TestBackpressureLoadControl:
                     active_count["value"] += 1
                     max_observed["value"] = max(max_observed["value"], active_count["value"])
 
-                time.sleep(0.1)  # Hold permit for 100ms
+                time.sleep(0.1)  # Hold permit for 100ms (simulates real work)
 
                 with lock:
                     active_count["value"] -= 1
@@ -61,14 +62,17 @@ class TestBackpressureLoadControl:
             timeout=10.0,  # Long timeout (we won't wait)
         )
 
+        gate = ThreadGate()
+
         # Block the single execution slot
-        lock = threading.Lock()
-        lock.acquire()  # Held until we release it
+        execution_lock = threading.Lock()
+        execution_lock.acquire()  # Held until we release it
 
         def blocking_operation():
             """Operation that blocks until lock is released."""
             with controller.acquire():
-                with lock:  # This will block
+                gate.signal("acquired")
+                with execution_lock:  # This will block
                     pass
 
         def quick_operation():
@@ -79,7 +83,7 @@ class TestBackpressureLoadControl:
         # Start the blocking operation in a thread
         blocking_thread = threading.Thread(target=blocking_operation)
         blocking_thread.start()
-        time.sleep(0.05)  # Let it acquire the execution permit
+        gate.wait("acquired")
 
         # Now the execution slot is occupied, queue should start filling
         # Try to launch more operations than queue_size
@@ -103,7 +107,7 @@ class TestBackpressureLoadControl:
             t.join(timeout=1.0)
 
         # Release the blocking operation
-        lock.release()
+        execution_lock.release()
         blocking_thread.join(timeout=1.0)
 
         # Should have rejected the operations beyond queue capacity
@@ -117,19 +121,22 @@ class TestBackpressureLoadControl:
             timeout=0.01,  # Very short timeout for fast fail
         )
 
+        gate = ThreadGate()
+
         # Occupy the execution slot
         execution_lock = threading.Lock()
         execution_lock.acquire()
 
         def blocking_op():
             with controller.acquire():
+                gate.signal("acquired")
                 with execution_lock:
                     pass
 
         # Start blocking operation
         thread = threading.Thread(target=blocking_op)
         thread.start()
-        time.sleep(0.05)  # Let it acquire
+        gate.wait("acquired")
 
         # Now queue is full and execution is blocked
         # New request should fail fast
@@ -176,7 +183,12 @@ class TestBackpressureLoadControl:
         for t in threads:
             t.start()
 
-        time.sleep(0.1)  # Let them queue up
+        # Wait for threads to queue up (deterministic polling)
+        TimingHelper.wait_for_condition(
+            lambda: controller.queue_depth > 0,
+            timeout=2.0,
+            message="Should have queued requests",
+        )
 
         # Queue depth should be >0 (threads are waiting)
         current_depth = controller.queue_depth
@@ -199,18 +211,21 @@ class TestBackpressureLoadControl:
             timeout=0.01,
         )
 
+        gate = ThreadGate()
+
         # Block the execution slot
         execution_lock = threading.Lock()
         execution_lock.acquire()
 
         def blocking_op():
             with controller.acquire():
+                gate.signal("acquired")
                 with execution_lock:
                     pass
 
         thread = threading.Thread(target=blocking_op)
         thread.start()
-        time.sleep(0.05)
+        gate.wait("acquired")
 
         initial_rejected = controller.rejected_count
 
@@ -326,13 +341,15 @@ class TestBackpressureLoadControl:
         for t in threads:
             t.start()
 
-        time.sleep(0.1)  # Let them queue
+        # Wait for threads to queue (deterministic polling)
+        TimingHelper.wait_for_condition(
+            lambda: controller.queue_depth > 0,
+            timeout=2.0,
+            message="Should have queued requests",
+        )
 
         stats = controller.get_stats()
         assert stats["queue_depth"] > 0, "Should show queued requests"
-        # Health should be False if queue_depth >= 80% of queue_size
-        # 90 operations, 10 concurrent = 80 in queue -> 80% threshold
-        # This might be True or False depending on exact timing
 
         # Cleanup
         execution_lock.release()
@@ -402,18 +419,21 @@ class TestBackpressureLoadControl:
         """CRITICAL: reset_stats() properly clears monitoring counters."""
         controller = BackpressureController(max_concurrent=1, queue_size=1, timeout=0.01)
 
+        gate = ThreadGate()
+
         # Block execution
         execution_lock = threading.Lock()
         execution_lock.acquire()
 
         def blocking_op():
             with controller.acquire():
+                gate.signal("acquired")
                 with execution_lock:
                     pass
 
         thread = threading.Thread(target=blocking_op)
         thread.start()
-        time.sleep(0.05)
+        gate.wait("acquired")
 
         # Generate rejections
         from cachekit.backends.errors import BackendError

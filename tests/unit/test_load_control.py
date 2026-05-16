@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from cachekit.reliability.load_control import BackpressureController
+from tests.utils.timing_helper import ThreadGate, TimingHelper
 
 
 class TestBackpressureController:
@@ -51,17 +52,19 @@ class TestBackpressureController:
         """Test that requests are rejected when queue is full."""
         controller = BackpressureController(max_concurrent=1, queue_size=2, timeout=0.1)
 
+        gate = ThreadGate()
+        release = threading.Event()
+
         # Fill the semaphore with a long-running operation
         def blocking_operation():
             with controller.acquire():
-                time.sleep(0.2)  # Hold the permit
+                gate.signal("acquired")
+                release.wait(timeout=5.0)
 
         # Start background thread to hold the semaphore
         thread = threading.Thread(target=blocking_operation)
         thread.start()
-
-        # Give time for thread to acquire semaphore
-        time.sleep(0.05)
+        gate.wait("acquired")
 
         # These requests should be able to join the queue
         exceptions = []
@@ -82,7 +85,12 @@ class TestBackpressureController:
             queue_threads.append(t)
             t.start()
 
-        time.sleep(0.05)  # Let them enter queue
+        # Wait for queue to fill (threads are waiting on the semaphore)
+        TimingHelper.wait_for_condition(
+            lambda: controller.queue_depth >= 2,
+            timeout=2.0,
+            message="Queue should have 2 entries",
+        )
 
         # This request should be rejected (queue full)
         from cachekit.backends.errors import BackendError
@@ -95,6 +103,7 @@ class TestBackpressureController:
         assert controller.rejected_count >= 1
 
         # Clean up
+        release.set()
         thread.join()
         for t in queue_threads:
             t.join()
@@ -103,16 +112,18 @@ class TestBackpressureController:
         """Test that requests timeout when unable to acquire semaphore."""
         controller = BackpressureController(max_concurrent=1, timeout=0.05)
 
+        gate = ThreadGate()
+        release = threading.Event()
+
         # Hold the semaphore with a blocking operation
         def blocking_operation():
             with controller.acquire():
-                time.sleep(0.2)
+                gate.signal("acquired")
+                release.wait(timeout=5.0)
 
         thread = threading.Thread(target=blocking_operation)
         thread.start()
-
-        # Give time for thread to acquire semaphore
-        time.sleep(0.02)
+        gate.wait("acquired")
 
         # This should timeout
         from cachekit.backends.errors import BackendError
@@ -125,6 +136,7 @@ class TestBackpressureController:
         assert controller.rejected_count == 1
 
         # Clean up
+        release.set()
         thread.join()
 
     def test_context_manager_exception_handling(self):
@@ -333,14 +345,18 @@ class TestBackpressureController:
         """Test behavior with very small timeouts."""
         controller = BackpressureController(max_concurrent=1, timeout=0.001)
 
+        gate = ThreadGate()
+        release = threading.Event()
+
         # Hold the semaphore
         def blocking_operation():
             with controller.acquire():
-                time.sleep(0.1)
+                gate.signal("acquired")
+                release.wait(timeout=5.0)
 
         thread = threading.Thread(target=blocking_operation)
         thread.start()
-        time.sleep(0.01)  # Ensure semaphore is held
+        gate.wait("acquired")
 
         # This should timeout very quickly
         from cachekit.backends.errors import BackendError
@@ -353,4 +369,5 @@ class TestBackpressureController:
         elapsed = time.time() - start_time
         assert elapsed < 0.2  # Should timeout quickly (generous for CI jitter)
 
+        release.set()
         thread.join()

@@ -1,10 +1,9 @@
 """Unit tests for L1Cache stale-while-revalidate (SWR) functionality."""
 
 import threading
-import time
-from unittest.mock import patch
 
 import pytest
+import time_machine
 
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache
@@ -41,14 +40,13 @@ class TestL1CacheSWR:
         value = b"test_value"
         ttl = 100.0
 
-        # Mock time to simulate staleness
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Time at put
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # Time at get (60s later, past threshold of ~50s even with jitter)
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
 
             assert hit is True
@@ -65,13 +63,13 @@ class TestL1CacheSWR:
         value = b"test_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put at time 1000
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # First get at 1060 (triggers refresh)
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit1, val1, needs_refresh1, version1 = cache.get_with_swr(key, ttl)
             assert needs_refresh1 is True
 
@@ -90,20 +88,20 @@ class TestL1CacheSWR:
         new_value = b"new_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put old value
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, old_value, redis_ttl=ttl)
 
             # Trigger refresh
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
             assert needs_refresh is True
             assert version == 0
 
             # Complete refresh
-            mock_time.return_value = 1065.0
-            success = cache.complete_refresh(key, version, new_value, mock_time.return_value)
+            traveller.move_to(1065.0)
+            success = cache.complete_refresh(key, version, new_value, 1065.0)
             assert success is True
 
             # Verify new value is cached
@@ -129,14 +127,14 @@ class TestL1CacheSWR:
             cache.clear()
             test_key = f"{key}_{i}"
 
-            with patch("time.time") as mock_time:
+            with time_machine.travel(0, tick=False) as traveller:
                 # Put at time 1000
-                mock_time.return_value = 1000.0
+                traveller.move_to(1000.0)
                 cache.put(test_key, value, redis_ttl=ttl)
 
                 # Test at different elapsed times to find threshold
                 for elapsed in range(40, 61):  # 40-60s (around 50s ±10%)
-                    mock_time.return_value = 1000.0 + elapsed
+                    traveller.move_to(1000.0 + elapsed)
                     hit, val, needs_refresh, version = cache.get_with_swr(test_key, ttl)
 
                     if needs_refresh:
@@ -164,13 +162,13 @@ class TestL1CacheSWR:
         value = b"test_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put at time 1000
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # Trigger refresh
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
             assert needs_refresh is True
 
@@ -186,9 +184,10 @@ class TestL1CacheSWR:
         """Test that version mismatch prevents stale refresh under concurrent invalidation.
 
         CRITICAL RACE CONDITION TEST:
-        Thread 1: Triggers SWR refresh, sleeps 100ms, attempts complete_refresh()
-        Thread 2: Invalidates key after 50ms
-        Expected: complete_refresh() returns False (version mismatch), entry does NOT exist
+        Uses threading.Event for deterministic ordering (no sleep-based timing):
+        1. Refresher triggers SWR refresh, signals ready, waits for invalidation
+        2. Invalidator waits for ready signal, invalidates key, signals done
+        3. Refresher attempts complete_refresh() — must see version mismatch
         """
         config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5)
         cache = L1Cache(max_memory_mb=10, config=config)
@@ -198,54 +197,64 @@ class TestL1CacheSWR:
         new_value = b"new_value"
         ttl = 100.0
 
+        # Deterministic synchronization — no timing assumptions
+        refresh_triggered = threading.Event()
+        invalidation_done = threading.Event()
+
         # Shared state
         refresh_result = [None]
         thread_errors = []
 
         def refresher_thread():
-            """Thread that triggers refresh and attempts to complete it after delay."""
+            """Thread that triggers refresh, waits for invalidation, then completes."""
             try:
-                with patch("time.time") as mock_time:
-                    # Trigger refresh
-                    mock_time.return_value = 1060.0
-                    hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
+                # Trigger refresh (time is frozen at 1060.0 by time-machine)
+                hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
 
-                    if needs_refresh:
-                        # Simulate slow refresh (100ms)
-                        time.sleep(0.1)
+                if needs_refresh:
+                    # Signal: refresh is in progress, invalidator can proceed
+                    refresh_triggered.set()
 
-                        # Try to complete refresh
-                        mock_time.return_value = 1065.0
-                        success = cache.complete_refresh(key, version, new_value, mock_time.return_value)
-                        refresh_result[0] = success
+                    # Wait for invalidation to complete before attempting refresh
+                    invalidation_done.wait(timeout=2.0)
+
+                    # Try to complete refresh — should fail (version mismatch)
+                    success = cache.complete_refresh(key, version, new_value, 1065.0)
+                    refresh_result[0] = success
             except Exception as e:
                 thread_errors.append(e)
 
         def invalidator_thread():
-            """Thread that invalidates key during refresh."""
+            """Thread that invalidates key after refresh is triggered."""
             try:
-                # Wait 50ms (midway through refresh)
-                time.sleep(0.05)
+                # Wait until refresher has triggered SWR
+                refresh_triggered.wait(timeout=2.0)
 
-                # Invalidate key
+                # Invalidate key (increments version)
                 cache.invalidate_by_key(key)
+
+                # Signal: invalidation complete, refresher can proceed
+                invalidation_done.set()
             except Exception as e:
                 thread_errors.append(e)
 
-        # Setup: Put initial value
-        with patch("time.time") as mock_time:
-            mock_time.return_value = 1000.0
+        # Setup: Put initial value and advance clock past SWR threshold
+        with time_machine.travel(0, tick=False) as traveller:
+            traveller.move_to(1000.0)
             cache.put(key, old_value, redis_ttl=ttl)
 
-        # Start concurrent threads
-        t1 = threading.Thread(target=refresher_thread)
-        t2 = threading.Thread(target=invalidator_thread)
+            # Advance past SWR threshold so get_with_swr triggers refresh
+            traveller.move_to(1060.0)
 
-        t1.start()
-        t2.start()
+            # Start concurrent threads
+            t1 = threading.Thread(target=refresher_thread)
+            t2 = threading.Thread(target=invalidator_thread)
 
-        t1.join(timeout=1.0)
-        t2.join(timeout=1.0)
+            t1.start()
+            t2.start()
+
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
 
         # Verify no thread errors
         assert len(thread_errors) == 0, f"Thread errors occurred: {thread_errors}"
@@ -267,13 +276,13 @@ class TestL1CacheSWR:
         value = b"test_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put at time 1000
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # Get at 1060 (way past threshold)
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
 
             assert hit is True
@@ -289,13 +298,13 @@ class TestL1CacheSWR:
         value = b"test_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put at time 1000
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # Get at 1101 (past expiry)
-            mock_time.return_value = 1101.0
+            traveller.move_to(1101.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
 
             assert hit is False
@@ -312,13 +321,13 @@ class TestL1CacheSWR:
         new_value = b"new_value"
         ttl = 100.0
 
-        with patch("time.time") as mock_time:
+        with time_machine.travel(0, tick=False) as traveller:
             # Put entry
-            mock_time.return_value = 1000.0
+            traveller.move_to(1000.0)
             cache.put(key, value, redis_ttl=ttl)
 
             # Trigger refresh
-            mock_time.return_value = 1060.0
+            traveller.move_to(1060.0)
             hit, val, needs_refresh, version = cache.get_with_swr(key, ttl)
             assert needs_refresh is True
 
@@ -326,8 +335,8 @@ class TestL1CacheSWR:
             cache.invalidate_by_key(key)
 
             # Try to complete refresh (entry no longer exists)
-            mock_time.return_value = 1065.0
-            success = cache.complete_refresh(key, version, new_value, mock_time.return_value)
+            traveller.move_to(1065.0)
+            success = cache.complete_refresh(key, version, new_value, 1065.0)
 
             # Should return False (entry was evicted, even though version might match)
             # NOTE: Current implementation returns False for evicted entries

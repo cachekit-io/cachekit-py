@@ -1,7 +1,6 @@
 """Unit tests for metrics collection infrastructure."""
 
 import threading
-import time
 from unittest.mock import patch
 
 from cachekit.reliability.metrics_collection import (
@@ -71,8 +70,7 @@ class TestAsyncMetricsCollector:
         collector.record_counter("test_counter", {"label1": "value1"}, 2.0)
         collector.record_counter("test_counter", {"label1": "value2"}, 1.0)
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         stats = collector.get_stats()
         assert stats["processed_count"] >= 2
@@ -88,8 +86,7 @@ class TestAsyncMetricsCollector:
         collector.record_histogram("test_histogram", 0.025, {"operation": "get"})
         collector.record_histogram("test_histogram", 0.15, {"operation": "set"})
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         stats = collector.get_stats()
         assert stats["processed_count"] >= 2
@@ -104,8 +101,7 @@ class TestAsyncMetricsCollector:
         collector.record_gauge("test_gauge", 0.75, {"type": "utilization"})
         collector.record_gauge("test_gauge", 0.85, {"type": "utilization"})
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         stats = collector.get_stats()
         assert stats["processed_count"] >= 2
@@ -121,8 +117,7 @@ class TestAsyncMetricsCollector:
         for i in range(20):
             collector.record_counter("overflow_test", {"id": str(i)})
 
-        # Allow time for processing
-        time.sleep(0.2)
+        collector.flush()
 
         stats = collector.get_stats()
         # Some metrics should have been dropped
@@ -202,8 +197,7 @@ class TestAsyncMetricsCollector:
         for thread in threads:
             thread.join()
 
-        # Allow time for processing
-        time.sleep(0.2)
+        collector.flush()
 
         stats = collector.get_stats()
         # Should have processed 50 metrics (5 threads × 10 metrics each)
@@ -223,8 +217,7 @@ class TestAsyncMetricsCollector:
         # Record a valid metric after the malformed one
         collector.record_counter("valid_metric", {"test": "value"})
 
-        # Allow time for processing
-        time.sleep(0.2)
+        collector.flush()
 
         # Worker should still be alive despite the error
         assert collector._worker_thread.is_alive()
@@ -274,8 +267,7 @@ class TestMetricsIntegration:
         # Record a cache operation metric
         collector.record_counter("redis_cache_operations_total", {"operation": "get", "status": "hit"}, 1.0)
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         # Should have called the Prometheus metric
         mock_counter.labels.assert_called_with(operation="get", status="hit")
@@ -291,8 +283,7 @@ class TestMetricsIntegration:
         # Record a latency metric
         collector.record_histogram("redis_cache_operation_duration_seconds", 0.025, {"operation": "set"})
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         # Should have called the Prometheus metric
         mock_histogram.labels.assert_called_with(operation="set")
@@ -308,8 +299,7 @@ class TestMetricsIntegration:
         # Record a circuit breaker state metric
         collector.record_gauge("redis_circuit_breaker_state", 1.0, {"namespace": "test"})
 
-        # Allow time for processing
-        time.sleep(0.1)
+        collector.flush()
 
         # Should have called the Prometheus metric
         mock_gauge.labels.assert_called_with(namespace="test")
@@ -325,8 +315,7 @@ class TestMetricsIntegration:
             # Record a metric with unknown name
             collector.record_counter("unknown_metric_name", {"test": "value"}, 1.0)
 
-            # Allow time for processing
-            time.sleep(0.1)
+            collector.flush()
 
             # Should log debug message about unknown metric
             mock_logger.debug.assert_called()
