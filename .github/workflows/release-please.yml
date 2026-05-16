@@ -161,7 +161,7 @@ jobs:
   attest:
     name: Attest Build Provenance and SBOM
     needs: [release-please, validate-inputs, build-wheels, build-sdist]
-    if: needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true'
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -183,7 +183,6 @@ jobs:
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: dist/*
-        continue-on-error: true
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -230,7 +229,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [release-please, build-wheels, build-sdist, attest]
+    needs: [release-please, build-wheels, build-sdist]
     if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     environment: release
