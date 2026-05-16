@@ -95,11 +95,11 @@ class TestCacheClearSync:
             sync_func.cache_clear()  # No exception = pass
 
 
-class TestAsyncInvalidateCacheStillWorks:
-    """ainvalidate_cache() remains the recommended path for async+backend."""
+class TestAsyncInvalidateCacheL1Only:
+    """ainvalidate_cache() works for async functions in L1-only mode."""
 
-    def test_async_ainvalidate_cache_works(self):
-        """The recommended path (ainvalidate_cache) must still work for async."""
+    def test_async_ainvalidate_cache_l1_only(self):
+        """ainvalidate_cache() clears entries for async L1-only functions."""
         call_count = 0
 
         @cache(backend=None, namespace="test_ainvalidate_works")

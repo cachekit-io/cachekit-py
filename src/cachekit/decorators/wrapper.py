@@ -580,6 +580,7 @@ def create_cache_wrapper(
             found, cached_value = _object_cache.get(cache_key)
             if found:
                 _stats.record_l1_hit()
+                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 return cached_value
 
@@ -587,7 +588,7 @@ def create_cache_wrapper(
             _stats.record_miss()
             try:
                 result = func(*args, **kwargs)
-                _object_cache.put(cache_key, result, ttl=ttl or 300)
+                _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
                 _cached_keys.add(cache_key)
                 return result
             finally:
@@ -904,12 +905,13 @@ def create_cache_wrapper(
                 found, cached_value = _object_cache.get(cache_key)
                 if found:
                     _stats.record_l1_hit()
+                    features.clear_correlation_id()
                     return cached_value
 
                 # Cache miss - execute function and store raw result
                 _stats.record_miss()
                 result = await func(*args, **kwargs)
-                _object_cache.put(cache_key, result, ttl=ttl or 300)
+                _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
                 _cached_keys.add(cache_key)
                 return result
 
