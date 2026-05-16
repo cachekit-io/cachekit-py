@@ -14,10 +14,11 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 
-[dependencies.cachekit-storage]
-path = ".."
-# Target pure Rust core without Python
-default-features = false
+# Fuzz targets use cachekit-core's internal module paths (byte_storage::, encryption::)
+# not the thin PyO3 wrapper's flat re-exports.
+[dependencies.cachekit_storage]
+package = "cachekit-core"
+version = "=0.1.1"
 features = ["compression", "checksum", "messagepack", "encryption"]
 
 # Prevent this from interfering with normal build

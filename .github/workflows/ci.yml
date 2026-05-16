@@ -66,19 +66,14 @@ jobs:
       matrix:
         python-version: ${{ github.event_name == 'push' && fromJSON('["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]') || fromJSON('["3.12"]') }}
 
-    services:
-      redis:
-        image: redis@sha256:4bfd9eca23339865dc14fe75f6d9ae643f714924623978dd2798f1a673b08f43  # redis:7-alpine amd64
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: |
+        docker run -d --name redis -p 6379:6379 \
+          redis:7-alpine redis-server --save "" --appendonly no
+        until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
     - name: Install dependencies
       run: uv sync --python ${{ matrix.python-version }} --group dev
