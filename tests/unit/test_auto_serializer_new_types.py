@@ -626,11 +626,20 @@ class TestAutoSerializerTuple:
         result = serializer.deserialize(serialized, metadata)
         assert isinstance(result, list)
 
+    def test_single_element_tuple_roundtrip(self):
+        serializer = AutoSerializer()
+        data = (1,)
+        serialized, metadata = serializer.serialize(data)
+        result = serializer.deserialize(serialized, metadata)
+        assert isinstance(result, tuple)
+        assert len(result) == 1
+        assert result == (1,)
+
     def test_malformed_tuple_marker_missing_value(self):
         """Malformed __tuple__ marker raises SerializationError."""
         import msgpack
 
-        serializer = AutoSerializer(enable_integrity_checking=False)
+        serializer = AutoSerializer()
         bad_data = msgpack.packb({"__tuple__": True})
         with pytest.raises(SerializationError, match="missing 'value' field"):
             serializer.deserialize(bad_data)
@@ -639,7 +648,7 @@ class TestAutoSerializerTuple:
         """__tuple__ marker with non-list value raises SerializationError."""
         import msgpack
 
-        serializer = AutoSerializer(enable_integrity_checking=False)
+        serializer = AutoSerializer()
         bad_data = msgpack.packb({"__tuple__": True, "value": "not a list"})
         with pytest.raises(SerializationError, match="expected list"):
             serializer.deserialize(bad_data)
