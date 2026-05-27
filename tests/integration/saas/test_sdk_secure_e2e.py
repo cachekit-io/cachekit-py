@@ -47,6 +47,7 @@ from cachekit import cache
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.standard_serializer import StandardSerializer
+from cachekit.serializers.wrapper import SerializationWrapper
 
 API_URL = os.getenv("CACHEKIT_API_URL", "https://api.cachekit.io")
 API_KEY = os.getenv("CACHEKIT_API_KEY")
@@ -75,12 +76,14 @@ def _return_registered(tag: str) -> object:
 def _plaintext_recoverable(raw: bytes, expected: object) -> bool:
     """True if the *unencrypted* standard serializer reads `raw` back to `expected`.
 
-    The definitive "is it actually encrypted?" check: LZ4 compression alone can
-    hide a plaintext sentinel, but it cannot defeat a real deserialize. If this
-    returns True the bytes were never encrypted.
+    Unwraps the SerializationWrapper JSON envelope first so the check
+    operates on the actual payload bytes, not the envelope.  Without
+    this, the envelope itself would defeat the recovery check even for
+    plaintext data — a false negative.
     """
     try:
-        return _STD.deserialize(raw) == expected
+        inner_bytes, _meta, _name = SerializationWrapper.unwrap(raw)
+        return _STD.deserialize(inner_bytes) == expected
     except Exception:  # noqa: BLE001
         return False
 

@@ -577,10 +577,26 @@ class DecoratorConfig:
         # Create backend (loads config from environment)
         backend = CachekitIOBackend()
 
+        # Auto-detect encryption from CACHEKIT_MASTER_KEY if not explicitly configured
+        encryption_config = kwargs.pop("encryption", None)
+        if encryption_config is None:
+            from cachekit.config.singleton import get_settings
+
+            settings = get_settings()
+            if settings.master_key:
+                encryption_config = EncryptionConfig(
+                    enabled=True,
+                    master_key=settings.master_key.get_secret_value(),
+                    single_tenant_mode=True,
+                )
+            else:
+                encryption_config = EncryptionConfig()
+
         # Use production-grade settings with SaaS backend
         return cls(
             backend=backend,
             integrity_checking=True,
+            encryption=encryption_config,
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
