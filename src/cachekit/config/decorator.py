@@ -539,6 +539,12 @@ class DecoratorConfig:
             CACHEKIT_API_KEY: API key for authentication (required)
             CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
 
+        Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
+        AES-256-GCM encryption — no code changes needed. The SaaS stores opaque
+        ciphertext (zero-knowledge). For explicit EncryptionConfig, you must set
+        single_tenant_mode=True or provide a tenant_extractor; use @cache.secure()
+        for a convenience wrapper that handles this automatically.
+
         Args:
             **kwargs: Overrides (ttl, namespace, etc.)
 

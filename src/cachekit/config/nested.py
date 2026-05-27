@@ -285,6 +285,11 @@ class EncryptionConfig:
     NOTE: Per backend abstraction spec, encryption stores encrypted bytes in BOTH L1 and L2.
     L1 can be enabled with encryption (stores encrypted bytes, not plaintext).
 
+    Tenant mode is required: set single_tenant_mode=True for single-tenant or provide
+    a tenant_extractor callable for multi-tenant key isolation. @cache.secure() sets
+    single_tenant_mode automatically; if using EncryptionConfig directly (e.g. with
+    @cache.io), you must set it explicitly.
+
     Attributes:
         enabled: Enable client-side encryption (default: False)
         master_key: Hex-encoded master key for key derivation (required if enabled)
