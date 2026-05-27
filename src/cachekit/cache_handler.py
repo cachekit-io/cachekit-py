@@ -806,6 +806,9 @@ class CacheOperationHandler:
                 # Return a tuple (True, value) to distinguish from "no cache entry"
                 return (True, deserialized)
             return None
+        except SerializationError as e:
+            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
             return None
@@ -835,6 +838,9 @@ class CacheOperationHandler:
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
                 # Return a tuple (True, value) to distinguish from "no cache entry"
                 return (True, deserialized)
+            return None
+        except SerializationError as e:
+            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
