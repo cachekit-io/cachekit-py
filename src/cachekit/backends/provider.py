@@ -102,32 +102,46 @@ class DefaultCacheClientProvider(CacheClientProvider):
 
 
 class DefaultBackendProvider(BackendProviderInterface):
-    """Default backend provider using Redis backend.
+    """Default backend provider with env-based auto-detection.
 
-    Creates RedisBackendProvider singleton with connection pooling.
-    Delegates to RedisBackendProvider.get_backend() for per-request wrappers.
+    Priority order (first matching env var wins):
+        1. CACHEKIT_API_KEY  → CachekitIOBackend (SaaS)
+        2. CACHEKIT_REDIS_URL or REDIS_URL → RedisBackend
 
     For single-tenant deployments (default), sets tenant_context to "default".
     For multi-tenant deployments, tenant_context must be set externally.
     """
 
     def __init__(self):
-        self._provider = None
+        self._backend = None
 
     def get_backend(self):
-        """Get per-request backend instance from singleton provider."""
-        if self._provider is None:
-            from cachekit.backends.redis.config import RedisBackendConfig
-            from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+        """Get backend instance, auto-detected from environment on first call."""
+        if self._backend is not None:
+            return self._backend
 
-            redis_config = RedisBackendConfig.from_env()
-            self._provider = RedisBackendProvider(redis_url=redis_config.redis_url)
+        import os
 
-            # Set default tenant for single-tenant mode (if not already set)
-            if tenant_context.get() is None:
-                tenant_context.set("default")
+        # Priority 1: CachekitIO SaaS backend
+        if os.environ.get("CACHEKIT_API_KEY"):
+            from cachekit.backends.cachekitio import CachekitIOBackend
 
-        return self._provider.get_backend()
+            self._backend = CachekitIOBackend()
+            return self._backend
+
+        # Priority 2: Redis backend (CACHEKIT_REDIS_URL or REDIS_URL)
+        from cachekit.backends.redis.config import RedisBackendConfig
+        from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+
+        redis_config = RedisBackendConfig.from_env()
+        provider = RedisBackendProvider(redis_url=redis_config.redis_url)
+
+        # Set default tenant for single-tenant mode (if not already set)
+        if tenant_context.get() is None:
+            tenant_context.set("default")
+
+        self._backend = provider.get_backend()
+        return self._backend
 
 
 __all__ = [

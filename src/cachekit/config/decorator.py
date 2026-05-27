@@ -382,7 +382,7 @@ class DecoratorConfig:
         Use cases: PII, medical data, financial records, GDPR compliance
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:

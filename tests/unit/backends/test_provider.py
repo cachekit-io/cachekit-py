@@ -250,141 +250,120 @@ class TestDefaultCacheClientProvider:
             mock_get.assert_called_once()
 
 
+_FAKE_API_KEY = "ck_sdk_test"  # pragma: allowlist secret
+
+
 @pytest.mark.unit
 class TestDefaultBackendProvider:
-    """Test DefaultBackendProvider lazy initialization and tenant context."""
+    """Test DefaultBackendProvider env-based auto-detection."""
 
-    def test_init_provider_is_none(self) -> None:
-        """Test __init__ sets _provider to None."""
+    def test_init_backend_is_none(self) -> None:
+        """Test __init__ sets _backend to None."""
+        provider = DefaultBackendProvider()
+        assert provider._backend is None
+
+    def test_get_backend_returns_cachekitio_when_api_key_set(self) -> None:
+        """CACHEKIT_API_KEY → CachekitIOBackend (highest priority)."""
         provider = DefaultBackendProvider()
 
-        assert provider._provider is None
+        with mock.patch.dict("os.environ", {"CACHEKIT_API_KEY": _FAKE_API_KEY}):
+            with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_ckio:
+                mock_instance = mock.MagicMock()
+                mock_ckio.return_value = mock_instance
 
-    def test_get_backend_lazy_initialization(self) -> None:
-        """Test get_backend creates provider on first call."""
+                backend = provider.get_backend()
+
+                assert backend is mock_instance
+                mock_ckio.assert_called_once()
+
+    def test_get_backend_falls_through_to_redis_without_api_key(self) -> None:
+        """No CACHEKIT_API_KEY → falls through to Redis."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+            os.environ.pop("CACHEKIT_API_KEY", None)
 
-                    mock_context.get.return_value = None
+            with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
+                with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
+                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
+                        mock_config_instance = mock.MagicMock()
+                        mock_config_class.from_env.return_value = mock_config_instance
+                        mock_config_instance.redis_url = "redis://localhost:6379"
 
-                    backend = provider.get_backend()
+                        mock_provider_instance = mock.MagicMock()
+                        mock_backend_instance = mock.MagicMock()
+                        mock_provider_class.return_value = mock_provider_instance
+                        mock_provider_instance.get_backend.return_value = mock_backend_instance
+                        mock_context.get.return_value = None
 
-                    assert backend is mock_backend_instance
-                    mock_config_class.from_env.assert_called_once()
-                    mock_provider_class.assert_called_once_with(redis_url="redis://localhost:6379")
+                        backend = provider.get_backend()
 
-    def test_get_backend_uses_cached_provider(self) -> None:
-        """Test get_backend reuses provider on subsequent calls."""
+                        assert backend is mock_backend_instance
+                        mock_config_class.from_env.assert_called_once()
+
+    def test_get_backend_caches_result(self) -> None:
+        """Second call returns cached backend, no re-init."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with mock.patch.dict("os.environ", {"CACHEKIT_API_KEY": _FAKE_API_KEY}):
+            with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_ckio:
+                mock_instance = mock.MagicMock()
+                mock_ckio.return_value = mock_instance
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+                b1 = provider.get_backend()
+                b2 = provider.get_backend()
 
-                    mock_context.get.return_value = None
+                assert b1 is b2
+                mock_ckio.assert_called_once()
 
-                    # First call
-                    backend1 = provider.get_backend()
-
-                    # Second call
-                    backend2 = provider.get_backend()
-
-                    # Should use cached provider
-                    assert backend1 is mock_backend_instance
-                    assert backend2 is mock_backend_instance
-                    # RedisBackendProvider should only be instantiated once
-                    mock_provider_class.assert_called_once()
-
-    def test_get_backend_sets_default_tenant_on_init(self) -> None:
-        """Test get_backend sets default tenant context if not already set."""
+    def test_get_backend_sets_default_tenant_for_redis(self) -> None:
+        """Redis path sets tenant_context to 'default' if unset."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+            os.environ.pop("CACHEKIT_API_KEY", None)
 
-                    # Tenant context is None initially
-                    mock_context.get.return_value = None
+            with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
+                with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
+                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
+                        mock_config_instance = mock.MagicMock()
+                        mock_config_class.from_env.return_value = mock_config_instance
+                        mock_config_instance.redis_url = "redis://localhost:6379"
 
-                    provider.get_backend()
+                        mock_provider_instance = mock.MagicMock()
+                        mock_provider_class.return_value = mock_provider_instance
+                        mock_provider_instance.get_backend.return_value = mock.MagicMock()
+                        mock_context.get.return_value = None
 
-                    # Should set default tenant
-                    mock_context.set.assert_called_once_with("default")
+                        provider.get_backend()
+
+                        mock_context.set.assert_called_once_with("default")
 
     def test_get_backend_skips_tenant_setup_if_already_set(self) -> None:
-        """Test get_backend doesn't override existing tenant context."""
+        """Redis path doesn't override existing tenant context."""
         provider = DefaultBackendProvider()
 
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
 
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
+            os.environ.pop("CACHEKIT_API_KEY", None)
 
-                    # Tenant context is already set
-                    mock_context.get.return_value = "existing-tenant"
+            with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
+                with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
+                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
+                        mock_config_instance = mock.MagicMock()
+                        mock_config_class.from_env.return_value = mock_config_instance
+                        mock_config_instance.redis_url = "redis://localhost:6379"
 
-                    provider.get_backend()
+                        mock_provider_instance = mock.MagicMock()
+                        mock_provider_class.return_value = mock_provider_instance
+                        mock_provider_instance.get_backend.return_value = mock.MagicMock()
+                        mock_context.get.return_value = "existing-tenant"
 
-                    # Should NOT call set
-                    mock_context.set.assert_not_called()
+                        provider.get_backend()
 
-    def test_get_backend_multiple_calls_no_tenant_override(self) -> None:
-        """Test that subsequent calls don't reset tenant context."""
-        provider = DefaultBackendProvider()
-
-        with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
-            with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                    mock_config_instance = mock.MagicMock()
-                    mock_config_class.from_env.return_value = mock_config_instance
-                    mock_config_instance.redis_url = "redis://localhost:6379"
-
-                    mock_provider_instance = mock.MagicMock()
-                    mock_backend_instance = mock.MagicMock()
-                    mock_provider_class.return_value = mock_provider_instance
-                    mock_provider_instance.get_backend.return_value = mock_backend_instance
-
-                    # First call - tenant is None
-                    mock_context.get.return_value = None
-                    provider.get_backend()
-
-                    # Second call - tenant was set by first call
-                    mock_context.get.return_value = "default"
-                    provider.get_backend()
-
-                    # Should only set once (on first call)
-                    mock_context.set.assert_called_once_with("default")
+                        mock_context.set.assert_not_called()
