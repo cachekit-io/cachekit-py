@@ -61,6 +61,12 @@ jobs:
     name: Miri UB Detection (Subset)
     runs-on: cachekit
     timeout-minutes: 20
+    env:
+      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
+      # toolchain across overlay/hostPath boundaries on the ARC runner pod
+      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
+      RUSTUP_HOME: /tmp/rustup
+      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
