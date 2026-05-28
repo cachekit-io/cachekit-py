@@ -692,8 +692,9 @@ class CacheSerializationHandler:
             else:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)
-        except ValueError:
-            # cache_key missing for encrypted data - FAIL CLOSED (re-raise)
+        except (ValueError, SerializationError):
+            # ValueError: cache_key missing for encrypted data — FAIL CLOSED
+            # SerializationError/EncryptionError: let the outer handler log and handle
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {e}")
