@@ -233,7 +233,7 @@ class TestDecoratorConfigToDict:
         )
         d = config.to_dict()
         assert d["encryption"] is True
-        assert d["master_key"] == "a" * 64
+        assert d["master_key"] == "[REDACTED]"  # master_key masked in to_dict (CWE-200)
         assert d["tenant_extractor"] is tenant_extractor
 
     def test_to_dict_complete_config(self) -> None:
@@ -278,4 +278,4 @@ class TestDecoratorConfigToDict:
         assert d["collect_stats"] is True
         assert d["enable_prometheus_metrics"] is False
         assert d["encryption"] is True
-        assert d["master_key"] == "a" * 64
+        assert d["master_key"] == "[REDACTED]"  # masked (CWE-200)

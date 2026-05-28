@@ -303,13 +303,25 @@ class CacheSerializationHandler:
             but extraction fails, ValueError propagates to caller (no fallback to shared key).
         """
         self.serializer_name = serializer_name
+        self.enable_integrity_checking = enable_integrity_checking
+        self._deployment_uuid_value: Optional[str] = None
+
+        # Auto-detect encryption from CACHEKIT_MASTER_KEY when not explicitly configured.
+        # This is the single convergence point for ALL backends and presets.
+        if not encryption and master_key is None and tenant_extractor is None:
+            from cachekit.config.singleton import get_settings
+
+            settings = get_settings()
+            if settings.master_key:
+                encryption = True
+                master_key = settings.master_key.get_secret_value()
+                single_tenant_mode = True
+
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor
         self.single_tenant_mode = single_tenant_mode
         self.deployment_uuid = deployment_uuid
         self.master_key = master_key
-        self.enable_integrity_checking = enable_integrity_checking
-        self._deployment_uuid_value: Optional[str] = None
 
         # Extract string name for metadata storage (for protocol instances, use class name)
         if isinstance(serializer_name, str):

@@ -7,7 +7,7 @@ timeout, backpressure, monitoring, encryption).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .validation import ConfigurationError
@@ -327,7 +327,7 @@ class EncryptionConfig:
     """
 
     enabled: bool = False
-    master_key: str | None = None
+    master_key: str | None = field(default=None, repr=False)
     tenant_extractor: Callable[..., str] | None = None
     single_tenant_mode: bool = False
     deployment_uuid: str | None = None

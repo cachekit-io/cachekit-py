@@ -376,3 +376,9 @@ class TestEncryptionConfig:
             deployment_uuid="deployment-uuid-123",
         )
         config.validate()  # Should not raise
+
+    def test_master_key_not_in_repr(self) -> None:
+        """master_key must not appear in repr (CWE-532: sensitive data in logs)."""
+        key = "ab" * 32  # pragma: allowlist secret
+        config = EncryptionConfig(enabled=True, master_key=key, single_tenant_mode=True)
+        assert key not in repr(config)

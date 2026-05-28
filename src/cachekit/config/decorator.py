@@ -285,7 +285,7 @@ class DecoratorConfig:
             "enable_prometheus_metrics": self.monitoring.enable_prometheus_metrics,
             # Encryption (flattened)
             "encryption": self.encryption.enabled,
-            "master_key": self.encryption.master_key,
+            "master_key": "[REDACTED]" if self.encryption.master_key else None,
             "tenant_extractor": self.encryption.tenant_extractor,
         }
 
@@ -540,10 +540,8 @@ class DecoratorConfig:
             CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
 
         Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
-        AES-256-GCM encryption — no code changes needed. The SaaS stores opaque
-        ciphertext (zero-knowledge). For explicit EncryptionConfig, you must set
-        single_tenant_mode=True or provide a tenant_extractor; use @cache.secure()
-        for a convenience wrapper that handles this automatically.
+        AES-256-GCM encryption — no code changes needed. Auto-detection happens in
+        CacheSerializationHandler and applies to ALL presets, not just .io().
 
         Args:
             **kwargs: Overrides (ttl, namespace, etc.)
@@ -577,26 +575,11 @@ class DecoratorConfig:
         # Create backend (loads config from environment)
         backend = CachekitIOBackend()
 
-        # Auto-detect encryption from CACHEKIT_MASTER_KEY if not explicitly configured
-        encryption_config = kwargs.pop("encryption", None)
-        if encryption_config is None:
-            from cachekit.config.singleton import get_settings
-
-            settings = get_settings()
-            if settings.master_key:
-                encryption_config = EncryptionConfig(
-                    enabled=True,
-                    master_key=settings.master_key.get_secret_value(),
-                    single_tenant_mode=True,
-                )
-            else:
-                encryption_config = EncryptionConfig()
-
         # Use production-grade settings with SaaS backend
+        # Encryption auto-detected from CACHEKIT_MASTER_KEY in CacheSerializationHandler
         return cls(
             backend=backend,
             integrity_checking=True,
-            encryption=encryption_config,
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
