@@ -22,6 +22,7 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
+from ..serializers.base import SerializationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -1033,8 +1034,21 @@ def create_cache_wrapper(
 
                     return result
 
+            except SerializationError as e:
+                # Decrypt/integrity failure on L2 data — warn explicitly (fail-open: recompute)
+                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                get_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.handle_cache_error(
+                    error=e,
+                    operation="cache_get_deserialize",
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    duration_ms=get_duration_ms,
+                    correlation_id=correlation_id,
+                )
+
             except Exception as e:
-                # Redis error - record but continue to function execution
+                # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
                 features.handle_cache_error(
                     error=e,
@@ -1080,6 +1094,8 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
+                            except SerializationError as e:
+                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
@@ -1106,6 +1122,8 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
+                            except SerializationError as e:
+                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(

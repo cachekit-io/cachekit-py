@@ -285,7 +285,7 @@ class DecoratorConfig:
             "enable_prometheus_metrics": self.monitoring.enable_prometheus_metrics,
             # Encryption (flattened)
             "encryption": self.encryption.enabled,
-            "master_key": self.encryption.master_key,
+            "master_key": "[REDACTED]" if self.encryption.master_key else None,
             "tenant_extractor": self.encryption.tenant_extractor,
         }
 
@@ -382,7 +382,7 @@ class DecoratorConfig:
         Use cases: PII, medical data, financial records, GDPR compliance
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
@@ -539,6 +539,10 @@ class DecoratorConfig:
             CACHEKIT_API_KEY: API key for authentication (required)
             CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
 
+        Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
+        AES-256-GCM encryption — no code changes needed. Auto-detection happens in
+        CacheSerializationHandler and applies to ALL presets, not just .io().
+
         Args:
             **kwargs: Overrides (ttl, namespace, etc.)
 
@@ -572,6 +576,7 @@ class DecoratorConfig:
         backend = CachekitIOBackend()
 
         # Use production-grade settings with SaaS backend
+        # Encryption auto-detected from CACHEKIT_MASTER_KEY in CacheSerializationHandler
         return cls(
             backend=backend,
             integrity_checking=True,

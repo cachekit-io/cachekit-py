@@ -14,6 +14,11 @@ import pytest
 from cachekit.key_generator import CacheKeyGenerator
 
 
+def _top_level_for_key_test():
+    """Module-level function used by TestFuncNameSanitization."""
+    return 1
+
+
 class TestCacheKeyGenerator:
     """Test cache key generation algorithms."""
 
@@ -732,4 +737,77 @@ class TestKeyNormalization:
         key1 = key_generator.generate_key(func, (long_arg,), {})
         key2 = key_generator.generate_key(func, (long_arg,), {})
 
+        assert key1 == key2
+
+
+class TestFuncNameSanitization:
+    """Cache key func component must match SaaS regex [a-zA-Z0-9_.]{1,200}."""
+
+    @pytest.fixture
+    def key_generator(self):
+        return CacheKeyGenerator()
+
+    def test_nested_function_qualname_sanitized(self, key_generator):
+        """Nested functions have qualname like 'outer.<locals>.inner'."""
+
+        def outer():
+            def inner():
+                return 42
+
+            return inner
+
+        fn = outer()
+        key = key_generator.generate_key(fn, (), {})
+        func_part = key.split("func:")[1].split(":")[0]
+        assert "<" not in func_part
+        assert ">" not in func_part
+        # Should contain the sanitized equivalent
+        assert "_locals_" in func_part
+
+    def test_lambda_qualname_sanitized(self, key_generator):
+        """Lambdas have qualname like 'TestClass.<lambda>'."""
+        fn = lambda: 42  # noqa: E731
+        key = key_generator.generate_key(fn, (), {})
+        func_part = key.split("func:")[1].split(":")[0]
+        assert "<" not in func_part
+        assert ">" not in func_part
+
+    def test_saas_regex_compliance(self, key_generator):
+        """func component must match [a-zA-Z0-9_.]{1,200} with no '..'."""
+        import re
+
+        saas_regex = re.compile(r"^[a-zA-Z0-9_.]{1,200}$")
+
+        def outer():
+            def inner():
+                return 1
+
+            return inner
+
+        fn = outer()
+        key = key_generator.generate_key(fn, (), {})
+        func_part = key.split("func:")[1].split(":")[0]
+        assert saas_regex.match(func_part), f"func component '{func_part}' fails SaaS validation"
+        assert ".." not in func_part
+
+    def test_normal_function_unchanged(self, key_generator):
+        """Module-level functions with clean qualnames pass through unchanged."""
+        # _top_level_for_key_test is defined at module level — no <locals>
+        key = key_generator.generate_key(_top_level_for_key_test, (), {})
+        func_part = key.split("func:")[1].split(":")[0]
+        assert "_top_level_for_key_test" in func_part
+        assert "<" not in func_part
+
+    def test_deterministic_for_same_function(self, key_generator):
+        """Same function must always produce the same sanitized key."""
+
+        def outer():
+            def inner():
+                return 1
+
+            return inner
+
+        fn = outer()
+        key1 = key_generator.generate_key(fn, (1,), {})
+        key2 = key_generator.generate_key(fn, (1,), {})
         assert key1 == key2

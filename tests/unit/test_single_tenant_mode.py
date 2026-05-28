@@ -45,8 +45,11 @@ class TestSingleTenantModeValidation:
                 single_tenant_mode=True,
             )
 
-    def test_single_tenant_mode_allowed_without_encryption(self):
+    def test_single_tenant_mode_allowed_without_encryption(self, monkeypatch: pytest.MonkeyPatch):
         """Single-tenant mode flag is ignored when encryption=False."""
+        # Clear env to prevent auto-detect from upgrading encryption
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
         # Should not raise - single_tenant_mode is only validated when encryption=True
         handler = CacheSerializationHandler(
             encryption=False,
@@ -256,8 +259,11 @@ class TestBackwardCompatibility:
         assert handler.tenant_extractor is not None
         assert handler.single_tenant_mode is False
 
-    def test_no_encryption_unchanged(self):
+    def test_no_encryption_unchanged(self, monkeypatch: pytest.MonkeyPatch):
         """Non-encrypted handlers should work identically."""
+        # Clear env to prevent auto-detect from upgrading encryption
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
         handler = CacheSerializationHandler(
             encryption=False,
         )
