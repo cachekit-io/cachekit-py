@@ -257,10 +257,11 @@ _FAKE_API_KEY = "ck_sdk_test"  # pragma: allowlist secret
 class TestDefaultBackendProvider:
     """Test DefaultBackendProvider env-based auto-detection."""
 
-    def test_init_backend_is_none(self) -> None:
-        """Test __init__ sets _backend to None."""
+    def test_init_fields_are_none(self) -> None:
+        """Test __init__ sets cached fields to None."""
         provider = DefaultBackendProvider()
-        assert provider._backend is None
+        assert provider._cachekitio_backend is None
+        assert provider._redis_provider is None
 
     def test_get_backend_returns_cachekitio_when_api_key_set(self) -> None:
         """CACHEKIT_API_KEY → CachekitIOBackend (highest priority)."""

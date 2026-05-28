@@ -91,9 +91,9 @@ jobs:
         # GHSA-5239-wwwm-4pmq: pygments ReDoS in AdlLexer (dev-only, no fix available)
         # GHSA-58qw-9mgm-455v: pip tar/zip confusion (pip itself, no fix available)
         # GHSA-jp4c-xjxw-mgf9: pip self-update import ordering (fix requires py3.10+)
-        # GHSA-qccp-gfcp-xxvc: urllib3 cross-origin header leak (fix 2.7.0 requires py3.10+)
-        # GHSA-mf9v-mfxr-j63j: urllib3 decompression bomb (fix 2.7.0 requires py3.10+)
-        # PYSEC-2026-113: pyarrow C++ IPC pre-buffer UAF (Python bindings not affected per advisory)
+        # GHSA-qccp-gfcp-xxvc: urllib3 cross-origin header leak (dev dep via uv sync; runtime uses httpx, fix 2.7.0 requires py3.10+)
+        # GHSA-mf9v-mfxr-j63j: urllib3 decompression bomb (dev dep via uv sync; runtime uses httpx, fix 2.7.0 requires py3.10+)
+        # PYSEC-2026-113: pyarrow C++ IPC pre-buffer UAF (PreBufferMetadata not exposed to Python bindings per advisory)
         uv run pip-audit --desc --format json --output pip-audit-report.json \
           --ignore-vuln GHSA-5239-wwwm-4pmq \
           --ignore-vuln GHSA-58qw-9mgm-455v \
