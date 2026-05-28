@@ -41,6 +41,12 @@ jobs:
     name: Extended Fuzzing (3 targets × 1h)
     runs-on: cachekit
     timeout-minutes: 200
+    env:
+      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
+      # toolchain across overlay/hostPath boundaries on the ARC runner pod
+      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
+      RUSTUP_HOME: /tmp/rustup
+      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -127,6 +133,12 @@ jobs:
     name: Miri Full Suite
     runs-on: cachekit
     timeout-minutes: 30
+    env:
+      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
+      # toolchain across overlay/hostPath boundaries on the ARC runner pod
+      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
+      RUSTUP_HOME: /tmp/rustup
+      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
