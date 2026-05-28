@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
+import random
 import time
-from typing import TYPE_CHECKING, Any
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import quote
 
 import httpx
 
 from cachekit.backends.cachekitio.client import get_cached_async_http_client, get_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
-from cachekit.backends.errors import BackendError
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.logging import get_structured_logger
 
@@ -544,42 +550,104 @@ class CachekitIOBackend:
 
     # ==================== LockableBackend Protocol ====================
 
-    async def acquire_lock(self, lock_key: str, timeout: int = 5) -> str | None:
-        """Acquire distributed lock.
+    async def _try_acquire_lock(self, lock_key: str, timeout: float) -> str | None:
+        """Single attempt at the SaaS lock endpoint. Returns lock_id, or None if held.
 
-        Args:
-            lock_key: Lock identifier
-            timeout: Lock timeout in seconds
+        Non-finite (NaN / ±inf) or non-positive ``timeout`` is clamped to 1ms — without
+        the guard, ``int(NaN)`` / ``int(inf)`` would raise outside ``BackendError`` and
+        escape the wrapper's degrade-to-no-lock branch.
 
-        Returns:
-            Lock ID if acquired, None if failed
+        Raises:
+            BackendError: For AUTHENTICATION and PERMANENT failures (bad key, bad lock_key
+                format) — polling won't recover and the wrapper degrades to no-lock execution.
+                TRANSIENT/TIMEOUT/UNKNOWN are swallowed as None so the polling loop can retry.
         """
+        # Clamp non-positive / non-finite timeouts before the int conversion.
+        # int(NaN) / int(inf) raise ValueError/OverflowError that aren't BackendError, so
+        # they'd escape the wrapper's degrade-to-no-lock branch and crash the @cache.io call.
+        timeout_ms = max(1, int(timeout * 1000)) if math.isfinite(timeout) else 1
+        encoded_key = quote(lock_key, safe="")
         try:
-            payload = json.dumps({"timeout_ms": timeout * 1000})
             response = await self._request_async(
                 "POST",
-                f"{lock_key}/lock",
-                content=payload.encode(),
+                f"{encoded_key}/lock",
+                content=json.dumps({"timeout_ms": timeout_ms}).encode(),
                 headers={"Content-Type": "application/json"},
             )
-            data = response.json()
-            return data.get("lock_id")
-        except BackendError:
+        except BackendError as exc:
+            # Re-raise unrecoverable failures so the wrapper can log + degrade once,
+            # instead of burning the full blocking_timeout on billable retries.
+            if exc.error_type in (BackendErrorType.AUTHENTICATION, BackendErrorType.PERMANENT):
+                raise
             return None
 
-    async def release_lock(self, lock_key: str, lock_id: str) -> bool:
-        """Release distributed lock.
+        try:
+            data = response.json()
+            lock_id = data.get("lock_id")
+        except (ValueError, AttributeError):
+            # Malformed body from the SaaS — treat as held (retry) rather than crashing
+            # the wrapper. Same failure class as the original issue #129 if we re-raised.
+            return None
+
+        return lock_id if isinstance(lock_id, str) else None
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        timeout: float,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[bool]:
+        """Acquire distributed lock (LockableBackend protocol).
+
+        The SaaS endpoint returns immediately; client-side polling implements
+        ``blocking_timeout`` with proportional jitter (0.5×–1× the capped delay) to
+        avoid lockstep retries on concurrent waiters. Each retry is a billable SaaS
+        request — keep the cap tight.
 
         Args:
-            lock_key: Lock identifier
-            lock_id: Lock ID from acquire_lock
+            key: Lock key
+            timeout: Server-side hold duration before auto-release (seconds)
+            blocking_timeout: Max client-side wait to acquire (None = single attempt)
 
-        Returns:
-            True if released, False otherwise
+        Yields:
+            True if acquired, False if ``blocking_timeout`` elapsed without acquisition
         """
+        lock_id: str | None = None
         try:
-            # DELETE /v1/cache/{key}/lock?lock_id=xxx
-            await self._request_async("DELETE", f"{lock_key}/lock?lock_id={lock_id}")
+            lock_id = await self._try_acquire_lock(key, timeout)
+
+            if lock_id is None and blocking_timeout is not None:
+                deadline = time.monotonic() + blocking_timeout
+                delay = 0.05
+                while lock_id is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
+                    jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
+                    await asyncio.sleep(min(delay, remaining) * jitter)
+                    lock_id = await self._try_acquire_lock(key, timeout)
+                    delay = min(delay * 2, 0.5)
+
+            yield lock_id is not None
+        finally:
+            if lock_id is not None:
+                await self._release_lock(key, lock_id)
+
+    async def _release_lock(self, lock_key: str, lock_id: str) -> bool:
+        """Release distributed lock. Internal helper for ``acquire_lock``'s cleanup.
+
+        Best-effort: swallows ``BackendError`` and returns False so a release failure
+        inside ``__aexit__`` cannot mask the user's exception. The server-side ``timeout``
+        on the lock is the safety net if the DELETE never lands.
+        """
+        # URL-encode both segments: lock_key is caller-controlled, lock_id is server-issued
+        # but the SaaS contract doesn't pin a charset.
+        encoded_key = quote(lock_key, safe="")
+        encoded_id = quote(lock_id, safe="")
+        try:
+            await self._request_async("DELETE", f"{encoded_key}/lock?lock_id={encoded_id}")
             return True
         except BackendError:
             return False
