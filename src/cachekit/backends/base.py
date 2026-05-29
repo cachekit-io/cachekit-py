@@ -233,7 +233,7 @@ class LockableBackend(Protocol):
             BackendError: If backend operation fails
 
         Example:
-            >>> async with backend.acquire_lock("lock:key", timeout=30, blocking_timeout=5) as acquired:  # doctest: +SKIP
+            >>> async with backend.acquire_lock("user:123:profile", timeout=30, blocking_timeout=5) as acquired:  # doctest: +SKIP
             ...     if acquired:  # doctest: +SKIP
             ...         # Lock held, safe to proceed
             ...         pass  # doctest: +SKIP

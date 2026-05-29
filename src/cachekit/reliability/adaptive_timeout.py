@@ -161,11 +161,12 @@ class AdaptiveTimeoutManager:
         # Get adaptive timeouts for lock operations
         lock_timeout, blocking_timeout = timeout_manager.get_lock_timeouts()
 
-        redis_lock = redis_client.lock(
+        async with backend.acquire_lock(
             cache_key,
             timeout=lock_timeout,
-            blocking_timeout=blocking_timeout
-        )
+            blocking_timeout=blocking_timeout,
+        ) as acquired:
+            ...
 
     Examples:
         Create manager with defaults:
@@ -360,11 +361,12 @@ class AdaptiveTimeoutManager:
 
         Example:
             lock_timeout, blocking_timeout = manager.get_lock_timeouts()
-            redis_lock = redis_client.lock(
+            async with backend.acquire_lock(
                 cache_key,
                 timeout=lock_timeout,
-                blocking_timeout=blocking_timeout
-            )
+                blocking_timeout=blocking_timeout,
+            ) as acquired:
+                ...
         """
         with self._lock:
             return (self._current_lock_timeout, self._current_blocking_timeout)
