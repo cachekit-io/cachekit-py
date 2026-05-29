@@ -445,28 +445,29 @@ def reset_call_counters(*mock_objects):
 # Keep existing fixtures for backward compatibility
 @pytest.fixture(autouse=True)
 def setup_redis_env():
-    """Legacy fixture for backward compatibility."""
+    """Legacy fixture for backward compatibility.
 
-    # Use test database by default
+    Previously also set CACHEKIT_MASTER_KEY for every test. That broke after the
+    PR #127 auto-detect: any cached settings singleton that captured the env-set
+    master key turned encryption on globally, which the v0.6.0 cross-SDK rule
+    then rejected for non-default serializers (serializer='auto', custom
+    instances). Tests that need encryption now set CACHEKIT_MASTER_KEY locally
+    via monkeypatch.setenv.
+
+    reset_settings() brackets each test so the singleton never carries env
+    state across test boundaries.
+    """
+    from cachekit.config.singleton import reset_settings
+
     original_db = os.environ.get("REDIS_POOL_DB")
     os.environ.setdefault("REDIS_POOL_DB", "15")
-
-    # Set up master key for encryption tests (deterministic for reproducibility)
-    original_master_key = os.environ.get("CACHEKIT_MASTER_KEY")
-    if original_master_key is None:
-        # Use a fixed test master key (not secret, just for testing)
-        test_master_key = "a" * 64  # 32 bytes in hex = 64 hex chars
-        os.environ["CACHEKIT_MASTER_KEY"] = test_master_key
+    reset_settings()
 
     yield
 
-    # Restore original settings
     if original_db is not None:
         os.environ["REDIS_POOL_DB"] = original_db
-    if original_master_key is None and "CACHEKIT_MASTER_KEY" in os.environ:
-        del os.environ["CACHEKIT_MASTER_KEY"]
-    elif original_master_key is not None:
-        os.environ["CACHEKIT_MASTER_KEY"] = original_master_key
+    reset_settings()
 
 
 # =============================================================================

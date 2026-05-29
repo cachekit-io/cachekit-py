@@ -241,60 +241,15 @@ class TestSerializerGracefulDegradation:
         assert call_count == 2  # Function executed again (no cache)
 
 
-@pytest.mark.integration
-class TestSerializerWithEncryptionInProduction:
-    """Test serializer + encryption integration (production-like scenarios)."""
-
-    @pytest.fixture(autouse=True)
-    def setup_encryption(self):
-        """Set up encryption master key."""
-        original_master_key = os.environ.get("CACHEKIT_MASTER_KEY")
-        test_master_key = "a" * 64
-        os.environ["CACHEKIT_MASTER_KEY"] = test_master_key
-
-        yield
-
-        if original_master_key is not None:
-            os.environ["CACHEKIT_MASTER_KEY"] = original_master_key
-        else:
-            if "CACHEKIT_MASTER_KEY" in os.environ:
-                del os.environ["CACHEKIT_MASTER_KEY"]
-
-    def test_arrow_dataframe_caching_works_correctly(self, redis_isolated):
-        """ArrowSerializer caching with DataFrames works end-to-end."""
-        call_count = 0
-
-        @cache(ttl=300, serializer=ArrowSerializer())
-        def load_data(user_id: str) -> pd.DataFrame:
-            nonlocal call_count
-            call_count += 1
-            return pd.DataFrame({"user_id": [user_id], "balance": [call_count * 1000.0]})
-
-        # First call - cache miss
-        df1 = load_data("user-123")
-        assert call_count == 1
-        assert df1["balance"].iloc[0] == 1000.0
-
-        # Verify data in Redis exists
-        keys = redis_isolated.keys("*")
-        assert len(keys) > 0
-
-        # Second call - cache hit
-        df2 = load_data("user-123")
-        assert call_count == 1  # No additional function call (cache hit)
-        pd.testing.assert_frame_equal(df2, df1)
-
-    def test_dataframe_index_preserved_with_arrow_serializer(self, redis_isolated):
-        """DataFrame index is preserved with ArrowSerializer caching."""
-
-        @cache(ttl=300, serializer=ArrowSerializer())
-        def get_indexed_data() -> pd.DataFrame:
-            return pd.DataFrame({"value": [10, 20, 30]}, index=["a", "b", "c"])
-
-        df1 = get_indexed_data()
-        assert list(df1.index) == ["a", "b", "c"]
-
-        # Cache hit should preserve index
-        df2 = get_indexed_data()
-        pd.testing.assert_frame_equal(df2, df1)
-        assert list(df2.index) == ["a", "b", "c"]
+# TestSerializerWithEncryptionInProduction was removed: the tests combined
+# `@cache(serializer=ArrowSerializer())` with `CACHEKIT_MASTER_KEY` to assert that
+# Arrow encoding flows through the encryption path. That combination was never
+# end-to-end functional — cache_handler.py creates `EncryptionWrapper` without
+# passing the user's serializer, so the wrapper silently fell back to
+# StandardSerializer (MessagePack), not Arrow. The v0.6.0 cross-SDK rule
+# (cache_handler.py:351-362) made that silent substitution loud by rejecting
+# the configuration outright.
+#
+# Making this combination actually work requires threading the user's
+# serializer into EncryptionWrapper, marking serializers as cross-SDK
+# compatible, and updating strategy/saas-protocol-v1.0.md. Tracked separately.
