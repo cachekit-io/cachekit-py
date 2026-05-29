@@ -553,14 +553,21 @@ class CachekitIOBackend:
     async def _try_acquire_lock(self, lock_key: str, timeout: float) -> str | None:
         """Single attempt at the SaaS lock endpoint. Returns lock_id, or None if held.
 
+        ``lock_key`` is the bare cache key (LockableBackend contract). The SaaS lock
+        endpoint is ``POST /v1/cache/{key}/lock`` — no internal derivation is needed
+        because lock semantics live in the URL path, not the key namespace. Appending
+        ``:lock`` here would push the SaaS validator past its 7-segment canonical key
+        budget and trigger a 400 at the edge.
+
         Non-finite (NaN / ±inf) or non-positive ``timeout`` is clamped to 1ms — without
         the guard, ``int(NaN)`` / ``int(inf)`` would raise outside ``BackendError`` and
         escape the wrapper's degrade-to-no-lock branch.
 
         Raises:
-            BackendError: For AUTHENTICATION and PERMANENT failures (bad key, bad lock_key
-                format) — polling won't recover and the wrapper degrades to no-lock execution.
-                TRANSIENT/TIMEOUT/UNKNOWN are swallowed as None so the polling loop can retry.
+            BackendError: For AUTHENTICATION and PERMANENT failures (bad key, bad key
+                format rejected by SaaS validator) — polling won't recover and the wrapper
+                degrades to no-lock execution. TRANSIENT/TIMEOUT/UNKNOWN are swallowed as
+                None so the polling loop can retry.
         """
         # Clamp non-positive / non-finite timeouts before the int conversion.
         # int(NaN) / int(inf) raise ValueError/OverflowError that aren't BackendError, so

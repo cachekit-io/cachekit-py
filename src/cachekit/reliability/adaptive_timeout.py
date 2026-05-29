@@ -162,7 +162,7 @@ class AdaptiveTimeoutManager:
         lock_timeout, blocking_timeout = timeout_manager.get_lock_timeouts()
 
         redis_lock = redis_client.lock(
-            lock_key,
+            cache_key,
             timeout=lock_timeout,
             blocking_timeout=blocking_timeout
         )
@@ -361,7 +361,7 @@ class AdaptiveTimeoutManager:
         Example:
             lock_timeout, blocking_timeout = manager.get_lock_timeouts()
             redis_lock = redis_client.lock(
-                lock_key,
+                cache_key,
                 timeout=lock_timeout,
                 blocking_timeout=blocking_timeout
             )
