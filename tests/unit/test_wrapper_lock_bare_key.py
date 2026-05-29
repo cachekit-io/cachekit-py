@@ -117,6 +117,57 @@ class TestWrapperPassesBareCacheKeyToAcquireLock:
         )
 
 
+class _LockDeniedBackend(_RecordingLockableBackend):
+    """Variant of the recording backend whose acquire_lock yields False, simulating
+    a held lock that didn't release within ``blocking_timeout``. Drives the
+    wrapper into the lock-timeout fallback branch (``wrapper.py:1105-1108``)."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        timeout: float = 10.0,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[bool]:
+        self.lock_keys.append(key)
+        yield False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestWrapperLockTimeoutFallback:
+    """When ``acquire_lock`` yields False (contended lock didn't release in
+    time), the wrapper must log a warning naming the bare ``cache_key`` —
+    not a ``:lock``-suffixed variant — and double-check the cache before
+    falling through to execute the function."""
+
+    async def test_async_wrapper_logs_warning_with_bare_key_on_lock_timeout(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        backend = _LockDeniedBackend()
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> dict[str, int]:
+            return {"result": x * 2}
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            result = await my_func(42)
+        assert result == {"result": 84}
+
+        assert len(backend.lock_keys) == 1
+        bare_key = backend.lock_keys[0]
+
+        # The warning must reference the bare cache_key (no ``:lock`` smuggled in)
+        # so operators reading logs see the same key shape that ``get``/``set`` use.
+        timeout_warnings = [r for r in caplog.records if "Failed to acquire lock" in r.message]
+        assert len(timeout_warnings) == 1, (
+            f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
+        )
+        msg = timeout_warnings[0].message
+        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestRedisBackendOwnsLockSuffixOnWire:
