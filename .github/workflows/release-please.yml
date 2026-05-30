@@ -229,7 +229,9 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [release-please, build-wheels, build-sdist]
+    # Gate publish on attest: a paid security product must not ship wheels without
+    # verified build provenance. If attest fails, publish is skipped (re-runnable).
+    needs: [release-please, build-wheels, build-sdist, attest]
     if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     environment: release

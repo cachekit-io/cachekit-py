@@ -18,8 +18,17 @@ jobs:
     name: Kani Formal Verification
     runs-on: cachekit
     timeout-minutes: 30
+    env:
+      # Pin rustup/cargo to /tmp (single fs) to avoid EXDEV on toolchain staging,
+      # and so the kani-verifier binary lands in a known, PATH-able location. The
+      # runner's default CARGO_HOME/bin is not on PATH, so cargo-kani exited 127.
+      RUSTUP_HOME: /tmp/rustup
+      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Put cargo bin on PATH
+      run: echo "/tmp/cargo/bin" >> "$GITHUB_PATH"
 
     - name: Ensure stable toolchain
       run: |
@@ -52,8 +61,11 @@ jobs:
 
     - name: Install nightly Rust
       run: |
-        rustup toolchain install nightly
-        rustup default nightly
+        # Pin nightly: cargo-fuzz 0.13.1 → rustix uses rustc_layout_scalar_valid_range_*
+        # attributes reserved after nightly-2026-04-27. Last known-good date.
+        # Same pin as fuzz-smoke.yml.
+        rustup toolchain install nightly-2026-04-27
+        rustup default nightly-2026-04-27
 
     - name: Install cargo-fuzz
       run: cargo install --locked cargo-fuzz
@@ -68,10 +80,13 @@ jobs:
         cd rust
         timeout 3600 cargo fuzz run byte_storage_decompress --no-default-features --features compression,checksum || true
 
-    - name: Fuzz encryption_roundtrip (1 hour)
+    # NOTE: encryption_roundtrip and 8 other encryption targets are stale against
+    # cachekit-core 0.1.1 (encrypt_aes_gcm → encrypt_with_keys). See #114. Using
+    # encryption_key_derivation, which compiles, until those targets are migrated.
+    - name: Fuzz encryption_key_derivation (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run encryption_roundtrip --no-default-features --features encryption || true
+        timeout 3600 cargo fuzz run encryption_key_derivation --no-default-features --features encryption || true
 
     - name: Check for crashes
       run: |
@@ -87,7 +102,7 @@ jobs:
     - name: Generate coverage report
       run: |
         cd rust
-        for target in byte_storage_compress byte_storage_decompress encryption_roundtrip; do
+        for target in byte_storage_compress byte_storage_decompress encryption_key_derivation; do
           echo "=== Coverage for $target ==="
           cargo fuzz coverage $target || true
         done
@@ -156,6 +171,12 @@ jobs:
     name: Sanitizers (ASan, TSan, MSan)
     runs-on: cachekit
     timeout-minutes: 40
+    env:
+      # Avoid EXDEV "cross-device link" errors when rustup stages the nightly
+      # toolchain / rust-src across overlay/hostPath boundaries on the ARC runner
+      # pod (rust-lang/rustup#1239). Same pattern as fuzzing / miri-full jobs.
+      RUSTUP_HOME: /tmp/rustup
+      CARGO_HOME: /tmp/cargo
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +261,7 @@ jobs:
         Status: ${{ needs.fuzzing.result }}
         - byte_storage_compress (1 hour)
         - byte_storage_decompress (1 hour)
-        - encryption_roundtrip (1 hour)
+        - encryption_key_derivation (1 hour)
 
         ### Undefined Behavior Detection (Miri)
         Status: ${{ needs.miri-full.result }}
@@ -280,6 +301,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
+    permissions:
+      contents: read
+      issues: write
     steps:
     - name: Check all deep security checks passed
       run: |
@@ -297,3 +321,29 @@ jobs:
           exit 1
         fi
         echo "✅ All deep security checks passed"
+
+    # Surface nightly failures: a schedule-only job that fails silently is worse
+    # than no job. De-duplicate by title so we don't open a new issue every night.
+    - name: File / update tracking issue on failure
+      if: failure()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TITLE: "Security Deep nightly is failing"
+      run: |
+        body=$(printf '%s\n' \
+          "Security Deep failed on run ${{ github.run_id }}." \
+          "" \
+          "- Kani: ${{ needs.kani-verification.result }}" \
+          "- Fuzzing: ${{ needs.fuzzing.result }}" \
+          "- Atheris: ${{ needs.atheris-fuzzing.result }}" \
+          "- Miri: ${{ needs.miri-full.result }}" \
+          "- Sanitizers: ${{ needs.sanitizers.result }}" \
+          "" \
+          "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+        existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+          --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
+        else
+          gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label bug --body "$body"
+        fi
