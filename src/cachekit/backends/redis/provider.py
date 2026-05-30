@@ -327,7 +327,10 @@ class PerRequestRedisBackend:
         """Acquire distributed lock (LockableBackend protocol).
 
         Args:
-            key: Lock key (will be tenant-scoped)
+            key: Bare cache key (will be tenant-scoped and ``:lock``-suffixed internally).
+                The LockableBackend protocol passes the same key as ``get``/``set``/``delete``;
+                the ``:lock`` namespace is a Redis-backend implementation detail kept
+                on-wire for zero-migration compatibility with existing deployments.
             timeout: How long to hold lock (seconds) before auto-release
             blocking_timeout: Max time to wait for lock (None = non-blocking)
 
@@ -343,7 +346,11 @@ class PerRequestRedisBackend:
         """
         import asyncio
 
-        scoped_key = self._scoped_key(key)
+        # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
+        # Keeping this suffix on the wire preserves compatibility with existing Redis
+        # deployments — the lock identity didn't change, only the protocol boundary
+        # (the wrapper no longer pollutes the cache_key passed in).
+        scoped_key = f"{self._scoped_key(key)}:lock"
         lock = None
         try:
             from redis.lock import Lock

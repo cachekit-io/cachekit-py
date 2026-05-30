@@ -1060,8 +1060,11 @@ def create_cache_wrapper(
                 )
 
             # CACHE MISS - Use distributed lock to prevent thundering herd
-            # This ensures only one request executes the function while others wait
-            lock_key = f"{cache_key}:lock"
+            # This ensures only one request executes the function while others wait.
+            # LockableBackend protocol contract: pass the bare cache_key. Each backend
+            # owns its internal lock-namespace derivation (Redis: ``<key>:lock``; SaaS:
+            # ``POST /v1/cache/{key}/lock``). Appending here would pollute the SaaS
+            # 7-segment canonical key and 400 at the edge.
             lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
@@ -1070,7 +1073,7 @@ def create_cache_wrapper(
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
-                        lock_key,
+                        cache_key,
                         timeout=lock_timeout,
                         blocking_timeout=blocking_timeout,
                     ) as lock_acquired:
@@ -1102,9 +1105,7 @@ def create_cache_wrapper(
                         else:
                             # Lock timeout - double-check cache before giving up
                             # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {cache_key} (lock_key={lock_key}) after {blocking_timeout}s, checking cache"
-                            )
+                            logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
@@ -1202,7 +1203,7 @@ def create_cache_wrapper(
                             raise e.original_exception from e
 
                     # Lock operation failed - execute without lock
-                    logger().warning(f"Lock operation failed for {cache_key} (lock_key={lock_key}), executing without lock: {e}")
+                    logger().warning(f"Lock operation failed for {cache_key}, executing without lock: {e}")
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
