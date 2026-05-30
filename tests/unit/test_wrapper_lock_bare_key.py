@@ -25,7 +25,7 @@ does not regress the on-wire Redis lock name — the Redis backend now owns the
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -73,9 +73,9 @@ class _RecordingLockableBackend:
 
 
 @pytest.fixture(autouse=True)
-def setup_di_for_redis_isolation() -> AsyncIterator[None]:
+def setup_di_for_redis_isolation() -> Iterator[None]:
     """Override the root conftest's Redis isolation — these tests are pure unit."""
-    yield  # type: ignore[misc]
+    yield
 
 
 @pytest.mark.unit
@@ -174,10 +174,12 @@ class TestRedisBackendOwnsLockSuffixOnWire:
     """Wire compatibility: removing the wrapper's ``:lock`` suffix must NOT change
     the on-wire Redis lock name. The Redis backend owns the suffix internally."""
 
-    async def test_redis_lock_name_keeps_lock_suffix_on_wire(self) -> None:
+    async def test_redis_lock_name_keeps_lock_suffix_on_wire(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Given the wrapper passes a bare cache_key, the Redis backend must
         still construct the underlying ``redis.lock.Lock`` with ``<key>:lock``
         — preserving zero-migration compatibility for existing Redis deployments."""
+        import redis.lock
+
         from cachekit.backends.redis.provider import PerRequestRedisBackend
 
         # Mock redis client — we only need to capture Lock(name=...) construction.
@@ -196,16 +198,10 @@ class TestRedisBackendOwnsLockSuffixOnWire:
             def release(self) -> None:
                 return None
 
-        # Patch the Lock class the provider imports inside its method.
-        import redis.lock
+        monkeypatch.setattr(redis.lock, "Lock", _FakeLock)
 
-        original_lock = redis.lock.Lock
-        redis.lock.Lock = _FakeLock  # type: ignore[misc, assignment]
-        try:
-            async with backend.acquire_lock("user:123", timeout=10.0) as acquired:
-                assert acquired is True
-        finally:
-            redis.lock.Lock = original_lock  # type: ignore[misc]
+        async with backend.acquire_lock("user:123", timeout=10.0) as acquired:
+            assert acquired is True
 
         assert len(captured_lock_names) == 1
         wire_name = captured_lock_names[0]
