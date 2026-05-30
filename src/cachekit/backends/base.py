@@ -188,10 +188,23 @@ class LockableBackend(Protocol):
     - Local-only: SQLite, FileSystem (single-process locking)
     - Not supported: HTTP (stateless), Memcached, S3
 
+    Contract — bare cache key:
+        ``acquire_lock`` receives the **bare cache key**, identical to what
+        ``get``/``set``/``delete`` receive. Callers MUST NOT append suffixes
+        like ``:lock`` before passing the key. Each backend owns its own
+        lock-namespace derivation:
+
+        - Redis: derives ``<key>:lock`` internally for the on-wire lock name.
+        - CachekitIO (SaaS): the lock endpoint is ``POST /v1/cache/{key}/lock`` —
+          no key derivation needed.
+
+        This convergence keeps the Python SDK byte-for-byte compatible with
+        the cachekit-rs and cachekit-ts SDKs at the protocol boundary.
+
     Example:
         >>> # Distributed locking pattern (async context):
         >>> # if hasattr(backend, 'acquire_lock'):
-        >>> #     async with backend.acquire_lock("lock:compute", timeout=30) as acquired:
+        >>> #     async with backend.acquire_lock("user:123:profile", timeout=30) as acquired:
         >>> #         if acquired:
         >>> #             result = expensive_computation()
     """
@@ -205,7 +218,10 @@ class LockableBackend(Protocol):
         """Acquire a distributed lock on key.
 
         Args:
-            key: Lock key (e.g., "lock:user:123")
+            key: Bare cache key (e.g., ``"user:123"``) — the SAME shape passed
+                to ``get``/``set``/``delete``. Implementations are responsible
+                for any internal lock-namespace derivation; callers MUST NOT
+                pre-suffix the key.
             timeout: How long to hold the lock (seconds) before auto-release
             blocking_timeout: Max time to wait for lock acquisition (None = non-blocking)
 
@@ -217,7 +233,7 @@ class LockableBackend(Protocol):
             BackendError: If backend operation fails
 
         Example:
-            >>> async with backend.acquire_lock("lock:key", timeout=30, blocking_timeout=5) as acquired:  # doctest: +SKIP
+            >>> async with backend.acquire_lock("user:123:profile", timeout=30, blocking_timeout=5) as acquired:  # doctest: +SKIP
             ...     if acquired:  # doctest: +SKIP
             ...         # Lock held, safe to proceed
             ...         pass  # doctest: +SKIP

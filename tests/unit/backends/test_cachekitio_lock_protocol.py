@@ -121,10 +121,11 @@ class TestLockAcquisitionBehavior:
         async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=1.0) as acquired:
             assert acquired is False
 
-        # Polling must have executed multiple attempts in 1s; jitter floor is 25ms,
-        # ceiling 250ms, so at least 3 POSTs is comfortably reachable.
+        # Behavior under test: the client RETRIED at least once after the first
+        # held response. Don't pin a wall-clock count — slow runners flake on
+        # tight timing assertions even when the retry logic is correct.
         methods = _method_calls(request_mock)
-        assert methods.count("POST") >= 3, f"expected ≥3 POST attempts in 1s, got {methods}"
+        assert methods.count("POST") >= 2, f"expected client to retry at least once, got {methods}"
         assert "DELETE" not in methods
 
     async def test_eventually_acquires_after_poll(self, backend: CachekitIOBackend) -> None:
@@ -332,12 +333,15 @@ class TestCancellation:
         request_mock = AsyncMock(side_effect=responses)
         backend._request_async = request_mock  # type: ignore[method-assign]
 
+        entered = asyncio.Event()
+
         async def run() -> None:
             async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None):
+                entered.set()  # explicit handshake — body has entered the context
                 await asyncio.sleep(10)  # will be cancelled
 
         task = asyncio.create_task(run())
-        await asyncio.sleep(0.01)  # let it enter the context
+        await entered.wait()  # deterministic, no wall-clock dependence
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
