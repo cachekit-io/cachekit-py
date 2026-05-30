@@ -43,22 +43,28 @@ class _RecordingLockableBackend:
     """
 
     def __init__(self) -> None:
+        """Initialise empty in-memory store and an empty list of received lock keys."""
         self._store: dict[str, bytes] = {}
         self.lock_keys: list[str] = []  # everything the wrapper passed to acquire_lock
 
     def get(self, key: str) -> bytes | None:
+        """Return stored bytes for ``key`` or ``None`` for a cache miss."""
         return self._store.get(key)
 
     def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        """Store ``value`` at ``key``; ``ttl`` is accepted but ignored (test backend)."""
         self._store[key] = value
 
     def delete(self, key: str) -> bool:
+        """Remove ``key`` from the store; return True iff the key was present."""
         return self._store.pop(key, None) is not None
 
     def exists(self, key: str) -> bool:
+        """Return True iff ``key`` is present in the store."""
         return key in self._store
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
+        """Return ``(True, info)`` — test backend is always healthy."""
         return True, {"backend_type": "recording_lockable"}
 
     @asynccontextmanager
@@ -68,6 +74,7 @@ class _RecordingLockableBackend:
         timeout: float = 10.0,
         blocking_timeout: Optional[float] = None,
     ) -> AsyncIterator[bool]:
+        """Record ``key`` and yield ``True`` — the happy-path lock acquisition."""
         self.lock_keys.append(key)
         yield True
 
@@ -90,6 +97,7 @@ class TestWrapperPassesBareCacheKeyToAcquireLock:
 
         @cache(backend=backend, ttl=300, l1_enabled=False)
         async def my_func(x: int) -> dict[str, int]:
+            """Trivial cached coroutine used to drive the wrapper through one cache miss."""
             return {"result": x * 2}
 
         result = await my_func(42)
@@ -129,6 +137,7 @@ class _LockDeniedBackend(_RecordingLockableBackend):
         timeout: float = 10.0,
         blocking_timeout: Optional[float] = None,
     ) -> AsyncIterator[bool]:
+        """Record ``key`` and yield ``False`` — simulates a held lock not released in time."""
         self.lock_keys.append(key)
         yield False
 
@@ -146,6 +155,7 @@ class _LockBackendErrorBackend(_RecordingLockableBackend):
         timeout: float = 10.0,
         blocking_timeout: Optional[float] = None,
     ) -> AsyncIterator[bool]:
+        """Record ``key`` and raise ``BackendError`` — simulates a lock-op failure (HTTP 5xx, dropped conn)."""
         from cachekit.backends.errors import BackendError, BackendErrorType
 
         self.lock_keys.append(key)
@@ -169,12 +179,14 @@ class TestWrapperLockTimeoutFallback:
     falling through to execute the function."""
 
     async def test_async_wrapper_logs_warning_with_bare_key_on_lock_timeout(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Drive the lock-contended branch and assert the warning names the bare cache_key."""
         import logging
 
         backend = _LockDeniedBackend()
 
         @cache(backend=backend, ttl=300, l1_enabled=False)
         async def my_func(x: int) -> dict[str, int]:
+            """Trivial cached coroutine — exercises the lock-timeout fallback path."""
             return {"result": x * 2}
 
         with caplog.at_level(logging.WARNING, logger="cachekit"):
@@ -203,6 +215,7 @@ class TestWrapperLockOperationFailureFallback:
     ``cache_key``, and fall through to execute the function without a lock."""
 
     async def test_async_wrapper_logs_warning_and_falls_through_on_lock_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Raise ``BackendError`` from acquire_lock; assert warning fires and function still runs."""
         import logging
 
         backend = _LockBackendErrorBackend()
@@ -210,6 +223,7 @@ class TestWrapperLockOperationFailureFallback:
 
         @cache(backend=backend, ttl=300, l1_enabled=False)
         async def my_func(x: int) -> dict[str, int]:
+            """Trivial cached coroutine — exercises the lock-operation-failed fallback path."""
             nonlocal call_count
             call_count += 1
             return {"result": x * 3}
@@ -256,13 +270,18 @@ class TestRedisBackendOwnsLockSuffixOnWire:
         captured_lock_names: list[str] = []
 
         class _FakeLock:
+            """Stand-in for ``redis.lock.Lock`` that captures the ``name=`` kwarg passed at construction."""
+
             def __init__(self, _client: Any, *, name: str, **_kwargs: Any) -> None:
+                """Record the lock name (the on-wire key) used to construct the lock."""
                 captured_lock_names.append(name)
 
             def acquire(self, blocking: bool = True) -> bool:
+                """Pretend acquisition always succeeds (no real Redis round-trip)."""
                 return True
 
             def release(self) -> None:
+                """No-op release — no real lock state to clear."""
                 return None
 
         monkeypatch.setattr(redis.lock, "Lock", _FakeLock)
