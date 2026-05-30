@@ -133,6 +133,33 @@ class _LockDeniedBackend(_RecordingLockableBackend):
         yield False
 
 
+class _LockBackendErrorBackend(_RecordingLockableBackend):
+    """Variant whose acquire_lock raises ``BackendError`` before yielding. Drives
+    the wrapper into the ``except Exception`` lock-operation-failed branch
+    (``wrapper.py:1195-1212``) where the warning at line 1211 fires and the
+    function falls through to execute without a lock."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        timeout: float = 10.0,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[bool]:
+        from cachekit.backends.errors import BackendError, BackendErrorType
+
+        self.lock_keys.append(key)
+        # No original_exception → wrapper takes the line-1211 branch (not the
+        # function-exception re-raise at line 1208).
+        raise BackendError(
+            "simulated lock-acquisition failure",
+            error_type=BackendErrorType.TRANSIENT,
+            operation="acquire_lock",
+            key=key,
+        )
+        yield True  # unreachable, satisfies asynccontextmanager typing
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestWrapperLockTimeoutFallback:
@@ -164,6 +191,46 @@ class TestWrapperLockTimeoutFallback:
             f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
         )
         msg = timeout_warnings[0].message
+        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestWrapperLockOperationFailureFallback:
+    """When ``acquire_lock`` raises ``BackendError`` (e.g. SaaS HTTP 5xx, Redis
+    connection dropped), the wrapper must catch, log a warning naming the bare
+    ``cache_key``, and fall through to execute the function without a lock."""
+
+    async def test_async_wrapper_logs_warning_and_falls_through_on_lock_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        backend = _LockBackendErrorBackend()
+        call_count = 0
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> dict[str, int]:
+            nonlocal call_count
+            call_count += 1
+            return {"result": x * 3}
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            result = await my_func(7)
+
+        # Function executed despite lock failure (fell through to no-lock path)
+        assert result == {"result": 21}
+        assert call_count == 1, "function must execute when lock acquisition raises"
+
+        assert len(backend.lock_keys) == 1
+        bare_key = backend.lock_keys[0]
+
+        # The lock-operation-failed warning must reference the bare cache_key —
+        # not a ``:lock``-suffixed variant — matching the protocol contract.
+        lock_failed_warnings = [r for r in caplog.records if "Lock operation failed" in r.message]
+        assert len(lock_failed_warnings) == 1, (
+            f"expected one lock-operation-failed warning; got {[r.message for r in caplog.records]!r}"
+        )
+        msg = lock_failed_warnings[0].message
         assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
         assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
 

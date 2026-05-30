@@ -1104,13 +1104,8 @@ def create_cache_wrapper(
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
                         else:
                             # Lock timeout - double-check cache before giving up
-                            # Another request may have populated it while we waited.
-                            # pragma: behaviour pinned by tests/unit/test_wrapper_lock_bare_key.py
-                            # ::TestWrapperLockTimeoutFallback (caplog assertion); codecov's
-                            # multi-session aggregate misreports this defensive warning.
-                            logger().warning(  # pragma: no cover
-                                f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache"
-                            )
+                            # Another request may have populated it while we waited
+                            logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
