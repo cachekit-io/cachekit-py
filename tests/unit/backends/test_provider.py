@@ -11,6 +11,7 @@ Tests for backends/provider.py covering:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -368,3 +369,90 @@ class TestDefaultBackendProvider:
                         provider.get_backend()
 
                         mock_context.set.assert_not_called()
+
+    def test_init_includes_memcached_and_file_caches(self) -> None:
+        """New cached fields start as None."""
+        provider = DefaultBackendProvider()
+        assert provider._memcached_backend is None
+        assert provider._file_backend is None
+
+    def test_get_backend_returns_memcached_when_servers_set(self) -> None:
+        """CACHEKIT_MEMCACHED_SERVERS → MemcachedBackend."""
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict("os.environ", {"CACHEKIT_MEMCACHED_SERVERS": '["127.0.0.1:11211"]'}, clear=True):
+            with mock.patch("cachekit.backends.memcached.MemcachedBackend") as mock_mc:
+                with mock.patch("cachekit.backends.memcached.MemcachedBackendConfig"):
+                    mock_instance = mock.MagicMock()
+                    mock_mc.return_value = mock_instance
+
+                    backend = provider.get_backend()
+
+                    assert backend is mock_instance
+                    mock_mc.assert_called_once()
+
+    def test_get_backend_returns_file_when_cache_dir_set(self, tmp_path: Path) -> None:
+        """CACHEKIT_FILE_CACHE_DIR → FileBackend."""
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict("os.environ", {"CACHEKIT_FILE_CACHE_DIR": str(tmp_path)}, clear=True):
+            with mock.patch("cachekit.backends.file.FileBackend") as mock_file:
+                with mock.patch("cachekit.backends.file.FileBackendConfig"):
+                    mock_instance = mock.MagicMock()
+                    mock_file.return_value = mock_instance
+
+                    backend = provider.get_backend()
+
+                    assert backend is mock_instance
+                    mock_file.assert_called_once()
+
+    def test_get_backend_explicit_redis_url(self) -> None:
+        """CACHEKIT_REDIS_URL is an explicit selector → RedisBackend."""
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict("os.environ", {"CACHEKIT_REDIS_URL": "redis://localhost:6379"}, clear=True):
+            with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
+                with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
+                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
+                        mock_config_class.from_env.return_value = mock.MagicMock(redis_url="redis://localhost:6379")
+                        mock_provider_instance = mock.MagicMock()
+                        mock_backend_instance = mock.MagicMock()
+                        mock_provider_class.return_value = mock_provider_instance
+                        mock_provider_instance.get_backend.return_value = mock_backend_instance
+                        mock_context.get.return_value = None
+
+                        backend = provider.get_backend()
+
+                        assert backend is mock_backend_instance
+
+    def test_get_backend_raises_on_ambiguous_selectors(self) -> None:
+        """More than one prefixed selector → ConfigurationError (unambiguous auto-detect)."""
+        from cachekit.config.validation import ConfigurationError
+
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict(
+            "os.environ",
+            {"CACHEKIT_API_KEY": _FAKE_API_KEY, "CACHEKIT_REDIS_URL": "redis://localhost:6379"},
+            clear=True,
+        ):
+            with pytest.raises(ConfigurationError, match="Ambiguous backend"):
+                provider.get_backend()
+
+    def test_redis_url_fallback_is_not_a_conflict(self) -> None:
+        """Non-prefixed REDIS_URL alongside a prefixed selector is a fallback, not a conflict."""
+        provider = DefaultBackendProvider()
+
+        with mock.patch.dict(
+            "os.environ",
+            {"CACHEKIT_API_KEY": _FAKE_API_KEY, "REDIS_URL": "redis://localhost:6379"},
+            clear=True,
+        ):
+            with mock.patch("cachekit.backends.cachekitio.CachekitIOBackend") as mock_ckio:
+                mock_instance = mock.MagicMock()
+                mock_ckio.return_value = mock_instance
+
+                backend = provider.get_backend()
+
+                # API_KEY wins; REDIS_URL is ignored and does not raise.
+                assert backend is mock_instance
