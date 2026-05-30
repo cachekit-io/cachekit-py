@@ -104,36 +104,85 @@ class DefaultCacheClientProvider(CacheClientProvider):
 class DefaultBackendProvider(BackendProviderInterface):
     """Default backend provider with env-based auto-detection.
 
-    Priority order (first matching env var wins):
-        1. CACHEKIT_API_KEY  → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL or REDIS_URL → RedisBackend
+    Selection is by a single, unambiguous environment signal. Priority order:
+        1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
+        2. CACHEKIT_REDIS_URL          → RedisBackend
+        3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
+        4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
+        5. REDIS_URL, or nothing set   → RedisBackend (12-factor / localhost default)
 
-    For single-tenant deployments (default), sets tenant_context to "default".
-    For multi-tenant deployments, tenant_context must be set externally.
+    Setting more than one of the four prefixed selectors (1-4) raises
+    ``ConfigurationError`` — auto-detection must be unambiguous; pass
+    ``backend=`` explicitly to override. The non-prefixed ``REDIS_URL`` is only a
+    fallback and never counts as a conflict (12-factor convention).
+
+    CachekitIO/Memcached/File backends are stateless singletons (cached). Redis
+    backends are per-request tenant-scoped wrappers (not cached —
+    RedisBackendProvider.get_backend() reads the tenant_context ContextVar). For
+    single-tenant deployments (default), tenant_context is set to "default".
     """
+
+    # Prefixed selectors in priority order. REDIS_URL is the implicit fallback
+    # and intentionally excluded so it never triggers a conflict.
+    _SELECTORS = (
+        ("CACHEKIT_API_KEY", "cachekitio"),
+        ("CACHEKIT_REDIS_URL", "redis"),
+        ("CACHEKIT_MEMCACHED_SERVERS", "memcached"),
+        ("CACHEKIT_FILE_CACHE_DIR", "file"),
+    )
 
     def __init__(self):
         self._cachekitio_backend = None
         self._redis_provider = None
+        self._memcached_backend = None
+        self._file_backend = None
 
-    def get_backend(self):
-        """Get backend instance, auto-detected from environment on first call.
+    def _detect(self):
+        """Return the chosen backend key, or None to use the Redis fallback.
 
-        CachekitIO backends are stateless singletons (cached).
-        Redis backends are per-request tenant-scoped wrappers (not cached —
-        RedisBackendProvider.get_backend() reads tenant_context ContextVar).
+        Raises ConfigurationError if more than one prefixed selector is set.
         """
         import os
 
-        # Priority 1: CachekitIO SaaS backend (stateless, safe to cache)
-        if os.environ.get("CACHEKIT_API_KEY"):
+        matched = [(env_var, key) for env_var, key in self._SELECTORS if os.environ.get(env_var)]
+        if len(matched) > 1:
+            from cachekit.config.validation import ConfigurationError
+
+            names = ", ".join(env_var for env_var, _ in matched)
+            raise ConfigurationError(
+                f"Ambiguous backend auto-detection: multiple selectors set ({names}). "
+                "Set exactly one of CACHEKIT_API_KEY / CACHEKIT_REDIS_URL / "
+                "CACHEKIT_MEMCACHED_SERVERS / CACHEKIT_FILE_CACHE_DIR, or pass backend= explicitly."
+            )
+        return matched[0][1] if matched else None
+
+    def get_backend(self):
+        """Get backend instance, auto-detected from environment on first call."""
+        choice = self._detect()
+
+        if choice == "cachekitio":
             if self._cachekitio_backend is None:
                 from cachekit.backends.cachekitio import CachekitIOBackend
 
                 self._cachekitio_backend = CachekitIOBackend()
             return self._cachekitio_backend
 
-        # Priority 2: Redis backend (tenant-scoped, call provider each time)
+        if choice == "memcached":
+            if self._memcached_backend is None:
+                from cachekit.backends.memcached import MemcachedBackend, MemcachedBackendConfig
+
+                self._memcached_backend = MemcachedBackend(MemcachedBackendConfig.from_env())
+            return self._memcached_backend
+
+        if choice == "file":
+            if self._file_backend is None:
+                from cachekit.backends.file import FileBackend, FileBackendConfig
+
+                self._file_backend = FileBackend(FileBackendConfig.from_env())
+            return self._file_backend
+
+        # choice == "redis" (explicit CACHEKIT_REDIS_URL) or None (REDIS_URL / localhost fallback).
+        # Tenant-scoped: call the provider each time so it re-reads tenant_context.
         if self._redis_provider is None:
             from cachekit.backends.redis.config import RedisBackendConfig
             from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
