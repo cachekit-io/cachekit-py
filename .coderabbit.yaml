@@ -1,0 +1,68 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-AU"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        Rust code. Check for unsafe blocks, unwrap abuse, missing error propagation,
+        and clippy-level issues. Prefer Result over panic. Pay special attention to
+        FFI boundaries (NAPI, PyO3) — verify buffer lengths, null checks, and that
+        keys/secrets are zeroized on drop.
+    - path: "**/*.py"
+      instructions: |
+        Python code. Enforce ruff compatibility, type hints on public APIs,
+        guard clauses over nesting. No bare except clauses. Secrets must use
+        pydantic SecretStr. Config via pydantic-settings only.
+    - path: "**/*.ts"
+      instructions: |
+        TypeScript code. Strict mode, no `any` types on public APIs.
+        Verify async error handling — no unhandled promise rejections.
+        Check that NAPI bindings match Rust function signatures exactly.
+    - path: "**/encryption/**"
+      instructions: |
+        Security-critical encryption code. Verify AAD v0x03 format compliance,
+        key length validation (exactly 32 bytes), nonce uniqueness, and that
+        keys never leak into error messages or logs. Cross-reference with
+        protocol spec at https://github.com/cachekit-io/protocol.
+    - path: ".github/workflows/**"
+      instructions: |
+        GitHub Actions workflows. All actions MUST be pinned to full 40-char SHA
+        with a version comment (e.g., @abc123 # v6). Never use tag refs.
+    - path: "**/Dockerfile*"
+      instructions: |
+        Dockerfiles. Check for missing cleanup (rm -rf /var/lib/apt/lists/*),
+        unnecessary layers, running as root, and unpinned base images.
+
+  tools:
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    ruff:
+      enabled: true
+    yamllint:
+      enabled: true
+    hadolint:
+      enabled: true
+    biome:
+      enabled: true
+    eslint:
+      enabled: true
+
+chat:
+  auto_reply: true
