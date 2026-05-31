@@ -114,16 +114,21 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
+    # interpreter uv builds atheris from sdist, which needs clang + libFuzzer
+    # (find_libfuzzer.sh) — absent on the self-hosted runner, so install fails
+    # before any fuzzing runs. Both uv sync and uv run must pin, or uv run
+    # re-resolves to a different interpreter and re-triggers the source build.
     - name: Install dependencies
       run: |
-        uv sync --group dev --group fuzz
+        uv sync --group dev --group fuzz --python 3.11
 
     - name: Run Atheris fuzz targets (10 min each)
       run: |
         for fuzz_target in tests/fuzzing/fuzz_*.py; do
           if [ -f "$fuzz_target" ]; then
             echo "Fuzzing $fuzz_target..."
-            timeout 10m uv run python "$fuzz_target" -max_total_time=600 || true
+            timeout 10m uv run --python 3.11 python "$fuzz_target" -max_total_time=600 || true
           fi
         done
 
