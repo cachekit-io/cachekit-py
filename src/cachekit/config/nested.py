@@ -290,20 +290,35 @@ class EncryptionConfig:
     single_tenant_mode automatically; if using EncryptionConfig directly (e.g. with
     @cache.io), you must set it explicitly.
 
+    Tri-state ``enabled`` (issue #128): a plain bool cannot tell "user left it unset"
+    from "user explicitly disabled", so a deliberate opt-out was silently overridden by
+    fleet-wide CACHEKIT_MASTER_KEY auto-detection. ``enabled`` is therefore None/True/False:
+        - None (default): unset — defer to CACHEKIT_MASTER_KEY auto-detection downstream.
+        - True: force client-side encryption ON (requires master_key + tenant mode).
+        - False: explicit hard opt-out — never encrypt, even when a master key is present.
+
     Attributes:
-        enabled: Enable client-side encryption (default: False)
-        master_key: Hex-encoded master key for key derivation (required if enabled)
+        enabled: Tri-state encryption flag (default: None = unset/auto-detect).
+                 True = force-on, False = explicit opt-out.
+        master_key: Hex-encoded master key for key derivation (required if enabled=True)
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode (default: None)
 
     Examples:
-        Disabled by default (no encryption):
+        Unset by default (defers to auto-detection, no encryption forced):
 
         >>> config = EncryptionConfig()
-        >>> config.enabled
+        >>> config.enabled is None
+        True
+        >>> config.validate()  # No error when unset
+
+        Explicit opt-out (never encrypts, even with CACHEKIT_MASTER_KEY set):
+
+        >>> off = EncryptionConfig(enabled=False)
+        >>> off.enabled
         False
-        >>> config.validate()  # No error when disabled
+        >>> off.validate()  # No error when explicitly disabled
 
         Single-tenant encryption:
 
@@ -326,7 +341,7 @@ class EncryptionConfig:
         cachekit.config.validation.ConfigurationError: Encryption requires explicit tenant mode...
     """
 
-    enabled: bool = False
+    enabled: bool | None = None
     master_key: str | None = field(default=None, repr=False)
     tenant_extractor: Callable[..., str] | None = None
     single_tenant_mode: bool = False
@@ -335,10 +350,18 @@ class EncryptionConfig:
     def validate(self) -> None:
         """Validate encryption configuration.
 
+        Only the explicit force-on state (enabled=True) requires a master key. The
+        unset (None) and explicit opt-out (False) states are both falsy and skip
+        validation — None defers to downstream auto-detection, False never encrypts.
+
+        The master key may be supplied inline or via the CACHEKIT_MASTER_KEY env var
+        (resolved here so force-on works fleet-wide without inlining the key, matching
+        the handler's own resolution).
+
         Raises:
-            ConfigurationError: If encryption enabled but master_key not set
+            ConfigurationError: If encryption enabled but no master_key (inline or env)
         """
-        if self.enabled and not self.master_key:
+        if self.enabled and not self._resolve_master_key():
             raise ConfigurationError(
                 "encryption.enabled=True requires encryption.master_key. "
                 "Set CACHEKIT_MASTER_KEY environment variable or pass master_key parameter."
@@ -357,3 +380,17 @@ class EncryptionConfig:
                     "Cannot use both tenant_extractor and single_tenant_mode. "
                     "Choose multi-tenant (tenant_extractor) OR single-tenant (single_tenant_mode=True)."
                 )
+
+    def _resolve_master_key(self) -> str | None:
+        """Resolve the master key from the inline value, falling back to env settings.
+
+        Inline master_key takes precedence; otherwise read CACHEKIT_MASTER_KEY via the
+        settings singleton. Mirrors validate_encryption_config so the config-level and
+        handler-level views of "is a key available?" stay consistent.
+        """
+        if self.master_key:
+            return self.master_key
+        from cachekit.config.singleton import get_settings
+
+        settings = get_settings()
+        return settings.master_key.get_secret_value() if settings.master_key else None

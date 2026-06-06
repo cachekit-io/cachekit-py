@@ -144,6 +144,28 @@ def cache(
             existing_l1 = manual_overrides.pop("l1", L1CacheConfig())
             manual_overrides["l1"] = replace(existing_l1, enabled=l1_enabled)
 
+        # Map flattened tri-state encryption flag + related kwargs to nested EncryptionConfig.
+        # Tri-state (issue #128): @cache(encryption=False) is a DELIBERATE opt-out that must
+        # survive fleet-wide CACHEKIT_MASTER_KEY auto-detection. None=auto, True=force, False=off.
+        #
+        # Scope: ONLY the bare/default decorator path (no config=, no _intent). Intent presets
+        # (.secure, .io, ...) own their encryption-param handling, and config= is the RORO form.
+        # An already-constructed EncryptionConfig passes through untouched — wrapping it again
+        # would nest EncryptionConfig inside EncryptionConfig.enabled.
+        if config is None and _intent is None:
+            from cachekit.config.nested import EncryptionConfig
+
+            _enc_passthrough = isinstance(manual_overrides.get("encryption"), EncryptionConfig)
+            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"}
+            if not _enc_passthrough and (_enc_keys & manual_overrides.keys()):
+                enc_overrides: dict[str, Any] = {}
+                if "encryption" in manual_overrides:
+                    enc_overrides["enabled"] = manual_overrides.pop("encryption")
+                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"):
+                    if _k in manual_overrides:
+                        enc_overrides[_k] = manual_overrides.pop(_k)
+                manual_overrides["encryption"] = replace(EncryptionConfig(), **enc_overrides)
+
         # RORO config takes highest precedence
         if config is not None:
             # DecoratorConfig instance provided - use it directly with overrides

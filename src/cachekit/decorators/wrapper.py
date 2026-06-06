@@ -281,7 +281,7 @@ def create_cache_wrapper(
     # Serialization & Security
     serializer: Union[str, SerializerProtocol] = "default",  # type: ignore[name-defined]
     integrity_checking: bool = True,
-    encryption: bool = False,
+    encryption: bool | None = None,
     tenant_extractor: TenantContextExtractor | None = None,
     single_tenant_mode: bool = False,
     deployment_uuid: str | None = None,
@@ -318,8 +318,13 @@ def create_cache_wrapper(
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
-        encryption: Enable zero-knowledge encryption layer (AES-256-GCM).
-                   Orthogonal to serializer - wraps ANY serializer with encryption.
+        encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
+                   to serializer - wraps ANY serializer with encryption.
+                   - None (default): auto-detect from CACHEKIT_MASTER_KEY (fleet-wide opt-in).
+                   - True: force encryption ON.
+                   - False: explicit per-function opt-out — never encrypts, even when
+                     CACHEKIT_MASTER_KEY is set. Use to exclude a single function from
+                     fleet-wide encryption (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
                          If None: single-tenant mode (uses nil UUID for encryption).

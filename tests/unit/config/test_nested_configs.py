@@ -288,9 +288,13 @@ class TestEncryptionConfig:
     """Test EncryptionConfig validation (master_key + tenant mode)."""
 
     def test_defaults(self) -> None:
-        """Test default values."""
+        """Test default values.
+
+        enabled defaults to None (tri-state, issue #128): unset means "defer to
+        CACHEKIT_MASTER_KEY auto-detection", distinct from an explicit False opt-out.
+        """
         config = EncryptionConfig()
-        assert config.enabled is False
+        assert config.enabled is None
         assert config.master_key is None
         assert config.tenant_extractor is None
         assert config.single_tenant_mode is False
