@@ -22,6 +22,7 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
+from ..serializers.base import SerializationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -1033,8 +1034,21 @@ def create_cache_wrapper(
 
                     return result
 
+            except SerializationError as e:
+                # Decrypt/integrity failure on L2 data — warn explicitly (fail-open: recompute)
+                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                get_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.handle_cache_error(
+                    error=e,
+                    operation="cache_get_deserialize",
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    duration_ms=get_duration_ms,
+                    correlation_id=correlation_id,
+                )
+
             except Exception as e:
-                # Redis error - record but continue to function execution
+                # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
                 features.handle_cache_error(
                     error=e,
@@ -1046,8 +1060,11 @@ def create_cache_wrapper(
                 )
 
             # CACHE MISS - Use distributed lock to prevent thundering herd
-            # This ensures only one request executes the function while others wait
-            lock_key = f"{cache_key}:lock"
+            # This ensures only one request executes the function while others wait.
+            # LockableBackend protocol contract: pass the bare cache_key. Each backend
+            # owns its internal lock-namespace derivation (Redis: ``<key>:lock``; SaaS:
+            # ``POST /v1/cache/{key}/lock``). Appending here would pollute the SaaS
+            # 7-segment canonical key and 400 at the edge.
             lock_timeout = 30.0  # Lock expires after 30 seconds to prevent deadlock
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
@@ -1056,7 +1073,7 @@ def create_cache_wrapper(
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
-                        lock_key,
+                        cache_key,
                         timeout=lock_timeout,
                         blocking_timeout=blocking_timeout,
                     ) as lock_acquired:
@@ -1080,15 +1097,15 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
+                            except SerializationError as e:
+                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
                         else:
                             # Lock timeout - double-check cache before giving up
                             # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {cache_key} (lock_key={lock_key}) after {blocking_timeout}s, checking cache"
-                            )
+                            logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
                                 cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
                                 if cached_data is not None:
@@ -1106,6 +1123,8 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
+                            except SerializationError as e:
+                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
@@ -1184,7 +1203,7 @@ def create_cache_wrapper(
                             raise e.original_exception from e
 
                     # Lock operation failed - execute without lock
-                    logger().warning(f"Lock operation failed for {cache_key} (lock_key={lock_key}), executing without lock: {e}")
+                    logger().warning(f"Lock operation failed for {cache_key}, executing without lock: {e}")
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)

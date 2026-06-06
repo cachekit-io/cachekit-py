@@ -82,6 +82,7 @@ dump.rdb
 # Development
 .env.local
 .env.*.local
+.env.dev
 *.local
 coverage.json
 

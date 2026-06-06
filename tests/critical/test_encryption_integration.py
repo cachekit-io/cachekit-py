@@ -7,7 +7,6 @@ Tests complete encryption flow from decorator through Redis storage.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -146,73 +145,33 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         # (due to different derived encryption keys)
         assert ciphertext1 != ciphertext2, "Same plaintext with different tenant_ids must produce different ciphertext"
 
-    def test_master_key_validation_missing_key(self):
-        """CRITICAL: Missing CACHEKIT_MASTER_KEY must fail validation at decoration time.
-
-        Note: This test verifies validation logic exists and is correctly placed at decoration time.
-        The autouse fixture in conftest.py sets CACHEKIT_MASTER_KEY, so we validate via config module directly.
-        """
+    def test_master_key_validation_missing_key(self, monkeypatch):
+        """CRITICAL: Missing CACHEKIT_MASTER_KEY must fail validation at decoration time."""
         from cachekit.config import ConfigurationError, reset_settings, validate_encryption_config
 
-        # Save and remove master key temporarily
-        original_key = os.environ.get("CACHEKIT_MASTER_KEY")
-        try:
-            if "CACHEKIT_MASTER_KEY" in os.environ:
-                del os.environ["CACHEKIT_MASTER_KEY"]
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
 
-            # Reset settings to pick up the env change
-            reset_settings()
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_encryption_config(encryption=True)
 
-            # Direct validation should fail when master key missing
-            with pytest.raises(ConfigurationError) as exc_info:
-                validate_encryption_config(encryption=True)
+        error_msg = str(exc_info.value).lower()
+        assert "master" in error_msg or "key" in error_msg, f"Expected key/master in error, got: {exc_info.value}"
 
-            # Should raise an error about missing master key
-            error_msg = str(exc_info.value).lower()
-            assert "master" in error_msg or "key" in error_msg, f"Expected key/master in error, got: {exc_info.value}"
-
-        finally:
-            # Restore original key
-            if original_key is not None:
-                os.environ["CACHEKIT_MASTER_KEY"] = original_key
-
-            # Reset settings again
-            reset_settings()
-
-    def test_master_key_validation_invalid_length(self):
-        """CRITICAL: Master key with invalid length must fail validation at decoration time.
-
-        Note: This test verifies validation logic exists and is correctly placed at decoration time.
-        The autouse fixture in conftest.py sets CACHEKIT_MASTER_KEY, so we validate via config module directly.
-        """
+    def test_master_key_validation_invalid_length(self, monkeypatch):
+        """CRITICAL: Master key with invalid length must fail validation at decoration time."""
         from cachekit.config import ConfigurationError, reset_settings, validate_encryption_config
 
-        # Save and replace with invalid key temporarily
-        original_key = os.environ.get("CACHEKIT_MASTER_KEY")
-        try:
-            # Set too-short master key (less than 32 bytes)
-            os.environ["CACHEKIT_MASTER_KEY"] = "too_short_key"
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "too_short_key")
+        reset_settings()
 
-            # Reset settings to pick up the env change
-            reset_settings()
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_encryption_config(encryption=True)
 
-            # Direct validation should fail when master key invalid
-            with pytest.raises(ConfigurationError) as exc_info:
-                validate_encryption_config(encryption=True)
-
-            # Should raise an error about key format/length/encoding
-            error_msg = str(exc_info.value).lower()
-            assert any(kw in error_msg for kw in ["length", "32", "bytes", "hex", "encode"]), (
-                f"Expected validation error (length/32/bytes/hex/encode), got: {exc_info.value}"
-            )
-
-        finally:
-            # Restore original key
-            if original_key is not None:
-                os.environ["CACHEKIT_MASTER_KEY"] = original_key
-
-            # Reset settings again
-            reset_settings()
+        error_msg = str(exc_info.value).lower()
+        assert any(kw in error_msg for kw in ["length", "32", "bytes", "hex", "encode"]), (
+            f"Expected validation error (length/32/bytes/hex/encode), got: {exc_info.value}"
+        )
 
     def test_aes_gcm_authentication_prevents_tampering(self):
         """CRITICAL: AES-256-GCM authentication tags must prevent data tampering."""

@@ -43,6 +43,12 @@ class CacheKeyGenerator:
         "local": "l",  # Reference caching (no serialization)
     }
 
+    # Regex for chars allowed in the func component of a SaaS cache key.
+    # SaaS validates: /^[a-zA-Z0-9_.]{1,200}$/
+    _FUNC_ALLOWED_RE = __import__("re").compile(r"[^A-Za-z0-9_.]")
+    _DOUBLE_DOT_RE = __import__("re").compile(r"\.{2,}")
+    _FUNC_NAME_MAX = 200
+
     def __init__(self):
         """Initialize the key generator.
 
@@ -83,8 +89,9 @@ class CacheKeyGenerator:
         if namespace:
             key_parts.extend(["ns:", namespace, ":"])
 
-        # Add function identifier (module + name) - single string operation
-        key_parts.extend(["func:", func.__module__, ".", func.__qualname__, ":"])
+        # Add function identifier (module + name) — sanitized for SaaS key format
+        func_name = self._sanitize_func_name(func.__module__, func.__qualname__)
+        key_parts.extend(["func:", func_name, ":"])
 
         # Generate args hash using Blake2b-256
         args_hash = self._blake2b_hash(args, kwargs)
@@ -347,3 +354,21 @@ class CacheKeyGenerator:
             normalized = f"{prefix}:{key_hash[:32]}"
 
         return normalized
+
+    @classmethod
+    def _sanitize_func_name(cls, module: str, qualname: str) -> str:
+        """Sanitize module.qualname for SaaS cache-key compliance.
+
+        The SaaS ``func`` component must match ``[a-zA-Z0-9_.]{1,200}``
+        and must not contain ``..``.  Nested functions have qualnames like
+        ``outer.<locals>.inner`` and lambdas are ``<lambda>`` — the angle
+        brackets violate the regex.
+
+        This replaces every disallowed char with ``_``, collapses runs of
+        ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
+        is deterministic: same function → same key.
+        """
+        raw = f"{module}.{qualname}"
+        sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)
+        sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
+        return sanitized[: cls._FUNC_NAME_MAX]
