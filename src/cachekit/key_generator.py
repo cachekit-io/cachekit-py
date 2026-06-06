@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any, Callable, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import UUID
 
 import msgpack
