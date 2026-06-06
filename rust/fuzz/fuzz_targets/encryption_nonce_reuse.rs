@@ -21,7 +21,9 @@ fuzz_target!(|data: &[u8]| {
     let (key, plaintext) = data.split_at(32);
     let aad = b"fuzz_test_aad";
 
-    let encryptor = ZeroKnowledgeEncryptor::new();
+    let Ok(encryptor) = ZeroKnowledgeEncryptor::new() else {
+        return;
+    };
 
     // Encrypt same plaintext multiple times
     let mut ciphertexts = HashSet::new();

@@ -11,7 +11,7 @@ struct OverflowTestCase {
     /// Compressed data size (small to create suspicious ratios)
     compressed_data_len: u8, // 0-255 bytes
     /// Checksum bytes
-    checksum: [u8; 32],
+    checksum: [u8; 8],
     /// Format string
     format_len: u8, // 0-255 for format string length
 }
@@ -40,9 +40,10 @@ fuzz_target!(|test_case: OverflowTestCase| {
             // Decompression succeeded - envelope passed all validation checks
             // This should only happen for valid sizes within limits
         }
-        Err(err_msg) => {
+        Err(err) => {
             // Expected for oversized allocations (u32::MAX, beyond 512MB, etc.)
             // Verify error message is descriptive
+            let err_msg = err.to_string();
             assert!(
                 err_msg.contains("Security violation") || err_msg.contains("failed"),
                 "Error message should be descriptive: {}",
