@@ -70,7 +70,8 @@ Example Usage:
 
 __version__ = "0.8.0"
 
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 # Configure hiredis compatibility BEFORE any Redis imports
 # This prevents GIL warnings in Python 3.13+ free-threading mode

@@ -139,7 +139,7 @@ class TestRedisIntegration:
         call_count = 0
 
         async def run_concurrent_requests():
-            lock = asyncio.Lock()  # Must create inside running loop (Python 3.9 compat)
+            lock = asyncio.Lock()  # Create inside the running loop to bind to the active event loop
 
             @cache(ttl=300)
             async def thread_safe_func(key):
