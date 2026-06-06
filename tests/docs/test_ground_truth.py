@@ -128,10 +128,10 @@ class TestREADMEClaims:
 
     def test_python_version_requirement(self):
         """README.md:230 - Verify Python version requirement matches documentation."""
-        # README claims Python 3.9+
+        # README claims Python 3.10+
         import sys
 
-        assert sys.version_info >= (3, 9), "README.md:230 - Python 3.9+ requirement failed"
+        assert sys.version_info >= (3, 10), "README.md:230 - Python 3.10+ requirement failed"
 
 
 @pytest.mark.critical

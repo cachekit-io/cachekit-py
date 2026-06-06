@@ -5,8 +5,8 @@ against the live SaaS backend (Worker API + Durable Objects).
 """
 
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import pytest
 import requests
