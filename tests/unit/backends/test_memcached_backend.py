@@ -81,7 +81,7 @@ class TestBasicOperations:
     def test_set_stores_value(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test set calls client.set with correct arguments."""
         backend.set("mykey", b"myvalue", ttl=60)
-        mock_hash_client.set.assert_called_once_with("mykey", b"myvalue", expire=60)
+        mock_hash_client.set.assert_called_once_with("mykey", b"myvalue", expire=60, noreply=False)
 
     def test_delete_returns_true_when_key_exists(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test delete returns True when key existed."""
@@ -157,33 +157,33 @@ class TestTTLBehavior:
     def test_ttl_none_passes_expire_zero(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test ttl=None passes expire=0 (no expiry)."""
         backend.set("key", b"val", ttl=None)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0, noreply=False)
 
     def test_ttl_zero_passes_expire_zero(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test ttl=0 passes expire=0 (no expiry)."""
         backend.set("key", b"val", ttl=0)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0, noreply=False)
 
     def test_ttl_positive_passes_expire(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test ttl=100 passes expire=100."""
         backend.set("key", b"val", ttl=100)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=100)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=100, noreply=False)
 
     def test_ttl_exceeding_30_days_gets_clamped(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test TTL > 30 days gets clamped to MAX_MEMCACHED_TTL (2592000)."""
         huge_ttl = MAX_MEMCACHED_TTL + 1000
         backend.set("key", b"val", ttl=huge_ttl)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL, noreply=False)
 
     def test_ttl_exactly_30_days_not_clamped(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test TTL exactly at 30-day max passes through unchanged."""
         backend.set("key", b"val", ttl=MAX_MEMCACHED_TTL)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL, noreply=False)
 
     def test_negative_ttl_passes_expire_zero(self, backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test negative TTL is treated as no expiry."""
         backend.set("key", b"val", ttl=-5)
-        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0)
+        mock_hash_client.set.assert_called_once_with("key", b"val", expire=0, noreply=False)
 
 
 @pytest.mark.unit
@@ -209,7 +209,7 @@ class TestKeyPrefix:
     def test_set_applies_prefix(self, prefixed_backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test set prepends prefix to key."""
         prefixed_backend.set("mykey", b"val", ttl=60)
-        mock_hash_client.set.assert_called_once_with("app:mykey", b"val", expire=60)
+        mock_hash_client.set.assert_called_once_with("app:mykey", b"val", expire=60, noreply=False)
 
     def test_delete_applies_prefix(self, prefixed_backend: MemcachedBackend, mock_hash_client: MagicMock) -> None:
         """Test delete prepends prefix to key."""

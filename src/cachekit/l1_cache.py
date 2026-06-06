@@ -284,6 +284,23 @@ class L1Cache:
         # Estimate size
         size = self._estimate_size(value)
 
+        # Reject entries that cannot fit even in an empty cache. Storing one would push L1
+        # permanently over its budget, and a multi-GB serialized DataFrame envelope is a
+        # direct OOM vector (it would also evict every other useful entry on the way in).
+        # The value is still available from L2; we only decline to mirror it in L1. If a
+        # smaller entry for this key was cached, drop it so L1 stops serving the stale value.
+        if size > self.max_memory_bytes:
+            with self._lock:
+                if key in self._cache:
+                    self._remove_entry(key)
+            logger.debug(
+                "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
+                key,
+                size,
+                self.max_memory_bytes,
+            )
+            return
+
         with self._lock:
             # Check if key already exists
             if key in self._cache:

@@ -232,7 +232,7 @@ class TestArrowSerializerIntegrity:
             serializer.deserialize(b"")
 
         assert "Invalid data" in str(exc_info.value)
-        assert "Expected at least 40 bytes" in str(exc_info.value)
+        assert "Arrow envelope" in str(exc_info.value)
 
     def test_too_short_data_raises_error(self):
         """Data shorter than minimum raises error."""
@@ -245,7 +245,7 @@ class TestArrowSerializerIntegrity:
             serializer.deserialize(invalid_data)
 
         assert "Invalid data" in str(exc_info.value)
-        assert "Expected at least 40 bytes" in str(exc_info.value)
+        assert "Arrow envelope" in str(exc_info.value)
 
     def test_bit_flip_in_dataframe_detected(self):
         """Single bit flip in DataFrame data is detected."""

@@ -45,7 +45,7 @@ def mock_hash_client(mock_store):
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
         instance = MagicMock()
 
-        def _set(key, value, expire=0):
+        def _set(key, value, expire=0, noreply=True):
             mock_store[key] = value
 
         def _get(key):
@@ -87,6 +87,31 @@ def test_get_set_delete_roundtrip(backend):
     assert backend.delete("key") is True
     assert backend.get("key") is None
     assert backend.delete("key") is False  # Already deleted
+
+
+@pytest.mark.critical
+def test_oversized_value_rejected_loudly(backend, mock_hash_client):
+    """A value over memcached's item-size cap must raise a clear PERMANENT BackendError,
+    NOT be silently dropped (the noreply=True default swallowed the server error)."""
+    big = b"\x00" * (1024 * 1024 + 1)  # > 1 MB default memcached item cap
+
+    with pytest.raises(BackendError) as exc_info:
+        backend.set("key", big, ttl=60)
+
+    assert exc_info.value.error_type == BackendErrorType.PERMANENT
+    assert "too large" in str(exc_info.value).lower() or "exceeds" in str(exc_info.value).lower()
+    # Must reject before hitting the server (no silent store)
+    mock_hash_client.set.assert_not_called()
+
+
+@pytest.mark.critical
+def test_set_uses_noreply_false_so_server_errors_surface(backend, mock_hash_client):
+    """set() must pass noreply=False so memcached's error reply is read, not swallowed."""
+    backend.set("key", b"value", ttl=60)
+
+    mock_hash_client.set.assert_called_once()
+    _, kwargs = mock_hash_client.set.call_args
+    assert kwargs.get("noreply") is False
 
 
 @pytest.mark.critical
@@ -163,7 +188,7 @@ def test_ttl_clamped_to_30_day_max(mock_hash_client):
     backend = MemcachedBackend(MemcachedBackendConfig())
     huge_ttl = MAX_MEMCACHED_TTL + 86400  # 31 days
     backend.set("key", b"val", ttl=huge_ttl)
-    mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL)
+    mock_hash_client.set.assert_called_once_with("key", b"val", expire=MAX_MEMCACHED_TTL, noreply=False)
 
 
 @pytest.mark.critical
@@ -172,10 +197,10 @@ def test_ttl_none_and_zero_mean_no_expiry(mock_hash_client):
     backend = MemcachedBackend(MemcachedBackendConfig())
 
     backend.set("k1", b"v1", ttl=None)
-    mock_hash_client.set.assert_called_with("k1", b"v1", expire=0)
+    mock_hash_client.set.assert_called_with("k1", b"v1", expire=0, noreply=False)
 
     backend.set("k2", b"v2", ttl=0)
-    mock_hash_client.set.assert_called_with("k2", b"v2", expire=0)
+    mock_hash_client.set.assert_called_with("k2", b"v2", expire=0, noreply=False)
 
 
 @pytest.mark.critical
@@ -269,7 +294,7 @@ def test_intent_decorators_with_memcached_backend(mock_store):
 
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
         instance = MagicMock()
-        instance.set.side_effect = lambda k, v, expire=0: mock_store.__setitem__(k, v)
+        instance.set.side_effect = lambda k, v, expire=0, noreply=True: mock_store.__setitem__(k, v)
         instance.get.side_effect = lambda k: mock_store.get(k)
         instance.delete.side_effect = lambda k, noreply=True: mock_store.pop(k, None) is not None
         mock_cls.return_value = instance
@@ -297,7 +322,7 @@ def test_set_default_backend_with_memcached_backend(mock_store):
 
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
         instance = MagicMock()
-        instance.set.side_effect = lambda k, v, expire=0: mock_store.__setitem__(k, v)
+        instance.set.side_effect = lambda k, v, expire=0, noreply=True: mock_store.__setitem__(k, v)
         instance.get.side_effect = lambda k: mock_store.get(k)
         instance.delete.side_effect = lambda k, noreply=True: mock_store.pop(k, None) is not None
         mock_cls.return_value = instance
