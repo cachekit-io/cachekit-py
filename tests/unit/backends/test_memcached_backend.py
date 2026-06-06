@@ -233,14 +233,13 @@ class TestKeyPrefix:
 class TestErrorClassification:
     """Test classify_memcached_error maps pymemcache exceptions correctly."""
 
-    def test_socket_timeout_maps_to_timeout(self) -> None:
-        """Test socket.timeout is classified as TIMEOUT."""
-        exc = TimeoutError("timed out")
-        error = classify_memcached_error(exc, operation="get", key="k1")
-        assert error.error_type == BackendErrorType.TIMEOUT
-
     def test_timeout_error_maps_to_timeout(self) -> None:
-        """Test TimeoutError is classified as TIMEOUT."""
+        """Test TimeoutError is classified as TIMEOUT.
+
+        socket.timeout is an alias of TimeoutError on Python >=3.10, so this
+        single test covers both; a separate socket.timeout case would be a
+        byte-for-byte duplicate.
+        """
         exc = TimeoutError("operation timed out")
         error = classify_memcached_error(exc, operation="set", key="k2")
         assert error.error_type == BackendErrorType.TIMEOUT
