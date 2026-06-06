@@ -12,9 +12,10 @@ using RLock and double-checked locking for thread safety.
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType

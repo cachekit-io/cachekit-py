@@ -5,7 +5,7 @@ This test suite validates claims made in docs/comparison.md about how cachekit
 compares to the Python standard library's functools.lru_cache.
 
 VERSION PINS (for evidence tracking):
-- Python: 3.9+ (lru_cache is standard)
+- Python: 3.10+ (lru_cache is standard)
 - cachekit: v1.0+
 - Validation Date: {INSERT_DATE_HERE}
 """
