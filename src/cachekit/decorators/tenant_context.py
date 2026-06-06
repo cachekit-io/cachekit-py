@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import contextvars
 import uuid
-from typing import Any, Callable, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
