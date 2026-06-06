@@ -7,8 +7,9 @@ Provides the @cache decorator with intent-based variants (@cache.minimal, @cache
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from dataclasses import replace
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from ..config import DecoratorConfig
 from .wrapper import create_cache_wrapper

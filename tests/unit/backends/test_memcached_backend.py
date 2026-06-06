@@ -11,7 +11,6 @@ Tests for backends/memcached/backend.py covering:
 
 from __future__ import annotations
 
-import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -236,7 +235,7 @@ class TestErrorClassification:
 
     def test_socket_timeout_maps_to_timeout(self) -> None:
         """Test socket.timeout is classified as TIMEOUT."""
-        exc = socket.timeout("timed out")
+        exc = TimeoutError("timed out")
         error = classify_memcached_error(exc, operation="get", key="k1")
         assert error.error_type == BackendErrorType.TIMEOUT
 

@@ -19,7 +19,6 @@ Marked with @pytest.mark.critical for fast CI runs.
 
 from __future__ import annotations
 
-import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -188,7 +187,7 @@ def test_error_classification_all_types():
     )
 
     # Timeout
-    err = classify_memcached_error(socket.timeout("timed out"), operation="get")
+    err = classify_memcached_error(TimeoutError("timed out"), operation="get")
     assert err.error_type == BackendErrorType.TIMEOUT
 
     # Transient — connection close

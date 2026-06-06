@@ -7,7 +7,8 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, TypeVar, Union
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
