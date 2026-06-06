@@ -8,7 +8,7 @@
 
 ## Table of Contents
 
-- [Quick Start with Redis](#quick-start-with-redis)
+- [Quick Start](#quick-start)
 - [Progressive Disclosure](#progressive-disclosure-choose-your-level)
 - [Installation](#installation)
 - [Choose Your Backend](#choose-your-backend)
@@ -20,9 +20,15 @@
 
 ---
 
-## Quick Start with Redis
+## Quick Start
 
-cachekit uses Redis as its backend:
+CacheKit provides a unified caching API with pluggable backends. You write `@cache`
+once; the backend (Redis, CachekitIO, Memcached, or File / L1-only) is selected from
+your environment. See [Choose Your Backend](#choose-your-backend) for the full menu.
+
+By default `@cache` auto-detects the backend from env vars, falling back to Redis at
+localhost (12-factor convention), so the fastest path to a working cache is to point
+it at a local Redis:
 
 ```bash
 # 1. Run Redis
@@ -35,7 +41,7 @@ export REDIS_URL="redis://localhost:6379"
 ```python
 from cachekit import cache
 
-@cache  # Uses Redis by default
+@cache  # Auto-detects backend (defaults to Redis at localhost)
 def expensive_function():
     return do_work()
 ```
@@ -222,7 +228,7 @@ docker run -p 6379:6379 redis
 ### Environment Setup
 
 ```bash
-# Redis (recommended default)
+# Redis (auto-detected default — falls back to localhost)
 export REDIS_URL="redis://localhost:6379"
 
 # Optional: explicit Redis configuration
