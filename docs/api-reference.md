@@ -786,16 +786,76 @@ def typed_function(data: dict[str, Any]) -> str | int | None:
 
 ## Monitoring and Observability
 
+### Per-function statistics via `cache_info()`
+
+Every decorated function exposes `cache_info()`, modelled on `functools.lru_cache`. It
+returns a `CacheInfo` named tuple with cumulative, per-function statistics — no Prometheus
+scrape or external dependency required. `CacheInfo` is exported from the top-level package
+(`from cachekit import CacheInfo`).
+
+`CacheInfo` has nine fields:
+
+| Field | Type | Meaning |
+|:------|:-----|:--------|
+| `hits` | `int` | Total cache hits (L1 + L2) |
+| `misses` | `int` | Total cache misses |
+| `l1_hits` | `int` | L1 (in-memory) hits only |
+| `l2_hits` | `int` | L2 (backend) hits only |
+| `maxsize` | `int \| None` | Always `None` for external caches |
+| `currsize` | `int \| None` | Always `None` for external caches |
+| `l2_avg_latency_ms` | `float` | Average L2 (backend) latency in milliseconds |
+| `last_operation_at` | `float \| None` | Unix timestamp of the last cache operation, or `None` |
+| `session_id` | `str \| None` | Function-specific session ID for correlation |
+
+The hit counters satisfy the invariant `l1_hits + l2_hits == hits`: every hit is served
+either from the in-memory L1 layer or from the backend L2 layer, never both. `maxsize` and
+`currsize` are kept only for `lru_cache` API parity and are always `None` because the cache
+lives in an external store, not a bounded in-process dict.
+
+Statistics are tracked per decorated function (shared across all calls) and are thread-safe.
+`cache_clear()` resets the counters and rotates `session_id`.
+
+A minimal stats endpoint that surfaces `cache_info()` over HTTP:
+
+```python notest
+from cachekit import cache
+
+@cache(ttl=300)
+def get_user(user_id):
+    return db.query(User).get(user_id)
+
+def cache_stats():
+    """Return per-function cache statistics as a JSON-serializable dict."""
+    info = get_user.cache_info()
+    total = info.hits + info.misses
+    return {
+        "hits": info.hits,
+        "misses": info.misses,
+        "l1_hits": info.l1_hits,
+        "l2_hits": info.l2_hits,
+        "hit_ratio": round(info.hits / total, 4) if total else 0.0,
+        "l2_avg_latency_ms": info.l2_avg_latency_ms,
+        "last_operation_at": info.last_operation_at,
+        "session_id": info.session_id,
+    }
+```
+
 ### Prometheus Metrics
 
-The library exposes comprehensive metrics (enabled by default):
+The library records metrics on the default `prometheus_client` registry (enabled by
+default). **Exposition is the application's responsibility** — cachekit does not start an
+HTTP server or register a `/metrics` route; wire up `prometheus_client` exposition
+(`start_http_server` or `make_wsgi_app`/`make_asgi_app`) in your app. The emitted series
+names carry no `cachekit_` prefix:
 
-- `cachekit_cache_operations_total` - Operation counts by operation, status, serializer, namespace
-- `cachekit_cache_operation_duration_seconds` - Latency histograms with optimized buckets
-- `cachekit_circuit_breaker_state` - Circuit breaker state per namespace (0=closed, 1=open, 2=half-open)
-- `cachekit_connection_pool_utilization` - Pool usage ratio (0.0-1.0)
-- `cachekit_connection_pool_usage` - Detailed pool statistics (created, available, in_use)
-- `cachekit_serialization_fallbacks_total` - Serializer fallback tracking
+- `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
+- `redis_cache_operations_total` - Load-control operation counter. Labels: `operation`, `status`, `serializer`, `namespace`
+- `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
+- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
+- `circuit_breaker_state` - Circuit breaker state gauge (0=CLOSED, 1=OPEN, 2=HALF_OPEN). Labels: `namespace`, `state`
+
+See the [Prometheus Metrics guide](features/prometheus-metrics.md) for exposition setup,
+query examples, and alerting rules.
 
 ### Structured Logging
 
@@ -804,13 +864,6 @@ All operations include structured logging with:
 - Operation context (namespace, cache key, serializer)
 - Performance metrics (duration, cache hit/miss)
 - Error classification and recovery actions
-
-### Health Monitoring
-
-Pre-built Grafana dashboards available in `/monitoring/grafana/`:
-- Cache Overview Dashboard
-- Reliability Metrics Dashboard
-- Performance Analysis Dashboard
 
 ## Best Practices
 
