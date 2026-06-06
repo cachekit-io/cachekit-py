@@ -401,6 +401,53 @@ class TestCompression:
         pd.testing.assert_frame_equal(result, df)
 
 
+class TestConfigurableCompression:
+    """Arrow IPC compression is configurable: zstd/lz4 for small payloads, or None
+    (uncompressed) to enable zero-copy memory-mapped reads. Default resolves from
+    CACHEKIT_ARROW_COMPRESSION via compression='auto'."""
+
+    def test_compression_none_is_uncompressed_and_round_trips(self):
+        df = pd.DataFrame({"a": [1] * 100_000, "b": ["constant"] * 100_000})
+        raw, meta_raw = ArrowSerializer(compression=None).serialize(df)
+        comp, _ = ArrowSerializer(compression="zstd").serialize(df)
+
+        assert meta_raw.compressed is False
+        assert len(raw) > len(comp)  # uncompressed is larger on compressible data
+        pd.testing.assert_frame_equal(ArrowSerializer(compression=None).deserialize(raw, meta_raw), df)
+
+    def test_compression_none_string_normalizes(self):
+        _, meta = ArrowSerializer(compression="none").serialize(pd.DataFrame({"a": [1, 2, 3]}))
+        assert meta.compressed is False
+
+    def test_compression_lz4_round_trips(self):
+        df = pd.DataFrame({"x": list(range(5000)), "y": [f"s{i % 7}" for i in range(5000)]})
+        data, meta = ArrowSerializer(compression="lz4").serialize(df)
+        assert meta.compressed is True
+        pd.testing.assert_frame_equal(ArrowSerializer().deserialize(data, meta), df)
+
+    def test_invalid_compression_raises(self):
+        with pytest.raises(ValueError):
+            ArrowSerializer(compression="gzip")
+
+    def test_auto_resolves_from_settings_env(self, monkeypatch):
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv("CACHEKIT_ARROW_COMPRESSION", "none")
+        reset_settings()
+        try:
+            _, meta = ArrowSerializer(compression="auto").serialize(pd.DataFrame({"a": [1, 2, 3]}))
+            assert meta.compressed is False
+        finally:
+            reset_settings()
+
+    def test_default_is_auto_zstd(self):
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()  # no env override -> default zstd
+        _, meta = ArrowSerializer().serialize(pd.DataFrame({"a": [1] * 1000}))
+        assert meta.compressed is True
+
+
 class TestIntegrityAlwaysOn:
     """DATA IS SACRED: corruption is always detected, even with integrity_checking=False."""
 

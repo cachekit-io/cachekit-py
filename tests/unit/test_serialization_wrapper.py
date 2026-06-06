@@ -14,6 +14,7 @@ import json
 
 import pytest
 
+from cachekit.serializers.base import SerializationError
 from cachekit.serializers.wrapper import SerializationWrapper
 
 PAYLOAD = b"\x00\x01\xff\xfe\x00ARROW1\x00\x00binary-not-text\x80\x81"
@@ -101,3 +102,61 @@ class TestUnwrapRejectsGarbage:
     def test_unrecognized_envelope_raises(self):
         with pytest.raises((ValueError, Exception)):
             SerializationWrapper.unwrap(b"\x99\x98 not a frame and not json")
+
+
+class TestEncryptionThroughFrame:
+    """The binary frame is on the hot path for @cache.secure too: encrypted payloads and
+    their encryption metadata must survive the frame, AAD binding must still hold, and old
+    base64+JSON encrypted entries must still decrypt. (Regression for the wrapper rewrite.)"""
+
+    KEY = "user:42:credentials"
+
+    @pytest.fixture
+    def enc_handler(self):
+        import os
+
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64
+        from cachekit.cache_handler import CacheSerializationHandler
+
+        handler = CacheSerializationHandler(
+            serializer_name="default",
+            encryption=True,
+            single_tenant_mode=True,
+            deployment_uuid="00000000-0000-0000-0000-000000000001",
+        )
+        yield handler
+        reset_settings()
+        os.environ.pop("CACHEKIT_MASTER_KEY", None)
+
+    def test_encrypted_payload_round_trips_through_frame(self, enc_handler):
+        secret = {"ssn": "123-45-6789", "balance": 99999}
+        blob = enc_handler.serialize_data(secret, cache_key=self.KEY)
+        assert blob[:2] == b"CK"  # new binary frame
+        assert b"123-45-6789" not in blob  # plaintext never present
+        assert enc_handler.deserialize_data(blob, cache_key=self.KEY) == secret
+
+    def test_encryption_metadata_survives_frame_header(self, enc_handler):
+        blob = enc_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+        _, meta, _ = SerializationWrapper.unwrap(blob)
+        assert meta["encrypted"] is True
+        assert meta["tenant_id"]
+        assert meta["encryption_algorithm"] == "AES-256-GCM"
+
+    def test_wrong_cache_key_is_rejected(self, enc_handler):
+        """AAD binding: ciphertext is bound to the cache key; a mismatched key must not decrypt."""
+        blob = enc_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+        # EncryptionError subclasses SerializationError; AAD mismatch must raise, never silently succeed.
+        with pytest.raises(SerializationError):
+            enc_handler.deserialize_data(blob, cache_key="WRONG:key")
+
+    def test_legacy_base64_json_encrypted_entry_still_decrypts(self, enc_handler):
+        """A pre-upgrade encrypted entry (base64+JSON envelope) must remain readable."""
+        new_blob = enc_handler.serialize_data({"old": "secret"}, cache_key=self.KEY)
+        inner, meta, name = SerializationWrapper.unwrap(new_blob)
+        legacy = json.dumps(
+            {"data": base64.b64encode(inner).decode("ascii"), "metadata": meta, "serializer": name, "version": "2.0"}
+        ).encode("utf-8")
+        assert enc_handler.deserialize_data(legacy, cache_key=self.KEY) == {"old": "secret"}

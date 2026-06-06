@@ -124,7 +124,7 @@ class ArrowSerializer:
         SerializationError: Checksum validation failed - data corruption detected
     """
 
-    def __init__(self, return_format: str = "pandas", enable_integrity_checking: bool = True):
+    def __init__(self, return_format: str = "pandas", enable_integrity_checking: bool = True, compression: str | None = "auto"):
         """Initialize ArrowSerializer.
 
         Args:
@@ -132,17 +132,40 @@ class ArrowSerializer:
                 - "pandas": Convert to pandas.DataFrame (default)
                 - "polars": Convert to polars.DataFrame
                 - "arrow": Return pyarrow.Table (zero-copy, no conversion)
-            enable_integrity_checking: Enable xxHash3-64 checksum validation (default: True)
-                When True: 8-byte checksum overhead + validation cost (integrity guarantee)
-                When False: No checksum (faster, use for @cache.minimal speed-first scenarios)
+            enable_integrity_checking: Retained for API compatibility. The 8-byte xxHash3-64
+                checksum is now ALWAYS written and validated (silently returning corrupted
+                DataFrames is unacceptable, and 8 bytes is negligible), so this flag no longer
+                disables integrity.
+            compression: Arrow IPC compression codec.
+                - "auto" (default): use the CACHEKIT_ARROW_COMPRESSION setting (itself "zstd" by default)
+                - "zstd" / "lz4": compress the payload (smaller wire/L1; must be decompressed on read)
+                - None or "none": store uncompressed Arrow IPC, enabling zero-copy memory-mapped reads
+                  (lowest read memory) at the cost of a larger payload
 
         Raises:
-            ValueError: If return_format is not one of the valid options
+            ValueError: If return_format or compression is not a valid option
         """
         if return_format not in ("pandas", "polars", "arrow"):
             raise ValueError(f"Invalid return_format: '{return_format}'. Valid options: 'pandas', 'polars', 'arrow'")
         self.return_format = return_format
         self.enable_integrity_checking = enable_integrity_checking
+        self.compression = self._resolve_compression(compression)
+
+    @staticmethod
+    def _resolve_compression(compression: str | None) -> str | None:
+        """Normalize/validate the compression option. 'auto' resolves from settings."""
+        if compression == "auto":
+            try:
+                from cachekit.config.singleton import get_settings
+
+                compression = get_settings().arrow_compression
+            except Exception:  # noqa: BLE001 — settings unavailable: fall back to a sane default
+                compression = "zstd"
+        if compression in (None, "none"):
+            return None
+        if compression not in ("zstd", "lz4"):
+            raise ValueError(f"Invalid compression: {compression!r}. Valid options: 'auto', 'zstd', 'lz4', None ('none').")
+        return compression
 
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:  # type: ignore[name-defined]
         """Serialize DataFrame to Arrow IPC format bytes with optional xxHash3-64 integrity protection.
@@ -192,13 +215,14 @@ class ArrowSerializer:
                     f"For scalar values or nested dicts, use AutoSerializer."
                 )
 
-            # Serialize to Arrow IPC with built-in zstd compression. Compression runs per
-            # record-batch, so writing in bounded batches keeps the compressor's working set
-            # bounded (one big batch makes zstd allocate a full-size working buffer — measured
-            # ~3.6x the payload). Size each batch to ~8 MiB regardless of schema width.
+            # Serialize to Arrow IPC. Compression (when enabled) runs per record-batch, so
+            # writing in bounded batches keeps the compressor's working set bounded (one big
+            # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
+            # payload). Size each batch to ~8 MiB regardless of schema width. compression=None
+            # writes uncompressed IPC, which a reader can memory-map zero-copy.
             max_chunksize = _bounded_chunksize(table)
             sink = pa.BufferOutputStream()
-            write_options = pa.ipc.IpcWriteOptions(compression="zstd")
+            write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
                 writer.write_table(table, max_chunksize=max_chunksize)
             del table  # free the Arrow table before materializing the IPC bytes (lowers peak)
@@ -220,7 +244,7 @@ class ArrowSerializer:
 
             return envelope, SerializationMetadata(
                 serialization_format=SerializationFormat.ARROW,
-                compressed=True,  # zstd IPC compression is on by default
+                compressed=self.compression is not None,  # reflects the configured codec (None = uncompressed)
                 encrypted=False,  # Encryption is EncryptionWrapper's responsibility
                 original_type="arrow",
             )
