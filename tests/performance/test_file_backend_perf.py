@@ -100,7 +100,7 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
     _print_stats("  ", delete_stats)
 
     # Combined (typical cache line: set + get + delete)
-    combined_latencies = [w + r + d for w, r, d in zip(write_latencies, read_latencies, delete_latencies)]
+    combined_latencies = [w + r + d for w, r, d in zip(write_latencies, read_latencies, delete_latencies, strict=True)]
     combined_stats = _calculate_stats(combined_latencies)
 
     print("\nCOMBINED (Set+Get+Delete):")

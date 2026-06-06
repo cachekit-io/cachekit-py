@@ -36,7 +36,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -51,7 +50,7 @@ classifiers = [
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     # Core Redis functionality
     "redis[hiredis]>=4.0.0",
@@ -101,7 +100,7 @@ include = ["LICENSE", "README.md"]
 # Ruff configuration
 [tool.ruff]
 line-length = 129
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [
@@ -237,7 +236,11 @@ fuzz = [
 # Override vulnerable transitive dependencies
 [tool.uv]
 constraint-dependencies = [
-    "urllib3>=2.6.0",
+    "urllib3>=2.7.0",
     "fonttools>=4.60.2",
     "werkzeug>=3.1.4",
+    # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixes
+    # PYSEC-2026-196 (entry-point path traversal), GHSA-58qw-9mgm-455v (tar/zip
+    # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering).
+    "pip>=26.1.2",
 ]

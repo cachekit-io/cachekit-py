@@ -10,7 +10,7 @@ This project follows a standard code of conduct. Please be respectful and profes
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.10 or higher
 - Rust 1.80 or higher
 - Redis 5.0 or higher (for testing)
 - [uv](https://github.com/astral-sh/uv) (recommended for dependency management)
@@ -80,7 +80,7 @@ This project follows a standard code of conduct. Please be respectful and profes
 - **Linter**: Ruff (runs automatically with `make lint`)
 - **Type checker**: basedpyright (standard mode, zero errors enforced)
 - **Type hints**: Required for all public APIs
-- **Python 3.9+ compatibility**: Use `from __future__ import annotations` for modern union syntax
+- **Python 3.10+ compatibility**: Use `from __future__ import annotations` for modern union syntax
 - **Docstrings**: Google style for public functions/classes
 - **Imports**: Absolute imports only
 

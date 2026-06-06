@@ -179,7 +179,7 @@ class TestAiocacheComparison:
 
     def test_cachekit_sync_focused_vs_aiocache_async_focused(self):
         """
-        CLAIM: cachekit is sync-first (Python 3.9+ compatible).
+        CLAIM: cachekit is sync-first (Python 3.10+ compatible).
         aiocache is async-first (requires asyncio).
 
         This is TRUE. Different design philosophies:

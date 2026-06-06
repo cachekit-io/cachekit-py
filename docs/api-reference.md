@@ -782,7 +782,7 @@ def typed_function(data: dict[str, Any]) -> str | int | None:
     return process_data(data)
 ```
 
-**Type Safety**: The library uses `from __future__ import annotations` for Python 3.9+ compatibility, enabling modern union syntax (`X | Y`) while maintaining backward compatibility.
+**Type Safety**: The library uses `from __future__ import annotations` for Python 3.10+ compatibility, enabling modern union syntax (`X | Y`) while maintaining backward compatibility.
 
 ## Monitoring and Observability
 
