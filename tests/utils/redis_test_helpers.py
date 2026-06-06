@@ -8,7 +8,8 @@ to use the new isolation framework with minimal code changes.
 """
 
 import functools
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 import pytest
 

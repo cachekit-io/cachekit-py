@@ -6,8 +6,9 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from .nested import (
     BackpressureConfig,

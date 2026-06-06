@@ -7,15 +7,9 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Union, runtime_checkable
-
-# TypeGuard requires Python 3.10+, use typing_extensions for 3.9
-if sys.version_info >= (3, 10):
-    from typing import TypeGuard
-else:
-    from typing_extensions import TypeGuard
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
 from cachekit.backends.base import BackendError, BaseBackend, TTLInspectableBackend
 from cachekit.backends.provider import (
