@@ -26,7 +26,7 @@ CacheKit provides a unified caching API with pluggable backends. You write `@cac
 once; the backend (Redis, CachekitIO, Memcached, or File / L1-only) is selected from
 your environment. See [Choose Your Backend](#choose-your-backend) for the full menu.
 
-By default `@cache` auto-detects the backend from env vars, falling back to Redis at
+By default, `@cache` auto-detects the backend from env vars, falling back to Redis at
 localhost (12-factor convention), so the fastest path to a working cache is to point
 it at a local Redis:
 
