@@ -26,7 +26,7 @@ Choose your storage backend:
 | Guide | Description |
 |:------|:------------|
 | [Backend Overview](backends/README.md) | Comparison and selection guide |
-| [Redis](backends/redis.md) | Production default, connection pooling |
+| [Redis](backends/redis.md) | Self-hosted, production-grade, connection pooling |
 | [File](backends/file.md) | Local filesystem, zero dependencies |
 | [Memcached](backends/memcached.md) | High-throughput, consistent hashing |
 | [CachekitIO](backends/cachekitio.md) | Managed SaaS, zero infrastructure |

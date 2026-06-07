@@ -65,7 +65,17 @@ Or with [uv][uv-url] (recommended):
 uv add cachekit
 ```
 
-### Setup (Redis — recommended default)
+### Setup (choose a backend)
+
+cachekit exposes one decorator API over a pluggable backend abstraction. Pick the
+backend that fits your infrastructure — they're peers behind the same `@cache` API:
+
+| Backend | Best for | Select with |
+|---------|----------|-------------|
+| Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
+| CachekitIO | Managed, zero-ops (alpha) | `CACHEKIT_API_KEY` |
+| Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
+| File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / `backend=None` |
 
 ```bash
 # Run Redis locally or use your existing infrastructure
@@ -75,7 +85,7 @@ export REDIS_URL="redis://localhost:6379"
 ```python
 from cachekit import cache
 
-@cache  # Uses Redis backend by default
+@cache  # Auto-detects backend (defaults to Redis at localhost)
 def expensive_api_call(user_id: int):
     return fetch_user_data(user_id)
 ```

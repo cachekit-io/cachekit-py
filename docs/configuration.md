@@ -20,7 +20,7 @@ cachekit supports four backends. Pick the one that fits your infrastructure:
 | File | Local dev, testing | None |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 
-**Redis is the recommended default.** CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
+By default `@cache` auto-detects your backend from env vars, falling back to Redis at localhost (12-factor convention). CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
 
 ### Redis Backend
 
@@ -30,7 +30,7 @@ For self-hosted Redis infrastructure:
 ```python
 from cachekit import cache
 
-@cache  # Uses Redis backend by default
+@cache  # Auto-detects backend (defaults to Redis at localhost)
 def fetch_data():
     return expensive_computation()
 ```
