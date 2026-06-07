@@ -5,6 +5,7 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -225,8 +226,11 @@ class DecoratorConfig:
             ConfigurationError: If configuration is invalid
         """
         # TTL validation
-        if self.ttl is not None and self.ttl < 0:
-            raise ValueError(f"ttl must be non-negative, got {self.ttl}")
+        if self.ttl is not None:
+            if not math.isfinite(self.ttl):
+                raise ValueError(f"ttl must be a finite number, got {self.ttl!r}")
+            if self.ttl < 0:
+                raise ValueError(f"ttl must be non-negative, got {self.ttl}")
 
         # TTL refresh threshold validation
         if not 0.0 <= self.ttl_refresh_threshold <= 1.0:

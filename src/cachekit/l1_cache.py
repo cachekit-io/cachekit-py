@@ -5,6 +5,7 @@ dramatically reducing network latency while maintaining Redis as the source of t
 """
 
 import logging
+import math
 import random
 import threading
 import time
@@ -276,9 +277,10 @@ class L1Cache:
             # Default 5 minute TTL if not specified
             expiry = current_time + 300 - self.ttl_buffer_seconds
 
-        # Skip caching if TTL is too short (would expire immediately or already expired)
-        if expiry <= current_time:
-            logger.debug("Skipping L1 cache for key %s - TTL too short (effective TTL: %.2fs)", key, expiry - current_time)
+        # Skip caching if the effective TTL is non-finite (NaN/inf would create an
+        # immortal entry that never expires) or too short (would expire immediately).
+        if not math.isfinite(expiry) or expiry <= current_time:
+            logger.debug("Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)", key, expiry)
             return
 
         # Estimate size
