@@ -302,12 +302,36 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 
 </details>
 
-### Built-in Monitoring
+### Monitoring & Observability
 
-- **Prometheus metrics** - Production-ready observability
+- **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
+- **Prometheus metrics** - Recorded by default (your app owns exposition)
 - **Structured logging** - Context-aware with correlation IDs
 - **Health checks** - Comprehensive status endpoints
-- **Performance tracking** - Built-in latency monitoring
+
+Every decorated function exposes `cache_info()`, returning a `CacheInfo` named tuple with
+hit/miss counts, the L1/L2 split, and average backend latency:
+
+```python
+@cache()
+def get_score(x):
+    return x ** 2
+
+get_score(2)
+get_score(2)  # served from cache
+
+info = get_score.cache_info()
+# CacheInfo has 9 fields: hits, misses, l1_hits, l2_hits, maxsize,
+# currsize, l2_avg_latency_ms, last_operation_at, session_id
+assert info.l1_hits + info.l2_hits == info.hits  # every hit is L1 or L2
+```
+
+`maxsize` and `currsize` are always `None` (the cache lives in an external store, not a
+bounded in-process dict); they exist only for `lru_cache` API parity. See the
+[API Reference](docs/api-reference.md#per-function-statistics-via-cache_info) for the full
+field reference and a sample stats endpoint, and the
+[Prometheus Metrics guide](docs/features/prometheus-metrics.md) for metric names and
+exposition setup.
 
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
@@ -327,8 +351,10 @@ def expensive_func(x):
 with ThreadPoolExecutor(max_workers=10) as executor:
     results = list(executor.map(expensive_func, range(100)))
 
-print(expensive_func.cache_info())
-# CacheInfo(hits=90, misses=10, maxsize=None, currsize=10)
+info = expensive_func.cache_info()
+# CacheInfo(hits=..., misses=..., l1_hits=..., l2_hits=...,
+#           maxsize=None, currsize=None, l2_avg_latency_ms=...,
+#           last_operation_at=..., session_id=...)
 ```
 
 </details>
