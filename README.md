@@ -170,7 +170,7 @@ def get_user_profile(user_id: int):
 
 > 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
 >
-> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability/encryption columns above do not apply to it.
+> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
 <details>
 <summary><strong>Additional Presets: <code>@cache.dev</code> and <code>@cache.test</code></strong></summary>
