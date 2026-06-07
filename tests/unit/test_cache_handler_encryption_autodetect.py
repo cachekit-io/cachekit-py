@@ -9,8 +9,11 @@ opt-out. An explicit False must survive fleet-wide CACHEKIT_MASTER_KEY auto-dete
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.base import SerializationMetadata
@@ -170,3 +173,83 @@ class TestEncryptionTriState:
             encryption=EncryptionConfig(enabled=True, single_tenant_mode=True),
         )
         assert forced.encryption.enabled is True
+
+
+@pytest.mark.unit
+class TestDecoratorEncryptionFlattening:
+    """`@cache(...)` folds flat encryption kwargs into a nested EncryptionConfig (issue #128).
+
+    Covers the bare-decorator mapping block in ``cachekit.decorators.intent.cache`` that turns
+    flat ``encryption`` / ``master_key`` / ``tenant_extractor`` / ``single_tenant_mode`` /
+    ``deployment_uuid`` kwargs into ``DecoratorConfig.encryption``. This is the path that lets a
+    deliberate per-function ``encryption=False`` survive all the way to config resolution.
+
+    The wrapper factory is patched out so we assert on the resolved DecoratorConfig directly,
+    without constructing a real (Rust-backed) cache wrapper or touching a backend.
+    """
+
+    @pytest.fixture
+    def captured_config(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        import cachekit.decorators.intent as intent_mod
+
+        captured: dict[str, Any] = {}
+
+        def _fake_wrapper(func: Any, *, config: Any, _l1_only_mode: bool = False, **_kwargs: Any) -> Any:
+            captured["config"] = config
+            return func
+
+        monkeypatch.setattr(intent_mod, "create_cache_wrapper", _fake_wrapper)
+        return captured
+
+    def test_flat_encryption_false_maps_to_opt_out(self, captured_config: dict[str, Any]) -> None:
+        from cachekit.config.nested import EncryptionConfig
+
+        @cache(encryption=False, backend=None)
+        def fn() -> int:
+            return 1
+
+        enc = captured_config["config"].encryption
+        assert isinstance(enc, EncryptionConfig)
+        assert enc.enabled is False
+
+    def test_flat_encryption_true_maps_to_force_on(self, captured_config: dict[str, Any]) -> None:
+        from cachekit.config.nested import EncryptionConfig
+
+        @cache(encryption=True, master_key=_FAKE_KEY, single_tenant_mode=True, backend=None)
+        def fn() -> int:
+            return 1
+
+        enc = captured_config["config"].encryption
+        assert isinstance(enc, EncryptionConfig)
+        assert enc.enabled is True
+        assert enc.single_tenant_mode is True
+
+    def test_flat_key_params_fold_in_without_encryption_flag(self, captured_config: dict[str, Any]) -> None:
+        """master_key / single_tenant_mode / deployment_uuid fold in even when `encryption`
+        is omitted — `enabled` stays None (auto), exercising the per-key loop branch."""
+        from cachekit.config.nested import EncryptionConfig
+
+        @cache(master_key=_FAKE_KEY, single_tenant_mode=True, deployment_uuid=_DEPLOYMENT_UUID, backend=None)
+        def fn() -> int:
+            return 1
+
+        enc = captured_config["config"].encryption
+        assert isinstance(enc, EncryptionConfig)
+        assert enc.enabled is None
+        assert enc.master_key == _FAKE_KEY
+        assert enc.single_tenant_mode is True
+        assert enc.deployment_uuid == _DEPLOYMENT_UUID
+
+    def test_prebuilt_encryption_config_passes_through_unwrapped(self, captured_config: dict[str, Any]) -> None:
+        """An already-constructed EncryptionConfig is NOT re-wrapped (would nest a config in
+        `.enabled`); the passthrough guard skips the mapping block."""
+        from cachekit.config.nested import EncryptionConfig
+
+        @cache(encryption=EncryptionConfig(enabled=False), backend=None)
+        def fn() -> int:
+            return 1
+
+        enc = captured_config["config"].encryption
+        assert isinstance(enc, EncryptionConfig)
+        # If the guard failed, enabled would be an EncryptionConfig, not the bool False.
+        assert enc.enabled is False
