@@ -162,7 +162,11 @@ class ArrowSerializer:
                 from cachekit.config.singleton import get_settings
 
                 compression = get_settings().arrow_compression
-            except Exception:  # noqa: BLE001 — settings unavailable: fall back to a sane default
+            except ImportError:
+                # Config module genuinely unavailable: fall back to a sane default.
+                # Invalid CACHEKIT_ARROW_COMPRESSION values surface as a pydantic
+                # ValidationError from get_settings() and must NOT be masked here —
+                # let them propagate so misconfiguration fails loud.
                 compression = "zstd"
         if compression in (None, "none"):
             return None

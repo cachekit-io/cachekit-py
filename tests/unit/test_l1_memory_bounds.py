@@ -35,6 +35,17 @@ class TestOversizedEntryRejection:
         assert cache.get("toobig")[0] is False
         assert cache._current_memory_bytes <= cache.max_memory_bytes
 
+    def test_oversized_update_drops_stale_smaller_entry(self):
+        """An oversized put for an EXISTING key must drop the stale value, not serve it."""
+        cache = L1Cache(max_memory_mb=1)
+        cache.put("k", b"\x00" * (256 * 1024), redis_ttl=300)  # fits
+        assert cache.get("k")[0] is True
+
+        cache.put("k", b"\x00" * (5 * MB), redis_ttl=300)  # same key, now oversized
+
+        assert cache.get("k")[0] is False  # stale smaller value evicted, not served
+        assert cache._current_memory_bytes == 0
+
     def test_entry_equal_to_budget_is_stored(self):
         cache = L1Cache(max_memory_mb=1)
         cache.put("exact", b"\x00" * (1 * MB), redis_ttl=300)

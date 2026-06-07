@@ -112,13 +112,13 @@ class TestEncryptionThroughFrame:
     KEY = "user:42:credentials"
 
     @pytest.fixture
-    def enc_handler(self):
-        import os
-
+    def enc_handler(self, monkeypatch):
         from cachekit.config.singleton import reset_settings
 
         reset_settings()
-        os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64
+        # monkeypatch.setenv restores any pre-existing CACHEKIT_MASTER_KEY on teardown
+        # (and unsets it if it was absent), avoiding cross-test process-env leakage.
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.cache_handler import CacheSerializationHandler
 
         handler = CacheSerializationHandler(
@@ -129,7 +129,6 @@ class TestEncryptionThroughFrame:
         )
         yield handler
         reset_settings()
-        os.environ.pop("CACHEKIT_MASTER_KEY", None)
 
     def test_encrypted_payload_round_trips_through_frame(self, enc_handler):
         secret = {"ssn": "123-45-6789", "balance": 99999}

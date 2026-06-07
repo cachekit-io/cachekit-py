@@ -440,12 +440,17 @@ class TestConfigurableCompression:
         finally:
             reset_settings()
 
-    def test_default_is_auto_zstd(self):
+    def test_default_is_auto_zstd(self, monkeypatch):
         from cachekit.config.singleton import reset_settings
 
+        # Env-independent: clear any externally-set override so the default holds.
+        monkeypatch.delenv("CACHEKIT_ARROW_COMPRESSION", raising=False)
         reset_settings()  # no env override -> default zstd
-        _, meta = ArrowSerializer().serialize(pd.DataFrame({"a": [1] * 1000}))
-        assert meta.compressed is True
+        try:
+            _, meta = ArrowSerializer().serialize(pd.DataFrame({"a": [1] * 1000}))
+            assert meta.compressed is True
+        finally:
+            reset_settings()
 
 
 class TestIntegrityAlwaysOn:
