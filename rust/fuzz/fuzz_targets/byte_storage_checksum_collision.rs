@@ -55,8 +55,9 @@ fuzz_target!(|test_case: ChecksumTestCase| {
             // If it succeeded, data must be unchanged (flip reverted or no-op)
             // This is only acceptable if flip_mask was 0 or flipped back to original
         }
-        Err(err_msg) => {
+        Err(err) => {
             // Expected: Checksum validation should fail
+            let err_msg = err.to_string();
             assert!(
                 err_msg.contains("Checksum validation failed") || err_msg.contains("decompression failed"),
                 "Error should indicate checksum or decompression failure: {}",
@@ -68,7 +69,7 @@ fuzz_target!(|test_case: ChecksumTestCase| {
     // Test with completely wrong checksum
     let wrong_checksum_envelope = StorageEnvelope {
         compressed_data: envelope.compressed_data.clone(),
-        checksum: [0xFF; 32], // Wrong checksum
+        checksum: [0xFF; 8], // Wrong checksum
         original_size: envelope.original_size,
         format: envelope.format.clone(),
     };
@@ -76,9 +77,10 @@ fuzz_target!(|test_case: ChecksumTestCase| {
     // Should be rejected unless original checksum happened to be all 0xFF
     match wrong_checksum_envelope.extract() {
         Ok(_) => {
-            // Only acceptable if original checksum was [0xFF; 32]
+            // Only acceptable if original checksum was [0xFF; 8]
         }
-        Err(err_msg) => {
+        Err(err) => {
+            let err_msg = err.to_string();
             assert!(
                 err_msg.contains("Checksum") || err_msg.contains("failed"),
                 "Wrong checksum should be detected: {}",

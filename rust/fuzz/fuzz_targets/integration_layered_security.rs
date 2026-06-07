@@ -21,7 +21,9 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let aad = b"layered_test";
-    let encryptor = ZeroKnowledgeEncryptor::new();
+    let Ok(encryptor) = ZeroKnowledgeEncryptor::new() else {
+        return;
+    };
 
     // Step 1: Create ByteStorage envelope (compression + checksum)
     let envelope = match StorageEnvelope::new(plaintext.to_vec(), "msgpack".to_string()) {
