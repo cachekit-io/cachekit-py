@@ -78,7 +78,7 @@ def get_redis_client() -> redis.Redis:
                 # Use URL-based connection
                 _pool_instance = redis.ConnectionPool.from_url(
                     redis_config.redis_url,
-                    decode_responses=True,
+                    decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
                     max_connections=redis_config.connection_pool_size,
                 )
 
@@ -120,7 +120,7 @@ async def get_async_redis_client() -> redis_async.Redis:
                 # Use URL-based connection
                 _async_pool_instance = redis_async.ConnectionPool.from_url(
                     redis_config.redis_url,
-                    decode_responses=True,
+                    decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
                     max_connections=redis_config.connection_pool_size,
                 )
 

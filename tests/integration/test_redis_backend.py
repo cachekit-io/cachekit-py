@@ -18,6 +18,8 @@ import redis
 from cachekit.backends.base import BackendError, BaseBackend
 from cachekit.backends.redis import RedisBackend
 
+from ..utils.redis_test_helpers import RedisIsolationMixin
+
 
 @pytest.mark.unit
 class TestRedisBackendInitialization:
@@ -139,14 +141,15 @@ class TestRedisBackendGet:
             assert result is None
 
     @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
-    def test_get_handles_string_response(self):
-        """get() should handle string response from decode_responses=True."""
+    def test_get_returns_raw_bytes_unchanged(self):
+        """get() returns Redis bytes unchanged — the pool uses decode_responses=False,
+        so binary payloads (incl. non-UTF-8) pass through without decode/coercion (#154)."""
         with patch("cachekit.backends.redis.backend.DIContainer") as mock_container_class:
             mock_container_instance = Mock()
             mock_container_class.return_value = mock_container_instance
             mock_client = Mock()
-            # Redis with decode_responses=True returns str
-            mock_client.get.return_value = "string_value"
+            # decode_responses=False -> redis-py returns raw bytes, including non-UTF-8.
+            mock_client.get.return_value = b"\x82\xa3val\xff\xfe"
             mock_provider = Mock()
             mock_provider.get_sync_client.return_value = mock_client
             mock_container_instance.get.return_value = mock_provider
@@ -154,8 +157,7 @@ class TestRedisBackendGet:
             backend = RedisBackend()
             result = backend.get("test:key")
 
-            # Should convert str to bytes
-            assert result == b"string_value"
+            assert result == b"\x82\xa3val\xff\xfe"
             assert isinstance(result, bytes)
 
     @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
@@ -777,3 +779,37 @@ class TestResetGlobalPoolAsyncLockReset:
         finally:
             loop.close()
             asyncio.set_event_loop(None)
+
+
+@pytest.mark.integration
+class TestRedisBinaryRoundtrip(RedisIsolationMixin):
+    """Regression for #154: the shared Redis pool must return raw bytes.
+
+    Non-UTF-8 payloads (Rust ByteStorage LZ4, Arrow IPC, AES-256-GCM ciphertext)
+    must round-trip intact. Previously the pool used decode_responses=True, so
+    redis-py ran value.decode('utf-8', 'strict') on every GET and raised
+    UnicodeDecodeError on any binary payload.
+    """
+
+    def test_non_utf8_payload_roundtrips_through_shared_pool(self, monkeypatch):
+        import cachekit.backends.redis.client as rc
+        from cachekit.config.singleton import reset_settings
+
+        kw = self.redis_client.connection_pool.connection_kwargs
+        # pytest-redis uses a unix socket by default; support both transports.
+        if "path" in kw:
+            url = f"unix://{kw['path']}?db={kw.get('db', 0)}"
+        else:
+            url = f"redis://{kw['host']}:{kw['port']}/{kw.get('db', 0)}"
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", url)
+        rc._pool_instance = None
+        reset_settings()
+        try:
+            client = rc.get_cached_redis_client()
+            # Valid MessagePack-ish bytes that are NOT valid UTF-8 (0x82, 0xff).
+            evil = b"\x82\xa3ssn\xa3123\x00\xff\xfe"
+            client.set("ck:154:bin", evil)
+            assert client.get("ck:154:bin") == evil
+        finally:
+            rc._pool_instance = None
+            reset_settings()

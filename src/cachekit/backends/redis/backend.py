@@ -107,15 +107,11 @@ class RedisBackend:
         try:
             client = self._get_client()
             value = client.get(key)
-            # Redis client with decode_responses=True returns str, need bytes
-            # But get() with binary data returns bytes if decode fails
-            # For safety, encode if we got str
-            if value is not None:
-                if isinstance(value, str):
-                    return value.encode("utf-8")
-                if isinstance(value, bytes):
-                    return value
-            return None
+            # The pool is configured with decode_responses=False (see redis/client.py),
+            # so Redis returns raw bytes, or None for a missing key. Cached payloads are
+            # binary (LZ4/Arrow/AES ciphertext) and must never be UTF-8 decoded. The
+            # isinstance check enforces the bytes|None contract without any str coercion.
+            return value if isinstance(value, bytes) else None
         except Exception as e:
             raise BackendError(
                 message=f"Redis GET failed: {e}",
