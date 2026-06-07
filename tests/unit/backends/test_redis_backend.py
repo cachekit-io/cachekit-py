@@ -60,41 +60,34 @@ class TestRedisPoolDecodeResponses:
 
 @pytest.mark.unit
 class TestRedisBackendGetContract:
-    """get() returns raw bytes (or None) — never str, never UTF-8 decoded."""
+    """get() returns raw bytes (or None) — never str, never UTF-8 decoded.
+
+    Uses explicit client_provider injection (no DIContainer / env patching) so the
+    tests are independent of REDIS_URL vs CACHEKIT_REDIS_URL alias resolution.
+    """
 
     @staticmethod
     def _backend_returning(value):
+        from cachekit.backends.provider import CacheClientProvider
+
         mock_client = Mock()
         mock_client.get.return_value = value
-        container = Mock()
-        provider = Mock()
+        provider = Mock(spec=CacheClientProvider)
         provider.get_sync_client.return_value = mock_client
-        container_instance = Mock()
-        container_instance.get.return_value = provider
-        container.return_value = container_instance
-        return container
+        return RedisBackend("redis://localhost:6379", client_provider=provider)
 
-    @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_get_returns_non_utf8_bytes_unchanged(self):
-        container = self._backend_returning(b"\x82\xa3val\xff\xfe")
-        with patch("cachekit.backends.redis.backend.DIContainer", container):
-            backend = RedisBackend()
-            result = backend.get("k")
+        backend = self._backend_returning(b"\x82\xa3val\xff\xfe")
+        result = backend.get("k")
         assert result == b"\x82\xa3val\xff\xfe"
         assert isinstance(result, bytes)
 
-    @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_get_returns_none_for_missing_key(self):
-        container = self._backend_returning(None)
-        with patch("cachekit.backends.redis.backend.DIContainer", container):
-            backend = RedisBackend()
-            assert backend.get("missing") is None
+        backend = self._backend_returning(None)
+        assert backend.get("missing") is None
 
-    @patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True)
     def test_get_returns_none_for_non_bytes_response(self):
         # decode_responses=False means this never happens in practice, but the
         # bytes|None narrowing guard must hold defensively (no str coercion).
-        container = self._backend_returning("unexpected-str")
-        with patch("cachekit.backends.redis.backend.DIContainer", container):
-            backend = RedisBackend()
-            assert backend.get("k") is None
+        backend = self._backend_returning("unexpected-str")
+        assert backend.get("k") is None
