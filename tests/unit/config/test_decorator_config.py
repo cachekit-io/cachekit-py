@@ -94,7 +94,7 @@ class TestDecoratorConfigValidation:
         with pytest.raises(ConfigurationError, match="ttl_refresh_threshold must be 0.0-1.0, got -0.1"):
             DecoratorConfig(ttl_refresh_threshold=-0.1)
 
-    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_ttl_rejected(self, bad_ttl: float) -> None:
         """Non-finite TTL (NaN/inf) must fail validation (#158: would create an immortal entry)."""
         with pytest.raises(ValueError, match="finite"):

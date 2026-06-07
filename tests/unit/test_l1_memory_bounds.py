@@ -68,14 +68,14 @@ class TestOversizedEntryRejection:
 class TestL1NonFiniteTtl:
     """A non-finite TTL (NaN/inf) must never produce an immortal L1 entry (#158)."""
 
-    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_redis_ttl_not_stored(self, bad_ttl):
         cache = L1Cache(max_memory_mb=10)
         cache.put("k", b"value", redis_ttl=bad_ttl)
         assert cache.get("k")[0] is False
         assert cache._current_memory_bytes == 0
 
-    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_expires_at_not_stored(self, bad_ttl):
         cache = L1Cache(max_memory_mb=10)
         cache.put("k", b"value", expires_at=bad_ttl)
