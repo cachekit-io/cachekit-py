@@ -17,7 +17,7 @@ Note:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import (
     Field,
@@ -115,6 +115,15 @@ class CachekitConfig(BaseSettings):
         ge=1,
         le=9,
         description="Zlib compression level (1-9, where 9 is highest compression)",
+    )
+    arrow_compression: Literal["zstd", "lz4", "none"] = Field(
+        default="zstd",
+        description=(
+            "Arrow IPC compression codec for DataFrame caching (ArrowSerializer, compression='auto'). "
+            "'zstd'/'lz4' shrink the stored payload but must be decompressed into the heap on read. "
+            "'none' stores uncompressed Arrow IPC, which enables zero-copy memory-mapped reads "
+            "(lowest read memory) at the cost of a larger payload. Env: CACHEKIT_ARROW_COMPRESSION."
+        ),
     )
     retry_on_timeout: bool = Field(
         default=True,

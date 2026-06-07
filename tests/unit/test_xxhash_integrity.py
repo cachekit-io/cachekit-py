@@ -132,18 +132,17 @@ class TestArrowSerializerXxhashIntegrity:
         assert len(data) >= 40, f"Expected at least 40 bytes, got {len(data)}"
 
     def test_checksum_overhead_is_8_bytes(self):
-        """Verify checksum overhead is exactly 8 bytes (xxHash3-64, not 32-byte Blake3)."""
-        # Create two serializers: one with integrity, one without
-        serializer_with = ArrowSerializer(enable_integrity_checking=True)
-        serializer_without = ArrowSerializer(enable_integrity_checking=False)
-
+        """The 8-byte xxHash3-64 checksum is ALWAYS prepended, regardless of the
+        enable_integrity_checking flag. Silently returning corrupted DataFrames is
+        unacceptable (DATA IS SACRED), and 8 bytes is negligible vs the payload, so the
+        speed-first 'no checksum' path was removed. Format: [8-byte checksum][Arrow IPC]."""
         df = pd.DataFrame({"col": range(1000)})
 
-        data_with, _ = serializer_with.serialize(df)
-        data_without, _ = serializer_without.serialize(df)
-
-        overhead = len(data_with) - len(data_without)
-        assert overhead == 8, f"Expected 8-byte overhead (xxHash3-64), got {overhead} bytes"
+        for integrity in (True, False):
+            data, _ = ArrowSerializer(enable_integrity_checking=integrity).serialize(df)
+            # The Arrow IPC file magic 'ARROW1' sits at offset 8, proving exactly an
+            # 8-byte checksum prefix precedes the payload in both modes.
+            assert data[8:14] == b"ARROW1", f"8-byte checksum prefix missing (integrity={integrity})"
 
     def test_minimum_size_check_is_40_bytes(self):
         """Deserialize should require at least 40 bytes (8-byte checksum + 32-byte Arrow header)."""
@@ -154,7 +153,7 @@ class TestArrowSerializerXxhashIntegrity:
             serializer.deserialize(b"X" * 39)
 
         assert "Invalid data" in str(exc_info.value)
-        assert "40 bytes" in str(exc_info.value)
+        assert "Arrow envelope" in str(exc_info.value)
 
     def test_roundtrip_with_xxhash_checksum(self):
         """Normal DataFrame serialize/deserialize roundtrip works with xxHash3-64 checksum."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
 from cachekit.backends.memcached.error_handler import classify_memcached_error
 
@@ -108,12 +109,32 @@ class MemcachedBackend:
         Raises:
             BackendError: If Memcached operation fails.
         """
+        # Guard client-side against oversized items. Memcached rejects items over its
+        # item-size limit (default 1 MiB), but with noreply that rejection is never read —
+        # the call appears to succeed and the entry is silently never cached. Fail loudly
+        # instead, so the caller can compress, shard, or switch backends.
+        max_size = self._config.max_item_size_bytes
+        if max_size and len(value) > max_size:
+            raise BackendError(
+                message=(
+                    f"Value for key {key!r} is {len(value)} bytes, which exceeds the Memcached "
+                    f"max item size of {max_size} bytes. Memcached cannot store it. Enable "
+                    f"compression, use a larger-payload backend (Redis/SaaS/File), or raise both "
+                    f"the server's -I limit and CACHEKIT_MEMCACHED_MAX_ITEM_SIZE_BYTES."
+                ),
+                error_type=BackendErrorType.PERMANENT,
+                operation="set",
+                key=key,
+            )
+
         expire = 0
         if ttl is not None and ttl > 0:
             expire = min(ttl, MAX_MEMCACHED_TTL)
 
         try:
-            self._client.set(self._prefixed_key(key), value, expire=expire)
+            # noreply=False so an oversized/error reply from the server is read and surfaced
+            # rather than silently swallowed (HashClient defaults to noreply=True).
+            self._client.set(self._prefixed_key(key), value, expire=expire, noreply=False)
         except Exception as exc:
             raise classify_memcached_error(exc, operation="set", key=key) from exc
 

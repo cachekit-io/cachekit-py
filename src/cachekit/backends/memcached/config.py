@@ -85,6 +85,16 @@ class MemcachedBackendConfig(BaseBackendConfig):
         default="",
         description="Optional prefix for all cache keys",
     )
+    max_item_size_bytes: int = Field(
+        default=1024 * 1024,
+        ge=0,
+        description=(
+            "Reject values larger than this BEFORE sending to Memcached (0 disables the check). "
+            "Memcached's default item-size limit is 1 MiB (server -I flag); oversized items are "
+            "rejected by the server, and with noreply that rejection is silent — so cachekit "
+            "guards client-side and fails loudly. Raise this only if the server's -I is raised too."
+        ),
+    )
 
     @field_validator("servers", mode="after")
     @classmethod
