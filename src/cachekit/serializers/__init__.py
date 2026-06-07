@@ -8,6 +8,7 @@ from cachekit._rust_serializer import ByteStorage
 
 from .auto_serializer import AutoSerializer
 from .base import (
+    CrossSDKSerializerProtocol,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -207,6 +208,7 @@ __all__ = [
     "OrjsonSerializer",
     "StandardSerializer",
     # Base types
+    "CrossSDKSerializerProtocol",
     "SerializationError",
     "SerializationFormat",
     "SerializationMetadata",

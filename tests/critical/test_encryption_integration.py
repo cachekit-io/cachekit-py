@@ -343,3 +343,65 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         result3 = get_data(1)
         assert result3["call"] == 2
         assert call_count == 2
+
+    def test_encrypted_arrow_dataframe_uses_arrow_not_messagepack(self):
+        """CRITICAL (Issue #134): Arrow DataFrame must flow through the encryption path as Arrow.
+
+        Before the fix, EncryptionWrapper was built without the user's serializer and
+        silently substituted StandardSerializer (MessagePack), which cannot round-trip a
+        DataFrame. This asserts:
+        1. The cached EncryptionWrapper wraps the user's ArrowSerializer.
+        2. A DataFrame survives encrypt -> store-in-Redis -> retrieve -> decrypt unchanged.
+        3. The raw bytes in Redis are ciphertext (no plaintext column values).
+        """
+        import pandas as pd
+
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.nested import EncryptionConfig, L1CacheConfig
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+        from cachekit.serializers.base import SerializationFormat
+
+        # Direct handler-level invariant: wrapper wraps Arrow, metadata carries Arrow format.
+        deployment_uuid = "00000000-0000-0000-0000-000000000134"
+        handler = CacheSerializationHandler(
+            serializer_name=ArrowSerializer(),
+            encryption=True,
+            single_tenant_mode=True,
+            deployment_uuid=deployment_uuid,
+            master_key="a" * 64,
+        )
+        wrapper = handler._get_cached_encryption_wrapper(deployment_uuid)
+        assert type(wrapper.serializer).__name__ == "ArrowSerializer", (
+            "EncryptionWrapper must wrap the user's ArrowSerializer under encryption, not MessagePack"
+        )
+        sentinel_df = pd.DataFrame({"col": [1, 2, 3]})
+        _, meta = wrapper.serialize(sentinel_df, cache_key="df:sentinel")
+        assert meta.encrypted is True
+        assert meta.format == SerializationFormat.ARROW
+
+        # End-to-end via the decorator + Redis (L1 disabled so we exercise L2 decrypt).
+        @cache(
+            ttl=300,
+            namespace="enc_arrow_crit",
+            serializer=ArrowSerializer(),
+            encryption=EncryptionConfig(enabled=True, master_key="a" * 64, single_tenant_mode=True),
+            l1=L1CacheConfig(enabled=False),
+        )
+        def load_balances(account: str) -> pd.DataFrame:
+            return pd.DataFrame({"account": [account], "balance": [424242.0]})
+
+        df1 = load_balances("acct-1")
+        assert df1["balance"].iloc[0] == 424242.0
+
+        # Raw Redis bytes must be ciphertext, not the plaintext column value.
+        key_gen = CacheKeyGenerator()
+        cache_key = key_gen.generate_key(load_balances, ("acct-1",), {}, "enc_arrow_crit")
+        raw = self.redis_client.get(self.get_scoped_key(cache_key))
+        assert raw is not None, "Encrypted Arrow data should be stored in Redis"
+        assert b"424242" not in raw, "Balance must NOT appear in plaintext in Redis"
+        assert b"acct-1" not in raw, "Account id must NOT appear in plaintext in Redis"
+
+        # Cache hit decrypts back to the exact DataFrame (proves Arrow, not MessagePack).
+        df2 = load_balances("acct-1")
+        assert isinstance(df2, pd.DataFrame)
+        pd.testing.assert_frame_equal(df2, df1)

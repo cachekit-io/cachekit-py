@@ -10,7 +10,9 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Create encryptor
-    let encryptor = ZeroKnowledgeEncryptor::new();
+    let Ok(encryptor) = ZeroKnowledgeEncryptor::new() else {
+        return;
+    };
 
     // Generate deterministic key and AAD from input
     // (In real usage, keys come from key derivation)

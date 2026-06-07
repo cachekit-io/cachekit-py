@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 from uuid import UUID
 
 import msgpack
@@ -351,6 +351,10 @@ class AutoSerializer:
         >>> fast_serializer.deserialize(data)
         {'fast': True}
     """
+
+    # AutoSerializer emits Python-specific type tags (set, frozenset, UUID, tuple) that no
+    # other-language SDK can decode — single-SDK only, so it is rejected under encryption.
+    cross_sdk_compatible: ClassVar[bool] = False
 
     def __init__(
         self,
