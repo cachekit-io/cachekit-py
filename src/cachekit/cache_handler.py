@@ -27,6 +27,11 @@ from cachekit.serializers.wrapper import SerializationWrapper
 if TYPE_CHECKING:
     from cachekit.serializers.base import SerializerProtocol
 
+# Serializer string names whose wire format is language-agnostic and therefore safe to
+# use under encryption (Issue #134). 'auto' is intentionally excluded — it emits
+# Python-specific type tags that no other-language SDK can decode.
+CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
+
 # Global DI container instance with default registrations
 container = DIContainer()
 container.register(LoggerProvider, DefaultLoggerProvider)
@@ -342,17 +347,27 @@ class CacheSerializationHandler:
                     "Choose multi-tenant (tenant_extractor) OR single-tenant (single_tenant_mode=True)."
                 )
 
-            # Encryption requires StandardSerializer (MessagePack) for cross-SDK interop
-            if isinstance(serializer_name, str) and serializer_name not in ("default", "std", "standard"):
+            # Issue #134: Encryption requires a cross-SDK-compatible serializer so the
+            # encrypted bytes remain decodable by other-language SDKs. The user's
+            # serializer is threaded into EncryptionWrapper (see
+            # _get_cached_encryption_wrapper); it is NOT silently replaced. We therefore
+            # allow any serializer that produces a language-agnostic wire format and reject
+            # the rest (notably 'auto' and unmarked custom instances) with a clear error.
+            if isinstance(serializer_name, str):
+                if serializer_name not in CROSS_SDK_SERIALIZER_NAMES:
+                    raise ConfigurationError(
+                        f"Encryption requires a cross-SDK-compatible serializer for cross-language "
+                        f"interop, got serializer='{serializer_name}'. Allowed under encryption: "
+                        f"{', '.join(CROSS_SDK_SERIALIZER_NAMES)}. The 'auto' serializer emits "
+                        f"Python-specific types that other SDKs cannot decode, so it cannot be used "
+                        f"with encryption."
+                    )
+            elif not getattr(type(serializer_name), "cross_sdk_compatible", False):
                 raise ConfigurationError(
-                    f"Encryption requires 'default' serializer for cross-language interop, "
-                    f"got serializer='{serializer_name}'. EncryptionWrapper uses StandardSerializer "
-                    f"(MessagePack) internally for cross-SDK compatibility."
-                )
-            elif not isinstance(serializer_name, str):
-                raise ConfigurationError(
-                    "Encryption requires 'default' serializer for cross-language interop. "
-                    "Custom serializer instances cannot be used with encryption."
+                    f"Encryption requires a cross-SDK-compatible serializer for cross-language interop. "
+                    f"The serializer instance '{type(serializer_name).__name__}' does not declare "
+                    f"cross_sdk_compatible=True. Custom serializers used with encryption must set the "
+                    f"cross_sdk_compatible ClassVar to True and guarantee a language-agnostic wire format."
                 )
 
             # Generate deterministic deployment UUID for single-tenant mode
@@ -489,7 +504,18 @@ class CacheSerializationHandler:
 
             # Convert master_key from hex string to bytes if provided
             master_key_bytes = bytes.fromhex(self.master_key) if self.master_key else None
-            wrapper = EncryptionWrapper(tenant_id=tenant_id, master_key=master_key_bytes)
+
+            # Issue #134: thread the user's base serializer into the wrapper so a
+            # cross-SDK-compatible serializer (Arrow/orjson) is actually used under
+            # encryption instead of being silently replaced by StandardSerializer.
+            # The base serializer is fixed per handler instance, so the per-tenant
+            # cache key (tenant_id) remains correct — every wrapper for this handler
+            # wraps the same _base_serializer.
+            wrapper = EncryptionWrapper(
+                serializer=self._base_serializer,
+                tenant_id=tenant_id,
+                master_key=master_key_bytes,
+            )
 
             # Enforce LRU cache size limit
             if len(self._encryption_wrapper_cache) >= self._encryption_cache_maxsize:

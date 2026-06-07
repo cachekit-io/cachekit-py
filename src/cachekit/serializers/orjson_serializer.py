@@ -12,7 +12,7 @@ Integrity Protection:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import orjson
 import xxhash
@@ -73,6 +73,9 @@ class OrjsonSerializer:
         Traceback (most recent call last):
         SerializationError: Checksum validation failed - data corruption detected
     """
+
+    # orjson emits standard JSON — a language-agnostic wire format, safe under encryption.
+    cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, option: int = orjson.OPT_SORT_KEYS, enable_integrity_checking: bool = True):
         """Initialize OrjsonSerializer.

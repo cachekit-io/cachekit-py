@@ -22,7 +22,7 @@ Type checker cannot statically verify optional imports; suppressed via pyright c
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata
 
@@ -108,6 +108,9 @@ class ArrowSerializer:
         Traceback (most recent call last):
         SerializationError: Checksum validation failed - data corruption detected
     """
+
+    # Apache Arrow IPC is a cross-language columnar format (Python, R, Julia, Rust) — safe under encryption.
+    cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, return_format: str = "pandas", enable_integrity_checking: bool = True):
         """Initialize ArrowSerializer.
