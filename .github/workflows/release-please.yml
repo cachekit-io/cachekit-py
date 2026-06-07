@@ -30,6 +30,10 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      # prs_created is "true" when a release PR was opened or updated this run.
+      # pr is the JSON-encoded PullRequest object; we read .headBranchName from it.
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       # Use GitHub App for token vending (avoids branch protection issues with GITHUB_TOKEN)
       # If APP_ID/APP_PRIVATE_KEY not set, falls back to GITHUB_TOKEN
@@ -48,6 +52,62 @@ jobs:
           manifest-file: .release-please-manifest.json
           config-file: release-please-config.json
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+  sync-lockfiles:
+    name: Sync lockfiles in release PR
+    needs: release-please
+    # Only run when release-please opened or updated a release PR. The lockfiles
+    # (uv.lock, root Cargo.lock) are not touched by release-please, so they drift
+    # behind the version bumps in pyproject.toml / __init__.py / Cargo.toml unless
+    # we regenerate and commit them onto the release PR branch.
+    if: ${{ needs.release-please.outputs.prs_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Re-mint the App token in this job: step outputs are job-scoped, so the
+      # token from the release-please job is not visible here. The App token lets
+      # the push below re-trigger required checks on the PR (pushes made with the
+      # default GITHUB_TOKEN do not trigger further workflow runs).
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        if: ${{ vars.USE_APP_TOKEN == 'true' }}
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout release PR branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # Regenerate the lockfiles from the bumped manifests. Both run from the repo
+      # root: uv.lock and Cargo.lock are the workspace locks (there is no rust/Cargo.lock).
+      - name: Sync uv lockfile
+        run: uv lock
+
+      - name: Sync Cargo lockfile
+        run: cargo update -p cachekit-rs
+
+      - name: Commit and push lockfile changes
+        env:
+          BRANCH: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock Cargo.lock
+          if git diff --staged --quiet; then
+            echo "Lockfiles already in sync; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: sync lockfiles with release"
+          git push origin "HEAD:${BRANCH}"
 
   validate-inputs:
     name: Validate Release Inputs
@@ -84,26 +144,26 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux builds - must specify interpreters explicitly (manylinux has 3.8+ but we support 3.9+)
+          # Linux builds - must specify interpreters explicitly (manylinux has 3.8+ but we support 3.10+)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13
           # macOS/Windows - must specify interpreters explicitly (auto-discovery unreliable)
           - os: macos-latest
             target: x86_64-apple-darwin
-            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13
           - os: macos-latest
             target: aarch64-apple-darwin
-            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13
           # aarch64 Linux cross-compilation - must specify Python versions explicitly
           # (cross containers don't have discoverable Python interpreters)
           # Uses manylinux_2_28 for modern GCC (fixes ring crate aarch64 build)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            interpreter: -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+            interpreter: -i python3.10 -i python3.11 -i python3.12 -i python3.13
             manylinux: "2_28"
     runs-on: ${{ matrix.os }}
     steps:
@@ -119,7 +179,6 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: |
-            3.9
             3.10
             3.11
             3.12

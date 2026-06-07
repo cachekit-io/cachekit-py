@@ -11,7 +11,7 @@ struct EmptyDataTestCase {
     /// Compressed data length (can be 0)
     compressed_len: u8, // 0-255
     /// Checksum
-    checksum: [u8; 32],
+    checksum: [u8; 8],
 }
 
 fuzz_target!(|test_case: EmptyDataTestCase| {

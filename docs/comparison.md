@@ -44,9 +44,9 @@ Are you caching in Python?
 | **Upgrade Path** | None | None | Rewrite | Rewrite | Rewrite | ✅ Seamless |
 
 > [!NOTE]
-> **Type preservation**: The default serializer (MessagePack/`StandardSerializer`) converts tuples to lists and frozensets to lists — this is consistent across all backends and modes, and ensures cross-language SDK compatibility (Rust, TypeScript, PHP).
+> **Type preservation**: In L1-only mode (`backend=None`), Python types are preserved exactly — tuples, sets, frozensets all survive cache hits (raw object storage, no serialization). When using a distributed backend (Redis, Memcached, CachekitIO), the default `StandardSerializer` converts tuples to lists and frozensets to lists for cross-language SDK compatibility.
 >
-> **If you need type preservation**, use `serializer='auto'`:
+> **If you need type preservation with a distributed backend**, use `serializer='auto'`:
 > ```python
 > @cache(serializer='auto', ttl=300)
 > def fn(): return (1, 2, 3)  # tuple preserved on cache hit
@@ -71,7 +71,7 @@ Are you caching in Python?
 > - Prometheus metrics built-in (zero setup)
 > - **Zero code changes to upgrade**: Remove `backend=None` → distributed at any time
 >
-> **Tradeoff**: The default serializer converts tuples to lists for cross-language compatibility. Use `serializer='auto'` to preserve Python types (tuples, sets, frozensets). See note above.
+> **Type safe**: L1-only mode stores raw Python objects — tuples, sets, frozensets are preserved exactly like `lru_cache`. No serialization overhead.
 
 ```python notest
 # Single-process, local development
@@ -425,7 +425,7 @@ All competitive claims validated by automated tests against real libraries (not 
 **Key verified findings**:
 - `lru_cache` and `cachetools` crash on unhashable args (`TypeError`) — cachekit handles them
 - `lru_cache` on async functions caches the coroutine, not the result (`RuntimeError` on second await) — no stdlib fix as of Python 3.12+
-- cachekit serializes in all modes (including L1-only) — tuples become lists via MessagePack
+- cachekit L1-only mode (`backend=None`) preserves all Python types (raw object storage, like `lru_cache`); distributed backends serialize via MessagePack (tuples→lists unless `serializer='auto'`)
 - All libraries handle primitives, bytes, datetime, Decimal, UUID, Enum identically in-memory
 
 **Legacy Suite**: `pytest tests/competitive/ -v` (includes older assertion-based tests)

@@ -15,7 +15,9 @@ fuzz_target!(|data: &[u8]| {
     let (key, plaintext) = data.split_at(32);
     let aad = b"test_aad";
 
-    let encryptor = ZeroKnowledgeEncryptor::new();
+    let Ok(encryptor) = ZeroKnowledgeEncryptor::new() else {
+        return;
+    };
 
     // Create valid ciphertext
     let ciphertext = match encryptor.encrypt_aes_gcm(plaintext, key, aad) {

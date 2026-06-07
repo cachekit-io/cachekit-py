@@ -21,7 +21,7 @@ Security: Uses strict isinstance() checks (no hasattr()) to prevent arbitrary co
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, ClassVar
 
 import msgpack
 
@@ -225,6 +225,9 @@ class StandardSerializer:
         Traceback (most recent call last):
         TypeError: StandardSerializer does not support NumPy arrays...
     """
+
+    # MessagePack is a language-agnostic wire format — safe under encryption for cross-SDK reads.
+    cross_sdk_compatible: ClassVar[bool] = True
 
     def __init__(self, enable_integrity_checking: bool = True):
         """Initialize StandardSerializer.

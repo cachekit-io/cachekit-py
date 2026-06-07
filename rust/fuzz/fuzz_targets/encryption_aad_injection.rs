@@ -19,7 +19,9 @@ fuzz_target!(|data: &[u8]| {
 
     let (plaintext, aad) = rest.split_at(rest.len() / 2);
 
-    let encryptor = ZeroKnowledgeEncryptor::new();
+    let Ok(encryptor) = ZeroKnowledgeEncryptor::new() else {
+        return;
+    };
 
     // Encrypt with potentially malicious AAD
     // AAD can contain: nulls, control chars, Unicode, empty, long strings

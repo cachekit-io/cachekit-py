@@ -88,25 +88,92 @@ class TestEncryptionWrapperExplicitSerializer:
 
 
 class TestCacheSerializationHandlerEncryptionSerializerValidation:
-    """Cover ConfigurationError branches when encryption=True with non-default serializers."""
+    """Cover validation branches when encryption=True (Issue #134 cross-SDK contract).
 
-    def test_string_non_default_serializer_raises(self):
-        """String serializer name other than default/std/standard raises ConfigurationError."""
-        with pytest.raises(ConfigurationError, match="cross-language interop"):
-            CacheSerializationHandler(
+    Under the cross-SDK contract, encryption ALLOWS any serializer that produces a
+    language-agnostic wire format (default/std/standard/orjson/arrow strings and
+    instances marked cross_sdk_compatible=True), and REJECTS single-SDK serializers
+    ('auto' and unmarked custom instances) so the encrypted bytes stay decodable by
+    other-language SDKs.
+    """
+
+    def test_auto_string_serializer_raises(self, monkeypatch):
+        """String serializer 'auto' (single-SDK) raises ConfigurationError under encryption."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            with pytest.raises(ConfigurationError, match="cross-SDK-compatible"):
+                CacheSerializationHandler(
+                    serializer_name="auto",
+                    encryption=True,
+                    single_tenant_mode=True,
+                )
+        finally:
+            reset_settings()
+
+    def test_unmarked_custom_instance_serializer_raises(self, monkeypatch):
+        """Custom serializer instance without cross_sdk_compatible=True raises under encryption."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        class UnmarkedSerializer:
+            # No cross_sdk_compatible attribute -> treated as single-SDK
+            def serialize(self, obj):
+                return b"", None
+
+            def deserialize(self, data, metadata=None):
+                return None
+
+        reset_settings()
+        try:
+            with pytest.raises(ConfigurationError, match="cross_sdk_compatible"):
+                CacheSerializationHandler(
+                    serializer_name=UnmarkedSerializer(),
+                    encryption=True,
+                    single_tenant_mode=True,
+                )
+        finally:
+            reset_settings()
+
+    def test_orjson_string_accepted_with_encryption(self, monkeypatch):
+        """String serializer 'orjson' (cross-SDK) is accepted under encryption (Issue #134)."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            handler = CacheSerializationHandler(
                 serializer_name="orjson",
                 encryption=True,
                 single_tenant_mode=True,
             )
+            assert handler.encryption is True
+        finally:
+            reset_settings()
 
-    def test_protocol_instance_serializer_raises(self):
-        """Protocol instance as serializer raises ConfigurationError when encryption=True."""
-        with pytest.raises(ConfigurationError, match="cross-language interop"):
-            CacheSerializationHandler(
-                serializer_name=OrjsonSerializer(),
+    def test_cross_sdk_instance_accepted_and_threaded_into_wrapper(self, monkeypatch):
+        """A cross_sdk_compatible serializer instance is accepted AND used by the wrapper (Issue #134)."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            serializer = OrjsonSerializer()
+            assert OrjsonSerializer.cross_sdk_compatible is True
+            handler = CacheSerializationHandler(
+                serializer_name=serializer,
                 encryption=True,
                 single_tenant_mode=True,
+                deployment_uuid="00000000-0000-0000-0000-0000000000aa",
+                master_key="a" * 64,
             )
+            assert handler.encryption is True
+            wrapper = handler._get_cached_encryption_wrapper("00000000-0000-0000-0000-0000000000aa")
+            assert wrapper.serializer is serializer, "User's serializer must be threaded into the EncryptionWrapper"
+        finally:
+            reset_settings()
 
     @pytest.mark.parametrize("alias", ["default", "std"])
     def test_alias_accepted_with_encryption(self, monkeypatch, alias):

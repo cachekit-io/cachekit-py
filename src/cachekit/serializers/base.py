@@ -6,7 +6,7 @@ This module contains shared types and utilities used by all serializers.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -19,6 +19,27 @@ class SerializerProtocol(Protocol):
 
     The protocol is runtime-checkable to enable isinstance() validation
     without requiring explicit inheritance.
+
+    Cross-SDK contract (``cross_sdk_compatible``):
+        Serializers carry a class-level ``cross_sdk_compatible: bool`` attribute
+        that declares whether their wire format is language-agnostic (readable by
+        other-language CacheKit SDKs). It governs whether the serializer may be
+        used under encryption — see ``EncryptionWrapper`` and the validation in
+        ``CacheSerializationHandler.__init__``:
+
+        - ``True``  (StandardSerializer/MessagePack, OrjsonSerializer/JSON,
+          ArrowSerializer/Arrow IPC): the user's serializer is threaded into the
+          EncryptionWrapper and used as-is under encryption.
+        - ``False`` (AutoSerializer, which emits Python-specific type tags; and any
+          serializer that does not declare the flag): single-SDK only, so combining
+          it with encryption is rejected at decoration time.
+
+        This attribute is intentionally NOT part of the runtime-checkable structural
+        set: ``runtime_checkable`` would otherwise force every method-only custom
+        serializer to also declare it, breaking ``isinstance(x, SerializerProtocol)``
+        on the plaintext path across Python 3.10-3.14. It is enforced for type
+        checkers via ``CrossSDKSerializerProtocol`` below, and read at runtime via
+        ``getattr(type(s), "cross_sdk_compatible", False)`` (unmarked == single-SDK).
 
     Examples:
         >>> class MySerializer:
@@ -98,6 +119,23 @@ class SerializerProtocol(Protocol):
             True
         """
         ...
+
+
+class CrossSDKSerializerProtocol(SerializerProtocol, Protocol):
+    """SerializerProtocol plus the ``cross_sdk_compatible`` class attribute.
+
+    Static-typing-only extension of :class:`SerializerProtocol`. It is deliberately
+    NOT ``@runtime_checkable``: the marker is enforced by type checkers (so the core
+    serializers and any opt-in custom serializer must declare the flag), while the
+    runtime ``isinstance(x, SerializerProtocol)`` check stays method-only and never
+    rejects a valid method-only custom serializer just because it omits the flag.
+
+    At runtime the flag is read defensively via
+    ``getattr(type(serializer), "cross_sdk_compatible", False)``; an unmarked
+    serializer is treated as single-SDK (not safe under encryption).
+    """
+
+    cross_sdk_compatible: ClassVar[bool]
 
 
 class SerializerType(str, Enum):

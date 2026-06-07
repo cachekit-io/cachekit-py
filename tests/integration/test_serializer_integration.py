@@ -241,15 +241,113 @@ class TestSerializerGracefulDegradation:
         assert call_count == 2  # Function executed again (no cache)
 
 
-# TestSerializerWithEncryptionInProduction was removed: the tests combined
-# `@cache(serializer=ArrowSerializer())` with `CACHEKIT_MASTER_KEY` to assert that
-# Arrow encoding flows through the encryption path. That combination was never
-# end-to-end functional — cache_handler.py creates `EncryptionWrapper` without
-# passing the user's serializer, so the wrapper silently fell back to
-# StandardSerializer (MessagePack), not Arrow. The v0.6.0 cross-SDK rule
-# (cache_handler.py:351-362) made that silent substitution loud by rejecting
-# the configuration outright.
-#
-# Making this combination actually work requires threading the user's
-# serializer into EncryptionWrapper, marking serializers as cross-SDK
-# compatible, and updating strategy/saas-protocol-v1.0.md. Tracked separately.
+@pytest.mark.integration
+class TestSerializerWithEncryptionInProduction:
+    """Serializer + encryption integration (Issue #134).
+
+    Re-added after PR #133 removed the original variants. Those tests combined
+    ``@cache(serializer=ArrowSerializer())`` with ``CACHEKIT_MASTER_KEY`` and asserted
+    Arrow encoding flowed through the encryption path — it never did, because
+    ``CacheSerializationHandler._get_cached_encryption_wrapper`` built the
+    EncryptionWrapper WITHOUT the user's serializer, so it silently fell back to
+    StandardSerializer (MessagePack). Issue #134 threads the user's serializer into
+    the wrapper and adds the ``cross_sdk_compatible`` marker. These tests lock in the
+    fix: the user's serializer must actually be used under encryption.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_encryption(self):
+        """Set up encryption master key and reset the settings singleton each side."""
+        from cachekit.config.singleton import reset_settings
+
+        original_master_key = os.environ.get("CACHEKIT_MASTER_KEY")
+        os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes hex
+        reset_settings()
+
+        yield
+
+        if original_master_key is not None:
+            os.environ["CACHEKIT_MASTER_KEY"] = original_master_key
+        else:
+            os.environ.pop("CACHEKIT_MASTER_KEY", None)
+        reset_settings()
+
+    def test_arrow_dataframe_encrypt_decrypt_roundtrip(self, redis_isolated):
+        """Arrow DataFrame survives an encrypt -> store -> retrieve -> decrypt roundtrip.
+
+        REGRESSION (Issue #134): before the fix this silently substituted MessagePack,
+        which cannot round-trip a DataFrame, so the cache hit would not equal the source.
+        """
+        call_count = 0
+
+        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_rt")
+        def load_data(user_id: str) -> pd.DataFrame:
+            nonlocal call_count
+            call_count += 1
+            return pd.DataFrame({"user_id": [user_id], "balance": [call_count * 1000.0]})
+
+        # First call - cache miss (serialize+encrypt path)
+        df1 = load_data("user-123")
+        assert call_count == 1
+        assert df1["balance"].iloc[0] == 1000.0
+
+        # Cache entry exists in Redis
+        keys = redis_isolated.keys("*")
+        assert len(keys) > 0
+
+        # Second call - cache hit (retrieve+decrypt path), must equal original DataFrame
+        df2 = load_data("user-123")
+        assert call_count == 1, "Expected cache hit; function should not run again"
+        assert isinstance(df2, pd.DataFrame)
+        pd.testing.assert_frame_equal(df2, df1)
+
+    def test_encrypted_arrow_uses_arrow_not_messagepack(self, redis_isolated):
+        """The EncryptionWrapper must wrap the user's ArrowSerializer, not StandardSerializer.
+
+        This is the core assertion for Issue #134: assert the wrapper's base serializer
+        is the user's Arrow serializer and that the produced metadata carries the Arrow
+        wire format (not MessagePack).
+        """
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+        from cachekit.serializers.base import SerializationFormat
+
+        deployment_uuid = "00000000-0000-0000-0000-000000000134"
+        handler = CacheSerializationHandler(
+            serializer_name=ArrowSerializer(),
+            encryption=True,
+            single_tenant_mode=True,
+            deployment_uuid=deployment_uuid,
+            master_key="a" * 64,
+        )
+
+        wrapper = handler._get_cached_encryption_wrapper(deployment_uuid)
+        assert type(wrapper.serializer).__name__ == "ArrowSerializer", (
+            "EncryptionWrapper must wrap the user's ArrowSerializer, not fall back to StandardSerializer"
+        )
+
+        df = pd.DataFrame({"col": [1, 2, 3], "val": [1.5, 2.5, 3.5]})
+        encrypted, metadata = wrapper.serialize(df, cache_key="data:df")
+
+        assert metadata.encrypted is True
+        assert metadata.format == SerializationFormat.ARROW, (
+            f"Encrypted data must carry the Arrow wire format, got {metadata.format}"
+        )
+
+        decrypted = wrapper.deserialize(encrypted, metadata, cache_key="data:df")
+        assert isinstance(decrypted, pd.DataFrame)
+        pd.testing.assert_frame_equal(decrypted, df)
+
+    def test_dataframe_index_preserved_with_encrypted_arrow_serializer(self, redis_isolated):
+        """DataFrame index is preserved through the encrypted Arrow path end-to-end."""
+
+        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_idx")
+        def get_indexed_data() -> pd.DataFrame:
+            return pd.DataFrame({"value": [10, 20, 30]}, index=["a", "b", "c"])
+
+        df1 = get_indexed_data()
+        assert list(df1.index) == ["a", "b", "c"]
+
+        df2 = get_indexed_data()
+        pd.testing.assert_frame_equal(df2, df1)
+        assert list(df2.index) == ["a", "b", "c"]

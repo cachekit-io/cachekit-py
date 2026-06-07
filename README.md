@@ -65,7 +65,17 @@ Or with [uv][uv-url] (recommended):
 uv add cachekit
 ```
 
-### Setup (Redis — recommended default)
+### Setup (choose a backend)
+
+cachekit exposes one decorator API over a pluggable backend abstraction. Pick the
+backend that fits your infrastructure — they're peers behind the same `@cache` API:
+
+| Backend | Best for | Select with |
+|---------|----------|-------------|
+| Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
+| CachekitIO | Managed, zero-ops (alpha) | `CACHEKIT_API_KEY` |
+| Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
+| File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / `backend=None` |
 
 ```bash
 # Run Redis locally or use your existing infrastructure
@@ -75,7 +85,7 @@ export REDIS_URL="redis://localhost:6379"
 ```python
 from cachekit import cache
 
-@cache  # Uses Redis backend by default
+@cache  # Auto-detects backend (defaults to Redis at localhost)
 def expensive_api_call(user_id: int):
     return fetch_user_data(user_id)
 ```
@@ -153,26 +163,37 @@ def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
-| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` | `@cache.io()` | `@cache.local()` |
-|:--------|:----------------:|:-------------------:|:---------------:|:-------------:|:----------------:|
-| Circuit Breaker | - | ✅ | ✅ | ✅ | - |
-| Adaptive Timeouts | - | ✅ | ✅ | ✅ | - |
-| Monitoring | - | ✅ Full | ✅ Full | ✅ Full | ✅ Basic |
-| Integrity Checking | - | ✅ Enabled | ✅ Enforced | ✅ Enabled | - |
-| Encryption | - | - | ✅ Required | - | - |
-| Backend | Redis | Redis | Redis | CachekitIO SaaS | In-process |
-| **Use Case** | High throughput | Production reliability | Compliance/security | Managed cloud | Opaque objects |
+| Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |
+|:--------|:----------------:|:------------:|:-------------:|:-------------------:|:---------------:|
+| Circuit Breaker | - | ✅ | - | ✅ | ✅ |
+| Adaptive Timeouts | - | ✅ | - | ✅ | ✅ |
+| Backpressure | ✅ | ✅ | - | ✅ | ✅ |
+| Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
+| Encryption | - | - | - | - | ✅ Required |
+| L1 SWR | - | ✅ | - | ✅ | ✅ |
+| L1 Invalidation | - | - | - | ✅ | ✅ |
+| L1 Namespace Index | - | - | - | ✅ | ✅ |
+| Prometheus Metrics | - | - | - | ✅ | ✅ |
+| Tracing | - | ✅ | - | ✅ | ✅ |
+| Structured Logging | - | ✅ | - | ✅ | ✅ |
+| **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
+
+> 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+>
+> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
 <details>
-<summary><strong>Additional Presets</strong></summary>
+<summary><strong>Additional Presets: <code>@cache.dev</code> and <code>@cache.test</code></strong></summary>
+
+See the comparison table above for the exact feature set of each preset.
 
 ```python
-# Development: debugging with verbose output
+# Development: verbose logging, integrity checks on, Prometheus off
 @cache.dev
 def debug_expensive_call():
     return complex_computation()
 
-# Testing: deterministic, no randomness
+# Testing: deterministic, all protections off (no circuit breaker, no backpressure)
 @cache.test
 def test_cached_function():
     return fixed_test_value()
@@ -302,12 +323,36 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 
 </details>
 
-### Built-in Monitoring
+### Monitoring & Observability
 
-- **Prometheus metrics** - Production-ready observability
+- **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
+- **Prometheus metrics** - Recorded by default (your app owns exposition)
 - **Structured logging** - Context-aware with correlation IDs
 - **Health checks** - Comprehensive status endpoints
-- **Performance tracking** - Built-in latency monitoring
+
+Every decorated function exposes `cache_info()`, returning a `CacheInfo` named tuple with
+hit/miss counts, the L1/L2 split, and average backend latency:
+
+```python
+@cache()
+def get_score(x):
+    return x ** 2
+
+get_score(2)
+get_score(2)  # served from cache
+
+info = get_score.cache_info()
+# CacheInfo has 9 fields: hits, misses, l1_hits, l2_hits, maxsize,
+# currsize, l2_avg_latency_ms, last_operation_at, session_id
+assert info.l1_hits + info.l2_hits == info.hits  # every hit is L1 or L2
+```
+
+`maxsize` and `currsize` are always `None` (the cache lives in an external store, not a
+bounded in-process dict); they exist only for `lru_cache` API parity. See the
+[API Reference](docs/api-reference.md#per-function-statistics-via-cache_info) for the full
+field reference and a sample stats endpoint, and the
+[Prometheus Metrics guide](docs/features/prometheus-metrics.md) for metric names and
+exposition setup.
 
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
@@ -327,8 +372,10 @@ def expensive_func(x):
 with ThreadPoolExecutor(max_workers=10) as executor:
     results = list(executor.map(expensive_func, range(100)))
 
-print(expensive_func.cache_info())
-# CacheInfo(hits=90, misses=10, maxsize=None, currsize=10)
+info = expensive_func.cache_info()
+# CacheInfo(hits=..., misses=..., l1_hits=..., l2_hits=...,
+#           maxsize=None, currsize=None, l2_avg_latency_ms=...,
+#           last_operation_at=..., session_id=...)
 ```
 
 </details>
@@ -405,7 +452,7 @@ See [CONTRIBUTING.md][contributing-url] for full development guidelines.
 
 | Component | Version |
 |:----------|:--------|
-| Python | 3.9+ |
+| Python | 3.10+ |
 
 ---
 
