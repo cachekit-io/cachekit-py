@@ -153,26 +153,37 @@ def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
-| Feature | `@cache.minimal` | `@cache.production` | `@cache.secure` | `@cache.io()` | `@cache.local()` |
-|:--------|:----------------:|:-------------------:|:---------------:|:-------------:|:----------------:|
-| Circuit Breaker | - | ✅ | ✅ | ✅ | - |
-| Adaptive Timeouts | - | ✅ | ✅ | ✅ | - |
-| Monitoring | - | ✅ Full | ✅ Full | ✅ Full | ✅ Basic |
-| Integrity Checking | - | ✅ Enabled | ✅ Enforced | ✅ Enabled | - |
-| Encryption | - | - | ✅ Required | - | - |
-| Backend | Redis | Redis | Redis | CachekitIO SaaS | In-process |
-| **Use Case** | High throughput | Production reliability | Compliance/security | Managed cloud | Opaque objects |
+| Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |
+|:--------|:----------------:|:------------:|:-------------:|:-------------------:|:---------------:|
+| Circuit Breaker | - | ✅ | - | ✅ | ✅ |
+| Adaptive Timeouts | - | ✅ | - | ✅ | ✅ |
+| Backpressure | ✅ | ✅ | - | ✅ | ✅ |
+| Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
+| Encryption | - | - | - | - | ✅ Required |
+| L1 SWR | - | ✅ | - | ✅ | ✅ |
+| L1 Invalidation | - | - | - | ✅ | ✅ |
+| L1 Namespace Index | - | - | - | ✅ | ✅ |
+| Prometheus Metrics | - | - | - | ✅ | ✅ |
+| Tracing | - | ✅ | - | ✅ | ✅ |
+| Structured Logging | - | ✅ | - | ✅ | ✅ |
+| **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
+
+> 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+>
+> **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
 <details>
-<summary><strong>Additional Presets</strong></summary>
+<summary><strong>Additional Presets: <code>@cache.dev</code> and <code>@cache.test</code></strong></summary>
+
+See the comparison table above for the exact feature set of each preset.
 
 ```python
-# Development: debugging with verbose output
+# Development: verbose logging, integrity checks on, Prometheus off
 @cache.dev
 def debug_expensive_call():
     return complex_computation()
 
-# Testing: deterministic, no randomness
+# Testing: deterministic, all protections off (no circuit breaker, no backpressure)
 @cache.test
 def test_cached_function():
     return fixed_test_value()
