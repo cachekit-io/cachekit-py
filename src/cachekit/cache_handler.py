@@ -224,8 +224,9 @@ class CacheSerializationHandler:
     - Encryption: Defines WHETHER to encrypt (security layer on top, orthogonal)
     - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
 
-    Modes:
-    - encryption=False: Direct serialization (plaintext in cache)
+    Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
+    - encryption=None: Auto-detect from CACHEKIT_MASTER_KEY (single-tenant if a key is present)
+    - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (nil UUID)
     - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
 
@@ -265,7 +266,7 @@ class CacheSerializationHandler:
     def __init__(
         self,
         serializer_name: Union[str, SerializerProtocol] = "default",  # type: ignore[name-defined]
-        encryption: bool = False,
+        encryption: bool | None = None,
         tenant_extractor: Any | None = None,
         single_tenant_mode: bool = False,
         deployment_uuid: Optional[str] = None,
@@ -278,7 +279,12 @@ class CacheSerializationHandler:
             serializer_name: Serializer instance or name. Accepts either:
                             - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy), "orjson" (JSON)
                             - SerializerProtocol instance: Custom serializer implementing the protocol
-            encryption: Enable encryption layer (wraps serializer with EncryptionWrapper)
+            encryption: Tri-state encryption control (wraps serializer with EncryptionWrapper):
+                        - None (default): auto-detect from CACHEKIT_MASTER_KEY. Single-tenant mode
+                          is auto-enabled when a master key is present.
+                        - True: force encryption ON (requires a master key + explicit tenant mode).
+                        - False: explicit hard opt-out. Never encrypts, even when CACHEKIT_MASTER_KEY
+                          is set fleet-wide. This is the deliberate per-function escape hatch.
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (uses nil UUID).
@@ -305,16 +311,24 @@ class CacheSerializationHandler:
         self.enable_integrity_checking = enable_integrity_checking
         self._deployment_uuid_value: Optional[str] = None
 
-        # Auto-detect encryption from CACHEKIT_MASTER_KEY when not explicitly configured.
-        # This is the single convergence point for ALL backends and presets.
-        if not encryption and master_key is None and tenant_extractor is None:
-            from cachekit.config.singleton import get_settings
+        # Tri-state encryption resolution. `encryption` is None/True/False:
+        #   None  -> auto-detect from CACHEKIT_MASTER_KEY (fleet-wide convergence point)
+        #   True  -> explicit force-on (validated below)
+        #   False -> explicit hard opt-out; honored even when a master key is present
+        #
+        # Auto-detection is the ONLY path that may flip encryption on and auto-set
+        # single_tenant_mode. An explicit False MUST NOT be promoted to True just
+        # because CACHEKIT_MASTER_KEY exists (issue #128).
+        if encryption is None:
+            encryption = False
+            if master_key is None and tenant_extractor is None:
+                from cachekit.config.singleton import get_settings
 
-            settings = get_settings()
-            if settings.master_key:
-                encryption = True
-                master_key = settings.master_key.get_secret_value()
-                single_tenant_mode = True
+                settings = get_settings()
+                if settings.master_key:
+                    encryption = True
+                    master_key = settings.master_key.get_secret_value()
+                    single_tenant_mode = True
 
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor

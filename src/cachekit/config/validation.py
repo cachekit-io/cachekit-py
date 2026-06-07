@@ -30,14 +30,15 @@ class ConfigurationError(Exception):
     pass
 
 
-def validate_encryption_config(encryption: bool = False, master_key: str | None = None) -> None:
+def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:
     """Validate encryption configuration when encryption is enabled.
 
     Checks for a master key: first from the explicit parameter, then from
     CACHEKIT_MASTER_KEY env var via pydantic-settings.
 
     Args:
-        encryption: Whether encryption is enabled. If False, no validation.
+        encryption: Tri-state encryption flag. Falsy (None unset / False opt-out) skips
+                    validation; only an explicit True requires a resolvable master key.
         master_key: Explicit master key (hex string). Takes precedence over env var.
 
     Raises:
