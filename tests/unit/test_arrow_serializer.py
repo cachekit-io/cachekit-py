@@ -452,6 +452,15 @@ class TestConfigurableCompression:
         finally:
             reset_settings()
 
+    def test_auto_falls_back_to_zstd_when_settings_module_unavailable(self, monkeypatch):
+        import sys
+
+        # Simulate the config module being unimportable: auto-resolution must fall
+        # back to zstd (ImportError path) rather than crash. Setting the module to
+        # None in sys.modules makes `from cachekit.config.singleton import ...` raise.
+        monkeypatch.setitem(sys.modules, "cachekit.config.singleton", None)
+        assert ArrowSerializer._resolve_compression("auto") == "zstd"
+
 
 class TestIntegrityAlwaysOn:
     """DATA IS SACRED: corruption is always detected, even with integrity_checking=False."""

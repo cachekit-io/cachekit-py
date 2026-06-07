@@ -103,6 +103,23 @@ class TestUnwrapRejectsGarbage:
         with pytest.raises((ValueError, Exception)):
             SerializationWrapper.unwrap(b"\x99\x98 not a frame and not json")
 
+    def test_truncated_frame_raises_valueerror(self):
+        # Starts with the CK magic but is shorter than the 7-byte prefix.
+        with pytest.raises(ValueError, match="Truncated cache envelope frame"):
+            SerializationWrapper.unwrap(b"CK\x03")
+
+    def test_unsupported_frame_version_raises_valueerror(self):
+        # Valid prefix length but an unknown frame version byte.
+        frame = b"CK" + bytes((99,)) + (2).to_bytes(4, "big") + b"{}"
+        with pytest.raises(ValueError, match="Unsupported cache envelope frame version"):
+            SerializationWrapper.unwrap(frame)
+
+    def test_header_length_exceeds_frame_raises_valueerror(self):
+        # Declares a header far larger than the actual frame body.
+        frame = b"CK" + bytes((3,)) + (9999).to_bytes(4, "big") + b"{}"
+        with pytest.raises(ValueError, match="Invalid cache envelope header length"):
+            SerializationWrapper.unwrap(frame)
+
 
 class TestEncryptionThroughFrame:
     """The binary frame is on the hot path for @cache.secure too: encrypted payloads and
