@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Union
+from typing import Any, Union
 
 # v3 binary frame constants
 _MAGIC = b"CK"
@@ -70,7 +70,7 @@ class SerializationWrapper:
     """
 
     @staticmethod
-    def wrap(data: bytes, metadata: dict, serializer_name: str, version: str = "2.0") -> bytes:
+    def wrap(data: bytes, metadata: dict[str, Any], serializer_name: str, version: str = "2.0") -> bytes:
         """Frame serialized data with a metadata header for cache storage.
 
         Args:
@@ -99,7 +99,7 @@ class SerializationWrapper:
         )
 
     @staticmethod
-    def unwrap(wrapped_data: Union[str, bytes]) -> tuple[bytes, dict, str]:
+    def unwrap(wrapped_data: Union[str, bytes]) -> tuple[bytes, dict[str, Any], str]:
         """Unwrap a cache envelope, reading either the v3 frame or the legacy format.
 
         Args:
@@ -113,11 +113,15 @@ class SerializationWrapper:
         if isinstance(wrapped_data, (bytes, bytearray, memoryview)):
             mv = memoryview(wrapped_data)
             if bytes(mv[: len(_MAGIC)]) == _MAGIC:
+                if mv.nbytes < _PREFIX_LEN:
+                    raise ValueError(f"Truncated cache envelope frame: {mv.nbytes} bytes (minimum {_PREFIX_LEN})")
                 frame_version = mv[len(_MAGIC)]
                 if frame_version != _FRAME_VERSION:
                     raise ValueError(f"Unsupported cache envelope frame version {frame_version} (expected {_FRAME_VERSION})")
                 hdr_len = int.from_bytes(mv[len(_MAGIC) + 1 : _PREFIX_LEN], "big")
                 header_end = _PREFIX_LEN + hdr_len
+                if header_end > mv.nbytes:
+                    raise ValueError(f"Invalid cache envelope header length {hdr_len}: frame has only {mv.nbytes} bytes")
                 header = json.loads(bytes(mv[_PREFIX_LEN:header_end]))
                 payload = bytes(mv[header_end:])  # single copy of the raw payload
                 return payload, header.get("m", {}), header.get("s", "unknown")
