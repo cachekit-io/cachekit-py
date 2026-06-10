@@ -668,13 +668,25 @@ class AutoSerializer:
         # Serialize each column separately
         for col in df.columns:
             series = df[col]
-            if series.dtype.name.startswith("int") or series.dtype.name.startswith("float"):
-                # Use NumPy's efficient serialization for numeric data
+            # Fast raw-buffer path only for PLAIN NumPy numeric dtypes. Pandas
+            # nullable/extension dtypes (Int64/Float64, pyarrow-backed, etc.) must NOT
+            # take this path: their .values has no .tobytes() (AttributeError), and
+            # naming is inconsistent ("Int64" misses startswith("int"); "int64[pyarrow]"
+            # wrongly matches it). is_extension_array_dtype + dtype.kind is the reliable test.
+            if not pd.api.types.is_extension_array_dtype(series.dtype) and series.dtype.kind in ("i", "u", "f"):
                 serialized["data"][col] = {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
             else:
-                # Use MessagePack for other types (including datetime columns)
-                # tolist() will preserve datetime objects for our custom encoder
-                serialized["data"][col] = {"type": "object", "data": series.tolist()}
+                # Strings, datetimes, and nullable/extension columns. tolist() preserves
+                # datetime objects for our custom encoder; scalar pandas NA sentinels
+                # (pd.NA/NaT/NaN) are converted to None so msgpack can pack them.
+                values = []
+                for v in series.tolist():
+                    try:
+                        is_na = bool(pd.isna(v))
+                    except (TypeError, ValueError):
+                        is_na = False  # array-like cell (e.g. a list) is not a scalar NA
+                    values.append(None if is_na else v)
+                serialized["data"][col] = {"type": "object", "data": values}
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
