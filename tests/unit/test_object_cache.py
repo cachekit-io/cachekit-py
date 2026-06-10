@@ -73,6 +73,13 @@ class TestObjectCacheTTL:
         assert value is None
         assert oc.size == 0  # lazy removal happened
 
+    @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_ttl_raises(self, bad_ttl: float) -> None:
+        """Non-finite TTL (NaN/inf) must be rejected, not stored as an immortal entry (#158)."""
+        oc = ObjectCache()
+        with pytest.raises(ValueError, match="finite"):
+            oc.put("k", "value", ttl=bad_ttl)
+
     def test_put_evicts_expired_before_lru(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When full, expired entries are evicted before the LRU fresh entry."""
         fake_time = types.SimpleNamespace(monotonic=lambda: 1000.0)

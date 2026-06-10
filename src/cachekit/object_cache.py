@@ -7,6 +7,7 @@ process boundaries or survive restarts.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -105,8 +106,8 @@ class ObjectCache:
         Raises:
             ValueError: If ttl is less than 1.
         """
-        if ttl < 1:
-            raise ValueError(f"ttl must be >= 1, got {ttl}")
+        if not math.isfinite(ttl) or ttl < 1:
+            raise ValueError(f"ttl must be a finite number >= 1, got {ttl!r}")
         expires_at = time.monotonic() + ttl
         with self._lock:
             # If key already present, update in-place and move to end
