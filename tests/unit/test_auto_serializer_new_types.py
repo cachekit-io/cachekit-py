@@ -662,3 +662,69 @@ class TestPythonicSerializerAlias:
 
         s = get_serializer("pythonic")
         assert isinstance(s, AutoSerializer)
+
+
+class TestColumnarFallbackExtensionDtypes:
+    """The no-pyarrow columnar DataFrame fallback (_serialize_dataframe) must handle
+    pandas nullable/extension dtypes without crashing (#160). Round-trip is lossy on
+    this fallback (NA -> null), so we assert no-crash + value/null preservation, not
+    exact dtype fidelity (that is the Arrow path's job)."""
+
+    def test_nullable_dtypes_and_objects_roundtrip(self):
+        pd = pytest.importorskip("pandas")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        df = pd.DataFrame(
+            {
+                "ints": pd.array([1, 2, None, 4], dtype="Int64"),  # capital -> missed numeric branch before
+                "floats": pd.array([1.5, 2.5, None, 4.5], dtype="Float64"),
+                "objs": ["x", None, "z", "w"],
+                "plain": [10, 20, 30, 40],  # plain numpy int64 -> fast numeric path
+            }
+        )
+
+        data = ser._serialize_dataframe(df)  # previously raised: msgpack can't pack pd.NA
+        out = ser._deserialize_dataframe(data)
+
+        assert list(out.columns) == ["ints", "floats", "objs", "plain"]
+        assert out.shape == (4, 4)
+        # Non-NA values preserved; NA positions are null after the lossy fallback.
+        assert out["ints"].iloc[0] == 1 and out["ints"].iloc[3] == 4
+        assert pd.isna(out["ints"].iloc[2])
+        assert out["objs"].iloc[0] == "x" and out["objs"].iloc[2] == "z"
+        assert pd.isna(out["objs"].iloc[1])
+        assert out["plain"].tolist() == [10, 20, 30, 40]
+
+    def test_pyarrow_backed_dtype_does_not_crash(self):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        # "int64[pyarrow]".startswith("int") was True -> hit the numeric branch ->
+        # .values.tobytes() AttributeError on the Arrow extension array, before the fix.
+        df = pd.DataFrame({"x": pd.array([1, 2, 3], dtype="int64[pyarrow]")})
+
+        data = ser._serialize_dataframe(df)
+        out = ser._deserialize_dataframe(data)
+
+        assert out["x"].tolist() == [1, 2, 3]
+
+    def test_nullable_series_roundtrip(self):
+        pd = pytest.importorskip("pandas")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        s = pd.Series(pd.array([1, 2, None, 4], dtype="Int64"), name="n")
+
+        data = ser._serialize_series(s)  # previously raised on the pd.NA sentinel
+        out = ser._deserialize_series(data)
+
+        assert out.name == "n"
+        assert out.iloc[0] == 1 and out.iloc[3] == 4
+        assert pd.isna(out.iloc[2])
+
+    def test_pyarrow_backed_series_does_not_crash(self):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        s = pd.Series(pd.array([1, 2, 3], dtype="int64[pyarrow]"), name="x")
+
+        out = ser._deserialize_series(ser._serialize_series(s))
+
+        assert out.tolist() == [1, 2, 3]
