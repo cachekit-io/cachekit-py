@@ -854,7 +854,15 @@ class CacheOperationHandler:
                 return (True, deserialized)
             return None
         except SerializationError as e:
-            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+            # Corruption / integrity-auth failure on the stored bytes. Best-effort evict
+            # the poisoned entry so subsequent reads don't re-pay full decompress+verify
+            # only to fail again; the caller recomputes and re-stores the value (#159).
+            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            try:
+                if self._cache_handler is not None:
+                    self._cache_handler.delete(cache_key)
+            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -887,7 +895,15 @@ class CacheOperationHandler:
                 return (True, deserialized)
             return None
         except SerializationError as e:
-            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+            # Corruption / integrity-auth failure on the stored bytes. Best-effort evict
+            # the poisoned entry so subsequent reads don't re-pay full decompress+verify
+            # only to fail again; the caller recomputes and re-stores the value (#159).
+            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            try:
+                if self._cache_handler is not None:
+                    await self._cache_handler.delete_async(cache_key)
+            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
