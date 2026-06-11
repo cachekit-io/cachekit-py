@@ -76,3 +76,54 @@ class TestL2DecryptFailureWarning:
 
         result = handler.get_cached_value("test:key")
         assert result is None  # Caller will recompute
+
+    def test_serialization_error_evicts_poisoned_entry(self) -> None:
+        """On corruption, the poisoned L2 entry is deleted so reads stop re-failing (#159)."""
+        handler = self._make_handler(deserialize_side_effect=SerializationError("integrity check failed"))
+
+        result = handler.get_cached_value("poison:key")
+
+        assert result is None
+        handler._cache_handler.delete.assert_called_once_with("poison:key")
+
+    def test_eviction_failure_does_not_mask_miss(self, caplog: pytest.LogCaptureFixture) -> None:
+        """If eviction itself fails, get_cached_value still returns None (best-effort)."""
+        handler = self._make_handler(deserialize_side_effect=SerializationError("corrupt"))
+        handler._cache_handler.delete.side_effect = RuntimeError("backend down")
+
+        with caplog.at_level(logging.WARNING):
+            result = handler.get_cached_value("poison:key")
+
+        assert result is None
+        assert any("Failed to evict poisoned" in r.message for r in caplog.records)
+
+    async def test_async_serialization_error_evicts_poisoned_entry(self) -> None:
+        """Async corruption path evicts the poisoned entry via delete_async (#159)."""
+        mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        mock_serialization.deserialize_data.side_effect = SerializationError("integrity check failed")
+        handler = CacheOperationHandler(mock_serialization, CacheKeyGenerator())
+        mock_ch = mock.MagicMock()
+        mock_ch.get_async = mock.AsyncMock(return_value=b"corrupted-bytes")
+        mock_ch.delete_async = mock.AsyncMock(return_value=True)
+        handler.set_cache_handler(mock_ch)
+
+        result = await handler.get_cached_value_async("poison:key")
+
+        assert result is None
+        mock_ch.delete_async.assert_awaited_once_with("poison:key")
+
+    async def test_async_eviction_failure_does_not_mask_miss(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Async eviction failure must not propagate; still a miss."""
+        mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        mock_serialization.deserialize_data.side_effect = SerializationError("corrupt")
+        handler = CacheOperationHandler(mock_serialization, CacheKeyGenerator())
+        mock_ch = mock.MagicMock()
+        mock_ch.get_async = mock.AsyncMock(return_value=b"corrupted-bytes")
+        mock_ch.delete_async = mock.AsyncMock(side_effect=RuntimeError("backend down"))
+        handler.set_cache_handler(mock_ch)
+
+        with caplog.at_level(logging.WARNING):
+            result = await handler.get_cached_value_async("poison:key")
+
+        assert result is None
+        assert any("Failed to evict poisoned" in r.message for r in caplog.records)
