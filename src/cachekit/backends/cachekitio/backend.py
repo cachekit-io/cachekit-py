@@ -27,6 +27,13 @@ if TYPE_CHECKING:
 # Module-level logger
 _logger = get_structured_logger(__name__)
 
+# Lock capability token travels in this request header, never the query string:
+# a ?lock_id= query leaks the token into access/proxy logs and OpenTelemetry
+# http.url spans (CWE-532), letting anyone with log access replay it. The SaaS
+# handler dual-reads this header + the legacy ?lock_id= query during rollout,
+# preferring the header. See protocol spec/saas-api.md (DELETE .../lock).
+LOCK_ID_HEADER = "X-CacheKit-Lock-Id"
+
 
 def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     """Extract cache metrics and format as HTTP headers.
@@ -649,12 +656,13 @@ class CachekitIOBackend:
         inside ``__aexit__`` cannot mask the user's exception. The server-side ``timeout``
         on the lock is the safety net if the DELETE never lands.
         """
-        # URL-encode both segments: lock_key is caller-controlled, lock_id is server-issued
-        # but the SaaS contract doesn't pin a charset.
+        # lock_key is caller-controlled → percent-encode it into the path. lock_id is a
+        # capability token and travels in the X-CacheKit-Lock-Id header, NOT the query
+        # string (CWE-532): a ?lock_id= query leaks it into access/proxy logs and OTel
+        # http.url spans. It is server-issued, so it needs no URL-encoding.
         encoded_key = quote(lock_key, safe="")
-        encoded_id = quote(lock_id, safe="")
         try:
-            await self._request_async("DELETE", f"{encoded_key}/lock?lock_id={encoded_id}")
+            await self._request_async("DELETE", f"{encoded_key}/lock", headers={LOCK_ID_HEADER: lock_id})
             return True
         except BackendError:
             return False
