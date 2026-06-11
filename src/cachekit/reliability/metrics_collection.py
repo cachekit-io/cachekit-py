@@ -110,7 +110,6 @@ def get_all_metrics() -> dict[str, dict[str, Any]]:
     """Get all collected metrics.
 
     Examples:
-        >>> clear_metrics()  # Start fresh
         >>> counter = MetricsCollector("api_calls")
         >>> counter.inc()
         >>> metrics = get_all_metrics()
