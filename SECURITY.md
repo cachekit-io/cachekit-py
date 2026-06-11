@@ -187,6 +187,10 @@ When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Sid
 
 See [SSRF Protection](docs/features/ssrf-protection.md) for full details, including custom host configuration for development environments.
 
+### Lock Token Transport (CWE-532)
+
+The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Lock-Id` request header when releasing a lock (`DELETE /v1/cache/{key}/lock`), **never** in the URL query string. Query strings are routinely captured by access logs, proxy/CDN logs, and OpenTelemetry `http.url` spans ([CWE-532][cwe-532]); a leaked token could be replayed to release a lock within its short TTL. The CacheKit SaaS backend dual-reads the header and the legacy `?lock_id=` query during migration, preferring the header (removed in protocol 2.0).
+
 ---
 
 ## FFI Boundary Security
@@ -394,3 +398,4 @@ We appreciate responsible disclosure from the security community. Security resea
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
+[cwe-532]: https://cwe.mitre.org/data/definitions/532.html
