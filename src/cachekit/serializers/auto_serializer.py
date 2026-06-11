@@ -145,6 +145,29 @@ def _wrap_tuples(obj: Any) -> Any:
     return obj
 
 
+def _is_plain_numpy_numeric(dtype: Any) -> bool:
+    """True only for a plain NumPy int/uint/float dtype.
+
+    Pandas nullable/extension dtypes (Int64, Float64, boolean, pyarrow-backed, ...)
+    are excluded: their backing arrays have no ``.tobytes()`` (AttributeError), and
+    dtype-name matching is unreliable ("Int64" misses ``startswith("int")`` while
+    "int64[pyarrow]" wrongly matches it). Used by the no-pyarrow columnar fallback.
+    """
+    return HAS_PANDAS and not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
+
+
+def _na_safe_object_list(series: Any) -> list:
+    """``series.tolist()`` with scalar pandas NA sentinels (pd.NA/NaT/NaN) mapped to None.
+
+    msgpack cannot pack pd.NA/NaT. The column-level ``isna()`` mask is used (rather than
+    per-element ``pd.isna``) to avoid ambiguity on object cells that are themselves
+    array-like (e.g. a list value). Datetime objects are preserved for the custom encoder.
+    """
+    na_mask = series.isna().tolist()
+    raw = series.astype(object).tolist()
+    return [None if is_na else value for is_na, value in zip(na_mask, raw, strict=True)]
+
+
 def _auto_default(obj: Any) -> Any:
     """Custom encoder for types not natively supported by MessagePack.
 
@@ -668,25 +691,12 @@ class AutoSerializer:
         # Serialize each column separately
         for col in df.columns:
             series = df[col]
-            # Fast raw-buffer path only for PLAIN NumPy numeric dtypes. Pandas
-            # nullable/extension dtypes (Int64/Float64, pyarrow-backed, etc.) must NOT
-            # take this path: their .values has no .tobytes() (AttributeError), and
-            # naming is inconsistent ("Int64" misses startswith("int"); "int64[pyarrow]"
-            # wrongly matches it). is_extension_array_dtype + dtype.kind is the reliable test.
-            if not pd.api.types.is_extension_array_dtype(series.dtype) and series.dtype.kind in ("i", "u", "f"):
+            # Fast raw-buffer path only for plain NumPy numeric dtypes; nullable/extension
+            # dtypes fall through to the NA-safe object path (see helper docstrings).
+            if _is_plain_numpy_numeric(series.dtype):
                 serialized["data"][col] = {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
             else:
-                # Strings, datetimes, and nullable/extension columns. tolist() preserves
-                # datetime objects for our custom encoder; scalar pandas NA sentinels
-                # (pd.NA/NaT/NaN) are converted to None so msgpack can pack them.
-                values = []
-                for v in series.tolist():
-                    try:
-                        is_na = bool(pd.isna(v))
-                    except (TypeError, ValueError):
-                        is_na = False  # array-like cell (e.g. a list) is not a scalar NA
-                    values.append(None if is_na else v)
-                serialized["data"][col] = {"type": "object", "data": values}
+                serialized["data"][col] = {"type": "object", "data": _na_safe_object_list(series)}
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
@@ -747,11 +757,13 @@ class AutoSerializer:
             "index": series.index.tolist() if series.index.name or not series.index.equals(pd.RangeIndex(len(series))) else None,
         }
 
-        if series.dtype.name.startswith("int") or series.dtype.name.startswith("float"):
+        # Same dtype handling as _serialize_dataframe: plain NumPy numeric uses the raw
+        # buffer; nullable/extension dtypes take the NA-safe object path so pd.NA/NaT
+        # do not crash msgpack (#160).
+        if _is_plain_numpy_numeric(series.dtype):
             serialized.update({"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)})  # type: ignore[union-attr]
         else:
-            # Use tolist() for object types - preserves datetime objects for custom encoder
-            serialized.update({"type": "object", "data": series.tolist()})
+            serialized.update({"type": "object", "data": _na_safe_object_list(series)})
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 

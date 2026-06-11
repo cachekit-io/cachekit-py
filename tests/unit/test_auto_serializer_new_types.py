@@ -706,3 +706,25 @@ class TestColumnarFallbackExtensionDtypes:
         out = ser._deserialize_dataframe(data)
 
         assert out["x"].tolist() == [1, 2, 3]
+
+    def test_nullable_series_roundtrip(self):
+        pd = pytest.importorskip("pandas")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        s = pd.Series(pd.array([1, 2, None, 4], dtype="Int64"), name="n")
+
+        data = ser._serialize_series(s)  # previously raised on the pd.NA sentinel
+        out = ser._deserialize_series(data)
+
+        assert out.name == "n"
+        assert out.iloc[0] == 1 and out.iloc[3] == 4
+        assert pd.isna(out.iloc[2])
+
+    def test_pyarrow_backed_series_does_not_crash(self):
+        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        ser = AutoSerializer(enable_integrity_checking=False)
+        s = pd.Series(pd.array([1, 2, 3], dtype="int64[pyarrow]"), name="x")
+
+        out = ser._deserialize_series(ser._serialize_series(s))
+
+        assert out.tolist() == [1, 2, 3]
