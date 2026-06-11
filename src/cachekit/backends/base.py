@@ -32,9 +32,9 @@ class BaseBackend(Protocol):
 
     Example:
         >>> from cachekit.backends import BaseBackend, RedisBackend
-        >>> backend = RedisBackend()
-        >>> isinstance(backend, BaseBackend)  # Runtime checkable protocol
+        >>> issubclass(RedisBackend, BaseBackend)  # structural (runtime-checkable) protocol
         True
+        >>> backend = RedisBackend()  # doctest: +SKIP
         >>> backend.set("key", b"value", ttl=60)  # doctest: +SKIP
         >>> data = backend.get("key")  # doctest: +SKIP
     """

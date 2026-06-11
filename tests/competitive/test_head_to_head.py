@@ -33,12 +33,11 @@ import enum
 import math
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
 import pytest
-import time_machine
 from cachetools import TTLCache, cached
 
 from cachekit import cache
@@ -210,9 +209,10 @@ class TestCollectionTypes:
 
         lru_cache: preserves (in-memory, no serialization)
         cachetools: preserves (in-memory, no serialization)
-        cachekit L1-only: DOES NOT preserve — serializes via MessagePack which
-        converts tuples to lists, even in L1-only mode. This is a known
-        tradeoff: consistent serialization behavior regardless of backend.
+        cachekit L1-only (backend=None): preserves — the L1 cache stores native
+        object references with no serialization, so tuples survive. MessagePack
+        serialization (which converts tuples to lists) only happens when values
+        are written out to an L2 backend.
         """
 
         def fn():
@@ -224,9 +224,9 @@ class TestCollectionTypes:
 
         assert isinstance(lru_result, tuple), "lru_cache preserves tuples"
         assert isinstance(ct_result, tuple), "cachetools preserves tuples"
-        # cachekit serializes even in L1-only mode — tuples become lists
-        assert isinstance(ck_result, list), "cachekit converts tuples to lists via MessagePack"
-        assert ck_result == [1, 2, 3]
+        # cachekit L1-only stores native objects (no serialization) — tuples preserved
+        assert isinstance(ck_result, tuple), "cachekit L1-only preserves tuples (native object cache)"
+        assert ck_result == (1, 2, 3)
 
     def test_set_preservation(self):
         """Set type preservation.
@@ -264,7 +264,8 @@ class TestCollectionTypes:
     def test_nested_dict_of_lists_of_tuples(self):
         """Complex nested structure preservation.
 
-        cachekit serializes even in L1 mode, so inner tuples become lists.
+        cachekit L1-only stores native objects (no serialization), so inner
+        tuples are preserved just like lru_cache and cachetools.
         """
 
         def fn():
@@ -277,8 +278,8 @@ class TestCollectionTypes:
         # lru_cache and cachetools preserve (in-memory, no serialization)
         assert isinstance(lru_result["users"][0], tuple)
         assert isinstance(ct_result["users"][0], tuple)
-        # cachekit serializes — tuples become lists
-        assert isinstance(ck_result["users"][0], list)
+        # cachekit L1-only stores native objects — inner tuples preserved
+        assert isinstance(ck_result["users"][0], tuple)
 
 
 class TestSpecialFloats:
@@ -558,30 +559,30 @@ class TestTTLBehavior:
         assert call_count == 2  # Re-executed after TTL
 
     def test_cachekit_has_ttl(self):
-        """cachekit supports TTL with decorator parameter."""
+        """cachekit supports TTL with decorator parameter.
+
+        Uses a real (short) sleep rather than time_machine: cachekit's L1 cache
+        keys expiry on time.time(), and a real-time wait reliably exercises it
+        without coupling to clock-patching internals.
+        """
         call_count = 0
 
-        with time_machine.travel(0, tick=False) as traveller:
+        @cache(backend=None, ttl=1)
+        def fn(x):
+            nonlocal call_count
+            call_count += 1
+            return x * 2
 
-            @cache(backend=None, ttl=2)
-            def fn(x):
-                nonlocal call_count
-                call_count += 1
-                return x * 2
+        fn(1)
+        fn(1)  # cached: no re-execution
+        second_count = call_count
 
-            fn(1)
-            first_count = call_count
+        time.sleep(1.2)  # wait past the 1s TTL
+        fn(1)
+        # After TTL expiry, the function MUST re-execute
+        assert call_count > second_count, "Function should re-execute after TTL expires"
 
-            fn(1)
-            # May or may not cache depending on L1 implementation details
-            second_count = call_count
-
-            traveller.shift(timedelta(seconds=3))  # Advance clock past TTL
-            fn(1)
-            # After TTL expiry, function MUST re-execute
-            assert call_count > second_count, "Function should re-execute after TTL expires"
-
-            fn.cache_clear()
+        fn.cache_clear()
 
 
 class TestCacheManagement:
