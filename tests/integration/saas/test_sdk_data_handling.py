@@ -175,6 +175,87 @@ def test_large_values(cache_io_decorator, clean_cache):
 
 
 # ============================================================================
+# Multi-MB / value-chunking tests (P1) — regression for the evidence-explorer
+# incident: a ~13.5 MB @cache.io value 500'd on PUT because the SaaS stored each
+# value in a single 2 MB-capped SQLite cell. The backend now chunks transparently.
+# These use INCOMPRESSIBLE random bytes so the *stored* payload actually exceeds
+# 2 MB — a repetitive string would LZ4-compress to ~KB and never chunk.
+# ============================================================================
+
+
+def _size_limit_key(namespace: str, name: str) -> str:
+    """Build a SaaS-valid cache key: ns:<ns>:func:<module.qualname>:args:<hash>:<meta>."""
+    import hashlib
+
+    args_hash = hashlib.blake2b(name.encode(), digest_size=32).hexdigest()
+    return f"ns:{namespace}:func:tests.e2e.size_limits.{name}:args:{args_hash}:1s"
+
+
+def test_chunked_value_roundtrip(cache_io_decorator, clean_cache):
+    """A value larger than the backend's 2 MB cell limit round-trips intact through the
+    full SDK → Worker → DO path via transparent server-side chunking.
+
+    Priority: P1
+    """
+    import os
+
+    blob = os.urandom(13_500_000)  # ~13.5 MB, incompressible → forces chunking
+
+    @cache_io_decorator
+    def get_blob():
+        return blob
+
+    assert get_blob() == blob  # miss → compute → chunked PUT
+    assert get_blob() == blob  # hit → exact bytes preserved across reassembly
+
+
+def test_chunked_roundtrip_and_overwrite_via_http(http_client, sdk_config, unique_namespace):
+    """Direct HTTP (bypasses SDK L1/serialization): a >2 MB value chunk-stores and
+    reassembles byte-identically, and overwriting it with a small value leaves no stale
+    chunks (GET returns exactly the small value — proves chunk cleanup on overwrite).
+
+    Priority: P1
+    """
+    import os
+
+    # Raw key in the path (colons unencoded) — matches how the SDK builds the URL
+    # (backend.py: f"/v1/cache/{key}"); the worker splits the path on literal ':'.
+    # (Percent-encoding the colons makes the worker see 1 component → 400.)
+    key = _size_limit_key(unique_namespace, "roundtrip")
+    url = f"{sdk_config['api_url']}/v1/cache/{key}"
+    headers = {"Content-Type": "application/octet-stream", "X-TTL": "300"}
+
+    big = os.urandom(13_500_000)
+    put = http_client.put(url, data=big, headers=headers)
+    assert put.status_code == 200, put.text
+    got = http_client.get(url)
+    assert got.status_code == 200
+    assert got.content == big  # chunk reassembly is byte-exact
+
+    # Overwrite large → small: stale chunks must be cleared (no orphans, no corruption).
+    small = os.urandom(1024)
+    put2 = http_client.put(url, data=small, headers=headers)
+    assert put2.status_code == 200, put2.text
+    got2 = http_client.get(url)
+    assert got2.status_code == 200
+    assert got2.content == small
+
+
+def test_oversized_value_rejected_with_413(http_client, sdk_config, unique_namespace):
+    """A value above the 25 MB ceiling is rejected with a clean 413 (a permanent error),
+    NOT a 500 that the SDK would mis-classify as transient and retry.
+
+    Priority: P1
+    """
+    # Raw key in the path (colons unencoded) — see test_chunked_roundtrip_and_overwrite_via_http.
+    key = _size_limit_key(unique_namespace, "oversized")
+    url = f"{sdk_config['api_url']}/v1/cache/{key}"
+    body = b"\x00" * (26 * 1024 * 1024)  # 26 MB > 25 MB ceiling (raw HTTP — not compressed)
+    resp = http_client.put(url, data=body, headers={"Content-Type": "application/octet-stream"})
+    assert resp.status_code == 413
+
+
+# ============================================================================
 # Pydantic and Dataclass Tests (P1)
 # ============================================================================
 

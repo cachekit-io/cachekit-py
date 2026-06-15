@@ -40,6 +40,15 @@ class TestHTTPStatusClassification:
         result = classify_http_error(exc, response=_response(status))
         assert result.error_type == BackendErrorType.PERMANENT
 
+    def test_value_too_large_413_is_permanent(self) -> None:
+        # Regression: a too-large value previously surfaced as a 500 → TRANSIENT and was
+        # retried 3× before a silent graceful-degrade. 413 must be PERMANENT (retrying
+        # never helps — the value must shrink) with a clear "too large" message.
+        exc = Exception("payload too large")
+        result = classify_http_error(exc, response=_response(413), operation="put")
+        assert result.error_type == BackendErrorType.PERMANENT
+        assert "too large" in str(result).lower()
+
 
 class TestNetworkExceptionClassification:
     """Tests for network-level exception → error type mapping."""

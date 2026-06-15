@@ -35,6 +35,7 @@ def classify_http_error(
     Classification rules:
         - HTTP 401/403: AUTHENTICATION (alert ops, don't retry)
         - HTTP 429: TRANSIENT (rate limit, exponential backoff)
+        - HTTP 413: PERMANENT (value too large — retrying never helps)
         - HTTP 5xx: TRANSIENT (server error, retry)
         - HTTP 4xx: PERMANENT (client error, don't retry)
         - TimeoutException: TIMEOUT (configurable retry)
@@ -70,6 +71,19 @@ def classify_http_error(
             return BackendError(
                 f"Server error: HTTP {status}",
                 error_type=BackendErrorType.TRANSIENT,
+                original_exception=exc,
+                operation=operation,
+                key=key,
+            )
+
+        # PERMANENT: value too large. A 413 would already classify PERMANENT via the generic
+        # 4xx branch below — this dedicated branch exists only to give an ACTIONABLE message
+        # ("value too large") instead of "Client error: HTTP 413". Retrying never helps (the
+        # value must shrink), so the decorator degrades: runs uncached, once.
+        if status == 413:
+            return BackendError(
+                "Value too large for cachekit.io backend (HTTP 413): value exceeds the server's maximum cache value size",
+                error_type=BackendErrorType.PERMANENT,
                 original_exception=exc,
                 operation=operation,
                 key=key,
