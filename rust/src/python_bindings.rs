@@ -187,7 +187,8 @@ impl PyZeroKnowledgeEncryptor {
             encryption_time_micros: metrics.encryption_time_micros,
             hardware_accelerated: metrics.hardware_accelerated,
         };
-        Python::with_gil(|py| Py::new(py, py_metrics))
+        // pyo3 0.29 renamed Python::with_gil -> Python::attach (GIL/free-threaded terminology).
+        Python::attach(|py| Py::new(py, py_metrics))
     }
 }
 
