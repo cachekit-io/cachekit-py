@@ -175,6 +175,85 @@ def test_large_values(cache_io_decorator, clean_cache):
 
 
 # ============================================================================
+# Large-value tests (P1) — multi-MB values must round-trip intact through the SDK,
+# and values above the API's maximum size must be rejected with a permanent 413.
+# These use INCOMPRESSIBLE random bytes so the payload is genuinely multi-MB on the
+# wire (a repetitive string would compress to ~KB and never exercise the large path).
+# ============================================================================
+
+
+def _size_limit_key(namespace: str, name: str) -> str:
+    """Build a valid cache key: ns:<ns>:func:<module.qualname>:args:<hash>:<meta>."""
+    import hashlib
+
+    args_hash = hashlib.blake2b(name.encode(), digest_size=32).hexdigest()
+    return f"ns:{namespace}:func:tests.e2e.size_limits.{name}:args:{args_hash}:1s"
+
+
+def test_large_value_roundtrip(cache_io_decorator, clean_cache):
+    """A multi-MB value round-trips byte-identically through the SDK.
+
+    Priority: P1
+    """
+    import os
+
+    blob = os.urandom(13_500_000)  # ~13.5 MB, incompressible → genuinely multi-MB on the wire
+
+    @cache_io_decorator
+    def get_blob():
+        return blob
+
+    assert get_blob() == blob  # miss → compute → store
+    assert get_blob() == blob  # hit → exact bytes preserved
+
+
+def test_large_value_roundtrip_and_overwrite_via_http(http_client, sdk_config, unique_namespace):
+    """Direct HTTP (bypasses SDK L1/serialization): a multi-MB value round-trips
+    byte-identically, and overwriting it with a small value returns exactly the small
+    value (no stale bytes).
+
+    Priority: P1
+    """
+    import os
+
+    # Raw key in the path (colons unencoded) — matches how the SDK builds the URL
+    # (backend.py: f"/v1/cache/{key}"); the API splits the path on literal ':'.
+    # (Percent-encoding the colons fails key-format validation.)
+    key = _size_limit_key(unique_namespace, "roundtrip")
+    url = f"{sdk_config['api_url']}/v1/cache/{key}"
+    headers = {"Content-Type": "application/octet-stream", "X-TTL": "300"}
+
+    big = os.urandom(13_500_000)
+    put = http_client.put(url, data=big, headers=headers)
+    assert put.status_code == 200, put.text
+    got = http_client.get(url)
+    assert got.status_code == 200
+    assert got.content == big  # round-trip is byte-exact
+
+    # Overwrite large → small: GET must return exactly the small value (no stale bytes).
+    small = os.urandom(1024)
+    put2 = http_client.put(url, data=small, headers=headers)
+    assert put2.status_code == 200, put2.text
+    got2 = http_client.get(url)
+    assert got2.status_code == 200
+    assert got2.content == small
+
+
+def test_oversized_value_rejected_with_413(http_client, sdk_config, unique_namespace):
+    """A value above the API's maximum size is rejected with a clean, permanent 413
+    (not a 500 the SDK would mis-classify as transient and retry).
+
+    Priority: P1
+    """
+    # Raw key in the path (colons unencoded) — see test_large_value_roundtrip_and_overwrite_via_http.
+    key = _size_limit_key(unique_namespace, "oversized")
+    url = f"{sdk_config['api_url']}/v1/cache/{key}"
+    body = b"\x00" * (26 * 1024 * 1024)  # exceeds the API maximum value size
+    resp = http_client.put(url, data=body, headers={"Content-Type": "application/octet-stream"})
+    assert resp.status_code == 413
+
+
+# ============================================================================
 # Pydantic and Dataclass Tests (P1)
 # ============================================================================
 
