@@ -15,6 +15,7 @@ Performance targets (informational, not asserted):
 
 from __future__ import annotations
 
+import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -519,3 +520,47 @@ def _print_stats(indent: str, stats: dict[str, float]) -> None:
     print(f"{indent}P95:    {stats['p95_us']:>10.2f} μs")
     print(f"{indent}P99:    {stats['p99_us']:>10.2f} μs")
     print(f"{indent}StdDev: {stats['stdev_us']:>10.2f} μs")
+
+
+@pytest.mark.performance
+@pytest.mark.slow
+@pytest.mark.skipif(os.name != "posix", reason="mmap read path is POSIX-only (#171)")
+def test_mmap_read_rss_far_below_full_read(tmp_path: Path) -> None:
+    """The whole point of #171: get_buffer() must NOT materialize the payload on the heap.
+
+    Mapping a large value and touching a few pages should cost a fraction of the RSS that
+    os.read of the same value does. A relative comparison (mmap vs full read of the SAME payload
+    in the SAME process) is far more robust to allocator/GC noise than an absolute RSS bound.
+    """
+    import gc
+
+    import psutil
+
+    proc = psutil.Process()
+    size = 150 * 1024 * 1024  # 150 MB
+    backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "c", max_size_mb=1024, max_value_mb=512))
+    backend.set("big", b"\x00" * size, ttl=300)
+    gc.collect()
+
+    # Full read: os.read pulls the whole payload onto the heap.
+    base = proc.memory_info().rss
+    data = backend.get("big")
+    assert data is not None and len(data) == size
+    full_read_rss = proc.memory_info().rss - base
+    del data
+    gc.collect()
+
+    # mmap read: only the few pages we touch are faulted in.
+    base = proc.memory_info().rss
+    handle = backend.get_buffer("big")
+    assert handle is not None
+    try:
+        _ = handle.view[0]
+        _ = handle.view[len(handle.view) // 2]
+        _ = handle.view[-1]
+        mmap_rss = proc.memory_info().rss - base
+    finally:
+        handle.close()
+
+    print(f"\n  full-read RSS: {full_read_rss / 1e6:.1f} MB   mmap RSS: {mmap_rss / 1e6:.1f} MB")
+    assert mmap_rss < full_read_rss * 0.5, f"mmap RSS {mmap_rss} not < 0.5x full-read RSS {full_read_rss}"

@@ -81,3 +81,31 @@ class TestL1NonFiniteTtl:
         cache.put("k", b"value", expires_at=bad_ttl)
         assert cache.get("k")[0] is False
         assert cache._current_memory_bytes == 0
+
+
+@pytest.mark.unit
+class TestNonBytesRejection:
+    """#171 blocker C belt-and-suspenders: L1 stores raw bytes ONLY.
+
+    An mmap-backed memoryview must never reach L1 — it would pin the mapped file's inode for the
+    whole L1 TTL (silent staleness on POSIX, write failures on Windows, RSS blowup under hot keys).
+    The mmap read path confines the view to the deserialize frame, but a future refactor could
+    regress; this guard makes that regression a loud TypeError instead of a silent alias. bytearray
+    is rejected too (a mutable buffer could change underneath the cache).
+    """
+
+    def test_put_rejects_memoryview(self):
+        cache = L1Cache(max_memory_mb=10)
+        with pytest.raises(TypeError):
+            cache.put("k", memoryview(b"data"), redis_ttl=300)  # type: ignore[arg-type]
+        assert cache.get("k")[0] is False
+
+    def test_put_rejects_bytearray(self):
+        cache = L1Cache(max_memory_mb=10)
+        with pytest.raises(TypeError):
+            cache.put("k", bytearray(b"data"), redis_ttl=300)  # type: ignore[arg-type]
+
+    def test_put_accepts_bytes(self):
+        cache = L1Cache(max_memory_mb=10)
+        cache.put("k", b"data", redis_ttl=300)
+        assert cache.get("k")[0] is True

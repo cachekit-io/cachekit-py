@@ -1695,3 +1695,75 @@ class TestSecurityBugFixes:
         # Verify we can still open files (no exhaustion)
         backend.set("final_key", b"final_value")
         assert backend.get("final_key") == b"final_value"
+
+
+@pytest.mark.unit
+class TestMmapBuffer:
+    """get_buffer(): POSIX zero-copy mmap read of the payload past the 14-byte header.
+
+    Backs the Arrow plaintext-uncompressed read fast path (#171). Returns a handle owning the
+    mmap + a memoryview slice; the caller must close() it. None => caller falls back to get().
+    """
+
+    def test_get_buffer_roundtrips_payload(self, backend: FileBackend) -> None:
+        backend.set("k", b"arrow-payload-bytes", ttl=60)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        try:
+            assert isinstance(handle.view, memoryview)
+            assert bytes(handle.view) == b"arrow-payload-bytes"
+        finally:
+            handle.close()
+
+    def test_get_buffer_view_is_mmap_backed_not_a_heap_copy(self, backend: FileBackend) -> None:
+        """The whole point: the view must alias an mmap, not a materialized heap copy."""
+        import mmap as _mmap
+
+        backend.set("k", b"z" * 9000, ttl=60)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        try:
+            assert isinstance(handle.view.obj, _mmap.mmap)
+        finally:
+            handle.close()
+
+    def test_get_buffer_missing_key_returns_none(self, backend: FileBackend) -> None:
+        assert backend.get_buffer("nonexistent") is None
+
+    def test_get_buffer_oversized_returns_none_for_fallback(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Files larger than the read ceiling fall back to os.read (None), never mapped unbounded."""
+        backend.set("big", b"y" * 5000, ttl=60)
+        monkeypatch.setattr("cachekit.backends.file.backend.MMAP_MAX_BYTES", 1000)
+        assert backend.get_buffer("big") is None
+
+    def test_get_buffer_expired_returns_none(self, backend: FileBackend) -> None:
+        with time_machine.travel(0, tick=False) as traveller:
+            backend.set("k", b"data", ttl=60)
+            traveller.move_to(120, tick=False)  # past the 60s TTL
+            assert backend.get_buffer("k") is None
+
+    def test_close_is_idempotent_and_releases_the_view(self, backend: FileBackend) -> None:
+        backend.set("k", b"data", ttl=60)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        handle.close()
+        handle.close()  # idempotent — no error
+        with pytest.raises((ValueError, BufferError)):
+            bytes(handle.view)  # mapping released; the view is dead
+
+    @pytest.mark.skipif(os.name != "posix", reason="rename-replace inode pinning is POSIX-only")
+    def test_open_mmap_unaffected_by_concurrent_set(self, backend: FileBackend) -> None:
+        """The load-bearing invariant: a set() that renames over the key while a reader holds the
+        mmap must NOT change what the reader sees. POSIX keeps the old (now-unlinked) inode alive
+        as long as the mapping exists, so the reader gets a stable snapshot. This is why set() must
+        stay rename-replace-only — any in-place write would corrupt live mmap readers."""
+        backend.set("k", b"OLD-PAYLOAD", ttl=300)
+        handle = backend.get_buffer("k")
+        assert handle is not None
+        try:
+            assert bytes(handle.view) == b"OLD-PAYLOAD"
+            backend.set("k", b"NEW-PAYLOAD-IS-LONGER", ttl=300)  # atomic rename over the same key
+            assert bytes(handle.view) == b"OLD-PAYLOAD"  # mapping still sees the old snapshot
+        finally:
+            handle.close()
+        assert backend.get("k") == b"NEW-PAYLOAD-IS-LONGER"  # a fresh read sees the new value

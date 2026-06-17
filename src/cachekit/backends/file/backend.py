@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import mmap
 import os
 import platform
 import struct
@@ -46,6 +47,40 @@ TEMP_FILE_MAX_AGE_SECONDS: int = 60  # Delete orphaned temp files older than 60s
 
 # TTL bounds (security: prevent integer overflow)
 MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
+
+# Read-side mmap ceiling (#171, fork 4): a fixed internal cap independent of max_value_mb so a
+# misconfigured huge max_value_mb (or an out-of-band file dropped in cache_dir) can't map an
+# unbounded region. Above this, get_buffer() returns None and the caller falls back to os.read.
+MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
+
+
+class _MmapHandle:
+    """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
+    header). Zero-copy: the view aliases mapped pages, never a heap copy.
+
+    The CALLER must ``close()`` once the consumer is done (after Arrow deserialize has copied the
+    data out via to_pandas). The view DANGLES after close — touching it segfaults — so the handle
+    must never escape the deserialize call frame and must never be stored in L1 (#171 blocker C).
+    """
+
+    __slots__ = ("_mm", "view")
+
+    def __init__(self, mm: mmap.mmap) -> None:
+        self._mm = mm
+        # Slice past the 14-byte header; the slice exports its buffer directly from `mm`, so it is
+        # the only export to release before mm.close().
+        self.view: memoryview = memoryview(mm)[HEADER_SIZE:]
+
+    def close(self) -> None:
+        """Release the view then the mapping. Idempotent (safe to call more than once)."""
+        try:
+            self.view.release()  # must release exports before mmap.close(), else BufferError
+        except (ValueError, BufferError):
+            pass  # already released
+        try:
+            self._mm.close()
+        except (ValueError, BufferError):
+            pass  # already closed
 
 
 class FileBackend:
@@ -188,6 +223,85 @@ class FileBackend:
                     operation="get",
                     key=key,
                 ) from exc
+
+    def get_buffer(self, key: str) -> _MmapHandle | None:
+        """Memory-map a cache value for a zero-copy read of its payload (POSIX only; #171).
+
+        Returns an `_MmapHandle` owning the mmap + a memoryview of the payload (past the 14-byte
+        header), or `None` when mmap does not apply — the caller then falls back to `get()`:
+          - non-POSIX platform (Windows pins mapped files against rename/unlink);
+          - missing / expired / corrupt entry (corrupt + expired are unlinked, mirroring `get`);
+          - empty payload (nothing to map);
+          - file larger than ``MMAP_MAX_BYTES``.
+
+        Security: the fd is opened with ``O_NOFOLLOW`` and the header is validated from the fd
+        BEFORE mapping. We never use ``pa.memory_map(path)`` / a path-based mmap — that re-opens
+        by path and would follow an attacker-swapped symlink, reintroducing the TOCTOU that
+        ``O_NOFOLLOW`` closes. The mapping survives the fd close on POSIX.
+        """
+        if os.name != "posix":
+            return None  # mapped files can't be renamed/unlinked on Windows; caller uses get()
+
+        file_path = self._key_to_path(key)
+
+        with self._lock:
+            try:
+                fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ELOOP):
+                    return None  # missing, or symlink rejected by O_NOFOLLOW
+                raise BackendError(
+                    f"Failed to open cache file for mmap: {exc}",
+                    error_type=self._classify_os_error(exc, is_directory=False),
+                    original_exception=exc,
+                    operation="get_buffer",
+                    key=key,
+                ) from exc
+
+            mm: mmap.mmap | None = None
+            try:
+                self._acquire_file_lock(fd, exclusive=False)
+                try:
+                    st_size = os.fstat(fd).st_size
+
+                    # Validate-then-map: never map a file we're about to delete.
+                    if st_size < HEADER_SIZE:
+                        self._safe_unlink(file_path)
+                        return None
+                    header = os.read(fd, HEADER_SIZE)
+                    if header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                        self._safe_unlink(file_path)
+                        return None
+                    expiry_timestamp = struct.unpack(">Q", header[6:14])[0]
+                    if expiry_timestamp > 0 and time.time() > expiry_timestamp:
+                        self._safe_unlink(file_path)
+                        return None
+
+                    # Empty payload (header only): nothing to map (mmap rejects length 0 anyway).
+                    # Too large: fall back to os.read so we never map an unbounded region.
+                    if st_size <= HEADER_SIZE or st_size > MMAP_MAX_BYTES:
+                        return None
+
+                    mm = mmap.mmap(fd, st_size, access=mmap.ACCESS_READ)
+                    handle = _MmapHandle(mm)
+                    mm = None  # ownership transferred to the handle; don't close it in finally
+                    return handle
+                finally:
+                    self._release_file_lock(fd)
+            except OSError as exc:
+                raise BackendError(
+                    f"Failed to mmap cache file: {exc}",
+                    error_type=self._classify_os_error(exc, is_directory=False),
+                    original_exception=exc,
+                    operation="get_buffer",
+                    key=key,
+                ) from exc
+            finally:
+                if mm is not None:
+                    mm.close()
+                os.close(fd)
 
     def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
         """Store value in file storage with atomic write.

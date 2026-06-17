@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
-from cachekit.backends.base import BackendError, BaseBackend, TTLInspectableBackend
+from cachekit.backends.base import BackendError, BaseBackend, BufferHandle, BufferReadableBackend, TTLInspectableBackend
 from cachekit.backends.provider import (
     BackendProviderInterface,
     DefaultBackendProvider,
@@ -83,6 +83,15 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBackend]:
+    """Type guard: backend can return a zero-copy buffer via get_buffer (#171, File/POSIX only).
+
+    Returns:
+        True if backend implements BufferReadableBackend (used for the mmap Arrow read fast path).
+    """
+    return hasattr(backend, "get_buffer")
 
 
 # Import caching for serializer modules
@@ -640,7 +649,25 @@ class CacheSerializationHandler:
             get_logger().error(f"Serialization failed with {self.serializer_name}: {e}")
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
 
-    def deserialize_data(self, data: str | bytes, cache_key: str = "") -> Any:
+    def supports_mmap_read(self) -> bool:
+        """True iff reads can use the zero-copy mmap fast path (#171).
+
+        Eligible only for PLAINTEXT Arrow that returns pandas:
+        - encrypted values can never mmap (AES-GCM decrypt owns its buffer);
+        - non-Arrow serializers gain nothing (they copy at the Rust/C boundary, rebuild objects);
+        - the "arrow" return_format yields a table that ALIASES the mapped pages, so closing the
+          handle would be a use-after-free — pandas (which copies out via to_pandas) only.
+
+        The backend must also support buffer reads (File/POSIX); that is checked separately, so a
+        True here on a non-File backend simply means get_buffer returns None and we fall back.
+        """
+        return (
+            not self.encryption
+            and self._serializer_string_name == "arrow"
+            and getattr(self._base_serializer, "return_format", None) == "pandas"
+        )
+
+    def deserialize_data(self, data: str | bytes | memoryview, cache_key: str = "") -> Any:
         """Deserialize data from cache storage with cache_key verification.
 
         Args:
@@ -845,6 +872,19 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value")
 
+            # mmap fast path (#171): plaintext Arrow -> pandas on a buffer-readable backend (File,
+            # POSIX) reads zero-copy. The handle is confined to this frame and closed in `finally`,
+            # so the mmap never becomes the returned value and never reaches L1 (blocker C). A None
+            # from get_buffer (ineligible file, or a non-buffer backend) falls through to bytes.
+            if self.serialization_handler.supports_mmap_read():
+                handle = self._cache_handler.get_buffer(cache_key)
+                if handle is not None:
+                    try:
+                        get_logger().cache_hit(cache_key, "Backend(mmap)")
+                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
+                    finally:
+                        handle.close()
+
             cached_data = self._cache_handler.get(cache_key, refresh_ttl)
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
@@ -885,6 +925,18 @@ class CacheOperationHandler:
         try:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_async")
+
+            # mmap fast path (#171): same as the sync path. mmap setup is a fast local syscall and
+            # the existing async path already deserializes synchronously here, so this adds no new
+            # event-loop blocking. The handle is confined to this frame; the mmap never reaches L1.
+            if self.serialization_handler.supports_mmap_read():
+                handle = self._cache_handler.get_buffer(cache_key)
+                if handle is not None:
+                    try:
+                        get_logger().cache_hit(cache_key, "Backend(mmap)")
+                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
+                    finally:
+                        handle.close()
 
             cached_data = await self._cache_handler.get_async(cache_key, refresh_ttl)
             if cached_data is not None:
@@ -1100,6 +1152,10 @@ class CacheHandlerStrategy(Protocol):
         """Get value from cache with optional TTL refresh."""
         ...
 
+    def get_buffer(self, key: str) -> Optional[BufferHandle]:
+        """Return a zero-copy buffer handle if the backend supports it (#171), else None."""
+        ...
+
     def set(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:
         """Set value in cache with TTL and optional metadata."""
         ...
@@ -1264,6 +1320,23 @@ class StandardCacheHandler:
             return None
         except Exception as e:
             get_logger().error(f"Unexpected error getting key {key}: {e}")
+            return None
+
+    def get_buffer(self, key: str) -> Optional[BufferHandle]:
+        """Return a zero-copy buffer handle for key if the backend supports it (#171), else None.
+
+        Mirrors get()'s backpressure/timeout wrapping. Returns None when the backend can't map the
+        value (or on any backend error) so the caller transparently falls back to get().
+        """
+        if not supports_buffer_read(self.backend):
+            return None
+        try:
+            return self._with_backpressure_and_timeout(self.backend.get_buffer, key)
+        except BackendError as e:
+            get_logger().error(f"Backend error mmapping key {key}: {e}")
+            return None
+        except Exception as e:
+            get_logger().error(f"Unexpected error mmapping key {key}: {e}")
             return None
 
     def set(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:

@@ -142,8 +142,10 @@ class ArrowSerializer:
             compression: Arrow IPC compression codec.
                 - "auto" (default): use the CACHEKIT_ARROW_COMPRESSION setting (itself "zstd" by default)
                 - "zstd" / "lz4": compress the payload (smaller wire/L1; must be decompressed on read)
-                - None or "none": store uncompressed Arrow IPC, enabling zero-copy memory-mapped reads
-                  (lowest read memory) at the cost of a larger payload
+                - None or "none": store uncompressed Arrow IPC. Lets the File backend serve plaintext
+                  DataFrame reads (returned as pandas) via a zero-copy mmap — low steady-state read
+                  RSS (~0.32x), though peak is transiently higher from checksum verification + pandas
+                  materialization — at the cost of a larger stored payload. No effect on wire backends.
 
         Raises:
             ValueError: If return_format or compression is not a valid option
@@ -226,7 +228,8 @@ class ArrowSerializer:
             # writing in bounded batches keeps the compressor's working set bounded (one big
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
             # payload). Size each batch to ~8 MiB regardless of schema width. compression=None
-            # writes uncompressed IPC, which a reader can memory-map zero-copy.
+            # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
+            # plaintext, pandas return only).
             max_chunksize = _bounded_chunksize(table)
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
