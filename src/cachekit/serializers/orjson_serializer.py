@@ -156,7 +156,7 @@ class OrjsonSerializer:
             # ValueError = data encoding error
             raise SerializationError(f"Failed to serialize object to JSON: {e}") from e
 
-    def deserialize(self, data: bytes, metadata: SerializationMetadata | None = None) -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: SerializationMetadata | None = None) -> Any:
         """Deserialize JSON bytes with optional xxHash3-64 integrity validation.
 
         Args:
@@ -176,6 +176,7 @@ class OrjsonSerializer:
             >>> result == {"test": 123}
             True
         """
+        data = bytes(data)  # coerce unwrap's zero-copy memoryview; no-op when already bytes
         try:
             if self.enable_integrity_checking:
                 # Guard clause: Minimum size check (8 bytes checksum + at least 2 bytes JSON: {})

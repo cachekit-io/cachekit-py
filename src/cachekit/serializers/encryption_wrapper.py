@@ -241,7 +241,7 @@ class EncryptionWrapper:
         except Exception as e:
             raise EncryptionError(f"Encryption failed: {e}") from e
 
-    def deserialize(self, data: bytes, metadata: SerializationMetadata, cache_key: str = "") -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: SerializationMetadata, cache_key: str = "") -> Any:
         """Decrypt and deserialize data with cache_key verification.
 
         Args:
@@ -329,7 +329,10 @@ class EncryptionWrapper:
             # NOTE: If cache_key doesn't match the one used during encryption,
             # the AAD will be different and AES-GCM authentication will fail.
             # This is the SECURITY mechanism that detects ciphertext substitution.
-            decrypted_data = self.encryptor.decrypt_with_keys(data, aad, self.tenant_keys)
+            # `unwrap` may hand us a memoryview; the AES-GCM binding requires owned bytes, and an
+            # encrypted value can never be zero-copy anyway (decrypt reads the whole ciphertext
+            # into an owned buffer), so coercing here costs nothing the cipher wasn't already paying.
+            decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
 
             # Deserialize the decrypted data using base serializer
             return self.serializer.deserialize(decrypted_data, raw_metadata)

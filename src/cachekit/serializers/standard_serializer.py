@@ -308,7 +308,7 @@ class StandardSerializer:
             # ValueError = data encoding error
             raise SerializationError(f"Failed to serialize object to MessagePack: {e}") from e
 
-    def deserialize(self, data: bytes, metadata: SerializationMetadata | None = None) -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: SerializationMetadata | None = None) -> Any:
         """Deserialize MessagePack bytes with optional ByteStorage unwrapping.
 
         Args:
@@ -328,6 +328,7 @@ class StandardSerializer:
             >>> result == {"test": 123}
             True
         """
+        data = bytes(data)  # coerce unwrap's zero-copy memoryview; no-op when already bytes (Rust retrieve needs bytes)
         try:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
