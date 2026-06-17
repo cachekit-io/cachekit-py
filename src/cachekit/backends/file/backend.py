@@ -75,12 +75,12 @@ class _MmapHandle:
         """Release the view then the mapping. Idempotent (safe to call more than once)."""
         try:
             self.view.release()  # must release exports before mmap.close(), else BufferError
-        except (ValueError, BufferError):
-            pass  # already released
+        except (ValueError, BufferError):  # pragma: no cover - defensive (already released / lingering sub-export)
+            pass
         try:
             self._mm.close()
-        except (ValueError, BufferError):
-            pass  # already closed
+        except (ValueError, BufferError):  # pragma: no cover - defensive (already closed)
+            pass
 
 
 class FileBackend:
@@ -239,7 +239,7 @@ class FileBackend:
         by path and would follow an attacker-swapped symlink, reintroducing the TOCTOU that
         ``O_NOFOLLOW`` closes. The mapping survives the fd close on POSIX.
         """
-        if os.name != "posix":
+        if os.name != "posix":  # pragma: no cover - Windows-only branch; CI is Linux
             return None  # mapped files can't be renamed/unlinked on Windows; caller uses get()
 
         file_path = self._key_to_path(key)
@@ -249,7 +249,7 @@ class FileBackend:
                 fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW)
             except FileNotFoundError:
                 return None
-            except OSError as exc:
+            except OSError as exc:  # pragma: no cover - rare open errors (ELOOP/EACCES); defensive
                 if exc.errno in (errno.ENOENT, errno.ELOOP):
                     return None  # missing, or symlink rejected by O_NOFOLLOW
                 raise BackendError(
@@ -299,7 +299,7 @@ class FileBackend:
                     key=key,
                 ) from exc
             finally:
-                if mm is not None:
+                if mm is not None:  # pragma: no cover - only on a mid-map exception; ownership normally moved to the handle
                     mm.close()
                 os.close(fd)
 

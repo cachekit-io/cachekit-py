@@ -926,18 +926,9 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_async")
 
-            # mmap fast path (#171): same as the sync path. mmap setup is a fast local syscall and
-            # the existing async path already deserializes synchronously here, so this adds no new
-            # event-loop blocking. The handle is confined to this frame; the mmap never reaches L1.
-            if self.serialization_handler.supports_mmap_read():
-                handle = self._cache_handler.get_buffer(cache_key)
-                if handle is not None:
-                    try:
-                        get_logger().cache_hit(cache_key, "Backend(mmap)")
-                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
-                    finally:
-                        handle.close()
-
+            # NOTE: no mmap fast path here. The async decorator path inlines get_async (it does not
+            # route through this method today), so an mmap branch would be dead code. The mmap read
+            # lives on the sync get_cached_value; add it here only when an async caller routes through.
             cached_data = await self._cache_handler.get_async(cache_key, refresh_ttl)
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")

@@ -1767,3 +1767,37 @@ class TestMmapBuffer:
         finally:
             handle.close()
         assert backend.get("k") == b"NEW-PAYLOAD-IS-LONGER"  # a fresh read sees the new value
+
+    def test_get_buffer_corrupt_magic_returns_none_and_unlinks(self, backend: FileBackend) -> None:
+        backend.set("k", b"payload-data-here", ttl=300)
+        path = Path(backend._key_to_path("k"))
+        raw = bytearray(path.read_bytes())
+        raw[0:2] = b"XX"  # clobber the CK magic
+        path.write_bytes(bytes(raw))
+        assert backend.get_buffer("k") is None
+        assert not path.exists()  # corrupt entry is unlinked
+
+    def test_get_buffer_empty_payload_returns_none(self, backend: FileBackend) -> None:
+        backend.set("k", b"", ttl=300)  # header only, no payload to map
+        assert backend.get_buffer("k") is None
+
+    def test_get_buffer_truncated_file_returns_none_and_unlinks(self, backend: FileBackend) -> None:
+        path = Path(backend._key_to_path("trunc"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"CK\x01")  # shorter than the 14-byte header
+        assert backend.get_buffer("trunc") is None
+        assert not path.exists()
+
+    def test_get_buffer_wraps_unexpected_oserror_as_backend_error(
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend.set("k", b"x" * 5000, ttl=300)
+        import cachekit.backends.file.backend as backend_mod
+        from cachekit.backends.errors import BackendError
+
+        def boom(*_a, **_k):
+            raise OSError(errno.EIO, "simulated I/O error")
+
+        monkeypatch.setattr(backend_mod.mmap, "mmap", boom)
+        with pytest.raises(BackendError):
+            backend.get_buffer("k")

@@ -43,16 +43,10 @@ class TestSupportsMmapRead:
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
         sh = CacheSerializationHandler(serializer_name="arrow")
-        serializer = sh._base_serializer
-        assert isinstance(serializer, ArrowSerializer)  # narrows type so .return_format is valid
-        # get_serializer caches one ArrowSerializer process-wide; restore after mutating so later
-        # tests don't get a serializer that returns a Table instead of a DataFrame.
-        original = serializer.return_format
-        serializer.return_format = "arrow"
-        try:
-            assert sh.supports_mmap_read() is False
-        finally:
-            serializer.return_format = original
+        # Swap in a throwaway serializer rather than mutating the process-wide cached instance, so
+        # this test can never leak an "arrow" return_format into another test (no shared state).
+        sh._base_serializer = ArrowSerializer(return_format="arrow")
+        assert sh.supports_mmap_read() is False
 
 
 @pytest.mark.unit
@@ -71,6 +65,22 @@ class TestStandardCacheHandlerGetBuffer:
                 return None
 
         ch = StandardCacheHandler(NoBufferBackend())  # type: ignore[arg-type]
+        assert ch.get_buffer("k") is None
+
+    def test_returns_none_on_backend_error(self) -> None:
+        """A backend error during get_buffer must degrade to None so the caller falls back to get()."""
+        from cachekit.backends.errors import BackendError
+
+        backend = MagicMock()
+        backend.get_buffer.side_effect = BackendError("boom")
+        ch = StandardCacheHandler(backend)
+        assert ch.get_buffer("k") is None
+
+    def test_returns_none_on_unexpected_error(self) -> None:
+        """A non-BackendError exception must also degrade to None (mirrors get()'s catch-all)."""
+        backend = MagicMock()
+        backend.get_buffer.side_effect = RuntimeError("unexpected")
+        ch = StandardCacheHandler(backend)
         assert ch.get_buffer("k") is None
 
 
