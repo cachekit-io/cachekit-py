@@ -125,6 +125,8 @@ jobs:
     # of CI. Version-independent, so run once on 3.12 (~5s) rather than across the push matrix.
     - name: Run memory-invariant tests
       if: matrix.python-version == '3.12'
+      env:
+        REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
     - name: Upload coverage to Codecov
