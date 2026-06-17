@@ -258,7 +258,7 @@ class ArrowSerializer:
         except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError) as e:
             raise SerializationError(f"Failed to serialize DataFrame to Arrow IPC format: {e}") from e
 
-    def deserialize(self, data: bytes, metadata: SerializationMetadata | None = None) -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: SerializationMetadata | None = None) -> Any:
         """Deserialize Arrow IPC bytes with optional xxHash3-64 integrity validation.
 
         Args:

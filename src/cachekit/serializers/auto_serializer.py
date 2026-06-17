@@ -478,7 +478,7 @@ class AutoSerializer:
         metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type="msgpack")
         return data, metadata
 
-    def deserialize(self, data: bytes, metadata: Optional[SerializationMetadata] = None) -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: Optional[SerializationMetadata] = None) -> Any:
         """Deserialize bytes back to Python object.
 
         Automatically detects format from envelope and deserializes accordingly.
@@ -490,6 +490,8 @@ class AutoSerializer:
         Returns:
             Any: Deserialized Python object
         """
+        # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
+        data = bytes(data)
         # Check for custom NumPy format
         if data.startswith(b"NUMPY_RAW"):
             return self._deserialize_numpy(data)

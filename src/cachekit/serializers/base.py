@@ -95,7 +95,7 @@ class SerializerProtocol(Protocol):
         """
         ...
 
-    def deserialize(self, data: bytes, metadata: Any = None) -> Any:
+    def deserialize(self, data: bytes | memoryview, metadata: Any = None) -> Any:
         """Deserialize bytes to Python object.
 
         Args:

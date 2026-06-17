@@ -63,6 +63,28 @@ class TestBinaryFrame:
         assert meta == enc_meta
 
 
+class TestZeroCopyRead:
+    """#162: unwrap must return the v3 payload as a zero-copy VIEW of the input frame, not a
+    fresh ``bytes`` copy. The full-payload copy on every read (incl. every L1 hit) was the
+    read-RSS regression; for a 300MB Arrow frame it doubled peak. A memoryview slice past the
+    frame header flows zero-copy into ``pa.py_buffer`` (and, later, the mmap read path)."""
+
+    def test_v3_payload_is_a_memoryview(self):
+        data, _, _ = SerializationWrapper.unwrap(SerializationWrapper.wrap(PAYLOAD, META, "arrow"))
+        assert isinstance(data, memoryview)
+
+    def test_v3_payload_aliases_input_no_copy(self):
+        """Mutating the source frame shows through the returned payload => no copy was made.
+        (A bytes copy would not reflect the mutation.)"""
+        frame = bytearray(SerializationWrapper.wrap(b"PAYLOAD!!!", META, "arrow"))
+        data, _, _ = SerializationWrapper.unwrap(frame)
+        assert bytes(data) == b"PAYLOAD!!!"  # correct slice past the header
+        hdr_len = int.from_bytes(bytes(frame[3:7]), "big")
+        payload_off = 7 + hdr_len  # MAGIC(2)+ver(1)+hdrlen(4)+header
+        frame[payload_off] ^= 0xFF  # mutate the SOURCE buffer in place
+        assert data[0] == frame[payload_off]  # view reflects it; a copy would not
+
+
 class TestLegacyBackwardCompat:
     """Old base64+JSON entries (written before this change) must still deserialize."""
 

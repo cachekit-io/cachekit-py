@@ -99,15 +99,18 @@ class SerializationWrapper:
         )
 
     @staticmethod
-    def unwrap(wrapped_data: Union[str, bytes]) -> tuple[bytes, dict[str, Any], str]:
+    def unwrap(
+        wrapped_data: Union[str, bytes, bytearray, memoryview],
+    ) -> tuple[Union[bytes, memoryview], dict[str, Any], str]:
         """Unwrap a cache envelope, reading either the v3 frame or the legacy format.
 
         Args:
-            wrapped_data: v3 frame (bytes starting with MAGIC) OR legacy base64+JSON
+            wrapped_data: v3 frame (bytes-like starting with MAGIC) OR legacy base64+JSON
                           envelope (bytes/str starting with '{').
 
         Returns:
-            tuple: (data_bytes, metadata_dict, serializer_name)
+            tuple: (payload, metadata_dict, serializer_name). For a v3 frame the payload is a
+            zero-copy ``memoryview`` aliasing ``wrapped_data``; the legacy path returns ``bytes``.
         """
         # v3 binary frame: only bytes-like can be a frame (str is always legacy JSON).
         if isinstance(wrapped_data, (bytes, bytearray, memoryview)):
@@ -123,7 +126,11 @@ class SerializationWrapper:
                 if header_end > mv.nbytes:
                     raise ValueError(f"Invalid cache envelope header length {hdr_len}: frame has only {mv.nbytes} bytes")
                 header = json.loads(bytes(mv[_PREFIX_LEN:header_end]))
-                payload = bytes(mv[header_end:])  # single copy of the raw payload
+                # Zero-copy: a memoryview slice past the header aliases the input frame (no
+                # full-payload copy on every read). It flows into pa.py_buffer (Arrow) and the
+                # mmap read path without materializing. The view keeps `wrapped_data` alive, so
+                # it never dangles; consumers needing owned bytes coerce at their own boundary.
+                payload = mv[header_end:]
                 return payload, header.get("m", {}), header.get("s", "unknown")
 
         # Legacy base64+JSON envelope (pre-v3 entries; backward compatible read path).
