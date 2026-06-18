@@ -119,6 +119,16 @@ jobs:
           --junitxml=junit.xml \
           -o junit_family=legacy
 
+    # Deterministic memory invariants (RSS/allocation bounds), not wall-clock benchmarks. These
+    # are `performance and slow` — the mmap zero-copy read (#171) and the large-object allocation
+    # caps (#152). Flaky timing/throughput benchmarks are `performance` WITHOUT `slow` and stay out
+    # of CI. Version-independent, so run once on 3.12 (~5s) rather than across the push matrix.
+    - name: Run memory-invariant tests
+      if: matrix.python-version == '3.12'
+      env:
+        REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
+      run: uv run pytest tests/performance/ -m "performance and slow" -q
+
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5

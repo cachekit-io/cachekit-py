@@ -266,7 +266,23 @@ class L1Cache:
             redis_ttl: TTL in seconds from Redis (used to calculate expiry)
             expires_at: Absolute expiry timestamp (overrides redis_ttl)
             namespace: Optional namespace for invalidation support
+
+        Raises:
+            TypeError: if `value` is not exactly `bytes`. L1 stores raw bytes only; a memoryview
+                (e.g. an mmap-backed view from the File backend) or a mutable bytearray must never
+                be stored — the former would pin a mapped file's inode for the whole TTL, the
+                latter could mutate underneath the cache (#171 blocker C). Loud-fail a regression
+                rather than silently alias.
         """
+        # Runtime guard: the annotation says bytes, but callers reach here across dynamic
+        # boundaries (backend.get returns, decorator paths) where the type isn't enforced.
+        if not isinstance(value, bytes):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(
+                f"L1Cache.put requires bytes, got {type(value).__name__}. "
+                "Storing a memoryview/bytearray in L1 is forbidden: an mmap-backed view would pin "
+                "the mapped file for the entry's TTL. Materialize to bytes before caching."
+            )
+
         # Calculate expiry time
         current_time = time.time()
         if expires_at is not None:

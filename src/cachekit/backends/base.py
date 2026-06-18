@@ -176,6 +176,41 @@ class TTLInspectableBackend(Protocol):
 
 
 @runtime_checkable
+class BufferHandle(Protocol):
+    """A borrowed, zero-copy view of a cached value plus the resource backing it.
+
+    Returned by ``BufferReadableBackend.get_buffer``. ``view`` aliases backend-owned memory (e.g.
+    mmap'd file pages), not a heap copy — so the consumer must finish reading and ``close()``
+    before the view is touched again. The view DANGLES after close (touching it can segfault), so
+    it must never be stored (e.g. in L1) nor returned past the read call frame (#171).
+    """
+
+    view: memoryview
+    """Zero-copy view of the payload (valid only until close())."""
+
+    def close(self) -> None:
+        """Release the view and its backing resource. Idempotent."""
+        ...
+
+
+@runtime_checkable
+class BufferReadableBackend(Protocol):
+    """Optional protocol for backends that can return a zero-copy buffer instead of materializing
+    the whole value on the heap.
+
+    Lets large plaintext values (e.g. uncompressed Arrow IPC) be read without copying the payload.
+    Only the File backend implements this today (mmap, POSIX). Backends that don't implement it
+    are simply read via ``get`` as usual.
+    """
+
+    def get_buffer(self, key: str) -> Optional[BufferHandle]:
+        """Return a borrowed zero-copy handle for ``key``, or None when the value is not mappable
+        (missing/expired/too large/non-POSIX) — the caller then falls back to ``get``. The caller
+        MUST ``close()`` the handle when done reading."""
+        ...
+
+
+@runtime_checkable
 class LockableBackend(Protocol):
     """Optional protocol for backends supporting distributed locking.
 

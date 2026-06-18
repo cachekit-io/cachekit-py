@@ -121,8 +121,9 @@ class CachekitConfig(BaseSettings):
         description=(
             "Arrow IPC compression codec for DataFrame caching (ArrowSerializer, compression='auto'). "
             "'zstd'/'lz4' shrink the stored payload but must be decompressed into the heap on read. "
-            "'none' stores uncompressed Arrow IPC, which enables zero-copy memory-mapped reads "
-            "(lowest read memory) at the cost of a larger payload. Env: CACHEKIT_ARROW_COMPRESSION."
+            "'none' stores uncompressed Arrow IPC, which lets the File backend serve plaintext "
+            "DataFrame reads via a zero-copy mmap (low steady-state read RSS; peak transiently "
+            "higher) at the cost of a larger payload. Env: CACHEKIT_ARROW_COMPRESSION."
         ),
     )
     retry_on_timeout: bool = Field(
