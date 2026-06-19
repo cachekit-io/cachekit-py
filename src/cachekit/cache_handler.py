@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 # Python-specific type tags that no other-language SDK can decode.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 
+# Serializer-name aliases collapsed to one canonical frame tag so interchangeable names stay
+# cache-compatible: an entry written as 'auto' must read back under 'pythonic' (its documented
+# alias) and vice-versa, instead of a serializer-mismatch that recomputes on every read (#167).
+_SERIALIZER_NAME_ALIASES = {"std": "default", "standard": "default", "pythonic": "auto"}
+
 # Global DI container instance with default registrations
 container = DIContainer()
 container.register(LoggerProvider, DefaultLoggerProvider)
@@ -348,7 +353,7 @@ class CacheSerializationHandler:
         # Extract string name for metadata storage (for protocol instances, use class name)
         if isinstance(serializer_name, str):
             # Canonicalize aliases to prevent envelope mismatch on deserialize
-            self._serializer_string_name = "default" if serializer_name in ("std", "standard") else serializer_name
+            self._serializer_string_name = _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name)
         else:
             # Protocol instance - use class name for metadata
             self._serializer_string_name = type(serializer_name).__name__
