@@ -375,8 +375,12 @@ class TestOrjsonSerializerIntegration:
         assert serializer1 is serializer2
 
     def test_orjson_serializer_in_registry(self):
-        """Test that OrjsonSerializer is registered."""
+        """orjson is registered as a lazy (None) placeholder — like arrow.
+
+        orjson moved to the optional [json] extra, so the registry holds None and
+        get_serializer('orjson') resolves the class on demand (covered above).
+        """
         from cachekit.serializers import SERIALIZER_REGISTRY
 
         assert "orjson" in SERIALIZER_REGISTRY
-        assert SERIALIZER_REGISTRY["orjson"] == OrjsonSerializer
+        assert SERIALIZER_REGISTRY["orjson"] is None

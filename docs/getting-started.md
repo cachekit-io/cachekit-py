@@ -126,7 +126,7 @@ def analyze_data():
     import numpy as np
     return np.array([1, 2, 3, 4, 5])
 
-# For JSON APIs: OrjsonSerializer (2-5x faster)
+# For JSON APIs: OrjsonSerializer (2-5x faster) — requires: pip install 'cachekit[json]'
 @cache(ttl=900, serializer="orjson")
 def get_api_response():
     return {"status": "ok", "data": "response"}

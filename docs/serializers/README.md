@@ -19,6 +19,8 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 | [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching, GDPR/HIPAA/PCI-DSS compliance |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
+> **OrjsonSerializer** requires the `[json]` extra: `pip install 'cachekit[json]'` (or `uv add 'cachekit[json]'`).
+
 For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 ## Decision Matrix
