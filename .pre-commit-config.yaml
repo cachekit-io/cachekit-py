@@ -39,6 +39,15 @@ repos:
         files: \.rs$
         pass_filenames: false
 
+      # Makefile linting with checkmake (config in checkmake.ini)
+      # Requires: go install github.com/checkmake/checkmake/cmd/checkmake@latest
+      - id: checkmake
+        name: checkmake (Makefile lint)
+        entry: checkmake --config checkmake.ini Makefile
+        language: system
+        files: ^Makefile$
+        pass_filenames: false
+
   # Block internal development artifacts from public repo
   - repo: local
     hooks:
