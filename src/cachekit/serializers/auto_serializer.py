@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 from uuid import UUID
 
 import msgpack
+import xxhash
 
 if TYPE_CHECKING:
     import numpy as np
@@ -492,15 +493,19 @@ class AutoSerializer:
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
-        # Check for custom NumPy format
-        if data.startswith(b"NUMPY_RAW"):
+        # Custom NumPy format — raw [NUMPY_RAW...] or checksummed [8-byte xxHash3-64][NUMPY_RAW...].
+        # Detect by structure (like ArrowSerializer) so it is caught here, before the lossy
+        # retrieve()/msgpack fallback below — _deserialize_numpy strips + verifies the optional
+        # checksum and fails closed on mismatch (#155), even when no metadata is supplied.
+        if data.startswith(b"NUMPY_RAW") or (len(data) >= 17 and data[8:17] == b"NUMPY_RAW"):
             return self._deserialize_numpy(data)
 
         # Use metadata for format detection if available
         if metadata and hasattr(metadata, "original_type"):
             detected_format = metadata.original_type
 
-            # For specialized formats, call type-specific deserializers
+            # For specialized formats, call type-specific deserializers.
+            # _deserialize_numpy strips + verifies the optional xxHash3-64 checksum prefix itself.
             if detected_format == "numpy":
                 return self._deserialize_numpy(data)
             elif detected_format == "arrow":
@@ -603,17 +608,20 @@ class AutoSerializer:
             return self._deserialize_numpy(data)
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
-        """Serialize NumPy array with metadata, bypassing Rust ByteStorage.
+        """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.
 
         Requires: numpy installed (HAS_NUMPY=True)
 
         Raises:
             RuntimeError: If numpy not installed
 
-        Skips Rust layer because:
-        - Compression ineffective on NumPy's random data patterns
-        - Native serialization already fast (~2ms)
-        - Rust overhead adds ~8ms with minimal benefit
+        When ``enable_integrity_checking`` is on (the default / ``@cache``), an 8-byte
+        xxHash3-64 checksum is prepended to the ``NUMPY_RAW`` payload with NO compression,
+        mirroring ``ArrowSerializer`` ([checksum][payload]). The numpy branch used to return
+        these bytes *unchecked*, so a corrupted entry was reconstructed as silently-wrong data
+        on read (#155). Compression is deliberately skipped: numpy is large, often-incompressible
+        binary, and LZ4 here measured ~100x slower with no size benefit. When integrity is off
+        (``@cache.minimal``), the raw payload is returned without a checksum (msgpack-off parity).
         """
         if not HAS_NUMPY:
             raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
@@ -627,7 +635,18 @@ class AutoSerializer:
         shape_len = len(shape_data).to_bytes(2, byteorder="little")
 
         # Combine: header + raw numpy bytes (zero-copy from NumPy)
-        return b"NUMPY_RAW" + dtype_len + dtype_str + shape_len + shape_data + arr.tobytes()
+        raw = b"NUMPY_RAW" + dtype_len + dtype_str + shape_len + shape_data + arr.tobytes()
+
+        if self.enable_integrity_checking:
+            # Checksum-only envelope: prepend the 8-byte xxHash3-64 of the payload, NO compression.
+            # numpy arrays are large, often-incompressible binary; routing them through ByteStorage's
+            # LZ4 measured ~100x slower to serialize, ~400x slower to read, and inflated incompressible
+            # data ~1.56x. This mirrors ArrowSerializer's [8-byte xxHash3-64][payload] scheme, giving
+            # the #155 integrity guarantee at ~0 cost. The read side strips + verifies in
+            # _deserialize_numpy. (No LZ4 here means numpy is genuinely uncompressed, so the
+            # metadata.compressed=False set in serialize() is correct — sidesteps #166 entirely.)
+            return xxhash.xxh3_64_digest(raw) + raw
+        return raw
 
     def _deserialize_numpy(self, data: bytes) -> np.ndarray:
         """Deserialize NumPy array from NUMPY_RAW binary format.
@@ -640,6 +659,16 @@ class AutoSerializer:
         """
         if not HAS_NUMPY:
             raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
+
+        # Strip + verify the optional 8-byte xxHash3-64 checksum prefix written by integrity-on
+        # serialization. Detect by structure (like ArrowSerializer): a checksummed entry is
+        # [8-byte checksum][NUMPY_RAW...]; a raw entry (integrity-off / legacy) is [NUMPY_RAW...].
+        # A mismatch fails closed (#155) — never reconstructs the corrupted array.
+        if not data.startswith(b"NUMPY_RAW") and len(data) >= 17 and data[8:17] == b"NUMPY_RAW":
+            body = data[8:]
+            if xxhash.xxh3_64_digest(body) != data[:8]:
+                raise SerializationError("NumPy integrity check failed: xxHash3-64 checksum mismatch (corrupted cache entry)")
+            data = body
 
         if not data.startswith(b"NUMPY_RAW"):
             raise SerializationError("Invalid NumPy data format - expected NUMPY_RAW header")
