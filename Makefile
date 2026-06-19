@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: help install test test-cov lint format check clean build build-multiarch-linux publish publish-test release release-check sbom
+.PHONY: help install test test-cov lint lint-makefile format check clean build build-multiarch-linux publish publish-test release release-check sbom test-critical security-deep
 .DEFAULT_GOAL := help
 
 # Colors for output (using printf for cross-platform compatibility)
@@ -277,6 +277,10 @@ lint-rust: ## Lint Rust code only
 lint-rust-quiet: setup-logs ## Lint Rust code (minimal output)
 	@$(MAKE) -C rust lint-quiet LOG_LINT_DIR=$(LOG_LINT_DIR) TIMESTAMP=$(TIMESTAMP)
 
+lint-makefile: ## Lint the Makefile with checkmake
+	@command -v checkmake >/dev/null 2>&1 || { echo "$(YELLOW)⚠️  checkmake not found. Install: go install github.com/checkmake/checkmake/cmd/checkmake@latest$(RESET)"; exit 1; }
+	@checkmake --config checkmake.ini Makefile && echo "$(GREEN)✓ Makefile lint passed$(RESET)"
+
 type-check: setup-logs ## Run type checking with basedpyright
 	@echo "$(BLUE)Running type checking with basedpyright...$(RESET)"
 	@echo "$(YELLOW)Note: Using standard mode for gradual migration$(RESET)"
@@ -315,17 +319,7 @@ quick-check: format-python-quiet format-rust-quiet lint-python-quiet lint-rust-q
 	@echo "$(GREEN)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(RESET)"
 
 version-check: ## Check version consistency across files
-	@echo "$(BLUE)Checking version consistency...$(RESET)"
-	@PYTHON_VERSION=$$(grep -E "^version = " pyproject.toml | head -1 | cut -d'"' -f2); \
-	RUST_VERSION=$$(grep -E "^version = " rust/Cargo.toml | head -1 | cut -d'"' -f2); \
-	echo "  Python version: $$PYTHON_VERSION"; \
-	echo "  Rust version:   $$RUST_VERSION"; \
-	if [ "$$PYTHON_VERSION" != "$$RUST_VERSION" ]; then \
-		echo "$(YELLOW)❌ Version mismatch! Python and Rust versions must match.$(RESET)"; \
-		exit 1; \
-	else \
-		echo "$(GREEN)✓ Versions match$(RESET)"; \
-	fi
+	@bash scripts/version-check.sh
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🦀 RUST COMMANDS
@@ -403,28 +397,7 @@ build-pgo: setup-logs ## Build with Profile-Guided Optimization (5-8% faster)
 	@echo "$(GREEN)✓ Build complete$(RESET)"
 
 build-multiarch-linux: ## Build Linux wheels for amd64 + arm64 using Docker (local Mac)
-	@echo "$(BLUE)Building multi-arch Linux wheels...$(RESET)"
-	$(call require_binary,docker,Install Docker: https://www.docker.com/products/docker-desktop)
-	@echo "$(YELLOW)Setting up multi-platform builder...$(RESET)"
-	@if ! docker buildx ls | grep -q "cachekit-builder"; then \
-		echo "$(YELLOW)Creating buildx builder for multi-platform support...$(RESET)"; \
-		docker buildx create --name cachekit-builder --platform linux/amd64,linux/arm64 --use || \
-		docker buildx use cachekit-builder; \
-	else \
-		echo "$(GREEN)✓ Using existing cachekit-builder$(RESET)"; \
-		docker buildx use cachekit-builder; \
-	fi
-	@echo "$(YELLOW)Building for linux/amd64 and linux/arm64...$(RESET)"
-	@mkdir -p $(LOG_BUILD_DIR) dist .dist-linux-build
-	@docker buildx build --platform linux/amd64,linux/arm64 \
-		--output type=local,dest=./.dist-linux-build \
-		--file Dockerfile . 2>&1 | tee $(LOG_BUILD_DIR)/multiarch_$(TIMESTAMP).log || \
-		(echo "$(YELLOW)Build failed. Check $(LOG_BUILD_DIR)/multiarch_$(TIMESTAMP).log$(RESET)" && exit 1)
-	@echo "$(YELLOW)Extracting wheels to dist/...$(RESET)"
-	@cp .dist-linux-build/linux_amd64/cachekit-*.whl dist/ 2>/dev/null || true
-	@cp .dist-linux-build/linux_arm64/cachekit-*.whl dist/ 2>/dev/null || true
-	@echo "$(GREEN)✓ Multi-arch wheels built$(RESET)"
-	@ls -lh dist/cachekit-*linux*.whl 2>/dev/null || (echo "$(YELLOW)⚠️  No Linux wheels found. Check $(LOG_BUILD_DIR)/multiarch_$(TIMESTAMP).log$(RESET)" && exit 1)
+	@bash scripts/build-multiarch-linux.sh
 
 publish-test: ## Publish all wheels to Test PyPI
 	@echo "$(BLUE)Publishing all wheels to Test PyPI...$(RESET)"
@@ -500,64 +473,7 @@ ci: setup-logs ## Run CI pipeline locally
 # ═══════════════════════════════════════════════════════════════════════════════
 
 security-install: ## Install all security tools (cargo-audit, deny, geiger, etc.)
-	@echo "$(BLUE)Installing security tools...$(RESET)"
-	$(call require_binary,cargo,Install Rust: https://rustup.rs)
-	@echo "$(YELLOW)Installing cargo-audit...$(RESET)"
-	@if command -v cargo-audit >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-audit already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-audit && echo "  $(GREEN)✓ cargo-audit installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-deny...$(RESET)"
-	@if command -v cargo-deny >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-deny already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-deny && echo "  $(GREEN)✓ cargo-deny installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-geiger...$(RESET)"
-	@if command -v cargo-geiger >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-geiger already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-geiger && echo "  $(GREEN)✓ cargo-geiger installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-semver-checks...$(RESET)"
-	@if command -v cargo-semver-checks >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-semver-checks already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-semver-checks && echo "  $(GREEN)✓ cargo-semver-checks installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-machete...$(RESET)"
-	@if command -v cargo-machete >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-machete already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-machete && echo "  $(GREEN)✓ cargo-machete installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing kani-verifier...$(RESET)"
-	@if command -v cargo-kani >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ kani-verifier already installed$(RESET)"; \
-	else \
-		cargo install --locked kani-verifier && cargo kani setup && echo "  $(GREEN)✓ kani-verifier installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-fuzz...$(RESET)"
-	@if command -v cargo-fuzz >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-fuzz already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-fuzz && echo "  $(GREEN)✓ cargo-fuzz installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing cargo-sbom...$(RESET)"
-	@if command -v cargo-sbom >/dev/null 2>&1; then \
-		echo "  $(GREEN)✓ cargo-sbom already installed$(RESET)"; \
-	else \
-		cargo install --locked cargo-sbom && echo "  $(GREEN)✓ cargo-sbom installed$(RESET)"; \
-	fi
-	@echo "$(YELLOW)Installing nightly toolchain with Miri...$(RESET)"
-	@if rustup toolchain list | grep -q nightly; then \
-		echo "  $(GREEN)✓ nightly toolchain already installed$(RESET)"; \
-		rustup component add miri --toolchain nightly 2>/dev/null || echo "  $(GREEN)✓ miri already installed$(RESET)"; \
-	else \
-		rustup toolchain install nightly --component miri && echo "  $(GREEN)✓ nightly + miri installed$(RESET)"; \
-	fi
-	@echo "$(GREEN)✓ All security tools installed$(RESET)"
+	@bash scripts/install-security-tools.sh
 
 security-fast: ## Run fast security checks (< 3 min)
 	@$(MAKE) -C rust security-fast
@@ -578,18 +494,7 @@ kani-verify: ## Run Kani formal verification
 	@$(MAKE) -C rust kani-verify
 
 fuzz-quick: ## Run Atheris Python fuzzing (10 min per target) + Rust fuzzing
-	@if command -v python &> /dev/null && python -c "import atheris" 2>/dev/null; then \
-		echo "$(BLUE)Running Atheris fuzzing...$(RESET)"; \
-		for fuzz_target in tests/fuzzing/fuzz_*.py; do \
-			if [ -f "$$fuzz_target" ]; then \
-				echo "$(YELLOW)Fuzzing $$fuzz_target...$(RESET)"; \
-				timeout 10m uv run python "$$fuzz_target" -max_total_time=600 || true; \
-			fi; \
-		done; \
-	else \
-		echo "$(YELLOW)⚠️  Atheris not available (macOS limitation - libFuzzer not in Apple Clang)$(RESET)"; \
-		echo "$(YELLOW)   Atheris fuzzing will run in CI on Linux$(RESET)"; \
-	fi
+	@bash scripts/fuzz-python.sh
 	@echo "$(BLUE)Running Rust fuzzing...$(RESET)"
 	@$(MAKE) -C rust/fuzz quick
 
@@ -624,37 +529,7 @@ msan: ## Run MemorySanitizer
 	@$(MAKE) -C rust msan
 
 security-report: setup-logs ## Generate comprehensive security report
-	@echo "$(BLUE)Generating security report...$(RESET)"
-	@mkdir -p reports/security
-	@REPORT_FILE="$$(pwd)/reports/security/report_$(TIMESTAMP).md"; \
-	echo "# Security Report" > "$$REPORT_FILE"; \
-	echo "Generated: $$(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "## Summary" >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "### Vulnerability Scan (cargo-audit)" >> "$$REPORT_FILE"; \
-	(cd rust && cargo audit --json 2>/dev/null | jq -r '.vulnerabilities.count // 0' | xargs -I {} echo "- Vulnerabilities found: {}") >> "$$REPORT_FILE" || echo "- cargo-audit not run" >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "### License Compliance (cargo-deny)" >> "$$REPORT_FILE"; \
-	(cd rust && cargo deny check licenses --format json 2>/dev/null | jq -r '.advisories | length' | xargs -I {} echo "- License issues: {}") >> "$$REPORT_FILE" || echo "- cargo-deny not run" >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "### Unsafe Code Analysis (cargo-geiger)" >> "$$REPORT_FILE"; \
-	if [ -f rust/geiger-report.json ]; then \
-		TOTAL=$$(jq '[.packages[].package.functions.safe + .packages[].package.functions.unsafe] | add' rust/geiger-report.json); \
-		UNSAFE=$$(jq '[.packages[].package.functions.unsafe] | add' rust/geiger-report.json); \
-		RATIO=$$(echo "scale=2; $$UNSAFE / $$TOTAL * 100" | bc); \
-		echo "- Unsafe ratio: $$RATIO% ($$UNSAFE / $$TOTAL functions)" >> "$$REPORT_FILE"; \
-	else \
-		echo "- Geiger report not available" >> "$$REPORT_FILE"; \
-	fi; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "## Details" >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "See individual tool outputs in logs/ directory for detailed findings." >> "$$REPORT_FILE"; \
-	echo "" >> "$$REPORT_FILE"; \
-	echo "Report saved to: $$REPORT_FILE"; \
-	cat "$$REPORT_FILE"
-	@echo "$(GREEN)✓ Security report generated$(RESET)"
+	@bash scripts/security-report.sh
 
 security-deep: kani-verify fuzz-deep security-report ## Run deep security analysis (master target)
 
