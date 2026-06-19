@@ -416,3 +416,29 @@ def test_json_size_comparison(orjson_serializer, auto_serializer, json_heavy_dat
 
     # MessagePack should be more compact than JSON
     # (But orjson is still useful for JSON-native APIs and interoperability)
+
+
+@pytest.mark.performance
+def test_numpy_integrity_path_is_checksum_only_not_compressed() -> None:
+    """Top-level np.ndarray integrity must be checksum-only, never LZ4 (#155 regression guard).
+
+    The first #155 attempt routed numpy through ByteStorage's LZ4: it measured ~60-130x slower and
+    inflated incompressible arrays ~1.56x. The shipped fix prepends only an 8-byte xxHash3-64
+    checksum (no compression), so the wire size stays ~1x the raw bytes.
+
+    The guard is the wire size, not a wall-clock bound: it is deterministic (never flaky) yet still
+    trips the moment LZ4 returns to the numpy path — incompressible data is exactly where LZ4 both
+    inflates size and costs the most time, so size is a faithful proxy here. Wall-clock regression
+    tracking belongs in the pytest-benchmark harness, not a hard assert. This is the only coverage
+    of the bare-ndarray path; numpy-in-DataFrame uses the Arrow path.
+    """
+    arr = np.random.default_rng(0).standard_normal(262_144)  # 2 MiB incompressible float64
+    serializer = AutoSerializer(enable_integrity_checking=True)
+
+    data, _ = serializer.serialize(arr)
+
+    # checksum-only adds a tiny constant header (8-byte checksum + NUMPY_RAW metadata) and never
+    # compresses; incompressible data through LZ4 would inflate well past this.
+    assert len(data) <= arr.nbytes + 256, (
+        f"numpy integrity envelope is {len(data) / arr.nbytes:.3f}x the payload — LZ4 back on the numpy path?"
+    )
