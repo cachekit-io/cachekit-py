@@ -64,7 +64,7 @@ dependencies = [
     "psutil>=7.0.0",
     # Serialization and hashing
     "blake3>=1.0.5",
-    "msgpack>=1.1.2",
+    "msgpack>=1.2.1",
     "orjson>=3.9.0",
     "xxhash>=3.5.0",
     # HTTP client for SaaS backend (cachekit.io)
