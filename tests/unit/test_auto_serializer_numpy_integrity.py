@@ -6,9 +6,10 @@ branches they carried no xxHash3-64 checksum. A corrupted numpy entry was silent
 reconstructed as wrong data, violating the "never silently return corrupted data"
 contract for the entire numpy path.
 
-The fix routes numpy through ``ByteStorage`` exactly like ``_serialize_msgpack``:
-checksum + LZ4 when ``enable_integrity_checking`` is on (the default / ``@cache``),
-raw ``NUMPY_RAW`` bytes when off (``@cache.minimal``, consistent with msgpack-off).
+The fix prepends an 8-byte xxHash3-64 checksum to the ``NUMPY_RAW`` payload — no
+compression — when ``enable_integrity_checking`` is on (the default / ``@cache``),
+mirroring ``ArrowSerializer``; raw ``NUMPY_RAW`` bytes when off (``@cache.minimal``,
+consistent with msgpack-off).
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ class TestAutoSerializerNumpyIntegrity:
         original = np.arange(2000, dtype=np.float64)
         data, metadata = serializer.serialize(original)
 
-        # Flip a byte deep in the payload (past the 10-byte ByteStorage envelope header).
+        # Flip a byte deep in the payload (past the 8-byte xxHash3-64 checksum prefix).
         corrupted = bytearray(data)
         corrupted[len(corrupted) // 2] ^= 0xFF
         corrupted = bytes(corrupted)
@@ -102,7 +103,7 @@ class TestAutoSerializerNumpyMinimalMode:
 
 @pytest.mark.unit
 class TestAutoSerializerNumpyEdgeCases:
-    """The ByteStorage routing must preserve every array shape/dtype it handled before."""
+    """The checksum-only integrity path must preserve every array shape/dtype it handled before."""
 
     @pytest.mark.parametrize(
         "arr",
@@ -119,15 +120,16 @@ class TestAutoSerializerNumpyEdgeCases:
         serializer = AutoSerializer()
         data, metadata = serializer.serialize(arr)
         result = serializer.deserialize(data, metadata)
-        # tobytes() flattens, so compare values via ravel; dtype must survive.
+        # dtype, shape, and values must all survive (ravel for values: tobytes() returns C-order).
         assert result.dtype == arr.dtype
+        assert result.shape == arr.shape
         np.testing.assert_array_equal(result.ravel(), np.ascontiguousarray(arr).ravel())
 
     def test_numpy_deserialize_without_metadata(self) -> None:
-        """Enveloped numpy decodes via the ByteStorage format_id when no metadata is passed.
+        """Checksummed numpy decodes without metadata via structural detection.
 
-        The decorator read path may not carry metadata; the format label baked into the
-        envelope ('numpy') must be enough to route to the numpy deserializer.
+        The decorator read path may not carry metadata; the ``[8-byte checksum][NUMPY_RAW...]``
+        structure alone must be enough to route to the numpy deserializer.
         """
         serializer = AutoSerializer()
         original = np.arange(2000, dtype=np.float64)
@@ -153,7 +155,7 @@ class TestAutoSerializerNumpyEdgeCases:
 
 @pytest.mark.unit
 class TestAutoSerializerNumpyUnderEncryption:
-    """Blast-radius check: numpy now compresses via ByteStorage — must still survive encryption.
+    """Blast-radius check: the numpy checksum envelope must still survive encryption.
 
     @cache.secure rejects AutoSerializer (cross_sdk_compatible=False), so this exercises the
     direct EncryptionWrapper(serializer=AutoSerializer()) composition used in tests/tooling.
