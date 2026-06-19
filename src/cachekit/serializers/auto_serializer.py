@@ -296,7 +296,8 @@ def _auto_object_hook(obj: Any) -> Any:
                 raise SerializationError("Cannot deserialize numpy array: numpy is not installed")
             if "data" not in obj or "shape" not in obj or "dtype" not in obj:
                 raise SerializationError("Invalid ndarray format: missing required fields in cached data")
-            return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+            # .copy(): writable result that does not alias the source buffer (the L1-cached bytes on a hit) — #157.
+            return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"]).copy()
 
     return obj
 
@@ -518,31 +519,31 @@ class AutoSerializer:
                         "Install with: pip install 'cachekit[data]'"
                     )
             elif detected_format == "dataframe":
-                # For DataFrame and Series, we need to handle both Rust envelope and direct data
                 if self.enable_integrity_checking and len(data) > 4:
+                    # Unwrap the ByteStorage envelope. A checksum mismatch (raised by retrieve) fails
+                    # closed with a clear corruption error instead of being swallowed and re-parsed as
+                    # raw msgpack, which lost the diagnostic and produced a confusing error (#156).
+                    # The unpack/build sits OUTSIDE this guard so a genuine post-retrieve error surfaces
+                    # as itself rather than being mistaken for corruption.
                     try:
-                        # Try Rust envelope first
                         original_data, _ = self._byte_storage.retrieve(data)
-                        unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                        return self._deserialize_dataframe(unpacked_data)
-                    except Exception as e:
-                        # Fall back to direct unpacking
-                        logger.debug(f"Rust envelope parsing failed for DataFrame, falling back to direct unpacking: {e}")
-                # Direct msgpack data
+                    except (ValueError, SerializationError) as e:
+                        raise SerializationError(f"DataFrame integrity check failed (corrupted cache entry): {e}") from e
+                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
+                    return self._deserialize_dataframe(unpacked_data)
+                # Integrity off: data is direct msgpack (no envelope)
                 unpacked_data = msgpack.unpackb(data, **self._msgpack_unpack_opts)
                 return self._deserialize_dataframe(unpacked_data)
             elif detected_format == "series":
-                # For DataFrame and Series, we need to handle both Rust envelope and direct data
                 if self.enable_integrity_checking and len(data) > 4:
+                    # Same fail-closed contract as the DataFrame branch above (#156).
                     try:
-                        # Try Rust envelope first
                         original_data, _ = self._byte_storage.retrieve(data)
-                        unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                        return self._deserialize_series(unpacked_data)
-                    except Exception as e:
-                        # Fall back to direct unpacking
-                        logger.debug(f"Rust envelope parsing failed for Series, falling back to direct unpacking: {e}")
-                # Direct msgpack data
+                    except (ValueError, SerializationError) as e:
+                        raise SerializationError(f"Series integrity check failed (corrupted cache entry): {e}") from e
+                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
+                    return self._deserialize_series(unpacked_data)
+                # Integrity off: data is direct msgpack (no envelope)
                 unpacked_data = msgpack.unpackb(data, **self._msgpack_unpack_opts)
                 return self._deserialize_series(unpacked_data)
 
@@ -695,9 +696,11 @@ class AutoSerializer:
                 shape.append(dim)
             shape = tuple(shape)
 
-            # Extract raw numpy bytes and reconstruct
+            # Extract raw numpy bytes and reconstruct. .copy() so the result is writable and does
+            # not alias the source bytes (the L1-cached buffer on a hit) — see #157. frombuffer alone
+            # returns a read-only view aliasing the input.
             raw_bytes = data[offset:]
-            arr = np.frombuffer(raw_bytes, dtype=dtype_str)
+            arr = np.frombuffer(raw_bytes, dtype=dtype_str).copy()
             return arr.reshape(shape)
         except (ValueError, IndexError, UnicodeDecodeError) as e:
             raise SerializationError(f"Failed to deserialize NumPy array: {e}") from e
@@ -758,8 +761,8 @@ class AutoSerializer:
         columns_data = {}
         for col, col_info in serialized["data"].items():
             if col_info["type"] == "numeric":
-                # Reconstruct from NumPy bytes
-                arr = np.frombuffer(col_info["data"], dtype=col_info["dtype"])
+                # Reconstruct from NumPy bytes; .copy() → writable, non-aliasing column (#157).
+                arr = np.frombuffer(col_info["data"], dtype=col_info["dtype"]).copy()
                 columns_data[col] = arr
             else:
                 # Use object data directly
@@ -822,7 +825,8 @@ class AutoSerializer:
             serialized = msgpack.unpackb(data, **self._msgpack_unpack_opts)
 
         if serialized["type"] == "numeric":
-            values = np.frombuffer(serialized["data"], dtype=serialized["dtype"])
+            # .copy() → writable Series values that do not alias the source buffer (#157).
+            values = np.frombuffer(serialized["data"], dtype=serialized["dtype"]).copy()
         else:
             values = serialized["data"]
 
