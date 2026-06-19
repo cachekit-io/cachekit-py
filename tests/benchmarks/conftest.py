@@ -6,11 +6,13 @@ local redis-server binary when REDIS_URL is unset) is overridden to a no-op
 here, the same way tests/unit/conftest.py does for unit tests.
 """
 
+from collections.abc import Iterator
+
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def setup_di_for_redis_isolation():
+def setup_di_for_redis_isolation() -> Iterator[None]:
     """Override root conftest's Redis isolation - benchmarks need no backend.
 
     Shadows the parent autouse fixture by having the same name (nearest
