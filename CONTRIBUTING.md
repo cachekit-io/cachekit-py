@@ -246,8 +246,13 @@ make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ### Running Benchmarks
 
 ```bash
-make benchmark-quick  # Quick performance check
+make benchmark          # Run serializer benchmarks + save a local baseline
+make benchmark-compare  # Re-run and fail on >10% median regression vs that baseline
 ```
+
+Baselines are written to `.benchmarks/` (gitignored, per-machine), so regression
+comparison is a local developer tool — wall-clock benchmarks deliberately do not
+gate CI.
 
 ### Formatting Code
 

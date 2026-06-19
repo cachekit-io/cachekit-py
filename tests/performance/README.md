@@ -93,7 +93,7 @@ Provides rigorous performance measurement tools:
 
 ### Quick Check (Basic Tests)
 ```bash
-make test-performance-quick
+uv run pytest tests/performance/ -m "performance and not slow" -q
 ```
 
 ### Full Suite (All Tests)

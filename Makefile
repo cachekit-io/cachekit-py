@@ -353,17 +353,32 @@ rust-bench: ## Run Rust benchmarks
 # 📊 BENCHMARKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-benchmark: setup-logs ## Run quick benchmarks
-	@echo "$(BLUE)Running quick benchmarks...$(RESET)"
-	@echo "$(YELLOW)Logging to $(LOG_BENCHMARK_DIR)/quick_$(TIMESTAMP).log$(RESET)"
-	@uv run python -m benchmarks.cli quick 2>&1 | tee $(LOG_BENCHMARK_DIR)/quick_$(TIMESTAMP).log
-	@echo "$(GREEN)✓ Benchmarks completed$(RESET)"
+# Serializer micro-benchmarks live in tests/benchmarks/ under benchmark_*.py /
+# Benchmark* names, deliberately kept OUT of the default `make test` discovery
+# (wall-clock numbers are noisy and must not gate unit CI). The -o overrides
+# make them collectable only here; addopts is reset to drop the
+# --doctest-modules/--markdown-docs/--verbose noise. pytest-benchmark writes
+# baselines to .benchmarks/ (gitignored, per-machine).
+BENCHMARK_PYTEST := uv run pytest tests/benchmarks/ \
+    -o addopts="" \
+    -o python_files="benchmark_*.py" \
+    -o python_classes="Benchmark*" \
+    --benchmark-only --benchmark-disable-gc
 
-benchmark-full: setup-logs ## Run comprehensive benchmarks
-	@echo "$(BLUE)Running comprehensive benchmarks...$(RESET)"
-	@echo "$(YELLOW)Logging to $(LOG_BENCHMARK_DIR)/full_$(TIMESTAMP).log$(RESET)"
-	@uv run python -m benchmarks.cli performance --comprehensive 2>&1 | tee $(LOG_BENCHMARK_DIR)/full_$(TIMESTAMP).log
-	@echo "$(GREEN)✓ Comprehensive benchmarks completed$(RESET)"
+benchmark: setup-logs ## Run serializer benchmarks + save a local baseline
+	@echo "$(BLUE)Running serializer benchmarks (saving baseline)...$(RESET)"
+	@echo "$(YELLOW)Logging to $(LOG_BENCHMARK_DIR)/bench_$(TIMESTAMP).log$(RESET)"
+	@$(BENCHMARK_PYTEST) --benchmark-autosave 2>&1 | tee $(LOG_BENCHMARK_DIR)/bench_$(TIMESTAMP).log
+	@echo "$(GREEN)✓ Saved to .benchmarks/ (gitignored, per-machine)$(RESET)"
+
+benchmark-compare: setup-logs ## Run benchmarks, fail on >10% median regression vs last saved baseline
+	@echo "$(BLUE)Comparing against last saved baseline (run 'make benchmark' first)...$(RESET)"
+	@if ! $(BENCHMARK_PYTEST) --benchmark-compare --benchmark-compare-fail=median:10% 2>&1 | tee $(LOG_BENCHMARK_DIR)/bench_compare_$(TIMESTAMP).log; then \
+		echo "$(YELLOW)❌ benchmark-compare failed: median regression >10% vs baseline, or no baseline yet (run 'make benchmark' first).$(RESET)"; \
+		echo "$(YELLOW)   Threshold is tunable — set it above your machine's run-to-run median noise (~6% here).$(RESET)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)✓ No median regression beyond 10% vs baseline$(RESET)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 BUILD & RELEASE
