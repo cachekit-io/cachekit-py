@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.1](https://github.com/cachekit-io/cachekit-py/compare/v0.10.0...v0.10.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* canonicalize the pythonic serializer alias to auto ([#192](https://github.com/cachekit-io/cachekit-py/issues/192)) ([666d09c](https://github.com/cachekit-io/cachekit-py/commit/666d09c760bda72857ad1d41b2db84e71c905574))
+* checksum-protect numpy serialization without compression overhead ([#189](https://github.com/cachekit-io/cachekit-py/issues/189)) ([3b0565f](https://github.com/cachekit-io/cachekit-py/commit/3b0565fbeb858dd96ed94932e771d4b4a83e2d2b))
+* return writable numpy/Series reads and surface DataFrame/Series corruption clearly ([#191](https://github.com/cachekit-io/cachekit-py/issues/191)) ([46a3c3c](https://github.com/cachekit-io/cachekit-py/commit/46a3c3cdbb564377b3957fe6f8b2aae753d6def7))
+
 ## [0.10.0](https://github.com/cachekit-io/cachekit-py/compare/v0.9.1...v0.10.0) (2026-06-18)
 
 
