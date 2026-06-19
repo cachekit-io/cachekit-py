@@ -246,13 +246,20 @@ make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ### Running Benchmarks
 
 ```bash
-make benchmark          # Run serializer benchmarks + save a local baseline
+make perf               # Full battery: env fingerprint + timer calibration, serializer benchmarks, GIL scaling
+make perf-compare       # Regression gate: fail on >10% median serializer regression vs baseline
+
+make benchmark          # Serializer benchmarks only + save a local baseline
 make benchmark-compare  # Re-run and fail on >10% median regression vs that baseline
+make benchmark-gil      # Serializer thread-scaling under the current interpreter (GIL)
 ```
 
+All perf tests live in one folder, `tests/performance/`; the pytest-benchmark ones are
+selected by `--benchmark-only` and skipped elsewhere via the `--benchmark-skip` default.
 Baselines are written to `.benchmarks/` (gitignored, per-machine), so regression
-comparison is a local developer tool — wall-clock benchmarks deliberately do not
-gate CI.
+comparison is a local developer tool — wall-clock benchmarks deliberately do not gate
+CI. `make perf` first prints a system fingerprint + environment verdict and
+self-calibrates the timer, so numbers come with the context needed to trust them.
 
 ### Formatting Code
 

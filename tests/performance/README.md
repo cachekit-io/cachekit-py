@@ -4,6 +4,19 @@
 
 **Philosophy**: Test what users ACTUALLY experience, not idealized microbenchmarks.
 
+**One folder, two kinds.** Everything perf lives here. Assertion-based regression
+*guards* (via `stats_utils.py`) assert fixed targets and fail on regression; baseline-
+tracked *benchmarks* (pytest-benchmark, in `test_serializer_microbench.py`) measure a
+distribution and compare against a saved baseline. The two are separated by mechanism,
+not folders: pytest-benchmark tests are selected with `--benchmark-only` and skipped
+elsewhere via the `--benchmark-skip` default in `pyproject.toml`.
+
+**Measurement integrity.** `measurement_env.py` provides a reproducible system
+fingerprint, an environment pre-flight check (throttling / load), and a timer
+self-calibration (`test_measurement_calibration.py`) — run before trusting any number.
+`gil_benchmark.py` reports serializer thread-scaling under the current interpreter.
+Run the whole battery with `make perf`; gate regressions with `make perf-compare`.
+
 ---
 
 ## Test Organization

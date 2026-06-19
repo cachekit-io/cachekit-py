@@ -353,16 +353,13 @@ rust-bench: ## Run Rust benchmarks
 # 📊 BENCHMARKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Serializer micro-benchmarks live in tests/benchmarks/ under benchmark_*.py /
-# Benchmark* names, deliberately kept OUT of the default `make test` discovery
-# (wall-clock numbers are noisy and must not gate unit CI). The -o overrides
-# make them collectable only here; addopts is reset to drop the
-# --doctest-modules/--markdown-docs/--verbose noise. pytest-benchmark writes
-# baselines to .benchmarks/ (gitignored, per-machine).
-BENCHMARK_PYTEST := uv run pytest tests/benchmarks/ \
+# Serializer micro-benchmarks live in tests/performance/test_serializer_microbench.py
+# and use the pytest-benchmark fixture. They are skipped in the normal suite via the
+# --benchmark-skip default (pyproject addopts) and selected here with --benchmark-only.
+# addopts is reset to drop the --doctest-modules/--markdown-docs/--verbose noise.
+# pytest-benchmark writes baselines to .benchmarks/ (gitignored, per-machine).
+BENCHMARK_PYTEST := uv run pytest tests/performance/ \
     -o addopts="" \
-    -o python_files="benchmark_*.py" \
-    -o python_classes="Benchmark*" \
     --benchmark-only --benchmark-disable-gc
 
 benchmark: setup-logs ## Run serializer benchmarks + save a local baseline
@@ -379,6 +376,21 @@ benchmark-compare: setup-logs ## Run benchmarks, fail on >10% median regression 
 		exit 1; \
 	fi
 	@echo "$(GREEN)✓ No median regression beyond 10% vs baseline$(RESET)"
+
+benchmark-gil: setup-logs ## Serializer thread-scaling under the current interpreter (GIL)
+	@echo "$(BLUE)GIL thread-scaling (current interpreter)...$(RESET)"
+	@uv run python tests/performance/gil_benchmark.py 2>&1 | tee $(LOG_BENCHMARK_DIR)/gil_$(TIMESTAMP).log
+	@echo "$(GREEN)✓ GIL arm complete (no-GIL arm: run under a free-threaded interpreter once cachekit installs there)$(RESET)"
+
+perf: setup-logs ## Unified benchmark battery: env + calibration, serializer benchmarks, GIL scaling (informational)
+	@echo "$(BLUE)Measurement environment + timer calibration...$(RESET)"
+	@uv run pytest tests/performance/test_measurement_calibration.py -m performance -q -s 2>&1 | tee $(LOG_BENCHMARK_DIR)/perf_$(TIMESTAMP).log
+	@$(MAKE) --no-print-directory benchmark
+	@$(MAKE) --no-print-directory benchmark-gil
+	@echo "$(GREEN)✓ perf battery complete (informational; gate with 'make perf-compare')$(RESET)"
+
+perf-compare: benchmark-compare ## Perf regression gate: fail on >10% median serializer regression
+	@echo "$(GREEN)✓ perf-compare passed$(RESET)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔧 BUILD & RELEASE
