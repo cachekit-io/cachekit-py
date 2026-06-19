@@ -170,6 +170,27 @@ class TestLazyOrjsonSerializerLoading:
         assert info["orjson"]["available"] is True
         assert info["orjson"]["class"] == "OrjsonSerializer"
 
+    def test_get_serializer_info_reports_orjson_unavailable(self, monkeypatch):
+        """When orjson is absent, get_serializer_info() labels it OrjsonSerializer/unavailable.
+
+        Guards the generalized optional-dep branch — before it was hardcoded to
+        ArrowSerializer and would have mislabeled a missing orjson.
+        """
+        import cachekit.serializers as serializers_mod
+
+        def _missing() -> type:
+            raise ImportError("orjson is not installed. OrjsonSerializer requires the [json] extra")
+
+        monkeypatch.setattr(serializers_mod, "_get_orjson_serializer", _missing)
+        # Bypass the factory cache so get_serializer re-resolves orjson and the
+        # ImportError reaches get_serializer_info's except branch.
+        monkeypatch.delitem(serializers_mod._serializer_cache, "orjson:True", raising=False)
+
+        info = serializers_mod.get_serializer_info()
+        assert info["orjson"]["available"] is False
+        assert info["orjson"]["class"] == "OrjsonSerializer"
+        assert info["orjson"]["module"] == "cachekit.serializers.orjson_serializer"
+
 
 class TestOrjsonIsOptional:
     """orjson is an optional dependency (the [json] extra): it must not be pulled
