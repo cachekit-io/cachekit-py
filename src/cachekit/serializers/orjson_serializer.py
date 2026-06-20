@@ -14,7 +14,12 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-import orjson
+# Required dependency: orjson (fail-fast with install hint when the [json] extra is absent)
+try:
+    import orjson
+except ImportError as e:  # pragma: no cover - only reachable without the [json] extra (behavior tested via subprocess)
+    raise ImportError("orjson is not installed. OrjsonSerializer requires the [json] extra: pip install 'cachekit[json]'") from e
+
 import xxhash
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata

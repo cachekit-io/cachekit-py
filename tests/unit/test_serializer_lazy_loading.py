@@ -6,11 +6,15 @@ the optional [data] extra (pyarrow).
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from cachekit.serializers import (
     SERIALIZER_REGISTRY,
     _get_arrow_serializer,
+    _get_orjson_serializer,
     benchmark_serializers,
     get_available_serializers,
     get_serializer,
@@ -18,6 +22,7 @@ from cachekit.serializers import (
 )
 from cachekit.serializers.arrow_serializer import ArrowSerializer
 from cachekit.serializers.base import SerializerProtocol
+from cachekit.serializers.orjson_serializer import OrjsonSerializer
 
 
 class TestLazyArrowSerializerLoading:
@@ -129,3 +134,90 @@ class TestGetAvailableSerializers:
         """Arrow entry is None in the raw registry (lazy placeholder)."""
         available = get_available_serializers()
         assert available["arrow"] is None
+
+
+class TestLazyOrjsonSerializerLoading:
+    """Test lazy loading mechanism for OrjsonSerializer (optional [json] extra)."""
+
+    def test_registry_has_none_for_orjson(self):
+        """SERIALIZER_REGISTRY stores None for orjson (lazy placeholder)."""
+        assert "orjson" in SERIALIZER_REGISTRY
+        assert SERIALIZER_REGISTRY["orjson"] is None
+
+    def test_get_orjson_serializer_returns_class(self):
+        """_get_orjson_serializer() returns the OrjsonSerializer class."""
+        assert _get_orjson_serializer() is OrjsonSerializer
+
+    def test_get_orjson_serializer_caches_result(self):
+        """_get_orjson_serializer() caches the imported class."""
+        assert _get_orjson_serializer() is _get_orjson_serializer()
+
+    def test_get_serializer_orjson_returns_instance(self):
+        """get_serializer('orjson') returns an OrjsonSerializer instance."""
+        serializer = get_serializer("orjson")
+        assert isinstance(serializer, OrjsonSerializer)
+        assert isinstance(serializer, SerializerProtocol)
+
+    def test_module_getattr_returns_orjson_serializer(self):
+        """Module __getattr__ returns OrjsonSerializer for lazy access."""
+        from cachekit import serializers
+
+        assert serializers.OrjsonSerializer is OrjsonSerializer
+
+    def test_get_serializer_info_includes_orjson(self):
+        """get_serializer_info() reports orjson as available with the right class."""
+        info = get_serializer_info()
+        assert info["orjson"]["available"] is True
+        assert info["orjson"]["class"] == "OrjsonSerializer"
+
+    def test_get_serializer_info_reports_orjson_unavailable(self, monkeypatch):
+        """When orjson is absent, get_serializer_info() labels it OrjsonSerializer/unavailable.
+
+        Guards the generalized optional-dep branch — before it was hardcoded to
+        ArrowSerializer and would have mislabeled a missing orjson.
+        """
+        import cachekit.serializers as serializers_mod
+
+        def _missing() -> type:
+            raise ImportError("orjson is not installed. OrjsonSerializer requires the [json] extra")
+
+        monkeypatch.setattr(serializers_mod, "_get_orjson_serializer", _missing)
+        # Bypass the factory cache so get_serializer re-resolves orjson and the
+        # ImportError reaches get_serializer_info's except branch.
+        monkeypatch.delitem(serializers_mod._serializer_cache, "orjson:True", raising=False)
+
+        info = serializers_mod.get_serializer_info()
+        assert info["orjson"]["available"] is False
+        assert info["orjson"]["class"] == "OrjsonSerializer"
+        assert info["orjson"]["module"] == "cachekit.serializers.orjson_serializer"
+
+
+class TestOrjsonIsOptional:
+    """orjson is an optional dependency (the [json] extra): it must not be pulled
+    eagerly, and when absent it must yield a helpful install error while the rest of
+    cachekit keeps working. Verified in fresh subprocesses because sys.modules is
+    shared across the test session (orjson is installed in the dev environment).
+    """
+
+    def test_import_cachekit_does_not_pull_orjson(self):
+        """Importing cachekit must NOT eagerly import orjson (the optionality regression guard)."""
+        code = "import cachekit, sys; assert 'orjson' not in sys.modules, 'orjson was imported eagerly'"
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+        assert result.returncode == 0, result.stderr
+
+    def test_orjson_absent_raises_helpful_error(self):
+        """Without orjson, cachekit + the default serializer still work, and requesting
+        the orjson serializer raises a helpful, actionable [json]-extra ImportError."""
+        code = (
+            'import sys; sys.modules["orjson"] = None\n'
+            "import cachekit\n"
+            "from cachekit.serializers import get_serializer\n"
+            'assert type(get_serializer("default")).__name__ == "StandardSerializer"\n'
+            "try:\n"
+            '    get_serializer("orjson")\n'
+            '    raise SystemExit("expected ImportError")\n'
+            "except ImportError as e:\n"
+            '    assert "[json] extra" in str(e), str(e)\n'
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+        assert result.returncode == 0, result.stderr

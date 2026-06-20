@@ -15,11 +15,11 @@ from .base import (
     SerializerProtocol,
 )
 from .encryption_wrapper import EncryptionWrapper
-from .orjson_serializer import OrjsonSerializer
 from .standard_serializer import StandardSerializer
 
 if TYPE_CHECKING:
     from .arrow_serializer import ArrowSerializer
+    from .orjson_serializer import OrjsonSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,20 @@ def _get_arrow_serializer() -> type:
 
         _ArrowSerializer = ArrowSerializer
     return _ArrowSerializer
+
+
+# Lazy import for optional OrjsonSerializer (requires orjson from [json] extra)
+_OrjsonSerializer: type | None = None
+
+
+def _get_orjson_serializer() -> type:
+    """Lazy-load OrjsonSerializer. Raises ImportError if orjson not installed."""
+    global _OrjsonSerializer
+    if _OrjsonSerializer is None:
+        from .orjson_serializer import OrjsonSerializer
+
+        _OrjsonSerializer = OrjsonSerializer
+    return _OrjsonSerializer
 
 
 # Validate ByteStorage works correctly
@@ -57,7 +71,7 @@ SERIALIZER_REGISTRY = {
     "default": StandardSerializer,  # Language-agnostic MessagePack for multi-language caches
     "std": StandardSerializer,  # Explicit StandardSerializer alias
     "arrow": None,  # Lazy-loaded: requires pyarrow from [data] extra
-    "orjson": OrjsonSerializer,
+    "orjson": None,  # Lazy-loaded: requires orjson from [json] extra
     "encrypted": EncryptionWrapper,  # StandardSerializer + AES-256-GCM encryption
 }
 
@@ -116,9 +130,11 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
                 f"@cache(serializer=MySerializer())"
             )
 
-        # Get serializer class (lazy-load arrow if needed)
+        # Get serializer class (lazy-load optional serializers if needed)
         if name == "arrow":
             serializer_class = _get_arrow_serializer()
+        elif name == "orjson":
+            serializer_class = _get_orjson_serializer()
         else:
             serializer_class = SERIALIZER_REGISTRY[name]
 
@@ -177,9 +193,15 @@ def get_serializer_info() -> dict[str, dict[str, Any]]:
             if hasattr(instance, "get_info"):
                 info[name].update(instance.get_info())  # type: ignore[attr-defined]
         except ImportError as e:
+            # Optional serializer whose backing dependency (pyarrow / orjson) is absent.
+            optional_modules = {
+                "arrow": ("ArrowSerializer", "cachekit.serializers.arrow_serializer"),
+                "orjson": ("OrjsonSerializer", "cachekit.serializers.orjson_serializer"),
+            }
+            cls, module = optional_modules.get(name, ("Unknown", "unknown"))
             info[name] = {
-                "class": "ArrowSerializer" if name == "arrow" else "Unknown",
-                "module": "cachekit.serializers.arrow_serializer",
+                "class": cls,
+                "module": module,
                 "available": False,
                 "error": str(e),
             }
@@ -194,9 +216,11 @@ def get_serializer_info() -> dict[str, dict[str, Any]]:
 
 
 def __getattr__(name: str) -> Any:
-    """Lazy attribute access for optional ArrowSerializer."""
+    """Lazy attribute access for optional ArrowSerializer / OrjsonSerializer."""
     if name == "ArrowSerializer":
         return _get_arrow_serializer()
+    if name == "OrjsonSerializer":
+        return _get_orjson_serializer()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

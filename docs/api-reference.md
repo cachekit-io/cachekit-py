@@ -489,7 +489,7 @@ result = process_numpy_data()
 
 ### Using OrjsonSerializer (JSON-Optimized)
 
-Use OrjsonSerializer for JSON-heavy workloads and APIs:
+Use OrjsonSerializer for JSON-heavy workloads and APIs. Requires the `[json]` extra: `pip install 'cachekit[json]'` (or `uv add 'cachekit[json]'`).
 
 ```python notest
 from cachekit import cache

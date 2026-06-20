@@ -4,6 +4,16 @@
 
 **JSON-optimized serializer** — Fast JSON serialization powered by Rust (orjson library). Ideal for JSON-heavy workloads and API response caching.
 
+**Requires the `[json]` extra** — orjson is an optional dependency:
+
+```bash
+pip install 'cachekit[json]'
+# or
+uv add 'cachekit[json]'
+```
+
+Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson is not installed. OrjsonSerializer requires the [json] extra: pip install 'cachekit[json]'`.
+
 ## Overview
 
 **Best for:**

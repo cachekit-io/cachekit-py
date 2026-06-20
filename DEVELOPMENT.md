@@ -41,7 +41,7 @@ cachekit prioritizes explicit, predictable behavior.
 | **StandardSerializer** | Language-agnostic MessagePack | Default, works everywhere |
 | **AutoSerializer** | Python-optimized (NumPy, pandas, datetime) | Named "Auto" to be transparent |
 | **ArrowSerializer** | Apache Arrow for DataFrames | 60%+ faster for pandas |
-| **OrjsonSerializer** | JSON via orjson | JSON compatibility |
+| **OrjsonSerializer** | JSON via orjson — requires `pip install 'cachekit[json]'` | JSON compatibility |
 
 > [!IMPORTANT]
 > **NO auto-detection of business logic**: Pydantic models, SQLAlchemy ORM objects, and custom classes require explicit conversion to dict.
