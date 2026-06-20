@@ -20,7 +20,8 @@
     ".": {
       "package-name": "cachekit",
       "changelog-path": "CHANGELOG.md",
-      "include-component-in-tag": false
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true
     }
   },
   "extra-files": [
