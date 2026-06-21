@@ -243,48 +243,37 @@ jobs:
         with:
           subject-path: dist/*
 
+      # Check out into a subdirectory: actions/checkout deletes the contents of its
+      # target path before cloning, and the wheels/sdist we just downloaded live in
+      # ./dist at the workspace root. Isolating the checkout in ./source keeps dist
+      # intact for the SBOM attestation below.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
+          path: source
 
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      # One syft pass catalogs both the Python (uv.lock) and Rust (Cargo.lock)
+      # dependency trees. syft parses lockfiles statically and never executes build
+      # code — unlike cargo-sbom, which runs Cargo (and therefore build.rs / proc
+      # macros from the dependency tree) just to enumerate packages. For a supply-
+      # chain security product, generating the SBOM without executing untrusted code
+      # is the correct posture. This replaces the previous cyclonedx-py + cargo-sbom
+      # + cyclonedx-cli merge pipeline, which silently produced no SBOM at all.
+      - name: Generate SBOM (Python + Rust)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          python-version: '3.12'
+          path: source
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
 
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Generate Python SBOM
-        run: |
-          pip install cyclonedx-bom
-          cyclonedx-py requirements --outfile python-sbom.cdx.json --format json
-        continue-on-error: true
-
-      - name: Generate Rust SBOM
-        run: |
-          cargo install cargo-sbom --locked
-          cd rust && cargo sbom --output-format cyclonedx_json_v1_6 > ../rust-sbom.cdx.json
-        continue-on-error: true
-
-      - name: Merge SBOMs
-        run: |
-          pip install cyclonedx-cli || true
-          # If cyclonedx-cli merge is available, merge; otherwise use the Python SBOM
-          if command -v cyclonedx &> /dev/null; then
-            cyclonedx merge --input-files python-sbom.cdx.json rust-sbom.cdx.json --output-file sbom.cdx.json
-          else
-            # Fallback: use Python SBOM (Rust SBOM still attested separately if needed)
-            cp python-sbom.cdx.json sbom.cdx.json
-          fi
-        continue-on-error: true
-
+      # No continue-on-error: a security product must not ship wheels without a
+      # verified SBOM. If this step fails, the publish job (needs: attest) is skipped
+      # rather than shipping silently. Releases are re-runnable via workflow_dispatch.
       - name: Attest SBOM
         uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
         with:
           subject-path: dist/*
           sbom-path: sbom.cdx.json
-        continue-on-error: true
 
   publish:
     name: Publish to PyPI
