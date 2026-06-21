@@ -1,0 +1,10 @@
+# syft configuration for the release SBOM (consumed by anchore/sbom-action in the
+# `sbom` job of release-please.yml).
+#
+# Exclude the test and fuzz trees so the attested SBOM describes the dependencies
+# that actually ship in the wheel, not the test harness. syft catalogs every
+# lockfile/manifest under the scan root by default, which would otherwise pull in
+# e.g. tests/integration/saas/requirements.txt — packages that are never shipped.
+exclude:
+  - ./tests/**
+  - ./rust/fuzz/**

@@ -217,9 +217,60 @@ jobs:
           name: sdist
           path: dist
 
+  # SBOM generation runs in its own job with NO id-token / attestations / contents:write.
+  # It invokes a third-party action (syft); keeping it credential-less means untrusted
+  # code never shares a runner with the OIDC signing token. The `attest` job below runs
+  # first-party actions only and consumes the SBOM as an artifact.
+  sbom:
+    name: Generate SBOM
+    needs: [release-please, validate-inputs]
+    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
+          persist-credentials: false
+
+      # syft parses uv.lock + Cargo.lock statically — it never executes Cargo / build.rs
+      # / proc-macros to enumerate packages (unlike cargo-sbom). .github/syft.yaml
+      # excludes tests/** so the SBOM reflects shipped deps, not the test harness. The
+      # action's own upload-artifact / upload-release-assets are disabled; the SBOM is
+      # handed to `attest` via the explicit artifact below.
+      - name: Generate SBOM (Python + Rust)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          config: .github/syft.yaml
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # Guard against a valid-but-empty SBOM: syft can exit 0 yet catalog nothing
+      # (e.g. a future lockfile-format rename). Attesting an empty BOM is worse than
+      # failing — fail closed instead.
+      - name: Verify SBOM is non-empty
+        run: |
+          count=$(jq '.components | length' sbom.cdx.json)
+          echo "SBOM components: $count"
+          # ponytail: floor of 5 catches empty/grossly-partial; cachekit's Python+Rust
+          # graph is far above it. Tighten to an exact manifest only if a partial slips.
+          test "$count" -ge 5
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
+
+  # Only first-party actions run here, so the OIDC signing credentials are never
+  # exposed to third-party code. No checkout: the SBOM arrives as an artifact.
   attest:
     name: Attest Build Provenance and SBOM
-    needs: [release-please, validate-inputs, build-wheels, build-sdist]
+    needs: [release-please, validate-inputs, build-wheels, build-sdist, sbom]
     if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     permissions:
@@ -238,40 +289,17 @@ jobs:
           name: sdist
           path: dist
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sbom
+
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: dist/*
 
-      # Check out into a subdirectory: actions/checkout deletes the contents of its
-      # target path before cloning, and the wheels/sdist we just downloaded live in
-      # ./dist at the workspace root. Isolating the checkout in ./source keeps dist
-      # intact for the SBOM attestation below.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
-          path: source
-          # No git operations follow, and the next step runs a third-party action
-          # (syft) against this tree — don't persist the job token in source/.git/config.
-          persist-credentials: false
-
-      # One syft pass catalogs both the Python (uv.lock) and Rust (Cargo.lock)
-      # dependency trees. syft parses lockfiles statically and never executes build
-      # code — unlike cargo-sbom, which runs Cargo (and therefore build.rs / proc
-      # macros from the dependency tree) just to enumerate packages. For a supply-
-      # chain security product, generating the SBOM without executing untrusted code
-      # is the correct posture. This replaces the previous cyclonedx-py + cargo-sbom
-      # + cyclonedx-cli merge pipeline, which silently produced no SBOM at all.
-      - name: Generate SBOM (Python + Rust)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: source
-          format: cyclonedx-json
-          output-file: sbom.cdx.json
-
       # No continue-on-error: a security product must not ship wheels without a
-      # verified SBOM. If this step fails, the publish job (needs: attest) is skipped
-      # rather than shipping silently. Releases are re-runnable via workflow_dispatch.
+      # verified SBOM. If this (or the sbom job) fails, publish is gated below.
       - name: Attest SBOM
         uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
         with:
@@ -280,10 +308,13 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    # Gate publish on attest: a paid security product must not ship wheels without
-    # verified build provenance. If attest fails, publish is skipped (re-runnable).
+    # Gate publish on attest SUCCESS (not merely "no failure"): a paid security product
+    # must not ship wheels without verified provenance + SBOM attestation. Checking the
+    # result explicitly matters now that attest depends on the sbom job — if sbom fails,
+    # attest is *skipped* (not failed), and a plain !failure() check would let publish
+    # proceed unattested. Re-runnable via workflow_dispatch.
     needs: [release-please, build-wheels, build-sdist, attest]
-    if: ${{ !failure() && !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
+    if: ${{ !cancelled() && needs.attest.result == 'success' && (needs.release-please.outputs.release_created == 'true' || github.event.inputs.force_release == 'true') }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
