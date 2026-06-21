@@ -251,6 +251,9 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name || needs.validate-inputs.outputs.release_tag }}
           path: source
+          # No git operations follow, and the next step runs a third-party action
+          # (syft) against this tree — don't persist the job token in source/.git/config.
+          persist-credentials: false
 
       # One syft pass catalogs both the Python (uv.lock) and Rust (Cargo.lock)
       # dependency trees. syft parses lockfiles statically and never executes build
