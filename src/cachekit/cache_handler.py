@@ -308,7 +308,7 @@ class CacheSerializationHandler:
             deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
                             If not provided, uses env var or persistent file.
             master_key: Optional master key for encryption (hex-encoded). If not provided,
-                       reads from REDIS_CACHE_MASTER_KEY environment variable.
+                       reads from CACHEKIT_MASTER_KEY environment variable.
             enable_integrity_checking: Enable integrity checking (default: True)
                                       Uses xxHash3-64 (8 bytes) for all serializers.
                                       Set to False for @cache.minimal (speed-first, no checksums)
