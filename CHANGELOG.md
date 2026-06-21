@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0](https://github.com/cachekit-io/cachekit-py/compare/v0.10.1...v0.11.0) (2026-06-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* orjson is no longer installed by `pip install cachekit`. To use the orjson serializer (serializer="orjson" or OrjsonSerializer), install `cachekit[json]`. Without it, get_serializer("orjson") raises an ImportError with an actionable install hint.
+
+### Features
+
+* make orjson an optional dependency (cachekit[json]) ([#196](https://github.com/cachekit-io/cachekit-py/issues/196)) ([4512a2a](https://github.com/cachekit-io/cachekit-py/commit/4512a2a19240a38a2dd4eabf401ef4cbd4722be4))
+
+
+### Security
+
+* bump msgpack floor to 1.2.1 (GHSA-6v7p-g79w-8964) ([#197](https://github.com/cachekit-io/cachekit-py/issues/197)) ([fc1bb80](https://github.com/cachekit-io/cachekit-py/commit/fc1bb80d6f3fb02854b8447eac4043e99769013c))
+
 ## [0.10.1](https://github.com/cachekit-io/cachekit-py/compare/v0.10.0...v0.10.1) (2026-06-19)
 
 
