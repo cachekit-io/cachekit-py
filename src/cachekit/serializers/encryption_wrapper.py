@@ -128,7 +128,7 @@ class EncryptionWrapper:
             settings = get_settings()
             if not settings.master_key:
                 raise EncryptionError(
-                    "Master key required. Set REDIS_CACHE_MASTER_KEY environment variable or pass master_key parameter."
+                    "Master key required. Set CACHEKIT_MASTER_KEY environment variable or pass master_key parameter."
                 )
             try:
                 master_key = bytes.fromhex(settings.master_key.get_secret_value())
