@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/cachekit-io/cachekit-py/compare/v0.11.0...v0.11.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* re-read settings when CACHEKIT_MASTER_KEY appears + correct missing-key env var name ([#200](https://github.com/cachekit-io/cachekit-py/issues/200)) ([12c9fff](https://github.com/cachekit-io/cachekit-py/commit/12c9fffc5ac9249640610050160b1fa03501960d))
+
 ## [0.11.0](https://github.com/cachekit-io/cachekit-py/compare/v0.10.1...v0.11.0) (2026-06-20)
 
 
