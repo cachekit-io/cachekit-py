@@ -24,8 +24,15 @@ all-features = true
 # Check all workspace crates for unmaintained dependencies
 unmaintained = "workspace"
 
-# No initial exemptions - all vulnerabilities must be addressed
-ignore = []
+# Exemptions require a reason and are re-checked whenever the parent dep updates.
+# quick-xml 0.26 is pinned by pprof 0.15 -> inferno 0.11 (dev-only profiling/flamegraph
+# stack, never shipped in the wheel). No patched quick-xml exists on the 0.26 line and
+# pprof 0.15 (latest) cannot take inferno 0.12. Remove when pprof releases with inferno >= 0.12.
+# Keep in sync with the audit-check ignore list in .github/workflows/security-fast.yml.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS (quadratic attr check); dev-only via pprof->inferno, no upgrade path yet" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS (unbounded ns alloc); dev-only via pprof->inferno, no upgrade path yet" },
+]
 
 # ═══════════════════════════════════════════════════════════════
 # LICENSES - License Policy Enforcement
