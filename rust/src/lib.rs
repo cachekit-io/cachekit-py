@@ -30,6 +30,11 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add byte storage class
     m.add_class::<python_bindings::PyByteStorage>()?;
 
+    // Standalone integrity primitive — registered unconditionally (usable with
+    // the checksum feature alone; must not vanish when encryption is off)
+    m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
+
     // Add encryption functionality if feature is enabled
     #[cfg(feature = "encryption")]
     {
@@ -43,13 +48,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "encryption")]
     m.add(
         "__description__",
-        "Raw byte storage with LZ4 compression, Blake3 checksums, and zero-knowledge encryption",
+        "Raw byte storage with LZ4 compression, xxHash3-64 checksums, and zero-knowledge encryption",
     )?;
 
     #[cfg(not(feature = "encryption"))]
     m.add(
         "__description__",
-        "Raw byte storage layer with LZ4 compression and Blake3 checksums",
+        "Raw byte storage layer with LZ4 compression and xxHash3-64 checksums",
     )?;
 
     Ok(())
