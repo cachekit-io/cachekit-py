@@ -4,10 +4,11 @@ Tests that EncryptionWrapper can wrap any serializer (OrjsonSerializer, ArrowSer
 to enable zero-knowledge caching for any data type.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer
+from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer, StandardSerializer
 
 
 class TestEncryptionWrapperComposability:
@@ -117,6 +118,58 @@ class TestEncryptionWrapperComposability:
         # Only client can decrypt
         decrypted = client_wrapper.deserialize(encrypted_blob, metadata, cache_key=cache_key)
         assert decrypted == sensitive_data
+
+    def test_auto_serializer_binds_true_compressed_flag_into_aad(self, master_key):
+        """Regression (#166): AutoSerializer's ByteStorage paths must bind compressed="True" into AAD v0x03.
+
+        AutoSerializer LZ4-compresses via ByteStorage but never set compressed=True in its
+        metadata, so EncryptionWrapper authenticated "False" while a conformant reader
+        (protocol spec/encryption.md: create_aad(..., compressed=true) for enveloped
+        payloads) computes "True" — AES-GCM authentication failed on legitimate entries.
+        """
+        wrapper = EncryptionWrapper(serializer=AutoSerializer(), master_key=master_key, tenant_id="test-tenant")
+        cache_key = "test:encryption:auto:compressed"
+        data = {"user": "alice", "score": 100}
+
+        encrypted, metadata = wrapper.serialize(data, cache_key=cache_key)
+
+        # Writer metadata reflects the ByteStorage LZ4 envelope (parity with StandardSerializer)
+        assert metadata.compressed is True
+
+        # Conformant reader: hand-built AAD v0x03 per spec (compressed="True") must authenticate.
+        # AutoSerializer's msgpack path sets original_type="msgpack", appended as 5th component.
+        components = [b"test-tenant", cache_key.encode(), b"msgpack", b"True", b"msgpack"]
+        spec_aad = bytes([0x03]) + b"".join(len(c).to_bytes(4, "big") + c for c in components)
+        envelope = wrapper.encryptor.decrypt_with_keys(encrypted, spec_aad, wrapper.tenant_keys)
+
+        # Recovered ByteStorage envelope round-trips to the original object
+        assert AutoSerializer().deserialize(bytes(envelope), metadata) == data
+
+        # Full wrapper round-trip still works with the stored metadata
+        assert wrapper.deserialize(encrypted, metadata, cache_key=cache_key) == data
+
+    def test_auto_serializer_aad_matches_standard_serializer(self, master_key):
+        """AutoSerializer and StandardSerializer produce identical AAD bytes for the same entry (#166).
+
+        Both wrap msgpack in the ByteStorage LZ4 envelope, so both must authenticate the same
+        (format="msgpack", compressed="True", original_type="msgpack") context.
+        """
+        wrapper = EncryptionWrapper(master_key=master_key, tenant_id="test-tenant")
+        cache_key = "test:encryption:aad:parity"
+
+        _, auto_meta = AutoSerializer().serialize({"a": 1})
+        _, std_meta = StandardSerializer().serialize({"a": 1})
+
+        assert wrapper._create_aad(auto_meta, cache_key) == wrapper._create_aad(std_meta, cache_key)
+
+    def test_auto_serializer_numpy_stays_uncompressed_in_metadata(self):
+        """NumPy path uses a checksum-only envelope (no LZ4), so compressed must remain False (#166)."""
+        _, metadata = AutoSerializer().serialize(np.array([1, 2, 3]))
+        assert metadata.compressed is False
+
+        # Integrity-off produces no envelope at all — compressed False on every path
+        _, off_meta = AutoSerializer(enable_integrity_checking=False).serialize({"a": 1})
+        assert off_meta.compressed is False
 
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""

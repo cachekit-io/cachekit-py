@@ -452,32 +452,52 @@ class AutoSerializer:
         Returns:
             Tuple[bytes, SerializationMetadata]: Serialized data with metadata
         """
+        # metadata.compressed feeds the AES-GCM AAD v0x03 (EncryptionWrapper binds str(compressed)),
+        # so it MUST reflect the codec actually applied: True iff the ByteStorage LZ4 envelope wrapped
+        # the payload (parity with StandardSerializer), False for the checksum-only numpy path (#166).
+
         # NumPy detection (only if numpy installed)
         if HAS_NUMPY and isinstance(obj, np.ndarray):  # type: ignore[union-attr]
             data = self._serialize_numpy(obj)
-            metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type="numpy")
+            # compressed=False: _serialize_numpy never LZ4-compresses (checksum-only envelope)
+            metadata = SerializationMetadata(
+                serialization_format=SerializationFormat.MSGPACK, compressed=False, original_type="numpy"
+            )
             return data, metadata
 
         # DataFrame detection (delegate to ArrowSerializer if available)
         if HAS_PANDAS and isinstance(obj, pd.DataFrame):  # type: ignore[union-attr]
             if self._arrow_serializer is not None:
                 # Use ArrowSerializer for 50-100x faster DataFrame serialization
+                # (its metadata already reflects its own configured codec)
                 return self._arrow_serializer.serialize(obj)
             else:
                 # Fallback to msgpack columnar format
                 data = self._serialize_dataframe(obj)
-                metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type="dataframe")
+                metadata = SerializationMetadata(
+                    serialization_format=SerializationFormat.MSGPACK,
+                    compressed=self.enable_integrity_checking,
+                    original_type="dataframe",
+                )
                 return data, metadata
 
         # Series detection (only if pandas installed)
         if HAS_PANDAS and isinstance(obj, pd.Series):  # type: ignore[union-attr]
             data = self._serialize_series(obj)
-            metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type="series")
+            metadata = SerializationMetadata(
+                serialization_format=SerializationFormat.MSGPACK,
+                compressed=self.enable_integrity_checking,
+                original_type="series",
+            )
             return data, metadata
 
         # Default: MessagePack (always available)
         data = self._serialize_msgpack(obj)
-        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK, original_type="msgpack")
+        metadata = SerializationMetadata(
+            serialization_format=SerializationFormat.MSGPACK,
+            compressed=self.enable_integrity_checking,
+            original_type="msgpack",
+        )
         return data, metadata
 
     def deserialize(self, data: bytes | memoryview, metadata: Optional[SerializationMetadata] = None) -> Any:
