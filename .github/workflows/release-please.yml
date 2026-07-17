@@ -53,6 +53,18 @@ jobs:
           config-file: release-please-config.json
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
+      # release-please's config schema has no assignees/reviewers option, so the
+      # assignee is bolted on here so the release PR notifies a human. Runs on
+      # every open/update of the release PR; --add-assignee is idempotent.
+      # GH_REPO is required: this job has no checkout, so gh has no git context.
+      - name: Assign release PR to 27Bslash6
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.pr).number }}
+        run: gh pr edit "$PR_NUMBER" --add-assignee 27Bslash6
+
   sync-lockfiles:
     name: Sync lockfiles in release PR
     needs: release-please
