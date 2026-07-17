@@ -455,6 +455,9 @@ class AutoSerializer:
         # metadata.compressed feeds the AES-GCM AAD v0x03 (EncryptionWrapper binds str(compressed)),
         # so it MUST reflect the codec actually applied: True iff the ByteStorage LZ4 envelope wrapped
         # the payload (parity with StandardSerializer), False for the checksum-only numpy path (#166).
+        # Every non-numpy path below envelopes iff integrity checking is on (_serialize_* helpers
+        # gate ByteStorage.store on the same flag).
+        enveloped = self.enable_integrity_checking
 
         # NumPy detection (only if numpy installed)
         if HAS_NUMPY and isinstance(obj, np.ndarray):  # type: ignore[union-attr]
@@ -474,7 +477,7 @@ class AutoSerializer:
             data = self._serialize_dataframe(obj)
             metadata = SerializationMetadata(
                 serialization_format=SerializationFormat.MSGPACK,
-                compressed=self.enable_integrity_checking,
+                compressed=enveloped,
                 original_type="dataframe",
             )
             return data, metadata
@@ -484,7 +487,7 @@ class AutoSerializer:
             data = self._serialize_series(obj)
             metadata = SerializationMetadata(
                 serialization_format=SerializationFormat.MSGPACK,
-                compressed=self.enable_integrity_checking,
+                compressed=enveloped,
                 original_type="series",
             )
             return data, metadata
@@ -493,7 +496,7 @@ class AutoSerializer:
         data = self._serialize_msgpack(obj)
         metadata = SerializationMetadata(
             serialization_format=SerializationFormat.MSGPACK,
-            compressed=self.enable_integrity_checking,
+            compressed=enveloped,
             original_type="msgpack",
         )
         return data, metadata

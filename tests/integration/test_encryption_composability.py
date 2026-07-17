@@ -150,27 +150,38 @@ class TestEncryptionWrapperComposability:
 
     @pytest.mark.parametrize("integrity", [True, False])
     def test_compressed_flag_reflects_bytestorage_codec(self, integrity):
-        """compressed=True iff the ByteStorage LZ4 envelope wrapped the payload (#166).
+        """compressed=True iff the ByteStorage LZ4 envelope actually wrapped the payload (#166).
 
-        Covers every AutoSerializer path: msgpack default, Series, the DataFrame
-        msgpack-columnar fallback (pyarrow absent), and the checksum-only numpy path
-        (never LZ4, so False regardless of integrity checking).
+        Ground truth comes from the bytes themselves (retrieve() succeeds iff the envelope
+        is present), not from the implementation's own flag formula — so a future helper
+        that changes its codec policy without updating the metadata fails here instead of
+        silently poisoning the AAD. Covers every AutoSerializer path: msgpack default,
+        Series, the DataFrame msgpack-columnar fallback (pyarrow absent), and the
+        checksum-only numpy path (never LZ4, so False regardless of integrity checking).
         """
+        from cachekit._rust_serializer import ByteStorage
+
+        def is_enveloped(data) -> bool:
+            try:
+                ByteStorage("msgpack").retrieve(bytes(data))
+                return True
+            except Exception:
+                return False
+
         serializer = AutoSerializer(enable_integrity_checking=integrity)
+        serializer._arrow_serializer = None  # force the msgpack-columnar DataFrame fallback path
 
-        _, msgpack_meta = serializer.serialize({"a": 1})
-        assert msgpack_meta.compressed is integrity
-
-        _, series_meta = serializer.serialize(pd.Series([1, 2, 3]))
-        assert series_meta.compressed is integrity
-
-        serializer._arrow_serializer = None  # force the msgpack-columnar fallback path
-        _, df_meta = serializer.serialize(pd.DataFrame({"a": [1, 2, 3]}))
-        assert df_meta.original_type == "dataframe"
-        assert df_meta.compressed is integrity
-
-        _, numpy_meta = serializer.serialize(np.array([1, 2, 3]))
-        assert numpy_meta.compressed is False
+        cases = [
+            ({"a": 1}, "msgpack", integrity),
+            (pd.Series([1, 2, 3]), "series", integrity),
+            (pd.DataFrame({"a": [1, 2, 3]}), "dataframe", integrity),
+            (np.array([1, 2, 3]), "numpy", False),  # checksum-only envelope, never LZ4
+        ]
+        for obj, expected_type, expected_compressed in cases:
+            data, meta = serializer.serialize(obj)
+            assert meta.original_type == expected_type
+            assert meta.compressed is expected_compressed
+            assert is_enveloped(data) is expected_compressed, f"{expected_type}: metadata.compressed lies about the bytes"
 
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""

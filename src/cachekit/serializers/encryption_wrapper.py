@@ -343,9 +343,11 @@ class EncryptionWrapper:
     def _create_aad(self, metadata: SerializationMetadata, cache_key: str) -> bytes:
         """Create length-prefixed AAD v0x03 with cache_key binding.
 
-        Format: [version_byte(0x03)][len1(4)][tenant_id][len2(4)][cache_key][len3(4)][format][len4(4)][compressed]
+        Format: [version_byte(0x03)][len1(4)][tenant_id][len2(4)][cache_key][len3(4)][format][len4(4)][compressed][len5(4)][original_type]
         - Version byte: 0x03 (includes cache_key binding)
         - Each length is 4-byte big-endian integer
+        - The 5th component (original_type) is appended only when metadata.original_type is set —
+          a conformant reader MUST include it for serializers that set it (e.g. AutoSerializer)
         - Mathematically impossible to collide (unambiguous parsing)
 
         SECURITY CRITICAL (Protocol v1.0.1, Section 5.6):
