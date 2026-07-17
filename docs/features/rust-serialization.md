@@ -20,7 +20,7 @@ Serializer (MessagePack / Arrow / Orjson — your choice)
     ↓  [Rust ByteStorage takes over here]
 LZ4 compression  (fast, ~500MB/s)
     ↓
-Blake3 integrity hash  (~GB/s, detects corruption)
+xxHash3-64 integrity hash  (~GB/s, detects corruption)
     ↓
 [Optional] AES-256-GCM encryption  (if @cache.secure)
     ↓
@@ -76,6 +76,9 @@ This protects against Redis memory corruption, storage bugs, and bit rot.
 
 ### Standalone checksum API
 
+> **Available since v0.12.0.** On earlier releases,
+> `from cachekit._rust_serializer import checksum` raises `ImportError`.
+
 The same primitive is exposed directly — decoupled from LZ4 compression — for
 serializers where compression is ineffective (Arrow IPC, compact JSON):
 
@@ -89,8 +92,10 @@ assert verify_checksum(b"tampered", digest) is False
 ```
 
 `verify_checksum` raises `ValueError` unless the expected checksum is exactly
-8 bytes. The output is byte-identical to the checksum embedded in every
-ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` package.
+8 bytes. Both functions accept any buffer-protocol object (`bytes`, `bytearray`,
+`memoryview`), so a serializer holding its payload as a `memoryview` can hash it
+without a `bytes` copy. The output is byte-identical to the checksum embedded in
+every ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` package.
 
 ---
 

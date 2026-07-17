@@ -4,6 +4,7 @@
 //! All business logic is delegated to cachekit-core.
 
 use cachekit_core::ByteStorage;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -342,31 +343,43 @@ pub fn key_fingerprint_py(key: &[u8]) -> Vec<u8> {
 
 /// Compute the standalone xxHash3-64 checksum of `data` (8 bytes, big-endian).
 ///
+/// Accepts any buffer-protocol object — `bytes`, `bytearray`, `memoryview`,
+/// Arrow buffers — so a serializer holding its payload as a `memoryview`
+/// (e.g. Arrow IPC) can hash it directly, without forcing a `bytes` copy.
+///
 /// NON-cryptographic: detects corruption, not tampering. For tamper-resistance
 /// use @cache.secure (AES-256-GCM), never this checksum. Produces the exact
 /// bytes embedded in every StorageEnvelope, without the LZ4 compression
 /// overhead — for serializers where compression is ineffective (Arrow IPC, JSON).
 #[pyfunction]
 #[pyo3(name = "checksum")]
-pub fn checksum_py(py: Python, data: &[u8]) -> Py<PyBytes> {
-    PyBytes::new(py, &cachekit_core::checksum(data)).into()
+pub fn checksum_py(py: Python, data: PyBuffer<u8>) -> PyResult<Py<PyBytes>> {
+    let data = data.to_vec(py)?;
+    Ok(PyBytes::new(py, &cachekit_core::checksum(&data)).into())
 }
 
 /// Verify `data` against an expected 8-byte xxHash3-64 checksum.
+///
+/// Both arguments accept any buffer-protocol object (`bytes`, `bytearray`,
+/// `memoryview`, …) — the Arrow verify path slices a `memoryview` (`mv[8:]`),
+/// so a bytes-only signature would break the moment a serializer moves onto
+/// this FFI.
 ///
 /// NON-cryptographic: detects corruption, not tampering (see `checksum`).
 /// Raises ValueError if `expected` is not exactly 8 bytes — a truncated
 /// checksum must fail loudly, never return a wrong verdict.
 #[pyfunction]
 #[pyo3(name = "verify_checksum")]
-pub fn verify_checksum_py(data: &[u8], expected: &[u8]) -> PyResult<bool> {
-    let expected: &[u8; 8] = expected.try_into().map_err(|_| {
-        PyValueError::new_err(format!(
-            "expected must be exactly 8 bytes, got {}",
-            expected.len()
-        ))
+pub fn verify_checksum_py(
+    py: Python,
+    data: PyBuffer<u8>,
+    expected: PyBuffer<u8>,
+) -> PyResult<bool> {
+    let expected: [u8; 8] = expected.to_vec(py)?.try_into().map_err(|v: Vec<u8>| {
+        PyValueError::new_err(format!("expected must be exactly 8 bytes, got {}", v.len()))
     })?;
-    Ok(cachekit_core::verify_checksum(data, expected))
+    let data = data.to_vec(py)?;
+    Ok(cachekit_core::verify_checksum(&data, &expected))
 }
 
 /// Register encryption module with Python

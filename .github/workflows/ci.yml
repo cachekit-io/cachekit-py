@@ -48,14 +48,25 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo fmt --check
 
-    # A leftover path-dep would make maturin build release wheels from the local
-    # workspace instead of the published crate (release-please rewrites versions,
-    # not path -> version), producing a non-reproducible public wheel.
-    - name: Guard cachekit-core crates.io pin
+    # A leftover path dep or [patch.crates-io] redirect would make maturin build
+    # release wheels from unpublished local source instead of the published crate,
+    # producing a non-reproducible public wheel. Assert the POSITIVE invariant on
+    # the lockfile: cachekit-core must resolve to the crates.io registry. A path or
+    # patch dep has no `source` line, so this one check covers every Cargo.toml form
+    # (inline table, [dependencies.cachekit-core], [patch.crates-io]) and the
+    # workspace root — unlike a grep for `path =`, which only caught the inline form.
+    - name: Guard cachekit-core resolves to crates.io
       if: success() || failure()
       run: |
-        if grep -nE '^\s*cachekit-core\s*=.*path\s*=' rust/Cargo.toml; then
-          echo "::error::cachekit-core must be a crates.io version pin, not a path dep"
+        src=$(awk '
+          /^\[\[package\]\]/ { name=""; source="" }
+          /^name = / { name=$3 }
+          /^source = / { source=$0 }
+          name == "\"cachekit-core\"" && source != "" { print source; exit }
+        ' Cargo.lock)
+        echo "cachekit-core resolved: ${src:-<no source line>}"
+        if [ "$src" != 'source = "registry+https://github.com/rust-lang/crates.io-index"' ]; then
+          echo "::error::cachekit-core must resolve to the crates.io registry, not a local path/patch dep"
           exit 1
         fi
 

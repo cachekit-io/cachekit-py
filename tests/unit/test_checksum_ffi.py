@@ -41,11 +41,22 @@ class TestChecksumFFI:
     def test_checksum_matches_python_xxhash_package(self):
         """FFI and the pure-Python xxhash package must agree byte-for-byte.
 
-        The Arrow/orjson serializers currently compute envelopes via
-        xxhash.xxh3_64_digest; this proves the FFI is a drop-in producer of
-        the same wire bytes.
+        The Arrow/orjson serializers compute envelopes via xxhash.xxh3_64_digest;
+        this proves the FFI is a drop-in producer of the same wire bytes across
+        xxHash3's size-dependent code paths — short, the 17-240 B mid path, and
+        the >64 KB accumulator-merge path (all previously unchecked above ~10 KB,
+        where an xxhash-rust vs libxxhash divergence would ship silently).
         """
-        for data in (b"", b"cachekit-kat", b"payload", bytes(range(256)) * 41):
+        payloads = (
+            b"",
+            b"cachekit-kat",
+            b"payload",
+            bytes(range(200)),  # 200 B — xxHash3 mid-size path
+            bytes(range(256)) * 41,  # ~10 KB
+            bytes(i % 251 for i in range(65_536 + 7)),  # > 64 KB — accumulator merge
+            bytes(i % 251 for i in range(1_048_576)),  # 1 MB
+        )
+        for data in payloads:
             assert rs.checksum(data) == xxhash.xxh3_64_digest(data)
 
 
@@ -64,3 +75,38 @@ class TestVerifyChecksumFFI:
         """expected must be exactly 8 bytes; anything else raises, never lies."""
         with pytest.raises(ValueError, match="8 bytes"):
             rs.verify_checksum(b"payload", b"\x00" * bad_len)
+
+
+class TestBufferProtocol:
+    """The FFI must accept any buffer-protocol object, not only `bytes`.
+
+    The Arrow serializer hashes a `memoryview` on both write
+    (arrow_serializer.py:245) and verify (`body = mv[8:]`, :283). A bytes-only
+    signature would raise TypeError the moment a serializer migrates onto this
+    FFI — while a bytes-only test suite stayed green. These tests lock the
+    buffer-protocol contract that makes that migration safe.
+    """
+
+    PAYLOAD = b"cachekit-kat payload of some length \x00\xff\x7f"
+
+    @pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview], ids=["bytes", "bytearray", "memoryview"])
+    def test_checksum_accepts_buffer_types(self, wrap):
+        assert rs.checksum(wrap(self.PAYLOAD)) == xxhash.xxh3_64_digest(self.PAYLOAD)
+
+    @pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview], ids=["bytes", "bytearray", "memoryview"])
+    def test_verify_accepts_buffer_types(self, wrap):
+        digest = rs.checksum(self.PAYLOAD)
+        assert rs.verify_checksum(wrap(self.PAYLOAD), digest) is True
+        assert rs.verify_checksum(wrap(self.PAYLOAD), wrap(digest)) is True
+
+    def test_verify_accepts_memoryview_slice_like_arrow(self):
+        """Mirror the Arrow verify path exactly: envelope = [8-byte checksum][body],
+        then verify the body (a memoryview slice) against the sliced checksum."""
+        body = self.PAYLOAD
+        envelope = memoryview(rs.checksum(body) + body)
+        assert rs.verify_checksum(envelope[8:], envelope[:8]) is True
+
+        tampered = bytearray(envelope)
+        tampered[-1] ^= 0x01  # corrupt the body, leave the checksum prefix intact
+        mv = memoryview(tampered)
+        assert rs.verify_checksum(mv[8:], mv[:8]) is False
