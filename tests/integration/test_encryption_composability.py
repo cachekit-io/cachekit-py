@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer, StandardSerializer
+from cachekit.serializers import ArrowSerializer, AutoSerializer, EncryptionWrapper, OrjsonSerializer
 
 
 class TestEncryptionWrapperComposability:
@@ -148,28 +148,29 @@ class TestEncryptionWrapperComposability:
         # Full wrapper round-trip still works with the stored metadata
         assert wrapper.deserialize(encrypted, metadata, cache_key=cache_key) == data
 
-    def test_auto_serializer_aad_matches_standard_serializer(self, master_key):
-        """AutoSerializer and StandardSerializer produce identical AAD bytes for the same entry (#166).
+    @pytest.mark.parametrize("integrity", [True, False])
+    def test_compressed_flag_reflects_bytestorage_codec(self, integrity):
+        """compressed=True iff the ByteStorage LZ4 envelope wrapped the payload (#166).
 
-        Both wrap msgpack in the ByteStorage LZ4 envelope, so both must authenticate the same
-        (format="msgpack", compressed="True", original_type="msgpack") context.
+        Covers every AutoSerializer path: msgpack default, Series, the DataFrame
+        msgpack-columnar fallback (pyarrow absent), and the checksum-only numpy path
+        (never LZ4, so False regardless of integrity checking).
         """
-        wrapper = EncryptionWrapper(master_key=master_key, tenant_id="test-tenant")
-        cache_key = "test:encryption:aad:parity"
+        serializer = AutoSerializer(enable_integrity_checking=integrity)
 
-        _, auto_meta = AutoSerializer().serialize({"a": 1})
-        _, std_meta = StandardSerializer().serialize({"a": 1})
+        _, msgpack_meta = serializer.serialize({"a": 1})
+        assert msgpack_meta.compressed is integrity
 
-        assert wrapper._create_aad(auto_meta, cache_key) == wrapper._create_aad(std_meta, cache_key)
+        _, series_meta = serializer.serialize(pd.Series([1, 2, 3]))
+        assert series_meta.compressed is integrity
 
-    def test_auto_serializer_numpy_stays_uncompressed_in_metadata(self):
-        """NumPy path uses a checksum-only envelope (no LZ4), so compressed must remain False (#166)."""
-        _, metadata = AutoSerializer().serialize(np.array([1, 2, 3]))
-        assert metadata.compressed is False
+        serializer._arrow_serializer = None  # force the msgpack-columnar fallback path
+        _, df_meta = serializer.serialize(pd.DataFrame({"a": [1, 2, 3]}))
+        assert df_meta.original_type == "dataframe"
+        assert df_meta.compressed is integrity
 
-        # Integrity-off produces no envelope at all — compressed False on every path
-        _, off_meta = AutoSerializer(enable_integrity_checking=False).serialize({"a": 1})
-        assert off_meta.compressed is False
+        _, numpy_meta = serializer.serialize(np.array([1, 2, 3]))
+        assert numpy_meta.compressed is False
 
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""

@@ -459,7 +459,6 @@ class AutoSerializer:
         # NumPy detection (only if numpy installed)
         if HAS_NUMPY and isinstance(obj, np.ndarray):  # type: ignore[union-attr]
             data = self._serialize_numpy(obj)
-            # compressed=False: _serialize_numpy never LZ4-compresses (checksum-only envelope)
             metadata = SerializationMetadata(
                 serialization_format=SerializationFormat.MSGPACK, compressed=False, original_type="numpy"
             )
