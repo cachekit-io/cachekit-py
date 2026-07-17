@@ -38,7 +38,7 @@ The Rust layer is transparent — you configure serializers and encryption at th
 | Operation | Python | Rust (ByteStorage) |
 |-----------|--------|---------------------|
 | LZ4 compression | ~50-100 MB/s | ~500 MB/s |
-| Blake3 hashing | ~500 MB/s | ~15 GB/s |
+| xxHash3-64 hashing | ~35 GB/s (`xxhash` C ext) | ~35 GB/s |
 | AES-256-GCM | ~200 MB/s | ~1-4 GB/s (AES-NI) |
 
 For most workloads the bottleneck is Redis RTT (~2-50ms), not serialization. The Rust layer matters for large payloads (DataFrames, bulk data) where serialization time approaches network time.
@@ -61,15 +61,36 @@ Compression runs automatically. It can be toggled via the `CACHEKIT_ENABLE_COMPR
 
 ---
 
-## Blake3 Integrity
+## xxHash3-64 Integrity
 
-Every value stored includes a Blake3 hash. On retrieval:
+Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On retrieval:
 
-1. Hash of retrieved bytes is computed
-2. Stored hash is compared
+1. Checksum of retrieved bytes is computed
+2. Stored checksum is compared
 3. Mismatch → `BackendError` (corrupted data, never returned to caller)
 
 This protects against Redis memory corruption, storage bugs, and bit rot.
+
+> **Non-cryptographic.** The checksum detects corruption, not tampering.
+> Tamper-resistance comes from AES-256-GCM (`@cache.secure`), never from this checksum.
+
+### Standalone checksum API
+
+The same primitive is exposed directly — decoupled from LZ4 compression — for
+serializers where compression is ineffective (Arrow IPC, compact JSON):
+
+```python
+from cachekit._rust_serializer import checksum, verify_checksum
+
+digest = checksum(b"payload")  # 8 bytes, big-endian
+assert len(digest) == 8
+assert verify_checksum(b"payload", digest) is True
+assert verify_checksum(b"tampered", digest) is False
+```
+
+`verify_checksum` raises `ValueError` unless the expected checksum is exactly
+8 bytes. The output is byte-identical to the checksum embedded in every
+ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` package.
 
 ---
 
@@ -99,7 +120,7 @@ The Rust ByteStorage layer is orthogonal to the serializer. Mix and match:
 | Typed models | [Pydantic](../serializers/pydantic.md) | Optional |
 | Custom types | [Custom](../serializers/custom.md) | Optional |
 
-All serializers pass through the same ByteStorage pipeline (LZ4 + Blake3 + optional AES-256-GCM).
+All serializers pass through the same ByteStorage pipeline (LZ4 + xxHash3-64 + optional AES-256-GCM).
 
 ---
 

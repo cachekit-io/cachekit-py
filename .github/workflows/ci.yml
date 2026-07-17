@@ -48,9 +48,22 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo fmt --check
 
+    # A leftover path-dep would make maturin build release wheels from the local
+    # workspace instead of the published crate (release-please rewrites versions,
+    # not path -> version), producing a non-reproducible public wheel.
+    - name: Guard cachekit-core crates.io pin
+      if: success() || failure()
+      run: |
+        if grep -nE '^\s*cachekit-core\s*=.*path\s*=' rust/Cargo.toml; then
+          echo "::error::cachekit-core must be a crates.io version pin, not a path dep"
+          exit 1
+        fi
+
+    # --locked: fail on a stale Cargo.lock so the build provably resolves
+    # cachekit-core from crates.io as committed
     - name: Lint Rust
       if: success() || failure()
-      run: cd rust && cargo clippy -- -D warnings
+      run: cd rust && cargo clippy --locked -- -D warnings
 
   # PR: single Python version, critical tests only
   # Push: full matrix, full test suite
