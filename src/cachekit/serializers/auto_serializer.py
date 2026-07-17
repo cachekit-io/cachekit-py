@@ -471,15 +471,14 @@ class AutoSerializer:
                 # Use ArrowSerializer for 50-100x faster DataFrame serialization
                 # (its metadata already reflects its own configured codec)
                 return self._arrow_serializer.serialize(obj)
-            else:
-                # Fallback to msgpack columnar format
-                data = self._serialize_dataframe(obj)
-                metadata = SerializationMetadata(
-                    serialization_format=SerializationFormat.MSGPACK,
-                    compressed=self.enable_integrity_checking,
-                    original_type="dataframe",
-                )
-                return data, metadata
+            # Fallback to msgpack columnar format
+            data = self._serialize_dataframe(obj)
+            metadata = SerializationMetadata(
+                serialization_format=SerializationFormat.MSGPACK,
+                compressed=self.enable_integrity_checking,
+                original_type="dataframe",
+            )
+            return data, metadata
 
         # Series detection (only if pandas installed)
         if HAS_PANDAS and isinstance(obj, pd.Series):  # type: ignore[union-attr]
