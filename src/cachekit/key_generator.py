@@ -44,8 +44,12 @@ class CacheKeyGenerator:
         "local": "l",  # Reference caching (no serialization)
     }
 
-    # Regex for chars allowed in the func component of a SaaS cache key.
-    # SaaS validates: /^[a-zA-Z0-9_.]{1,200}$/
+    # Regex for chars allowed in the func component of a cache key.
+    # The [a-zA-Z0-9_.]{1,200} shape is SDK convention (the SaaS validates
+    # security-only: charset whitelist [a-zA-Z0-9_.:-], `..` rejection,
+    # 400-char cap — see protocol/spec/cache-key-format.md). Sanitization is
+    # still required: qualnames like `<lambda>` carry chars outside the
+    # server's charset whitelist.
     _FUNC_ALLOWED_RE = __import__("re").compile(r"[^A-Za-z0-9_.]")
     _DOUBLE_DOT_RE = __import__("re").compile(r"\.{2,}")
     _FUNC_NAME_MAX = 200
@@ -358,12 +362,14 @@ class CacheKeyGenerator:
 
     @classmethod
     def _sanitize_func_name(cls, module: str, qualname: str) -> str:
-        """Sanitize module.qualname for SaaS cache-key compliance.
+        """Sanitize module.qualname for cache-key charset compliance.
 
-        The SaaS ``func`` component must match ``[a-zA-Z0-9_.]{1,200}``
-        and must not contain ``..``.  Nested functions have qualnames like
-        ``outer.<locals>.inner`` and lambdas are ``<lambda>`` — the angle
-        brackets violate the regex.
+        The SaaS validates keys security-only (charset whitelist
+        ``[a-zA-Z0-9_.:-]``, no ``..``, 400-char cap); the stricter
+        ``[a-zA-Z0-9_.]{1,200}`` func shape kept here is SDK convention.
+        Nested functions have qualnames like ``outer.<locals>.inner`` and
+        lambdas are ``<lambda>`` — the angle brackets violate the server's
+        charset whitelist either way, so sanitization stays mandatory.
 
         This replaces every disallowed char with ``_``, collapses runs of
         ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
