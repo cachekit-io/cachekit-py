@@ -340,6 +340,35 @@ pub fn key_fingerprint_py(key: &[u8]) -> Vec<u8> {
     key_fingerprint(key).to_vec()
 }
 
+/// Compute the standalone xxHash3-64 checksum of `data` (8 bytes, big-endian).
+///
+/// NON-cryptographic: detects corruption, not tampering. For tamper-resistance
+/// use @cache.secure (AES-256-GCM), never this checksum. Produces the exact
+/// bytes embedded in every StorageEnvelope, without the LZ4 compression
+/// overhead — for serializers where compression is ineffective (Arrow IPC, JSON).
+#[pyfunction]
+#[pyo3(name = "checksum")]
+pub fn checksum_py(py: Python, data: &[u8]) -> Py<PyBytes> {
+    PyBytes::new(py, &cachekit_core::checksum(data)).into()
+}
+
+/// Verify `data` against an expected 8-byte xxHash3-64 checksum.
+///
+/// NON-cryptographic: detects corruption, not tampering (see `checksum`).
+/// Raises ValueError if `expected` is not exactly 8 bytes — a truncated
+/// checksum must fail loudly, never return a wrong verdict.
+#[pyfunction]
+#[pyo3(name = "verify_checksum")]
+pub fn verify_checksum_py(data: &[u8], expected: &[u8]) -> PyResult<bool> {
+    let expected: &[u8; 8] = expected.try_into().map_err(|_| {
+        PyValueError::new_err(format!(
+            "expected must be exactly 8 bytes, got {}",
+            expected.len()
+        ))
+    })?;
+    Ok(cachekit_core::verify_checksum(data, expected))
+}
+
 /// Register encryption module with Python
 #[cfg(feature = "encryption")]
 pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
