@@ -50,6 +50,8 @@ def run_threads(n_threads: int, ops_total: int) -> float:
     """
     serializer = StandardSerializer()
     data = _payload()
+    if n_threads <= 0:
+        raise ValueError("n_threads must be greater than zero")
     if ops_total % n_threads != 0:
         raise ValueError(f"ops_total={ops_total} must be evenly divisible by n_threads={n_threads}")
     per = ops_total // n_threads
