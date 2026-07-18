@@ -50,6 +50,8 @@ def run_threads(n_threads: int, ops_total: int) -> float:
     """
     serializer = StandardSerializer()
     data = _payload()
+    if ops_total % n_threads != 0:
+        raise ValueError(f"ops_total={ops_total} must be evenly divisible by n_threads={n_threads}")
     per = ops_total // n_threads
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
@@ -73,7 +75,7 @@ def main() -> None:
     single = run_threads(1, ops_total)
     print(f"  {'threads':>7}  {'wall (s)':>9}  {'speedup':>8}  {'efficiency':>11}")
     for n_threads in THREAD_COUNTS:
-        wall = run_threads(n_threads, ops_total)
+        wall = single if n_threads == 1 else run_threads(n_threads, ops_total)
         speedup = single / wall
         efficiency = (speedup / n_threads) * 100
         print(f"  {n_threads:>7}  {wall:>9.4f}  {speedup:>7.2f}x  {efficiency:>10.0f}%")
