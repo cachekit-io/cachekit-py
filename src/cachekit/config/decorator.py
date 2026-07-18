@@ -393,7 +393,10 @@ class DecoratorConfig:
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
             tenant_extractor: Optional tenant ID extractor for multi-tenant encryption
-            **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking cannot be overridden
+            **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking cannot be overridden.
+                     fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
+                     auth failure / key-fingerprint mismatch instead of silently recomputing
+                     (default None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, which defaults to False)
 
         Returns:
             DecoratorConfig with encryption enabled and full security features
@@ -408,6 +411,8 @@ class DecoratorConfig:
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
         deployment_uuid = kwargs.pop("deployment_uuid", None)
+        # Tri-state: None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open)
+        fail_closed = kwargs.pop("fail_closed", None)
 
         # SECURITY INVARIANT: Force integrity_checking=True (non-negotiable for encryption)
         # Remove any explicit integrity_checking override (if user tried to disable it)
@@ -436,6 +441,7 @@ class DecoratorConfig:
                 tenant_extractor=tenant_extractor,
                 single_tenant_mode=single_tenant_mode,
                 deployment_uuid=deployment_uuid,
+                fail_closed=fail_closed,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
             timeout=TimeoutConfig(enabled=True),

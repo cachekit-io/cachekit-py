@@ -71,8 +71,14 @@ Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On ret
 
 This protects against Redis memory corruption, storage bugs, and bit rot.
 
-> **Non-cryptographic.** The checksum detects corruption, not tampering.
-> Tamper-resistance comes from AES-256-GCM (`@cache.secure`), never from this checksum.
+> **Non-cryptographic — corruption detection only.** xxHash3-64 is not a cryptographic
+> hash and the comparison is a plain equality check: an attacker with backend write
+> access can forge a valid checksum for arbitrary bytes in microseconds. On the
+> plaintext `@cache` path the stored bytes are therefore attacker-forgeable.
+> Tamper-resistance comes from AES-256-GCM (`@cache.secure` / `CACHEKIT_MASTER_KEY`),
+> never from this checksum. See
+> [zero-knowledge-encryption.md](zero-knowledge-encryption.md#corruption-vs-tamper-telemetry-and-fail-closed-mode)
+> for the corruption-vs-tamper telemetry split.
 
 ### Standalone checksum API
 

@@ -304,6 +304,13 @@ class EncryptionConfig:
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode (default: None)
+        fail_closed: Tri-state tamper-failure policy (default: None = defer to the
+                 CACHEKIT_ENCRYPTION_FAIL_CLOSED env setting, which defaults to False).
+                 True = raise DecryptionAuthenticationError to the caller on AES-GCM
+                 authentication failure or key-fingerprint mismatch instead of silently
+                 recomputing (fail closed). False = explicit per-decorator opt-out of a
+                 fleet-wide fail-closed setting (fail open: warn, record the
+                 cachekit_decrypt_failures_total metric, recompute).
 
     Examples:
         Unset by default (defers to auto-detection, no encryption forced):
@@ -346,6 +353,7 @@ class EncryptionConfig:
     tenant_extractor: Callable[..., str] | None = None
     single_tenant_mode: bool = False
     deployment_uuid: str | None = None
+    fail_closed: bool | None = None
 
     def validate(self) -> None:
         """Validate encryption configuration.

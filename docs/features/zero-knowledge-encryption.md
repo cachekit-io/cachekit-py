@@ -381,6 +381,64 @@ Relocating these fields would be a cross-SDK wire-format change owned by the
 [protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
 exposure rather than diverging from the shared frame format.
 
+### Corruption vs Tamper: Telemetry and Fail-Closed Mode
+
+Two very different failure classes surface on the decrypt read path, and cachekit
+distinguishes them (cachekit-py#170):
+
+- **`auth_tamper`** — AES-GCM authentication failed: the ciphertext was modified, the
+  key is wrong (rotation/misconfiguration), or the AAD didn't match (ciphertext moved
+  between cache keys). Raised as `DecryptionAuthenticationError`. This is the signal an
+  active attack would produce.
+- **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
+  serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
+  Storage rot and bugs, not evidence of tampering.
+
+Both are counted on the Prometheus counter
+`cachekit_decrypt_failures_total{reason="auth_tamper"|"corruption", tier="l1"|"l2"}` —
+alert on `reason="auth_tamper"` specifically; a nonzero rate there is a security
+event, not noise.
+
+**Default (fail open):** a decrypt failure of either class logs a warning, evicts the
+poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
+degrades to a cache miss. The tampering is visible only in logs and the metric.
+
+**Fail closed (opt-in):** `auth_tamper` failures raise
+`DecryptionAuthenticationError` to *your* caller instead of silently recomputing, and
+a key-fingerprint mismatch refuses to even attempt decryption. The poisoned entry is
+deliberately **not** evicted (it is evidence). Corruption-class failures still fail
+open — only authentication failures escalate. Enable it fleet-wide or per-function:
+
+```bash
+# Fleet-wide (all decorators, overridable per-function)
+export CACHEKIT_ENCRYPTION_FAIL_CLOSED=1
+```
+
+```python notest
+# Per-function (overrides the env setting in either direction)
+@cache.secure(master_key="a" * 64, fail_closed=True)
+def get_payment_token(user_id: int): ...
+
+# Or via explicit EncryptionConfig
+from cachekit.config.nested import EncryptionConfig
+config = EncryptionConfig(enabled=True, master_key="a" * 64,
+                          single_tenant_mode=True, fail_closed=True)
+```
+
+Note the boundary with the integrity checksum: the ByteStorage **xxHash3-64 checksum
+is corruption detection only** — it is not cryptographic and an attacker who can write
+to the backend can trivially forge a valid checksum for arbitrary bytes. On the
+plaintext `@cache` path the stored bytes are therefore attacker-forgeable; tamper
+resistance exists **only** under encryption, where AES-256-GCM authenticates every
+byte. `fail_closed` governs the authenticated path — it cannot add tamper resistance
+to plaintext caching.
+
+**Config-drift reads:** if a handler has encryption *disabled* but reads a stale
+*encrypted* entry (e.g. encryption was recently turned off), cachekit decrypts it via
+the globally configured master key — but logs a warning on every such read, because
+the same signature appears under misconfiguration or a planted entry. If you didn't
+recently disable encryption for that function, investigate.
+
 ---
 
 ## Compliance Implications

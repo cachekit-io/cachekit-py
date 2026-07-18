@@ -80,6 +80,13 @@ cache_operations_total{operation="get",namespace="users",success="True",serializ
 # Cache operations from the backpressure/load-control path.
 # Labels: operation, status, serializer, namespace
 redis_cache_operations_total{operation="get",status="hit",serializer="default",namespace="users"}
+
+# Decrypt/integrity failures on the read path, split by failure class.
+# Labels: reason ("auth_tamper" = AES-GCM authentication failure or key-fingerprint
+#         mismatch — possible tampering or wrong key; "corruption" = checksum/format
+#         failure — storage rot or bugs), tier ("l1" or "l2").
+# ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
+cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 ```
 
 > Hits and misses are not separate series. Compute them from labels — the `success` label

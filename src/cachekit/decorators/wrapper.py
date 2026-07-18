@@ -18,12 +18,14 @@ from ..cache_handler import (
     StandardCacheHandler,
     get_backend_provider,
     get_logger,
+    record_decrypt_failure,
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers.base import SerializationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -286,6 +288,7 @@ def create_cache_wrapper(
     single_tenant_mode: bool = False,
     deployment_uuid: str | None = None,
     master_key: str | None = None,
+    encryption_fail_closed: bool | None = None,
     # Performance features
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
@@ -336,6 +339,10 @@ def create_cache_wrapper(
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
                         If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
                         Must be deterministic (same across restarts) to decrypt cached data.
+        encryption_fail_closed: Tri-state tamper-failure policy. None (default) defers to
+                        CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open). True raises
+                        DecryptionAuthenticationError to the caller on AES-GCM authentication
+                        failure or key-fingerprint mismatch instead of silently recomputing.
         refresh_ttl_on_get: Refresh TTL on cache hit
         ttl_refresh_threshold: Refresh when TTL below this fraction
         fast_mode: Disable monitoring for maximum performance
@@ -404,6 +411,7 @@ def create_cache_wrapper(
         single_tenant_mode = config.encryption.single_tenant_mode
         deployment_uuid = config.encryption.deployment_uuid
         master_key = config.encryption.master_key
+        encryption_fail_closed = config.encryption.fail_closed
 
         # Custom key function (escape hatch for complex types)
         custom_key_func = config.key
@@ -441,6 +449,7 @@ def create_cache_wrapper(
         deployment_uuid=deployment_uuid,
         master_key=master_key,
         enable_integrity_checking=integrity_checking,
+        encryption_fail_closed=encryption_fail_closed,
     )
 
     # Create cache handler strategy (initialized with actual Redis client when first used)
@@ -695,6 +704,19 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
+                except SerializationError as e:
+                    # Decrypt/integrity failure on L1 bytes — record the tamper-vs-corruption
+                    # metric, then apply the fail policy (cachekit-py#170).
+                    reason = record_decrypt_failure(e, tier="l1")
+                    if reason == "auth_tamper" and serialization_handler.encryption_fail_closed:
+                        logger().error(
+                            f"L1 cache decrypt AUTHENTICATION failure for {cache_key}; failing closed "
+                            f"(encryption.fail_closed=True): {e}"
+                        )
+                        reset_current_function_stats(token)
+                        raise
+                    logger().warning(f"L1 cache deserialization failed ({reason}) for {cache_key}: {e}")
+                    _l1_cache.invalidate(cache_key)
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
                     logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
@@ -761,6 +783,12 @@ def create_cache_wrapper(
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
                 return cached_result[1]
+        except DecryptionAuthenticationError:
+            # Fail-closed tamper failure propagated from get_cached_value — it only
+            # raises when encryption.fail_closed=True (the metric and error log were
+            # recorded there). Never swallow this into an uncached recompute.
+            reset_current_function_stats(token)
+            raise
         except Exception as e:
             # Cache GET failed - execute function without caching
             get_duration_ms = (time.time() - start_time) * 1000
@@ -955,6 +983,18 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
+                    except SerializationError as e:
+                        # Decrypt/integrity failure on L1 bytes — record the tamper-vs-corruption
+                        # metric, then apply the fail policy (cachekit-py#170).
+                        reason = record_decrypt_failure(e, tier="l1")
+                        if reason == "auth_tamper" and serialization_handler.encryption_fail_closed:
+                            logger().error(
+                                f"L1 cache decrypt AUTHENTICATION failure for {cache_key}; failing closed "
+                                f"(encryption.fail_closed=True): {e}"
+                            )
+                            raise
+                        logger().warning(f"L1 cache deserialization failed ({reason}) for {cache_key}: {e}")
+                        _l1_cache.invalidate(cache_key)
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
                         logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
@@ -1041,8 +1081,9 @@ def create_cache_wrapper(
                     return result
 
             except SerializationError as e:
-                # Decrypt/integrity failure on L2 data — warn explicitly (fail-open: recompute)
-                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                # Decrypt/integrity failure on L2 data — record the tamper-vs-corruption
+                # metric, then apply the fail policy (cachekit-py#170).
+                reason = record_decrypt_failure(e, tier="l2")
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
                 features.handle_cache_error(
                     error=e,
@@ -1052,6 +1093,13 @@ def create_cache_wrapper(
                     duration_ms=get_duration_ms,
                     correlation_id=correlation_id,
                 )
+                if reason == "auth_tamper" and serialization_handler.encryption_fail_closed:
+                    logger().error(
+                        f"L2 cache decrypt AUTHENTICATION failure for {cache_key}; failing closed "
+                        f"(encryption.fail_closed=True): {e}"
+                    )
+                    raise
+                logger().warning(f"L2 cache decrypt/integrity failure ({reason}) for {cache_key}: {e}")
 
             except Exception as e:
                 # Backend/network error - record but continue to function execution
@@ -1104,7 +1152,14 @@ def create_cache_wrapper(
 
                                     return result
                             except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                                reason = record_decrypt_failure(e, tier="l2")
+                                if reason == "auth_tamper" and serialization_handler.encryption_fail_closed:
+                                    logger().error(
+                                        f"L2 cache decrypt AUTHENTICATION failure for {cache_key}; failing "
+                                        f"closed (encryption.fail_closed=True): {e}"
+                                    )
+                                    raise
+                                logger().warning(f"L2 cache decrypt/integrity failure ({reason}) for {cache_key}: {e}")
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
@@ -1130,7 +1185,14 @@ def create_cache_wrapper(
 
                                     return result
                             except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                                reason = record_decrypt_failure(e, tier="l2")
+                                if reason == "auth_tamper" and serialization_handler.encryption_fail_closed:
+                                    logger().error(
+                                        f"L2 cache decrypt AUTHENTICATION failure for {cache_key}; failing "
+                                        f"closed (encryption.fail_closed=True): {e}"
+                                    )
+                                    raise
+                                logger().warning(f"L2 cache decrypt/integrity failure ({reason}) for {cache_key}: {e}")
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
