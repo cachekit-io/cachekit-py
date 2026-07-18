@@ -160,7 +160,7 @@ entries are **rejected, never read**. The read path fails closed: the entry rais
 `SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
 and re-stores the value encrypted. Migration is therefore lazy and self-healing:
 
-```
+```text
 read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
 ```
 
@@ -172,10 +172,16 @@ fail-closed read path exists to prevent. If you need to read plaintext entries, 
 handler with `encryption=False` (which never had keys to protect).
 
 For large caches, prefer an eager flush when flipping encryption on — otherwise every
-legacy entry pays one recompute on first read (a self-inflicted cold-start stampede):
+legacy entry pays one recompute on first read (a self-inflicted cold-start stampede).
+Scope the eviction to cachekit's keys so unrelated data in the same Redis database
+survives:
 
 ```bash
-redis-cli FLUSHDB   # then deploy with CACHEKIT_MASTER_KEY set
+# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
+redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+
+# FLUSHDB is only safe when the database is dedicated to cachekit
+# then deploy with CACHEKIT_MASTER_KEY set
 ```
 
 ### L1 Cache Conflict
@@ -345,7 +351,7 @@ model) could exploit that gap by planting a frame whose header claims
 downgrade (CWE-757). cachekit therefore never lets header metadata select the read
 path when encryption is configured:
 
-```
+```text
 Handler configured with encryption:
   entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
   entry header claims plaintext  → SerializationError (fail closed, entry evicted)
