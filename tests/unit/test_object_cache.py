@@ -413,6 +413,59 @@ class TestObjectCacheSWR:
         assert oc.complete_refresh("k", version, "v2", ttl=10) is False
         assert oc.get("k")[0] is False
 
+    def test_complete_refresh_after_put_replacement_does_not_overwrite(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """put() replacing an entry mid-refresh invalidates the in-flight refresh.
+
+        Regression: put() used a bare pop() that kept the old refresh valid, so
+        an older in-flight refresh could overwrite the newer value.
+        """
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh
+
+        oc.put("k", "v2-newer", ttl=10)  # replaced while the refresh is "in flight"
+
+        assert oc.complete_refresh("k", version, "v1-stale-refresh", ttl=10) is False
+        hit, value = oc.get("k")
+        assert hit is True
+        assert value == "v2-newer"  # the newer value survived
+
+    def test_put_replacement_clears_refreshing_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After put() replaces mid-refresh, a later stale hit can flag a new refresh."""
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh, _ = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh  # marker now set
+
+        oc.put("k", "v2", ttl=10)  # replacement clears the in-flight marker
+
+        fake.monotonic = lambda: 1012.0  # new entry (cached at 1006) is stale again
+        _, _, needs_refresh_again, _ = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_again is True
+
+    def test_complete_refresh_after_delete_and_reput_does_not_overwrite(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """delete() + a fresh put() of the same key must still reject the old refresh."""
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh
+
+        oc.delete("k")
+        oc.put("k", "v2-new-entry", ttl=10)
+
+        assert oc.complete_refresh("k", version, "v1-stale-refresh", ttl=10) is False
+        assert oc.get("k")[1] == "v2-new-entry"
+
     def test_cancel_refresh_allows_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """After a failed refresh is cancelled, the next stale hit flags again."""
         fake = self._fake_clock(monkeypatch)

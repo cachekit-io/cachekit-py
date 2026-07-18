@@ -60,6 +60,7 @@ class _Entry:
     expires_at: float  # time.monotonic() hard-expiry deadline
     cached_at: float  # time.monotonic() write timestamp (SWR freshness clock)
     size_bytes: int  # 0 when the cache is not byte-bounded
+    generation: int  # anti-resurrection token: allocated per stored entry, never reused
 
 
 class ObjectCache:
@@ -79,8 +80,11 @@ class ObjectCache:
     while flagging it for background refresh once past
     ``ttl * swr_threshold_ratio`` (±10% jitter). The caller runs the refresh and
     finishes the cycle with ``complete_refresh`` (or ``cancel_refresh`` on
-    failure). A per-key version token prevents a refresh that completes after
-    an invalidation from resurrecting stale data (mirrors L1Cache semantics).
+    failure). Each stored entry carries a generation token from a monotonic
+    counter; a refresh only lands if the same entry (same generation) is still
+    live, so a refresh that completes after an invalidation, eviction, or
+    replacement can never resurrect stale data — without retaining any per-key
+    state for removed entries.
 
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
@@ -137,12 +141,12 @@ class ObjectCache:
         self._misses = 0
         self._current_size_bytes = 0
 
-        # SWR state: keys with an in-flight background refresh, and a per-key
-        # version bumped on every removal so a refresh completing after an
-        # invalidation cannot resurrect stale data. Like L1Cache, _versions
-        # keeps one int per removed key for the cache's lifetime.
+        # SWR state: keys with an in-flight background refresh, plus a monotonic
+        # generation counter stamped onto every stored entry. A refresh captures
+        # the entry's generation at read time and only lands if that exact entry
+        # is still live — removal leaves no per-key residue (no tombstones).
         self._refreshing: set[str] = set()
-        self._versions: dict[str, int] = {}
+        self._generation = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -213,7 +217,7 @@ class ObjectCache:
             self._store.move_to_end(key)
             self._hits += 1
 
-            version = self._versions.get(key, 0)
+            version = entry.generation
             needs_refresh = False
             # ±10% jitter staggers refreshes when many keys cross the threshold together
             jitter = random.uniform(0.9, 1.1)  # noqa: S311 - not cryptographic
@@ -251,13 +255,13 @@ class ObjectCache:
             # Clear in-flight marker regardless of outcome so future refreshes can run
             self._refreshing.discard(key)
 
-            if self._versions.get(key, 0) != version:
-                # Entry was invalidated during refresh — don't resurrect stale data
-                return False
-
             entry = self._store.get(key)
             if entry is None:
-                # Entry was evicted (LRU/byte pressure) during refresh
+                # Entry was invalidated or evicted during refresh — don't resurrect it
+                return False
+            if entry.generation != version:
+                # Entry was replaced (e.g. by put()) during refresh — the newer
+                # value wins; the stale refresh result is discarded
                 return False
 
             if self._max_size_bytes is not None and size > self._max_size_bytes:
@@ -316,23 +320,28 @@ class ObjectCache:
             return
 
         with self._lock:
-            # Replacing? Release the old entry's bytes first (pop re-appends at MRU below)
-            existing = self._store.pop(key, None)
-            if existing is not None:
-                self._current_size_bytes -= existing.size_bytes
+            # Replacing? Remove through _remove so byte accounting and any
+            # in-flight refresh marker stay consistent (the new entry re-appends
+            # at MRU below). The fresh generation below makes an older in-flight
+            # refresh unable to overwrite this newer value.
+            if key in self._store:
+                self._remove(key)
 
             self._evict(extra_bytes=size, need_slot=True)
 
             now = time.monotonic()
-            self._store[key] = _Entry(value=value, expires_at=now + ttl, cached_at=now, size_bytes=size)
+            self._generation += 1
+            self._store[key] = _Entry(
+                value=value, expires_at=now + ttl, cached_at=now, size_bytes=size, generation=self._generation
+            )
             self._current_size_bytes += size
             # No move_to_end needed — OrderedDict.__setitem__ appends new keys to end
 
     def delete(self, key: str) -> bool:
         """Remove a single entry from the cache.
 
-        Bumps the entry's version so an in-flight SWR refresh cannot
-        resurrect it.
+        An in-flight SWR refresh cannot resurrect it: the refresh only lands
+        on the exact entry (generation) it was started against.
 
         Args:
             key: Cache key to remove.
@@ -350,12 +359,10 @@ class ObjectCache:
         """Remove all entries from the cache.
 
         Hit/miss counters are NOT reset; they represent lifetime statistics.
-        In-flight SWR refreshes are invalidated (version bump) so they cannot
-        resurrect cleared entries.
+        In-flight SWR refreshes cannot resurrect cleared entries — their
+        target entries no longer exist.
         """
         with self._lock:
-            for key in self._store:
-                self._versions[key] = self._versions.get(key, 0) + 1
             self._store.clear()
             self._current_size_bytes = 0
             self._refreshing.clear()
@@ -406,14 +413,14 @@ class ObjectCache:
         """Remove an entry and update all bookkeeping.
 
         Must be called with self._lock held. Every removal path funnels here so
-        byte accounting, version bumps (anti-resurrection), and in-flight
-        refresh cancellation stay consistent.
+        byte accounting and in-flight refresh cancellation stay consistent.
+        Anti-resurrection needs no per-key residue: a refresh can only land on
+        the exact entry (generation) it was started against.
         """
         entry = self._store.pop(key, None)
         if entry is None:
             return
         self._current_size_bytes -= entry.size_bytes
-        self._versions[key] = self._versions.get(key, 0) + 1
         self._refreshing.discard(key)
 
     def _evict(self, extra_bytes: int, need_slot: bool) -> None:

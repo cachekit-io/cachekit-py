@@ -16,6 +16,8 @@ No Redis or external services required.
 from __future__ import annotations
 
 import asyncio
+import copy
+import threading
 import time
 
 import pytest
@@ -189,6 +191,129 @@ class TestL1OnlySWRSync:
             time.sleep(0.02)
         assert calls == 2
         assert fn() == 1  # stale value still served
+
+
+@pytest.mark.unit
+class TestL1OnlyDisabled:
+    """backend=None + L1CacheConfig(enabled=False) must not cache at all."""
+
+    def test_sync_no_caching_when_l1_disabled(self):
+        calls = 0
+
+        @cache(ttl=60, backend=None, l1=L1CacheConfig(enabled=False))
+        def fn():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert fn() == 1
+        assert fn() == 2  # every call executes — nothing was cached
+        assert calls == 2
+
+    async def test_async_no_caching_when_l1_disabled(self):
+        calls = 0
+
+        @cache(ttl=60, backend=None, l1=L1CacheConfig(enabled=False))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert await fn() == 1
+        assert await fn() == 2
+        assert calls == 2
+
+
+@pytest.mark.unit
+class TestL1OnlySWRArgumentSnapshot:
+    """The background refresh must see the arguments as they were at call time.
+
+    The cache key is computed before the refresh is scheduled; if the caller
+    mutates an argument after receiving the stale value, an un-snapshotted
+    refresh would compute from the new state and store it under the old key.
+    """
+
+    async def test_async_refresh_uses_snapshot_not_live_args(self):
+        seen: list[dict] = []
+
+        @cache(ttl=2, backend=None, l1=L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.2))
+        async def fn(payload: dict):
+            seen.append(copy.deepcopy(payload))
+            return dict(payload)
+
+        payload = {"v": 1}
+        assert await fn(payload) == {"v": 1}  # miss -> executes
+        await asyncio.sleep(0.6)
+        assert await fn(payload) == {"v": 1}  # stale hit -> refresh scheduled (snapshot taken)
+        payload["v"] = 999  # caller mutates BEFORE the refresh task first runs
+
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert len(seen) == 2, "no background refresh happened"
+        assert seen[1] == {"v": 1}, f"refresh saw the caller's mutation: {seen[1]}"
+
+    def test_sync_refresh_uses_snapshot_not_live_args(self):
+        seen: list[dict] = []
+        release = threading.Event()
+
+        @cache(ttl=2, backend=None, l1=L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.2))
+        def fn(payload: dict):
+            if seen:  # only the refresh call waits, so the mutation happens first
+                release.wait(timeout=2.0)
+            seen.append(copy.deepcopy(payload))
+            return dict(payload)
+
+        payload = {"v": 1}
+        assert fn(payload) == {"v": 1}
+        time.sleep(1.0)
+        assert fn(payload) == {"v": 1}  # snapshot taken synchronously before this returns
+        payload["v"] = 999
+        release.set()  # now let the refresh thread read its (copied) argument
+
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(seen) == 2, "no background refresh happened"
+        assert seen[1] == {"v": 1}, f"refresh saw the caller's mutation: {seen[1]}"
+
+
+@pytest.mark.unit
+class TestL1OnlySWRBoundedConcurrency:
+    """Background refresh concurrency is capped (32 per wrapped function).
+
+    Per-key suppression alone would spawn one task per distinct stale key. At
+    capacity the refresh is skipped (stale keeps being served) and the per-key
+    marker is released so a later hit retries.
+    """
+
+    async def test_async_refreshes_capped_at_32_distinct_stale_keys(self):
+        n_keys = 40
+        refresh_calls = 0
+
+        @cache(ttl=2, backend=None, l1=L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.2))
+        async def fn(i: int):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return i
+
+        for i in range(n_keys):  # seed
+            assert await fn(i) == i
+        assert refresh_calls == n_keys
+
+        await asyncio.sleep(1.0)  # everything stale, nothing hard-expired
+
+        # The wrapper's hit path has no await points, so all 40 stale hits
+        # reserve slots before any refresh task gets to run: exactly 32 slots
+        # grant, 8 are rejected (marker released for a later retry).
+        for i in range(n_keys):
+            assert await fn(i) == i  # stale value served either way
+
+        deadline = time.monotonic() + 3.0
+        while refresh_calls < n_keys + 32 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.1)  # settle: catch any over-cap stragglers
+        assert refresh_calls == n_keys + 32, f"expected exactly 32 refreshes, got {refresh_calls - n_keys}"
 
 
 @pytest.mark.unit
