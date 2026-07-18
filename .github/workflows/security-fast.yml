@@ -32,6 +32,9 @@ jobs:
     - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+        # quick-xml DoS advisories: dev-only via pprof->inferno, no upgrade path.
+        # Keep in sync with deny.toml [advisories].ignore.
+        ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
   cargo-deny:
     name: License & Supply Chain
