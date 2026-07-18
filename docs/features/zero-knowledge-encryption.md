@@ -171,10 +171,11 @@ an attacker with backend write access is indistinguishable from a legacy one —
 fail-closed read path exists to prevent. If you need to read plaintext entries, use a
 handler with `encryption=False` (which never had keys to protect).
 
-For large caches, prefer an eager flush when flipping encryption on — otherwise every
-legacy entry pays one recompute on first read (a self-inflicted cold-start stampede).
-Scope the eviction to cachekit's keys so unrelated data in the same Redis database
-survives:
+For large caches, choose between lazy migration and eager eviction based on your
+workload: lazy migration spreads recomputation over reads (each legacy entry pays one
+recompute on first access), while an eager flush concentrates it into a cold-start miss
+wave — throttle or batch the eviction if the recompute cost is high. Either way, scope
+eviction to cachekit's keys so unrelated data in the same Redis database survives:
 
 ```bash
 # Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
