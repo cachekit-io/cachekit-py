@@ -247,6 +247,82 @@ class TestDeserializeDataMissingTenantId:
             reset_settings()
 
 
+class TestEncryptionDowngradeFailClosed:
+    """LAB-241 / CWE-757: an encryption-enabled handler must never trust the plaintext
+    frame header's `encrypted` flag to route onto the unauthenticated plaintext path.
+
+    The CK frame header is NOT covered by the AES-GCM tag (AAD binds tenant/cache_key/
+    format/compressed only), so a backend-write attacker can forge `encrypted: false`
+    plus arbitrary plaintext msgpack. Fail closed: raise SerializationError, which
+    callers already treat as a miss (evict + recompute + re-store encrypted).
+    """
+
+    @pytest.fixture
+    def enc_handler(self, monkeypatch):
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        yield CacheSerializationHandler(
+            serializer_name="default",
+            encryption=True,
+            single_tenant_mode=True,
+        )
+        reset_settings()
+
+    def test_forged_plaintext_header_rejected_and_base_serializer_unreachable(self, enc_handler):
+        """Attacker-forged `encrypted: false` frame MUST raise; plaintext branch unreachable.
+
+        Builds the exact frame a backend-write attacker would plant: valid CK envelope,
+        header claiming plaintext msgpack, attacker-controlled payload.
+        """
+        serialized_payload, payload_meta = StandardSerializer().serialize({"attacker": "controlled"})
+        forged_metadata = payload_meta.to_dict()
+        # Explicit `encrypted: false` in the header — the attacker controls this field.
+        # (The key-absent variant is covered by the legacy-entry test below.)
+        forged_metadata["encrypted"] = False
+        blob = SerializationWrapper.wrap(serialized_payload, forged_metadata, "default")
+
+        class UnreachableSerializer:
+            """Fails the test if the plaintext deserialize branch is ever taken."""
+
+            def deserialize(self, data, metadata=None):
+                pytest.fail("plaintext base serializer was invoked on an encryption-enabled handler")
+
+        enc_handler._base_serializer = UnreachableSerializer()
+
+        with pytest.raises(SerializationError, match="fail closed"):
+            enc_handler.deserialize_data(blob, cache_key="victim:key")
+
+    def test_legacy_plaintext_entry_raises_after_enabling_encryption(self, enc_handler):
+        """Migration story: entries written before encryption was enabled are rejected.
+
+        Callers treat the SerializationError as a miss (evict + recompute + re-store
+        encrypted) — lazy self-healing, never silent acceptance of plaintext. There is
+        deliberately NO opt-in flag to accept plaintext: a forged frame is
+        indistinguishable from a legacy one.
+        """
+        plain_handler = CacheSerializationHandler(serializer_name="default", encryption=False)
+        legacy_blob = plain_handler.serialize_data({"user": "alice"}, cache_key="user:alice")
+
+        with pytest.raises(SerializationError, match="fail closed"):
+            enc_handler.deserialize_data(legacy_blob, cache_key="user:alice")
+
+    def test_plaintext_handler_roundtrip_unaffected(self, monkeypatch):
+        """Regression guard: encryption=False handlers still read plaintext normally."""
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        from cachekit.config.singleton import reset_settings
+
+        reset_settings()
+        try:
+            handler = CacheSerializationHandler(serializer_name="default", encryption=False)
+            data = {"plain": True, "n": 7}
+            blob = handler.serialize_data(data, cache_key="plain:key")
+            assert handler.deserialize_data(blob, cache_key="plain:key") == data
+        finally:
+            reset_settings()
+
+
 class TestEncryptedRoundTrip:
     """Cover serialize_data/deserialize_data success paths with encryption enabled."""
 

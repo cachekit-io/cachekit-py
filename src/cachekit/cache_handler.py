@@ -685,7 +685,11 @@ class CacheSerializationHandler:
 
         Raises:
             ValueError: If cache_key is empty when data is encrypted
-            SerializationError: If deserialization fails (including AAD mismatch)
+            SerializationError: If deserialization fails (including AAD mismatch), or if
+                this handler has encryption enabled and the entry's header claims
+                plaintext — the header is unauthenticated, so an encryption-enabled
+                handler never routes to the plaintext deserializer (fail closed,
+                CWE-757 downgrade protection). Callers treat this as a cache miss.
 
         Examples:
             Basic round-trip (serialize then deserialize):
@@ -740,9 +744,28 @@ class CacheSerializationHandler:
                     f"for gradual migrations: @cache(namespace='v2-{self._serializer_string_name}')"
                 )
 
-            # Determine serializer based on whether data is encrypted
-            # Check metadata.encrypted flag (not just self.encryption) to handle
-            # cases where handler config changed but old encrypted data exists
+            # SECURITY (LAB-241 / CWE-757): the CK frame header is plaintext and NOT
+            # covered by the AES-GCM tag (AAD v0x03 binds tenant/cache_key/format/
+            # compressed — not the header itself). A backend-write attacker can plant
+            # a frame claiming `encrypted: false` with an arbitrary plaintext payload;
+            # an encryption-enabled reader must never let that header downgrade it to
+            # the unauthenticated plaintext path. Fail closed — callers treat
+            # SerializationError as a miss and evict, so legacy plaintext entries
+            # written before encryption was enabled are recomputed and re-stored
+            # encrypted rather than silently accepted (see docs/serializers/encryption.md).
+            if self.encryption and not metadata.encrypted:
+                raise SerializationError(
+                    "Encryption is enabled but the cache entry's header claims plaintext. "
+                    "Refusing the unauthenticated plaintext read path (fail closed): the "
+                    "header is not covered by the AES-GCM tag and may be forged. If this "
+                    "entry predates enabling encryption, it will be recomputed and "
+                    "re-stored encrypted; flush the cache to migrate eagerly."
+                )
+
+            # Determine serializer based on whether data is encrypted.
+            # metadata.encrypted may still be True while self.encryption is False
+            # (handler config changed but old encrypted data exists) — decrypting
+            # is safe in that direction because it stays on the authenticated path.
             if metadata.encrypted:
                 # Data is encrypted - use cached EncryptionWrapper for decryption
                 # CRITICAL-03 FIX: Use cached instance instead of creating new one
