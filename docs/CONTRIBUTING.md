@@ -62,7 +62,7 @@ These functions are provided for documentation examples and return mock data:
 #### Configuration
 - `secret_key` - Test encryption key (value: `"a" * 64`). `@cache.secure` examples must
   pass it explicitly (`master_key=secret_key`); the conftest does **not** set
-  `CACHEKIT_MASTER_KEY` in the environment, because an ambient key turns encryption on
+  `CACHEKIT_MASTER_KEY` in the environment because an ambient key turns encryption on
   globally and breaks plain `@cache` fences that use `serializer="auto"` or custom
   serializers.
 
