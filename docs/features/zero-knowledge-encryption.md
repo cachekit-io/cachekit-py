@@ -153,6 +153,38 @@ export CACHEKIT_MASTER_KEY=new_key
 # Restart app → re-populates cache with new key
 ```
 
+### Enabling Encryption on an Existing (Plaintext) Cache
+
+When you turn encryption on over a cache that already holds plaintext entries, those
+entries are **rejected, never read**. The read path fails closed: the entry raises a
+`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
+and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+
+```text
+read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+```
+
+There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
+plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
+an attacker with backend write access is indistinguishable from a legacy one — any
+"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
+fail-closed read path exists to prevent. If you need to read plaintext entries, use a
+handler with `encryption=False` (which never had keys to protect).
+
+For large caches, choose between lazy migration and eager eviction based on your
+workload: lazy migration spreads recomputation over reads (each legacy entry pays one
+recompute on first access), while an eager flush concentrates it into a cold-start miss
+wave — throttle or batch the eviction if the recompute cost is high. Either way, scope
+eviction to cachekit's keys so unrelated data in the same Redis database survives:
+
+```bash
+# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
+redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+
+# FLUSHDB is only safe when the database is dedicated to cachekit
+# then deploy with CACHEKIT_MASTER_KEY set
+```
+
 ### L1 Cache Conflict
 ```python notest
 @cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption + L1 cache (stores encrypted bytes)
@@ -305,6 +337,49 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
         └─ Increments per encryption
            Prevents nonce reuse even across reboots
 ```
+
+### Fail-Closed Read Path (Encryption Downgrade Protection)
+
+The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
+and the serializer name — is plaintext and is **not** covered by the AES-GCM
+authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
+into the tag, but the header itself stays outside that boundary so a reader can parse
+it before it has a key.
+
+An attacker with backend write access (the threat actor in the protocol's threat
+model) could exploit that gap by planting a frame whose header claims
+`encrypted: false` plus an arbitrary plaintext payload — a classic encryption
+downgrade (CWE-757). cachekit therefore never lets header metadata select the read
+path when encryption is configured:
+
+```text
+Handler configured with encryption:
+  entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
+  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+```
+
+The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
+of what the stored frame claims. Configuration decides the read path; stored (i.e.
+attacker-writable) data never does.
+
+### Cleartext Frame Header Fields (Accepted Exposure)
+
+Encrypted entries expose three fields in the plaintext header: `tenant_id`,
+`encryption_algorithm`, and `key_fingerprint`. This exposure is deliberate and
+accepted:
+
+- **`tenant_id`** — required *before* decryption to derive the per-tenant key
+  (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
+  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
+  binds it into the GCM tag, so a modified header fails authentication.
+- **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
+  clearer diagnostics during key rotation. It reveals nothing about key material.
+- **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
+  algorithm adds no security (Kerckhoffs's principle).
+
+Relocating these fields would be a cross-SDK wire-format change owned by the
+[protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
+exposure rather than diverging from the shared frame format.
 
 ---
 
