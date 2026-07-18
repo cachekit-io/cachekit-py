@@ -25,7 +25,6 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
-from ..serializers.base import SerializationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -488,6 +487,19 @@ def create_cache_wrapper(
         collect_stats=use_collect_stats,
         enable_structured_logging=use_enable_structured_logging,
     )
+
+    # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
+    # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    def _on_l2_deserialize_error(error: Exception, key: str) -> None:
+        features.handle_cache_error(
+            error=error,
+            operation="cache_get_deserialize",
+            cache_key=key,
+            namespace=namespace or "default",
+            duration_ms=0.0,
+        )
+
+    operation_handler.on_deserialize_error = _on_l2_deserialize_error
 
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
@@ -1153,12 +1165,13 @@ def create_cache_wrapper(
                 correlation_id = features.create_correlation_id()
 
             try:
-                # Attempt to retrieve from Redis
-                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
+                # Route through get_cached_value_async so corrupt/tampered entries inherit
+                # eviction + the cache_get_deserialize metric instead of persisting (#159)
+                cached_result = await operation_handler.get_cached_value_async(cache_key)
 
-                if cached_data is not None:
-                    # Deserialize the cached data
-                    result = operation_handler.serialization_handler.deserialize_data(cached_data, cache_key=cache_key)
+                if cached_result is not None:
+                    # Cache hit: (True, value, raw serialized envelope for L1 backfill)
+                    _found, result, cached_data = cached_result
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1199,19 +1212,6 @@ def create_cache_wrapper(
 
                     return result
 
-            except SerializationError as e:
-                # Decrypt/integrity failure on L2 data — warn explicitly (fail-open: recompute)
-                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
-                get_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_get_deserialize",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=get_duration_ms,
-                    correlation_id=correlation_id,
-                )
-
             except Exception as e:
                 # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1244,14 +1244,13 @@ def create_cache_wrapper(
                     ) as lock_acquired:
                         if lock_acquired:
                             # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited
+                            # Another request may have populated it while we waited.
+                            # Routed through get_cached_value_async: corrupt entries evict (#159).
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1262,8 +1261,6 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
@@ -1272,12 +1269,11 @@ def create_cache_wrapper(
                             # Another request may have populated it while we waited
                             logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                # Routed through get_cached_value_async: corrupt entries evict (#159)
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1288,8 +1284,6 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
