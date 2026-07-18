@@ -382,6 +382,7 @@ def create_cache_wrapper(
 
         # L1 cache settings
         l1_enabled = config.l1.enabled
+        l1_max_size_mb = config.l1.max_size_mb
 
         # Circuit breaker settings
         circuit_breaker = config.circuit_breaker.enabled
@@ -409,6 +410,7 @@ def create_cache_wrapper(
         custom_key_func = config.key
     else:
         custom_key_func = None
+        l1_max_size_mb = None
 
     # Re-scope custom_key_func for closure
     if "custom_key_func" not in dir():
@@ -484,8 +486,10 @@ def create_cache_wrapper(
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
 
-    # FIX: Initialize L1 cache if enabled
-    _l1_cache = get_l1_cache(namespace or "default") if l1_enabled else None
+    # Initialize L1 cache if enabled. The per-decorator budget (config.l1.max_size_mb)
+    # applies only when this namespace's cache is first created — namespaces share one
+    # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
+    _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
 
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.

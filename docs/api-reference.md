@@ -611,9 +611,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 **Key Fields:**
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
-- **`enable_compression`** (`bool`, default: `True`) - Enable LZ4 compression (env: `CACHEKIT_ENABLE_COMPRESSION`)
-- **`compression_level`** (`int`, default: `6`) - Zlib compression level 1–9 (env: `CACHEKIT_COMPRESSION_LEVEL`)
-- **`max_chunk_size_mb`** (`int`, default: `50`) - Maximum cache chunk size in MB (env: `CACHEKIT_MAX_CHUNK_SIZE_MB`)
+- **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
 - **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)

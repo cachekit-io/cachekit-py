@@ -62,12 +62,12 @@ class TestRedisBackendConfigEnv:
         """Test that CachekitConfig loads generic cache settings."""
         monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
         monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "5")
-        monkeypatch.setenv("CACHEKIT_MAX_CHUNK_SIZE_MB", "100")
+        monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "256")
 
         config = CachekitConfig.from_env()
         assert config.default_ttl == 7200
         assert config.max_retries == 5
-        assert config.max_chunk_size_mb == 100
+        assert config.l1_max_size_mb == 256
 
     def test_backend_and_cache_configs_independent(self, monkeypatch):
         """Test that backend and cache configs are loaded independently."""
@@ -77,7 +77,7 @@ class TestRedisBackendConfigEnv:
 
         # Set cache-specific env vars
         monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "1800")
-        monkeypatch.setenv("CACHEKIT_ENABLE_COMPRESSION", "false")
+        monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "64")
 
         redis_config = RedisBackendConfig.from_env()
         cache_config = CachekitConfig.from_env()
@@ -88,7 +88,7 @@ class TestRedisBackendConfigEnv:
 
         # Verify cache config loaded correctly
         assert cache_config.default_ttl == 1800
-        assert cache_config.enable_compression is False
+        assert cache_config.l1_max_size_mb == 64
 
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
