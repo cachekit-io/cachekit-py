@@ -752,14 +752,16 @@ class CacheSerializationHandler:
             # the unauthenticated plaintext path. Fail closed — callers treat
             # SerializationError as a miss and evict, so legacy plaintext entries
             # written before encryption was enabled are recomputed and re-stored
-            # encrypted rather than silently accepted (see docs/serializers/encryption.md).
+            # encrypted rather than silently accepted
+            # (see docs/features/zero-knowledge-encryption.md, "Fail-Closed Read Path").
             if self.encryption and not metadata.encrypted:
                 raise SerializationError(
                     "Encryption is enabled but the cache entry's header claims plaintext. "
                     "Refusing the unauthenticated plaintext read path (fail closed): the "
                     "header is not covered by the AES-GCM tag and may be forged. If this "
                     "entry predates enabling encryption, it will be recomputed and "
-                    "re-stored encrypted; flush the cache to migrate eagerly."
+                    "re-stored encrypted on the next access; see "
+                    "docs/features/zero-knowledge-encryption.md for eager-migration guidance."
                 )
 
             # Determine serializer based on whether data is encrypted.
