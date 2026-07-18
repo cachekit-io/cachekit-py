@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
@@ -662,8 +663,12 @@ class CacheSerializationHandler:
         # returned) — a cache must never break the wrapped function.
         max_value_size = get_settings().max_value_size
         if len(wrapped) > max_value_size:
+            # Redact the raw cache key: it can carry caller-supplied tenant/user identifiers, and
+            # this message reaches the fallback warning log path (issue #163 review). A fixed-length
+            # blake2b digest keeps the message correlatable without leaking the key.
+            key_digest = hashlib.blake2b(str(cache_key).encode("utf-8"), digest_size=8).hexdigest()
             raise ValueError(
-                f"Serialized value for key '{cache_key}' is {len(wrapped)} bytes, exceeding "
+                f"Serialized value for key <redacted:{key_digest}> is {len(wrapped)} bytes, exceeding "
                 f"max_value_size ({max_value_size} bytes); refusing to cache. Increase "
                 f"CACHEKIT_MAX_VALUE_SIZE to cache larger values."
             )

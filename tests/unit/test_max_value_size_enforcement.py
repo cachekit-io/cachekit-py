@@ -41,6 +41,15 @@ def small_limit(monkeypatch):
     reset_settings()
 
 
+@pytest.fixture
+def default_limit(monkeypatch):
+    """Ensure the 100MB default applies regardless of process env / singleton state."""
+    monkeypatch.delenv("CACHEKIT_MAX_VALUE_SIZE", raising=False)
+    reset_settings()
+    yield
+    reset_settings()
+
+
 @pytest.mark.unit
 class TestMaxValueSizeEnforcement:
     def test_oversized_value_raises(self, small_limit):
@@ -80,7 +89,7 @@ class TestMaxValueSizeEnforcement:
         assert result is None
         assert backend.set_calls == []
 
-    def test_default_limit_allows_typical_values(self):
+    def test_default_limit_allows_typical_values(self, default_limit):
         """With the 100MB default, ordinary payloads are unaffected."""
         handler = CacheSerializationHandler()
         assert isinstance(handler.serialize_data(list(range(1000)), cache_key="typical:key"), bytes)
