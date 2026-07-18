@@ -141,11 +141,16 @@ class ObjectCache:
         self._misses = 0
         self._current_size_bytes = 0
 
-        # SWR state: keys with an in-flight background refresh, plus a monotonic
-        # generation counter stamped onto every stored entry. A refresh captures
-        # the entry's generation at read time and only lands if that exact entry
-        # is still live — removal leaves no per-key residue (no tombstones).
-        self._refreshing: set[str] = set()
+        # SWR state: in-flight refresh ownership (key -> owning generation) plus
+        # a monotonic generation counter stamped onto every stored entry. A
+        # refresh captures the entry's generation at read time and only lands —
+        # or clears/cancels its marker — for that exact generation, so a stale
+        # refresh from a replaced entry can neither resurrect data nor release
+        # a newer refresh's marker (which would allow duplicate concurrent
+        # refreshes racing last-write-wins). Invariant: a present marker always
+        # equals the live entry's generation, because every entry change funnels
+        # through _remove(), which pops it. Removal leaves no per-key residue.
+        self._refreshing: dict[str, int] = {}
         self._generation = 0
 
     # ------------------------------------------------------------------
@@ -222,7 +227,7 @@ class ObjectCache:
             # ±10% jitter staggers refreshes when many keys cross the threshold together
             jitter = random.uniform(0.9, 1.1)  # noqa: S311 - not cryptographic
             if (now - entry.cached_at) > ttl * self._swr_threshold_ratio * jitter and key not in self._refreshing:
-                self._refreshing.add(key)
+                self._refreshing[key] = entry.generation
                 needs_refresh = True
 
             return True, entry.value, needs_refresh, version
@@ -252,8 +257,11 @@ class ObjectCache:
 
         size = _estimate_object_size(value) if self._max_size_bytes is not None else 0
         with self._lock:
-            # Clear in-flight marker regardless of outcome so future refreshes can run
-            self._refreshing.discard(key)
+            # Clear the in-flight marker only if this refresh still owns it — a
+            # stale refresh must not release a newer refresh's marker (that
+            # would let a third reader schedule a duplicate concurrent refresh)
+            if self._refreshing.get(key) == version:
+                del self._refreshing[key]
 
             entry = self._store.get(key)
             if entry is None:
@@ -281,14 +289,20 @@ class ObjectCache:
             self._evict(extra_bytes=0, need_slot=False)
             return True
 
-    def cancel_refresh(self, key: str) -> None:
+    def cancel_refresh(self, key: str, version: int) -> None:
         """Cancel a background refresh so a later call can retry it.
+
+        Only the refresh that owns the in-flight marker (same generation) may
+        release it — a stale refresh cancelling after the entry was replaced
+        must not release a newer refresh's marker.
 
         Args:
             key: Cache key whose refresh failed or was abandoned.
+            version: Version token returned by ``get_with_swr``.
         """
         with self._lock:
-            self._refreshing.discard(key)
+            if self._refreshing.get(key) == version:
+                del self._refreshing[key]
 
     def put(self, key: str, value: Any, ttl: int) -> None:
         """Store a value in the cache.
@@ -421,7 +435,7 @@ class ObjectCache:
         if entry is None:
             return
         self._current_size_bytes -= entry.size_bytes
-        self._refreshing.discard(key)
+        self._refreshing.pop(key, None)
 
     def _evict(self, extra_bytes: int, need_slot: bool) -> None:
         """Evict entries until both bounds accommodate the pending write.

@@ -473,13 +473,63 @@ class TestObjectCacheSWR:
         oc.put("k", "v1", ttl=10)
 
         fake.monotonic = lambda: 1006.0
-        _, _, needs_refresh, _ = oc.get_with_swr("k", ttl=10)
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=10)
         assert needs_refresh
 
-        oc.cancel_refresh("k")
+        oc.cancel_refresh("k", version)
 
         _, _, needs_refresh_retry, _ = oc.get_with_swr("k", ttl=10)
         assert needs_refresh_retry is True
+
+    def test_stale_refresh_cannot_clear_newer_refresh_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An old refresh finishing after a replacement's refresh started must not
+        release the newer refresh's marker (that would allow duplicate concurrent
+        refreshes racing last-write-wins) nor overwrite its result.
+        """
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh_a, version_a = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_a  # refresh A in flight
+
+        oc.put("k", "v2", ttl=10)  # replacement clears A's marker, new generation
+
+        fake.monotonic = lambda: 1012.0  # replacement entry (cached at 1006) stale again
+        _, _, needs_refresh_b, version_b = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_b  # refresh B in flight
+        assert version_b != version_a
+
+        # A finishes late: must neither land nor release B's marker
+        assert oc.complete_refresh("k", version_a, "vA-stale", ttl=10) is False
+        _, _, needs_refresh_dup, _ = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_dup is False, "stale refresh released the in-flight marker"
+
+        # B still owns the cycle and lands normally
+        assert oc.complete_refresh("k", version_b, "vB-new", ttl=10) is True
+        assert oc.get("k") == (True, "vB-new")
+
+    def test_stale_cancel_cannot_clear_newer_refresh_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed old refresh cancelling late must not release a newer refresh's marker."""
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5)
+        oc.put("k", "v1", ttl=10)
+
+        fake.monotonic = lambda: 1006.0
+        _, _, needs_refresh_a, version_a = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_a
+
+        oc.put("k", "v2", ttl=10)
+
+        fake.monotonic = lambda: 1012.0
+        _, _, needs_refresh_b, _ = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_b
+
+        oc.cancel_refresh("k", version_a)  # A failed and cancels late
+
+        _, _, needs_refresh_dup, _ = oc.get_with_swr("k", ttl=10)
+        assert needs_refresh_dup is False, "stale cancel released the in-flight marker"
 
     def test_oversized_refresh_result_drops_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If the refreshed value no longer fits the byte budget, the stale entry

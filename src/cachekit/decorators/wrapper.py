@@ -548,26 +548,28 @@ def create_cache_wrapper(
     # and a later qualifying hit retries.
     _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
 
-    def _l1_swr_acquire(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> tuple[Any, Any] | None:
+    def _l1_swr_acquire(
+        cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> tuple[Any, Any] | None:
         """Reserve a refresh slot and snapshot the live arguments.
 
         The cache key was computed from the arguments as they were at call
         time; the refresh runs later, so it must not see mutations the caller
         makes after receiving the stale value (it would store the new state
         under the old key). Returns deep-copied (args, kwargs), or None when at
-        capacity or the arguments can't be copied — in both cases the refresh
-        marker is released so a later call retries, and the caller must not
-        schedule a refresh.
+        capacity or the arguments can't be copied — in both cases this exact
+        refresh (version) is cancelled so a later call retries, and the caller
+        must not schedule a refresh.
         """
         assert _object_cache is not None  # noqa: S101 - only called when scheduling a refresh
         if not _l1_swr_slots.acquire(blocking=False):
-            _object_cache.cancel_refresh(cache_key)
+            _object_cache.cancel_refresh(cache_key, version)
             return None
         try:
             return copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
             _l1_swr_slots.release()
-            _object_cache.cancel_refresh(cache_key)
+            _object_cache.cancel_refresh(cache_key, version)
             _logger.debug("L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", cache_key, exc)
             return None
 
@@ -587,7 +589,7 @@ def create_cache_wrapper(
             try:
                 result = await func(*call_args, **call_kwargs)
             except BaseException:
-                _object_cache.cancel_refresh(cache_key)  # let a later call retry
+                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
                 raise  # logged (at debug) by _l1_swr_task_done
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -603,7 +605,7 @@ def create_cache_wrapper(
             try:
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
-                _object_cache.cancel_refresh(cache_key)  # let a later call retry
+                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
                 _logger.debug("L1-only SWR background refresh failed for %s: %s", cache_key, exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
@@ -701,7 +703,7 @@ def create_cache_wrapper(
                 if needs_refresh:
                     # SWR: serve the stale value now, refresh on a daemon thread
                     # (sync functions have no event loop to schedule a task on)
-                    snapshot = _l1_swr_acquire(cache_key, args, kwargs)
+                    snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
                     if snapshot is not None:
                         refresh_args, refresh_kwargs = snapshot
                         try:
@@ -713,9 +715,9 @@ def create_cache_wrapper(
                             ).start()
                         except RuntimeError:
                             # Thread couldn't start (resource pressure) — release
-                            # the slot and marker so a later call retries
+                            # the slot and this exact refresh so a later call retries
                             _l1_swr_slots.release()
-                            _object_cache.cancel_refresh(cache_key)
+                            _object_cache.cancel_refresh(cache_key, version)
                 features.clear_correlation_id()
                 reset_current_function_stats(token)
                 return cached_value
@@ -1052,7 +1054,7 @@ def create_cache_wrapper(
                     if needs_refresh:
                         # SWR: serve the stale value now, refresh in the background
                         # without blocking the caller
-                        snapshot = _l1_swr_acquire(cache_key, args, kwargs)
+                        snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
                         if snapshot is not None:
                             refresh_args, refresh_kwargs = snapshot
                             refresh_task = asyncio.create_task(
