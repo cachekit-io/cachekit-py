@@ -27,6 +27,10 @@ class TestL2DecryptFailureWarning:
         """Build a CacheOperationHandler whose serialization_handler.deserialize_data raises."""
         mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
         mock_serialization.deserialize_data.side_effect = deserialize_side_effect
+        # Instance attr set in __init__, invisible to spec= — and it must be a real
+        # bool: a bare MagicMock here is truthy, which would silently flip the read
+        # path to fail-closed (cachekit-py#170).
+        mock_serialization.encryption_fail_closed = False
 
         handler = CacheOperationHandler(mock_serialization, CacheKeyGenerator())
 
@@ -101,6 +105,7 @@ class TestL2DecryptFailureWarning:
         """Async corruption path evicts the poisoned entry via delete_async (#159)."""
         mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
         mock_serialization.deserialize_data.side_effect = SerializationError("integrity check failed")
+        mock_serialization.encryption_fail_closed = False  # real bool: MagicMock is truthy
         handler = CacheOperationHandler(mock_serialization, CacheKeyGenerator())
         mock_ch = mock.MagicMock()
         mock_ch.get_async = mock.AsyncMock(return_value=b"corrupted-bytes")
@@ -116,6 +121,7 @@ class TestL2DecryptFailureWarning:
         """Async eviction failure must not propagate; still a miss."""
         mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
         mock_serialization.deserialize_data.side_effect = SerializationError("corrupt")
+        mock_serialization.encryption_fail_closed = False  # real bool: MagicMock is truthy
         handler = CacheOperationHandler(mock_serialization, CacheKeyGenerator())
         mock_ch = mock.MagicMock()
         mock_ch.get_async = mock.AsyncMock(return_value=b"corrupted-bytes")

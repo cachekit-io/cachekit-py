@@ -1,16 +1,19 @@
 """Security hardening for the decrypt fail path (cachekit-py#170 / LAB-108).
 
 Covers:
-- Exception taxonomy: AES-GCM auth failure raises DecryptionAuthenticationError
-  (tamper-class), post-decrypt failures stay plain EncryptionError (corruption-class).
+- Exception taxonomy: AES-GCM auth failure and tenant mismatch raise
+  DecryptionAuthenticationError (tamper-class); envelope inconsistencies raise
+  SuspiciousCacheEntryError; post-decrypt failures stay plain EncryptionError.
 - Key-fingerprint mismatch: warn-and-attempt by default, hard raise with fail_closed.
-- record_decrypt_failure: metric classification and never-break-the-read-path.
+- handle_decrypt_failure: classification, metric, fail policy, never-break-the-read-path.
 - CacheSerializationHandler fail-closed resolution (explicit > env > default False).
 - CacheOperationHandler.get_cached_value fail policy (evict+miss vs raise+retain).
-- Config-drift reads (encryption-disabled handler reading encrypted entry) log a warning.
-- Decorator-level fail-closed: ciphertext substitution raises instead of recomputing.
-- Regressions that must NOT change: tenant-mismatch fail-closed, nonce uniqueness,
-  HKDF per-tenant isolation and determinism.
+- Config-drift reads: warn once per key + counter, decryption still succeeds.
+- Decorator-level fail-closed: ciphertext substitution raises instead of recomputing,
+  and a poisoned L1 entry is invalidated before the raise.
+- Regressions that must NOT change: nonce uniqueness, HKDF per-tenant isolation and
+  determinism, and the CWE-757 downgrade guard staying miss+evict under fail-closed
+  (lazy migration, LAB-241).
 """
 
 from __future__ import annotations
@@ -23,10 +26,10 @@ import pytest
 from cachekit.cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
-    record_decrypt_failure,
+    handle_decrypt_failure,
 )
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
@@ -35,12 +38,6 @@ from cachekit.serializers.encryption_wrapper import (
 
 _HEX_KEY = "a" * 64
 _KEY_BYTES = b"\xaa" * 32
-
-
-@pytest.fixture(autouse=True)
-def setup_di_for_redis_isolation():
-    """Override root conftest's Redis isolation."""
-    yield
 
 
 class TestExceptionTaxonomy:
@@ -122,14 +119,17 @@ class TestFingerprintMismatch:
 
 
 class TestTenantMismatchRegression:
-    """Tenant mismatch was already fail-closed; the hardening must not change it."""
+    """Tenant mismatch always raises at the wrapper, and is tamper-class
+    (auth_tamper telemetry + honored by fail-closed) per panel review — a
+    foreign-tenant entry at this cache key is a cross-tenant substitution
+    signature, not corruption."""
 
     @pytest.mark.parametrize("fail_closed", [False, True])
-    def test_tenant_mismatch_always_raises(self, fail_closed):
+    def test_tenant_mismatch_always_raises_as_tamper_class(self, fail_closed):
         writer = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="tenant-1")
         reader = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="tenant-2", fail_closed=fail_closed)
         enc, meta = writer.serialize({"v": 1}, cache_key="key:a")
-        with pytest.raises(EncryptionError, match="Tenant mismatch"):
+        with pytest.raises(DecryptionAuthenticationError, match="Tenant mismatch"):
             reader.deserialize(enc, meta, cache_key="key:a")
 
 
@@ -163,15 +163,30 @@ class TestNonceHkdfRegression:
         assert reader.deserialize(enc, meta, cache_key="key:a") == {"v": 42}
 
 
-class TestRecordDecryptFailureMetric:
-    """cachekit_decrypt_failures_total classification and resilience."""
+class TestHandleDecryptFailure:
+    """Single policy point: classification, metric, fail policy, resilience."""
 
     def test_classifies_auth_tamper(self):
-        assert record_decrypt_failure(DecryptionAuthenticationError("x"), tier="l2") == "auth_tamper"
+        err = DecryptionAuthenticationError("x")
+        assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "auth_tamper"
+
+    def test_classifies_suspicious_envelope(self):
+        err = SuspiciousCacheEntryError("x")
+        assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "suspicious_envelope"
 
     def test_classifies_corruption(self):
-        assert record_decrypt_failure(SerializationError("x"), tier="l2") == "corruption"
-        assert record_decrypt_failure(EncryptionError("x"), tier="l1") == "corruption"
+        assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=False) == "corruption"
+        assert handle_decrypt_failure(EncryptionError("x"), tier="l1", cache_key="k", fail_closed=False) == "corruption"
+
+    def test_fail_closed_raises_only_for_tamper_class(self):
+        with pytest.raises(DecryptionAuthenticationError):
+            handle_decrypt_failure(DecryptionAuthenticationError("x"), tier="l2", cache_key="k", fail_closed=True)
+        # suspicious_envelope and corruption stay fail-open even under fail_closed
+        assert (
+            handle_decrypt_failure(SuspiciousCacheEntryError("x"), tier="l2", cache_key="k", fail_closed=True)
+            == "suspicious_envelope"
+        )
+        assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=True) == "corruption"
 
     def test_records_counter_with_reason_and_tier_labels(self, monkeypatch):
         recorded: list[tuple[str, dict[str, Any]]] = []
@@ -183,8 +198,22 @@ class TestRecordDecryptFailureMetric:
         import cachekit.reliability.async_metrics as am
 
         monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
-        record_decrypt_failure(DecryptionAuthenticationError("x"), tier="l1")
+        handle_decrypt_failure(DecryptionAuthenticationError("x"), tier="l1", cache_key="k", fail_closed=False)
         assert recorded == [("cachekit_decrypt_failures_total", {"reason": "auth_tamper", "tier": "l1"})]
+
+    def test_metric_recorded_even_when_failing_closed(self, monkeypatch):
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        class _Collector:
+            def record_counter(self, name, labels=None, value=1.0):
+                recorded.append((name, labels or {}))
+
+        import cachekit.reliability.async_metrics as am
+
+        monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
+        with pytest.raises(DecryptionAuthenticationError):
+            handle_decrypt_failure(DecryptionAuthenticationError("x"), tier="l2", cache_key="k", fail_closed=True)
+        assert recorded == [("cachekit_decrypt_failures_total", {"reason": "auth_tamper", "tier": "l2"})]
 
     def test_metrics_failure_never_breaks_the_read_path(self, monkeypatch):
         class _ExplodingCollector:
@@ -194,7 +223,7 @@ class TestRecordDecryptFailureMetric:
         import cachekit.reliability.async_metrics as am
 
         monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _ExplodingCollector())
-        assert record_decrypt_failure(SerializationError("x"), tier="l2") == "corruption"
+        assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=False) == "corruption"
 
 
 class TestFailClosedResolution:
@@ -287,12 +316,12 @@ class TestGetCachedValueFailPolicy:
         assert strategy.deleted == []  # evidence retained
         assert "key:b" in strategy.store
 
-    def test_fail_closed_corruption_still_fails_open(self):
+    def test_fail_closed_downgrade_guard_still_fails_open(self):
         """Only tamper-class failures escalate. A plaintext entry under an
-        encryption-enabled handler trips the CWE-757 downgrade guard — a plain
-        SerializationError (corruption-class) — and must stay a miss+evict even
-        with fail_closed=True, or lazy plaintext→encrypted migration (LAB-241)
-        would break."""
+        encryption-enabled handler trips the CWE-757 downgrade guard —
+        SuspiciousCacheEntryError (suspicious_envelope, NOT auth_tamper) — and
+        must stay a miss+evict even with fail_closed=True, or lazy
+        plaintext→encrypted migration (LAB-241) would break."""
         handler, strategy, _ = _make_operation_handler(fail_closed=True)
         plaintext_writer = CacheSerializationHandler()  # no encryption
         strategy.store["key:c"] = plaintext_writer.serialize_data({"v": 1}, cache_key="key:c")
@@ -309,7 +338,7 @@ class TestGetCachedValueFailPolicy:
 class TestConfigDriftRead:
     """Encryption-disabled handler reading an encrypted entry warns loudly."""
 
-    def test_drift_read_logs_warning_and_decrypts(self, monkeypatch, caplog):
+    def test_drift_read_warns_once_per_key_and_decrypts(self, monkeypatch, caplog):
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _HEX_KEY)
         from cachekit.config.singleton import reset_settings
 
@@ -322,7 +351,9 @@ class TestConfigDriftRead:
             assert reader.encryption is False
             with caplog.at_level(logging.WARNING):
                 assert reader.deserialize_data(entry, cache_key="key:a") == {"v": 1}
-            assert any("Config-drift read" in r.message for r in caplog.records)
+                assert reader.deserialize_data(entry, cache_key="key:a") == {"v": 1}  # second read
+            drift_warnings = [r for r in caplog.records if "Config-drift read" in r.message]
+            assert len(drift_warnings) == 1  # warn once per key, not per read (log-flood guard)
         finally:
             reset_settings()
 
@@ -405,3 +436,40 @@ class TestDecoratorFailClosed:
         self._poison_by_substitution(backend)
         assert get_value(1) == {"result": 1}  # fail open: recompute, correct value
         assert calls.count(1) == 2  # recomputed exactly once after poisoning
+
+    def test_fail_closed_invalidates_poisoned_l1_before_raising(self):
+        """A fail-closed raise from the L1 path must evict the poisoned L1 entry
+        first — otherwise stale process-local L1 keeps raising after the operator
+        remediates the durable L2 copy (panel finding). L2 stays the evidence."""
+        from cachekit import cache
+        from cachekit.l1_cache import get_l1_cache
+
+        backend = _DictBackend()
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            fail_closed=True,
+            namespace="lab108-l1",
+        )
+        def get_value(x: int) -> dict:
+            return {"result": x}
+
+        assert get_value(1) == {"result": 1}
+        assert get_value(2) == {"result": 2}
+        k1, k2 = sorted(backend.store)
+
+        # Plant ciphertext-substituted bytes directly in process-local L1
+        l1 = get_l1_cache("lab108-l1")
+        l1.put(k1, backend.store[k2], redis_ttl=300)
+
+        with pytest.raises(DecryptionAuthenticationError):
+            # Whichever of the two args maps to k1 raises from the L1 hit path
+            get_value(1)
+            get_value(2)
+
+        found, _ = l1.get(k1)
+        assert not found  # poisoned L1 entry invalidated before the raise

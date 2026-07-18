@@ -304,3 +304,19 @@ class SerializationError(Exception):
     """
 
     pass
+
+
+class SuspiciousCacheEntryError(SerializationError):
+    """The unauthenticated envelope of a cache entry is inconsistent with the
+    handler's configuration in a way tampering would also produce.
+
+    Raised for the CWE-757 downgrade guard (an encryption-enabled handler read
+    an entry whose header claims plaintext) and for an encrypted entry missing
+    its tenant_id. Both have benign explanations (lazy plaintext→encrypted
+    migration, corrupt header), so callers keep treating this as a miss
+    (evict → recompute → re-store) even in fail-closed mode — but telemetry
+    counts it under its own ``suspicious_envelope`` reason label so a spike
+    outside a migration window is visible to operators.
+    """
+
+    pass

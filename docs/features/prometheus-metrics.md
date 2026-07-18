@@ -82,11 +82,19 @@ cache_operations_total{operation="get",namespace="users",success="True",serializ
 redis_cache_operations_total{operation="get",status="hit",serializer="default",namespace="users"}
 
 # Decrypt/integrity failures on the read path, split by failure class.
-# Labels: reason ("auth_tamper" = AES-GCM authentication failure or key-fingerprint
-#         mismatch — possible tampering or wrong key; "corruption" = checksum/format
-#         failure — storage rot or bugs), tier ("l1" or "l2").
+# Labels: reason — "auth_tamper" (AES-GCM auth failure, tenant mismatch, or
+#         key-fingerprint mismatch under fail-closed: possible tampering or wrong key),
+#         "suspicious_envelope" (unauthenticated envelope inconsistent with config:
+#         plaintext claim under encryption / missing tenant_id — benign during lazy
+#         migration, suspect otherwise), "corruption" (checksum/format failure —
+#         storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
+
+# Encryption-disabled handler decrypting a stale encrypted entry via the global
+# master key (config drift). Expected briefly after disabling encryption; a spike
+# otherwise means misconfiguration or a planted entry.
+cachekit_config_drift_reads_total{reason="encryption_disabled"}
 ```
 
 > Hits and misses are not separate series. Compute them from labels — the `success` label

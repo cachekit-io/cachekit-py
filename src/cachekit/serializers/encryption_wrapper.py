@@ -29,19 +29,15 @@ class EncryptionError(SerializationError):
 
 
 class DecryptionAuthenticationError(EncryptionError):
-    """AES-GCM authentication failure or key-fingerprint mismatch.
+    """Tamper-class decrypt failure: cryptographic authentication did not hold.
 
-    Raised when the ciphertext fails cryptographic authentication: the AES-GCM
-    tag did not verify (tampered ciphertext, wrong key, or AAD/cache_key
-    mismatch), or — in fail-closed mode — the stored key fingerprint does not
-    match the current key. This is the tamper-class failure, distinct from
-    plain :class:`EncryptionError` / :class:`SerializationError` which cover
-    corruption and format problems on otherwise-unauthenticated data.
-
-    Read paths use this distinction to emit the ``auth_tamper`` (vs
-    ``corruption``) reason label on the ``cachekit_decrypt_failures_total``
-    metric, and to fail closed (raise to the caller instead of silently
-    recomputing) when ``encryption.fail_closed`` is enabled.
+    Raised when the AES-GCM tag fails to verify (tampered ciphertext, wrong
+    key, or AAD/cache_key mismatch), when the entry's tenant does not match the
+    handler's tenant, or — in fail-closed mode — when the stored key fingerprint
+    does not match the current key. Distinct from plain :class:`EncryptionError`
+    / :class:`SerializationError`, which cover corruption and format problems.
+    Classification and the fail-open/fail-closed policy live in
+    ``cachekit.cache_handler.handle_decrypt_failure``.
     """
 
     pass
@@ -125,9 +121,11 @@ class EncryptionWrapper:
             tenant_id: Tenant identifier for key isolation
             fail_closed: Treat key-fingerprint mismatch as a hard authentication
                 failure (raise DecryptionAuthenticationError before attempting
-                decryption) instead of warn-and-attempt. Read paths also use this
-                flag to propagate tamper-class failures to the caller instead of
-                silently recomputing. Default False preserves fail-open behavior.
+                decryption) instead of warn-and-attempt. This flag gates ONLY the
+                fingerprint pre-check on this wrapper; the read-path policy of
+                raising vs recomputing lives on the handler
+                (CacheSerializationHandler.encryption_fail_closed), which passes
+                the same resolved value here. Default False = warn-and-attempt.
         """
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
@@ -300,13 +298,13 @@ class EncryptionWrapper:
                 ...
             DecryptionAuthenticationError: Decryption failed: ...
 
-            Tenant mismatch raises EncryptionError:
+            Tenant mismatch raises DecryptionAuthenticationError (tamper-class):
 
             >>> other_wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-2")
             >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")  # doctest: +IGNORE_EXCEPTION_DETAIL
             Traceback (most recent call last):
                 ...
-            EncryptionError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
+            DecryptionAuthenticationError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
         """
         # Handle unencrypted data (fallback case)
         # Check encrypted flag (orthogonal to format - encryption is a wrapper, not a format)
@@ -325,9 +323,12 @@ class EncryptionWrapper:
                 "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
             )
 
-        # Verify tenant match for security
+        # Verify tenant match for security. Tamper-class (DecryptionAuthenticationError):
+        # an entry claiming another tenant at this cache key is either cross-tenant
+        # substitution or config drift — it must count as auth_tamper telemetry and be
+        # honored by the fail-closed policy, not vanish into the corruption bucket.
         if metadata.tenant_id != self.tenant_id:
-            raise EncryptionError(
+            raise DecryptionAuthenticationError(
                 f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"
             )
 

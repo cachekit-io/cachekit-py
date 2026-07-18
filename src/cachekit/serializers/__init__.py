@@ -13,6 +13,7 @@ from .base import (
     SerializationFormat,
     SerializationMetadata,
     SerializerProtocol,
+    SuspiciousCacheEntryError,
 )
 from .encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
 from .standard_serializer import StandardSerializer
@@ -239,6 +240,7 @@ __all__ = [
     "SerializationFormat",
     "SerializationMetadata",
     "SerializerProtocol",
+    "SuspiciousCacheEntryError",
     # Factory
     "get_serializer",
     "SERIALIZER_REGISTRY",
