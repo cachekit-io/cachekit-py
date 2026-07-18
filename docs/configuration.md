@@ -237,6 +237,38 @@ def my_function():
 - **Expiry**: Hard deadline when entry is deleted from cache
 - **Namespace**: Logical grouping for bulk invalidation (see [L1 Invalidation Guide](features/l1-invalidation.md))
 
+### L1-Only Mode (`backend=None`)
+
+With `backend=None` the decorator caches raw Python objects in process memory (no
+serialization — tuples, sets, and frozensets keep their types). `L1CacheConfig` is
+honored as follows:
+
+- **`max_size_mb`** bounds the cache by *estimated bytes*, not entry count. Sizes of
+  raw objects are estimated best-effort (builtin containers are walked recursively;
+  other objects are counted via `sys.getsizeof`). A single value larger than the whole
+  budget is returned to the caller but never cached.
+- **SWR requires a `ttl`.** With `swr_enabled=True` and a `ttl` set, a cache hit past
+  `ttl * swr_threshold_ratio` (±10% jitter) serves the cached value immediately and
+  refreshes it in the background — via `asyncio.create_task` for `async def` functions,
+  or a daemon thread for sync functions. A successful refresh restarts both the
+  freshness clock and the TTL. With `ttl=None` entries never go stale, so no refresh
+  is ever scheduled.
+- **Refresh failures are non-fatal**: the stale value keeps being served until hard
+  expiry, and the next qualifying hit retries the refresh.
+
+```python notest
+import asyncio
+from cachekit import cache
+from cachekit.config import L1CacheConfig
+
+@cache(ttl=60, backend=None, l1=L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5))
+async def load_dashboard():
+    return await fetch_expensive_data()  # illustrative - not defined
+
+# After 30s (50% of TTL), the next call returns the cached value instantly
+# and schedules a background refresh — callers never block on revalidation.
+```
+
 ### Intent Presets
 
 Use intent presets to configure L1 and other features for different use cases:

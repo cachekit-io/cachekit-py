@@ -489,7 +489,25 @@ def create_cache_wrapper(
 
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
-    _object_cache: ObjectCache | None = ObjectCache(max_entries=256) if _l1_only_mode else None
+    # L1CacheConfig is honored here (#207): max_size_mb bounds bytes (best-effort
+    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio
+    # drive background refresh via get_with_swr.
+    from ..config.nested import L1CacheConfig
+
+    _l1_config: L1CacheConfig = config.l1 if config is not None else L1CacheConfig()
+    _object_cache: ObjectCache | None = (
+        ObjectCache(
+            max_entries=None,
+            max_size_bytes=_l1_config.max_size_mb * 1024 * 1024,
+            swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+        )
+        if _l1_only_mode
+        else None
+    )
+
+    # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
+    # With ttl=None entries never go stale, so there is nothing to revalidate.
+    _l1_swr_active = _l1_only_mode and _l1_config.swr_enabled and ttl is not None and ttl > 0
 
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
@@ -509,6 +527,37 @@ def create_cache_wrapper(
     # Create stats tracker (session ID will be lazy-initialized on first use)
     # Pass l1_enabled for rate limit classification header
     _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+
+    # L1-only SWR: strong refs to in-flight refresh tasks. asyncio only keeps weak
+    # refs to tasks, so a fire-and-forget refresh could be GC'd mid-flight otherwise.
+    _l1_swr_tasks: set[asyncio.Task[None]] = set()
+
+    def _l1_swr_task_done(task: asyncio.Task[None], cache_key: str) -> None:
+        _l1_swr_tasks.discard(task)
+        _ttl_refresh_done_callback(task, cache_key)
+
+    async def _l1_swr_refresh_async(
+        cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> None:
+        """Background SWR refresh for async functions in L1-only mode."""
+        assert _object_cache is not None and ttl is not None  # noqa: S101 - _l1_swr_active guarantees both
+        try:
+            result = await func(*call_args, **call_kwargs)
+        except BaseException:
+            _object_cache.cancel_refresh(cache_key)  # let a later call retry
+            raise  # logged (at debug) by _l1_swr_task_done
+        _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
+
+    def _l1_swr_refresh_sync(cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+        """Background SWR refresh for sync functions in L1-only mode (runs on a daemon thread)."""
+        assert _object_cache is not None and ttl is not None  # noqa: S101 - _l1_swr_active guarantees both
+        try:
+            result = func(*call_args, **call_kwargs)
+        except Exception as exc:
+            _object_cache.cancel_refresh(cache_key)  # let a later call retry
+            _logger.debug("L1-only SWR background refresh failed for %s: %s", cache_key, exc)
+            return
+        _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
 
     # L1-only mode: debug log if backend would have been available
     # Helps developers understand that Redis config is being intentionally ignored
@@ -584,9 +633,22 @@ def create_cache_wrapper(
         # L1-ONLY MODE: Store raw Python objects (no serialization).
         # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
         if _l1_only_mode and _object_cache:
-            found, cached_value = _object_cache.get(cache_key)
+            if _l1_swr_active and ttl is not None:
+                found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
+            else:
+                found, cached_value = _object_cache.get(cache_key)
+                needs_refresh, version = False, 0
             if found:
                 _stats.record_l1_hit()
+                if needs_refresh:
+                    # SWR: serve the stale value now, refresh on a daemon thread
+                    # (sync functions have no event loop to schedule a task on)
+                    threading.Thread(
+                        target=_l1_swr_refresh_sync,
+                        args=(cache_key, version, args, kwargs),
+                        name=f"cachekit-swr-{func.__name__}",
+                        daemon=True,
+                    ).start()
                 features.clear_correlation_id()
                 reset_current_function_stats(token)
                 return cached_value
@@ -909,9 +971,19 @@ def create_cache_wrapper(
             # L1-ONLY MODE: Store raw Python objects (no serialization).
             # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
             if _l1_only_mode and _object_cache:
-                found, cached_value = _object_cache.get(cache_key)
+                if _l1_swr_active and ttl is not None:
+                    found, cached_value, needs_refresh, version = _object_cache.get_with_swr(cache_key, ttl)
+                else:
+                    found, cached_value = _object_cache.get(cache_key)
+                    needs_refresh, version = False, 0
                 if found:
                     _stats.record_l1_hit()
+                    if needs_refresh:
+                        # SWR: serve the stale value now, refresh in the background
+                        # without blocking the caller
+                        refresh_task = asyncio.create_task(_l1_swr_refresh_async(cache_key, version, args, kwargs))
+                        _l1_swr_tasks.add(refresh_task)
+                        refresh_task.add_done_callback(functools.partial(_l1_swr_task_done, cache_key=cache_key))
                     features.clear_correlation_id()
                     return cached_value
 
