@@ -10,30 +10,11 @@ Demonstrates best practices for performance testing:
 
 from __future__ import annotations
 
-import platform
-
 import pytest
 
 from cachekit.l1_cache import L1Cache
 
 from .stats_utils import benchmark_with_gc_handling
-
-
-@pytest.fixture(scope="session", autouse=True)
-def system_fingerprint():
-    """Capture system info for benchmark context and reproducibility."""
-    fingerprint = {
-        "python_version": platform.python_version(),
-        "platform": platform.platform(),
-        "processor": platform.processor(),
-    }
-    print(f"\n{'=' * 70}")
-    print("System Fingerprint (for benchmark context)")
-    print(f"{'=' * 70}")
-    for key, value in fingerprint.items():
-        print(f"  {key:<20} {value}")
-    print(f"{'=' * 70}\n")
-    return fingerprint
 
 
 @pytest.mark.performance

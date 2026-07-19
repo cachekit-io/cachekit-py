@@ -468,8 +468,8 @@ print("Caching working correctly!")
 # Run the built-in performance tests
 pytest tests/performance/ -v
 
-# Or run benchmarks
-uv run python -m benchmarks.cli quick --rust-only
+# Or run the serializer benchmarks (saves a local baseline)
+make benchmark
 ```
 
 ---
