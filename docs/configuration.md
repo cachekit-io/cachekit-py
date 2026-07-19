@@ -523,7 +523,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression saves network bandwidth for large values; `none` enables zero-copy mmap reads on the File backend.
+> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads.
 
 ### Connection Pooling
 

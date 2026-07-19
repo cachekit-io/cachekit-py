@@ -326,6 +326,8 @@ class TestEnvironmentVariables:
         naming a removed knob here would assert nothing (issue #163 review).
         """
         reset_settings()  # Clear singleton cache
+        _env_vars = ("CACHEKIT_DEFAULT_TTL", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB")
+        _previous_env = {key: os.environ.get(key) for key in _env_vars}
         os.environ["CACHEKIT_DEFAULT_TTL"] = "3600"
         os.environ["CACHEKIT_MAX_VALUE_SIZE"] = "52428800"
         os.environ["CACHEKIT_L1_MAX_SIZE_MB"] = "64"
@@ -336,8 +338,13 @@ class TestEnvironmentVariables:
             assert settings.max_value_size == 52428800, "README.md - CACHEKIT_MAX_VALUE_SIZE not loaded"
             assert settings.l1_max_size_mb == 64, "README.md - CACHEKIT_L1_MAX_SIZE_MB not loaded"
         finally:
-            for _var in ("CACHEKIT_DEFAULT_TTL", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB"):
-                os.environ.pop(_var, None)
+            # Restore pre-existing values rather than unconditionally deleting: CI or another
+            # test may have supplied these vars, and dropping them makes later tests order-dependent.
+            for _var, _value in _previous_env.items():
+                if _value is None:
+                    os.environ.pop(_var, None)
+                else:
+                    os.environ[_var] = _value
             reset_settings()
 
     def test_master_key_for_encryption(self):
