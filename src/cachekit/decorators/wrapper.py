@@ -468,6 +468,12 @@ def create_cache_wrapper(
             raise ConfigurationError(
                 "interop mode and fast_mode are mutually exclusive: fast-mode keys are not the canonical interop/v1 key format."
             )
+        if _l1_only_mode:
+            raise ConfigurationError(
+                "interop mode requires a shared backend (backend=None is L1-only, in-process): "
+                "L1-only mode stores raw Python objects, so the cross-SDK value contract "
+                "(plain MessagePack, closed data model) would silently not be enforced."
+            )
         # Backend known at decoration time -> guard now; lazily-resolved backends
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
@@ -1592,10 +1598,12 @@ def create_cache_wrapper(
             if interop is not None:
                 # CacheInvalidator regenerates auto-mode keys internally, which
                 # would miss the interop entry — delete the interop key directly.
+                # Log at ERROR (matching CacheInvalidator): a failed interop
+                # delete means OTHER SDKs keep serving the stale entry.
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.debug("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
             else:
                 invalidator.invalidate_cache(func, args, kwargs, namespace)
 
@@ -1649,10 +1657,12 @@ def create_cache_wrapper(
             if interop is not None:
                 # CacheInvalidator regenerates auto-mode keys internally, which
                 # would miss the interop entry — delete the interop key directly.
+                # Log at ERROR (matching CacheInvalidator): a failed interop
+                # delete means OTHER SDKs keep serving the stale entry.
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.debug("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
             else:
                 await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
 

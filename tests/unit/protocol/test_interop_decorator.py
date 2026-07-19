@@ -248,6 +248,44 @@ class TestInteropRejections:
             f(2)
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
+    def test_tenant_scoped_redis_wrapper_fails_closed(self):
+        """Panel CRIT regression (CWE-636): the default provider's Redis path is a
+        tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
+        key_prefix so the interop guard rejects it instead of silently diverging
+        from the bare keys other SDKs use."""
+        from unittest.mock import Mock
+
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
+        from cachekit.interop import ensure_interop_backend_compatible
+
+        scoped = PerRequestRedisBackend(Mock(), tenant_id="default")
+        assert scoped.key_prefix == "t:default:"
+        with pytest.raises(ConfigurationError, match="prefix"):
+            ensure_interop_backend_compatible(scoped)
+
+    def test_l1_only_mode_rejected(self):
+        """interop with backend=None (L1-only) has nothing to interoperate with,
+        and raw-object storage would skip the cross-SDK value contract."""
+        with pytest.raises(ConfigurationError, match="shared backend"):
+
+            @cache(backend=None, interop="op", namespace="ns")
+            def f(x: int):
+                return x
+
+    def test_z_suffix_sentinel_revives(self):
+        """Panel MAJ regression: JS/Rust writers emit ISO-8601 with a Z designator;
+        Python 3.10's fromisoformat cannot parse it — the decoder must normalize,
+        or foreign datetime-bearing entries get evicted on read."""
+        import msgpack
+
+        from cachekit.interop import decode_interop_value
+
+        foreign = msgpack.packb({"__datetime__": True, "value": "2024-01-01T12:30:45.123Z"}, use_bin_type=True)
+        revived = decode_interop_value(foreign)
+        from datetime import datetime, timezone
+
+        assert revived == datetime(2024, 1, 1, 12, 30, 45, 123000, tzinfo=timezone.utc)
+
     def test_ck_frame_at_interop_key_is_diagnosed_and_recomputed(self, backend: DictBackend):
         """A planted CK frame is rejected with the protocol#11 diagnostic path,
         treated as a miss, and overwritten with a valid interop value."""
@@ -315,6 +353,62 @@ class TestInteropEncryption:
 
         assert get_user(42) == {"name": "alice", "age": 30}, "forged plaintext must never be returned"
         assert backend.store[key] != forged, "forged entry must be overwritten with ciphertext"
+
+    def test_encrypted_out_of_model_value_raises_at_store(self, backend: DictBackend):
+        """Panel CRIT regression: EncryptionWrapper must not launder InteropError
+        into SerializationError — the encrypted store path fails loud too."""
+        pytest.importorskip("cachekit._rust_serializer")
+
+        @self._secure_decorator(backend)
+        def get_user(user_id: int):
+            return {1, 2, 3}  # sets do not round-trip cross-SDK
+
+        with pytest.raises(InteropError):
+            get_user(42)
+        assert not backend.store
+
+    def test_machine_local_deployment_uuid_rejected(self, backend: DictBackend, monkeypatch):
+        """Panel MAJ regression: interop encryption must never fall back to the
+        per-machine auto-generated deployment UUID (other hosts/SDKs could never
+        decrypt). Explicit deployment_uuid or CACHEKIT_DEPLOYMENT_UUID required."""
+        pytest.importorskip("cachekit._rust_serializer")
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        try:
+            with pytest.raises(ConfigurationError, match="deployment UUID"):
+
+                @_decorate(
+                    backend,
+                    interop="op",
+                    namespace="ns",
+                    encryption=True,
+                    master_key=self.MASTER_KEY_HEX,
+                    single_tenant_mode=True,
+                )
+                def f(x: int):
+                    return x
+        finally:
+            reset_settings()
+
+    def test_non_canonical_deployment_uuid_rejected(self, backend: DictBackend):
+        """Panel MAJ regression: Python normalizes UUIDs before key derivation;
+        other SDKs use the raw string — interop requires the canonical form."""
+        pytest.importorskip("cachekit._rust_serializer")
+        with pytest.raises(ConfigurationError, match="canonical"):
+
+            @_decorate(
+                backend,
+                interop="op",
+                namespace="ns",
+                encryption=True,
+                master_key=self.MASTER_KEY_HEX,
+                single_tenant_mode=True,
+                deployment_uuid="00000000-0000-0000-0000-00000000000A",  # uppercase hex digit
+            )
+            def f(x: int):
+                return x
 
     def test_tenant_extractor_rejected(self, backend: DictBackend):
         from cachekit.decorators.tenant_context import ArgumentNameExtractor

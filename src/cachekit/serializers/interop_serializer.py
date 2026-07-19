@@ -44,8 +44,6 @@ class InteropSerializer:
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:
         try:
             data = encode_interop_value(obj)
-        except SerializationError:
-            raise
         except ValueError:
             # InteropError (a ValueError): spec-mandated model rejection —
             # propagate untouched so it fails loud at the caller.

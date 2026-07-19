@@ -23,7 +23,7 @@ from cachekit.config import ConfigurationError, get_settings
 from cachekit.di import DIContainer
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SerializationFormat
+from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -498,6 +498,7 @@ class CacheSerializationHandler:
             try:
                 # Validate UUID format
                 validated_uuid = str(uuid.UUID(provided_uuid))
+                self._require_canonical_tenant_form(provided_uuid, validated_uuid, source="deployment_uuid parameter")
                 get_logger().info(f"Using provided deployment UUID: {validated_uuid}")
                 return validated_uuid
             except ValueError as e:
@@ -510,12 +511,28 @@ class CacheSerializationHandler:
         if settings.deployment_uuid:
             try:
                 validated_uuid = str(uuid.UUID(settings.deployment_uuid))
+                self._require_canonical_tenant_form(settings.deployment_uuid, validated_uuid, source="CACHEKIT_DEPLOYMENT_UUID")
                 get_logger().info(f"Using deployment UUID from configuration: {validated_uuid}")
                 return validated_uuid
             except ValueError as e:
                 raise ConfigurationError(
                     f"Invalid deployment_uuid in configuration (must be valid UUID): {settings.deployment_uuid}. Error: {e}"
                 ) from e
+
+        # Interop mode never falls through to the machine-local sources below:
+        # the persistent-file / freshly-generated UUID is random PER HOST, so
+        # two processes (or two SDKs) would silently derive different AES keys
+        # — every cross-host read fails auth, entries evict each other in a
+        # recompute loop, and on metered-misses billing every miss costs money.
+        # Cross-SDK encryption only works with an explicitly shared tenant.
+        if self.interop_mode:
+            raise ConfigurationError(
+                "interop mode with encryption requires an explicitly shared deployment UUID "
+                "(deployment_uuid parameter or CACHEKIT_DEPLOYMENT_UUID): the auto-generated "
+                "machine-local UUID differs per host, so other processes and SDKs could never "
+                "decrypt entries written here. Configure the same canonical lowercase UUID "
+                "in every SDK sharing this cache."
+            )
 
         # Option 3: Persistent file storage (auto-generated, survives restarts)
         deployment_uuid_file = Path.home() / ".cachekit" / "deployment_uuid"
@@ -525,6 +542,7 @@ class CacheSerializationHandler:
             stored_uuid = deployment_uuid_file.read_text().strip()
             try:
                 validated_uuid = str(uuid.UUID(stored_uuid))
+                self._require_canonical_tenant_form(stored_uuid, validated_uuid, source=str(deployment_uuid_file))
                 get_logger().info(f"Using persistent deployment UUID from {deployment_uuid_file}")
                 return validated_uuid
             except ValueError:
@@ -545,6 +563,26 @@ class CacheSerializationHandler:
             )
 
         return new_uuid
+
+    def _require_canonical_tenant_form(self, raw: str, canonical: str, source: str) -> None:
+        """Interop mode: reject a deployment UUID that is not already canonical.
+
+        The tenant string feeds HKDF key derivation and AAD component 1. Python
+        normalizes through uuid.UUID() (lowercases, strips braces/URN); another
+        SDK reading the same shared config would use the raw string — different
+        derived keys, silent cross-SDK auth failures, mutual entry eviction.
+        Interop mode therefore requires the configured value to be byte-equal to
+        its canonical lowercase-hyphenated form, so what Python derives from IS
+        the literal string every other SDK sees. Auto mode is unaffected
+        (normalization there is long-shipped behavior).
+        """
+        if self.interop_mode and raw.strip() != canonical:
+            raise ConfigurationError(
+                f"interop mode requires the deployment UUID from {source} to be in canonical "
+                f"lowercase-hyphenated form (got {raw!r}, canonical {canonical!r}): other SDKs "
+                f"derive tenant keys from the raw string, so any normalization on the Python "
+                f"side silently breaks cross-SDK decryption."
+            )
 
     def _get_cached_encryption_wrapper(self, tenant_id: str) -> Any:
         """Get or create cached EncryptionWrapper for tenant_id.
@@ -888,10 +926,7 @@ class CacheSerializationHandler:
                 # four AAD components). tenant/fingerprint come from config — an
                 # attacker cannot influence them because nothing is read from the
                 # stored bytes except the ciphertext itself.
-                serialization_metadata_cls = _get_cached_serializer_class(
-                    "metadata", "cachekit.serializers.SerializationMetadata"
-                )
-                metadata = serialization_metadata_cls(
+                metadata = SerializationMetadata(
                     serialization_format=SerializationFormat.MSGPACK,
                     compressed=False,
                     original_type=None,

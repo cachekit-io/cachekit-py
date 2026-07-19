@@ -11,7 +11,7 @@ that lets cachekit-py share cache entries with cachekit-rs and cachekit-ts:
 
 The canonical encoder is a port of the protocol reference implementation
 (protocol/tools/interop-reference.py) and is byte-verified against
-test-vectors/interop-mode.json in tests/protocol/test_interop_vectors.py.
+test-vectors/interop-mode.json in tests/unit/protocol/test_interop_vectors.py.
 
 WHY hand-rolled instead of msgpack.packb: interop/v1 requires shortest-form
 widths, code-point-sorted map keys at every level, float64-only floats, and a
@@ -377,15 +377,26 @@ def encode_interop_value(value: Any) -> bytes:
     return _encode_canonical(_normalize_value(value), collapse_floats=False)
 
 
+def _iso_utc(value: str) -> str:
+    """Normalize a trailing Z/z designator to +00:00.
+
+    JS Date.toISOString() and Rust chrono RFC 3339 writers emit "…Z";
+    datetime.fromisoformat only learned the Z designator in Python 3.11, and
+    this SDK supports 3.10 — without this, every foreign datetime-bearing
+    entry would decode-fail and be evicted by a 3.10 reader.
+    """
+    return value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+
+
 def _revive_sentinels(obj: Any) -> Any:
     """msgpack object_hook: revive wire-format.md temporal sentinel maps."""
     if isinstance(obj, dict):
         if obj.get("__datetime__") is True and isinstance(obj.get("value"), str):
-            return datetime.fromisoformat(obj["value"])
+            return datetime.fromisoformat(_iso_utc(obj["value"]))
         if obj.get("__date__") is True and isinstance(obj.get("value"), str):
             return date.fromisoformat(obj["value"])
         if obj.get("__time__") is True and isinstance(obj.get("value"), str):
-            return time.fromisoformat(obj["value"])
+            return time.fromisoformat(_iso_utc(obj["value"]))
     return obj
 
 
@@ -439,8 +450,9 @@ def ensure_interop_backend_compatible(backend: Any) -> None:
         raise ConfigurationError(
             f"interop mode cannot be used with a key-prefixing backend "
             f"({type(backend).__name__} has key_prefix={prefix!r}): the prefix would be "
-            f"invisible to other SDKs and break cross-SDK key identity. Remove the "
-            f"prefix or use a namespace segment in the interop key instead."
+            f"invisible to other SDKs and break cross-SDK key identity. Pass an explicit "
+            f"non-prefixing backend (e.g. RedisBackend()) instead — the default provider's "
+            f"Redis path is a tenant-scoped wrapper and cannot serve interop entries."
         )
 
 

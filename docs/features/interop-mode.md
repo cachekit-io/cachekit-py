@@ -57,9 +57,10 @@ def get_user(user_id: int):
     return db.fetch(user_id)  # illustrative
 ```
 
-Two constraints, both fail-closed:
+Three constraints, all fail-closed:
 
 - **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. To share encrypted entries across SDKs, configure the same master key **and** the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) everywhere.
+- **The shared tenant must be explicit and canonical.** The machine-local auto-generated deployment UUID is rejected (it differs per host — nothing else could ever decrypt), and the configured value must already be in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys).
 - **Config decides, bytes never do.** With encryption enabled, stored bytes are always treated as ciphertext and authenticated before any decode. There is no header to forge, so the CWE-757 downgrade class (see the auto-mode fail-closed read path in [zero-knowledge-encryption.md](zero-knowledge-encryption.md)) cannot exist here.
 
 ## Guardrails (all loud, none silent)
@@ -67,7 +68,8 @@ Two constraints, both fail-closed:
 | Situation | Behavior |
 | :--- | :--- |
 | Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
-| `interop=` combined with `key=`, `fast_mode`, or a non-default serializer | `ConfigurationError` at decoration time |
+| `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
+| Encryption without an explicit, canonical shared deployment UUID | `ConfigurationError` at decoration time |
 | Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
@@ -80,8 +82,9 @@ For debugging, migrations, or out-of-band writers:
 ```python
 from cachekit import generate_interop_key, encode_interop_value, decode_interop_value
 
+# Byte-pinned by the protocol vectors (single_int / issue_example_object):
 key = generate_interop_key("users", "get_user", [42])
-assert key == "users:get_user:" + key.rsplit(":", 1)[1]  # {ns}:{op}:{blake2b-256 hex}
+assert key == "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"
 
 data = encode_interop_value({"name": "alice", "age": 30})
 assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted keys

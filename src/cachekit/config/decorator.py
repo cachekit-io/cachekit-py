@@ -260,24 +260,10 @@ class DecoratorConfig:
                     "interop mode and a custom key= function are mutually exclusive: interop keys "
                     "are generated from the canonical argument array by specification."
                 )
-            if isinstance(self.serializer, str):
-                if self.serializer not in ("default", "std", "standard"):
-                    raise ConfigurationError(
-                        f"interop mode requires the default (MessagePack) serializer, got "
-                        f"serializer='{self.serializer}': interop/v1 values are plain MessagePack."
-                    )
-            else:
-                raise ConfigurationError(
-                    "interop mode does not accept a custom serializer instance: interop/v1 values "
-                    "are canonical plain MessagePack produced by the built-in interop encoder."
-                )
-            if self.encryption.tenant_extractor is not None:
-                raise ConfigurationError(
-                    "interop mode does not support tenant_extractor (multi-tenant) encryption: "
-                    "interop entries store no metadata header, so the read path cannot recover a "
-                    "per-call tenant. Use single-tenant encryption with a shared "
-                    "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
-                )
+            # Serializer and tenant_extractor constraints are enforced by their
+            # single authority, CacheSerializationHandler.__init__ (which owns
+            # the alias map and the encryption config) — it runs at decoration
+            # time on every path, so the error still fires before first use.
 
         # Validate nested configs
         self.l1.validate()
