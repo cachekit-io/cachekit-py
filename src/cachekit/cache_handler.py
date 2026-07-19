@@ -57,6 +57,16 @@ def get_backend_provider():
     return container.get(BackendProviderInterface)
 
 
+def redact_cache_key(cache_key: object) -> str:
+    """Redact a cache key for log/error messages.
+
+    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
+    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
+    across the sync and async cache-set failure paths without leaking the key itself.
+    """
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
+
+
 # Lazy logger initialization to avoid import-time container access
 _logger = None
 
@@ -664,11 +674,9 @@ class CacheSerializationHandler:
         max_value_size = get_settings().max_value_size
         if len(wrapped) > max_value_size:
             # Redact the raw cache key: it can carry caller-supplied tenant/user identifiers, and
-            # this message reaches the fallback warning log path (issue #163 review). A fixed-length
-            # blake2b digest keeps the message correlatable without leaking the key.
-            key_digest = hashlib.blake2b(str(cache_key).encode("utf-8"), digest_size=8).hexdigest()
+            # this message reaches the fallback warning log path (issue #163 review).
             raise ValueError(
-                f"Serialized value for key <redacted:{key_digest}> is {len(wrapped)} bytes, exceeding "
+                f"Serialized value for key {redact_cache_key(cache_key)} is {len(wrapped)} bytes, exceeding "
                 f"max_value_size ({max_value_size} bytes); refusing to cache. Increase "
                 f"CACHEKIT_MAX_VALUE_SIZE to cache larger values."
             )

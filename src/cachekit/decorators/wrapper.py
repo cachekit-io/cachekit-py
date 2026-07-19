@@ -18,6 +18,7 @@ from ..cache_handler import (
     StandardCacheHandler,
     get_backend_provider,
     get_logger,
+    redact_cache_key,
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
@@ -829,7 +830,7 @@ def create_cache_wrapper(
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
-                    cache_key=cache_key,
+                    cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                     namespace=namespace or "default",
                     duration_ms=set_duration_ms,
                     serializer="rust",
@@ -1189,7 +1190,7 @@ def create_cache_wrapper(
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
-                                cache_key=cache_key or "unknown",
+                                cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
                                 correlation_id=correlation_id,
@@ -1269,7 +1270,7 @@ def create_cache_wrapper(
                     features.handle_cache_error(
                         error=e,
                         operation="cache_set",
-                        cache_key=cache_key or "unknown",
+                        cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
                         correlation_id=correlation_id,

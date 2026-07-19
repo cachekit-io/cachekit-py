@@ -32,7 +32,7 @@ class TestL1CacheConfig:
         """Test default values."""
         config = L1CacheConfig()
         assert config.enabled is True
-        assert config.max_size_mb == 100
+        assert config.max_size_mb is None  # None inherits CACHEKIT_L1_MAX_SIZE_MB (issue #163)
 
     def test_custom_values(self) -> None:
         """Test custom configuration."""

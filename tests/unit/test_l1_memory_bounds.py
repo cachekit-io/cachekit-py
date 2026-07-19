@@ -191,3 +191,18 @@ class TestConfiguredBudgetWiring:
         create_cache_wrapper(fn, config=config)
 
         assert get_l1_cache(namespace).max_memory_bytes == 9 * MB
+
+    def test_presets_do_not_pin_l1_budget(self):
+        """Regression guard (issue #163): intent presets must leave max_size_mb=None so
+        CACHEKIT_L1_MAX_SIZE_MB is honored. The prior concrete default (100) was passed
+        explicitly by the wrapper and silently shadowed the settings-derived budget on
+        every @cache.* decorator. Combined with test_manager_default_reads_settings
+        (None -> settings), this proves the env var reaches presets end-to-end.
+        """
+        from cachekit.config import DecoratorConfig
+
+        # minimal() and production() need no external config; io()/secure() require an
+        # API key / master key but build L1CacheConfig the same way (all six presets omit
+        # max_size_mb), so these two are representative of the preset construction pattern.
+        assert DecoratorConfig.minimal().l1.max_size_mb is None
+        assert DecoratorConfig.production().l1.max_size_mb is None

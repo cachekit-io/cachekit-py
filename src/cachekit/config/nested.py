@@ -22,7 +22,8 @@ class L1CacheConfig:
 
     Attributes:
         enabled: Enable L1 in-memory cache (default: True)
-        max_size_mb: Maximum L1 cache size in megabytes (default: 100)
+        max_size_mb: Per-namespace L1 budget in MB. None (default) inherits the global
+            CACHEKIT_L1_MAX_SIZE_MB setting (issue #163); an int overrides it per decorator.
 
     Examples:
         Create with defaults:
@@ -30,8 +31,8 @@ class L1CacheConfig:
         >>> config = L1CacheConfig()
         >>> config.enabled
         True
-        >>> config.max_size_mb
-        100
+        >>> config.max_size_mb is None  # inherits CACHEKIT_L1_MAX_SIZE_MB
+        True
 
         Custom configuration validates successfully:
 
@@ -47,7 +48,7 @@ class L1CacheConfig:
     """
 
     enabled: bool = True
-    max_size_mb: int = 100
+    max_size_mb: int | None = None
     swr_enabled: bool = True
     swr_threshold_ratio: float = 0.5
     invalidation_enabled: bool = True
@@ -59,7 +60,7 @@ class L1CacheConfig:
         Raises:
             ConfigurationError: If max_size_mb < 1
         """
-        if self.max_size_mb < 1:
+        if self.max_size_mb is not None and self.max_size_mb < 1:
             raise ConfigurationError(f"L1 max_size_mb must be >= 1, got {self.max_size_mb}")
 
 

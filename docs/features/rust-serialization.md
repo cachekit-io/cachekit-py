@@ -57,7 +57,7 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-Compression runs automatically. It can be toggled via the `CACHEKIT_ENABLE_COMPRESSION` environment variable.
+Compression runs automatically. The codec is selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`).
 
 ---
 

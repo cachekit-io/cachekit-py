@@ -76,9 +76,8 @@ CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
 # Cache Behavior
 CACHEKIT_DEFAULT_TTL=3600
-CACHEKIT_MAX_CHUNK_SIZE_MB=50
-CACHEKIT_ENABLE_COMPRESSION=true
-CACHEKIT_COMPRESSION_LEVEL=6
+CACHEKIT_MAX_VALUE_SIZE=104857600
+CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption (for @cache.secure)
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
@@ -347,7 +346,7 @@ For production with Redis:
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
 export CACHEKIT_CONNECTION_POOL_SIZE=20
 export CACHEKIT_DEFAULT_TTL=3600
-export CACHEKIT_ENABLE_COMPRESSION=true
+export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 ### Secure Production (Encryption Enabled)
@@ -357,7 +356,7 @@ For production with sensitive data:
 ```bash
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-export CACHEKIT_ENABLE_COMPRESSION=true
+export CACHEKIT_ARROW_COMPRESSION=zstd
 export LOG_LEVEL=WARNING
 ```
 
@@ -504,30 +503,27 @@ export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
 
 ## Performance Configuration
 
-### Memory Usage
+### Value Size Limit
 
 ```bash
-# Limit cache chunk size (affects L2 large value handling)
-export CACHEKIT_MAX_CHUNK_SIZE_MB=50  # Default is 50MB
+# Reject values whose serialized envelope exceeds this many bytes (L2 ceiling)
+export CACHEKIT_MAX_VALUE_SIZE=104857600  # Default is 100MB
 
-# Reduce for memory-constrained environments
-export CACHEKIT_MAX_CHUNK_SIZE_MB=10
+# Tighten for memory-constrained environments
+export CACHEKIT_MAX_VALUE_SIZE=10485760   # 10MB
 ```
 
 ### Compression
 
-Enable compression for large values:
+Arrow payloads are compressed automatically. Select the codec:
 
 ```bash
-# Enable compression (recommended for >1KB values)
-export CACHEKIT_ENABLE_COMPRESSION=true
-
-# Compression level (1-9, higher = more compression)
-export CACHEKIT_COMPRESSION_LEVEL=6  # Default
+# zstd (default), lz4, or none
+export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression has 100-500μs overhead but saves network bandwidth for large values (>1KB).
+> Compression saves network bandwidth for large values; `none` enables zero-copy mmap reads on the File backend.
 
 ### Connection Pooling
 

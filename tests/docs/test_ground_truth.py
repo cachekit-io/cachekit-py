@@ -319,24 +319,25 @@ class TestEnvironmentVariables:
             reset_settings()
 
     def test_all_cachekit_vars_recognized(self):
-        """README.md - All documented CACHEKIT_* variables must be recognized."""
+        """README.md - documented CACHEKIT_* variables must actually load into settings.
+
+        Asserts live fields (not just default_ttl) so the test can't pass vacuously:
+        with extra="forbid", pydantic-settings silently ignores unknown env vars, so
+        naming a removed knob here would assert nothing (issue #163 review).
+        """
         reset_settings()  # Clear singleton cache
         os.environ["CACHEKIT_DEFAULT_TTL"] = "3600"
-        os.environ["CACHEKIT_MAX_CHUNK_SIZE_MB"] = "100"
-        os.environ["CACHEKIT_ENABLE_COMPRESSION"] = "true"
+        os.environ["CACHEKIT_MAX_VALUE_SIZE"] = "52428800"
+        os.environ["CACHEKIT_L1_MAX_SIZE_MB"] = "64"
         try:
-            # Get settings - should load configuration from env vars
             settings = get_settings()
             assert settings is not None, "README.md - Environment variables not recognized"
-            # Verify settings picked up at least one env var
             assert settings.default_ttl == 3600, "README.md - CACHEKIT_DEFAULT_TTL not loaded"
+            assert settings.max_value_size == 52428800, "README.md - CACHEKIT_MAX_VALUE_SIZE not loaded"
+            assert settings.l1_max_size_mb == 64, "README.md - CACHEKIT_L1_MAX_SIZE_MB not loaded"
         finally:
-            if "CACHEKIT_DEFAULT_TTL" in os.environ:
-                del os.environ["CACHEKIT_DEFAULT_TTL"]
-            if "CACHEKIT_MAX_CHUNK_SIZE_MB" in os.environ:
-                del os.environ["CACHEKIT_MAX_CHUNK_SIZE_MB"]
-            if "CACHEKIT_ENABLE_COMPRESSION" in os.environ:
-                del os.environ["CACHEKIT_ENABLE_COMPRESSION"]
+            for _var in ("CACHEKIT_DEFAULT_TTL", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB"):
+                os.environ.pop(_var, None)
             reset_settings()
 
     def test_master_key_for_encryption(self):
