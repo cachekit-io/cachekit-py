@@ -24,6 +24,14 @@ class L1CacheConfig:
         enabled: Enable L1 in-memory cache (default: True)
         max_size_mb: Per-namespace L1 budget in MB. None (default) inherits the global
             CACHEKIT_L1_MAX_SIZE_MB setting (issue #163); an int overrides it per decorator.
+            In L1-only mode (backend=None) this is a best-effort byte bound on raw object sizes.
+        swr_enabled: Enable stale-while-revalidate background refresh (default: True).
+            Requires a ttl; in L1-only mode async functions refresh via an asyncio
+            task and sync functions via a daemon thread.
+        swr_threshold_ratio: Fraction of TTL after which a hit triggers a background
+            refresh, in (0.0, 1.0] (default: 0.5)
+        invalidation_enabled: Enable invalidation event broadcasts (default: True)
+        namespace_index: Enable fast namespace-based invalidation (default: True)
 
     Examples:
         Create with defaults:
@@ -58,10 +66,13 @@ class L1CacheConfig:
         """Validate L1 cache configuration.
 
         Raises:
-            ConfigurationError: If max_size_mb < 1
+            ConfigurationError: If max_size_mb < 1 or swr_threshold_ratio is
+                outside (0.0, 1.0]
         """
         if self.max_size_mb is not None and self.max_size_mb < 1:
             raise ConfigurationError(f"L1 max_size_mb must be >= 1, got {self.max_size_mb}")
+        if not (0.0 < self.swr_threshold_ratio <= 1.0):
+            raise ConfigurationError(f"L1 swr_threshold_ratio must be in (0.0, 1.0], got {self.swr_threshold_ratio}")
 
 
 @dataclass(frozen=True)
