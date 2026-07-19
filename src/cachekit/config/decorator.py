@@ -186,12 +186,16 @@ class DecoratorConfig:
         encryption: Client-side encryption configuration
     """
 
-    # Core settings (5 fields)
+    # Core settings (6 fields)
     ttl: int | None = None
     namespace: str | None = None
     serializer: Union[str, SerializerProtocol] = "default"  # type: ignore[assignment]  # String name or protocol instance
     integrity_checking: bool = True  # Checksums for corruption detection (xxHash3-64 for all serializers)
     key: Callable[..., str] | None = None  # Custom key function (escape hatch for complex types)
+    # Interop mode (interop/v1): explicit cross-SDK operation name. Opting in switches
+    # this function to {namespace}:{operation}:{args_hash} keys and plain-MessagePack
+    # values shared byte-identically with cachekit-rs / cachekit-ts. None = auto mode.
+    interop: str | None = None
 
     # Performance (2 fields)
     refresh_ttl_on_get: bool = False
@@ -234,6 +238,46 @@ class DecoratorConfig:
         # TTL refresh threshold validation
         if not 0.0 <= self.ttl_refresh_threshold <= 1.0:
             raise ConfigurationError(f"ttl_refresh_threshold must be 0.0-1.0, got {self.ttl_refresh_threshold}")
+
+        # Interop mode validation (interop/v1, spec/interop-mode.md): loud at
+        # decoration time, never silently normalized.
+        if self.interop is not None:
+            from cachekit.interop import InteropError, validate_segment
+
+            try:
+                validate_segment("operation", self.interop)
+                if self.namespace is None:
+                    raise ConfigurationError(
+                        "interop mode requires an explicit namespace: "
+                        '@cache(interop="get_user", namespace="users"). The namespace is the '
+                        "first segment of the cross-SDK cache key."
+                    )
+                validate_segment("namespace", self.namespace)
+            except InteropError as e:
+                raise ConfigurationError(str(e)) from e
+            if self.key is not None:
+                raise ConfigurationError(
+                    "interop mode and a custom key= function are mutually exclusive: interop keys "
+                    "are generated from the canonical argument array by specification."
+                )
+            if isinstance(self.serializer, str):
+                if self.serializer not in ("default", "std", "standard"):
+                    raise ConfigurationError(
+                        f"interop mode requires the default (MessagePack) serializer, got "
+                        f"serializer='{self.serializer}': interop/v1 values are plain MessagePack."
+                    )
+            else:
+                raise ConfigurationError(
+                    "interop mode does not accept a custom serializer instance: interop/v1 values "
+                    "are canonical plain MessagePack produced by the built-in interop encoder."
+                )
+            if self.encryption.tenant_extractor is not None:
+                raise ConfigurationError(
+                    "interop mode does not support tenant_extractor (multi-tenant) encryption: "
+                    "interop entries store no metadata header, so the read path cannot recover a "
+                    "per-call tenant. Use single-tenant encryption with a shared "
+                    "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
+                )
 
         # Validate nested configs
         self.l1.validate()

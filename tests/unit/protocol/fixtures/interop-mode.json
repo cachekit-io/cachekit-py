@@ -1,0 +1,745 @@
+{
+  "version": "1.0.0",
+  "spec": "spec/interop-mode.md",
+  "generator": "tools/interop-reference.py (CPython stdlib)",
+  "cross_checked_by": "tools/interop-crosscheck.mjs (independent encoder + @noble/hashes blake2b + WebCrypto HKDF/AES-GCM)",
+  "hash_algorithm": "blake2b-256 (digest_size=32, unkeyed) over canonical MessagePack of the flat argument array",
+  "key_format": "{namespace}:{operation}:{args_hash}",
+  "segment_pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+  "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline).",
+  "width_coverage_note": "All *16 header boundaries (uint/int widths, str8->str16, bin8->bin16, fixarray->array16, fixmap->map16, including the root argument array) are pinned by vectors. The *32 tier (str32/bin32/array32/map32, >=64 KiB or >=65536 elements) is normative and implemented by both tools but untested-by-design: fixture blobs that size would bloat the file without exercising different logic (same length-prefix code path, wider field).",
+  "error_vectors_note": "The 'error' field is a human-readable reason for maintainers. Conformance means the input MUST be rejected with an error; the message text is not normative.",
+  "tagged_json": {
+    "note": "Single-key objects with a $-prefixed key are typed input tags; all other JSON maps directly.",
+    "$set": "set of tagged values (unordered)",
+    "$bytes": "hex-encoded byte string",
+    "$datetime": "ISO 8601 with mandatory UTC offset",
+    "$uuid": "UUID string (any case on input)",
+    "$float": "decimal float literal (JSON numbers are always integers in this file). Error vectors use 'nan' (parses to NaN in Python and JS) and '1e999' (overflows to +Infinity in Python, JS, and Rust) \u2014 never 'inf', which JS parses to NaN.",
+    "$int": "decimal integer literal (for values beyond 2^53, unsafe in JS JSON.parse)"
+  },
+  "key_vectors": [
+    {
+      "name": "empty_args",
+      "description": "Zero arguments: canonical encoding of the empty array",
+      "namespace": "users",
+      "operation": "get_all",
+      "args": [],
+      "canonical_args_hex": "90",
+      "args_hash": "8064bf5f945dba521b017bb3f32b31a293a6e16944838d171ea9e77fab085e8e",
+      "expected_key": "users:get_all:8064bf5f945dba521b017bb3f32b31a293a6e16944838d171ea9e77fab085e8e"
+    },
+    {
+      "name": "single_int",
+      "description": "Issue #1 example: users:get_user with one integer argument",
+      "namespace": "users",
+      "operation": "get_user",
+      "args": [
+        42
+      ],
+      "canonical_args_hex": "912a",
+      "args_hash": "61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
+      "expected_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"
+    },
+    {
+      "name": "uint64_max",
+      "description": "Largest interop integer (2^64-1), e.g. a snowflake ID",
+      "namespace": "users",
+      "operation": "get_user",
+      "args": [
+        {
+          "$int": "18446744073709551615"
+        }
+      ],
+      "canonical_args_hex": "91cfffffffffffffffff",
+      "args_hash": "0cc46c520dfb8f301e03756131351da58fb433d5258f5db3dde927a8c83b9430",
+      "expected_key": "users:get_user:0cc46c520dfb8f301e03756131351da58fb433d5258f5db3dde927a8c83b9430"
+    },
+    {
+      "name": "int64_min",
+      "description": "Smallest interop integer (-2^63)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$int": "-9223372036854775808"
+        }
+      ],
+      "canonical_args_hex": "91d38000000000000000",
+      "args_hash": "2882730c0cc9df9bc2152c1833892075377b801a72a715434f103b694e4a5909",
+      "expected_key": "t:op:2882730c0cc9df9bc2152c1833892075377b801a72a715434f103b694e4a5909"
+    },
+    {
+      "name": "uint_width_ladder",
+      "description": "Every unsigned width boundary: 127/128 (fixint/uint8), 255/256 (uint8/uint16), 65535/65536 (uint16/uint32), 4294967295/4294967296 (uint32/uint64)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        127,
+        128,
+        255,
+        256,
+        65535,
+        65536,
+        4294967295,
+        4294967296
+      ],
+      "canonical_args_hex": "987fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000",
+      "args_hash": "ccf107ae1fc53bde440609a16dc30794916bd692f06309832621b9c49c89f9b7",
+      "expected_key": "t:op:ccf107ae1fc53bde440609a16dc30794916bd692f06309832621b9c49c89f9b7"
+    },
+    {
+      "name": "int_width_ladder",
+      "description": "Every signed width boundary: -32/-33 (fixint/int8), -128/-129 (int8/int16), -32768/-32769 (int16/int32), -2147483648/-2147483649 (int32/int64)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        -32,
+        -33,
+        -128,
+        -129,
+        -32768,
+        -32769,
+        -2147483648,
+        -2147483649
+      ],
+      "canonical_args_hex": "98e0d0dfd080d1ff7fd18000d2ffff7fffd280000000d3ffffffff7fffffff",
+      "args_hash": "92fa9f5c0f336f282290472144b6a4cf86b2840a1cbd8366e42fdfa1d4faa98f",
+      "expected_key": "t:op:92fa9f5c0f336f282290472144b6a4cf86b2840a1cbd8366e42fdfa1d4faa98f"
+    },
+    {
+      "name": "unicode_string",
+      "description": "UTF-8 string, no Unicode normalization applied",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        "h\u00e9llo w\u00f6rld \u2713"
+      ],
+      "canonical_args_hex": "91b168c3a96c6c6f2077c3b6726c6420e29c93",
+      "args_hash": "00fd1c3045fe23cfe4cac788a9e15773e1f9722ca84e28917f64be99dd7a5a3c",
+      "expected_key": "t:op:00fd1c3045fe23cfe4cac788a9e15773e1f9722ca84e28917f64be99dd7a5a3c"
+    },
+    {
+      "name": "str_width_ladder",
+      "description": "String header boundaries by UTF-8 byte length: 31 (fixstr) / 32 (str8) / 255 (str8) / 256 (str16)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "canonical_args_hex": "94bf61616161616161616161616161616161616161616161616161616161616161d9206262626262626262626262626262626262626262626262626262626262626262d9ff636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363da010064646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464",
+      "args_hash": "9b750ae4a2ed646a51472aebbcffffade0f4633edbc8152cafcd2d00375d865b",
+      "expected_key": "t:op:9b750ae4a2ed646a51472aebbcffffade0f4633edbc8152cafcd2d00375d865b"
+    },
+    {
+      "name": "bin_width_ladder",
+      "description": "Binary header boundaries: 255 bytes (bin8) / 256 bytes (bin16)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$bytes": "ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+        },
+        {
+          "$bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "canonical_args_hex": "92c4ffabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababc50100cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "args_hash": "0a888f5ac66954cd56155853f2f2e964a65dd26783e9fc4249395ca1f99f28c0",
+      "expected_key": "t:op:0a888f5ac66954cd56155853f2f2e964a65dd26783e9fc4249395ca1f99f28c0"
+    },
+    {
+      "name": "array_width_boundary",
+      "description": "Array header boundary: 15 elements (fixarray) / 16 elements (array16)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      ],
+      "canonical_args_hex": "929f000102030405060708090a0b0c0d0edc0010000102030405060708090a0b0c0d0e0f",
+      "args_hash": "d121a3c3f0427c5df363068940c15d966120be41ea11d4befe62e3408a676130",
+      "expected_key": "t:op:d121a3c3f0427c5df363068940c15d966120be41ea11d4befe62e3408a676130"
+    },
+    {
+      "name": "map_width_boundary",
+      "description": "Map header boundary: 15 keys (fixmap) / 16 keys (map16); zero-padded keys keep the sort order obvious",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "k00": 0,
+          "k01": 1,
+          "k02": 2,
+          "k03": 3,
+          "k04": 4,
+          "k05": 5,
+          "k06": 6,
+          "k07": 7,
+          "k08": 8,
+          "k09": 9,
+          "k10": 10,
+          "k11": 11,
+          "k12": 12,
+          "k13": 13,
+          "k14": 14
+        },
+        {
+          "k00": 0,
+          "k01": 1,
+          "k02": 2,
+          "k03": 3,
+          "k04": 4,
+          "k05": 5,
+          "k06": 6,
+          "k07": 7,
+          "k08": 8,
+          "k09": 9,
+          "k10": 10,
+          "k11": 11,
+          "k12": 12,
+          "k13": 13,
+          "k14": 14,
+          "k15": 15
+        }
+      ],
+      "canonical_args_hex": "928fa36b303000a36b303101a36b303202a36b303303a36b303404a36b303505a36b303606a36b303707a36b303808a36b303909a36b31300aa36b31310ba36b31320ca36b31330da36b31340ede0010a36b303000a36b303101a36b303202a36b303303a36b303404a36b303505a36b303606a36b303707a36b303808a36b303909a36b31300aa36b31310ba36b31320ca36b31330da36b31340ea36b31350f",
+      "args_hash": "fed444a7b22613e6ff38c05e96df352182f71c41e4db57b2b3e7f0389cabfe46",
+      "expected_key": "t:op:fed444a7b22613e6ff38c05e96df352182f71c41e4db57b2b3e7f0389cabfe46"
+    },
+    {
+      "name": "root_array16",
+      "description": "16 arguments: the ROOT canonical argument array itself uses array16",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "canonical_args_hex": "dc0010000102030405060708090a0b0c0d0e0f",
+      "args_hash": "c55dd1f50e57b0dfbcd8827965516e2e33e7de2788f18d7d88d82575e34f2116",
+      "expected_key": "t:op:c55dd1f50e57b0dfbcd8827965516e2e33e7de2788f18d7d88d82575e34f2116"
+    },
+    {
+      "name": "bool_null",
+      "description": "Booleans and null",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        true,
+        false,
+        null
+      ],
+      "canonical_args_hex": "93c3c2c0",
+      "args_hash": "1e364f6582ca4dc93b8bed0ff4413162cddafd52407517bff6248286cb863ac1",
+      "expected_key": "t:op:1e364f6582ca4dc93b8bed0ff4413162cddafd52407517bff6248286cb863ac1"
+    },
+    {
+      "name": "float_fractional",
+      "description": "Non-integral float stays float64",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$float": "3.14"
+        }
+      ],
+      "canonical_args_hex": "91cb40091eb851eb851f",
+      "args_hash": "8a855804f9b7adf8f428c4f1c757c44262265a2d13be6b4242ab6556724011cd",
+      "expected_key": "t:op:8a855804f9b7adf8f428c4f1c757c44262265a2d13be6b4242ab6556724011cd"
+    },
+    {
+      "name": "float_integral_collapse",
+      "description": "Number canonicalization: 2.0 encodes as int 2 (must equal single_int_two)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$float": "2.0"
+        }
+      ],
+      "canonical_args_hex": "9102",
+      "args_hash": "6df5e966da1ba347f99784f56e50e2f570e775e54c9c9349dd8944cb7fe01ea7",
+      "expected_key": "t:op:6df5e966da1ba347f99784f56e50e2f570e775e54c9c9349dd8944cb7fe01ea7"
+    },
+    {
+      "name": "single_int_two",
+      "description": "Int 2 \u2014 must produce the same key as float_integral_collapse",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        2
+      ],
+      "canonical_args_hex": "9102",
+      "args_hash": "6df5e966da1ba347f99784f56e50e2f570e775e54c9c9349dd8944cb7fe01ea7",
+      "expected_key": "t:op:6df5e966da1ba347f99784f56e50e2f570e775e54c9c9349dd8944cb7fe01ea7"
+    },
+    {
+      "name": "negative_zero",
+      "description": "-0.0 is integral, collapses to int 0",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$float": "-0.0"
+        }
+      ],
+      "canonical_args_hex": "9100",
+      "args_hash": "f3255c8870de95dd7cf82fab94f78110361b999beea857dac7607a4a67522bda",
+      "expected_key": "t:op:f3255c8870de95dd7cf82fab94f78110361b999beea857dac7607a4a67522bda"
+    },
+    {
+      "name": "float_large_integral_out_of_range",
+      "description": "Integral float 2^64 exceeds uint64 -> stays float64",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$float": "18446744073709551616"
+        }
+      ],
+      "canonical_args_hex": "91cb43f0000000000000",
+      "args_hash": "ab5d4f7d9ddd4a4daceb62a06b1765ab33e6db86aafd4e79ab6ad49f8a3960c8",
+      "expected_key": "t:op:ab5d4f7d9ddd4a4daceb62a06b1765ab33e6db86aafd4e79ab6ad49f8a3960c8"
+    },
+    {
+      "name": "map_key_sort_ascii",
+      "description": "Map keys sorted by code point: 'A' (0x41) before 'a' (0x61) before 'b'",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "b": 2,
+          "a": 1,
+          "A": 3
+        }
+      ],
+      "canonical_args_hex": "9183a14103a16101a16202",
+      "args_hash": "355030356fd2716354d3c0518604658891794f80f4838202ef931424b51f3f29",
+      "expected_key": "t:op:355030356fd2716354d3c0518604658891794f80f4838202ef931424b51f3f29"
+    },
+    {
+      "name": "map_key_sort_supplementary",
+      "description": "Code-point order trap: U+FF61 sorts before U+10000. JS UTF-16 code-unit sort gets this BACKWARDS (0xD800 < 0xFF61).",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "\ud800\udc00": 1,
+          "\uff61": 2
+        }
+      ],
+      "canonical_args_hex": "9182a3efbda102a4f090808001",
+      "args_hash": "f732e0e1342939877b9991ccc7177e4ed974f9f84de464d225fc742e467dbf3f",
+      "expected_key": "t:op:f732e0e1342939877b9991ccc7177e4ed974f9f84de464d225fc742e467dbf3f"
+    },
+    {
+      "name": "nested_map_recursive_sort",
+      "description": "Sorting applies at every nesting level",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "z": {
+            "b": 1,
+            "a": 2
+          },
+          "a": [
+            1,
+            2
+          ]
+        }
+      ],
+      "canonical_args_hex": "9182a161920102a17a82a16102a16201",
+      "args_hash": "2be8ea89d36af856c225ff709cb4b892148cc336b47fcd9b255dc736f35780d4",
+      "expected_key": "t:op:2be8ea89d36af856c225ff709cb4b892148cc336b47fcd9b255dc736f35780d4"
+    },
+    {
+      "name": "set_int_sorted",
+      "description": "Set {3,1,2} -> elements sorted by encoded bytes -> [1,2,3]",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$set": [
+            3,
+            1,
+            2
+          ]
+        }
+      ],
+      "canonical_args_hex": "9193010203",
+      "args_hash": "458a244b5b00f4244d52c7f1c5cd231355beae391eaf1d2e4bfee04d495b58b5",
+      "expected_key": "t:op:458a244b5b00f4244d52c7f1c5cd231355beae391eaf1d2e4bfee04d495b58b5"
+    },
+    {
+      "name": "set_heterogeneous",
+      "description": "Set {'b', 10, 'a'} -> byte order puts int 10 (0x0a) before strings",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$set": [
+            "b",
+            10,
+            "a"
+          ]
+        }
+      ],
+      "canonical_args_hex": "91930aa161a162",
+      "args_hash": "6e2c172b9a9e966d3febc66a2a28c05a6ffabbd3b798bf341ec1d55ed73d6e4f",
+      "expected_key": "t:op:6e2c172b9a9e966d3febc66a2a28c05a6ffabbd3b798bf341ec1d55ed73d6e4f"
+    },
+    {
+      "name": "set_mixed_sign_order",
+      "description": "Set {-5, 'a', 1.5}: encoded-byte order is 'a' (0xa1..), 1.5 (0xcb..), -5 (0xfb) \u2014 NOT numeric/type-grouped order. Kills 'sort naturally, ints first' implementations.",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$set": [
+            -5,
+            "a",
+            {
+              "$float": "1.5"
+            }
+          ]
+        }
+      ],
+      "canonical_args_hex": "9193a161cb3ff8000000000000fb",
+      "args_hash": "1f1a8fdd7221fac0fd57e7e5cd1ceec1c43eadd35570f6de63eb59ffc014a1e9",
+      "expected_key": "t:op:1f1a8fdd7221fac0fd57e7e5cd1ceec1c43eadd35570f6de63eb59ffc014a1e9"
+    },
+    {
+      "name": "float_collapse_lower_bound",
+      "description": "Inclusive lower collapse bound: float -2^63 MUST collapse to the int64-min encoding (0xd3...), symmetric with the exclusive upper bound vector",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$float": "-9223372036854775808"
+        }
+      ],
+      "canonical_args_hex": "91d38000000000000000",
+      "args_hash": "2882730c0cc9df9bc2152c1833892075377b801a72a715434f103b694e4a5909",
+      "expected_key": "t:op:2882730c0cc9df9bc2152c1833892075377b801a72a715434f103b694e4a5909"
+    },
+    {
+      "name": "set_dedupe_canonicalization",
+      "description": "Set {2, 2.0}: number canonicalization makes the encodings identical; dedupe by encoded bytes leaves a single int 2",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$set": [
+            2,
+            {
+              "$float": "2.0"
+            }
+          ]
+        }
+      ],
+      "canonical_args_hex": "919102",
+      "args_hash": "0b32675997838bef03127b5e69d6c103d5f622676fd5006254fa36a36c9a828c",
+      "expected_key": "t:op:0b32675997838bef03127b5e69d6c103d5f622676fd5006254fa36a36c9a828c"
+    },
+    {
+      "name": "datetime_fractional",
+      "description": "tz-aware datetime -> floor to micros -> one float64 division by 10^6",
+      "namespace": "events",
+      "operation": "get_by_time",
+      "args": [
+        {
+          "$datetime": "2024-01-01T12:30:45.123456+00:00"
+        }
+      ],
+      "canonical_args_hex": "91cb41d964ac1d47e6b4",
+      "args_hash": "1b85c4d90f566c5df71ebd437c4f296c1a2d5567c9cc69edb026f804a134997b",
+      "expected_key": "events:get_by_time:1b85c4d90f566c5df71ebd437c4f296c1a2d5567c9cc69edb026f804a134997b"
+    },
+    {
+      "name": "datetime_whole_second",
+      "description": "Whole-second datetime yields integral float64 -> collapses to int",
+      "namespace": "events",
+      "operation": "get_by_time",
+      "args": [
+        {
+          "$datetime": "2024-01-01T00:00:00+00:00"
+        }
+      ],
+      "canonical_args_hex": "91ce65920080",
+      "args_hash": "b3504b56c162854b07071c4577f3c73f3ec615c8a3152928bf5c6dba086461c2",
+      "expected_key": "events:get_by_time:b3504b56c162854b07071c4577f3c73f3ec615c8a3152928bf5c6dba086461c2"
+    },
+    {
+      "name": "datetime_non_utc_offset",
+      "description": "Non-UTC offset converts to the same instant (+05:30); key must equal datetime_fractional",
+      "namespace": "events",
+      "operation": "get_by_time",
+      "args": [
+        {
+          "$datetime": "2024-01-01T18:00:45.123456+05:30"
+        }
+      ],
+      "canonical_args_hex": "91cb41d964ac1d47e6b4",
+      "args_hash": "1b85c4d90f566c5df71ebd437c4f296c1a2d5567c9cc69edb026f804a134997b",
+      "expected_key": "events:get_by_time:1b85c4d90f566c5df71ebd437c4f296c1a2d5567c9cc69edb026f804a134997b"
+    },
+    {
+      "name": "datetime_pre_epoch",
+      "description": "Pre-epoch datetime: negative timestamp (-0.876544), microseconds floored toward negative infinity",
+      "namespace": "events",
+      "operation": "get_by_time",
+      "args": [
+        {
+          "$datetime": "1969-12-31T23:59:59.123456+00:00"
+        }
+      ],
+      "canonical_args_hex": "91cbbfec0ca600b02928",
+      "args_hash": "821ed5d8a5c055d2e42cf1c1b3df57f7e99914a8245446cc16567e581c1c1630",
+      "expected_key": "events:get_by_time:821ed5d8a5c055d2e42cf1c1b3df57f7e99914a8245446cc16567e581c1c1630"
+    },
+    {
+      "name": "uuid_lowercased",
+      "description": "UUID normalizes to lowercase hyphenated string (input was uppercase)",
+      "namespace": "users",
+      "operation": "get_by_uuid",
+      "args": [
+        {
+          "$uuid": "550E8400-E29B-41D4-A716-446655440000"
+        }
+      ],
+      "canonical_args_hex": "91d92435353065383430302d653239622d343164342d613731362d343436363535343430303030",
+      "args_hash": "14821dfe8848465aa23db43cb83be508f51d9ac556479bcc78b8a522e268a62a",
+      "expected_key": "users:get_by_uuid:14821dfe8848465aa23db43cb83be508f51d9ac556479bcc78b8a522e268a62a"
+    },
+    {
+      "name": "bytes_bin",
+      "description": "Bytes encode as msgpack bin (never str family)",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        {
+          "$bytes": "deadbeef"
+        }
+      ],
+      "canonical_args_hex": "91c404deadbeef",
+      "args_hash": "2ed8716bf7f1438057a9e8082b456c8566f95ed0dda11b1e16e6a1a74ebebfc0",
+      "expected_key": "t:op:2ed8716bf7f1438057a9e8082b456c8566f95ed0dda11b1e16e6a1a74ebebfc0"
+    },
+    {
+      "name": "issue_example_mixed",
+      "description": "Issue #1 vector: (42, 'hello', {'b': 2, 'a': 1})",
+      "namespace": "t",
+      "operation": "op",
+      "args": [
+        42,
+        "hello",
+        {
+          "b": 2,
+          "a": 1
+        }
+      ],
+      "canonical_args_hex": "932aa568656c6c6f82a16101a16202",
+      "args_hash": "03a0edbae0c1b5816c431652268d1527730175cdc0b45807cb07e1025ff971f6",
+      "expected_key": "t:op:03a0edbae0c1b5816c431652268d1527730175cdc0b45807cb07e1025ff971f6"
+    }
+  ],
+  "value_vectors": [
+    {
+      "name": "issue_example_object",
+      "description": "Issue #1 round-trip vector (canonical: sorted keys)",
+      "value": {
+        "name": "alice",
+        "age": 30
+      },
+      "canonical_msgpack_hex": "82a36167651ea46e616d65a5616c696365"
+    },
+    {
+      "name": "float_value_stays_float64",
+      "description": "VALUE profile: no number canonicalization, 2.0 stays float64",
+      "value": {
+        "$float": "2.0"
+      },
+      "canonical_msgpack_hex": "cb4000000000000000"
+    },
+    {
+      "name": "mixed_array",
+      "description": "Array value with mixed scalars",
+      "value": [
+        1,
+        "two",
+        {
+          "$float": "3.5"
+        },
+        null,
+        true
+      ],
+      "canonical_msgpack_hex": "9501a374776fcb400c000000000000c0c3"
+    },
+    {
+      "name": "datetime_sentinel_value",
+      "description": "Temporal VALUES use the wire-format.md sentinel map convention",
+      "value": {
+        "__datetime__": true,
+        "value": "2024-01-01T12:30:45.123456+00:00"
+      },
+      "canonical_msgpack_hex": "82ac5f5f6461746574696d655f5fc3a576616c7565d920323032342d30312d30315431323a33303a34352e3132333435362b30303a3030"
+    }
+  ],
+  "error_vectors": [
+    {
+      "name": "reject_nan",
+      "args": [
+        {
+          "$float": "nan"
+        }
+      ],
+      "error": "NaN is not allowed"
+    },
+    {
+      "name": "reject_infinity",
+      "args": [
+        {
+          "$float": "1e999"
+        }
+      ],
+      "error": "Infinity is not allowed (1e999 overflows to +inf in Python, JS, and Rust float parsers alike)"
+    },
+    {
+      "name": "reject_negative_infinity",
+      "args": [
+        {
+          "$float": "-1e999"
+        }
+      ],
+      "error": "-Infinity is not allowed (independent vector: +Inf rejection does not imply -Inf rejection)"
+    },
+    {
+      "name": "reject_int_overflow",
+      "args": [
+        {
+          "$int": "18446744073709551616"
+        }
+      ],
+      "error": "integer above 2^64-1"
+    },
+    {
+      "name": "reject_int_underflow",
+      "args": [
+        {
+          "$int": "-9223372036854775809"
+        }
+      ],
+      "error": "integer below -2^63"
+    },
+    {
+      "name": "reject_naive_datetime",
+      "args": [
+        {
+          "$datetime": "2024-01-01T00:00:00"
+        }
+      ],
+      "error": "naive datetime (no UTC offset)"
+    },
+    {
+      "name": "reject_uppercase_namespace",
+      "namespace": "Users",
+      "operation": "get_user",
+      "args": [],
+      "error": "namespace must match the segment pattern"
+    },
+    {
+      "name": "reject_colon_in_operation",
+      "namespace": "users",
+      "operation": "get:user",
+      "args": [],
+      "error": "operation must match the segment pattern"
+    },
+    {
+      "name": "reject_trailing_newline",
+      "namespace": "users\n",
+      "operation": "get_user",
+      "args": [],
+      "error": "segment validation must be a FULL-string match (Python re.match + $ accepts a trailing newline; use fullmatch)"
+    }
+  ],
+  "aad_vectors": [
+    {
+      "name": "interop_key_aad",
+      "description": "AAD v0x03 over an interop key; format=msgpack, compressed=False (always, in interop mode)",
+      "tenant_id": "cross-sdk-test",
+      "cache_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000004f75736572733a6765745f757365723a36313539383731363235353038303038306636343536656230363563326535316261646661613433323062306566653937343639633239636666656538383735000000076d73677061636b0000000546616c7365"
+    }
+  ],
+  "encryption_vectors": [
+    {
+      "name": "interop_encryption_roundtrip",
+      "description": "Full interop encryption round-trip: HKDF-SHA256 per spec/encryption.md (same master key + tenant as test-vectors/encryption.json, hence the same derived key), AES-256-GCM over the PLAIN MessagePack value bytes (no ByteStorage step) with the interop_key_aad AAD and a fixed nonce.",
+      "master_key_hex": "6161616161616161616161616161616161616161616161616161616161616161",
+      "tenant_id": "cross-sdk-test",
+      "derived_key_fingerprint_hex": "96179a9bc881aa7ca83f04b78a66afd3",
+      "cache_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000004f75736572733a6765745f757365723a36313539383731363235353038303038306636343536656230363563326535316261646661613433323062306566653937343639633239636666656538383735000000076d73677061636b0000000546616c7365",
+      "plaintext_hex": "82a36167651ea46e616d65a5616c696365",
+      "nonce_hex": "000102030405060708090a0b",
+      "ciphertext_hex": "000102030405060708090a0b033caf732820ce189e1506f842aebf8cdb6a242eb08c55b6f5a91eb9007b3bd657",
+      "ciphertext_layout": "nonce(12) || ciphertext || auth_tag(16)"
+    }
+  ]
+}
