@@ -19,6 +19,7 @@ from ..cache_handler import (
     StandardCacheHandler,
     get_backend_provider,
     get_logger,
+    redact_cache_key,
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
@@ -388,6 +389,7 @@ def create_cache_wrapper(
 
         # L1 cache settings
         l1_enabled = config.l1.enabled
+        l1_max_size_mb = config.l1.max_size_mb
 
         # Circuit breaker settings
         circuit_breaker = config.circuit_breaker.enabled
@@ -415,6 +417,7 @@ def create_cache_wrapper(
         custom_key_func = config.key
     else:
         custom_key_func = None
+        l1_max_size_mb = None
 
     # Re-scope custom_key_func for closure
     if "custom_key_func" not in dir():
@@ -490,8 +493,10 @@ def create_cache_wrapper(
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
 
-    # FIX: Initialize L1 cache if enabled
-    _l1_cache = get_l1_cache(namespace or "default") if l1_enabled else None
+    # Initialize L1 cache if enabled. The per-decorator budget (config.l1.max_size_mb)
+    # applies only when this namespace's cache is first created — namespaces share one
+    # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
+    _l1_cache = get_l1_cache(namespace or "default", max_size_mb=l1_max_size_mb) if l1_enabled else None
 
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
@@ -499,15 +504,19 @@ def create_cache_wrapper(
     # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio
     # drive background refresh via get_with_swr.
     from ..config.nested import L1CacheConfig
+    from ..config.singleton import get_settings
 
     _l1_config: L1CacheConfig = config.l1 if config is not None else L1CacheConfig()
+    # max_size_mb=None inherits the global CACHEKIT_L1_MAX_SIZE_MB setting (issue #163),
+    # mirroring L1CacheManager's resolution for the L2-backed path.
+    _l1_budget_mb: int = _l1_config.max_size_mb if _l1_config.max_size_mb is not None else get_settings().l1_max_size_mb
     # l1_enabled already merges the decorator param with config.l1.enabled (see
     # config handling above) — with it False in L1-only mode there is no cache
     # at all and the wrappers call the function directly.
     _object_cache: ObjectCache | None = (
         ObjectCache(
             max_entries=None,
-            max_size_bytes=_l1_config.max_size_mb * 1024 * 1024,
+            max_size_bytes=_l1_budget_mb * 1024 * 1024,
             swr_threshold_ratio=_l1_config.swr_threshold_ratio,
         )
         if _l1_only_mode and l1_enabled
@@ -956,7 +965,7 @@ def create_cache_wrapper(
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
-                    cache_key=cache_key,
+                    cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                     namespace=namespace or "default",
                     duration_ms=set_duration_ms,
                     serializer="rust",
@@ -1335,7 +1344,7 @@ def create_cache_wrapper(
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
-                                cache_key=cache_key or "unknown",
+                                cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
                                 correlation_id=correlation_id,
@@ -1415,7 +1424,7 @@ def create_cache_wrapper(
                     features.handle_cache_error(
                         error=e,
                         operation="cache_set",
-                        cache_key=cache_key or "unknown",
+                        cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
                         correlation_id=correlation_id,

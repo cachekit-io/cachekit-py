@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
@@ -54,6 +55,16 @@ def get_logger_provider():
 def get_backend_provider():
     """Get the current BackendProviderInterface from DI container."""
     return container.get(BackendProviderInterface)
+
+
+def redact_cache_key(cache_key: object) -> str:
+    """Redact a cache key for log/error messages.
+
+    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
+    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
+    across the sync and async cache-set failure paths without leaking the key itself.
+    """
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 
 
 # Lazy logger initialization to avoid import-time container access
@@ -578,6 +589,8 @@ class CacheSerializationHandler:
         Raises:
             ValueError: If tenant extraction fails in multi-tenant mode (FAIL CLOSED)
             ValueError: If cache_key is empty when encryption is enabled
+            ValueError: If the serialized envelope exceeds max_value_size
+                (CACHEKIT_MAX_VALUE_SIZE) — the L2 oversized-entry ceiling
             SerializationError: If serialization fails
 
         Note:
@@ -644,7 +657,7 @@ class CacheSerializationHandler:
 
             # Convert metadata to dict if needed
             metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-            return SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
+            wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
         except ValueError:
             # Tenant extraction or cache_key missing - FAIL CLOSED (re-raise, don't catch)
             # This is a security violation: encryption requires valid tenant_id and cache_key
@@ -653,6 +666,21 @@ class CacheSerializationHandler:
             # Don't silently fallback - log error and raise to prevent data loss
             get_logger().error(f"Serialization failed with {self.serializer_name}: {e}")
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
+
+        # L2 oversized-entry ceiling (issue #163): every L2 write flows through here,
+        # so this is the single enforcement point for max_value_size. Callers catch the
+        # raise and degrade to uncached execution (warning logged, function result still
+        # returned) — a cache must never break the wrapped function.
+        max_value_size = get_settings().max_value_size
+        if len(wrapped) > max_value_size:
+            # Redact the raw cache key: it can carry caller-supplied tenant/user identifiers, and
+            # this message reaches the fallback warning log path (issue #163 review).
+            raise ValueError(
+                f"Serialized value for key {redact_cache_key(cache_key)} is {len(wrapped)} bytes, exceeding "
+                f"max_value_size ({max_value_size} bytes); refusing to cache. Increase "
+                f"CACHEKIT_MAX_VALUE_SIZE to cache larger values."
+            )
+        return wrapped
 
     def supports_mmap_read(self) -> bool:
         """True iff reads can use the zero-copy mmap fast path (#171).
