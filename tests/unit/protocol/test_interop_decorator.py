@@ -185,6 +185,38 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    def test_direct_wrapper_call_bad_segment_rejected(self):
+        """create_cache_wrapper callers that bypass DecoratorConfig.validate
+        hit the same shared rules (validate_interop_config)."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        def f(x: int):
+            return x
+
+        with pytest.raises(ConfigurationError, match="invalid interop"):
+            create_cache_wrapper(f, interop="Not Valid", namespace="users")
+
+    def test_direct_wrapper_call_missing_namespace_rejected(self):
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        def f(x: int):
+            return x
+
+        with pytest.raises(ConfigurationError, match="namespace"):
+            create_cache_wrapper(f, interop="op")
+
+    def test_fast_mode_rejected(self, backend: DictBackend):
+        """fast-mode keys are not the canonical interop/v1 key format.
+        fast_mode is a direct create_cache_wrapper parameter (not a
+        DecoratorConfig field), so the guard lives there."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        def f(x: int):
+            return x
+
+        with pytest.raises(ConfigurationError, match="fast_mode"):
+            create_cache_wrapper(f, interop="op", namespace="ns", backend=backend, fast_mode=True)
+
     def test_non_default_serializer_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="serializer"):
 
