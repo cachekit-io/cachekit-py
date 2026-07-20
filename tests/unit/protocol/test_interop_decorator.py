@@ -162,6 +162,77 @@ class TestInteropKeysAndValues:
         assert get_user.cache_info().hits == 1
 
 
+class TestIntentDecoratorComposition:
+    """interop= is a DecoratorConfig field, so it composes with the intent
+    presets (@cache.production / .minimal / .secure) and the RORO config form —
+    the wire bytes are identical under every intent (presets tune reliability
+    knobs, which are orthogonal to the key/value format)."""
+
+    def test_production_and_minimal_presets_produce_vector_key(self):
+        # Distinct namespaces per case: presets keep L1 enabled (l1_enabled=
+        # collides with the presets' explicit l1= — pre-existing limitation),
+        # and L1 caches are global per namespace, so a shared namespace would
+        # serve case 2 from case 1's L1 entry (interop working as intended,
+        # but the wrong thing to assert on here).
+        from cachekit.interop import generate_interop_key
+
+        for preset, ns in ((cache.production, "users.prod"), (cache.minimal, "users.min")):
+            backend = DictBackend()
+
+            @preset(interop="get_user", namespace=ns, backend=backend)
+            def get_user(user_id: int):
+                return {"name": "alice", "age": 30}
+
+            get_user(42)
+            expected = generate_interop_key(ns, "get_user", [42])
+            assert list(backend.store) == [expected], f"{ns}: intent preset must not perturb interop keys"
+            # Value bytes are namespace-independent — byte-pinned by the vector
+            assert backend.store[expected].hex() == VALUE_VECTORS["issue_example_object"]["canonical_msgpack_hex"]
+
+    def test_secure_preset_composes_with_interop(self):
+        pytest.importorskip("cachekit._rust_serializer")
+        from cachekit.interop import generate_interop_key
+
+        backend = DictBackend()
+
+        @cache.secure(
+            interop="get_user",
+            namespace="users.sec",
+            backend=backend,
+            master_key="61" * 32,
+            single_tenant_mode=True,
+            deployment_uuid="00000000-0000-0000-0000-000000000001",
+        )
+        def get_user(user_id: int):
+            return {"name": "alice", "age": 30}
+
+        assert get_user(42) == {"name": "alice", "age": 30}
+        (key,) = backend.store
+        assert key == generate_interop_key("users.sec", "get_user", [42])
+        assert not backend.store[key].startswith(b"CK")
+        assert get_user(42) == {"name": "alice", "age": 30}  # decrypting hit
+
+    def test_local_preset_rejects_interop(self):
+        with pytest.raises(TypeError, match="interop"):
+
+            @cache.local(interop="get_user", namespace="users")
+            def get_user(user_id: int):
+                return user_id
+
+    def test_roro_config_form(self):
+        from cachekit import DecoratorConfig
+
+        backend = DictBackend()
+        cfg = DecoratorConfig(interop="get_user", namespace="users", backend=backend, ttl=300)
+
+        @cache(config=cfg, l1_enabled=False)
+        def get_user(user_id: int):
+            return {"name": "alice", "age": 30}
+
+        get_user(42)
+        assert list(backend.store) == [KEY_VECTORS["single_int"]["expected_key"]]
+
+
 class TestInteropRejections:
     def test_missing_namespace_rejected_at_decoration(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="namespace"):
