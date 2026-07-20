@@ -91,6 +91,17 @@ class PerRequestRedisBackend:
         self._tenant_id = url_encode(tenant_id, safe="")
         self._original_tenant_id = tenant_id
 
+    @property
+    def key_prefix(self) -> str:
+        """Wire-level key prefix (contract for interop mode's fail-closed guard).
+
+        Every key this wrapper touches is rewritten to ``t:{tenant}:{key}`` —
+        invisible to other SDKs reading the same Redis, so interop mode MUST
+        reject this backend (see cachekit.interop.ensure_interop_backend_compatible).
+        Backends that rewrite keys on the wire MUST expose the prefix here.
+        """
+        return f"t:{self._tenant_id}:"
+
     def _scoped_key(self, key: str) -> str:
         """Generate tenant-scoped key with URL-encoded tenant ID.
 
