@@ -13,6 +13,7 @@ def pytest_runtest_setup(item):
         or "secure_env_fallback" in item.nodeid
         or "local_cache_works" in item.nodeid
         or "backpressure_load_control" in item.nodeid
+        or "byte_storage_gil" in item.nodeid
     )
     if skip_redis:
         # Remove autouse redis fixtures for tests that don't need Redis
