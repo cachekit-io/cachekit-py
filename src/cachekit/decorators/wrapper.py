@@ -26,7 +26,7 @@ from ..interop import (
     bind_flat_args,
     ensure_interop_backend_compatible,
     generate_interop_key,
-    validate_segment,
+    validate_interop_config,
 )
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
@@ -456,14 +456,10 @@ def create_cache_wrapper(
     if interop is not None:
         from ..config.validation import ConfigurationError
 
-        validate_segment("operation", interop)
-        if namespace is None:
-            raise ConfigurationError(
-                'interop mode requires an explicit namespace: @cache(interop="get_user", namespace="users").'
-            )
-        validate_segment("namespace", namespace)
-        if custom_key_func is not None:
-            raise ConfigurationError("interop mode and a custom key= function are mutually exclusive.")
+        try:
+            validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
+        except InteropError as e:
+            raise ConfigurationError(str(e)) from e
         if fast_mode:
             raise ConfigurationError(
                 "interop mode and fast_mode are mutually exclusive: fast-mode keys are not the canonical interop/v1 key format."

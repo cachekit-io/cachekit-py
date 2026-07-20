@@ -242,24 +242,12 @@ class DecoratorConfig:
         # Interop mode validation (interop/v1, spec/interop-mode.md): loud at
         # decoration time, never silently normalized.
         if self.interop is not None:
-            from cachekit.interop import InteropError, validate_segment
+            from cachekit.interop import InteropError, validate_interop_config
 
             try:
-                validate_segment("operation", self.interop)
-                if self.namespace is None:
-                    raise ConfigurationError(
-                        "interop mode requires an explicit namespace: "
-                        '@cache(interop="get_user", namespace="users"). The namespace is the '
-                        "first segment of the cross-SDK cache key."
-                    )
-                validate_segment("namespace", self.namespace)
+                validate_interop_config(self.interop, self.namespace, has_custom_key=self.key is not None)
             except InteropError as e:
                 raise ConfigurationError(str(e)) from e
-            if self.key is not None:
-                raise ConfigurationError(
-                    "interop mode and a custom key= function are mutually exclusive: interop keys "
-                    "are generated from the canonical argument array by specification."
-                )
             # Serializer and tenant_extractor constraints are enforced by their
             # single authority, CacheSerializationHandler.__init__ (which owns
             # the alias map and the encryption config) — it runs at decoration

@@ -293,6 +293,30 @@ def validate_segment(name: str, segment: object) -> str:
     return segment
 
 
+def validate_interop_config(operation: object, namespace: object, *, has_custom_key: bool = False) -> tuple[str, str]:
+    """Core decoration-time interop rules — the single authority both
+    decoration paths (DecoratorConfig.validate and create_cache_wrapper)
+    delegate to, so the cross-SDK rules cannot drift between them.
+
+    Covers: operation/namespace segment charset, mandatory namespace,
+    ``key=`` mutual exclusion. Raises InteropError; callers keep their own
+    error wrapping and site-specific checks (fast_mode, L1-only, backend).
+    """
+    op = validate_segment("operation", operation)
+    if namespace is None:
+        raise InteropError(
+            'interop mode requires an explicit namespace: @cache(interop="get_user", namespace="users"). '
+            "The namespace is the first segment of the cross-SDK cache key."
+        )
+    ns = validate_segment("namespace", namespace)
+    if has_custom_key:
+        raise InteropError(
+            "interop mode and a custom key= function are mutually exclusive: interop keys "
+            "are generated from the canonical argument array by specification."
+        )
+    return op, ns
+
+
 def generate_interop_key(namespace: str, operation: str, args: list | tuple) -> str:
     """Build the interop/v1 cache key ``{namespace}:{operation}:{args_hash}``.
 
@@ -467,5 +491,6 @@ __all__ = [
     "encode_interop_value",
     "ensure_interop_backend_compatible",
     "generate_interop_key",
+    "validate_interop_config",
     "validate_segment",
 ]
