@@ -111,6 +111,24 @@ def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBacken
     return hasattr(backend, "get_buffer")
 
 
+class SWRCapableBackend(Protocol):
+    """Backend with server-signaled stale-while-revalidate reads (LAB-381).
+
+    Reads report whether the entry is in its stale-grace window; writes accept
+    the window length. Currently only CachekitIOBackend (the SaaS signals
+    freshness on read — see protocol spec/saas-api.md#stale-while-revalidate).
+    """
+
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]: ...
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None, stale_ttl: Optional[int] = None) -> None: ...
+
+
+def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
+    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381)."""
+    return hasattr(backend, "get_with_freshness")
+
+
 # Import caching for serializer modules
 #
 # PERFORMANCE OPTIMIZATION: Dynamic imports are expensive (~100μs per import)
@@ -1520,13 +1538,50 @@ class StandardCacheHandler:
             get_logger().error(f"Unexpected error mmapping key {key}: {e}")
             return None
 
-    def set(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
+        """Get value plus SWR staleness from an SWR-capable backend (LAB-381).
+
+        Returns ``(bytes, is_stale)`` on a hit, or None on miss/error (same
+        degradation contract as :meth:`get` — an error reads as a miss and the
+        caller takes the synchronous recompute path).
+        """
+        if not supports_swr(self.backend):
+            value = self.get(key)
+            return (value, False) if value is not None else None
+        try:
+            return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
+        except BackendError as e:
+            get_logger().error(f"Backend error getting key {key}: {e}")
+            return None
+        except Exception as e:
+            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            return None
+
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+        """Async variant of :meth:`get_with_freshness` (sync backend call in the thread pool)."""
+        if not supports_swr(self.backend):
+            value = await self.get_async(key)
+            return (value, False) if value is not None else None
+        try:
+            return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+        except BackendError as e:
+            get_logger().error(f"Backend error getting key {key}: {e}")
+            return None
+        except Exception as e:
+            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            return None
+
+    def set(
+        self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, stale_ttl: Optional[int] = None, **metadata
+    ) -> bool:
         """Set value in cache using backend.
 
         Args:
             key: Cache key
             value: Bytes value to store (encrypted or plaintext msgpack)
             ttl: Time-to-live in seconds
+            stale_ttl: SWR stale-grace window in seconds past the fresh TTL
+                (LAB-381); silently ignored on backends without SWR support.
             **metadata: Additional metadata (ignored, for compatibility)
 
         Returns:
@@ -1537,7 +1592,10 @@ class StandardCacheHandler:
             value = value.encode("utf-8")
 
         try:
-            self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
+            if stale_ttl is not None and supports_swr(self.backend):
+                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl, stale_ttl)
+            else:
+                self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
             get_logger().error(f"Backend error setting key {key}: {e}")
@@ -1601,10 +1659,14 @@ class StandardCacheHandler:
             get_logger().error(f"Unexpected error getting key {key}: {e}")
             return None
 
-    async def set_async(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:
+    async def set_async(
+        self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, stale_ttl: Optional[int] = None, **metadata
+    ) -> bool:
         """Set value in cache asynchronously using backend.
 
         Runs sync backend.set() in a thread pool to avoid blocking the event loop.
+        ``stale_ttl`` opens an SWR stale-grace window (LAB-381); silently ignored
+        on backends without SWR support.
         """
         # Ensure value is bytes
         if isinstance(value, str):
@@ -1612,7 +1674,10 @@ class StandardCacheHandler:
 
         try:
             # Run sync backend operation in thread pool
-            await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
+            if stale_ttl is not None and supports_swr(self.backend):
+                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl, stale_ttl)
+            else:
+                await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
             get_logger().error(f"Backend error setting key {key}: {e}")

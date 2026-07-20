@@ -34,6 +34,20 @@ _logger = get_structured_logger(__name__)
 # preferring the header. See protocol spec/saas-api.md (DELETE .../lock).
 LOCK_ID_HEADER = "X-CacheKit-Lock-Id"
 
+# Protocol-canonical TTL header (spec/saas-api.md). The legacy X-TTL is sent
+# alongside it until the dual-reading server (saas#245) is deployed everywhere;
+# sending both is value-identical and safe against either server generation.
+# TODO(LAB-381 follow-up): drop X-TTL once saas#245 is live in prod.
+TTL_HEADER = "X-CacheKit-TTL"
+LEGACY_TTL_HEADER = "X-TTL"
+
+# Stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate).
+# STALE_TTL_HEADER rides PUTs to open a stale-grace window past the fresh TTL;
+# FRESHNESS_HEADER labels every GET/HEAD 200 as fresh|stale. Pre-SWR servers
+# ignore the former and never emit the latter.
+STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
+FRESHNESS_HEADER = "X-CacheKit-Freshness"
+
 
 def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     """Extract cache metrics and format as HTTP headers.
@@ -335,22 +349,62 @@ class CachekitIOBackend:
                     return None
             raise
 
-    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+    @staticmethod
+    def _is_stale(response: httpx.Response) -> bool:
+        """Map the X-CacheKit-Freshness header to staleness (spec/saas-api.md).
+
+        Absent header = fresh (pre-SWR server); unrecognized value = stale
+        (revalidation is the conservative action). Tokens are lowercase and
+        case-sensitive per spec.
+        """
+        value = response.headers.get(FRESHNESS_HEADER)
+        return value is not None and value != "fresh"
+
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+        """Retrieve value plus its SWR freshness (sync).
+
+        Returns:
+            ``(value, is_stale)`` on a hit — ``is_stale`` is True only for an
+            entry in its stale-grace window (LAB-381) — or None on a miss.
+
+        Raises:
+            BackendError: If operation fails (network, auth, etc.)
+        """
+        try:
+            response = self._request_sync("GET", key)
+            return response.content, self._is_stale(response)
+        except BackendError as exc:
+            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
+                if exc.original_exception.response.status_code == 404:
+                    return None
+            raise
+
+    def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (sync).
 
         Args:
             key: Cache key
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional)
+            stale_ttl: Stale-grace window in seconds past the fresh TTL
+                (LAB-381 SWR). Only honoured alongside an explicit ``ttl``;
+                pre-SWR servers ignore it.
 
         Raises:
             BackendError: If operation fails
         """
-        headers = {}
-        if ttl is not None:
-            headers["X-TTL"] = str(ttl)
+        self._request_sync("PUT", key, content=value, headers=self._set_headers(ttl, stale_ttl))
 
-        self._request_sync("PUT", key, content=value, headers=headers)
+    @staticmethod
+    def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
+        """PUT timing headers: canonical + legacy TTL (dual-send until saas#245 deploys), stale window."""
+        headers: dict[str, str] = {}
+        if ttl is not None:
+            headers[TTL_HEADER] = str(ttl)
+            headers[LEGACY_TTL_HEADER] = str(ttl)
+        if stale_ttl is not None and stale_ttl > 0 and ttl is not None:
+            headers[STALE_TTL_HEADER] = str(stale_ttl)
+        return headers
 
     def delete(self, key: str) -> bool:
         """Delete key from cache (sync).
@@ -457,22 +511,32 @@ class CachekitIOBackend:
                     return None
             raise
 
-    async def set_async(self, key: str, value: bytes, ttl: int | None = None) -> None:
+    async def get_with_freshness_async(self, key: str) -> tuple[bytes, bool] | None:
+        """Retrieve value plus its SWR freshness (async). See :meth:`get_with_freshness`."""
+        try:
+            response = await self._request_async("GET", key)
+            return response.content, self._is_stale(response)
+        except BackendError as exc:
+            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
+                if exc.original_exception.response.status_code == 404:
+                    return None
+            raise
+
+    async def set_async(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (async).
 
         Args:
             key: Cache key
             value: Bytes to cache
             ttl: Time-to-live in seconds (optional)
+            stale_ttl: Stale-grace window in seconds past the fresh TTL
+                (LAB-381 SWR). Only honoured alongside an explicit ``ttl``;
+                pre-SWR servers ignore it.
 
         Raises:
             BackendError: If operation fails
         """
-        headers = {}
-        if ttl is not None:
-            headers["X-TTL"] = str(ttl)
-
-        await self._request_async("PUT", key, content=value, headers=headers)
+        await self._request_async("PUT", key, content=value, headers=self._set_headers(ttl, stale_ttl))
 
     async def delete_async(self, key: str) -> bool:
         """Delete key from cache (async).
