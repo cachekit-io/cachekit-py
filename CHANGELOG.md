@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.12.0](https://github.com/cachekit-io/cachekit-py/compare/v0.11.1...v0.12.0) (2026-07-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** CachekitConfig fields enable_compression, compression_level and max_chunk_size_mb were removed; constructing CachekitConfig with them now raises a ValidationError (their CACHEKIT_* env vars were already no-ops and remain ignored). max_value_size is now enforced: serialized envelopes larger than it (default 100MB, CACHEKIT_MAX_VALUE_SIZE) are no longer cached.
+
+### Features
+
+* checksum FFI binding + benchmark (cachekit-core[#13](https://github.com/cachekit-io/cachekit-py/issues/13) Phase 2) ([#212](https://github.com/cachekit-io/cachekit-py/issues/212)) ([9245c30](https://github.com/cachekit-io/cachekit-py/commit/9245c300ad8d1a510592f991d3de0b63bcdf9795))
+
+
+### Bug Fixes
+
+* **config:** enforce l1_max_size_mb + max_value_size, remove dead zlib/chunk knobs (LAB-109) ([#217](https://github.com/cachekit-io/cachekit-py/issues/217)) ([a5a347c](https://github.com/cachekit-io/cachekit-py/commit/a5a347c4334f017e88f366ee32a3b762a1946f93))
+* **decorators:** L1-only mode (backend=None) honors L1CacheConfig SWR + max_size_mb (LAB-106) ([#219](https://github.com/cachekit-io/cachekit-py/issues/219)) ([bef4c05](https://github.com/cachekit-io/cachekit-py/commit/bef4c05bb3442361fe6ac166ebbd4ddd966a6b3e))
+* **redis:** honour redis_url, fix zero-config DI crash, add finite socket timeouts (LAB-352) ([#224](https://github.com/cachekit-io/cachekit-py/issues/224)) ([e45106e](https://github.com/cachekit-io/cachekit-py/commit/e45106e0ffd832f01280b123f249692ed9a3c7db))
+* **security:** fail closed on plaintext frames when encryption is enabled (LAB-241) ([#215](https://github.com/cachekit-io/cachekit-py/issues/215)) ([7e5be4a](https://github.com/cachekit-io/cachekit-py/commit/7e5be4aee64d1a24b9e7278e5c628e3115154e45))
+* **serializers:** AutoSerializer sets compressed metadata from the actual ByteStorage codec ([#211](https://github.com/cachekit-io/cachekit-py/issues/211)) ([47f8520](https://github.com/cachekit-io/cachekit-py/commit/47f85205bc0ea60ec6df4bd9a1e2945887a390a5))
+
+
+### Performance Improvements
+
+* release the GIL during ByteStorage compress/hash (LAB-347) ([#223](https://github.com/cachekit-io/cachekit-py/issues/223)) ([269aecf](https://github.com/cachekit-io/cachekit-py/commit/269aecf6d6b3b8993b0f5b9aa1f5c1f527b578ff))
+
 ## [0.11.1](https://github.com/cachekit-io/cachekit-py/compare/v0.11.0...v0.11.1) (2026-06-26)
 
 
