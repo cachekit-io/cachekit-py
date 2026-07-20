@@ -60,8 +60,11 @@ These functions are provided for documentation examples and return mock data:
 - `process_tenant_request(tenant_id, request)` - Returns tenant result
 
 #### Configuration
-- `secret_key` - Test encryption key (value: `"a" * 64`)
-- `CACHEKIT_MASTER_KEY` - Environment variable set to `secret_key` (enables `@cache.secure` examples)
+- `secret_key` - Test encryption key (value: `"a" * 64`). `@cache.secure` examples must
+  pass it explicitly (`master_key=secret_key`); the conftest does **not** set
+  `CACHEKIT_MASTER_KEY` in the environment because an ambient key turns encryption on
+  globally and breaks plain `@cache` fences that use `serializer="auto"` or custom
+  serializers.
 
 ## Skipping Examples with `notest`
 

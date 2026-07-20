@@ -10,7 +10,7 @@ byte-identical output (see tests/unit/test_checksum_ffi.py), so the choice
 is purely a per-call-overhead question.
 
 Run:
-    uv run pytest tests/benchmarks/benchmark_checksum_ffi.py \
+    uv run pytest tests/performance/benchmark_checksum_ffi.py \
         --benchmark-only --benchmark-group-by=group --benchmark-min-rounds=30
 
 Results (2026-07-17, AMD Ryzen 9 5950X, CPython 3.13.12, median per call):

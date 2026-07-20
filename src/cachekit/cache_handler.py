@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
@@ -55,6 +56,16 @@ def get_logger_provider():
 def get_backend_provider():
     """Get the current BackendProviderInterface from DI container."""
     return container.get(BackendProviderInterface)
+
+
+def redact_cache_key(cache_key: object) -> str:
+    """Redact a cache key for log/error messages.
+
+    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
+    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
+    across the sync and async cache-set failure paths without leaking the key itself.
+    """
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 
 
 # Lazy logger initialization to avoid import-time container access
@@ -117,7 +128,9 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
     Args:
         error: The exception raised by the deserialize path.
         tier: Cache tier where the failure surfaced ("l1" or "l2").
-        cache_key: Cache key being read (logs only; metric labels stay bounded).
+        cache_key: Cache key being read. Logged only in redacted form
+            (redact_cache_key, issue #163 — keys can embed tenant/user
+            identifiers); metric labels stay bounded and never carry it.
         fail_closed: The handler's resolved encryption fail-closed policy.
 
     Returns:
@@ -141,11 +154,11 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
 
     if fail_closed and isinstance(error, DecryptionAuthenticationError):
         get_logger().error(
-            f"{tier.upper()} cache decrypt AUTHENTICATION failure for {cache_key}; "
+            f"{tier.upper()} cache decrypt AUTHENTICATION failure for {redact_cache_key(cache_key)}; "
             f"failing closed (encryption.fail_closed=True): {error}"
         )
         raise error
-    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {cache_key}: {error}")
+    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {error}")
     return reason
 
 
@@ -677,6 +690,8 @@ class CacheSerializationHandler:
         Raises:
             ValueError: If tenant extraction fails in multi-tenant mode (FAIL CLOSED)
             ValueError: If cache_key is empty when encryption is enabled
+            ValueError: If the serialized envelope exceeds max_value_size
+                (CACHEKIT_MAX_VALUE_SIZE) — the L2 oversized-entry ceiling
             SerializationError: If serialization fails
 
         Note:
@@ -743,7 +758,7 @@ class CacheSerializationHandler:
 
             # Convert metadata to dict if needed
             metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-            return SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
+            wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
         except ValueError:
             # Tenant extraction or cache_key missing - FAIL CLOSED (re-raise, don't catch)
             # This is a security violation: encryption requires valid tenant_id and cache_key
@@ -752,6 +767,21 @@ class CacheSerializationHandler:
             # Don't silently fallback - log error and raise to prevent data loss
             get_logger().error(f"Serialization failed with {self.serializer_name}: {e}")
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
+
+        # L2 oversized-entry ceiling (issue #163): every L2 write flows through here,
+        # so this is the single enforcement point for max_value_size. Callers catch the
+        # raise and degrade to uncached execution (warning logged, function result still
+        # returned) — a cache must never break the wrapped function.
+        max_value_size = get_settings().max_value_size
+        if len(wrapped) > max_value_size:
+            # Redact the raw cache key: it can carry caller-supplied tenant/user identifiers, and
+            # this message reaches the fallback warning log path (issue #163 review).
+            raise ValueError(
+                f"Serialized value for key {redact_cache_key(cache_key)} is {len(wrapped)} bytes, exceeding "
+                f"max_value_size ({max_value_size} bytes); refusing to cache. Increase "
+                f"CACHEKIT_MAX_VALUE_SIZE to cache larger values."
+            )
+        return wrapped
 
     def supports_mmap_read(self) -> bool:
         """True iff reads can use the zero-copy mmap fast path (#171).
@@ -884,8 +914,8 @@ class CacheSerializationHandler:
                     if cache_key not in self._drift_warned_keys and len(self._drift_warned_keys) < 1024:
                         self._drift_warned_keys.add(cache_key)
                         get_logger().warning(
-                            f"Config-drift read for {cache_key or 'unknown key'}: handler has encryption "
-                            f"disabled but the cache entry is encrypted (tenant "
+                            f"Config-drift read for {redact_cache_key(cache_key) if cache_key else 'unknown key'}: "
+                            f"handler has encryption disabled but the cache entry is encrypted (tenant "
                             f"'{metadata.tenant_id or 'unknown'}'). Decrypting via the globally configured "
                             f"master key. If encryption was not recently disabled for this function, "
                             f"investigate for misconfiguration or cache tampering. Further reads of this "
@@ -1062,7 +1092,7 @@ class CacheOperationHandler:
                 if self._cache_handler is not None:
                     self._cache_handler.delete(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1111,7 +1141,7 @@ class CacheOperationHandler:
                 if self._cache_handler is not None:
                     await self._cache_handler.delete_async(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")

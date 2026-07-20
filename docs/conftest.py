@@ -6,7 +6,6 @@ into all markdown code examples.
 """
 
 import logging
-import os
 import time
 
 try:
@@ -91,10 +90,16 @@ def pytest_markdown_docs_globals():
     logger = logging.getLogger("cachekit.examples")
     logger.setLevel(logging.INFO)
 
-    # Secret key for encryption examples (test value only)
+    # Secret key for encryption examples (test value only). Exposed as a global
+    # so @cache.secure fences can pass it explicitly (master_key=secret_key).
+    #
+    # We deliberately DO NOT set CACHEKIT_MASTER_KEY in the environment here.
+    # Since the PR #127 auto-detect + PR #200 settings re-read, an ambient
+    # master key turns encryption on globally, and the v0.6.0 cross-SDK rule
+    # then rejects any plain `@cache` fence using a non-cross-SDK serializer
+    # (serializer="auto", custom serializer instances) at decoration time.
+    # tests/conftest.py hit the same trap and fixed it the same way. See #205.
     secret_key = "a" * 64  # 32 bytes in hex
-    # Set env var so @cache.secure validation passes
-    os.environ["CACHEKIT_MASTER_KEY"] = secret_key
 
     globals_dict = {
         "cache": cache,
