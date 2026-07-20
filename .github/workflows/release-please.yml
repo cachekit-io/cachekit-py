@@ -120,6 +120,8 @@ jobs:
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
       # fetch-depth: 0 — the rebase needs history back to the merge-base with main.
+      # persist-credentials: false — don't leave the App token in .git/config for
+      # the uv/cargo steps; the final push re-supplies it via env (zizmor artipacked).
       - name: Checkout release PR branch
         if: steps.find.outputs.branch != ''
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -127,6 +129,7 @@ jobs:
           ref: ${{ steps.find.outputs.branch }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install uv
         if: steps.find.outputs.branch != ''
@@ -140,6 +143,7 @@ jobs:
         if: steps.find.outputs.branch != ''
         env:
           BRANCH: ${{ steps.find.outputs.branch }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -183,6 +187,13 @@ jobs:
           # force-with-lease: the rebase rewrites history; the lease refuses the
           # push if anything else (release-please, a human) moved the branch since
           # checkout — the next main push converges instead of clobbering.
+          # Auth is scoped to this one command: checkout ran with
+          # persist-credentials: false, so nothing earlier in the job could read a
+          # token from .git/config; GIT_CONFIG_* env vars keep it out of argv too.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
           git push --force-with-lease origin "HEAD:${BRANCH}"
 
   validate-inputs:
