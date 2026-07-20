@@ -51,6 +51,66 @@ def _get_async_pool_lock() -> asyncio.Lock:
 _thread_local = threading.local()
 
 
+def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -> int:
+    """Resolve the pool size, enforcing the same > 0 invariant as the config field."""
+    if override is None:
+        return cfg.connection_pool_size
+    if override <= 0:
+        raise ValueError(f"max_connections must be > 0, got {override}")
+    return override
+
+
+def create_connection_pool(
+    redis_url: str,
+    config: Optional[RedisBackendConfig] = None,
+    max_connections: Optional[int] = None,
+) -> redis.ConnectionPool:
+    """Create a sync connection pool bound to an explicit URL.
+
+    Single source of truth for pool kwargs: every sync pool in cachekit is
+    built here so binary-safety (decode_responses=False) and finite socket
+    timeouts (fail fast on an unreachable Redis instead of blocking on the
+    OS TCP timeout) apply uniformly.
+
+    Args:
+        redis_url: Redis connection URL the pool is bound to
+        config: Pool tuning knobs; defaults to env-derived config. Its
+            redis_url field is ignored — the explicit URL argument wins.
+        max_connections: Override for config.connection_pool_size
+
+    Returns:
+        redis.ConnectionPool bound to redis_url (no connection is made here;
+        the pool connects lazily on first use)
+    """
+    cfg = config or RedisBackendConfig.from_env()
+    return redis.ConnectionPool.from_url(
+        redis_url,
+        decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
+        max_connections=_resolve_max_connections(max_connections, cfg),
+        socket_timeout=cfg.socket_timeout,
+        socket_connect_timeout=cfg.socket_connect_timeout,
+    )
+
+
+def create_async_connection_pool(
+    redis_url: str,
+    config: Optional[RedisBackendConfig] = None,
+    max_connections: Optional[int] = None,
+) -> redis_async.ConnectionPool:
+    """Create an async connection pool bound to an explicit URL.
+
+    Async twin of create_connection_pool() — same kwargs, same rationale.
+    """
+    cfg = config or RedisBackendConfig.from_env()
+    return redis_async.ConnectionPool.from_url(
+        redis_url,
+        decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
+        max_connections=_resolve_max_connections(max_connections, cfg),
+        socket_timeout=cfg.socket_timeout,
+        socket_connect_timeout=cfg.socket_connect_timeout,
+    )
+
+
 def get_redis_client() -> redis.Redis:
     """Get a synchronous Redis client using connection pooling.
 
@@ -74,13 +134,7 @@ def get_redis_client() -> redis.Redis:
             if _pool_instance is None:
                 # Get Redis-specific configuration
                 redis_config = RedisBackendConfig.from_env()
-
-                # Use URL-based connection
-                _pool_instance = redis.ConnectionPool.from_url(
-                    redis_config.redis_url,
-                    decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
-                    max_connections=redis_config.connection_pool_size,
-                )
+                _pool_instance = create_connection_pool(redis_config.redis_url, redis_config)
 
     return redis.Redis(connection_pool=_pool_instance)
 
@@ -116,13 +170,7 @@ async def get_async_redis_client() -> redis_async.Redis:
             if _async_pool_instance is None:
                 # Get Redis-specific configuration
                 redis_config = RedisBackendConfig.from_env()
-
-                # Use URL-based connection
-                _async_pool_instance = redis_async.ConnectionPool.from_url(
-                    redis_config.redis_url,
-                    decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
-                    max_connections=redis_config.connection_pool_size,
-                )
+                _async_pool_instance = create_async_connection_pool(redis_config.redis_url, redis_config)
 
     return redis_async.Redis(connection_pool=_async_pool_instance)
 
@@ -205,6 +253,8 @@ def reset_global_pool():
 
 
 __all__ = [
+    "create_async_connection_pool",
+    "create_connection_pool",
     "get_async_redis_client",
     "get_cached_async_redis_client",
     "get_cached_redis_client",

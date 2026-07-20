@@ -5,6 +5,16 @@ implementations for dependency injection. Follows protocol-based design
 for maximum flexibility and testing capability.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import redis
+    import redis.asyncio as redis_async
+
+    from cachekit.backends.redis.config import RedisBackendConfig
+
 
 class CacheClientProvider:
     """Abstract interface for Redis client providers."""
@@ -99,6 +109,44 @@ class DefaultCacheClientProvider(CacheClientProvider):
         from cachekit.backends.redis.client import get_cached_async_redis_client
 
         return await get_cached_async_redis_client()
+
+
+class PooledClientProvider(CacheClientProvider):
+    """Redis client provider with per-instance pools bound to an explicit URL.
+
+    Unlike DefaultCacheClientProvider (process-global pool configured from the
+    environment), each instance owns its own connection pools built from the
+    URL it was given — the URL a caller passes is the URL that gets used.
+    This is what makes RedisBackend(redis_url=...) honour its argument instead
+    of silently connecting wherever CACHEKIT_REDIS_URL/REDIS_URL point (#222).
+
+    No connection is made at construction time; pools connect lazily on first use.
+    """
+
+    def __init__(self, redis_url: str, config: Optional[RedisBackendConfig] = None) -> None:
+        from cachekit.backends.redis.client import create_connection_pool
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        self._redis_url = redis_url
+        self._config = config or RedisBackendConfig.from_env()
+        self._pool = create_connection_pool(redis_url, self._config)
+        self._async_pool: Optional[redis_async.ConnectionPool] = None
+
+    def get_sync_client(self) -> redis.Redis:
+        import redis
+
+        return redis.Redis(connection_pool=self._pool)
+
+    async def get_async_client(self) -> redis_async.Redis:
+        import redis.asyncio as redis_async
+
+        from cachekit.backends.redis.client import create_async_connection_pool
+
+        if self._async_pool is None:
+            # Created lazily inside a running loop. No await between the check
+            # and the assignment, so single-loop use is race-free.
+            self._async_pool = create_async_connection_pool(self._redis_url, self._config)
+        return redis_async.Redis(connection_pool=self._async_pool)
 
 
 class DefaultBackendProvider(BackendProviderInterface):
@@ -205,4 +253,5 @@ __all__ = [
     "BackendProviderInterface",
     "DefaultCacheClientProvider",
     "DefaultBackendProvider",
+    "PooledClientProvider",
 ]

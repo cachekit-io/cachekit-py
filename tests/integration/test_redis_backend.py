@@ -87,18 +87,54 @@ class TestRedisBackendInitialization:
         assert backend._client_provider is mock_provider
 
     def test_backward_compatibility_fallback_to_container(self):
-        """RedisBackend should fallback to container when client_provider not provided."""
+        """Zero-config RedisBackend() should honour a DI-registered provider."""
         with patch("cachekit.backends.redis.backend.DIContainer") as mock_container_class:
             mock_container_instance = Mock()
             mock_provider = Mock()
             mock_container_class.return_value = mock_container_instance
             mock_container_instance.get.return_value = mock_provider
 
-            backend = RedisBackend("redis://localhost:6379")
+            backend = RedisBackend()
 
             # Verify container was called for backward compatibility
             mock_container_instance.get.assert_called_once()
             assert backend._client_provider is mock_provider
+
+    def test_explicit_url_bypasses_container(self):
+        """#222: an explicit redis_url must never be overridden by DI/env."""
+        from cachekit.backends.provider import PooledClientProvider
+
+        with patch("cachekit.backends.redis.backend.DIContainer") as mock_container_class:
+            backend = RedisBackend("redis://custom:1234")
+
+            mock_container_class.assert_not_called()
+            assert isinstance(backend._client_provider, PooledClientProvider)
+            kwargs = backend._client_provider._pool.connection_kwargs
+            assert kwargs["host"] == "custom"
+            assert kwargs["port"] == 1234
+
+    def test_explicit_url_roundtrip_against_real_redis(self, redis_isolated, monkeypatch):
+        """#222 end-to-end: writes go to the Redis the URL names, even when env disagrees."""
+        conn = redis_isolated.connection_pool.connection_kwargs
+        if "path" in conn:
+            # Local pytest-redis spawns on a unix socket; also proves the new
+            # pool kwargs are safe for UnixDomainSocketConnection.
+            url = f"unix://{conn['path']}?db={conn.get('db', 0)}"
+        else:
+            url = f"redis://{conn['host']}:{conn['port']}/{conn.get('db', 0)}"
+
+        # Env points somewhere unreachable — the URL argument must still win.
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://env-should-not-be-used:6399")
+
+        backend = RedisBackend(redis_url=url)
+        try:
+            backend.set("lab352:roundtrip", b"\x00binary\xff", ttl=30)
+            assert backend.get("lab352:roundtrip") == b"\x00binary\xff"
+            # Prove the write landed in the instance the URL names
+            assert redis_isolated.get("lab352:roundtrip") == b"\x00binary\xff"
+            assert backend.delete("lab352:roundtrip") is True
+        finally:
+            redis_isolated.delete("lab352:roundtrip")
 
 
 @pytest.mark.unit

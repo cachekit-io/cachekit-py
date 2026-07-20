@@ -6,12 +6,12 @@ This module provides Redis storage backend using existing connection infrastruct
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import redis
 
 from cachekit.backends.base import BackendError
-from cachekit.backends.provider import CacheClientProvider
+from cachekit.backends.provider import CacheClientProvider, PooledClientProvider
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.di import DIContainer
 
@@ -45,35 +45,60 @@ class RedisBackend:
 
     def __init__(
         self,
-        redis_url: Optional[str] = None,
+        redis_url: Optional[Union[str, RedisBackendConfig]] = None,
         client_provider: Optional[CacheClientProvider] = None,
-    ):
-        """Initialize RedisBackend with connection validation.
+    ) -> None:
+        """Initialize RedisBackend.
+
+        Provider resolution precedence (#222):
+            1. Explicit ``client_provider`` — used as-is (caller owns the pool).
+            2. Explicit ``redis_url`` (or a ``RedisBackendConfig``) — a
+               per-instance pool bound to that URL. The URL you pass is the
+               URL that gets used; it is never silently overridden by
+               CACHEKIT_REDIS_URL/REDIS_URL or a DI-registered provider.
+            3. Zero-config — a DI-registered ``CacheClientProvider`` when one
+               exists (app-level override / test isolation), otherwise a
+               per-instance pool built from env config. Works out of the box.
 
         Args:
-            redis_url: Redis connection URL (optional, defaults to settings)
-            client_provider: Optional CacheClientProvider instance (defaults to global container)
+            redis_url: Redis connection URL, or a full RedisBackendConfig
+                (its redis_url plus pool/timeout knobs are honoured)
+            client_provider: Optional CacheClientProvider instance
 
         Raises:
-            BackendError: If REDIS_URL is not configured
+            BackendError: If no Redis URL can be resolved
         """
-        # Get Redis URL from parameter or Redis backend config
-        redis_config = RedisBackendConfig.from_env()
-        self._redis_url = redis_url or redis_config.redis_url
+        if isinstance(redis_url, RedisBackendConfig):
+            redis_config = redis_url
+            explicit_url: Optional[str] = redis_config.redis_url
+        else:
+            redis_config = RedisBackendConfig.from_env()
+            explicit_url = redis_url
 
-        # Validate REDIS_URL is configured
+        self._redis_url = explicit_url or redis_config.redis_url
+
+        # Validate a Redis URL is configured
         if not self._redis_url:
             raise BackendError(
                 message="REDIS_URL configuration not set. Set CACHEKIT_REDIS_URL environment variable or pass redis_url parameter.",
                 operation="init",
             )
 
-        # Use explicit dependency or fallback to global container (backward compatibility)
         if client_provider is not None:
             self._client_provider = client_provider
+        elif explicit_url:
+            # An explicitly passed URL must be honoured: build a per-instance
+            # pool bound to it. Falling through to the env-configured global
+            # pool could silently read/write a *different* Redis (#222).
+            self._client_provider = PooledClientProvider(explicit_url, redis_config)
         else:
-            container = DIContainer()
-            self._client_provider = container.get(CacheClientProvider)
+            # Zero-config: honour a DI-registered provider when present,
+            # otherwise build a per-instance pool from env config so
+            # RedisBackend() works without any registration step (#222).
+            try:
+                self._client_provider = DIContainer().get(CacheClientProvider)
+            except ValueError:
+                self._client_provider = PooledClientProvider(self._redis_url, redis_config)
 
     def _get_client(self) -> redis.Redis:
         """Get Redis client from provider.
