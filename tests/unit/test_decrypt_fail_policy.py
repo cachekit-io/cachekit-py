@@ -473,3 +473,95 @@ class TestDecoratorFailClosed:
 
         found, _ = l1.get(k1)
         assert not found  # poisoned L1 entry invalidated before the raise
+
+    async def test_async_fail_closed_raises_on_substituted_entry(self):
+        """Async L2 read path (wrapper.py ~1098): a fail-closed tamper failure must
+        re-raise to the caller, never be demoted to a fail-open recompute. The sync
+        counterpart above covers ~788; this locks in the async guard so a future broad
+        `except Exception` on the async read path can't silently invert the policy."""
+        from cachekit import cache
+
+        backend = _DictBackend()
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            l1_enabled=False,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            fail_closed=True,
+        )
+        async def get_value(x: int) -> dict:
+            return {"result": x}
+
+        assert await get_value(1) == {"result": 1}
+        assert await get_value(2) == {"result": 2}
+        self._poison_by_substitution(backend)
+        with pytest.raises(DecryptionAuthenticationError):
+            await get_value(1)
+
+    async def test_async_fail_open_recomputes_on_substituted_entry(self):
+        """Async L2 fail-open regression: with fail_closed=False the same poisoned
+        entry is a miss+recompute (correct value), proving the async guard escalates
+        ONLY under fail_closed and doesn't turn every tamper into a hard error."""
+        from cachekit import cache
+
+        backend = _DictBackend()
+        calls: list[int] = []
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            l1_enabled=False,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            fail_closed=False,
+        )
+        async def get_value(x: int) -> dict:
+            calls.append(x)
+            return {"result": x}
+
+        assert await get_value(1) == {"result": 1}
+        assert await get_value(2) == {"result": 2}
+        self._poison_by_substitution(backend)
+        assert await get_value(1) == {"result": 1}  # fail open: recompute, correct value
+        assert calls.count(1) == 2  # recomputed exactly once after poisoning
+
+    async def test_async_fail_closed_invalidates_poisoned_l1_before_raising(self):
+        """Async L1 hit path (wrapper.py ~997): a fail-closed tamper failure re-raises
+        to the caller AND invalidates the poisoned L1 entry first, mirroring the sync
+        guarantee — stale process-local L1 must not outlive L2 remediation."""
+        from cachekit import cache
+        from cachekit.l1_cache import get_l1_cache
+
+        backend = _DictBackend()
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=_HEX_KEY,
+            fail_closed=True,
+            namespace="lab108-l1-async",
+        )
+        async def get_value(x: int) -> dict:
+            return {"result": x}
+
+        assert await get_value(1) == {"result": 1}
+        assert await get_value(2) == {"result": 2}
+        k1, k2 = sorted(backend.store)
+
+        # Plant ciphertext-substituted bytes directly in process-local L1
+        l1 = get_l1_cache("lab108-l1-async")
+        l1.put(k1, backend.store[k2], redis_ttl=300)
+
+        with pytest.raises(DecryptionAuthenticationError):
+            # Whichever of the two args maps to k1 raises from the L1 hit path
+            await get_value(1)
+            await get_value(2)
+
+        found, _ = l1.get(k1)
+        assert not found  # poisoned L1 entry invalidated before the raise

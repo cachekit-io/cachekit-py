@@ -1151,10 +1151,18 @@ def create_cache_wrapper(
                         # operator fixes L2). L2 remains the retained evidence.
                         _l1_cache.invalidate(cache_key)
                         # Single policy point (cachekit-py#170): metric + fail policy.
-                        # A fail-closed raise propagates to the outer try/finally.
-                        handle_decrypt_failure(
-                            e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                        )
+                        # Explicit local re-raise mirrors the sync L1/L2 fail-closed
+                        # guards and the async lock-path guard: a fail-closed tamper raise
+                        # must reach the caller, never be demoted to a fail-open recompute
+                        # if a future edit wraps this read path in a broad `except
+                        # Exception` (defense-in-depth, LAB-108). No manual stats reset —
+                        # the async wrapper's outer `finally` covers every exit path.
+                        try:
+                            handle_decrypt_failure(
+                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                            )
+                        except DecryptionAuthenticationError:
+                            raise
                         # Fail open: fall through to L2
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
@@ -1253,9 +1261,17 @@ def create_cache_wrapper(
                 )
                 # Single policy point (cachekit-py#170): metric + fail policy. On a
                 # fail-closed raise the poisoned entry is retained as evidence.
-                handle_decrypt_failure(
-                    e, tier="l2", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                )
+                # Explicit local re-raise mirrors the sync L1/L2 and async lock-path
+                # guards: keep the fail-closed tamper raise from being demoted to a
+                # fail-open recompute if a future edit wraps the policy call in a broad
+                # `except Exception` (defense-in-depth, LAB-108). No manual stats reset —
+                # the async wrapper's outer `finally` covers every exit path.
+                try:
+                    handle_decrypt_failure(
+                        e, tier="l2", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                    )
+                except DecryptionAuthenticationError:
+                    raise
                 # Fail open: best-effort evict so the next read (including this call's
                 # own lock double-check below) is a clean miss instead of re-failing
                 # and double-counting the metric (#159; mirrors the sync path).
