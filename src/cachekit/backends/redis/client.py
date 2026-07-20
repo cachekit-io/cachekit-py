@@ -51,6 +51,15 @@ def _get_async_pool_lock() -> asyncio.Lock:
 _thread_local = threading.local()
 
 
+def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -> int:
+    """Resolve the pool size, enforcing the same > 0 invariant as the config field."""
+    if override is None:
+        return cfg.connection_pool_size
+    if override <= 0:
+        raise ValueError(f"max_connections must be > 0, got {override}")
+    return override
+
+
 def create_connection_pool(
     redis_url: str,
     config: Optional[RedisBackendConfig] = None,
@@ -77,7 +86,7 @@ def create_connection_pool(
     return redis.ConnectionPool.from_url(
         redis_url,
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
-        max_connections=max_connections or cfg.connection_pool_size,
+        max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
     )
@@ -96,7 +105,7 @@ def create_async_connection_pool(
     return redis_async.ConnectionPool.from_url(
         redis_url,
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
-        max_connections=max_connections or cfg.connection_pool_size,
+        max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
     )

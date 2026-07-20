@@ -5,6 +5,16 @@ implementations for dependency injection. Follows protocol-based design
 for maximum flexibility and testing capability.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import redis
+    import redis.asyncio as redis_async
+
+    from cachekit.backends.redis.config import RedisBackendConfig
+
 
 class CacheClientProvider:
     """Abstract interface for Redis client providers."""
@@ -113,21 +123,21 @@ class PooledClientProvider(CacheClientProvider):
     No connection is made at construction time; pools connect lazily on first use.
     """
 
-    def __init__(self, redis_url: str, config=None):
+    def __init__(self, redis_url: str, config: Optional[RedisBackendConfig] = None) -> None:
         from cachekit.backends.redis.client import create_connection_pool
         from cachekit.backends.redis.config import RedisBackendConfig
 
         self._redis_url = redis_url
         self._config = config or RedisBackendConfig.from_env()
         self._pool = create_connection_pool(redis_url, self._config)
-        self._async_pool = None
+        self._async_pool: Optional[redis_async.ConnectionPool] = None
 
-    def get_sync_client(self):
+    def get_sync_client(self) -> redis.Redis:
         import redis
 
         return redis.Redis(connection_pool=self._pool)
 
-    async def get_async_client(self):
+    async def get_async_client(self) -> redis_async.Redis:
         import redis.asyncio as redis_async
 
         from cachekit.backends.redis.client import create_async_connection_pool

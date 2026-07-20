@@ -47,7 +47,7 @@ class RedisBackend:
         self,
         redis_url: Optional[Union[str, RedisBackendConfig]] = None,
         client_provider: Optional[CacheClientProvider] = None,
-    ):
+    ) -> None:
         """Initialize RedisBackend.
 
         Provider resolution precedence (#222):
