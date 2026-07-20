@@ -180,10 +180,18 @@ class TestRedisBackendProviderResolution:
         backend = RedisBackend(redis_url="redis://ignored:6379", client_provider=provider)
         assert backend._client_provider is provider
 
-    def test_config_object_accepted_positionally(self):
+    def test_config_object_accepted_positionally(self, monkeypatch):
         """docs/backends/redis.md promises RedisBackend(config) — honour it."""
         from cachekit.backends.provider import PooledClientProvider
         from cachekit.backends.redis.config import RedisBackendConfig
+
+        # Pre-existing wart (separate issue): when CACHEKIT_REDIS_URL/REDIS_URL
+        # is set, pydantic-settings rejects the redis_url *constructor kwarg*
+        # as extra_forbidden (env alias consumes the field, name key left
+        # over). Clear env so this test exercises the RedisBackend(config)
+        # contract, not that wart.
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_URL", raising=False)
 
         config = RedisBackendConfig(
             redis_url="redis://cfg-host:7000",
