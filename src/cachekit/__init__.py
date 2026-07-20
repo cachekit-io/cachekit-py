@@ -98,6 +98,16 @@ from .health import (
     health_check_handler,
 )
 
+# Interop mode (interop/v1): cross-SDK key generation and value codec.
+# The decorator API is @cache(interop="op", namespace="ns"); these helpers are
+# for manual key/value handling (debugging, out-of-band writers, migrations).
+from .interop import (
+    InteropError,
+    decode_interop_value,
+    encode_interop_value,
+    generate_interop_key,
+)
+
 # L1/L2 architecture integrated into standard cache interface
 # No separate imports needed - cache.minimal/.production/.secure handle L1+L2 transparently
 # Import reliability configuration
@@ -113,9 +123,13 @@ __all__ = [
     "CacheInfo",
     "CircuitBreakerConfig",
     "DecoratorConfig",
+    "decode_interop_value",
+    "encode_interop_value",
+    "generate_interop_key",
     "get_health_checker",
     "health_check_handler",
     "HealthCheckResult",
     "HealthLevel",
     "HealthStatus",
+    "InteropError",
 ]

@@ -186,12 +186,16 @@ class DecoratorConfig:
         encryption: Client-side encryption configuration
     """
 
-    # Core settings (5 fields)
+    # Core settings (6 fields)
     ttl: int | None = None
     namespace: str | None = None
     serializer: Union[str, SerializerProtocol] = "default"  # type: ignore[assignment]  # String name or protocol instance
     integrity_checking: bool = True  # Checksums for corruption detection (xxHash3-64 for all serializers)
     key: Callable[..., str] | None = None  # Custom key function (escape hatch for complex types)
+    # Interop mode (interop/v1): explicit cross-SDK operation name. Opting in switches
+    # this function to {namespace}:{operation}:{args_hash} keys and plain-MessagePack
+    # values shared byte-identically with cachekit-rs / cachekit-ts. None = auto mode.
+    interop: str | None = None
 
     # Performance (2 fields)
     refresh_ttl_on_get: bool = False
@@ -234,6 +238,20 @@ class DecoratorConfig:
         # TTL refresh threshold validation
         if not 0.0 <= self.ttl_refresh_threshold <= 1.0:
             raise ConfigurationError(f"ttl_refresh_threshold must be 0.0-1.0, got {self.ttl_refresh_threshold}")
+
+        # Interop mode validation (interop/v1, spec/interop-mode.md): loud at
+        # decoration time, never silently normalized.
+        if self.interop is not None:
+            from cachekit.interop import InteropError, validate_interop_config
+
+            try:
+                validate_interop_config(self.interop, self.namespace, has_custom_key=self.key is not None)
+            except InteropError as e:
+                raise ConfigurationError(str(e)) from e
+            # Serializer and tenant_extractor constraints are enforced by their
+            # single authority, CacheSerializationHandler.__init__ (which owns
+            # the alias map and the encryption config) — it runs at decoration
+            # time on every path, so the error still fires before first use.
 
         # Validate nested configs
         self.l1.validate()

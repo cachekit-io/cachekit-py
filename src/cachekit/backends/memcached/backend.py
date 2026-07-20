@@ -70,6 +70,16 @@ class MemcachedBackend:
         )
         self._key_prefix = self._config.key_prefix
 
+    @property
+    def key_prefix(self) -> str:
+        """Wire-level key prefix (contract for interop mode's fail-closed guard).
+
+        Backends that rewrite keys on the wire MUST expose the prefix here so
+        interop mode can reject them: a prefixed key is invisible to other SDKs
+        and breaks cross-SDK key identity (see cachekit.interop).
+        """
+        return self._key_prefix
+
     def _prefixed_key(self, key: str) -> str:
         """Apply key prefix if configured."""
         if self._key_prefix:
