@@ -39,9 +39,11 @@ impl PyByteStorage {
     /// Returns:
     ///     Bytes: Serialized StorageEnvelope
     pub fn store(&self, py: Python, data: &[u8], format: Option<String>) -> PyResult<Py<PyBytes>> {
-        let envelope_bytes = self
-            .inner
-            .store(data, format)
+        // Detach from the GIL: LZ4 + xxh3 on a large payload otherwise blocks every
+        // Python thread for the full compression duration (cachekit-core#45).
+        // Sound: `data` borrows an immutable `bytes` buffer kept alive by this call.
+        let envelope_bytes = py
+            .detach(|| self.inner.store(data, format))
             .map_err(|e| PyValueError::new_err(format!("Storage failed: {}", e)))?;
 
         Ok(PyBytes::new(py, &envelope_bytes).into())
@@ -54,22 +56,23 @@ impl PyByteStorage {
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
-    pub fn retrieve(&self, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
-        self.inner
-            .retrieve(envelope_bytes)
+    pub fn retrieve(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
+        // Detach from the GIL for decompression + checksum (see store()).
+        py.detach(|| self.inner.retrieve(envelope_bytes))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
     }
 
     /// Get compression ratio for given data
-    pub fn estimate_compression(&self, data: &[u8]) -> PyResult<f64> {
-        self.inner
-            .estimate_compression(data)
+    pub fn estimate_compression(&self, py: Python, data: &[u8]) -> PyResult<f64> {
+        // Full-payload LZ4 pass — same GIL-blocking profile as store().
+        py.detach(|| self.inner.estimate_compression(data))
             .map_err(|e| PyValueError::new_err(format!("Compression estimation failed: {}", e)))
     }
 
     /// Validate envelope without extracting data
-    pub fn validate(&self, envelope_bytes: &[u8]) -> PyResult<bool> {
-        Ok(self.inner.validate(envelope_bytes))
+    pub fn validate(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<bool> {
+        // Full decompression + checksum under the hood — same GIL-blocking profile.
+        Ok(py.detach(|| self.inner.validate(envelope_bytes)))
     }
 
     /// Get security limits for clients
