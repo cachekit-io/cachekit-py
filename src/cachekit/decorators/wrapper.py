@@ -369,6 +369,11 @@ def create_cache_wrapper(
         collect_stats: Enable statistics collection
         enable_tracing: Enable distributed tracing
         enable_structured_logging: Enable structured logging
+        interop: interop/v1 cross-SDK operation name. When set, switches this
+                function to canonical {namespace}:{operation}:{args_hash} keys
+                and plain-MessagePack values shared byte-identically with
+                cachekit-rs / cachekit-ts. Requires namespace; mutually
+                exclusive with key= and fast_mode. None (default) = auto mode.
 
     Security Note:
         When encryption=True and tenant_extractor is provided, tenant ID extraction
@@ -1175,6 +1180,33 @@ def create_cache_wrapper(
                     "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
                 )
 
+            nonlocal _backend
+
+            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
+            # make this SDK read/write a key other SDKs cannot see. Re-checked per
+            # call because the backend is lazily resolved and a prefix could
+            # appear dynamically. MUST run before the L1 check below — an L1 hit
+            # early-returns and would bypass the per-call re-check (mirrors
+            # sync_wrapper's ordering). Backend is resolved eagerly for interop
+            # calls only, so the non-interop L1 fast path is unchanged. The raise
+            # propagates; the outer finally clears correlation ID / stats context.
+            if interop is not None:
+                if _backend is None:
+                    try:
+                        _backend = get_backend_provider().get_backend()
+                    except Exception as e:
+                        # If Redis connection fails, execute function without caching - RETURN EARLY
+                        # This prevents the decorator from breaking the application
+                        features.handle_cache_error(
+                            error=e,
+                            operation="client_creation",
+                            cache_key=cache_key or "unknown",
+                            namespace=namespace or "default",
+                            duration_ms=0.0,
+                        )
+                        return await func(*args, **kwargs)
+                ensure_interop_backend_compatible(_backend)
+
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
@@ -1205,7 +1237,6 @@ def create_cache_wrapper(
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)
-            nonlocal _backend
             if _backend is None:
                 try:
                     _backend = get_backend_provider().get_backend()
@@ -1220,13 +1251,6 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
-
-            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
-            # make this SDK read/write a key other SDKs cannot see. Re-checked per
-            # call (outside the try above, so it propagates) because the backend
-            # is lazily resolved and a prefix could appear dynamically.
-            if interop is not None:
-                ensure_interop_backend_compatible(_backend)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

@@ -243,7 +243,10 @@ class TestInteropRejections:
 
     @pytest.mark.parametrize("bad", ["Users", "get:user", "users\n", "", "a" * 65])
     def test_bad_segments_rejected_at_decoration(self, backend: DictBackend, bad: str):
-        with pytest.raises((ConfigurationError, InteropError)):
+        # Decoration-time validation always wraps InteropError in
+        # ConfigurationError (see validate_interop_config callers) — accepting
+        # the raw InteropError here would hide a wrapping regression.
+        with pytest.raises(ConfigurationError):
 
             @_decorate(backend, interop=bad, namespace="users")
             def f(x: int):
@@ -350,6 +353,63 @@ class TestInteropRejections:
         with pytest.raises(ConfigurationError, match="prefix"):
             f(2)
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
+
+    async def test_key_prefix_appearing_later_fails_closed_per_call_async_l1_hit(self):
+        """Async mirror of the per-call re-check, through the worst case: a warm
+        L1 entry. The async path used to run the guard only after the L1 lookup,
+        so an L1 hit early-returned and bypassed the re-check entirely — serving
+        cached values from a backend that had started prefixing keys."""
+        mutable = DictBackend(key_prefix="")
+
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="ns")
+        async def f(x: int):
+            return x
+
+        assert await f(1) == 1  # clean backend works; warms L1 for x=1
+        mutable._key_prefix = "tenant-a:"  # contract violation after the fact
+        with pytest.raises(ConfigurationError, match="prefix"):
+            await f(1)  # same args → L1 hit path; must still fail closed
+        assert not any(k.startswith("tenant-a:") for k in mutable.store)
+
+    async def test_async_lazy_provider_prefixing_backend_fails_closed(self):
+        """Lazy DI resolution (backend unknown at decoration) still runs the
+        guard before the first async call touches L1 or executes the function."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        calls: list[int] = []
+
+        async def f(x: int):
+            calls.append(x)
+            return x
+
+        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+
+        provider = Mock()
+        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                await wrapped(1)
+        assert calls == [], "function must NOT run against an incompatible backend"
+
+    async def test_async_lazy_provider_failure_falls_back_uncached(self):
+        """Backend-creation failure degrades to uncached execution (same
+        contract as the sync interop path) — loud failure is reserved for
+        out-of-model arguments/values, not backend unavailability."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        async def f(x: int):
+            return x * 2
+
+        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+
+        provider = Mock()
+        provider.get_backend.side_effect = RuntimeError("backend down")
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
         """Panel CRIT regression (CWE-636): the default provider's Redis path is a
