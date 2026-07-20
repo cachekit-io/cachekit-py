@@ -448,12 +448,12 @@ class RedisBackendProvider:
             BackendError: If Redis connection fails
         """
         try:
-            # Fix #1: Create connection pool ONCE
-            self._pool = redis.ConnectionPool.from_url(
-                redis_url,
-                max_connections=pool_size,
-                decode_responses=False,  # We handle bytes explicitly
-            )
+            # Fix #1: Create connection pool ONCE. Shared builder wires the
+            # finite socket timeouts, so the ping below fails fast on an
+            # unreachable Redis instead of blocking on the OS TCP timeout.
+            from cachekit.backends.redis.client import create_connection_pool
+
+            self._pool = create_connection_pool(redis_url, max_connections=pool_size)
 
             # Create singleton Redis client from pool
             self._client = redis.Redis(connection_pool=self._pool)

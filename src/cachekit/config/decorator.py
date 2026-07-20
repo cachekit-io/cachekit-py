@@ -114,14 +114,13 @@ def _resolve_backend(explicit_backend: object = _UNSET) -> BaseBackend | None:
     # Actual URL resolution handled by RedisBackendConfig via AliasChoices
     if os.environ.get("CACHEKIT_REDIS_URL") or os.environ.get("REDIS_URL"):
         # Lazy import to avoid circular dependency
-        from cachekit.backends.provider import CacheClientProvider
         from cachekit.backends.redis import RedisBackend
-        from cachekit.di import DIContainer
 
-        # Inject client_provider explicitly (follows Dependency Injection Principle)
-        container = DIContainer()
-        client_provider = container.get(CacheClientProvider)
-        return RedisBackend(client_provider=client_provider)
+        # RedisBackend() resolves its own client provider: a DI-registered
+        # CacheClientProvider when present, else a per-instance pool from env
+        # config. The eager container.get() this used to do crashed the
+        # zero-config path — nothing registers the provider by default (#222).
+        return RedisBackend()
 
     # No backend configured - fail fast with helpful message
     raise ConfigurationError(
