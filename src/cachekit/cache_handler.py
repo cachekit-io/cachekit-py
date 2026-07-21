@@ -984,11 +984,30 @@ class CacheOperationHandler:
         serialization_handler: CacheSerializationHandler,
         key_generator: CacheKeyGenerator,
         cache_handler: Optional[CacheHandlerStrategy] = None,
+        on_deserialize_error: Optional[Callable[[Exception, str], None]] = None,
     ):
-        """Initialize with dependencies."""
+        """Initialize with dependencies.
+
+        Args:
+            on_deserialize_error: Optional hook invoked as (error, cache_key) when an
+                L2 read hits a corrupt/tampered entry (SerializationError). The decorator
+                wires this to its metrics pipeline so the cache_get_deserialize signal
+                fires from one place for both sync and async paths (#159). Best-effort:
+                hook failures are logged and never mask the miss/recompute.
+        """
         self.serialization_handler = serialization_handler
         self.key_generator = key_generator
         self._cache_handler = cache_handler
+        self.on_deserialize_error = on_deserialize_error
+
+    def _notify_deserialize_error(self, error: Exception, cache_key: str) -> None:
+        """Report a corrupt L2 entry to the observability hook (best-effort)."""
+        if self.on_deserialize_error is None:
+            return
+        try:
+            self.on_deserialize_error(error, cache_key)
+        except Exception as hook_err:  # observability must never break the miss path
+            get_logger().warning(f"on_deserialize_error hook failed for {cache_key}: {hook_err}")
 
     def get_cache_key(
         self,
@@ -1085,6 +1104,7 @@ class CacheOperationHandler:
                     self._cache_handler.delete(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
                 get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1098,7 +1118,9 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
+            Unlike the sync variant, the raw serialized envelope is included so the
+            async decorator can backfill L1 without re-serializing (re-encrypting).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1108,16 +1130,15 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_async")
 
-            # NOTE: no mmap fast path here. The async decorator path inlines get_async (it does not
-            # route through this method today), so an mmap branch would be dead code. The mmap read
-            # lives on the sync get_cached_value; add it here only when an async caller routes through.
+            # NOTE: no mmap fast path here yet. The async decorator routes through this method
+            # (#159), but buffer reads are sync-only today; the async mmap read is #171 scope.
             cached_data = await self._cache_handler.get_async(cache_key, refresh_ttl)
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
+                return (True, deserialized, cached_data)
             return None
         except SerializationError as e:
             # Corruption / integrity-auth failure on the stored bytes. Best-effort evict
@@ -1129,6 +1150,7 @@ class CacheOperationHandler:
                     await self._cache_handler.delete_async(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
                 get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
