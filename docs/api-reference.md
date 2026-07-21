@@ -812,6 +812,20 @@ lives in an external store, not a bounded in-process dict.
 Statistics are tracked per decorated function (shared across all calls) and are thread-safe.
 `cache_clear()` resets the counters and rotates `session_id`.
 
+> **Decorate once, at module scope — never inside a function you call repeatedly.** The
+> statistics tracker is bound to the wrapper when the decorator is applied, but the session
+> identity (`session_id` is derived from a process-scoped UUID plus the function's
+> `module.qualname`) is stable across re-decorations. Rebuilding the wrapper per call —
+> e.g. `cache.io(namespace=...)(fn)` inside a request handler or loop — therefore sends the
+> **same session ID with counters reset to zero** on every request. Against the CachekitIO
+> backend, the server's anti-replay validation reads those non-advancing counters as a replay
+> signature: the events lose their session tag (they vanish from session-scoped analytics
+> such as the layer-breakdown chart) and the server logs a `counters decreased (replay
+> attack?)` warning for entirely legitimate traffic. If the wrapped callable must vary per
+> call (a per-call closure or key), build the decorated wrapper once, cache it (e.g. in a
+> module-level holder or `functools.lru_cache` keyed by namespace), and route the per-call
+> state through an argument or a thread-local — not through re-decoration.
+
 A minimal stats endpoint that surfaces `cache_info()` over HTTP:
 
 ```python notest
