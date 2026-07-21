@@ -809,8 +809,23 @@ either from the in-memory L1 layer or from the backend L2 layer, never both. `ma
 `currsize` are kept only for `lru_cache` API parity and are always `None` because the cache
 lives in an external store, not a bounded in-process dict.
 
-Statistics are tracked per decorated function (shared across all calls) and are thread-safe.
-`cache_clear()` resets the counters and rotates `session_id`.
+Statistics are tracked per function identity (`module.qualname`) and are thread-safe.
+Re-applying a decorator to the same function — even with different options — reuses the
+existing counters from a process-global registry rather than resetting them, so `session_id`
+stays stable and the counters reported to the CachekitIO backend stay monotonic (counters
+that reset under an unchanged session ID would trip the server's anti-replay validation).
+`cache_clear()` resets the counters and rotates `session_id`. A forked child process starts
+with zeroed counters and a session ID derived from its own process UUID; the parent's
+statistics are unaffected.
+
+> **Decorate once, at module scope — as performance advice.** Rebuilding the wrapper per
+> call (e.g. `cache.io(namespace=...)(fn)` inside a request handler or loop) repeats the
+> decoration-time setup on every request and, in L1-only mode (`backend=None`), discards
+> the in-process object cache each time — every call becomes a miss. Session telemetry is
+> unaffected either way: the rebuilt wrapper reuses the same statistics tracker. If the
+> wrapped callable must vary per call, build the decorated wrapper once, cache it (e.g. in
+> a module-level holder or `functools.lru_cache` keyed by namespace), and route the
+> per-call state through an argument or a thread-local.
 
 A minimal stats endpoint that surfaces `cache_info()` over HTTP:
 

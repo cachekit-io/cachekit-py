@@ -282,6 +282,77 @@ class _FunctionStats:
             # Clear session ID - will be regenerated with new clear count on next operation
             self.session_id = None
 
+    def _reset_for_new_process(self) -> None:
+        """Discard state inherited across fork(): fresh lock, zeroed counters, new session.
+
+        Only called from the post-fork handler while the child is still
+        single-threaded. The lock must be replaced, not acquired: a parent
+        thread holding it at fork time leaves it permanently locked in the
+        child. session_id=None re-derives lazily from the child's own
+        process UUID (see decorators.session), so the child never reports
+        under the parent's session ID with reset counters — which the
+        server's anti-replay validation would reject.
+        """
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._l1_hits = 0
+        self._l2_hits = 0
+        self._l2_cumulative_latency_ms = 0.0
+        self._l2_cached_avg_ms = 0.0
+        self._last_operation_at = None
+        self._clear_count = 0
+        self.session_id = None
+
+
+# Process-global registry: one _FunctionStats per function identifier.
+# Session IDs are derived from process UUID + module.qualname and are thus
+# stable across re-decorations — a fresh counter object per decoration
+# (factory / per-call patterns) would send counters that go backwards under
+# an unchanged session ID, which the server's anti-replay validation rejects
+# by silently stripping the session tag. Strong references are deliberate:
+# counters must outlive any individual wrapper so a rebuilt wrapper
+# continues the same monotonic sequence.
+_function_stats_registry: dict[str, _FunctionStats] = {}
+_function_stats_registry_lock = threading.Lock()
+
+
+def _get_function_stats(function_identifier: str, l1_enabled: bool) -> _FunctionStats:
+    """Get or create the shared stats tracker for a function identifier.
+
+    Re-decorating the same function reuses the existing tracker. The most
+    recent decoration's l1_enabled wins: the flag only feeds the rate-limit
+    classification header, and the newest decoration reflects the current
+    configuration.
+    """
+    with _function_stats_registry_lock:
+        stats = _function_stats_registry.get(function_identifier)
+        if stats is None:
+            stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+            _function_stats_registry[function_identifier] = stats
+        else:
+            stats.l1_enabled = l1_enabled
+        return stats
+
+
+def _reset_stats_after_fork() -> None:
+    """Reset every registered stats tracker in a newly forked child.
+
+    The child inherits the parent's counters and cached session IDs;
+    reporting them would either continue the parent's session from another
+    process or reset counters under the parent's session ID — both corrupt
+    server-side session telemetry. The child is single-threaded here, so
+    wholesale lock replacement is safe.
+    """
+    global _function_stats_registry_lock
+    _function_stats_registry_lock = threading.Lock()
+    for stats in _function_stats_registry.values():
+        stats._reset_for_new_process()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_stats_after_fork)
+
 
 # Lazy logger initialization to avoid import-time container access
 def logger():
@@ -620,9 +691,9 @@ def create_cache_wrapper(
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
     _cached_keys: set[str] = set()
 
-    # Create stats tracker (session ID will be lazy-initialized on first use)
-    # Pass l1_enabled for rate limit classification header
-    _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+    # Shared stats tracker from the process-global registry (session ID lazy-initialized
+    # on first use). Re-decoration reuses the same counters — see _get_function_stats.
+    _stats = _get_function_stats(function_identifier, l1_enabled)
 
     # L1-only SWR: strong refs to in-flight refresh tasks. asyncio only keeps weak
     # refs to tasks, so a fire-and-forget refresh could be GC'd mid-flight otherwise.
@@ -1774,22 +1845,20 @@ def create_cache_wrapper(
         Returns hit/miss statistics for the decorated function.
 
         Threading behavior:
-            When used with threading/multiprocessing, statistics are tracked
-            per-function (shared across all invocations), not per-thread.
-            The internal _FunctionStats object is shared by all threads calling
-            the same decorated function, with thread-safe locking via RLock.
+            Statistics are tracked per function identity (``module.qualname``),
+            shared across all threads and all decorator applications, with
+            thread-safe locking via RLock. Re-applying a decorator to the same
+            function reuses the existing counters rather than resetting them —
+            the session ID is stable across re-decorations, and counters that
+            reset under an unchanged session ID would trip the server's
+            anti-replay validation. Consequently, decorating the same function
+            twice (even with different options) reports combined statistics
+            from one shared tracker.
 
-            For per-thread statistics, create separate decorated instances:
-
-                # Global shared stats
-                @cache()
-                def shared_func(x): ...
-
-                # Per-thread stats (different function instances)
-                def get_thread_func():
-                    @cache()
-                    def thread_func(x): ...
-                    return thread_func
+        Fork behavior:
+            A forked child process starts with zeroed counters and derives a
+            new session ID from its own process UUID; the parent's statistics
+            are unaffected.
 
         Returns:
             CacheInfo: Named tuple with hits, misses, maxsize, currsize

@@ -358,8 +358,9 @@ exposition setup.
 <summary><strong>Thread Safety Details</strong></summary>
 
 **Per-Function Statistics:**
-- Statistics tracked per decorated function (shared across all calls)
+- Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
 - Thread-safe via RLock (all methods safe for concurrent access)
+- Fork-safe: a forked child starts with zeroed counters and its own session ID
 
 ```python
 from concurrent.futures import ThreadPoolExecutor

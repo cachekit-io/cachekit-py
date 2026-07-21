@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
+
+import pytest
 
 from cachekit.backends.cachekitio.backend import _inject_metrics_headers
 from cachekit.backends.cachekitio.session import get_session_headers, get_session_id
@@ -534,3 +537,123 @@ class TestBackwardCompatibility:
 
         headers = get_session_headers()
         assert isinstance(headers, dict)
+
+
+class TestStatsRegistryReDecoration:
+    """LAB-506: re-applying a decorator to the same function must reuse its stats.
+
+    The session ID is derived from process UUID + module.qualname, so it is
+    stable across re-decorations — fresh counters under that unchanged ID go
+    backwards server-side and trip the anti-replay validator (session tag
+    stripped, telemetry silently lost).
+    """
+
+    def test_redecoration_reuses_counters_and_session_id(self):
+        def compute(x):
+            return x * 2
+
+        from cachekit import cache
+
+        first_wrapper = cache(ttl=60, backend=None)(compute)
+        assert first_wrapper(1) == 2
+        first = first_wrapper.cache_info()
+        assert first.hits + first.misses == 1
+
+        second_wrapper = cache(ttl=60, backend=None)(compute)
+        assert second_wrapper(1) == 2
+        second = second_wrapper.cache_info()
+
+        # Counters accumulate across re-decoration instead of resetting.
+        assert second.hits + second.misses == 2
+        # Session ID never rotates on re-decoration.
+        assert second.session_id == first.session_id
+        # Both wrappers report from one shared tracker.
+        assert first_wrapper.cache_info() == second_wrapper.cache_info()
+
+    def test_redecoration_l1_enabled_last_wins(self):
+        def compute(x):
+            return x + 10
+
+        from cachekit import cache
+
+        wrapper_l1 = cache(ttl=60, backend=None)(compute)
+        wrapper_l1(1)
+        cache(ttl=60, backend=None, l1_enabled=False)(compute)
+
+        # The stats tracker is shared; the most recent decoration's L1 flag
+        # drives the rate-limit classification header for both wrappers.
+        from cachekit.backends.cachekitio.backend import _inject_metrics_headers
+        from cachekit.decorators.wrapper import _function_stats_registry
+
+        identifier = f"{compute.__module__}.{compute.__qualname__}"
+        stats = _function_stats_registry[identifier]
+        assert stats.l1_enabled is False
+        assert _inject_metrics_headers(stats)["X-CacheKit-L1-Status"] == "disabled"
+
+
+class TestForkSessionIsolation:
+    """LAB-506: a forked child must not reuse the parent's session identity.
+
+    Inherited counters reset under the parent's session ID read as a replay
+    server-side; the child needs a fresh process UUID and zeroed counters.
+    """
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_fork_child_rotates_session_and_resets_counters(self):
+        import multiprocessing
+
+        from cachekit import cache
+        from cachekit.decorators.session import get_session_id as decorator_session_id
+
+        def compute(x):
+            return x + 1
+
+        wrapped = cache(ttl=60, backend=None)(compute)
+        assert wrapped(1) == 2
+        assert wrapped(1) == 2
+        parent = wrapped.cache_info()
+        assert parent.hits + parent.misses == 2
+        parent_process_uuid = decorator_session_id()
+
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+
+        def child(q):
+            pre = wrapped.cache_info()
+            wrapped(1)
+            post = wrapped.cache_info()
+            q.put(
+                {
+                    "pre_total": pre.hits + pre.misses,
+                    "post_total": post.hits + post.misses,
+                    "session_id": post.session_id,
+                    "process_uuid": decorator_session_id(),
+                }
+            )
+
+        process = ctx.Process(target=child, args=(queue,))
+        process.start()
+        try:
+            result = queue.get(timeout=30)
+        finally:
+            process.join(timeout=30)
+        assert process.exitcode == 0
+
+        # Child counters are consistent from zero, not inherited.
+        assert result["pre_total"] == 0
+        assert result["post_total"] == 1
+        # Child derives a different session identity than the parent.
+        assert result["session_id"] != parent.session_id
+        assert result["process_uuid"] != parent_process_uuid
+        # Parent state is untouched by the fork.
+        assert wrapped.cache_info().session_id == parent.session_id
+
+
+class TestSessionIDUnification:
+    """LAB-506: one process session UUID across decorator and backend paths."""
+
+    def test_decorator_and_backend_session_ids_match(self):
+        from cachekit.backends.cachekitio.session import get_session_id as backend_session_id
+        from cachekit.decorators.session import get_session_id as decorator_session_id
+
+        assert decorator_session_id() == backend_session_id()
