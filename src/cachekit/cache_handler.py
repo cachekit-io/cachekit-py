@@ -1108,6 +1108,39 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
             return None
 
+    def get_cached_value_with_freshness(
+        self, cache_key: str, refresh_ttl: Optional[int] = None
+    ) -> Optional[tuple[tuple[bool, Any], bool]]:
+        """SWR variant of :meth:`get_cached_value` (LAB-381): also reports staleness.
+
+        Returns ``((True, value), is_stale)`` on a hit, None on miss/error. The mmap
+        fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
+        Error semantics mirror get_cached_value (poisoned entries evicted, errors
+        read as misses so the caller recomputes).
+        """
+        try:
+            if self._cache_handler is None:
+                raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness")
+
+            hit = self._cache_handler.get_with_freshness(cache_key)
+            if hit is None:
+                return None
+            cached_data, is_stale = hit
+            get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
+            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+            return ((True, deserialized), is_stale)
+        except SerializationError as e:
+            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            try:
+                if self._cache_handler is not None:
+                    self._cache_handler.delete(cache_key)
+            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+            return None
+        except Exception as e:
+            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            return None
+
     async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
         """Get value from cache if it exists (async version).
 
@@ -1159,6 +1192,7 @@ class CacheOperationHandler:
         ttl: int | None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        stale_ttl: int | None = None,
     ) -> Optional[bytes]:
         """Store result in backend cache with optional tenant context for encryption.
 
@@ -1182,7 +1216,12 @@ class CacheOperationHandler:
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
-            self._cache_handler.set(cache_key, serialized_data, ttl)
+            # Only thread the SWR kwarg when set: strategy implementations without
+            # **metadata (tests, custom handlers) must keep working unchanged.
+            if stale_ttl is not None:
+                self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
+            else:
+                self._cache_handler.set(cache_key, serialized_data, ttl)
             get_logger().cache_stored(cache_key, ttl)
 
             # Return serialized string (wrapped envelope) for L1 cache storage
@@ -1373,6 +1412,14 @@ class CacheHandlerStrategy(Protocol):
 
     async def delete_async(self, key: str) -> bool:
         """Delete key from cache asynchronously."""
+        ...
+
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
+        """Get value plus SWR staleness (LAB-381); (bytes, is_stale) or None."""
+        ...
+
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+        """Async variant of get_with_freshness."""
         ...
 
 

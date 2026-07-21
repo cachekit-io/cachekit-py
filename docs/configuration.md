@@ -155,6 +155,33 @@ def fetch_data(user_id: int):
 
 `@cache.io()` automatically creates a `CachekitIOBackend` from environment variables. It applies production-grade defaults (see the [intent preset table](#intent-presets) below).
 
+### Stale-While-Revalidate (`stale_ttl`)
+
+`@cache.io` supports past-TTL stale-while-revalidate ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#stale-while-revalidate)): for a `stale_ttl`-second window after the fresh TTL lapses, the backend keeps serving the old value (flagged stale) and the SDK re-runs your function **in the background** — no request ever blocks on the recompute at a TTL boundary.
+
+```python notest
+from cachekit import cache
+
+# Default: @cache.io enables SWR with stale_ttl = ttl.
+@cache.io(ttl=300)
+def build_index():
+    return expensive_scan()
+
+# Size the window explicitly, or pass stale_ttl=0 to opt out.
+@cache.io(ttl=300, stale_ttl=900)
+def report():
+    return expensive_report()
+```
+
+Rules and behavior:
+
+- Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
+- **CachekitIO only** — other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set.
+- Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
+- A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
+- The background recompute runs **outside the request context** — don't rely on request-scoped state (contextvars, open sessions) inside functions that enable SWR.
+- Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
+
 ### File Backend Environment Variables
 
 ```bash
@@ -318,7 +345,7 @@ def secure_function():
 | `dev()` | ✓ | ❌ | ❌ | 100 MB | Verbose logs, no Prometheus |
 | `production()` | ✓ | ✓ | ✓ | 100 MB | Full observability |
 | `secure()` | ✓ | ✓ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)) |
+| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 ---
 
