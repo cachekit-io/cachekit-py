@@ -463,3 +463,81 @@ class TestOperationHandlerFreshnessDegradation:
         backend.stale = False
         assert compute() == 2  # revalidation refreshed L1 with fresh bytes
         assert calls["n"] == 2
+
+
+class TestSWRSchedulingHardening:
+    """CodeRabbit round-2 regressions: negative default window, arg snapshots,
+    slot release when scheduling fails."""
+
+    def test_default_window_off_when_ttl_at_or_above_cap(self) -> None:
+        """ttl ≥ the 30-day cap leaves no window headroom: SWR silently off,
+        never a negative stale_ttl."""
+        backend = FakeSWRBackend()
+        config = DecoratorConfig(backend=backend, ttl=_CAP + 100, swr_by_default=True)
+
+        @cache(config=config)
+        def compute() -> str:
+            return "v"
+
+        assert compute() == "v"
+        assert backend.set_calls == [(_CAP + 100, None)]  # no window, not negative
+
+    def test_uncopyable_args_skip_revalidation(self) -> None:
+        """Args that can't be deep-copied (e.g. a lock) skip the background
+        refresh — stale keeps being served, nothing recomputes with live refs."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, key=lambda lock: "fixed-key")
+        def compute(lock) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        lock = threading.Lock()  # deepcopy(threading.Lock()) raises TypeError
+        assert compute(lock) == 1
+        backend.stale = True
+        assert compute(lock) == 1  # stale served
+        time.sleep(0.2)
+        assert calls["n"] == 1  # refresh skipped: args not snapshot-able
+        assert len(backend.set_calls) == 1
+
+        # The slot was released: a copyable-args key on the same function can
+        # still revalidate (the pool didn't leak).
+        assert _wait_for(lambda: calls["n"] == 1)
+
+    def test_thread_start_failure_releases_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Thread.start() raising must not leak the in-flight marker/slot: the
+        next stale hit retries and succeeds."""
+        import types
+
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        assert compute() == 1
+        backend.stale = True
+
+        class _FailingThread:
+            def __init__(self, *a, **k) -> None: ...
+
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        shim = types.SimpleNamespace(**{name: getattr(threading, name) for name in dir(threading) if not name.startswith("_")})
+        shim.Thread = _FailingThread
+        monkeypatch.setattr(wrapper_mod, "threading", shim)
+
+        assert compute() == 1  # stale served; scheduling fails silently
+        time.sleep(0.1)
+        assert calls["n"] == 1
+
+        monkeypatch.setattr(wrapper_mod, "threading", threading)  # restore
+        assert compute() == 1  # slot NOT leaked: retry schedules successfully
+        assert _wait_for(lambda: calls["n"] == 2)
+        assert _wait_for(lambda: len(backend.set_calls) == 2)

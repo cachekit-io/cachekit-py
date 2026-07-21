@@ -628,8 +628,10 @@ def create_cache_wrapper(
         and _swr_backend_capable
     ):
         # Preset default (io()): stale window = ttl, capped so the total stays
-        # within the 30-day bound. stale_ttl=0 opts out explicitly.
-        _stale_ttl = min(ttl, _max_total_ttl - ttl) or None
+        # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
+        # above the cap leaves no window headroom -> no default (never negative).
+        _default_window = min(ttl, _max_total_ttl - ttl)
+        _stale_ttl = _default_window if _default_window > 0 else None
 
     _swr_active = _stale_ttl is not None
 
@@ -718,20 +720,39 @@ def create_cache_wrapper(
             _swr_end(cache_key)
 
     def _swr_schedule(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], *, is_async: bool) -> None:
-        """Kick off background revalidation for a stale hit (at most one per key)."""
+        """Kick off background revalidation for a stale hit (at most one per key).
+
+        Arguments are deep-copied before scheduling (same contract as the L1-only
+        SWR path): the cache key was computed from the arguments at call time, and
+        the refresh runs later — it must not see mutations the caller makes after
+        receiving the stale value, or it would store the new state under the old
+        key. Not-copyable arguments skip the refresh (stale keeps being served; a
+        later hit retries). Any scheduling failure releases the slot so the key
+        never becomes permanently unrevalidatable.
+        """
         if not _swr_try_begin(cache_key):
             return
-        if is_async:
-            task = asyncio.create_task(_swr_revalidate_async(cache_key, call_args, call_kwargs))
-            _swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
-            task.add_done_callback(_swr_tasks.discard)
-        else:
-            threading.Thread(
-                target=_swr_revalidate_sync,
-                args=(cache_key, call_args, call_kwargs),
-                daemon=True,
-                name=f"cachekit-swr-{cache_key[:40]}",
-            ).start()
+        try:
+            call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
+        except Exception as exc:
+            _swr_end(cache_key)
+            _logger.debug("SWR revalidation skipped for %s: arguments not deep-copyable: %s", cache_key, exc)
+            return
+        try:
+            if is_async:
+                task = asyncio.create_task(_swr_revalidate_async(cache_key, call_args, call_kwargs))
+                _swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
+                task.add_done_callback(_swr_tasks.discard)
+            else:
+                threading.Thread(
+                    target=_swr_revalidate_sync,
+                    args=(cache_key, call_args, call_kwargs),
+                    daemon=True,
+                    name=f"cachekit-swr-{cache_key[:40]}",
+                ).start()
+        except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
+            _swr_end(cache_key)
+            _logger.debug("SWR revalidation could not be scheduled for %s: %s", cache_key, exc)
 
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
