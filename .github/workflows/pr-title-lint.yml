@@ -1,0 +1,37 @@
+# These repos are squash-merge-only, so the PR title becomes the squash commit
+# header on main (always under squash_merge_commit_title=PR_TITLE; on a
+# multi-commit PR under COMMIT_OR_PR_TITLE). release-please SILENTLY skips
+# headers it can't parse: no version bump, no changelog entry, no visible
+# failure (LAB-451). This check makes the failure visible at PR time instead of
+# one release later.
+#
+# Ticket ids go in the branch (lab-123-slug), the body, or a title SUFFIX
+# "(LAB-123)" — never a "LAB-123:" prefix, which breaks the parse.
+name: PR Title Lint
+
+on:
+  pull_request:
+    # `synchronize` matters: if this check is made required, it must produce a
+    # result on every head SHA or merges block on a stale/absent status.
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a conventional-commit PR title
+        env:
+          # Via env, not inline ${{ }} in the script — PR titles are untrusted
+          # input and inline interpolation is a shell-injection vector.
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if printf '%s\n' "$TITLE" | grep -qE '^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-zA-Z0-9._,/-]+\))?!?: .+'; then
+            echo "PR title OK: $TITLE"
+          else
+            echo "::error::PR title must be a conventional-commit header — it becomes the squash commit that release-please parses."
+            echo "::error::Got: '$TITLE'"
+            echo "::error::Use 'type(scope): summary', ticket id at the END or in branch/body — e.g. 'fix(api): handle nil tenant (LAB-123)'. Never a 'LAB-NNN:' prefix."
+            exit 1
+          fi
