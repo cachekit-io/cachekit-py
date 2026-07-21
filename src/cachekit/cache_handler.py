@@ -122,8 +122,8 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
     _TTL_REFRESH_UNSUPPORTED_WARNED.add(name)
     warnings.warn(
         f"refresh_ttl_on_get=True has no effect on {name}: it does not support TTL "
-        f"inspection (get_ttl + refresh_ttl), so the setting is ignored. Use the Redis, "
-        f"CachekitIO, or File backend for TTL refresh.",
+        f"inspection (needs both get_ttl and refresh_ttl), so the setting is ignored. Use "
+        f"the Redis, CachekitIO, or File backend for TTL refresh.",
         UserWarning,
         stacklevel=3,
     )
