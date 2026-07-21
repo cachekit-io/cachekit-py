@@ -220,6 +220,15 @@ class CachekitConfig(BaseSettings):
         default=None,
         description="Master encryption key (hex-encoded, minimum 32 bytes for AES-256)",
     )
+    encryption_fail_closed: bool = Field(
+        default=False,
+        description=(
+            "Fail closed on decrypt authentication failures (env: CACHEKIT_ENCRYPTION_FAIL_CLOSED). "
+            "When True, AES-GCM authentication failures and key-fingerprint mismatches raise "
+            "DecryptionAuthenticationError to the caller instead of silently recomputing. "
+            "Per-decorator EncryptionConfig(fail_closed=...) overrides this fleet-wide default."
+        ),
+    )
 
     # Backend provider configuration (for testing)
     backend_provider_class: Optional[str] = Field(

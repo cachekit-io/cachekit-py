@@ -81,6 +81,11 @@ CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption (for @cache.secure)
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
+# Fail closed on decrypt authentication failures (default: false = fail open/recompute).
+# When true, AES-GCM auth failures and key-fingerprint mismatches raise
+# DecryptionAuthenticationError to the caller instead of silently recomputing.
+# Per-decorator fail_closed=True/False overrides this fleet-wide default.
+CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
 
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
