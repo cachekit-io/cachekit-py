@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/cachekit-io/cachekit-py/compare/v0.12.0...v0.13.0) (2026-07-21)
+
+
+### Features
+
+* **interop:** opt-in interop/v1 mode — cross-SDK keys + plain-MessagePack values (LAB-245) ([#220](https://github.com/cachekit-io/cachekit-py/issues/220)) ([e77fa6d](https://github.com/cachekit-io/cachekit-py/commit/e77fa6dc80649d93e990b681ba977bcdb6a4f01a))
+* **security:** tamper telemetry + fail-closed decrypt policy (LAB-108) ([#218](https://github.com/cachekit-io/cachekit-py/issues/218)) ([52d6a46](https://github.com/cachekit-io/cachekit-py/commit/52d6a465ed081e23ef162a59352b12df855f6c2c))
+
+
+### Bug Fixes
+
+* address coderabbit review — run async interop guard before L1 lookup ([#227](https://github.com/cachekit-io/cachekit-py/issues/227)) ([1ae680f](https://github.com/cachekit-io/cachekit-py/commit/1ae680fd87561c82f34b6f2b4088c9ec111fbec6))
+* **security:** route async decorator L2 reads through get_cached_value_async (LAB-111) ([#216](https://github.com/cachekit-io/cachekit-py/issues/216)) ([7df5860](https://github.com/cachekit-io/cachekit-py/commit/7df586059d6190ca847a8b18c1d30dc0a20a5a5f)), closes [#159](https://github.com/cachekit-io/cachekit-py/issues/159)
+
 ## [0.12.0](https://github.com/cachekit-io/cachekit-py/compare/v0.11.1...v0.12.0) (2026-07-20)
 
 
