@@ -76,18 +76,19 @@ def test_redecoration_reuses_single_stats_object() -> None:
     _function_stats_registry.pop(ident, None)
     before = len(_function_stats_registry)
 
-    first = _get_function_stats(ident, l1_enabled=True)
-    seen = {id(_get_function_stats(ident, l1_enabled=True)) for _ in range(2000)}
+    try:
+        first = _get_function_stats(ident, l1_enabled=True)
+        seen = {id(_get_function_stats(ident, l1_enabled=True)) for _ in range(2000)}
 
-    assert seen == {id(first)}, "re-decoration must reuse the same _FunctionStats instance"
-    assert len(_function_stats_registry) == before + 1, "re-decoration must not grow the registry"
+        assert seen == {id(first)}, "re-decoration must reuse the same _FunctionStats instance"
+        assert len(_function_stats_registry) == before + 1, "re-decoration must not grow the registry"
 
-    # l1_enabled is last-decoration-wins (it only feeds the X-CacheKit-L1-Status header).
-    latest = _get_function_stats(ident, l1_enabled=False)
-    assert latest is first
-    assert latest.l1_enabled is False
-
-    _function_stats_registry.pop(ident, None)
+        # l1_enabled is last-decoration-wins (it only feeds the X-CacheKit-L1-Status header).
+        latest = _get_function_stats(ident, l1_enabled=False)
+        assert latest is first
+        assert latest.l1_enabled is False
+    finally:
+        _function_stats_registry.pop(ident, None)
 
 
 @pytest.mark.performance
@@ -110,19 +111,23 @@ def test_registry_lock_not_on_per_call_path(monkeypatch: pytest.MonkeyPatch) -> 
         call_count += 1
         return x * 2
 
-    acquisitions_at_decoration = counting.entries
-    assert acquisitions_at_decoration >= 1, "decoration should register stats via the registry lock"
+    ident = f"{compute.__module__}.{compute.__qualname__}"
+    try:
+        acquisitions_at_decoration = counting.entries
+        assert acquisitions_at_decoration >= 1, "decoration should register stats via the registry lock"
 
-    # Exercise the hot path: one miss then many L1 hits.
-    assert compute(21) == 42
-    for _ in range(5000):
+        # Exercise the hot path: one miss then many L1 hits.
         assert compute(21) == 42
+        for _ in range(5000):
+            assert compute(21) == 42
 
-    assert call_count == 1, "sanity: after the first miss, all calls hit L1"
-    assert counting.entries == acquisitions_at_decoration, (
-        f"per-call path acquired the registry lock "
-        f"{counting.entries - acquisitions_at_decoration} time(s); it must be decoration-only"
-    )
+        assert call_count == 1, "sanity: after the first miss, all calls hit L1"
+        assert counting.entries == acquisitions_at_decoration, (
+            f"per-call path acquired the registry lock "
+            f"{counting.entries - acquisitions_at_decoration} time(s); it must be decoration-only"
+        )
+    finally:
+        _function_stats_registry.pop(ident, None)
 
 
 @pytest.mark.performance
