@@ -65,9 +65,13 @@ def _ensure_session_initialized() -> None:
         if _session_pid == current_pid and _session_id is not None:
             return
 
-        _session_pid = current_pid
-        _session_id = str(uuid.uuid4())
+        # _session_pid is assigned LAST: the fast path above reads without the
+        # lock and admits readers once pid+id are set, so all other fields must
+        # already be populated by then (a reader admitted between id and
+        # start_ms assignments would find start_ms still None).
         _session_start_ms = int(time.time() * 1000)
+        _session_id = str(uuid.uuid4())
+        _session_pid = current_pid
 
 
 def get_session_id() -> str:

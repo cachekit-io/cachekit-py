@@ -657,3 +657,80 @@ class TestSessionIDUnification:
         from cachekit.decorators.session import get_session_id as decorator_session_id
 
         assert decorator_session_id() == backend_session_id()
+
+
+class TestForkResetHandlers:
+    """LAB-506: the post-fork reset handlers, exercised in-process.
+
+    The real fork path is covered by TestForkSessionIsolation; these tests
+    pin the handlers' contracts directly — zeroed counters, replaced locks
+    (an inherited lock held at fork time would deadlock the child), and a
+    session identity re-derived from a fresh process UUID.
+    """
+
+    def test_function_stats_reset_for_new_process(self):
+        stats = _FunctionStats("mymodule.myfunc")
+        stats.record_l1_hit()
+        stats.record_l2_hit(2.5)
+        stats.record_miss()
+        stats.clear()  # bumps _clear_count → session ID carries '#1'
+        stats.record_miss()
+        assert stats.get_info().session_id.endswith("#1")
+        old_lock = stats._lock
+
+        stats._reset_for_new_process()
+
+        assert stats._lock is not old_lock
+        info = stats.get_info()
+        assert (info.hits, info.misses, info.l1_hits, info.l2_hits) == (0, 0, 0, 0)
+        assert info.l2_avg_latency_ms == 0.0
+        assert info.last_operation_at is None
+        # clear_count reset: fresh process session, no '#N' suffix
+        assert "#" not in info.session_id
+
+    def test_reset_stats_after_fork_resets_registry_entries(self):
+        from cachekit.decorators import wrapper as wrapper_module
+
+        stats = wrapper_module._get_function_stats("lab506.registry_reset_probe", l1_enabled=True)
+        stats.record_miss()
+        old_registry_lock = wrapper_module._function_stats_registry_lock
+
+        wrapper_module._reset_stats_after_fork()
+
+        assert wrapper_module._function_stats_registry_lock is not old_registry_lock
+        info = stats.get_info()
+        assert info.hits + info.misses == 0
+        # Same instance stays registered — identity survives, state resets
+        assert wrapper_module._function_stats_registry["lab506.registry_reset_probe"] is stats
+
+    def test_session_reset_state_mints_new_identity(self):
+        from cachekit.decorators import session as session_module
+
+        saved = (
+            session_module._session_lock,
+            session_module._session_pid,
+            session_module._session_id,
+            session_module._session_start_ms,
+        )
+        try:
+            first_id = session_module.get_session_id()
+            old_lock = session_module._session_lock
+
+            session_module._reset_session_state()
+
+            assert session_module._session_lock is not old_lock
+            assert session_module._session_id is None
+            assert session_module._session_pid is None
+            assert session_module._session_start_ms is None
+            # Next access lazily mints a fresh identity
+            assert session_module.get_session_id() != first_id
+            assert session_module.get_session_start_ms() > 0
+        finally:
+            # Restore the process-wide identity so other tests in this
+            # process keep their stable session UUID.
+            (
+                session_module._session_lock,
+                session_module._session_pid,
+                session_module._session_id,
+                session_module._session_start_ms,
+            ) = saved
