@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
 import warnings
 from typing import Any, Optional
@@ -23,7 +24,7 @@ import time_machine
 from cachekit import cache_handler as ch
 from cachekit.backends.base import TTLInspectableBackend
 from cachekit.backends.errors import BackendError
-from cachekit.backends.file.backend import HEADER_SIZE, MAGIC, FileBackend
+from cachekit.backends.file.backend import HEADER_SIZE, MAGIC, MAX_TTL_SECONDS, FileBackend
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.cache_handler import StandardCacheHandler, supports_ttl_inspection
 
@@ -107,6 +108,61 @@ class TestFileBackendTTLInspection:
         assert supports_ttl_inspection(file_backend) is True
         assert isinstance(file_backend, TTLInspectableBackend)
 
+    # --- error / corruption / security branches (LAB-446 review-gate hardening) ---
+
+    async def test_get_ttl_corrupt_header_unlinks_and_returns_none(self, file_backend: FileBackend) -> None:
+        """A file whose magic no longer matches is treated as absent AND evicted on read."""
+        file_backend.set("k", b"v", ttl=100)
+        path = file_backend._key_to_path("k")
+        with open(path, "r+b") as f:
+            f.write(b"XX")  # clobber the 2-byte magic
+        assert await file_backend.get_ttl("k") is None
+        assert not os.path.exists(path)  # poison evicted, not left to rot
+
+    async def test_get_ttl_rejects_symlink_and_returns_none(self, file_backend: FileBackend) -> None:
+        """O_NOFOLLOW rejects a symlink at the key path (ELOOP) -> reported absent, not followed."""
+        file_backend.set("real", b"v", ttl=100)
+        link = file_backend._key_to_path("linked")
+        os.symlink(file_backend._key_to_path("real"), link)
+        assert await file_backend.get_ttl("linked") is None
+
+    async def test_get_ttl_wraps_unexpected_oserror(self, file_backend: FileBackend) -> None:
+        """A non-ENOENT/ELOOP OS error surfaces as BackendError, never silently swallowed.
+
+        A directory where a cache file is expected makes ``os.read`` raise EISDIR — a real,
+        deterministic trigger (no global os.read patching, which would wedge the async loop)."""
+        file_backend.set("seed", b"x")  # ensure the cache dir exists
+        os.mkdir(file_backend._key_to_path("k"))  # os.read on a dir fd -> EISDIR
+        with pytest.raises(BackendError):
+            await file_backend.get_ttl("k")
+
+    async def test_refresh_ttl_rejects_out_of_range_ttl(self, file_backend: FileBackend) -> None:
+        """TTL bounds mirror set() (overflow/underflow guard); both ends raise BackendError."""
+        with pytest.raises(BackendError):
+            await file_backend.refresh_ttl("k", -1)
+        with pytest.raises(BackendError):
+            await file_backend.refresh_ttl("k", MAX_TTL_SECONDS + 1)
+
+    async def test_refresh_ttl_corrupt_header_unlinks_and_returns_false(self, file_backend: FileBackend) -> None:
+        file_backend.set("k", b"v", ttl=100)
+        path = file_backend._key_to_path("k")
+        with open(path, "r+b") as f:
+            f.write(b"XX")  # clobber magic
+        assert await file_backend.refresh_ttl("k", 100) is False
+        assert not os.path.exists(path)
+
+    async def test_refresh_ttl_rejects_symlink_and_returns_false(self, file_backend: FileBackend) -> None:
+        file_backend.set("real", b"v", ttl=100)
+        link = file_backend._key_to_path("linked")
+        os.symlink(file_backend._key_to_path("real"), link)
+        assert await file_backend.refresh_ttl("linked", 100) is False
+
+    async def test_refresh_ttl_wraps_unexpected_oserror(self, file_backend: FileBackend) -> None:
+        file_backend.set("seed", b"x")
+        os.mkdir(file_backend._key_to_path("k"))  # os.open O_RDWR on a dir -> EISDIR
+        with pytest.raises(BackendError):
+            await file_backend.refresh_ttl("k", 100)
+
 
 # ----------------------------------------------------------------------- Memcached
 
@@ -137,6 +193,13 @@ class TestMemcachedRefreshTTL:
         backend, fake = mc_backend
         fake.touch.return_value = False
         assert await backend.refresh_ttl("gone", 60) is False
+
+    async def test_refresh_ttl_zero_sets_no_expiry(self, mc_backend) -> None:
+        """ttl<=0 means 'no expiry' -> touch(expire=0), matching set() semantics."""
+        backend, fake = mc_backend
+        fake.touch.return_value = True
+        assert await backend.refresh_ttl("k", 0) is True
+        fake.touch.assert_called_once_with("app:k", expire=0, noreply=False)
 
     async def test_refresh_ttl_clamps_to_30_day_max(self, mc_backend) -> None:
         from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL
