@@ -841,25 +841,26 @@ class TestAsyncWrapperTTLRefreshEdgeCases:
     """
 
     @pytest.mark.asyncio
-    async def test_backend_without_ttl_support_logs_and_continues(self, backend_without_ttl, caplog):
-        """Backend without get_ttl/refresh_ttl should log debug and continue.
+    async def test_backend_without_ttl_support_warns_and_continues(self, backend_without_ttl):
+        """Backend without get_ttl/refresh_ttl warns once (LAB-446) and continues.
 
-        Coverage: Lines 1047-1048 (backend doesn't support TTL inspection)
+        The refresh_ttl_on_get flag is ignored when the backend can't inspect TTL; the
+        cache hit must still be returned (graceful degradation, no crash).
         """
-        import logging
+
+        from cachekit import cache_handler as ch
+
+        ch._TTL_REFRESH_UNSUPPORTED_WARNED.clear()  # warn-once guard is process-global
 
         @cache(backend=backend_without_ttl, ttl=300, refresh_ttl_on_get=True)
         async def cached_func():
             return 99
 
-        with caplog.at_level(logging.DEBUG):
+        with pytest.warns(UserWarning, match="refresh_ttl_on_get"):
             result = await cached_func()
 
-        # Should return cached value
+        # Cache hit is still returned despite the ignored flag.
         assert result == 42
-
-        # Debug log should mention backend doesn't support TTL inspection
-        # (logs are optional, main thing is it doesn't crash)
 
 
 # =============================================================================

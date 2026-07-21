@@ -100,6 +100,11 @@ class BaseBackend(Protocol):
 | **[HTTP (custom)](custom.md)** | 10–100ms | Varies | Yes | Varies | Varies |
 | **[DynamoDB (custom)](custom.md)** | 100–500ms | Yes | Yes | Yes | No |
 
+**TTL inspection/refresh** (`refresh_ttl_on_get` sliding expiration, via the
+`TTLInspectableBackend` protocol): supported by **File**, **Redis**, and **CachekitIO**.
+**Memcached** supports `refresh_ttl` (via `touch`) directly but not `get_ttl`, so
+`refresh_ttl_on_get` does not apply to it (see [Memcached](memcached.md#ttl-inspection--refresh)).
+
 ## When to Use Which Backend
 
 **Use [FileBackend](file.md) when**:

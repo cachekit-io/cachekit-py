@@ -119,8 +119,10 @@ class TTLInspectableBackend(Protocol):
     TTL refresh for frequently-accessed keys.
 
     Not all backends support this capability:
-    - Supported: Redis, PostgreSQL, DynamoDB, SQLite, FileSystem
-    - Not supported: HTTP (stateless), Memcached (limited), S3 (limited)
+    - Supported: Redis, CachekitIO, File, PostgreSQL, DynamoDB, SQLite
+    - Not supported: HTTP (stateless), S3 (limited)
+    - Memcached: partial — implements ``refresh_ttl`` (via ``touch``) but NOT ``get_ttl``
+      (no protocol command to read remaining TTL), so it is not a full TTLInspectableBackend.
 
     Example:
         >>> # TTL inspection pattern (async context):
