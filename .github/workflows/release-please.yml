@@ -30,10 +30,6 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
-      # prs_created is "true" when a release PR was opened or updated this run.
-      # pr is the JSON-encoded PullRequest object; we read .headBranchName from it.
-      prs_created: ${{ steps.release.outputs.prs_created }}
-      pr: ${{ steps.release.outputs.pr }}
     steps:
       # Use GitHub App for token vending (avoids branch protection issues with GITHUB_TOKEN)
       # If APP_ID/APP_PRIVATE_KEY not set, falls back to GITHUB_TOKEN
@@ -65,15 +61,33 @@ jobs:
           PR_NUMBER: ${{ fromJSON(steps.release.outputs.pr).number }}
         run: gh pr edit "$PR_NUMBER" --add-assignee 27Bslash6
 
-  sync-lockfiles:
-    name: Sync lockfiles in release PR
+  sync-release-pr:
+    name: Sync release PR with main
     needs: release-please
-    # Only run when release-please opened or updated a release PR. The lockfiles
-    # (uv.lock, root Cargo.lock) are not touched by release-please, so they drift
-    # behind the version bumps in pyproject.toml / __init__.py / Cargo.toml unless
-    # we regenerate and commit them onto the release PR branch.
-    if: ${{ needs.release-please.outputs.prs_created == 'true' }}
+    # Keep the open release PR mergeable with no manual rebase (LAB-335 / PR #214).
+    # release-please only regenerates its PR when a RELEASABLE commit (feat/fix/
+    # perf/security/revert) lands on main; the hidden changelog types (chore/docs/
+    # test/ci/..., e.g. Renovate lockfile bumps) advance main without regeneration,
+    # so the release branch silently drifts behind. This job runs on every push to
+    # main while a release PR is open: it rebases the branch onto main, then
+    # REGENERATES the lockfiles instead of rebasing them — the branch's lockfile
+    # commit is dropped and rebuilt, so lockfile changes on main can never conflict
+    # with it. It also covers the old sync-lockfiles duty: on runs where
+    # release-please just force-pushed a regeneration, the branch is already on
+    # main's tip, the rebase no-ops, and only the lockfile commit is added.
+    # Skipped when a release was just cut (the release PR was merged away), and on
+    # workflow_dispatch (force_release re-runs must not touch the open PR). The
+    # branch it pushes is not main, so it cannot re-trigger this workflow, and the
+    # wheel-build matrix stays gated on release_created.
+    if: ${{ github.event_name == 'push' && needs.release-please.outputs.release_created != 'true' }}
     runs-on: ubuntu-latest
+    # Two pushes to main in quick succession (e.g. a PR-merge train) run this
+    # workflow twice in parallel; serialize the branch writers so the
+    # force-with-lease pushes cannot race each other. A superseded pending run is
+    # cancelled — harmless, each run fetches fresh state and converges.
+    concurrency:
+      group: sync-release-pr
+      cancel-in-progress: false
     steps:
       # Re-mint the App token in this job: step outputs are job-scoped, so the
       # token from the release-please job is not visible here. The App token lets
@@ -87,39 +101,100 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      # release-please only sets outputs.pr on runs where it created/updated the
+      # PR — exactly the runs whose complement this job must also cover — so the
+      # open release PR is discovered at runtime instead. GH_REPO is required:
+      # there is no checkout yet. Trust note: creating a release-please--* branch
+      # here requires repo write access, the same trust level as any collaborator.
+      - name: Find open release PR
+        id: find
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          branch=$(gh pr list --state open --base main --json headRefName \
+            --jq '[.[].headRefName | select(startswith("release-please--"))][0] // empty')
+          if [ -z "$branch" ]; then
+            echo "No open release PR; nothing to sync."
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      # fetch-depth: 0 — the rebase needs history back to the merge-base with main.
+      # persist-credentials: false — don't leave the App token in .git/config for
+      # the uv/cargo steps; the final push re-supplies it via env (zizmor artipacked).
       - name: Checkout release PR branch
+        if: steps.find.outputs.branch != ''
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          ref: ${{ steps.find.outputs.branch }}
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install uv
+        if: steps.find.outputs.branch != ''
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Install Rust toolchain
+        if: steps.find.outputs.branch != ''
         run: rustup toolchain install stable --profile minimal
 
-      # Regenerate the lockfiles from the bumped manifests. Both run from the repo
-      # root: uv.lock and Cargo.lock are the workspace locks (there is no rust/Cargo.lock).
-      - name: Sync uv lockfile
-        run: uv lock
-
-      - name: Sync Cargo lockfile
-        run: cargo update -p cachekit-rs
-
-      - name: Commit and push lockfile changes
+      - name: Rebase onto main and regenerate lockfiles
+        if: steps.find.outputs.branch != ''
         env:
-          BRANCH: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          lockfile_subject="chore: sync lockfiles with release"
+
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            # Drop the bot's own lockfile commit before rebasing: generated
+            # lockfiles rebase dirtily against lockfile changes on main (Renovate
+            # bumps rewrite the same package blocks the version sync touches).
+            # It is regenerated below, which cannot conflict.
+            if [ "$(git log -1 --format=%s)" = "$lockfile_subject" ]; then
+              git reset --hard HEAD~1
+            fi
+            # Replays release-please's version/changelog commit. main never edits
+            # those regions between releases, so a conflict here means something
+            # unexpected — fail loudly for a human instead of guessing.
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "::error::${BRANCH} does not rebase cleanly onto main outside the lockfiles — manual resolution needed"
+              exit 1
+            fi
+          fi
+
+          # Regenerate the lockfiles from the (possibly rebased) bumped manifests.
+          # Both run from the repo root: uv.lock and Cargo.lock are the workspace
+          # locks (there is no rust/Cargo.lock).
+          uv lock
+          cargo update -p cachekit-rs
+
           git add uv.lock Cargo.lock
-          if git diff --staged --quiet; then
-            echo "Lockfiles already in sync; nothing to commit."
+          if ! git diff --staged --quiet; then
+            git commit -m "$lockfile_subject"
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${BRANCH}")" ]; then
+            echo "Release PR branch already current; nothing to push."
             exit 0
           fi
-          git commit -m "chore: sync lockfiles with release"
-          git push origin "HEAD:${BRANCH}"
+          # force-with-lease: the rebase rewrites history; the lease refuses the
+          # push if anything else (release-please, a human) moved the branch since
+          # checkout — the next main push converges instead of clobbering.
+          # Auth is scoped to this one command: checkout ran with
+          # persist-credentials: false, so nothing earlier in the job could read a
+          # token from .git/config; GIT_CONFIG_* env vars keep it out of argv too.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+          git push --force-with-lease origin "HEAD:${BRANCH}"
 
   validate-inputs:
     name: Validate Release Inputs

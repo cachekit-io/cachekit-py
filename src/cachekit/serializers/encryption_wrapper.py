@@ -236,6 +236,12 @@ class EncryptionWrapper:
         # Serialize with base serializer
         try:
             raw_data, raw_metadata = self.serializer.serialize(obj)
+        except ValueError:
+            # Interop/v1 data-model rejections (InteropError, a ValueError) must
+            # reach the caller unlaundered — wrapping them as SerializationError
+            # would route them into the silent "caching failed" fallbacks and
+            # violate the spec's fail-loud contract on the encrypted path.
+            raise
         except Exception as e:
             raise SerializationError(f"Serialization failed: {e}") from e
 

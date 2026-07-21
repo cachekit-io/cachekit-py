@@ -22,6 +22,13 @@ from ..cache_handler import (
     handle_decrypt_failure,
     redact_cache_key,
 )
+from ..interop import (
+    InteropError,
+    bind_flat_args,
+    ensure_interop_backend_compatible,
+    generate_interop_key,
+    validate_interop_config,
+)
 from ..key_generator import CacheKeyGenerator
 from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
@@ -312,6 +319,8 @@ def create_cache_wrapper(
     collect_stats: bool = True,
     enable_tracing: bool = True,
     enable_structured_logging: bool = True,
+    # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
+    interop: str | None = None,
     # L1-only mode flag
     _l1_only_mode: bool = False,
     **kwargs: Any,
@@ -367,6 +376,11 @@ def create_cache_wrapper(
         collect_stats: Enable statistics collection
         enable_tracing: Enable distributed tracing
         enable_structured_logging: Enable structured logging
+        interop: interop/v1 cross-SDK operation name. When set, switches this
+                function to canonical {namespace}:{operation}:{args_hash} keys
+                and plain-MessagePack values shared byte-identically with
+                cachekit-rs / cachekit-ts. Requires namespace; mutually
+                exclusive with key= and fast_mode. None (default) = auto mode.
 
     Security Note:
         When encryption=True and tenant_extractor is provided, tenant ID extraction
@@ -423,6 +437,9 @@ def create_cache_wrapper(
 
         # Custom key function (escape hatch for complex types)
         custom_key_func = config.key
+
+        # Interop mode (config carries it through DecoratorConfig validation)
+        interop = config.interop if interop is None else interop
     else:
         custom_key_func = None
         l1_max_size_mb = None
@@ -445,6 +462,32 @@ def create_cache_wrapper(
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
 
+    # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
+    # decoration time. These checks also cover direct create_cache_wrapper callers
+    # that bypass DecoratorConfig validation.
+    _interop_sig: inspect.Signature | None = None
+    if interop is not None:
+        from ..config.validation import ConfigurationError
+
+        try:
+            validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
+        except InteropError as e:
+            raise ConfigurationError(str(e)) from e
+        if fast_mode:
+            raise ConfigurationError(
+                "interop mode and fast_mode are mutually exclusive: fast-mode keys are not the canonical interop/v1 key format."
+            )
+        if _l1_only_mode:
+            raise ConfigurationError(
+                "interop mode requires a shared backend (backend=None is L1-only, in-process): "
+                "L1-only mode stores raw Python objects, so the cross-SDK value contract "
+                "(plain MessagePack, closed data model) would silently not be enforced."
+            )
+        # Backend known at decoration time -> guard now; lazily-resolved backends
+        # are re-checked per call (see the wrappers below).
+        ensure_interop_backend_compatible(backend)
+        _interop_sig = inspect.signature(func)
+
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
 
@@ -459,6 +502,7 @@ def create_cache_wrapper(
         master_key=master_key,
         enable_integrity_checking=integrity_checking,
         encryption_fail_closed=encryption_fail_closed,
+        interop_mode=interop is not None,
     )
 
     # Create cache handler strategy (initialized with actual Redis client when first used)
@@ -497,6 +541,19 @@ def create_cache_wrapper(
         collect_stats=use_collect_stats,
         enable_structured_logging=use_enable_structured_logging,
     )
+
+    # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
+    # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    def _on_l2_deserialize_error(error: Exception, key: str) -> None:
+        features.handle_cache_error(
+            error=error,
+            operation="cache_get_deserialize",
+            cache_key=key,
+            namespace=namespace or "default",
+            duration_ms=0.0,
+        )
+
+    operation_handler.on_deserialize_error = _on_l2_deserialize_error
 
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
@@ -544,6 +601,18 @@ def create_cache_wrapper(
     # Detect whether the wrapped function accepts parameters.
     # Used to distinguish "invalidate the zero-arg entry" from "invalidate ALL entries".
     _func_has_params = bool(inspect.signature(func).parameters)
+
+    def _interop_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
+        """Interop/v1 key for this call: {namespace}:{operation}:{args_hash}.
+
+        Raises InteropError on out-of-model arguments — interop keygen never
+        degrades to uncached execution (the cross-SDK contract requires loud
+        rejection; a value that hashes here and errors on another SDK is a
+        silent-consistency bug).
+        """
+        assert _interop_sig is not None and interop is not None and namespace is not None  # noqa: S101
+        flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
+        return generate_interop_key(namespace, interop, flat)
 
     # Track all cache keys written by this function (for no-args invalidation).
     # When invalidate_cache() is called with no args on a parameterized function,
@@ -674,8 +743,11 @@ def create_cache_wrapper(
 
         # Key generation - needed for both L1-only and L1+L2 modes
         try:
+            # Interop mode takes priority (mutually exclusive with key= and fast_mode)
+            if interop is not None:
+                cache_key = _interop_cache_key(args, kwargs)
             # Custom key function takes priority (escape hatch for complex types)
-            if custom_key_func is not None:
+            elif custom_key_func is not None:
                 custom_key = custom_key_func(*args, **kwargs)
                 if not isinstance(custom_key, str):
                     raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
@@ -690,6 +762,12 @@ def create_cache_wrapper(
             else:
                 cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
         except Exception as e:
+            if interop is not None:
+                # Interop/v1: out-of-model arguments MUST be rejected with an
+                # error — never silently degrade to uncached execution.
+                features.clear_correlation_id()
+                reset_current_function_stats(token)
+                raise
             # Key generation failed - execute function without caching
             features.handle_cache_error(
                 error=e,
@@ -801,6 +879,20 @@ def create_cache_wrapper(
                 # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
                 reset_current_function_stats(token)
                 return func(*args, **kwargs)
+
+        # Interop fail-closed guard (CWE-636): a key-prefixing backend would make
+        # this SDK read/write a key other SDKs cannot see. Re-checked per call
+        # (outside the try above, so it propagates) because the backend is
+        # lazily resolved and a prefix could appear dynamically. The raise path
+        # must restore the stats context itself — it sits outside the main
+        # try/finally (see test_context_leak_regression.py).
+        if interop is not None:
+            try:
+                ensure_interop_backend_compatible(_backend)
+            except Exception:
+                features.clear_correlation_id()
+                reset_current_function_stats(token)
+                raise
 
         # Guard clause: L1 cache check first - early return eliminates network latency
         if _l1_cache and cache_key:
@@ -989,6 +1081,10 @@ def create_cache_wrapper(
                         hit=False,  # Was a miss
                     )
 
+            except InteropError:
+                # Interop/v1 data-model rejection: fail loud, never "computed
+                # but silently never cached" (spec-mandated; matches cachekit-ts).
+                raise
             except Exception as e:
                 # Caching failed but function succeeded - return result anyway
                 set_duration_ms = (time.time() - start_time) * 1000
@@ -1048,8 +1144,11 @@ def create_cache_wrapper(
             cache_key = None
             func_start_time: float | None = None  # Initialize for exception handlers
             try:
+                # Interop mode takes priority (mutually exclusive with key= and fast_mode)
+                if interop is not None:
+                    cache_key = _interop_cache_key(args, kwargs)
                 # Custom key function takes priority (escape hatch for complex types)
-                if custom_key_func is not None:
+                elif custom_key_func is not None:
                     custom_key = custom_key_func(*args, **kwargs)
                     if not isinstance(custom_key, str):
                         raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
@@ -1065,6 +1164,10 @@ def create_cache_wrapper(
                     # Standard key generation with type-aware handling
                     cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
             except Exception as e:
+                if interop is not None:
+                    # Interop/v1: out-of-model arguments MUST be rejected with an
+                    # error — never silently degrade to uncached execution.
+                    raise
                 # If key generation fails, execute function without caching - RETURN EARLY
                 # This handles unhashable types gracefully
                 features.handle_cache_error(
@@ -1120,6 +1223,33 @@ def create_cache_wrapper(
                     "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
                 )
 
+            nonlocal _backend
+
+            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
+            # make this SDK read/write a key other SDKs cannot see. Re-checked per
+            # call because the backend is lazily resolved and a prefix could
+            # appear dynamically. MUST run before the L1 check below — an L1 hit
+            # early-returns and would bypass the per-call re-check (mirrors
+            # sync_wrapper's ordering). Backend is resolved eagerly for interop
+            # calls only, so the non-interop L1 fast path is unchanged. The raise
+            # propagates; the outer finally clears correlation ID / stats context.
+            if interop is not None:
+                if _backend is None:
+                    try:
+                        _backend = get_backend_provider().get_backend()
+                    except Exception as e:
+                        # If Redis connection fails, execute function without caching - RETURN EARLY
+                        # This prevents the decorator from breaking the application
+                        features.handle_cache_error(
+                            error=e,
+                            operation="client_creation",
+                            cache_key=cache_key or "unknown",
+                            namespace=namespace or "default",
+                            duration_ms=0.0,
+                        )
+                        return await func(*args, **kwargs)
+                ensure_interop_backend_compatible(_backend)
+
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
@@ -1170,7 +1300,6 @@ def create_cache_wrapper(
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)
-            nonlocal _backend
             if _backend is None:
                 try:
                     _backend = get_backend_provider().get_backend()
@@ -1203,12 +1332,13 @@ def create_cache_wrapper(
                 correlation_id = features.create_correlation_id()
 
             try:
-                # Attempt to retrieve from Redis
-                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
+                # Route through get_cached_value_async so corrupt/tampered entries inherit
+                # eviction + the cache_get_deserialize metric instead of persisting (#159)
+                cached_result = await operation_handler.get_cached_value_async(cache_key)
 
-                if cached_data is not None:
-                    # Deserialize the cached data
-                    result = operation_handler.serialization_handler.deserialize_data(cached_data, cache_key=cache_key)
+                if cached_result is not None:
+                    # Cache hit: (True, value, raw serialized envelope for L1 backfill)
+                    _found, result, cached_data = cached_result
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1249,37 +1379,13 @@ def create_cache_wrapper(
 
                     return result
 
-            except SerializationError as e:
-                get_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_get_deserialize",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=get_duration_ms,
-                    correlation_id=correlation_id,
-                )
-                # Single policy point (cachekit-py#170): metric + fail policy. On a
-                # fail-closed raise the poisoned entry is retained as evidence.
-                # Explicit local re-raise mirrors the sync L1/L2 and async lock-path
-                # guards: keep the fail-closed tamper raise from being demoted to a
-                # fail-open recompute if a future edit wraps the policy call in a broad
-                # `except Exception` (defense-in-depth, LAB-108). No manual stats reset —
-                # the async wrapper's outer `finally` covers every exit path.
-                try:
-                    handle_decrypt_failure(
-                        e, tier="l2", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                    )
-                except DecryptionAuthenticationError:
-                    raise
-                # Fail open: best-effort evict so the next read (including this call's
-                # own lock double-check below) is a clean miss instead of re-failing
-                # and double-counting the metric (#159; mirrors the sync path).
-                try:
-                    await operation_handler.cache_handler.delete_async(cache_key)  # type: ignore[attr-defined]
-                except Exception as del_err:
-                    logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
-
+            except DecryptionAuthenticationError:
+                # Fail-closed tamper failure propagated from get_cached_value_async —
+                # the tamper metric, error log, evidence retention, and fail policy all
+                # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108). It must
+                # reach the caller: the generic clause below would demote it to a
+                # fail-open "record and recompute".
+                raise
             except Exception as e:
                 # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1312,14 +1418,13 @@ def create_cache_wrapper(
                     ) as lock_acquired:
                         if lock_acquired:
                             # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited
+                            # Another request may have populated it while we waited.
+                            # Routed through get_cached_value_async: corrupt entries evict (#159).
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1330,14 +1435,11 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                # Single policy point (cachekit-py#170): metric + fail policy.
-                                handle_decrypt_failure(
-                                    e,
-                                    tier="l2",
-                                    cache_key=cache_key,
-                                    fail_closed=serialization_handler.encryption_fail_closed,
-                                )
+                            except DecryptionAuthenticationError:
+                                # Fail-closed tamper raise from get_cached_value_async
+                                # (cachekit-py#170) — must not be demoted to a recompute
+                                # by the generic clause below.
+                                raise
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
@@ -1346,12 +1448,11 @@ def create_cache_wrapper(
                             # Another request may have populated it while we waited
                             logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                # Routed through get_cached_value_async: corrupt entries evict (#159)
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1362,14 +1463,11 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                # Single policy point (cachekit-py#170): metric + fail policy.
-                                handle_decrypt_failure(
-                                    e,
-                                    tier="l2",
-                                    cache_key=cache_key,
-                                    fail_closed=serialization_handler.encryption_fail_closed,
-                                )
+                            except DecryptionAuthenticationError:
+                                # Fail-closed tamper raise from get_cached_value_async
+                                # (cachekit-py#170) — must not be demoted to a recompute
+                                # by the generic clause below.
+                                raise
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
@@ -1418,6 +1516,9 @@ def create_cache_wrapper(
                                     duration_ms=set_duration_ms,
                                 )
 
+                        except InteropError:
+                            # Interop/v1 data-model rejection: fail loud (spec-mandated).
+                            raise
                         except Exception as e:
                             # Caching failed but function succeeded - return result anyway
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1505,6 +1606,9 @@ def create_cache_wrapper(
                             duration_ms=set_duration_ms,
                         )
 
+                except InteropError:
+                    # Interop/v1 data-model rejection: fail loud (spec-mandated).
+                    raise
                 except Exception as e:
                     # Caching failed but function succeeded - return result anyway
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1567,7 +1671,10 @@ def create_cache_wrapper(
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
-        cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
+        if interop is not None:
+            cache_key = _interop_cache_key(args, kwargs)
+        else:
+            cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
         if _object_cache and cache_key:
             _object_cache.delete(cache_key)
@@ -1577,7 +1684,17 @@ def create_cache_wrapper(
 
         if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
-            invalidator.invalidate_cache(func, args, kwargs, namespace)
+            if interop is not None:
+                # CacheInvalidator regenerates auto-mode keys internally, which
+                # would miss the interop entry — delete the interop key directly.
+                # Log at ERROR (matching CacheInvalidator): a failed interop
+                # delete means OTHER SDKs keep serving the stale entry.
+                try:
+                    _backend.delete(cache_key)
+                except Exception as e:
+                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+            else:
+                invalidator.invalidate_cache(func, args, kwargs, namespace)
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -1612,7 +1729,10 @@ def create_cache_wrapper(
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
-        cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
+        if interop is not None:
+            cache_key = _interop_cache_key(args, kwargs)
+        else:
+            cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
 
         if _object_cache and cache_key:
             _object_cache.delete(cache_key)
@@ -1623,7 +1743,17 @@ def create_cache_wrapper(
         # Clear L2 cache via invalidator (skip in L1-only mode)
         if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
-            await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
+            if interop is not None:
+                # CacheInvalidator regenerates auto-mode keys internally, which
+                # would miss the interop entry — delete the interop key directly.
+                # Log at ERROR (matching CacheInvalidator): a failed interop
+                # delete means OTHER SDKs keep serving the stale entry.
+                try:
+                    _backend.delete(cache_key)
+                except Exception as e:
+                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+            else:
+                await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""

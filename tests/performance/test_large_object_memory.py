@@ -14,6 +14,9 @@ Pre-fix these assertions fail; post-fix store peak is ~2x, read ~1.1x, wire ~1x.
 from __future__ import annotations
 
 import gc
+import subprocess
+import sys
+import textwrap
 import tracemalloc
 
 import numpy as np
@@ -95,3 +98,40 @@ def test_full_roundtrip_through_cache_handler_is_correct_and_compact():
     assert len(blob) / _logical(df) < 1.1
     out = handler.deserialize_data(blob, cache_key="k")
     pd.testing.assert_frame_equal(out, df)
+
+
+@pytest.mark.slow
+@pytest.mark.performance
+def test_byte_storage_store_has_no_full_payload_copy():
+    """Rust-side allocation guard for ByteStorage.store() (cachekit-core#45).
+
+    tracemalloc cannot see Rust allocations, so this invariant uses peak RSS in
+    a dedicated subprocess. Determinism comes from the payload: 512MB of a
+    repeating 8-byte pattern LZ4-compresses to ~2MB, so every Rust-side buffer
+    downstream of the input (compressed data, msgpack envelope, returned bytes)
+    is negligible and peak RSS ~= interpreter + payload (~1.1x). The eliminated
+    ``data.to_vec()`` full-payload copy (cachekit-core < 0.3.0) re-adds ~1.0x
+    payload and trips the 1.7x bound with margin on both sides.
+    """
+    payload_mb = 512
+    script = textwrap.dedent(
+        f"""
+        import resource
+
+        from cachekit._rust_serializer import ByteStorage
+
+        payload = b"cachekit" * ({payload_mb} * 1024 * 1024 // 8)
+        envelope = ByteStorage(None).store(payload, None)
+        # Sanity: compressible payload => tiny envelope, or the RSS bound is meaningless.
+        assert len(envelope) < 32 * 1024 * 1024, f"envelope unexpectedly large: {{len(envelope)}}"
+        print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)  # KiB on Linux
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+    assert result.returncode == 0, f"store subprocess failed: {result.stderr}"
+    peak = int(result.stdout.strip()) * 1024
+    payload_bytes = payload_mb * 1024 * 1024
+    assert peak < payload_bytes * 1.7, (
+        f"store() peak RSS {peak / payload_bytes:.2f}x payload — a full-payload copy is back "
+        f"on the write path (expected ~1.1x without the to_vec copy, ~2.1x with it)"
+    )

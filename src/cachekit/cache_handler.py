@@ -21,8 +21,14 @@ from cachekit.backends.provider import (
 )
 from cachekit.config import ConfigurationError, get_settings
 from cachekit.di import DIContainer
+from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import (
+    SerializationError,
+    SerializationFormat,
+    SerializationMetadata,
+    SuspiciousCacheEntryError,
+)
 from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
 from cachekit.serializers.wrapper import SerializationWrapper
 
@@ -375,6 +381,7 @@ class CacheSerializationHandler:
         master_key: Optional[str] = None,
         enable_integrity_checking: bool = True,
         encryption_fail_closed: bool | None = None,
+        interop_mode: bool = False,
     ):
         """Initialize with serializer strategy and optional encryption.
 
@@ -422,7 +429,33 @@ class CacheSerializationHandler:
         """
         self.serializer_name = serializer_name
         self.enable_integrity_checking = enable_integrity_checking
+        self.interop_mode = interop_mode
         self._deployment_uuid_value: Optional[str] = None
+
+        # Interop mode (interop/v1, spec/interop-mode.md): values are ONE plain
+        # MessagePack document — no ByteStorage envelope and no CK v3 frame, so
+        # there is no stored metadata header at all. Whether an entry is
+        # encrypted is decided by THIS handler's configuration, never by
+        # sniffing stored bytes (fail closed by construction; the LAB-241
+        # downgrade cannot be reintroduced because there is no header to forge).
+        if interop_mode:
+            if tenant_extractor is not None:
+                raise ConfigurationError(
+                    "interop mode does not support tenant_extractor (multi-tenant) encryption: "
+                    "interop entries store no metadata header, so the read path cannot recover "
+                    "a per-call tenant. Use single-tenant encryption with an explicitly shared "
+                    "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
+                )
+            if isinstance(serializer_name, str) and _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name) != "default":
+                raise ConfigurationError(
+                    f"interop mode requires the default (MessagePack) serializer, got '{serializer_name}': "
+                    f"interop/v1 values are plain MessagePack by specification."
+                )
+            if not isinstance(serializer_name, str):
+                raise ConfigurationError(
+                    "interop mode does not accept a custom serializer instance: interop/v1 values "
+                    "are canonical plain MessagePack produced by the built-in interop encoder."
+                )
 
         # Tri-state encryption resolution. `encryption` is None/True/False:
         #   None  -> auto-detect from CACHEKIT_MASTER_KEY (fleet-wide convergence point)
@@ -522,7 +555,15 @@ class CacheSerializationHandler:
 
         # Use cached base serializer instance with integrity_checking setting
         # Encryption wrapper is created per-request with tenant_id (if encryption=True)
-        self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
+        if interop_mode:
+            # Interop values bypass ByteStorage entirely; integrity checking is
+            # meaningless here (tamper protection comes from AES-GCM when
+            # encryption is on). InteropSerializer is stateless — no cache needed.
+            from cachekit.serializers.interop_serializer import InteropSerializer
+
+            self._base_serializer = InteropSerializer()
+        else:
+            self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
 
         # CRITICAL-03 FIX: Cache EncryptionWrapper instances per tenant to prevent
         # 360K key copies/hour at 100 req/sec. Uses thread-safe LRU cache (maxsize=256)
@@ -562,6 +603,7 @@ class CacheSerializationHandler:
             try:
                 # Validate UUID format
                 validated_uuid = str(uuid.UUID(provided_uuid))
+                self._require_canonical_tenant_form(provided_uuid, validated_uuid, source="deployment_uuid parameter")
                 get_logger().info(f"Using provided deployment UUID: {validated_uuid}")
                 return validated_uuid
             except ValueError as e:
@@ -574,12 +616,28 @@ class CacheSerializationHandler:
         if settings.deployment_uuid:
             try:
                 validated_uuid = str(uuid.UUID(settings.deployment_uuid))
+                self._require_canonical_tenant_form(settings.deployment_uuid, validated_uuid, source="CACHEKIT_DEPLOYMENT_UUID")
                 get_logger().info(f"Using deployment UUID from configuration: {validated_uuid}")
                 return validated_uuid
             except ValueError as e:
                 raise ConfigurationError(
                     f"Invalid deployment_uuid in configuration (must be valid UUID): {settings.deployment_uuid}. Error: {e}"
                 ) from e
+
+        # Interop mode never falls through to the machine-local sources below:
+        # the persistent-file / freshly-generated UUID is random PER HOST, so
+        # two processes (or two SDKs) would silently derive different AES keys
+        # — every cross-host read fails auth, entries evict each other in a
+        # recompute loop, and on metered-misses billing every miss costs money.
+        # Cross-SDK encryption only works with an explicitly shared tenant.
+        if self.interop_mode:
+            raise ConfigurationError(
+                "interop mode with encryption requires an explicitly shared deployment UUID "
+                "(deployment_uuid parameter or CACHEKIT_DEPLOYMENT_UUID): the auto-generated "
+                "machine-local UUID differs per host, so other processes and SDKs could never "
+                "decrypt entries written here. Configure the same canonical lowercase UUID "
+                "in every SDK sharing this cache."
+            )
 
         # Option 3: Persistent file storage (auto-generated, survives restarts)
         deployment_uuid_file = Path.home() / ".cachekit" / "deployment_uuid"
@@ -589,6 +647,7 @@ class CacheSerializationHandler:
             stored_uuid = deployment_uuid_file.read_text().strip()
             try:
                 validated_uuid = str(uuid.UUID(stored_uuid))
+                self._require_canonical_tenant_form(stored_uuid, validated_uuid, source=str(deployment_uuid_file))
                 get_logger().info(f"Using persistent deployment UUID from {deployment_uuid_file}")
                 return validated_uuid
             except ValueError:
@@ -609,6 +668,26 @@ class CacheSerializationHandler:
             )
 
         return new_uuid
+
+    def _require_canonical_tenant_form(self, raw: str, canonical: str, source: str) -> None:
+        """Interop mode: reject a deployment UUID that is not already canonical.
+
+        The tenant string feeds HKDF key derivation and AAD component 1. Python
+        normalizes through uuid.UUID() (lowercases, strips braces/URN); another
+        SDK reading the same shared config would use the raw string — different
+        derived keys, silent cross-SDK auth failures, mutual entry eviction.
+        Interop mode therefore requires the configured value to be byte-equal to
+        its canonical lowercase-hyphenated form, so what Python derives from IS
+        the literal string every other SDK sees. Auto mode is unaffected
+        (normalization there is long-shipped behavior).
+        """
+        if self.interop_mode and raw.strip() != canonical:
+            raise ConfigurationError(
+                f"interop mode requires the deployment UUID from {source} to be in canonical "
+                f"lowercase-hyphenated form (got {raw!r}, canonical {canonical!r}): other SDKs "
+                f"derive tenant keys from the raw string, so any normalization on the Python "
+                f"side silently breaks cross-SDK decryption."
+            )
 
     def _get_cached_encryption_wrapper(self, tenant_id: str) -> Any:
         """Get or create cached EncryptionWrapper for tenant_id.
@@ -756,12 +835,18 @@ class CacheSerializationHandler:
                 serializer = self._base_serializer
                 serialized_data, metadata = serializer.serialize(data)
 
-            # Convert metadata to dict if needed
-            metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
-            wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
+            if self.interop_mode:
+                # Interop/v1: the stored bytes ARE the document — plain MessagePack,
+                # or nonce||ciphertext||tag when encrypted. No CK frame, no metadata
+                # header; other SDKs must be able to read these bytes as-is.
+                wrapped = serialized_data
+            else:
+                # Convert metadata to dict if needed
+                metadata_dict = metadata.to_dict() if hasattr(metadata, "to_dict") else {}
+                wrapped = SerializationWrapper.wrap(serialized_data, metadata_dict, self._serializer_string_name)
         except ValueError:
-            # Tenant extraction or cache_key missing - FAIL CLOSED (re-raise, don't catch)
-            # This is a security violation: encryption requires valid tenant_id and cache_key
+            # Tenant extraction, cache_key missing, or an interop data-model
+            # rejection (InteropError) — FAIL CLOSED / fail loud (re-raise).
             raise
         except Exception as e:
             # Don't silently fallback - log error and raise to prevent data loss
@@ -852,6 +937,9 @@ class CacheSerializationHandler:
             >>> result["flag"] is False
             True
         """
+        if self.interop_mode:
+            return self._deserialize_interop(data, cache_key)
+
         try:
             # Unwrap cache data envelope
             serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
@@ -946,6 +1034,47 @@ class CacheSerializationHandler:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {e}")
             raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {e}") from e
 
+    def _deserialize_interop(self, data: str | bytes | memoryview, cache_key: str) -> Any:
+        """Interop/v1 read path: config decides encryption, never the stored bytes.
+
+        Interop entries carry no metadata header, so there is nothing to sniff
+        and nothing to forge: with encryption enabled the bytes are ALWAYS
+        treated as nonce||ciphertext||tag and authenticated before any decode
+        (fail closed — same CWE-757 posture as the auto-mode LAB-241 fix);
+        without encryption they are decoded as one plain MessagePack document.
+        Decode/auth failures raise SerializationError, which callers treat as
+        a miss and evict (self-healing overwrite).
+        """
+        if isinstance(data, str):
+            raise SerializationError("interop cache entries are binary; got str from backend")
+        try:
+            if self.encryption:
+                if self._deployment_uuid_value is None:
+                    raise SerializationError("interop encryption requires single-tenant mode (deployment UUID missing)")
+                tenant_id = self._deployment_uuid_value
+                wrapper = self._get_cached_encryption_wrapper(tenant_id)
+                # Synthesize the metadata the wrapper needs: interop AAD is pinned
+                # to format=msgpack, compressed=False, NO original_type (exactly
+                # four AAD components). tenant/fingerprint come from config — an
+                # attacker cannot influence them because nothing is read from the
+                # stored bytes except the ciphertext itself.
+                metadata = SerializationMetadata(
+                    serialization_format=SerializationFormat.MSGPACK,
+                    compressed=False,
+                    original_type=None,
+                    encrypted=True,
+                    tenant_id=tenant_id,
+                    encryption_algorithm="AES-256-GCM",
+                    key_fingerprint=wrapper.encryption_key_fingerprint,
+                )
+                return wrapper.deserialize(data, metadata, cache_key)
+            return self._base_serializer.deserialize(data)
+        except (ValueError, SerializationError):
+            raise
+        except Exception as e:
+            get_logger().error(f"Interop deserialization failed: {e}")
+            raise SerializationError(f"Failed to deserialize interop cache entry: {e}") from e
+
 
 class CacheOperationHandler:
     """Handles core cache operations - Single Responsibility.
@@ -987,11 +1116,30 @@ class CacheOperationHandler:
         serialization_handler: CacheSerializationHandler,
         key_generator: CacheKeyGenerator,
         cache_handler: Optional[CacheHandlerStrategy] = None,
+        on_deserialize_error: Optional[Callable[[Exception, str], None]] = None,
     ):
-        """Initialize with dependencies."""
+        """Initialize with dependencies.
+
+        Args:
+            on_deserialize_error: Optional hook invoked as (error, cache_key) when an
+                L2 read hits a corrupt/tampered entry (SerializationError). The decorator
+                wires this to its metrics pipeline so the cache_get_deserialize signal
+                fires from one place for both sync and async paths (#159). Best-effort:
+                hook failures are logged and never mask the miss/recompute.
+        """
         self.serialization_handler = serialization_handler
         self.key_generator = key_generator
         self._cache_handler = cache_handler
+        self.on_deserialize_error = on_deserialize_error
+
+    def _notify_deserialize_error(self, error: Exception, cache_key: str) -> None:
+        """Report a corrupt L2 entry to the observability hook (best-effort)."""
+        if self.on_deserialize_error is None:
+            return
+        try:
+            self.on_deserialize_error(error, cache_key)
+        except Exception as hook_err:  # observability must never break the miss path
+            get_logger().warning(f"on_deserialize_error hook failed for {cache_key}: {hook_err}")
 
     def get_cache_key(
         self,
@@ -1093,6 +1241,7 @@ class CacheOperationHandler:
                     self._cache_handler.delete(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
                 get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1106,7 +1255,9 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
+            Unlike the sync variant, the raw serialized envelope is included so the
+            async decorator can backfill L1 without re-serializing (re-encrypting).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1116,16 +1267,15 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_async")
 
-            # NOTE: no mmap fast path here. The async decorator path inlines get_async (it does not
-            # route through this method today), so an mmap branch would be dead code. The mmap read
-            # lives on the sync get_cached_value; add it here only when an async caller routes through.
+            # NOTE: no mmap fast path here yet. The async decorator routes through this method
+            # (#159), but buffer reads are sync-only today; the async mmap read is #171 scope.
             cached_data = await self._cache_handler.get_async(cache_key, refresh_ttl)
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
+                return (True, deserialized, cached_data)
             return None
         except SerializationError as e:
             # Single policy point (cachekit-py#170): records the metric and raises when
@@ -1142,6 +1292,7 @@ class CacheOperationHandler:
                     await self._cache_handler.delete_async(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
                 get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1182,6 +1333,10 @@ class CacheOperationHandler:
 
             # Return serialized string (wrapped envelope) for L1 cache storage
             return serialized_data
+        except InteropError:
+            # Interop/v1 data-model rejection: fail loud, never "computed but
+            # silently never cached" (spec-mandated; matches cachekit-ts).
+            raise
         except Exception as e:
             get_logger().warning(f"Failed to store in backend cache: {e}")
             return None
@@ -1221,6 +1376,10 @@ class CacheOperationHandler:
 
             # Return serialized string (wrapped envelope) for L1 cache storage
             return serialized_data
+        except InteropError:
+            # Interop/v1 data-model rejection: fail loud, never "computed but
+            # silently never cached" (spec-mandated; matches cachekit-ts).
+            raise
         except Exception as e:
             get_logger().warning(f"Failed to store in backend cache: {e}")
             return None

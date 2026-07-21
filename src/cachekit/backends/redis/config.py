@@ -22,6 +22,9 @@ class RedisBackendConfig(BaseBackendConfig):
     Attributes:
         redis_url: Redis server connection URL
         connection_pool_size: Maximum connections in the Redis pool
+        socket_timeout: Socket read/write timeout in seconds (finite so a dead
+            Redis fails fast instead of blocking on the OS TCP timeout)
+        socket_connect_timeout: Socket connect timeout in seconds
         socket_keepalive: Enable TCP keepalive for connections
         disable_hiredis: Disable hiredis parser (use pure Python)
 
@@ -62,6 +65,16 @@ class RedisBackendConfig(BaseBackendConfig):
         default=10,
         gt=0,
         description="Maximum connections in the Redis pool",
+    )
+    socket_timeout: float = Field(
+        default=5.0,
+        gt=0,
+        description="Socket read/write timeout in seconds (env: CACHEKIT_SOCKET_TIMEOUT)",
+    )
+    socket_connect_timeout: float = Field(
+        default=5.0,
+        gt=0,
+        description="Socket connect timeout in seconds (env: CACHEKIT_SOCKET_CONNECT_TIMEOUT)",
     )
     socket_keepalive: bool = Field(
         default=True,
