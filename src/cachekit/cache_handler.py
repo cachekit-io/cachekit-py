@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
@@ -23,7 +24,13 @@ from cachekit.config import ConfigurationError, get_settings
 from cachekit.di import DIContainer
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata
+from cachekit.serializers.base import (
+    SerializationError,
+    SerializationFormat,
+    SerializationMetadata,
+    SuspiciousCacheEntryError,
+)
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -86,6 +93,82 @@ LOCK_BLOCKING_TIMEOUT = 5  # Wait max 5 seconds to acquire the lock
 LOCK_RETRY_INTERVAL = 0.1  # Sleep for 100ms between retries after lock fails
 
 
+def _record_security_counter(name: str, labels: dict[str, str]) -> None:
+    """Best-effort security-telemetry counter — must never break the read path.
+
+    The reliability import stays inside the guard deliberately: if the metrics
+    stack itself fails to import, that failure is swallowed like any other
+    telemetry error rather than taking down cache reads.
+    """
+    try:
+        from cachekit.reliability.async_metrics import get_async_metrics_collector
+
+        get_async_metrics_collector().record_counter(name, labels=labels)
+    except Exception:  # noqa: S110 — telemetry must never break the read path
+        pass
+
+
+def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_closed: bool) -> str:
+    """Classify a decrypt/integrity failure, record telemetry, and apply the fail policy.
+
+    This is the SINGLE implementation of the read-path security policy
+    (cachekit-py#170); every catch site delegates here so the sites cannot
+    drift. Classification is type-based, the metric is recorded before any
+    raise (fail-closed events are always counted), and the fail-open/fail-closed
+    decision lives in exactly one place.
+
+    Failure classes — the ``reason`` label on ``cachekit_decrypt_failures_total``:
+
+    - ``auth_tamper``: DecryptionAuthenticationError — AES-GCM tag verification
+      failed (tampered ciphertext, wrong key, AAD/cache_key mismatch), tenant
+      mismatch, or key-fingerprint mismatch under fail-closed. The signal an
+      active attack produces; honored by the fail-closed policy.
+    - ``suspicious_envelope``: SuspiciousCacheEntryError — the unauthenticated
+      envelope is inconsistent with handler config (plaintext claim under
+      encryption, missing tenant_id). Benign during lazy plaintext→encrypted
+      migration, so it ALWAYS fails open (miss + evict, LAB-241) — but spikes
+      outside a migration window warrant investigation.
+    - ``corruption``: any other SerializationError — checksum mismatch, malformed
+      frame, serializer mismatch, deserialize failure on authenticated
+      plaintext. Not tamper evidence; always fails open.
+
+    Args:
+        error: The exception raised by the deserialize path.
+        tier: Cache tier where the failure surfaced ("l1" or "l2").
+        cache_key: Cache key being read. Logged only in redacted form
+            (redact_cache_key, issue #163 — keys can embed tenant/user
+            identifiers); metric labels stay bounded and never carry it.
+        fail_closed: The handler's resolved encryption fail-closed policy.
+
+    Returns:
+        The reason label, when the policy is fail-open.
+
+    Raises:
+        DecryptionAuthenticationError: re-raises ``error`` when ``fail_closed``
+            is True and the failure is tamper-class (fail closed). Callers do
+            their tier-specific cleanup (L1 invalidation happens BEFORE calling
+            this; L2 eviction happens after a fail-open return, so a fail-closed
+            raise retains the entry as evidence).
+    """
+    if isinstance(error, DecryptionAuthenticationError):
+        reason = "auth_tamper"
+    elif isinstance(error, SuspiciousCacheEntryError):
+        reason = "suspicious_envelope"
+    else:
+        reason = "corruption"
+
+    _record_security_counter("cachekit_decrypt_failures_total", {"reason": reason, "tier": tier})
+
+    if fail_closed and isinstance(error, DecryptionAuthenticationError):
+        get_logger().error(
+            f"{tier.upper()} cache decrypt AUTHENTICATION failure for {redact_cache_key(cache_key)}; "
+            f"failing closed (encryption.fail_closed=True): {error}"
+        )
+        raise error
+    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {error}")
+    return reason
+
+
 def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBackend]:
     """Type guard to check if backend supports TTL inspection and refresh.
 
@@ -100,6 +183,32 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+# Backend type names already warned about, so refresh_ttl_on_get degradation warns at most
+# once per backend type per process (avoids per-hit log spam). Tests clear this set.
+_TTL_REFRESH_UNSUPPORTED_WARNED: set[str] = set()
+
+
+def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
+    """Warn ONCE per backend type that ``refresh_ttl_on_get=True`` has no effect here.
+
+    Backends without TTLInspectableBackend (both get_ttl and refresh_ttl) cannot do
+    threshold-based TTL refresh, so the flag is silently ignored. A silent no-op on a
+    feature the user explicitly opted into is a footgun — surface it once (LAB-446), while
+    still degrading gracefully (the caller returns without failing the cache op).
+    """
+    name = type(backend).__name__
+    if name in _TTL_REFRESH_UNSUPPORTED_WARNED:
+        return
+    _TTL_REFRESH_UNSUPPORTED_WARNED.add(name)
+    warnings.warn(
+        f"refresh_ttl_on_get=True has no effect on {name}: it does not support TTL "
+        f"inspection (needs both get_ttl and refresh_ttl), so the setting is ignored. Use "
+        f"the Redis, CachekitIO, or File backend for TTL refresh.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBackend]:
@@ -316,6 +425,7 @@ class CacheSerializationHandler:
         deployment_uuid: Optional[str] = None,
         master_key: Optional[str] = None,
         enable_integrity_checking: bool = True,
+        encryption_fail_closed: bool | None = None,
         interop_mode: bool = False,
     ):
         """Initialize with serializer strategy and optional encryption.
@@ -343,6 +453,16 @@ class CacheSerializationHandler:
             enable_integrity_checking: Enable integrity checking (default: True)
                                       Uses xxHash3-64 (8 bytes) for all serializers.
                                       Set to False for @cache.minimal (speed-first, no checksums)
+                                      NOTE: xxHash3-64 is CORRUPTION detection only — it is not
+                                      cryptographic and offers no tamper resistance. Tamper
+                                      resistance requires encryption (AES-256-GCM).
+            encryption_fail_closed: Tri-state tamper-failure policy:
+                                   - None (default): defer to CACHEKIT_ENCRYPTION_FAIL_CLOSED
+                                     env setting (defaults to False = fail open).
+                                   - True: raise DecryptionAuthenticationError to the caller on
+                                     AES-GCM authentication failure or key-fingerprint mismatch
+                                     instead of silently recomputing.
+                                   - False: explicit fail-open opt-out (warn + metric + recompute).
 
         Raises:
             ConfigurationError: If encryption config is invalid (missing mode or both modes).
@@ -393,8 +513,6 @@ class CacheSerializationHandler:
         if encryption is None:
             encryption = False
             if master_key is None and tenant_extractor is None:
-                from cachekit.config.singleton import get_settings
-
                 settings = get_settings()
                 if settings.master_key:
                     encryption = True
@@ -406,6 +524,20 @@ class CacheSerializationHandler:
         self.single_tenant_mode = single_tenant_mode
         self.deployment_uuid = deployment_uuid
         self.master_key = master_key
+
+        # Tri-state fail-closed resolution (mirrors the `encryption` tri-state, issue #128):
+        # an explicit True/False from EncryptionConfig wins; None defers to the fleet-wide
+        # CACHEKIT_ENCRYPTION_FAIL_CLOSED env setting (default False = historical fail-open).
+        # Resolved independently of self.encryption because an encryption-disabled handler can
+        # still decrypt stale encrypted entries (config-drift reads) and must honor the policy.
+        if encryption_fail_closed is None:
+            encryption_fail_closed = get_settings().encryption_fail_closed
+        self.encryption_fail_closed = encryption_fail_closed
+
+        # Config-drift warn-once bookkeeping: first drift read per cache_key warns,
+        # the rest only increment cachekit_config_drift_reads_total (log-flood guard).
+        # ponytail: bounded set — beyond 1024 distinct drifted keys, counter-only.
+        self._drift_warned_keys: set[str] = set()
 
         # Extract string name for metadata storage (for protocol instances, use class name)
         if isinstance(serializer_name, str):
@@ -646,6 +778,7 @@ class CacheSerializationHandler:
                 serializer=self._base_serializer,
                 tenant_id=tenant_id,
                 master_key=master_key_bytes,
+                fail_closed=self.encryption_fail_closed,
             )
 
             # Enforce LRU cache size limit
@@ -884,7 +1017,10 @@ class CacheSerializationHandler:
             # encrypted rather than silently accepted
             # (see docs/features/zero-knowledge-encryption.md, "Fail-Closed Read Path").
             if self.encryption and not metadata.encrypted:
-                raise SerializationError(
+                # SuspiciousCacheEntryError → telemetry reason "suspicious_envelope":
+                # legitimate during lazy plaintext→encrypted migration, an attack
+                # signature otherwise. Behavior stays miss+evict either way (LAB-241).
+                raise SuspiciousCacheEntryError(
                     "Encryption is enabled but the cache entry's header claims plaintext. "
                     "Refusing the unauthenticated plaintext read path (fail closed): the "
                     "header is not covered by the AES-GCM tag and may be forged. If this "
@@ -898,10 +1034,33 @@ class CacheSerializationHandler:
             # (handler config changed but old encrypted data exists) — decrypting
             # is safe in that direction because it stays on the authenticated path.
             if metadata.encrypted:
+                # SECURITY EVENT (cachekit-py#170, config-drift read): this handler has
+                # encryption DISABLED yet is being handed an encrypted entry. Legitimate
+                # cause: encryption was recently turned off and stale entries remain until
+                # TTL expiry. But the same signature appears when an attacker plants an
+                # encrypted entry or when configuration has silently drifted, and the
+                # decrypt below falls back to the global CACHEKIT_MASTER_KEY — so this must
+                # never happen silently. Warn on every occurrence; decryption itself stays
+                # on the authenticated (AES-GCM) path, so a forged entry still fails auth.
+                if not self.encryption:
+                    _record_security_counter("cachekit_config_drift_reads_total", {"reason": "encryption_disabled"})
+                    if cache_key not in self._drift_warned_keys and len(self._drift_warned_keys) < 1024:
+                        self._drift_warned_keys.add(cache_key)
+                        get_logger().warning(
+                            f"Config-drift read for {redact_cache_key(cache_key) if cache_key else 'unknown key'}: "
+                            f"handler has encryption disabled but the cache entry is encrypted (tenant "
+                            f"'{metadata.tenant_id or 'unknown'}'). Decrypting via the globally configured "
+                            f"master key. If encryption was not recently disabled for this function, "
+                            f"investigate for misconfiguration or cache tampering. Further reads of this "
+                            f"key count on cachekit_config_drift_reads_total without logging."
+                        )
+
                 # Data is encrypted - use cached EncryptionWrapper for decryption
                 # CRITICAL-03 FIX: Use cached instance instead of creating new one
                 if not metadata.tenant_id:
-                    raise SerializationError(
+                    # Envelope claims encryption but lacks the tenant needed to derive the
+                    # key — malformed or field-stripped. suspicious_envelope telemetry.
+                    raise SuspiciousCacheEntryError(
                         "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
                     )
                 tenant_id = metadata.tenant_id
@@ -1002,11 +1161,30 @@ class CacheOperationHandler:
         serialization_handler: CacheSerializationHandler,
         key_generator: CacheKeyGenerator,
         cache_handler: Optional[CacheHandlerStrategy] = None,
+        on_deserialize_error: Optional[Callable[[Exception, str], None]] = None,
     ):
-        """Initialize with dependencies."""
+        """Initialize with dependencies.
+
+        Args:
+            on_deserialize_error: Optional hook invoked as (error, cache_key) when an
+                L2 read hits a corrupt/tampered entry (SerializationError). The decorator
+                wires this to its metrics pipeline so the cache_get_deserialize signal
+                fires from one place for both sync and async paths (#159). Best-effort:
+                hook failures are logged and never mask the miss/recompute.
+        """
         self.serialization_handler = serialization_handler
         self.key_generator = key_generator
         self._cache_handler = cache_handler
+        self.on_deserialize_error = on_deserialize_error
+
+    def _notify_deserialize_error(self, error: Exception, cache_key: str) -> None:
+        """Report a corrupt L2 entry to the observability hook (best-effort)."""
+        if self.on_deserialize_error is None:
+            return
+        try:
+            self.on_deserialize_error(error, cache_key)
+        except Exception as hook_err:  # observability must never break the miss path
+            get_logger().warning(f"on_deserialize_error hook failed for {cache_key}: {hook_err}")
 
     def get_cache_key(
         self,
@@ -1094,15 +1272,21 @@ class CacheOperationHandler:
                 return (True, deserialized)
             return None
         except SerializationError as e:
-            # Corruption / integrity-auth failure on the stored bytes. Best-effort evict
-            # the poisoned entry so subsequent reads don't re-pay full decompress+verify
-            # only to fail again; the caller recomputes and re-stores the value (#159).
-            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            # Single policy point (cachekit-py#170): records the metric and raises when
+            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
+            # evidence for the operator (eviction only happens on the fail-open return).
+            handle_decrypt_failure(
+                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
+            )
+            # Fail open: best-effort evict the poisoned entry so subsequent reads don't
+            # re-pay full decompress+verify only to fail again; the caller recomputes
+            # and re-stores the value (#159).
             try:
                 if self._cache_handler is not None:
                     self._cache_handler.delete(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1115,8 +1299,9 @@ class CacheOperationHandler:
 
         Returns ``((True, value), is_stale)`` on a hit, None on miss/error. The mmap
         fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
-        Error semantics mirror get_cached_value (poisoned entries evicted, errors
-        read as misses so the caller recomputes).
+        Error semantics mirror get_cached_value: the LAB-108 policy point raises
+        DecryptionAuthenticationError when fail-closed (poisoned entry retained as
+        evidence); fail-open evicts and reads as a miss so the caller recomputes.
         """
         try:
             if self._cache_handler is None:
@@ -1130,12 +1315,55 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized), is_stale)
         except SerializationError as e:
-            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            # Single policy point (cachekit-py#170): records the metric and raises when
+            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
+            # evidence for the operator (eviction only happens on the fail-open return).
+            handle_decrypt_failure(
+                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
+            )
             try:
                 if self._cache_handler is not None:
                     self._cache_handler.delete(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
+            return None
+        except Exception as e:
+            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            return None
+
+    async def get_cached_value_with_freshness_async(
+        self, cache_key: str, refresh_ttl: Optional[int] = None
+    ) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
+        """Async SWR variant (LAB-381): staleness + the raw envelope for L1 backfill.
+
+        Returns ``((True, value, raw_bytes), is_stale)`` on a hit — the 3-tuple
+        matches :meth:`get_cached_value_async` (LAB-111 routing) so the async
+        decorator backfills L1 without re-serializing. None on miss/error; the
+        LAB-108 fail-closed policy propagates DecryptionAuthenticationError.
+        """
+        try:
+            if self._cache_handler is None:
+                raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness_async")
+
+            hit = await self._cache_handler.get_with_freshness_async(cache_key)
+            if hit is None:
+                return None
+            cached_data, is_stale = hit
+            get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
+            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+            return ((True, deserialized, cached_data), is_stale)
+        except SerializationError as e:
+            # Single policy point (cachekit-py#170) — see get_cached_value_async.
+            handle_decrypt_failure(
+                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
+            )
+            try:
+                if self._cache_handler is not None:
+                    await self._cache_handler.delete_async(cache_key)
+            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1149,7 +1377,9 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
+            Unlike the sync variant, the raw serialized envelope is included so the
+            async decorator can backfill L1 without re-serializing (re-encrypting).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1159,27 +1389,32 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_async")
 
-            # NOTE: no mmap fast path here. The async decorator path inlines get_async (it does not
-            # route through this method today), so an mmap branch would be dead code. The mmap read
-            # lives on the sync get_cached_value; add it here only when an async caller routes through.
+            # NOTE: no mmap fast path here yet. The async decorator routes through this method
+            # (#159), but buffer reads are sync-only today; the async mmap read is #171 scope.
             cached_data = await self._cache_handler.get_async(cache_key, refresh_ttl)
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
+                return (True, deserialized, cached_data)
             return None
         except SerializationError as e:
-            # Corruption / integrity-auth failure on the stored bytes. Best-effort evict
-            # the poisoned entry so subsequent reads don't re-pay full decompress+verify
-            # only to fail again; the caller recomputes and re-stores the value (#159).
-            get_logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}; evicting poisoned entry: {e}")
+            # Single policy point (cachekit-py#170): records the metric and raises when
+            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
+            # evidence for the operator (eviction only happens on the fail-open return).
+            handle_decrypt_failure(
+                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
+            )
+            # Fail open: best-effort evict the poisoned entry so subsequent reads don't
+            # re-pay full decompress+verify only to fail again; the caller recomputes
+            # and re-stores the value (#159).
             try:
                 if self._cache_handler is not None:
                     await self._cache_handler.delete_async(cache_key)
             except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {cache_key}: {del_err}")
+                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            self._notify_deserialize_error(e, cache_key)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1523,11 +1758,10 @@ class StandardCacheHandler:
             Uses TypeGuard pattern for proper type narrowing. Logs at debug level
             when skipping due to lack of backend support.
         """
-        # Check if backend supports TTL inspection (graceful degradation)
+        # Check if backend supports TTL inspection (graceful degradation).
+        # Warn once (not silently no-op) so the ignored flag is discoverable — LAB-446.
         if not supports_ttl_inspection(self.backend):
-            get_logger().debug(
-                f"Backend {type(self.backend).__name__} doesn't support TTL inspection, skipping TTL refresh for key {key}"
-            )
+            warn_ttl_refresh_unsupported(self.backend)
             return
 
         # Type checker now knows self.backend is TTLInspectableBackend

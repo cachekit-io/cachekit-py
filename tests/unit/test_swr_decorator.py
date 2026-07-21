@@ -406,6 +406,7 @@ class TestOperationHandlerFreshnessDegradation:
         if deserialize_side_effect is not None:
             serialization = mock.MagicMock(spec=CacheSerializationHandler)
             serialization.deserialize_data.side_effect = deserialize_side_effect
+            serialization.encryption_fail_closed = False  # real bool: MagicMock is truthy (LAB-108)
         else:
             serialization = CacheSerializationHandler()
         op = CacheOperationHandler(serialization, CacheKeyGenerator())

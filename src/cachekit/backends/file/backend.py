@@ -5,6 +5,7 @@ This module implements BaseBackend protocol for filesystem-based caching with:
 - Atomic writes via write-then-rename pattern
 - LRU eviction triggered at 90% capacity, evicting to 70%
 - TTL-based expiration with secure 14-byte header format
+- TTL inspection & refresh (TTLInspectableBackend): get_ttl / refresh_ttl off the header
 - Security features: O_NOFOLLOW, realpath resolution, permission enforcement
 - Blake2b key hashing (16 bytes hex = 32 chars) for filename safety
 """
@@ -570,6 +571,136 @@ class FileBackend:
                 "latency_ms": (time.time() - start_time) * 1000,
                 "error": str(exc),
             }
+
+    # ==================== TTLInspectableBackend Protocol ====================
+
+    async def get_ttl(self, key: str) -> int | None:
+        """Remaining TTL in seconds, read from the on-disk expiry header (bytes [6:14]).
+
+        Returns None when the key is missing, permanent (expiry field == 0), or already
+        expired. Expired/corrupt entries are unlinked on read, mirroring ``get``/``exists``.
+
+        The sync file I/O inside an ``async`` signature intentionally matches the Redis
+        provider (async method wrapping a blocking client call); local disk reads are fast
+        and this keeps every backend's TTLInspectableBackend surface uniform.
+        """
+        file_path = self._key_to_path(key)
+
+        with self._lock:
+            try:
+                fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW)
+                fd_closed = False
+                try:
+                    self._acquire_file_lock(fd, exclusive=False)
+                    try:
+                        header = os.read(fd, HEADER_SIZE)
+                        if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                            os.close(fd)
+                            fd_closed = True
+                            self._safe_unlink(file_path)
+                            return None
+
+                        expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
+                        if expiry_timestamp == 0:
+                            return None  # permanent, no TTL to report
+
+                        remaining = expiry_timestamp - time.time()
+                        if remaining <= 0:
+                            # Expired: unlink and report absent (same as get/exists).
+                            os.close(fd)
+                            fd_closed = True
+                            self._safe_unlink(file_path)
+                            return None
+                        return int(remaining)  # whole-second granularity, matching Redis TTL
+                    finally:
+                        self._release_file_lock(fd)
+                finally:
+                    if not fd_closed:
+                        os.close(fd)
+
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ELOOP):
+                    return None  # missing, or symlink rejected by O_NOFOLLOW
+                raise BackendError(
+                    f"Failed to read cache file TTL: {exc}",
+                    error_type=self._classify_os_error(exc, is_directory=False),
+                    original_exception=exc,
+                    operation="get_ttl",
+                    key=key,
+                ) from exc
+
+    async def refresh_ttl(self, key: str, ttl: int) -> bool:
+        """Slide a key's expiry by rewriting the 8-byte timestamp field in place.
+
+        Returns True if the key existed and was refreshed, False if it is missing or already
+        expired (an expired entry is treated as absent and unlinked, mirroring ``get``). A
+        ``ttl`` of 0 makes the entry permanent, matching ``set``. No on-disk format change:
+        only bytes [6:14] are rewritten, so the payload and all other header fields are
+        untouched (and cross-SDK File readers stay compatible).
+        """
+        # Same TTL bounds as set() (security: prevent integer overflow/underflow).
+        if ttl == 0:
+            new_expiry = 0
+        elif ttl < 0 or ttl > MAX_TTL_SECONDS:
+            raise BackendError(
+                f"TTL {ttl} out of range [0, {MAX_TTL_SECONDS}] (max 10 years)",
+                BackendErrorType.PERMANENT,
+            )
+        else:
+            new_expiry = int(time.time() + ttl)
+
+        file_path = self._key_to_path(key)
+
+        with self._lock:
+            try:
+                fd = os.open(file_path, os.O_RDWR | os.O_NOFOLLOW)
+                fd_closed = False
+                try:
+                    self._acquire_file_lock(fd, exclusive=True)
+                    try:
+                        header = os.read(fd, HEADER_SIZE)
+                        if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                            os.close(fd)
+                            fd_closed = True
+                            self._safe_unlink(file_path)
+                            return False
+
+                        current_expiry = struct.unpack(">Q", header[6:14])[0]
+                        if current_expiry > 0 and time.time() > current_expiry:
+                            # Already expired: treat as absent (mirror get/exists) and unlink.
+                            os.close(fd)
+                            fd_closed = True
+                            self._safe_unlink(file_path)
+                            return False
+
+                        # Overwrite ONLY the expiry field. ponytail: an 8-byte in-place write to
+                        # a fixed offset is atomic enough for a cache timestamp — a torn write on
+                        # power loss yields a wrong expiry, never a corrupt payload (magic/version
+                        # are untouched), so the entry just expires early/late. No rewrite-rename.
+                        os.lseek(fd, 6, os.SEEK_SET)
+                        os.write(fd, struct.pack(">Q", new_expiry))
+                        os.fsync(fd)
+                        return True
+                    finally:
+                        self._release_file_lock(fd)
+                finally:
+                    if not fd_closed:
+                        os.close(fd)
+
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ELOOP):
+                    return False  # missing, or symlink rejected by O_NOFOLLOW
+                raise BackendError(
+                    f"Failed to refresh cache file TTL: {exc}",
+                    error_type=self._classify_os_error(exc, is_directory=False),
+                    original_exception=exc,
+                    operation="refresh_ttl",
+                    key=key,
+                ) from exc
 
     # Private helper methods
 

@@ -13,8 +13,9 @@ from .base import (
     SerializationFormat,
     SerializationMetadata,
     SerializerProtocol,
+    SuspiciousCacheEntryError,
 )
-from .encryption_wrapper import EncryptionWrapper
+from .encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
 from .standard_serializer import StandardSerializer
 
 if TYPE_CHECKING:
@@ -228,6 +229,8 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "ArrowSerializer",
     "AutoSerializer",
+    "DecryptionAuthenticationError",
+    "EncryptionError",
     "EncryptionWrapper",
     "OrjsonSerializer",
     "StandardSerializer",
@@ -237,6 +240,7 @@ __all__ = [
     "SerializationFormat",
     "SerializationMetadata",
     "SerializerProtocol",
+    "SuspiciousCacheEntryError",
     # Factory
     "get_serializer",
     "SERIALIZER_REGISTRY",

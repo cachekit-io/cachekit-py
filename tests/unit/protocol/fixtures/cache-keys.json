@@ -1,0 +1,153 @@
+{
+  "version": "1.0.0",
+  "generator": "cachekit-py v0.12.0",
+  "ci_verification": "Vendored (sha256-pinned) and byte-verified against CacheKeyGenerator in cachekit-py default CI: tests/unit/protocol/test_cache_key_vectors.py",
+  "note": "Keys include __main__ module because vectors were generated at top level. Cross-SDK implementations should substitute their own module path \u2014 only the args hash portion must match.",
+  "key_format": "ns:{namespace}:func:{module}.{qualname}:args:{blake2b_256_hex}:{ic_flag}{serializer_code}",
+  "hash_algorithm": "blake2b-256 of msgpack([normalized_args, sorted_kwargs])",
+  "vectors": [
+    {
+      "name": "single_integer",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1s"
+    },
+    {
+      "name": "single_string",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        "hello"
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:07ed6e7b87ff98f70efe4f4a8f082fa79415b9f670be68f3ada1f42244b5b6de:1s"
+    },
+    {
+      "name": "multiple_args",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "process",
+      "args": [
+        1,
+        "two",
+        3.0
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.process:args:465e6bc8edd493c64748a0c405106db14d2bb481989bf1849481f1343982e179:1s"
+    },
+    {
+      "name": "kwargs_only",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [],
+      "kwargs": {
+        "user_id": 42,
+        "include_profile": true
+      },
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:14570849f0d99524f4149319d37fa0c298278b8f1724c12d6cb7631efaf86f0e:1s"
+    },
+    {
+      "name": "mixed_args_kwargs",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        "alice"
+      ],
+      "kwargs": {
+        "age": 30
+      },
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:573b0961d0bf4e7207c6628a3f9e42c97a0cd01e276d8904ec5af6c877cd599e:1s"
+    },
+    {
+      "name": "no_namespace",
+      "namespace": null,
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        1
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "func:__main__.get_user:args:386979f533ce537f0c42d385c8174948ebd58566ad81b32bebb830a187cb4387:1s"
+    },
+    {
+      "name": "empty_args",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:f9cf3864b6e929eb73f84cf6d69409e0bd7575f8cf6feafe3a543b0f7267b2b2:1s"
+    },
+    {
+      "name": "none_arg",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        null
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:073b96f1817ee2b2a26b6cee56401999e4dc2d8836d596927d0aad3e338c2f0b:1s"
+    },
+    {
+      "name": "boolean_args",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "process",
+      "args": [
+        true,
+        false
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.process:args:982385ac5333a35e2d5d68638aafe47ba31d36c1f3cd60d0ed57396e3c638334:1s"
+    },
+    {
+      "name": "nested_dict",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        {
+          "user": {
+            "name": "alice",
+            "ids": [
+              1,
+              2,
+              3
+            ]
+          }
+        }
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "std",
+      "expected_key": "ns:test:func:__main__.get_user:args:14a3433f54d70b4cc452c3a140f8c3a0979acb3dc2baf7238dc4e6675265f3a8:1s"
+    }
+  ]
+}

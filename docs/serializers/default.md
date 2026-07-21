@@ -81,6 +81,11 @@ StandardSerializer automatically handles:
 
 Both are handled by the Rust ByteStorage layer. No configuration required — it's always on.
 
+> **Corruption detection, not tamper resistance.** xxHash3-64 is non-cryptographic: an
+> attacker with backend write access can forge a valid checksum for arbitrary bytes. The
+> checksum catches bit rot and storage bugs. For tamper resistance, use encryption
+> (`@cache.secure` / `CACHEKIT_MASTER_KEY`), which authenticates every byte with AES-256-GCM.
+
 ```python
 @cache
 def get_large_dict():

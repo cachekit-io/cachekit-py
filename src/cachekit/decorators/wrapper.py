@@ -19,7 +19,9 @@ from ..cache_handler import (
     StandardCacheHandler,
     get_backend_provider,
     get_logger,
+    handle_decrypt_failure,
     redact_cache_key,
+    warn_ttl_refresh_unsupported,
 )
 from ..interop import (
     InteropError,
@@ -33,6 +35,7 @@ from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers.base import SerializationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -301,6 +304,7 @@ def create_cache_wrapper(
     single_tenant_mode: bool = False,
     deployment_uuid: str | None = None,
     master_key: str | None = None,
+    encryption_fail_closed: bool | None = None,
     # Performance features
     refresh_ttl_on_get: bool = False,
     ttl_refresh_threshold: float = 0.5,
@@ -353,6 +357,10 @@ def create_cache_wrapper(
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
                         If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
                         Must be deterministic (same across restarts) to decrypt cached data.
+        encryption_fail_closed: Tri-state tamper-failure policy. None (default) defers to
+                        CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open). True raises
+                        DecryptionAuthenticationError to the caller on AES-GCM authentication
+                        failure or key-fingerprint mismatch instead of silently recomputing.
         refresh_ttl_on_get: Refresh TTL on cache hit
         ttl_refresh_threshold: Refresh when TTL below this fraction
         fast_mode: Disable monitoring for maximum performance
@@ -370,6 +378,11 @@ def create_cache_wrapper(
         collect_stats: Enable statistics collection
         enable_tracing: Enable distributed tracing
         enable_structured_logging: Enable structured logging
+        interop: interop/v1 cross-SDK operation name. When set, switches this
+                function to canonical {namespace}:{operation}:{args_hash} keys
+                and plain-MessagePack values shared byte-identically with
+                cachekit-rs / cachekit-ts. Requires namespace; mutually
+                exclusive with key= and fast_mode. None (default) = auto mode.
 
     Security Note:
         When encryption=True and tenant_extractor is provided, tenant ID extraction
@@ -423,6 +436,7 @@ def create_cache_wrapper(
         single_tenant_mode = config.encryption.single_tenant_mode
         deployment_uuid = config.encryption.deployment_uuid
         master_key = config.encryption.master_key
+        encryption_fail_closed = config.encryption.fail_closed
 
         # Custom key function (escape hatch for complex types)
         custom_key_func = config.key
@@ -490,6 +504,7 @@ def create_cache_wrapper(
         deployment_uuid=deployment_uuid,
         master_key=master_key,
         enable_integrity_checking=integrity_checking,
+        encryption_fail_closed=encryption_fail_closed,
         interop_mode=interop is not None,
     )
 
@@ -529,6 +544,19 @@ def create_cache_wrapper(
         collect_stats=use_collect_stats,
         enable_structured_logging=use_enable_structured_logging,
     )
+
+    # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
+    # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    def _on_l2_deserialize_error(error: Exception, key: str) -> None:
+        features.handle_cache_error(
+            error=error,
+            operation="cache_get_deserialize",
+            cache_key=key,
+            namespace=namespace or "default",
+            duration_ms=0.0,
+        )
+
+    operation_handler.on_deserialize_error = _on_l2_deserialize_error
 
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
@@ -1048,6 +1076,21 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
+                except SerializationError as e:
+                    # Poisoned L1 must not outlive remediation of the durable L2 copy —
+                    # invalidate BEFORE the policy decision (a fail-closed raise would
+                    # otherwise keep re-raising from stale process-local L1 after the
+                    # operator fixes L2). L2 remains the retained evidence.
+                    _l1_cache.invalidate(cache_key)
+                    try:
+                        # Single policy point (cachekit-py#170): metric + fail policy.
+                        handle_decrypt_failure(
+                            e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                        )
+                    except DecryptionAuthenticationError:
+                        reset_current_function_stats(token)
+                        raise
+                    # Fail open: fall through to L2
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
                     logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
@@ -1127,6 +1170,12 @@ def create_cache_wrapper(
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
                 return cached_result[1]
+        except DecryptionAuthenticationError:
+            # Fail-closed tamper failure propagated from get_cached_value — it only
+            # raises when encryption.fail_closed=True (the metric and error log were
+            # recorded there). Never swallow this into an uncached recompute.
+            reset_current_function_stats(token)
+            raise
         except Exception as e:
             # Cache GET failed - execute function without caching
             get_duration_ms = (time.time() - start_time) * 1000
@@ -1327,6 +1376,33 @@ def create_cache_wrapper(
                     "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
                 )
 
+            nonlocal _backend
+
+            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
+            # make this SDK read/write a key other SDKs cannot see. Re-checked per
+            # call because the backend is lazily resolved and a prefix could
+            # appear dynamically. MUST run before the L1 check below — an L1 hit
+            # early-returns and would bypass the per-call re-check (mirrors
+            # sync_wrapper's ordering). Backend is resolved eagerly for interop
+            # calls only, so the non-interop L1 fast path is unchanged. The raise
+            # propagates; the outer finally clears correlation ID / stats context.
+            if interop is not None:
+                if _backend is None:
+                    try:
+                        _backend = get_backend_provider().get_backend()
+                    except Exception as e:
+                        # If Redis connection fails, execute function without caching - RETURN EARLY
+                        # This prevents the decorator from breaking the application
+                        features.handle_cache_error(
+                            error=e,
+                            operation="client_creation",
+                            cache_key=cache_key or "unknown",
+                            namespace=namespace or "default",
+                            duration_ms=0.0,
+                        )
+                        return await func(*args, **kwargs)
+                ensure_interop_backend_compatible(_backend)
+
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
@@ -1351,13 +1427,32 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
+                    except SerializationError as e:
+                        # Poisoned L1 must not outlive remediation of the durable L2 copy —
+                        # invalidate BEFORE the policy decision (a fail-closed raise would
+                        # otherwise keep re-raising from stale process-local L1 after the
+                        # operator fixes L2). L2 remains the retained evidence.
+                        _l1_cache.invalidate(cache_key)
+                        # Single policy point (cachekit-py#170): metric + fail policy.
+                        # Explicit local re-raise mirrors the sync L1/L2 fail-closed
+                        # guards and the async lock-path guard: a fail-closed tamper raise
+                        # must reach the caller, never be demoted to a fail-open recompute
+                        # if a future edit wraps this read path in a broad `except
+                        # Exception` (defense-in-depth, LAB-108). No manual stats reset —
+                        # the async wrapper's outer `finally` covers every exit path.
+                        try:
+                            handle_decrypt_failure(
+                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                            )
+                        except DecryptionAuthenticationError:
+                            raise
+                        # Fail open: fall through to L2
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
                         logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)
-            nonlocal _backend
             if _backend is None:
                 try:
                     _backend = get_backend_provider().get_backend()
@@ -1372,13 +1467,6 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
-
-            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
-            # make this SDK read/write a key other SDKs cannot see. Re-checked per
-            # call (outside the try above, so it propagates) because the backend
-            # is lazily resolved and a prefix could appear dynamically.
-            if interop is not None:
-                ensure_interop_backend_compatible(_backend)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
@@ -1397,20 +1485,22 @@ def create_cache_wrapper(
                 correlation_id = features.create_correlation_id()
 
             try:
-                # Attempt to retrieve from the backend. With SWR active the read
-                # carries the server's freshness signal (LAB-381): a stale hit is
-                # served immediately and revalidated in the background below.
+                # Route through the operation handler so corrupt/tampered entries inherit
+                # eviction + the cache_get_deserialize metric instead of persisting (#159),
+                # and fail-closed tamper errors propagate (LAB-108). With SWR active the
+                # read also carries the server's freshness signal (LAB-381): a stale hit
+                # is served immediately and revalidated in the background below.
                 _l2_is_stale = False
                 if _swr_active:
-                    _fresh_hit = await operation_handler.cache_handler.get_with_freshness_async(cache_key)  # type: ignore[attr-defined]
-                    cached_data = _fresh_hit[0] if _fresh_hit is not None else None
+                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
                 else:
-                    cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
+                    cached_result = await operation_handler.get_cached_value_async(cache_key)
 
-                if cached_data is not None:
-                    # Deserialize the cached data
-                    result = operation_handler.serialization_handler.deserialize_data(cached_data, cache_key=cache_key)
+                if cached_result is not None:
+                    # Cache hit: (True, value, raw serialized envelope for L1 backfill)
+                    _found, result, cached_data = cached_result
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1446,7 +1536,9 @@ def create_cache_wrapper(
                             # TTL refresh is optional, don't fail on error
                             _logger.debug("TTL refresh failed for %s: %s", cache_key, e)
                     elif refresh_ttl_on_get and ttl:
-                        logger().debug(f"Backend doesn't support TTL inspection for {cache_key}, skipping refresh")
+                        # Backend can't inspect TTL: warn once instead of silently ignoring
+                        # the opted-in flag (LAB-446). Still degrades gracefully.
+                        warn_ttl_refresh_unsupported(_backend)
 
                     # Record L2 hit with latency for cache_info()
                     _stats.record_l2_hit(get_duration_ms)
@@ -1458,19 +1550,13 @@ def create_cache_wrapper(
 
                     return result
 
-            except SerializationError as e:
-                # Decrypt/integrity failure on L2 data — warn explicitly (fail-open: recompute)
-                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
-                get_duration_ms = (time.perf_counter() - start_time) * 1000
-                features.handle_cache_error(
-                    error=e,
-                    operation="cache_get_deserialize",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    duration_ms=get_duration_ms,
-                    correlation_id=correlation_id,
-                )
-
+            except DecryptionAuthenticationError:
+                # Fail-closed tamper failure propagated from get_cached_value_async —
+                # the tamper metric, error log, evidence retention, and fail policy all
+                # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108). It must
+                # reach the caller: the generic clause below would demote it to a
+                # fail-open "record and recompute".
+                raise
             except Exception as e:
                 # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1503,14 +1589,13 @@ def create_cache_wrapper(
                     ) as lock_acquired:
                         if lock_acquired:
                             # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited
+                            # Another request may have populated it while we waited.
+                            # Routed through get_cached_value_async: corrupt entries evict (#159).
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1521,8 +1606,11 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                            except DecryptionAuthenticationError:
+                                # Fail-closed tamper raise from get_cached_value_async
+                                # (cachekit-py#170) — must not be demoted to a recompute
+                                # by the generic clause below.
+                                raise
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug("Double-check cache failed after lock acquisition: %s", e)
@@ -1531,12 +1619,11 @@ def create_cache_wrapper(
                             # Another request may have populated it while we waited
                             logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
-                                cached_data = await operation_handler.cache_handler.get_async(cache_key)  # type: ignore[attr-defined]
-                                if cached_data is not None:
+                                # Routed through get_cached_value_async: corrupt entries evict (#159)
+                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    result = operation_handler.serialization_handler.deserialize_data(
-                                        cached_data, cache_key=cache_key
-                                    )
+                                    _found, result, cached_data = cached_result
 
                                     # Update L1 cache with serialized bytes
                                     if _l1_cache and cache_key and cached_data:
@@ -1547,8 +1634,11 @@ def create_cache_wrapper(
                                         _cached_keys.add(cache_key)
 
                                     return result
-                            except SerializationError as e:
-                                logger().warning(f"L2 cache decrypt/integrity failure for {cache_key}: {e}")
+                            except DecryptionAuthenticationError:
+                                # Fail-closed tamper raise from get_cached_value_async
+                                # (cachekit-py#170) — must not be demoted to a recompute
+                                # by the generic clause below.
+                                raise
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
@@ -1615,6 +1705,13 @@ def create_cache_wrapper(
 
                         return result
 
+                except DecryptionAuthenticationError:
+                    # Fail-closed tamper failure from the lock double-check reads — must
+                    # propagate to the caller, never demote to "lock failed, execute
+                    # without lock". (The generic clause below would also re-raise it,
+                    # but only as a side effect of the BackendError check; this clause
+                    # makes the security dependency explicit.)
+                    raise
                 except Exception as e:
                     # Check if this is a lock-related exception or function execution exception
                     # BackendError may wrap function exceptions - check original_exception

@@ -164,12 +164,12 @@ def cache(
             from cachekit.config.nested import EncryptionConfig
 
             _enc_passthrough = isinstance(manual_overrides.get("encryption"), EncryptionConfig)
-            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"}
+            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
             if not _enc_passthrough and (_enc_keys & manual_overrides.keys()):
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in manual_overrides:
                     enc_overrides["enabled"] = manual_overrides.pop("encryption")
-                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"):
+                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
                     if _k in manual_overrides:
                         enc_overrides[_k] = manual_overrides.pop(_k)
                 manual_overrides["encryption"] = replace(EncryptionConfig(), **enc_overrides)
