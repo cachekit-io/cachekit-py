@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
@@ -100,6 +101,32 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+# Backend type names already warned about, so refresh_ttl_on_get degradation warns at most
+# once per backend type per process (avoids per-hit log spam). Tests clear this set.
+_TTL_REFRESH_UNSUPPORTED_WARNED: set[str] = set()
+
+
+def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
+    """Warn ONCE per backend type that ``refresh_ttl_on_get=True`` has no effect here.
+
+    Backends without TTLInspectableBackend (both get_ttl and refresh_ttl) cannot do
+    threshold-based TTL refresh, so the flag is silently ignored. A silent no-op on a
+    feature the user explicitly opted into is a footgun — surface it once (LAB-446), while
+    still degrading gracefully (the caller returns without failing the cache op).
+    """
+    name = type(backend).__name__
+    if name in _TTL_REFRESH_UNSUPPORTED_WARNED:
+        return
+    _TTL_REFRESH_UNSUPPORTED_WARNED.add(name)
+    warnings.warn(
+        f"refresh_ttl_on_get=True has no effect on {name}: it does not support TTL "
+        f"inspection (get_ttl + refresh_ttl), so the setting is ignored. Use the Redis, "
+        f"CachekitIO, or File backend for TTL refresh.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBackend]:
@@ -1458,11 +1485,10 @@ class StandardCacheHandler:
             Uses TypeGuard pattern for proper type narrowing. Logs at debug level
             when skipping due to lack of backend support.
         """
-        # Check if backend supports TTL inspection (graceful degradation)
+        # Check if backend supports TTL inspection (graceful degradation).
+        # Warn once (not silently no-op) so the ignored flag is discoverable — LAB-446.
         if not supports_ttl_inspection(self.backend):
-            get_logger().debug(
-                f"Backend {type(self.backend).__name__} doesn't support TTL inspection, skipping TTL refresh for key {key}"
-            )
+            warn_ttl_refresh_unsupported(self.backend)
             return
 
         # Type checker now knows self.backend is TTLInspectableBackend

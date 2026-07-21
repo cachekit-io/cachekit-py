@@ -81,9 +81,32 @@ backend = FileBackend(config)
 - Latency: p50: 100–500μs, p99: 1–5ms
 - Throughput: 1000+ operations/second (single-threaded)
 - LRU eviction: Triggered at 90%, evicts to 70% capacity
-- TTL support: Yes (automatic expiration checking)
+- TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: No (single-process only)
 - Platform support: Full on Linux/macOS, limited on Windows (no O_NOFOLLOW)
+
+## TTL Inspection & Sliding Expiration
+
+FileBackend implements the `TTLInspectableBackend` protocol (`get_ttl` / `refresh_ttl`) by
+reading and rewriting the expiry timestamp in each cache file's header. This enables
+**sliding expiration**: with `refresh_ttl_on_get=True`, a hot key's TTL is extended on every
+hit whose remaining life has dropped below `ttl_refresh_threshold`, so frequently-read keys
+don't expire out from under you.
+
+```python notest
+from cachekit import cache
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
+
+backend = FileBackend(FileBackendConfig())
+
+@cache(backend=backend, ttl=3600, refresh_ttl_on_get=True, ttl_refresh_threshold=0.5)
+async def get_profile(user_id: str) -> dict:
+    return await load_profile(user_id)
+```
+
+`refresh_ttl` rewrites only the 8-byte expiry field in place — no on-disk format change, and
+the cached payload is left untouched.
 
 ## Limitations and Security Notes
 

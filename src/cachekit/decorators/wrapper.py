@@ -20,6 +20,7 @@ from ..cache_handler import (
     get_backend_provider,
     get_logger,
     redact_cache_key,
+    warn_ttl_refresh_unsupported,
 )
 from ..interop import (
     InteropError,
@@ -1308,7 +1309,9 @@ def create_cache_wrapper(
                             # TTL refresh is optional, don't fail on error
                             _logger.debug("TTL refresh failed for %s: %s", cache_key, e)
                     elif refresh_ttl_on_get and ttl:
-                        logger().debug(f"Backend doesn't support TTL inspection for {cache_key}, skipping refresh")
+                        # Backend can't inspect TTL: warn once instead of silently ignoring
+                        # the opted-in flag (LAB-446). Still degrades gracefully.
+                        warn_ttl_refresh_unsupported(_backend)
 
                     # Record L2 hit with latency for cache_info()
                     _stats.record_l2_hit(get_duration_ms)
