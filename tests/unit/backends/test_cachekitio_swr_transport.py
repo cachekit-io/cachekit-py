@@ -23,7 +23,7 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import StandardCacheHandler, supports_swr
 
 _TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"
+_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
 
 _DUMMY_REQUEST = httpx.Request("GET", "https://api.cachekit.io/v1/cache/key")
 
@@ -183,3 +183,65 @@ class TestHandlerPlumbing:
         assert await handler.get_with_freshness_async("k") == (b"swr-get", True)
         assert await handler.set_async("k", b"v", ttl=300, stale_ttl=600) is True
         assert backend.set_calls == [("k", b"v", 300, 600)]
+
+
+class TestAsyncBackendVariants:
+    """Async mirrors of the freshness read/write (codecov: the async bodies count)."""
+
+    async def test_get_with_freshness_async_maps_header(self, backend: CachekitIOBackend) -> None:
+        resp = _response(200, b"payload", {FRESHNESS_HEADER: "stale"})
+        with patch.object(backend, "_request_async", return_value=resp):
+            assert await backend.get_with_freshness_async("k") == (b"payload", True)
+
+    async def test_get_with_freshness_async_miss_and_error(self, backend: CachekitIOBackend) -> None:
+        miss = BackendError(
+            "not found",
+            error_type=BackendErrorType.PERMANENT,
+            original_exception=httpx.HTTPStatusError("404", request=_DUMMY_REQUEST, response=_response(404)),
+        )
+        with patch.object(backend, "_request_async", side_effect=miss):
+            assert await backend.get_with_freshness_async("k") is None
+
+        boom = BackendError(
+            "boom",
+            error_type=BackendErrorType.TRANSIENT,
+            original_exception=httpx.HTTPStatusError("500", request=_DUMMY_REQUEST, response=_response(500)),
+        )
+        with patch.object(backend, "_request_async", side_effect=boom):
+            with pytest.raises(BackendError):
+                await backend.get_with_freshness_async("k")
+
+
+class _ExplodingBackend(_SWRBackend):
+    """SWR backend whose reads raise (handler degradation paths)."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self.exc = exc
+
+    def get_with_freshness(self, key: str):
+        raise self.exc
+
+    def get(self, key: str):
+        raise self.exc
+
+
+class TestHandlerDegradation:
+    """Errors read as misses (caller recomputes) — sync and async, both error classes."""
+
+    @pytest.mark.parametrize("exc", [BackendError("down", error_type=BackendErrorType.TRANSIENT), ValueError("weird")])
+    def test_get_with_freshness_errors_read_as_miss(self, exc: Exception) -> None:
+        handler = StandardCacheHandler(_ExplodingBackend(exc))  # type: ignore[arg-type]
+        assert handler.get_with_freshness("k") is None
+
+    @pytest.mark.parametrize("exc", [BackendError("down", error_type=BackendErrorType.TRANSIENT), ValueError("weird")])
+    async def test_get_with_freshness_async_errors_read_as_miss(self, exc: Exception) -> None:
+        handler = StandardCacheHandler(_ExplodingBackend(exc))  # type: ignore[arg-type]
+        assert await handler.get_with_freshness_async("k") is None
+
+    async def test_get_with_freshness_async_fallback_for_plain_backend(self) -> None:
+        backend = _PlainBackend()
+        backend.store["k"] = b"value"
+        handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
+        assert await handler.get_with_freshness_async("k") == (b"value", False)
+        assert await handler.get_with_freshness_async("missing") is None

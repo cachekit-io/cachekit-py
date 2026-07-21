@@ -273,3 +273,192 @@ class TestSWRConfig:
 
             @cache(backend=FakeSWRBackend(), ttl=60, stale_ttl=-5, l1_enabled=False)
             def f() -> None: ...
+
+
+class TestSWRCoverageEdges:
+    """Branches the main flows don't reach: L1 refresh, no-lock backends,
+    sync failure, slot exhaustion, operation-handler degradation."""
+
+    async def test_no_lock_backend_still_revalidates(self) -> None:
+        """Backend WITHOUT acquire_lock: the no-lease branch revalidates directly."""
+
+        class NoLockSWRBackend:
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+                self.stale = False
+                self.set_calls: list[tuple[int | None, int | None]] = []
+
+            def get(self, key: str) -> bytes | None:
+                return self.store.get(key)
+
+            def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+                value = self.store.get(key)
+                return None if value is None else (value, self.stale)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+                self.store[key] = value
+                self.set_calls.append((ttl, stale_ttl))
+
+            def delete(self, key: str) -> bool:
+                return self.store.pop(key, None) is not None
+
+        backend = NoLockSWRBackend()
+        assert not hasattr(backend, "acquire_lock")
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        assert await compute() == 1
+        backend.stale = True
+        assert await compute() == 1  # stale served
+        assert await _await_for(lambda: calls["n"] == 2)  # revalidated without a lease
+        assert await _await_for(lambda: len(backend.set_calls) == 2)
+
+    async def test_l1_refresh_on_revalidation(self) -> None:
+        """With L1 enabled: stale L2 bytes are NOT recorded in L1, and the
+        background revalidation refreshes L1 with the new fresh bytes."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, namespace="swr-l1-refresh")
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        assert await compute() == 1  # miss -> L2 + L1 store
+
+        # Force the next read to L2: clear L1 via the decorator API, then restore
+        # the L2 bytes it also cleared, and flip the entry stale.
+        l2_snapshot = dict(backend.store)
+        await compute.invalidate_cache()  # type: ignore[attr-defined]  # coroutine for async functions
+        backend.store.update(l2_snapshot)
+        backend.stale = True
+
+        assert await compute() == 1  # L1 miss -> stale L2 hit -> serve stale
+        assert await _await_for(lambda: calls["n"] == 2)  # background recompute ran
+        assert await _await_for(lambda: len(backend.set_calls) >= 2)
+
+        # L1 was refreshed with FRESH bytes by the revalidation: with the L2 entry
+        # still flagged stale, a pure-L1 hit returns the new value with no recompute.
+        backend.stale = False
+        assert await compute() == 2
+        assert calls["n"] == 2
+
+    def test_sync_revalidation_failure_is_silent(self) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("sync recompute exploded")
+            return calls["n"]
+
+        assert compute() == 1
+        backend.stale = True
+        assert compute() == 1  # caller unaffected
+        assert _wait_for(lambda: calls["n"] == 2)
+        time.sleep(0.1)
+        assert len(backend.set_calls) == 1  # nothing stored on failure
+        assert compute() == 1  # stale keeps serving
+
+    def test_slot_exhaustion_skips_revalidation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the refresh slot pool at 1, a second distinct stale key skips
+        revalidation (stale keeps being served; a later hit retries)."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L1_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        def compute(x: int) -> int:
+            calls["n"] += 1
+            if calls["n"] > 2:  # only background recomputes block (first two are misses)
+                gate.wait(2)
+            return calls["n"]
+
+        assert compute(1) == 1
+        assert compute(2) == 2
+        backend.stale = True
+        assert compute(1) == 1  # claims the single slot; recompute blocked on gate
+        assert _wait_for(lambda: calls["n"] == 3)  # background recompute started
+        assert compute(2) == 2  # slot pool exhausted -> revalidation skipped
+        time.sleep(0.15)
+        assert calls["n"] == 3  # no second background recompute
+        gate.set()
+        assert _wait_for(lambda: len(backend.set_calls) == 3)  # first revalidation lands
+
+
+class TestOperationHandlerFreshnessDegradation:
+    """get_cached_value_with_freshness error paths mirror get_cached_value (#159 contract)."""
+
+    def _make_op(self, deserialize_side_effect=None, get_result=(b"bytes", True)):
+        from unittest import mock
+
+        from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
+
+        if deserialize_side_effect is not None:
+            serialization = mock.MagicMock(spec=CacheSerializationHandler)
+            serialization.deserialize_data.side_effect = deserialize_side_effect
+        else:
+            serialization = CacheSerializationHandler()
+        op = CacheOperationHandler(serialization, CacheKeyGenerator())
+        cache_handler = mock.MagicMock()
+        cache_handler.get_with_freshness.return_value = get_result
+        op.set_cache_handler(cache_handler)
+        return op, cache_handler
+
+    def test_no_handler_reads_as_miss(self) -> None:
+        from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
+
+        op = CacheOperationHandler(CacheSerializationHandler(), CacheKeyGenerator())
+        assert op.get_cached_value_with_freshness("k") is None  # RuntimeError -> generic path -> miss
+
+    def test_backend_error_reads_as_miss(self) -> None:
+        op, cache_handler = self._make_op()
+        cache_handler.get_with_freshness.side_effect = ValueError("backend exploded")
+        assert op.get_cached_value_with_freshness("k") is None
+
+    def test_poisoned_entry_evicted_and_reads_as_miss(self) -> None:
+        from cachekit.serializers.base import SerializationError
+
+        op, cache_handler = self._make_op(deserialize_side_effect=SerializationError("integrity check failed"))
+        assert op.get_cached_value_with_freshness("poison:key") is None
+        cache_handler.delete.assert_called_once_with("poison:key")
+
+    def test_eviction_failure_never_masks_the_miss(self) -> None:
+        from cachekit.serializers.base import SerializationError
+
+        op, cache_handler = self._make_op(deserialize_side_effect=SerializationError("corrupt"))
+        cache_handler.delete.side_effect = RuntimeError("delete also broken")
+        assert op.get_cached_value_with_freshness("poison:key") is None
+
+    def test_sync_l1_refresh_on_revalidation(self) -> None:
+        """Sync twin of the L1-refresh case: the daemon-thread revalidation
+        writes the new fresh bytes back into L1."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, namespace="swr-l1-sync")
+        def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        assert compute() == 1
+        l2_snapshot = dict(backend.store)
+        compute.invalidate_cache()  # type: ignore[attr-defined]
+        backend.store.update(l2_snapshot)
+        backend.stale = True
+
+        assert compute() == 1  # L1 miss -> stale L2 hit
+        assert _wait_for(lambda: calls["n"] == 2)
+        assert _wait_for(lambda: len(backend.set_calls) >= 2)
+        backend.stale = False
+        assert compute() == 2  # revalidation refreshed L1 with fresh bytes
+        assert calls["n"] == 2
