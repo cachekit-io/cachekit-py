@@ -72,7 +72,7 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     try:
         exc = task.exception()
         if exc is not None:
-            _logger.debug("Background TTL refresh failed for %s: %s", cache_key, exc)
+            _logger.debug("Background TTL refresh failed for %s: %s", redact_cache_key(cache_key), exc)
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
@@ -831,7 +831,9 @@ def create_cache_wrapper(
         except Exception as exc:
             _l1_swr_slots.release()
             _object_cache.cancel_refresh(cache_key, version)
-            _logger.debug("L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", cache_key, exc)
+            _logger.debug(
+                "L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc
+            )
             return None
 
     def _l1_swr_task_done(task: asyncio.Task[None], cache_key: str) -> None:
@@ -867,7 +869,7 @@ def create_cache_wrapper(
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
                 _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
-                _logger.debug("L1-only SWR background refresh failed for %s: %s", cache_key, exc)
+                _logger.debug("L1-only SWR background refresh failed for %s: %s", redact_cache_key(cache_key), exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:

@@ -1327,7 +1327,7 @@ class CacheOperationHandler:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
     async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
@@ -1353,7 +1353,7 @@ class CacheOperationHandler:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
     async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
@@ -1805,10 +1805,10 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
             return None
 
     async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
@@ -1819,10 +1819,10 @@ class StandardCacheHandler:
         try:
             return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
             return None
 
     def set(
