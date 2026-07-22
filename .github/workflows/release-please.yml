@@ -53,13 +53,18 @@ jobs:
       # assignee is bolted on here so the release PR notifies a human. Runs on
       # every open/update of the release PR; --add-assignee is idempotent.
       # GH_REPO is required: this job has no checkout, so gh has no git context.
+      # The PR number is parsed in the shell, NOT via fromJSON() in env: step
+      # env templates are evaluated before `if`, so fromJSON('') on runs where
+      # release-please touches no PR (release-cut merges, chore/ci/docs pushes)
+      # was a template error that failed this job and skipped the entire
+      # build/attest/publish chain — v0.12.0–v0.14.0 never reached PyPI.
       - name: Assign release PR to 27Bslash6
         if: ${{ steps.release.outputs.pr }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.pr).number }}
-        run: gh pr edit "$PR_NUMBER" --add-assignee 27Bslash6
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: gh pr edit "$(jq -r '.number' <<<"$RELEASE_PR")" --add-assignee 27Bslash6
 
   sync-release-pr:
     name: Sync release PR with main
