@@ -98,7 +98,15 @@ def cache(
         func: The function to decorate (when used without parentheses)
         config: DecoratorConfig object for RORO-style configuration
         _intent: Internal parameter for intent variants (fast/safe/secure)
-        **manual_overrides: Any manual parameter overrides (including serializer)
+        **manual_overrides: Any manual parameter overrides (including serializer).
+            Notable: ``stale_ttl`` (LAB-381 stale-while-revalidate) — a stale-grace
+            window in seconds past the fresh ``ttl``. During the window an expired
+            entry is served immediately and the function re-runs in the background,
+            so no request pays the recompute at a TTL boundary. Requires a positive
+            ``ttl`` and an SWR-capable backend (CachekitIO); ``ttl + stale_ttl``
+            is capped at 2,592,000 s (30 days). ``@cache.io`` defaults it to
+            ``ttl`` — pass ``stale_ttl=0`` to opt out. The background recompute
+            runs outside the request context (no request-scoped state).
 
     Returns:
         Decorated function with intelligent caching
