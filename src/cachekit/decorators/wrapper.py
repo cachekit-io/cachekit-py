@@ -283,6 +283,77 @@ class _FunctionStats:
             # Clear session ID - will be regenerated with new clear count on next operation
             self.session_id = None
 
+    def _reset_for_new_process(self) -> None:
+        """Discard state inherited across fork(): fresh lock, zeroed counters, new session.
+
+        Only called from the post-fork handler while the child is still
+        single-threaded. The lock must be replaced, not acquired: a parent
+        thread holding it at fork time leaves it permanently locked in the
+        child. session_id=None re-derives lazily from the child's own
+        process UUID (see decorators.session), so the child never reports
+        under the parent's session ID with reset counters — which the
+        server's anti-replay validation would reject.
+        """
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._l1_hits = 0
+        self._l2_hits = 0
+        self._l2_cumulative_latency_ms = 0.0
+        self._l2_cached_avg_ms = 0.0
+        self._last_operation_at = None
+        self._clear_count = 0
+        self.session_id = None
+
+
+# Process-global registry: one _FunctionStats per function identifier.
+# Session IDs are derived from process UUID + module.qualname and are thus
+# stable across re-decorations — a fresh counter object per decoration
+# (factory / per-call patterns) would send counters that go backwards under
+# an unchanged session ID, which the server's anti-replay validation rejects
+# by silently stripping the session tag. Strong references are deliberate:
+# counters must outlive any individual wrapper so a rebuilt wrapper
+# continues the same monotonic sequence.
+_function_stats_registry: dict[str, _FunctionStats] = {}
+_function_stats_registry_lock = threading.Lock()
+
+
+def _get_function_stats(function_identifier: str, l1_enabled: bool) -> _FunctionStats:
+    """Get or create the shared stats tracker for a function identifier.
+
+    Re-decorating the same function reuses the existing tracker. The most
+    recent decoration's l1_enabled wins: the flag only feeds the rate-limit
+    classification header, and the newest decoration reflects the current
+    configuration.
+    """
+    with _function_stats_registry_lock:
+        stats = _function_stats_registry.get(function_identifier)
+        if stats is None:
+            stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+            _function_stats_registry[function_identifier] = stats
+        else:
+            stats.l1_enabled = l1_enabled
+        return stats
+
+
+def _reset_stats_after_fork() -> None:
+    """Reset every registered stats tracker in a newly forked child.
+
+    The child inherits the parent's counters and cached session IDs;
+    reporting them would either continue the parent's session from another
+    process or reset counters under the parent's session ID — both corrupt
+    server-side session telemetry. The child is single-threaded here, so
+    wholesale lock replacement is safe.
+    """
+    global _function_stats_registry_lock
+    _function_stats_registry_lock = threading.Lock()
+    for stats in _function_stats_registry.values():
+        stats._reset_for_new_process()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_stats_after_fork)
+
 
 # Lazy logger initialization to avoid import-time container access
 def logger():
@@ -604,28 +675,27 @@ def create_cache_wrapper(
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
     _swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
     _stale_ttl: int | None = None
-    if stale_ttl is not None and stale_ttl != 0:
+    if stale_ttl is not None:
         from ..config.validation import ConfigurationError
 
-        if not isinstance(stale_ttl, int) or stale_ttl < 0:
+        # Type-check BEFORE the zero opt-out test: bool is an int subclass and
+        # False == 0 == 0.0, so without this ordering True silently means a
+        # 1-second window and False/0.0 silently opt out unvalidated.
+        if isinstance(stale_ttl, bool) or not isinstance(stale_ttl, int) or stale_ttl < 0:
             raise ConfigurationError(f"stale_ttl must be a non-negative integer, got {stale_ttl!r}")
-        if ttl is None or ttl <= 0:
-            raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
-        if ttl + stale_ttl > _max_total_ttl:
-            raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
-        if not _swr_backend_capable:
-            raise ConfigurationError(
-                "stale_ttl requires an SWR-capable backend (CachekitIO). "
-                "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
-            )
-        _stale_ttl = stale_ttl
+        if stale_ttl != 0:  # integer 0 = explicit SWR opt-out
+            if ttl is None or ttl <= 0:
+                raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
+            if ttl + stale_ttl > _max_total_ttl:
+                raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
+            if not _swr_backend_capable:
+                raise ConfigurationError(
+                    "stale_ttl requires an SWR-capable backend (CachekitIO). "
+                    "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
+                )
+            _stale_ttl = stale_ttl
     elif (
-        stale_ttl is None
-        and config is not None
-        and getattr(config, "swr_by_default", False)
-        and ttl is not None
-        and ttl > 0
-        and _swr_backend_capable
+        config is not None and getattr(config, "swr_by_default", False) and ttl is not None and ttl > 0 and _swr_backend_capable
     ):
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
@@ -644,6 +714,7 @@ def create_cache_wrapper(
     _swr_inflight: set[str] = set()
     _swr_tasks: set[asyncio.Task[None]] = set()
     _swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+    _swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
     def _swr_try_begin(cache_key: str) -> bool:
@@ -653,6 +724,19 @@ def create_cache_wrapper(
         duplicate schedule is benign (the backend lease or last-write-wins between two
         freshly computed values absorbs it — spec explicitly allows duplicates).
         """
+        nonlocal _swr_inflight, _swr_tasks, _swr_slots, _swr_pid
+        if _swr_pid != os.getpid():
+            # Forked child: inherited in-flight keys would never clear (the parent
+            # threads that call _swr_end don't survive fork), permanently starving
+            # those keys of revalidation, and the inherited semaphore may carry
+            # consumed slots or a lock captured mid-acquire (even a non-blocking
+            # acquire would then hang). Replace wholesale. Sibling threads racing
+            # this swap are as benign as the dedup race above: worst case one
+            # duplicate schedule or one lost slot, both self-healing.
+            _swr_inflight = set()
+            _swr_tasks = set()
+            _swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+            _swr_pid = os.getpid()
         if cache_key in _swr_inflight:
             return False
         if not _swr_slots.acquire(blocking=False):
@@ -781,9 +865,9 @@ def create_cache_wrapper(
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
     _cached_keys: set[str] = set()
 
-    # Create stats tracker (session ID will be lazy-initialized on first use)
-    # Pass l1_enabled for rate limit classification header
-    _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+    # Shared stats tracker from the process-global registry (session ID lazy-initialized
+    # on first use). Re-decoration reuses the same counters — see _get_function_stats.
+    _stats = _get_function_stats(function_identifier, l1_enabled)
 
     # L1-only SWR: strong refs to in-flight refresh tasks. asyncio only keeps weak
     # refs to tasks, so a fire-and-forget refresh could be GC'd mid-flight otherwise.
@@ -795,6 +879,7 @@ def create_cache_wrapper(
     # function; at capacity the refresh is skipped (stale keeps being served)
     # and a later qualifying hit retries.
     _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+    _l1_swr_pid = os.getpid()  # owner process — see _swr_try_begin's fork note
 
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
@@ -809,7 +894,14 @@ def create_cache_wrapper(
         refresh (version) is cancelled so a later call retries, and the caller
         must not schedule a refresh.
         """
+        nonlocal _l1_swr_tasks, _l1_swr_slots, _l1_swr_pid
         assert _object_cache is not None  # noqa: S101 - only called when scheduling a refresh
+        if _l1_swr_pid != os.getpid():
+            # Forked child: same wholesale reset as _swr_try_begin — the inherited
+            # semaphore is parent state (consumed slots, possibly a poisoned lock).
+            _l1_swr_tasks = set()
+            _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+            _l1_swr_pid = os.getpid()
         if not _l1_swr_slots.acquire(blocking=False):
             _object_cache.cancel_refresh(cache_key, version)
             return None
@@ -1968,22 +2060,20 @@ def create_cache_wrapper(
         Returns hit/miss statistics for the decorated function.
 
         Threading behavior:
-            When used with threading/multiprocessing, statistics are tracked
-            per-function (shared across all invocations), not per-thread.
-            The internal _FunctionStats object is shared by all threads calling
-            the same decorated function, with thread-safe locking via RLock.
+            Statistics are tracked per function identity (``module.qualname``),
+            shared across all threads and all decorator applications, with
+            thread-safe locking via RLock. Re-applying a decorator to the same
+            function reuses the existing counters rather than resetting them —
+            the session ID is stable across re-decorations, and counters that
+            reset under an unchanged session ID would trip the server's
+            anti-replay validation. Consequently, decorating the same function
+            twice (even with different options) reports combined statistics
+            from one shared tracker.
 
-            For per-thread statistics, create separate decorated instances:
-
-                # Global shared stats
-                @cache()
-                def shared_func(x): ...
-
-                # Per-thread stats (different function instances)
-                def get_thread_func():
-                    @cache()
-                    def thread_func(x): ...
-                    return thread_func
+        Fork behavior:
+            A forked child process starts with zeroed counters and derives a
+            new session ID from its own process UUID; the parent's statistics
+            are unaffected.
 
         Returns:
             CacheInfo: Named tuple with hits, misses, maxsize, currsize

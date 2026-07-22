@@ -11,6 +11,7 @@ Spec: protocol spec/saas-api.md#stale-while-revalidate.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -274,8 +275,93 @@ class TestSWRConfig:
             @cache(backend=FakeSWRBackend(), ttl=60, stale_ttl=-5, l1_enabled=False)
             def f() -> None: ...
 
+    @pytest.mark.parametrize("bad", [True, False, 0.0, 5.5], ids=["True", "False", "0.0", "5.5"])
+    def test_non_integer_stale_ttl_raises(self, bad: Any) -> None:
+        """bool/float must be rejected, not coerced (DecoratorConfig is an unvalidated dataclass).
 
-class TestSWRCoverageEdges:
+        bool is an int subclass and False == 0 == 0.0: before the type check ran
+        ahead of the zero opt-out, True silently meant a 1-second window and
+        False/0.0 silently opted out.
+        """
+        with pytest.raises(ConfigurationError, match="non-negative integer"):
+
+            @cache(backend=FakeSWRBackend(), ttl=60, stale_ttl=bad, l1_enabled=False)
+            def f() -> None: ...
+
+    def test_integer_zero_opts_out_without_backend_requirements(self) -> None:
+        """stale_ttl=0 is the explicit opt-out: valid even on a non-SWR backend."""
+
+        class PlainBackend:
+            def get(self, k: str) -> None:
+                return None
+
+            def set(self, k: str, v: bytes, ttl: int | None = None) -> None: ...
+
+            def delete(self, k: str) -> bool:
+                return False
+
+        @cache(backend=PlainBackend(), ttl=60, stale_ttl=0, l1_enabled=False)
+        def f() -> int:
+            return 7
+
+        assert f() == 7
+
+
+class TestSWRForkIsolation:
+    """LAB-506 follow-through: SWR scheduler state must not survive fork().
+
+    The per-wrapper in-flight set and slot semaphore are parent state: the
+    parent threads that would clear them don't survive fork, so without a
+    PID guard an inherited in-flight key starves revalidation in the child
+    forever, and the inherited semaphore can carry consumed slots.
+    """
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_revalidates_key_stuck_inflight_in_parent(self) -> None:
+        import multiprocessing
+
+        backend = FakeSWRBackend()
+        gate = threading.Event()
+        calls: list[int] = []
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        def compute(x: int) -> int:
+            calls.append(os.getpid())
+            if len(calls) > 1 and not gate.is_set():
+                gate.wait(timeout=30)  # hold the parent's revalidation in flight
+            return x + 1
+
+        try:
+            assert compute(1) == 2  # miss -> store
+            backend.stale = True
+            assert compute(1) == 2  # stale hit -> schedules revalidation (blocks on gate)
+            # The revalidation daemon thread is now inside compute(), holding the
+            # key in the wrapper's in-flight set for the duration of the fork.
+            assert _wait_for(lambda: len(calls) == 2)
+
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q) -> None:
+                gate.set()  # child's own revalidation must not block
+                before = len(calls)
+                result = compute(1)  # stale hit; key is stuck in the INHERITED in-flight set
+                revalidated = _wait_for(lambda: len(calls) > before, timeout=5.0)
+                q.put({"result": result, "revalidated": revalidated})
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=30)
+            finally:
+                process.join(timeout=30)
+
+            assert process.exitcode == 0
+            assert outcome["result"] == 2
+            assert outcome["revalidated"], "forked child must reset inherited SWR in-flight state and revalidate"
+        finally:
+            gate.set()  # release the parent's parked revalidation thread
+
     """Branches the main flows don't reach: L1 refresh, no-lock backends,
     sync failure, slot exhaustion, operation-handler degradation."""
 
