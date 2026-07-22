@@ -185,33 +185,6 @@ class TestHandlerPlumbing:
         assert backend.set_calls == [("k", b"v", 300, 600)]
 
 
-class TestAsyncBackendVariants:
-    """Async mirrors of the freshness read/write (codecov: the async bodies count)."""
-
-    async def test_get_with_freshness_async_maps_header(self, backend: CachekitIOBackend) -> None:
-        resp = _response(200, b"payload", {FRESHNESS_HEADER: "stale"})
-        with patch.object(backend, "_request_async", return_value=resp):
-            assert await backend.get_with_freshness_async("k") == (b"payload", True)
-
-    async def test_get_with_freshness_async_miss_and_error(self, backend: CachekitIOBackend) -> None:
-        miss = BackendError(
-            "not found",
-            error_type=BackendErrorType.PERMANENT,
-            original_exception=httpx.HTTPStatusError("404", request=_DUMMY_REQUEST, response=_response(404)),
-        )
-        with patch.object(backend, "_request_async", side_effect=miss):
-            assert await backend.get_with_freshness_async("k") is None
-
-        boom = BackendError(
-            "boom",
-            error_type=BackendErrorType.TRANSIENT,
-            original_exception=httpx.HTTPStatusError("500", request=_DUMMY_REQUEST, response=_response(500)),
-        )
-        with patch.object(backend, "_request_async", side_effect=boom):
-            with pytest.raises(BackendError):
-                await backend.get_with_freshness_async("k")
-
-
 class _ExplodingBackend(_SWRBackend):
     """SWR backend whose reads raise (handler degradation paths)."""
 

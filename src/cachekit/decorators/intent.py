@@ -106,7 +106,9 @@ def cache(
             ``ttl`` and an SWR-capable backend (CachekitIO); ``ttl + stale_ttl``
             is capped at 2,592,000 s (30 days). ``@cache.io`` defaults it to
             ``ttl`` — pass ``stale_ttl=0`` to opt out. The background recompute
-            runs outside the request context (no request-scoped state).
+            sees a snapshot of the caller's ``contextvars`` (so contextvar-based
+            tenant extraction works), but no other request-scoped resources —
+            open sessions/connections from the request must not be relied on.
 
     Returns:
         Decorated function with intelligent caching

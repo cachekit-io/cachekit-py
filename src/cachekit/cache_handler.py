@@ -1232,6 +1232,31 @@ class CacheOperationHandler:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k != "_bypass_cache"}
         return self.key_generator.generate_key(func, args, filtered_kwargs, namespace, integrity_checking)
 
+    def _handle_l2_read_error(self, e: SerializationError, cache_key: str) -> None:
+        """Shared decrypt/integrity failure tail for sync L2 reads (LAB-108/#159).
+
+        Routes through the single policy point (raises DecryptionAuthenticationError
+        when fail-closed — poisoned entry retained as evidence), else best-effort
+        evicts the poisoned entry and notifies, so the caller treats it as a miss.
+        """
+        handle_decrypt_failure(e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed)
+        try:
+            if self._cache_handler is not None:
+                self._cache_handler.delete(cache_key)
+        except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+        self._notify_deserialize_error(e, cache_key)
+
+    async def _handle_l2_read_error_async(self, e: SerializationError, cache_key: str) -> None:
+        """Async twin of :meth:`_handle_l2_read_error` (delete_async eviction)."""
+        handle_decrypt_failure(e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed)
+        try:
+            if self._cache_handler is not None:
+                await self._cache_handler.delete_async(cache_key)
+        except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
+            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+        self._notify_deserialize_error(e, cache_key)
+
     def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
         """Get value from cache if it exists.
 
@@ -1272,29 +1297,13 @@ class CacheOperationHandler:
                 return (True, deserialized)
             return None
         except SerializationError as e:
-            # Single policy point (cachekit-py#170): records the metric and raises when
-            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
-            # evidence for the operator (eviction only happens on the fail-open return).
-            handle_decrypt_failure(
-                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
-            )
-            # Fail open: best-effort evict the poisoned entry so subsequent reads don't
-            # re-pay full decompress+verify only to fail again; the caller recomputes
-            # and re-stores the value (#159).
-            try:
-                if self._cache_handler is not None:
-                    self._cache_handler.delete(cache_key)
-            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
-            self._notify_deserialize_error(e, cache_key)
+            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
             return None
 
-    def get_cached_value_with_freshness(
-        self, cache_key: str, refresh_ttl: Optional[int] = None
-    ) -> Optional[tuple[tuple[bool, Any], bool]]:
+    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool]]:
         """SWR variant of :meth:`get_cached_value` (LAB-381): also reports staleness.
 
         Returns ``((True, value), is_stale)`` on a hit, None on miss/error. The mmap
@@ -1315,26 +1324,13 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized), is_stale)
         except SerializationError as e:
-            # Single policy point (cachekit-py#170): records the metric and raises when
-            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
-            # evidence for the operator (eviction only happens on the fail-open return).
-            handle_decrypt_failure(
-                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
-            )
-            try:
-                if self._cache_handler is not None:
-                    self._cache_handler.delete(cache_key)
-            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
-            self._notify_deserialize_error(e, cache_key)
+            self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
-    async def get_cached_value_with_freshness_async(
-        self, cache_key: str, refresh_ttl: Optional[int] = None
-    ) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
+    async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
         """Async SWR variant (LAB-381): staleness + the raw envelope for L1 backfill.
 
         Returns ``((True, value, raw_bytes), is_stale)`` on a hit — the 3-tuple
@@ -1354,19 +1350,10 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized, cached_data), is_stale)
         except SerializationError as e:
-            # Single policy point (cachekit-py#170) — see get_cached_value_async.
-            handle_decrypt_failure(
-                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
-            )
-            try:
-                if self._cache_handler is not None:
-                    await self._cache_handler.delete_async(cache_key)
-            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
-            self._notify_deserialize_error(e, cache_key)
+            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
     async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
@@ -1400,21 +1387,7 @@ class CacheOperationHandler:
                 return (True, deserialized, cached_data)
             return None
         except SerializationError as e:
-            # Single policy point (cachekit-py#170): records the metric and raises when
-            # fail-closed — in that case the poisoned entry is deliberately RETAINED as
-            # evidence for the operator (eviction only happens on the fail-open return).
-            handle_decrypt_failure(
-                e, tier="l2", cache_key=cache_key, fail_closed=self.serialization_handler.encryption_fail_closed
-            )
-            # Fail open: best-effort evict the poisoned entry so subsequent reads don't
-            # re-pay full decompress+verify only to fail again; the caller recomputes
-            # and re-stores the value (#159).
-            try:
-                if self._cache_handler is not None:
-                    await self._cache_handler.delete_async(cache_key)
-            except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-                get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
-            self._notify_deserialize_error(e, cache_key)
+            await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
@@ -1832,10 +1805,10 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
             return None
 
     async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
@@ -1846,10 +1819,10 @@ class StandardCacheHandler:
         try:
             return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
             return None
 
     def set(

@@ -511,17 +511,6 @@ class CachekitIOBackend:
                     return None
             raise
 
-    async def get_with_freshness_async(self, key: str) -> tuple[bytes, bool] | None:
-        """Retrieve value plus its SWR freshness (async). See :meth:`get_with_freshness`."""
-        try:
-            response = await self._request_async("GET", key)
-            return response.content, self._is_stale(response)
-        except BackendError as exc:
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return None
-            raise
-
     async def set_async(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (async).
 
