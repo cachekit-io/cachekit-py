@@ -188,6 +188,14 @@ class DecoratorConfig:
 
     # Core settings (6 fields)
     ttl: int | None = None
+    # Stale-while-revalidate stale-grace window in seconds past the fresh TTL
+    # (LAB-381, protocol spec/saas-api.md#stale-while-revalidate). Requires a
+    # positive ttl and an SWR-capable backend (CachekitIO). None = preset
+    # decides (io() defaults it to ttl via swr_by_default); 0 = explicitly off.
+    stale_ttl: int | None = None
+    # Preset flag: default stale_ttl to ttl (capped to the shared 30-day bound)
+    # when the backend supports SWR and the user didn't say otherwise.
+    swr_by_default: bool = False
     namespace: str | None = None
     serializer: Union[str, SerializerProtocol] = "default"  # type: ignore[assignment]  # String name or protocol instance
     integrity_checking: bool = True  # Checksums for corruption detection (xxHash3-64 for all serializers)
@@ -608,6 +616,11 @@ class DecoratorConfig:
         return cls(
             backend=backend,
             integrity_checking=True,
+            # SWR default-on for the managed backend (LAB-381 design decision):
+            # boundary requests serve stale + revalidate in the background.
+            # stale_ttl resolves to ttl (capped) at wrap time; pass stale_ttl=0
+            # to opt out, or an explicit value to size the window.
+            swr_by_default=True,
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,

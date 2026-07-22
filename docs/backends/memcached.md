@@ -81,14 +81,14 @@ backend = MemcachedBackend(config)
 **When NOT to use**:
 - Need persistence (Memcached is volatile — data lost on restart)
 - Need distributed locking (use [Redis](redis.md) instead)
-- Need TTL inspection/refresh (Memcached doesn't support it)
+- Need automatic sliding expiration via `refresh_ttl_on_get` (requires TTL *inspection*, which Memcached lacks — see [TTL Inspection & Refresh](#ttl-inspection--refresh))
 - Cache values exceed 1MB (Memcached default slab limit)
 
 ## Characteristics
 
 - Latency: 1–5ms per operation (network-dependent)
 - Throughput: Very high (multi-threaded C server)
-- TTL support: Yes (max 30 days)
+- TTL support: Yes (max 30 days); `refresh_ttl` yes (via `touch`), `get_ttl` no
 - Cross-process: Yes (shared across pods)
 - Persistence: No (volatile memory only)
 - Consistent hashing: Yes (via pymemcache HashClient)
@@ -99,7 +99,23 @@ backend = MemcachedBackend(config)
 2. **No locking**: No distributed lock support (use Redis for stampede prevention).
 3. **30-day TTL maximum**: TTLs exceeding 30 days are automatically clamped.
 4. **1MB value limit**: Default Memcached slab size limits values to ~1MB.
-5. **No TTL inspection**: Cannot query remaining TTL on a key.
+5. **No TTL inspection (`get_ttl`)**: see below — `refresh_ttl` is supported, inspection is not.
+
+## TTL Inspection & Refresh
+
+Memcached ships only **half** of the `TTLInspectableBackend` protocol, by design:
+
+- **`refresh_ttl` — supported.** Backed by the Memcached `touch` command; call it directly to
+  extend a key's life (returns `True` if the key existed, `False` if it was already gone).
+- **`get_ttl` — not supported.** The classic Memcached protocol has no command to *read* a
+  key's remaining TTL, and pymemcache's `HashClient` exposes no meta protocol (`mg <key> t`,
+  memcached ≥ 1.6). Without `get_ttl`, Memcached is **not** a `TTLInspectableBackend`.
+
+Consequence: `@cache(..., refresh_ttl_on_get=True)` performs *threshold-based* sliding
+expiration, which needs to read the remaining TTL first — so it **does not apply to
+Memcached** and is ignored (the decorator warns once, then continues serving the hit). For
+automatic sliding expiration use the [Redis](redis.md), [CachekitIO](cachekitio.md), or
+[File](file.md) backend. You can still call `backend.refresh_ttl(key, ttl)` yourself.
 
 ## See Also
 
