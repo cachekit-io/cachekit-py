@@ -675,28 +675,27 @@ def create_cache_wrapper(
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
     _swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
     _stale_ttl: int | None = None
-    if stale_ttl is not None and stale_ttl != 0:
+    if stale_ttl is not None:
         from ..config.validation import ConfigurationError
 
-        if not isinstance(stale_ttl, int) or stale_ttl < 0:
+        # Type-check BEFORE the zero opt-out test: bool is an int subclass and
+        # False == 0 == 0.0, so without this ordering True silently means a
+        # 1-second window and False/0.0 silently opt out unvalidated.
+        if isinstance(stale_ttl, bool) or not isinstance(stale_ttl, int) or stale_ttl < 0:
             raise ConfigurationError(f"stale_ttl must be a non-negative integer, got {stale_ttl!r}")
-        if ttl is None or ttl <= 0:
-            raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
-        if ttl + stale_ttl > _max_total_ttl:
-            raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
-        if not _swr_backend_capable:
-            raise ConfigurationError(
-                "stale_ttl requires an SWR-capable backend (CachekitIO). "
-                "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
-            )
-        _stale_ttl = stale_ttl
+        if stale_ttl != 0:  # integer 0 = explicit SWR opt-out
+            if ttl is None or ttl <= 0:
+                raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
+            if ttl + stale_ttl > _max_total_ttl:
+                raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
+            if not _swr_backend_capable:
+                raise ConfigurationError(
+                    "stale_ttl requires an SWR-capable backend (CachekitIO). "
+                    "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
+                )
+            _stale_ttl = stale_ttl
     elif (
-        stale_ttl is None
-        and config is not None
-        and getattr(config, "swr_by_default", False)
-        and ttl is not None
-        and ttl > 0
-        and _swr_backend_capable
+        config is not None and getattr(config, "swr_by_default", False) and ttl is not None and ttl > 0 and _swr_backend_capable
     ):
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
@@ -715,6 +714,7 @@ def create_cache_wrapper(
     _swr_inflight: set[str] = set()
     _swr_tasks: set[asyncio.Task[None]] = set()
     _swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+    _swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
     def _swr_try_begin(cache_key: str) -> bool:
@@ -724,6 +724,19 @@ def create_cache_wrapper(
         duplicate schedule is benign (the backend lease or last-write-wins between two
         freshly computed values absorbs it — spec explicitly allows duplicates).
         """
+        nonlocal _swr_inflight, _swr_tasks, _swr_slots, _swr_pid
+        if _swr_pid != os.getpid():
+            # Forked child: inherited in-flight keys would never clear (the parent
+            # threads that call _swr_end don't survive fork), permanently starving
+            # those keys of revalidation, and the inherited semaphore may carry
+            # consumed slots or a lock captured mid-acquire (even a non-blocking
+            # acquire would then hang). Replace wholesale. Sibling threads racing
+            # this swap are as benign as the dedup race above: worst case one
+            # duplicate schedule or one lost slot, both self-healing.
+            _swr_inflight = set()
+            _swr_tasks = set()
+            _swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+            _swr_pid = os.getpid()
         if cache_key in _swr_inflight:
             return False
         if not _swr_slots.acquire(blocking=False):
@@ -866,6 +879,7 @@ def create_cache_wrapper(
     # function; at capacity the refresh is skipped (stale keeps being served)
     # and a later qualifying hit retries.
     _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+    _l1_swr_pid = os.getpid()  # owner process — see _swr_try_begin's fork note
 
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
@@ -880,7 +894,14 @@ def create_cache_wrapper(
         refresh (version) is cancelled so a later call retries, and the caller
         must not schedule a refresh.
         """
+        nonlocal _l1_swr_tasks, _l1_swr_slots, _l1_swr_pid
         assert _object_cache is not None  # noqa: S101 - only called when scheduling a refresh
+        if _l1_swr_pid != os.getpid():
+            # Forked child: same wholesale reset as _swr_try_begin — the inherited
+            # semaphore is parent state (consumed slots, possibly a poisoned lock).
+            _l1_swr_tasks = set()
+            _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+            _l1_swr_pid = os.getpid()
         if not _l1_swr_slots.acquire(blocking=False):
             _object_cache.cancel_refresh(cache_key, version)
             return None
