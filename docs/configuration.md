@@ -243,7 +243,6 @@ from cachekit.config import L1CacheConfig
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,  # Refresh at 50% of TTL
-        invalidation_enabled=True,
         namespace_index=True,
     ),
     backend=None
@@ -260,7 +259,6 @@ def my_function():
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
-| `invalidation_enabled` | bool | `True` | Enable invalidation event broadcasts |
 | `namespace_index` | bool | `True` | Enable fast namespace-based invalidation |
 
 **L1 Cache Concepts:**
