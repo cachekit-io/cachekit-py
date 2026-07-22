@@ -371,7 +371,7 @@ class TestSWRCoverageEdges:
         revalidation (stale keeps being served; a later hit retries)."""
         import cachekit.decorators.wrapper as wrapper_mod
 
-        monkeypatch.setattr(wrapper_mod, "_L1_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
         backend = FakeSWRBackend()
         calls = {"n": 0}
         gate = threading.Event()
@@ -541,3 +541,127 @@ class TestSWRSchedulingHardening:
         assert compute() == 1  # slot NOT leaked: retry schedules successfully
         assert _wait_for(lambda: calls["n"] == 2)
         assert _wait_for(lambda: len(backend.set_calls) == 2)
+
+
+class TestPanelFollowUps:
+    """LAB-381 panel fast-follow regressions (fixes on top of the merged #228)."""
+
+    def test_sync_revalidation_preserves_contextvars_for_encryption(self) -> None:
+        """Panel MAJ: the daemon thread must see the caller's contextvars. With
+        encryption + ContextVarExtractor (fail-closed on unset var), background
+        revalidation must ACTUALLY execute and store — not silently no-op."""
+        from cachekit.decorators.tenant_context import ContextVarExtractor
+
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(
+            backend=backend,
+            ttl=60,
+            stale_ttl=120,
+            l1_enabled=False,
+            encryption=True,
+            master_key="a" * 64,
+            tenant_extractor=ContextVarExtractor(),
+        )
+        def compute() -> dict[str, int]:
+            calls["n"] += 1
+            return {"call": calls["n"]}
+
+        ContextVarExtractor.set_tenant_id("550e8400-e29b-41d4-a716-446655440000")
+        assert compute()["call"] == 1
+        backend.stale = True
+        assert compute()["call"] == 1  # stale served
+
+        # Without the copy_context() snapshot the daemon thread hits an unset
+        # tenant var -> fail-closed ValueError -> swallowed -> no recompute, no store.
+        assert _wait_for(lambda: calls["n"] == 2), "background revalidation must run off-request"
+        assert _wait_for(lambda: len(backend.set_calls) == 2), "revalidated value must be stored (encrypt succeeded)"
+
+    def test_no_raw_cache_key_in_thread_name_or_debug_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Panel MIN (CWE-532): thread names and SWR debug logs carry no raw key.
+
+        The namespace segment of a cache key can carry tenant/user IDs; the
+        revalidation thread name must be static and the SWR debug lines must
+        emit only the blake2b-redacted form.
+        """
+        import logging
+
+        backend = FakeSWRBackend()
+        seen_thread_names: list[str] = []
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        def compute() -> int:
+            seen_thread_names.append(threading.current_thread().name)
+            return 1
+
+        # Happy path: static thread name, no key slice.
+        assert compute() == 1
+        backend.stale = True
+        assert compute() == 1
+        assert _wait_for(lambda: len(backend.set_calls) == 2)
+        revalidation_threads = [n for n in seen_thread_names if n.startswith("cachekit-swr")]
+        assert revalidation_threads == ["cachekit-swr-revalidate"]  # static, no key slice
+
+        # Failure path: force the 'skipped' debug line (uncopyable arg) and prove
+        # the raw key never reaches the log — only the <redacted:...> digest does.
+        lock = threading.Lock()
+        backend3 = FakeSWRBackend()
+
+        @cache(backend=backend3, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns", key=lambda lock: "k3")
+        def compute3(lock) -> int:
+            return 1
+
+        assert compute3(lock) == 1
+        backend3.stale = True
+        with caplog.at_level(logging.DEBUG):
+            assert compute3(lock) == 1  # stale served; deepcopy fails -> skipped debug line
+            time.sleep(0.1)
+
+        swr_lines = [r.getMessage() for r in caplog.records if "SWR revalidation" in r.getMessage()]
+        assert swr_lines, "expected the 'skipped' SWR debug line to fire"
+        for line in swr_lines:
+            assert "tenant-secret-ns" not in line  # raw key redacted (CWE-532)
+            assert "<redacted:" in line
+
+
+class TestFreshnessFailClosedPropagation:
+    """Panel should-fix 5: a future except-reorder must not demote the freshness
+    getters to fail-open with green tests — mirror the get_cached_value_async
+    fail-closed contract on both new getters."""
+
+    def _make_op_fail_closed(self):
+        from unittest import mock
+
+        from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        serialization.deserialize_data.side_effect = DecryptionAuthenticationError("GCM tag mismatch")
+        serialization.encryption_fail_closed = True  # fail closed: MUST propagate
+        op = CacheOperationHandler(serialization, CacheKeyGenerator())
+        cache_handler = mock.MagicMock()
+        cache_handler.get_with_freshness.return_value = (b"tampered", True)
+
+        async def _gwfa(key: str):
+            return (b"tampered", True)
+
+        cache_handler.get_with_freshness_async.side_effect = _gwfa
+        op.set_cache_handler(cache_handler)
+        return op, cache_handler
+
+    def test_sync_freshness_getter_propagates_fail_closed(self) -> None:
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        op, cache_handler = self._make_op_fail_closed()
+        with pytest.raises(DecryptionAuthenticationError):
+            op.get_cached_value_with_freshness("k")
+        cache_handler.delete.assert_not_called()  # evidence retained when fail-closed
+
+    async def test_async_freshness_getter_propagates_fail_closed(self) -> None:
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        op, cache_handler = self._make_op_fail_closed()
+        with pytest.raises(DecryptionAuthenticationError):
+            await op.get_cached_value_with_freshness_async("k")
+        cache_handler.delete_async.assert_not_called()  # evidence retained when fail-closed

@@ -184,7 +184,7 @@ Rules and behavior:
 - **CachekitIO only** — other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set.
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
 - A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
-- The background recompute runs **outside the request context** — don't rely on request-scoped state (contextvars, open sessions) inside functions that enable SWR.
+- The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
 
 ### File Backend Environment Variables

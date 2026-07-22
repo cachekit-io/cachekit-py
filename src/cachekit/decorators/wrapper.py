@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import functools
 import inspect
@@ -52,6 +53,10 @@ _logger = logging.getLogger(__name__)
 # Bounds resource usage when many distinct keys go stale together; at capacity
 # the refresh is skipped (stale keeps being served) and a later hit retries.
 _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
+
+# Backed-mode (L2) SWR revalidation pool — deliberately separate from the L1
+# constant above so the two features can be tuned independently (LAB-381 panel).
+_L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
@@ -602,7 +607,7 @@ def create_cache_wrapper(
     # and re-run the wrapped function in the background. Requires an SWR-capable
     # backend (CachekitIO — the server signals freshness on read).
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
-    _swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
+    _l2_swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
     _stale_ttl: int | None = None
     if stale_ttl is not None and stale_ttl != 0:
         from ..config.validation import ConfigurationError
@@ -613,7 +618,7 @@ def create_cache_wrapper(
             raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
         if ttl + stale_ttl > _max_total_ttl:
             raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
-        if not _swr_backend_capable:
+        if not _l2_swr_backend_capable:
             raise ConfigurationError(
                 "stale_ttl requires an SWR-capable backend (CachekitIO). "
                 "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
@@ -625,7 +630,7 @@ def create_cache_wrapper(
         and getattr(config, "swr_by_default", False)
         and ttl is not None
         and ttl > 0
-        and _swr_backend_capable
+        and _l2_swr_backend_capable
     ):
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
@@ -633,7 +638,7 @@ def create_cache_wrapper(
         _default_window = min(ttl, _max_total_ttl - ttl)
         _stale_ttl = _default_window if _default_window > 0 else None
 
-    _swr_active = _stale_ttl is not None
+    _l2_swr_active = _stale_ttl is not None
 
     # Background revalidation machinery — mirrors the L1-only SWR shapes below:
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
@@ -641,30 +646,36 @@ def create_cache_wrapper(
     # backend's async lock as a non-blocking lease (contested = serve stale, no
     # wait, no retry — _try_acquire_lock already treats 409 AND 200+null as
     # contested, LAB-240). The lease is best-effort per spec.
-    _swr_inflight: set[str] = set()
-    _swr_tasks: set[asyncio.Task[None]] = set()
-    _swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
-    _swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
+    _l2_swr_inflight: set[str] = set()
+    _l2_swr_tasks: set[asyncio.Task[None]] = set()
+    _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
+    _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
-    def _swr_try_begin(cache_key: str) -> bool:
+    def _put_l1(cache_key: str, serialized_data: Any) -> None:
+        """Backfill L1 with serialized bytes (str payloads encoded) under the fresh TTL."""
+        if _l1_cache and cache_key:
+            _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
+            _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+
+    def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
 
-        The check-then-add on _swr_inflight is not atomic across OS threads; a rare
+        The check-then-add on _l2_swr_inflight is not atomic across OS threads; a rare
         duplicate schedule is benign (the backend lease or last-write-wins between two
         freshly computed values absorbs it — spec explicitly allows duplicates).
         """
-        if cache_key in _swr_inflight:
+        if cache_key in _l2_swr_inflight:
             return False
-        if not _swr_slots.acquire(blocking=False):
+        if not _l2_swr_slots.acquire(blocking=False):
             return False
-        _swr_inflight.add(cache_key)
+        _l2_swr_inflight.add(cache_key)
         return True
 
-    def _swr_end(cache_key: str) -> None:
-        _swr_inflight.discard(cache_key)
-        _swr_slots.release()
+    def _l2_swr_end(cache_key: str) -> None:
+        _l2_swr_inflight.discard(cache_key)
+        _l2_swr_slots.release()
 
-    async def _swr_recompute_store_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    async def _l2_swr_recompute_store_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         result = await func(*call_args, **call_kwargs)
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
@@ -673,29 +684,27 @@ def create_cache_wrapper(
             cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
         )
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
-        if _l1_cache and cache_key:
-            _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-            _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+        _put_l1(cache_key, serialized_data)
 
-    async def _swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for async functions. Failures are silent by design:
         the caller already got the stale value; the entry hard-expires at evict_at and
         the next request takes the ordinary synchronous miss path (spec degradation)."""
         try:
             _acquire_lock = getattr(_backend, "acquire_lock", None)
             if _acquire_lock is not None:
-                async with _acquire_lock(cache_key, timeout=_swr_lease_seconds, blocking_timeout=None) as got_lease:
+                async with _acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
-                    await _swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                    await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
             else:
-                await _swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", cache_key, exc)
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
         finally:
-            _swr_end(cache_key)
+            _l2_swr_end(cache_key)
 
-    def _swr_revalidate_sync(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    def _l2_swr_revalidate_sync(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for sync functions (daemon thread).
 
         ponytail: per-process single-flight only — the distributed lease API is
@@ -711,15 +720,13 @@ def create_cache_wrapper(
             operation_handler.cache_handler.set(  # type: ignore[attr-defined]
                 cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
             )
-            if _l1_cache and cache_key:
-                _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-                _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+            _put_l1(cache_key, serialized_data)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", cache_key, exc)
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
         finally:
-            _swr_end(cache_key)
+            _l2_swr_end(cache_key)
 
-    def _swr_schedule(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], *, is_async: bool) -> None:
+    def _l2_swr_schedule(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], *, is_async: bool) -> None:
         """Kick off background revalidation for a stale hit (at most one per key).
 
         Arguments are deep-copied before scheduling (same contract as the L1-only
@@ -730,29 +737,35 @@ def create_cache_wrapper(
         later hit retries). Any scheduling failure releases the slot so the key
         never becomes permanently unrevalidatable.
         """
-        if not _swr_try_begin(cache_key):
+        if not _l2_swr_try_begin(cache_key):
             return
         try:
             call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
-            _swr_end(cache_key)
-            _logger.debug("SWR revalidation skipped for %s: arguments not deep-copyable: %s", cache_key, exc)
+            _l2_swr_end(cache_key)
+            _logger.debug("SWR revalidation skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc)
             return
         try:
             if is_async:
-                task = asyncio.create_task(_swr_revalidate_async(cache_key, call_args, call_kwargs))
-                _swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
-                task.add_done_callback(_swr_tasks.discard)
+                task = asyncio.create_task(_l2_swr_revalidate_async(cache_key, call_args, call_kwargs))
+                _l2_swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
+                task.add_done_callback(_l2_swr_tasks.discard)
             else:
+                # Snapshot the caller's context (captured in-request, where e.g. a
+                # ContextVarExtractor's tenant var is set) so the daemon thread sees
+                # the same contextvars the async path inherits via create_task —
+                # without this, encryption tenant extraction fails off-request and
+                # the refresh silently no-ops (LAB-381 panel, MAJ).
+                ctx = contextvars.copy_context()
                 threading.Thread(
-                    target=_swr_revalidate_sync,
-                    args=(cache_key, call_args, call_kwargs),
+                    target=ctx.run,
+                    args=(_l2_swr_revalidate_sync, cache_key, call_args, call_kwargs),
                     daemon=True,
-                    name=f"cachekit-swr-{cache_key[:40]}",
+                    name="cachekit-swr-revalidate",  # no key material (CWE-532)
                 ).start()
         except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
-            _swr_end(cache_key)
-            _logger.debug("SWR revalidation could not be scheduled for %s: %s", cache_key, exc)
+            _l2_swr_end(cache_key)
+            _logger.debug("SWR revalidation could not be scheduled for %s: %s", redact_cache_key(cache_key), exc)
 
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
@@ -1128,8 +1141,8 @@ def create_cache_wrapper(
             # (LAB-381): a stale hit is served immediately and revalidated on a
             # background daemon thread below.
             _sync_l2_stale = False
-            if _swr_active:
-                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, refresh_ttl)
+            if _l2_swr_active:
+                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
             else:
@@ -1185,7 +1198,7 @@ def create_cache_wrapper(
 
                 # SWR: stale hit — serve now, revalidate on a daemon thread.
                 if _sync_l2_stale:
-                    _swr_schedule(cache_key, args, kwargs, is_async=False)
+                    _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
 
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
@@ -1512,7 +1525,7 @@ def create_cache_wrapper(
                 # read also carries the server's freshness signal (LAB-381): a stale hit
                 # is served immediately and revalidated in the background below.
                 _l2_is_stale = False
-                if _swr_active:
+                if _l2_swr_active:
                     _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
                     cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
@@ -1567,7 +1580,7 @@ def create_cache_wrapper(
                     # SWR: stale hit — value already in hand; revalidate in the
                     # background so no request pays the recompute at a TTL boundary.
                     if _l2_is_stale:
-                        _swr_schedule(cache_key, args, kwargs, is_async=True)
+                        _l2_swr_schedule(cache_key, args, kwargs, is_async=True)
 
                     return result
 
@@ -1689,11 +1702,7 @@ def create_cache_wrapper(
                             )
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                            if _l1_cache and cache_key:
-                                serialized_bytes = (
-                                    serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-                                )
-                                _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                            _put_l1(cache_key, serialized_data)
                             _cached_keys.add(cache_key)
 
                             # Record successful cache set
@@ -1780,11 +1789,7 @@ def create_cache_wrapper(
                     )
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    if _l1_cache and cache_key:
-                        serialized_bytes = (
-                            serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-                        )
-                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                    _put_l1(cache_key, serialized_data)
                     _cached_keys.add(cache_key)
 
                     # Record successful cache set
