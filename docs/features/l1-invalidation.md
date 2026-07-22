@@ -2,7 +2,7 @@
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
-> L1 invalidation and SWR freshness management are **process-local**. Invalidating a key also deletes it from the shared L2 backend, but other processes keep serving their own L1 copy until it expires (L1 TTL). There is no cross-instance invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
+> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
 
 ---
 
@@ -160,7 +160,7 @@ from cachekit import cache
 
 @cache
 def get_user(user_id: int):
-    return db.query(f"SELECT * FROM users WHERE id={user_id}")
+    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
 
 # Clear cache only for user #123
 get_user.invalidate_cache(user_id=123)
@@ -175,7 +175,7 @@ for uid in [1, 2, 3]:
 - User data refresh
 - Post cache invalidation
 
-**Effect:** The entry is removed from this process's L1 cache **and** deleted from the shared L2 backend. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it.
+**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local.
 
 ### Whole-Function Invalidation
 
@@ -184,7 +184,7 @@ Calling `invalidate_cache()` with **no arguments** on a parameterized function c
 ```python notest
 @cache
 def get_user(user_id: int):
-    return db.query(f"SELECT * FROM users WHERE id={user_id}")
+    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
 
 # Clear all get_user entries written by this process (L1 + L2)
 get_user.invalidate_cache()
@@ -366,7 +366,7 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 **Cause:** L1 cache eviction churn under a working set larger than the configured budget
 
-**Solution:** Check L1 cache hit rate and consider reducing `max_size_mb` or increasing TTL to reduce churn.
+**Solution:** Check L1 cache hit rate and either increase `max_size_mb` to fit the working set or reduce TTL so entries expire before LRU has to evict them.
 
 ---
 
