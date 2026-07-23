@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.15.0](https://github.com/cachekit-io/cachekit-py/compare/v0.14.0...v0.15.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the no-op `adaptive_timeout` decorator kwarg, the `TimeoutConfig` nested config, `DecoratorConfig.timeout`, and `ProfileConfig.adaptive_timeout` are removed; `CircuitBreaker.call()` and `.call_async()` are removed (use should_allow_request() + record_success() / record_failure()). All were non-functional or dead in production.
+
+### Code Refactoring
+
+* remove non-functional adaptive timeout, dead CircuitBreaker.call, unused tenacity (LAB-522) ([#239](https://github.com/cachekit-io/cachekit-py/issues/239)) ([5ade101](https://github.com/cachekit-io/cachekit-py/commit/5ade10126f590f4469d99874beea6ecc6fdfab68))
+
 ## [0.14.0](https://github.com/cachekit-io/cachekit-py/compare/v0.13.0...v0.14.0) (2026-07-22)
 
 
