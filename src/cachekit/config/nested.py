@@ -30,7 +30,6 @@ class L1CacheConfig:
             task and sync functions via a daemon thread.
         swr_threshold_ratio: Fraction of TTL after which a hit triggers a background
             refresh, in (0.0, 1.0] (default: 0.5)
-        invalidation_enabled: Enable invalidation event broadcasts (default: True)
         namespace_index: Enable fast namespace-based invalidation (default: True)
 
     Examples:
@@ -59,7 +58,6 @@ class L1CacheConfig:
     max_size_mb: int | None = None
     swr_enabled: bool = True
     swr_threshold_ratio: float = 0.5
-    invalidation_enabled: bool = True
     namespace_index: bool = True
 
     def validate(self) -> None:

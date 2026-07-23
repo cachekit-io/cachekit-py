@@ -337,7 +337,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
-                invalidation_enabled=False,
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
@@ -378,7 +377,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                invalidation_enabled=True,
                 namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
@@ -444,7 +442,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,  # L1 stores encrypted bytes. Enabled: ~50ns hits vs 2-7ms Redis
                 swr_enabled=True,
-                invalidation_enabled=True,
                 namespace_index=True,
             ),
             encryption=EncryptionConfig(
@@ -493,7 +490,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                invalidation_enabled=False,
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
@@ -534,7 +530,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
-                invalidation_enabled=False,
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
@@ -608,7 +603,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                invalidation_enabled=True,
                 namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
