@@ -57,8 +57,6 @@ dependencies = [
     # Configuration and validation
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    # Error handling
-    "tenacity>=8.0.0",
     # Monitoring and observability
     "prometheus-client>=0.22.1",
     "psutil>=7.0.0",

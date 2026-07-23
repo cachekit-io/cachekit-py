@@ -140,22 +140,6 @@ class TestAiocacheComparison:
         result = get_data(1)
         assert result == "value_1"
 
-    def test_cachekit_adaptive_timeouts(self):
-        """
-        CLAIM: cachekit has adaptive timeouts that adjust to Redis latency.
-
-        This is TRUE. Timeouts automatically adjust to P99 Redis latency.
-
-        UNIQUE ADVANTAGE vs aiocache.
-        """
-
-        @cache(ttl=300)  # Adaptive timeout enabled by default
-        def get_data(x: int) -> str:
-            return f"value_{x}"
-
-        result = get_data(1)
-        assert result == "value_1"
-
     def test_cachekit_pluggable_backend_protocol(self):
         """
         CLAIM: cachekit has protocol-based backend abstraction.
@@ -257,7 +241,6 @@ class TestCompetitiveEvidenceAiocache:
         - Distributed locking (aiocache: ❌)
         - L1+L2 caching (aiocache: L2-only)
         - Zero-knowledge encryption (aiocache: ❌)
-        - Adaptive timeouts (aiocache: static only)
 
         cachekit has all of these. aiocache has none.
         """

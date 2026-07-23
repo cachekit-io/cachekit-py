@@ -17,7 +17,6 @@ from .nested import (
     EncryptionConfig,
     L1CacheConfig,
     MonitoringConfig,
-    TimeoutConfig,
 )
 from .validation import ConfigurationError
 
@@ -180,7 +179,6 @@ class DecoratorConfig:
         backend: L2 backend (RedisBackend, HTTPBackend, None for L1-only)
         l1: L1 in-memory cache configuration
         circuit_breaker: Circuit breaker configuration
-        timeout: Adaptive timeout configuration
         backpressure: Backpressure configuration
         monitoring: Monitoring and observability configuration
         encryption: Client-side encryption configuration
@@ -212,10 +210,9 @@ class DecoratorConfig:
     # Backend abstraction (1 field)
     backend: BaseBackend | None = None  # L2 backend: RedisBackend, HTTPBackend (future), None (L1-only)
 
-    # Nested configuration groups (6 groups)
+    # Nested configuration groups (5 groups)
     l1: L1CacheConfig = field(default_factory=L1CacheConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
-    timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     backpressure: BackpressureConfig = field(default_factory=BackpressureConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     encryption: EncryptionConfig = field(default_factory=EncryptionConfig)
@@ -264,7 +261,6 @@ class DecoratorConfig:
         # Validate nested configs
         self.l1.validate()
         self.circuit_breaker.validate()
-        self.timeout.validate()
         self.backpressure.validate()
         self.monitoring.validate()
         self.encryption.validate()
@@ -296,13 +292,6 @@ class DecoratorConfig:
             "recovery_timeout": self.circuit_breaker.recovery_timeout,
             "half_open_requests": self.circuit_breaker.half_open_requests,
             "excluded_exceptions": self.circuit_breaker.excluded_exceptions,
-            # Timeout (flattened)
-            "adaptive_timeout": self.timeout.enabled,
-            "initial_timeout": self.timeout.initial,
-            "min_timeout": self.timeout.min,
-            "max_timeout": self.timeout.max,
-            "timeout_window_size": self.timeout.window_size,
-            "timeout_percentile": self.timeout.percentile,
             # Backpressure (flattened)
             "backpressure": self.backpressure.enabled,
             "max_concurrent_requests": self.backpressure.max_concurrent_requests,
@@ -326,7 +315,7 @@ class DecoratorConfig:
         """Minimal protections profile: Maximum throughput, minimal overhead.
 
         Use cases: Read-heavy workloads, non-critical caching, high-performance scenarios
-        Trade-offs: Circuit breaker disabled, adaptive timeout disabled, no monitoring, NO integrity checking
+        Trade-offs: Circuit breaker disabled, no monitoring, NO integrity checking
 
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
@@ -352,7 +341,6 @@ class DecoratorConfig:
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
-            timeout=TimeoutConfig(enabled=False),
             backpressure=BackpressureConfig(enabled=True),
             monitoring=MonitoringConfig(
                 collect_stats=False,
@@ -368,7 +356,7 @@ class DecoratorConfig:
         """Production profile: All protections enabled, full observability, integrity checking ON.
 
         Use cases: Payment systems, APIs, production services, critical workloads
-        Trade-offs: Additional latency from circuit breaker, timeout checks, monitoring, integrity validation
+        Trade-offs: Additional latency from circuit breaker, monitoring, integrity validation
 
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
@@ -394,7 +382,6 @@ class DecoratorConfig:
                 namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
-            timeout=TimeoutConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
             monitoring=MonitoringConfig(
                 collect_stats=True,
@@ -469,7 +456,6 @@ class DecoratorConfig:
                 fail_closed=fail_closed,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
-            timeout=TimeoutConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
             monitoring=MonitoringConfig(
                 collect_stats=True,
@@ -511,7 +497,6 @@ class DecoratorConfig:
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
-            timeout=TimeoutConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
             monitoring=MonitoringConfig(
                 collect_stats=True,
@@ -527,7 +512,7 @@ class DecoratorConfig:
         """Testing profile: Deterministic, all protections disabled, no monitoring, no integrity checking.
 
         Use cases: Unit tests, integration tests (with fakeredis)
-        Trade-offs: No circuit breaker, no adaptive timeout, no stats, no integrity (reproducible, fast)
+        Trade-offs: No circuit breaker, no stats, no integrity (reproducible, fast)
 
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
@@ -553,7 +538,6 @@ class DecoratorConfig:
                 namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
-            timeout=TimeoutConfig(enabled=False),
             backpressure=BackpressureConfig(enabled=False),
             monitoring=MonitoringConfig(
                 collect_stats=False,
@@ -628,7 +612,6 @@ class DecoratorConfig:
                 namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
-            timeout=TimeoutConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
             monitoring=MonitoringConfig(
                 collect_stats=True,

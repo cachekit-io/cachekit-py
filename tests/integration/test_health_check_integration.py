@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from cachekit import cache
 from cachekit.config import DecoratorConfig
-from cachekit.config.nested import BackpressureConfig, CircuitBreakerConfig, MonitoringConfig, TimeoutConfig
+from cachekit.config.nested import BackpressureConfig, CircuitBreakerConfig, MonitoringConfig
 
 
 class TestHealthCheckIntegration:
@@ -44,7 +44,6 @@ class TestHealthCheckIntegration:
                 ttl=300,
                 namespace="test_health",
                 circuit_breaker=CircuitBreakerConfig(enabled=True),
-                timeout=TimeoutConfig(enabled=True),
                 backpressure=BackpressureConfig(enabled=True),
                 monitoring=MonitoringConfig(collect_stats=True, enable_structured_logging=True),
             )
@@ -78,7 +77,6 @@ class TestHealthCheckIntegration:
         assert "max_concurrent" in load_control_info
         assert load_control_info["max_concurrent"] == 100
 
-        # Adaptive timeout is integrated into features, not separate component
         # Check health status is valid
         assert health_status["healthy"] is True
 
@@ -90,7 +88,6 @@ class TestHealthCheckIntegration:
                 ttl=300,
                 namespace="test_health_disabled",
                 circuit_breaker=CircuitBreakerConfig(enabled=False),
-                timeout=TimeoutConfig(enabled=False),
                 backpressure=BackpressureConfig(enabled=False),
                 monitoring=MonitoringConfig(collect_stats=False, enable_structured_logging=False),
             )

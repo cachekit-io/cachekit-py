@@ -339,7 +339,6 @@ A: Pass `circuit_breaker=CircuitBreakerConfig(enabled=False)`.
 ## See Also
 
 - [Distributed Locking](distributed-locking.md) - Prevents cache stampedes
-- [Adaptive Timeouts](adaptive-timeouts.md) - Auto-tune Redis timeouts
 - [Prometheus Metrics](prometheus-metrics.md) - Monitor circuit breaker state
 - [Comparison Guide](../comparison.md) - How cachekit's reliability beats competitors
 

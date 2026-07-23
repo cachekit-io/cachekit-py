@@ -45,7 +45,6 @@ Tests that reliability features work under production stress:
 |------|----------------|-------------------|--------|
 | `test_circuit_breaker_failure_injection` | Circuit breaker | Opens after failures, fast-fail behavior | ⏳ |
 | `test_backpressure_limit` | Backpressure | Queue limits, timeout enforcement | ⏳ |
-| `test_adaptive_timeout_behavior` | Adaptive timeout | Timeout adaptation, performance impact | ⏳ |
 | `test_full_stack_under_load` | All features | Production config performance | ⏳ |
 
 **Key Insight**: Reliability features add overhead but protect against failures.
