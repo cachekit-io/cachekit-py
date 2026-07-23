@@ -26,6 +26,13 @@ def setup_di_for_redis_isolation():
     yield
 
 
+class UnreachableSerializer:
+    """Fails the test if a plaintext deserialize path is ever taken (fail-closed guard bypassed)."""
+
+    def deserialize(self, data, metadata=None):
+        pytest.fail("plaintext deserialize path was invoked — fail-closed guard bypassed")
+
+
 class TestEncryptionWrapperSetupErrors:
     """Cover _setup_encryption error branches when master_key comes from settings."""
 
@@ -283,12 +290,6 @@ class TestEncryptionDowngradeFailClosed:
         forged_metadata["encrypted"] = False
         blob = SerializationWrapper.wrap(serialized_payload, forged_metadata, "default")
 
-        class UnreachableSerializer:
-            """Fails the test if the plaintext deserialize branch is ever taken."""
-
-            def deserialize(self, data, metadata=None):
-                pytest.fail("plaintext base serializer was invoked on an encryption-enabled handler")
-
         enc_handler._base_serializer = UnreachableSerializer()
 
         with pytest.raises(SerializationError, match="fail closed"):
@@ -345,12 +346,6 @@ class TestEncryptionWrapperSelfGuard:
         """
         attacker_bytes, plain_meta = StandardSerializer().serialize({"attacker": "controlled"})
         assert plain_meta.encrypted is False
-
-        class UnreachableSerializer:
-            """Fails the test if the wrapper ever routes to plaintext deserialize."""
-
-            def deserialize(self, data, metadata=None):
-                pytest.fail("EncryptionWrapper routed plaintext-claiming input to the base serializer")
 
         wrapper.serializer = UnreachableSerializer()
 
