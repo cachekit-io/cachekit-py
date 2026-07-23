@@ -48,11 +48,6 @@ class TestIntentBasedMinimal:
         config = DecoratorConfig.minimal(backend=None)
         assert config.circuit_breaker.enabled is False
 
-    def test_minimal_config_timeout_disabled(self):
-        """Minimal preset disables adaptive timeout."""
-        config = DecoratorConfig.minimal(backend=None)
-        assert config.timeout.enabled is False
-
     def test_minimal_config_monitoring_disabled(self):
         """Minimal preset disables monitoring."""
         config = DecoratorConfig.minimal(backend=None)
@@ -76,11 +71,6 @@ class TestIntentBasedProduction:
         """Production preset enables circuit breaker."""
         config = DecoratorConfig.production(backend=None)
         assert config.circuit_breaker.enabled is True
-
-    def test_production_config_timeout_enabled(self):
-        """Production preset enables adaptive timeout."""
-        config = DecoratorConfig.production(backend=None)
-        assert config.timeout.enabled is True
 
     def test_production_config_monitoring_enabled(self):
         """Production preset enables full monitoring."""
@@ -190,11 +180,6 @@ class TestIntentBasedTest:
         """Test preset disables circuit breaker for reproducibility."""
         config = DecoratorConfig.test(backend=None)
         assert config.circuit_breaker.enabled is False
-
-    def test_test_config_timeout_disabled(self):
-        """Test preset disables adaptive timeout."""
-        config = DecoratorConfig.test(backend=None)
-        assert config.timeout.enabled is False
 
     def test_test_config_backpressure_disabled(self):
         """Test preset disables backpressure."""

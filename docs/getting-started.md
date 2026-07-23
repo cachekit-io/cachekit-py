@@ -206,7 +206,7 @@ def critical_business_function(request_id: str):
 > @cache.minimal     # Maximum speed, minimal overhead
 > ```
 
-**New powers unlocked**: Circuit breaker, adaptive timeouts, backpressure control, comprehensive monitoring
+**New powers unlocked**: Circuit breaker, backpressure control, comprehensive monitoring
 
 ---
 

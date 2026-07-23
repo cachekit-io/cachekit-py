@@ -107,7 +107,6 @@ class TestErrorHandlerOrchestration:
         orchestrator = FeatureOrchestrator(
             namespace="minimal",
             circuit_breaker_enabled=False,
-            adaptive_timeout_enabled=False,
             backpressure_enabled=False,
             collect_stats=False,
             enable_structured_logging=False,

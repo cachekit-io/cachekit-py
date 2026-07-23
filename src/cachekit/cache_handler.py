@@ -1681,7 +1681,6 @@ class StandardCacheHandler:
     def __init__(
         self,
         backend: BaseBackend,
-        timeout_provider=None,
         backpressure_controller=None,
         ttl_refresh_threshold=0.5,
     ):
@@ -1689,17 +1688,19 @@ class StandardCacheHandler:
 
         Args:
             backend: Backend instance (implements BaseBackend protocol)
-            timeout_provider: Optional callable that returns timeout value
             backpressure_controller: Optional BackpressureController for request limiting
             ttl_refresh_threshold: Threshold for TTL refresh (0.0-1.0, default 0.5 = 50%)
         """
         self.backend = backend
-        self.timeout_provider = timeout_provider
         self.backpressure_controller = backpressure_controller
         self.ttl_refresh_threshold = ttl_refresh_threshold
 
     def _with_backpressure_and_timeout(self, operation, *args, **kwargs):
-        """Execute operation with backpressure control and adaptive timeout."""
+        """Execute operation under backpressure control.
+
+        Operation timeouts are enforced at the backend connection layer
+        (e.g. redis-py socket_timeout), not here.
+        """
         if self.backpressure_controller:
             # Apply backpressure control first
             with self.backpressure_controller.acquire():

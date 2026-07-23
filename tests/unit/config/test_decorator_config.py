@@ -19,7 +19,6 @@ from cachekit.config.nested import (
     EncryptionConfig,
     L1CacheConfig,
     MonitoringConfig,
-    TimeoutConfig,
 )
 from cachekit.config.validation import ConfigurationError
 
@@ -51,7 +50,6 @@ class TestDecoratorConfigDefaults:
         config = DecoratorConfig()
         assert isinstance(config.l1, L1CacheConfig)
         assert isinstance(config.circuit_breaker, CircuitBreakerConfig)
-        assert isinstance(config.timeout, TimeoutConfig)
         assert isinstance(config.backpressure, BackpressureConfig)
         assert isinstance(config.monitoring, MonitoringConfig)
         assert isinstance(config.encryption, EncryptionConfig)
@@ -114,11 +112,6 @@ class TestDecoratorConfigValidation:
         """Test validation delegates to CircuitBreakerConfig."""
         with pytest.raises(ConfigurationError, match="failure_threshold must be >= 1, got 0"):
             DecoratorConfig(circuit_breaker=CircuitBreakerConfig(failure_threshold=0))
-
-    def test_validate_delegates_to_timeout_config(self) -> None:
-        """Test validation delegates to TimeoutConfig."""
-        with pytest.raises(ConfigurationError, match="min .* <= initial .* <= max"):
-            DecoratorConfig(timeout=TimeoutConfig(min=5.0, initial=1.0, max=10.0))
 
     def test_validate_delegates_to_backpressure_config(self) -> None:
         """Test validation delegates to BackpressureConfig."""
@@ -188,19 +181,6 @@ class TestDecoratorConfigToDict:
         assert d["half_open_requests"] == 2
         assert d["excluded_exceptions"] == (ValueError,)
 
-    def test_to_dict_flattens_timeout_config(self) -> None:
-        """Test to_dict() flattens TimeoutConfig."""
-        config = DecoratorConfig(
-            timeout=TimeoutConfig(enabled=True, initial=2.0, min=0.5, max=10.0, window_size=500, percentile=99.0)
-        )
-        d = config.to_dict()
-        assert d["adaptive_timeout"] is True
-        assert d["initial_timeout"] == 2.0
-        assert d["min_timeout"] == 0.5
-        assert d["max_timeout"] == 10.0
-        assert d["timeout_window_size"] == 500
-        assert d["timeout_percentile"] == 99.0
-
     def test_to_dict_flattens_backpressure_config(self) -> None:
         """Test to_dict() flattens BackpressureConfig."""
         config = DecoratorConfig(
@@ -253,7 +233,6 @@ class TestDecoratorConfigToDict:
             backend=None,
             l1=L1CacheConfig(enabled=True, max_size_mb=150),
             circuit_breaker=CircuitBreakerConfig(enabled=True, failure_threshold=3),
-            timeout=TimeoutConfig(enabled=True, initial=1.5),
             backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=75),
             monitoring=MonitoringConfig(collect_stats=True, enable_prometheus_metrics=False),
             encryption=EncryptionConfig(enabled=True, master_key="a" * 64, single_tenant_mode=True),
@@ -277,8 +256,6 @@ class TestDecoratorConfigToDict:
         assert d["l1_max_size_mb"] == 150
         assert d["circuit_breaker"] is True
         assert d["failure_threshold"] == 3
-        assert d["adaptive_timeout"] is True
-        assert d["initial_timeout"] == 1.5
         assert d["backpressure"] is True
         assert d["max_concurrent_requests"] == 75
         assert d["collect_stats"] is True

@@ -136,64 +136,6 @@ class CircuitBreakerConfig:
 
 
 @dataclass(frozen=True)
-class TimeoutConfig:
-    """Adaptive timeout configuration.
-
-    Adaptive timeout dynamically adjusts request timeouts based on observed
-    latency percentiles, preventing both premature timeouts and excessive waiting.
-
-    Attributes:
-        enabled: Enable adaptive timeout (default: True)
-        initial: Initial timeout in seconds (default: 1.0)
-        min: Minimum timeout in seconds (default: 0.1)
-        max: Maximum timeout in seconds (default: 5.0)
-        window_size: Number of requests in sliding window for percentile calculation (default: 1000)
-        percentile: Target percentile for timeout calculation (default: 95.0)
-
-    Examples:
-        Create with defaults:
-
-        >>> config = TimeoutConfig()
-        >>> config.initial
-        1.0
-        >>> config.min
-        0.1
-        >>> config.max
-        5.0
-
-        Custom timeout range:
-
-        >>> custom = TimeoutConfig(min=0.5, initial=2.0, max=10.0)
-        >>> custom.validate()  # No error = valid
-
-        Invalid range (initial must be between min and max):
-
-        >>> TimeoutConfig(min=1.0, initial=0.5, max=5.0).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        cachekit.config.validation.ConfigurationError: Timeout must satisfy: min (1.0) <= initial (0.5) <= max (5.0)
-    """
-
-    enabled: bool = True
-    initial: float = 1.0
-    min: float = 0.1
-    max: float = 5.0
-    window_size: int = 1000
-    percentile: float = 95.0
-
-    def validate(self) -> None:
-        """Validate adaptive timeout configuration.
-
-        Raises:
-            ConfigurationError: If timeout values are inconsistent
-        """
-        if not self.min <= self.initial <= self.max:
-            raise ConfigurationError(f"Timeout must satisfy: min ({self.min}) <= initial ({self.initial}) <= max ({self.max})")
-        if not 0.0 < self.percentile <= 100.0:
-            raise ConfigurationError(f"percentile must be 0.0-100.0, got {self.percentile}")
-
-
-@dataclass(frozen=True)
 class BackpressureConfig:
     """Backpressure configuration for overload protection.
 

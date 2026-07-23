@@ -302,7 +302,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  STEP 17: RECORD METRICS & RETURN                                           │
 │  File: src/cachekit/decorators/wrapper.py                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  • features.record_success() → Circuit breaker, adaptive timeout            │
+│  • features.record_success() → Circuit breaker                              │
 │  • features.record_cache_operation() → Prometheus metrics                   │
 │  • features.log_cache_operation() → Structured logging                      │
 │                                                                             │
@@ -353,15 +353,15 @@ def custom_function():
 
 ### Configuration Profiles
 
-| Profile | Circuit Breaker | Adaptive Timeout | L1 Cache | L2 Backend | Stats Collection | Use Case |
-|---------|----------------|------------------|----------|------------|------------------|----------|
-| **default** | ✓ | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
-| **minimal** | ✗ | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
-| **production** | ✓ | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
-| **secure** | ✓ | ✓ | ✗ | RedisBackend | ✓ | Encrypted sensitive data (L2-only) |
-| **dev** | ✗ | ✗ | ✓ | None | ✗ | Local development (no Redis) |
-| **test** | ✗ | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
-| **io** | ✓ | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
+| Profile | Circuit Breaker | L1 Cache | L2 Backend | Stats Collection | Use Case |
+|---------|----------------|----------|------------|------------------|----------|
+| **default** | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
+| **minimal** | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
+| **production** | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
+| **secure** | ✓ | ✗ | RedisBackend | ✓ | Encrypted sensitive data (L2-only) |
+| **dev** | ✗ | ✓ | None | ✗ | Local development (no Redis) |
+| **test** | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
+| **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
 
 ---
 
@@ -812,7 +812,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 **Connection Layer:**
 - `src/cachekit/connection.py` - Redis connection pooling (used by RedisBackend)
-- `src/cachekit/reliability/` - Circuit breaker, adaptive timeout
+- `src/cachekit/reliability/` - Circuit breaker
 
 ---
 

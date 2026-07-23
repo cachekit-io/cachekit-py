@@ -9,7 +9,6 @@ Supports pluggable backends: Redis (default), CachekitIO SaaS, File, and custom.
 Key Features:
 - **Intelligent @cache decorator** with auto-detection and intent-based optimization
 - **Circuit breaker protection** against cascading failures
-- **Adaptive timeout adjustment** based on historical backend latency patterns
 - **Backpressure control** to prevent backend overload
 - **Connection pooling** for optimized performance
 - **Health check methods** for comprehensive monitoring
