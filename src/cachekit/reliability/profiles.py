@@ -42,8 +42,6 @@ class ProfileConfig:
         >>> config = ProfileConfig()
         >>> config.circuit_breaker
         True
-        >>> config.adaptive_timeout
-        True
 
         Access health check settings:
 
@@ -53,7 +51,6 @@ class ProfileConfig:
 
     # Core reliability features
     circuit_breaker: bool = True
-    adaptive_timeout: bool = True
     backpressure: bool = True
 
     # Monitoring and observability
@@ -87,7 +84,6 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
     ReliabilityProfile.MINIMAL: ProfileConfig(
         # Core features - only circuit breaker enabled
         circuit_breaker=True,
-        adaptive_timeout=False,  # Disabled for maximum performance
         backpressure=False,  # Disabled for maximum performance
         # Minimal monitoring
         collect_stats=False,
@@ -107,7 +103,6 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
     ReliabilityProfile.BALANCED: ProfileConfig(
         # Core features enabled
         circuit_breaker=True,
-        adaptive_timeout=True,
         backpressure=True,
         # Async monitoring for performance
         collect_stats=True,
@@ -132,7 +127,6 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
     ReliabilityProfile.FULL: ProfileConfig(
         # All features enabled
         circuit_breaker=True,
-        adaptive_timeout=True,
         backpressure=True,
         # Full monitoring
         collect_stats=True,
@@ -168,8 +162,6 @@ def get_profile_config(profile: ReliabilityProfile) -> ProfileConfig:
 
     Examples:
         >>> config = get_profile_config(ReliabilityProfile.MINIMAL)
-        >>> config.adaptive_timeout
-        False
         >>> config.collect_stats
         False
 
@@ -198,7 +190,6 @@ def get_decorator_kwargs(profile: ReliabilityProfile, overrides: Optional[dict[s
     kwargs = {
         # Core reliability features
         "circuit_breaker": config.circuit_breaker,
-        "adaptive_timeout": config.adaptive_timeout,
         "backpressure": config.backpressure,
         "max_concurrent_requests": config.max_concurrent_requests,
         # Monitoring features
@@ -233,7 +224,6 @@ def create_optimized_decorator_config(profile: ReliabilityProfile = ReliabilityP
     decorator_config = {
         # Core reliability (already optimized)
         "circuit_breaker": config.circuit_breaker,
-        "adaptive_timeout": config.adaptive_timeout,
         "backpressure": config.backpressure,
         "max_concurrent_requests": config.max_concurrent_requests,
         # Use optimized monitoring

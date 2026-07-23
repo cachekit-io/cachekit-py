@@ -40,7 +40,6 @@ class TestReliabilityProfiles:
 
         # Core features
         assert config.circuit_breaker is True, "Circuit breaker should be enabled"
-        assert config.adaptive_timeout is False, "Adaptive timeout should be disabled for performance"
         assert config.backpressure is False, "Backpressure should be disabled for performance"
 
         # Monitoring
@@ -57,7 +56,6 @@ class TestReliabilityProfiles:
 
         # Core features - all enabled
         assert config.circuit_breaker is True
-        assert config.adaptive_timeout is True
         assert config.backpressure is True
 
         # Monitoring - async for performance
@@ -75,7 +73,6 @@ class TestReliabilityProfiles:
 
         # All features enabled
         assert config.circuit_breaker is True
-        assert config.adaptive_timeout is True
         assert config.backpressure is True
 
         # Full monitoring
@@ -93,11 +90,9 @@ class TestReliabilityProfiles:
         kwargs = get_decorator_kwargs(ReliabilityProfile.BALANCED)
 
         assert "circuit_breaker" in kwargs
-        assert "adaptive_timeout" in kwargs
         assert "backpressure" in kwargs
         assert "max_concurrent_requests" in kwargs
         assert kwargs["circuit_breaker"] is True
-        assert kwargs["adaptive_timeout"] is True
 
     def test_get_decorator_kwargs_with_overrides(self):
         """CRITICAL: get_decorator_kwargs applies overrides correctly."""
@@ -119,7 +114,6 @@ class TestReliabilityProfiles:
 
         # Should use balanced profile by default
         assert config["circuit_breaker"] is True
-        assert config["adaptive_timeout"] is True
         assert config["backpressure"] is True
 
         # Optimized components
@@ -132,7 +126,6 @@ class TestReliabilityProfiles:
         config = create_optimized_decorator_config(profile=ReliabilityProfile.MINIMAL)
 
         assert config["circuit_breaker"] is True
-        assert config["adaptive_timeout"] is False, "Minimal profile disables adaptive timeout"
         assert config["backpressure"] is False, "Minimal profile disables backpressure"
 
     def test_create_optimized_decorator_config_with_overrides(self):
@@ -196,7 +189,6 @@ class TestReliabilityProfiles:
         config = minimal_reliability_decorator()
 
         assert config["circuit_breaker"] is True
-        assert config["adaptive_timeout"] is False
         assert config["backpressure"] is False
 
     def test_convenience_functions_balanced(self):
@@ -204,7 +196,6 @@ class TestReliabilityProfiles:
         config = balanced_reliability_decorator()
 
         assert config["circuit_breaker"] is True
-        assert config["adaptive_timeout"] is True
         assert config["backpressure"] is True
 
     def test_convenience_functions_full(self):
@@ -212,7 +203,6 @@ class TestReliabilityProfiles:
         config = full_reliability_decorator()
 
         assert config["circuit_breaker"] is True
-        assert config["adaptive_timeout"] is True
         assert config["backpressure"] is True
         assert config["_health_check_level"] == HealthLevel.FULL.value
 

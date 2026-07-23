@@ -43,7 +43,7 @@ def custom_function():
 
 **Intent-Based Profiles:**
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
-- **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, adaptive timeout, backpressure, monitoring)
+- **`@cache.production`** - Safety profile: StandardSerializer, all enterprise features enabled (circuit breaker, backpressure, monitoring)
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
 - **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
 - **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
@@ -65,7 +65,7 @@ When you need explicit control over caching parameters, use `@cache()` with manu
 
 ```python
 from cachekit import cache
-from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, TimeoutConfig, BackpressureConfig, MonitoringConfig
+from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, BackpressureConfig, MonitoringConfig
 
 @cache(
     ttl=3600,
@@ -77,7 +77,6 @@ from cachekit.config.nested import L1CacheConfig, CircuitBreakerConfig, TimeoutC
     # Nested configuration groups (see sections below for details)
     l1=L1CacheConfig(enabled=True),
     circuit_breaker=CircuitBreakerConfig(enabled=True),
-    timeout=TimeoutConfig(enabled=True),
     backpressure=BackpressureConfig(max_concurrent_requests=100),
     monitoring=MonitoringConfig(collect_stats=True, enable_tracing=True),
 )
@@ -108,13 +107,6 @@ def your_function(args):
   - `recovery_timeout` (`int`, default: `30`) - Seconds before attempting recovery
   - `half_open_requests` (`int`, default: `3`) - Test requests allowed in half-open state
   - `excluded_exceptions` (`tuple[type[Exception], ...]`, default: `()`) - Exceptions that don't trigger circuit breaker
-- **`timeout`** (`TimeoutConfig`, default: `TimeoutConfig()`) - Adaptive timeout configuration:
-  - `enabled` (`bool`, default: `True`) - Enable adaptive timeout
-  - `initial` (`float`, default: `1.0`) - Initial timeout in seconds
-  - `min` (`float`, default: `0.1`) - Minimum timeout in seconds
-  - `max` (`float`, default: `5.0`) - Maximum timeout in seconds
-  - `window_size` (`int`, default: `1000`) - Sliding window size for percentile calculation
-  - `percentile` (`float`, default: `95.0`) - Target percentile for timeout calculation
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
@@ -167,7 +159,7 @@ def test_cacheable_function():
 **Manual Configuration (fully supported):**
 ```python
 from cachekit import cache
-from cachekit.config.nested import CircuitBreakerConfig, TimeoutConfig, BackpressureConfig, MonitoringConfig
+from cachekit.config.nested import CircuitBreakerConfig, BackpressureConfig, MonitoringConfig
 
 @cache(ttl=1800, namespace="analytics", backend=None)
 def explicit_function(dataset_id, filters=None):
@@ -179,7 +171,6 @@ def explicit_function(dataset_id, filters=None):
     namespace="critical_data",
     backend=None,
     circuit_breaker=CircuitBreakerConfig(enabled=True),
-    timeout=TimeoutConfig(enabled=True),
     backpressure=BackpressureConfig(enabled=True),
     monitoring=MonitoringConfig(collect_stats=True, enable_structured_logging=True)
 )
@@ -193,7 +184,7 @@ def critical_business_logic():
 
 > *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
 
-**Profile for zero-infrastructure caching** via the cachekit.io edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, adaptive timeout, L1 in-memory cache).
+**Profile for zero-infrastructure caching** via the cachekit.io edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, L1 in-memory cache).
 
 #### Environment Variables
 
@@ -230,7 +221,7 @@ def get_exchange_rates():
 
 #### Notes
 
-- Inherits all production-grade reliability features: circuit breaker, adaptive timeout, backpressure, full monitoring
+- Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
@@ -242,7 +233,7 @@ All functions decorated with `@cache` automatically include health check methods
 
 #### `get_health_status()`
 
-Returns current health status including circuit breaker state, backpressure metrics, and adaptive timeout information.
+Returns current health status including circuit breaker state and backpressure metrics.
 
 ```python
 @cache(ttl=300, namespace="api")
@@ -256,7 +247,6 @@ print(health_status)
 #     "namespace": "api",
 #     "features_enabled": {
 #         "circuit_breaker": True,
-#         "adaptive_timeout": True,
 #         "backpressure": True,
 #         "statistics": True,
 #         "structured_logging": True
@@ -272,11 +262,6 @@ print(health_status)
 #         "max_concurrent": 100,
 #         "current_requests": 2,
 #         "rejected_requests": 0
-#     },
-#     "adaptive_timeout": {
-#         "current_timeout": 1.2,
-#         "base_timeout": 1.0,
-#         "average_duration": 0.85
 #     }
 # }
 ```
@@ -318,13 +303,12 @@ from cachekit.decorators.orchestrator import FeatureOrchestrator
 orchestrator = FeatureOrchestrator(
     namespace="api_service",
     circuit_breaker_enabled=True,
-    adaptive_timeout_enabled=True,
     collect_stats=True
 )
 ```
 
 **Key Components:**
-- **FeatureOrchestrator**: Manages reliability features (circuit breaker, adaptive timeout, backpressure, statistics, logging)
+- **FeatureOrchestrator**: Manages reliability features (circuit breaker, backpressure, statistics, logging)
 - **Thread-Local Client Caching**: `get_cached_redis_client()` in `cachekit.backends.redis.client` provides thread-local Redis client reuse for performance
 - **Configuration Caching**: LRU cached configuration objects to eliminate overhead
 
@@ -340,13 +324,6 @@ Non-blocking metrics collection system that prevents performance degradation:
 - Background thread processing
 - Self-healing worker thread management
 - Zero impact on critical path latency
-
-#### `AdaptiveTimeoutManager`
-Dynamic timeout calculation for Redis operations:
-- Tracks P95 latency over sliding window (default: 1000 operations)
-- Adjusts timeouts between min/max bounds (0.1s - 10s)
-- Separate tracking for lock operations vs. data operations
-- Provides detailed statistics via `get_stats()` method
 
 #### `RedisErrorClassifier`
 Intelligent error categorization for circuit breaker decisions:
@@ -913,7 +890,6 @@ def get_reference_data(): ...
 **Previous**: [Getting Started Guide](getting-started.md) - Learn the fundamentals
 **Next Feature Deep Dives**:
 - [Circuit Breaker](features/circuit-breaker.md) - Failure protection
-- [Adaptive Timeouts](features/adaptive-timeouts.md) - Smart timeout management
 - [Distributed Locking](features/distributed-locking.md) - Multi-pod safety
 
 ## See Also

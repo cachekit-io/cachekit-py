@@ -152,7 +152,7 @@ from cachekit import cache
 
 os.environ["CACHEKIT_API_KEY"] = "ck_live_your_key_here"
 
-# All production-grade features enabled: L1, circuit breaker, adaptive timeout, monitoring
+# All production-grade features enabled: L1, circuit breaker, monitoring
 @cache.io(ttl=300)
 def fetch_data(user_id: int):
     return expensive_api_call(user_id)

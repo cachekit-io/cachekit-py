@@ -1,7 +1,7 @@
 """Metrics collection for reliability monitoring.
 
 This module provides lightweight metrics collection for circuit breakers,
-adaptive timeouts, and other reliability features.
+backpressure, and other reliability features.
 """
 
 import logging
@@ -102,7 +102,6 @@ class MetricsCollector:
 cache_operations = MetricsCollector("cache_operations_total")
 cache_latency = MetricsCollector("cache_operation_duration_seconds")  # Added for test compatibility
 circuit_breaker_state = MetricsCollector("circuit_breaker_state")
-adaptive_timeout_adjustments = MetricsCollector("adaptive_timeout_adjustments")
 connection_pool_usage = MetricsCollector("connection_pool_usage")
 
 

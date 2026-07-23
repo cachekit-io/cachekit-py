@@ -332,27 +332,6 @@ class TestFeatureToggleBehavior:
         # Just verify the structure exists
         assert "components" in health_status
 
-    def test_adaptive_timeout_enabled_vs_disabled(self, redis_test_client):
-        """Test adaptive timeout when enabled vs disabled."""
-
-        # Test with adaptive timeout enabled (production preset)
-        @cache.production(ttl=300)
-        def function_with_at(x):
-            return f"at_result_{x}"
-
-        health_status = function_with_at.get_health_status()
-        # Adaptive timeout may not show in components when enabled
-        assert "components" in health_status
-
-        # Test with adaptive timeout disabled (minimal preset)
-        @cache.minimal(ttl=300)
-        def function_without_at(x):
-            return f"no_at_result_{x}"
-
-        health_status = function_without_at.get_health_status()
-        # Adaptive timeout disabled
-        assert "components" in health_status
-
     def test_structured_logging_enabled_vs_disabled(self, redis_test_client):
         """Test structured logging when enabled vs disabled."""
 

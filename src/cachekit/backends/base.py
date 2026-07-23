@@ -289,8 +289,8 @@ class TimeoutConfigurableBackend(Protocol):
     """Optional protocol for per-operation timeout configuration.
 
     Backends implementing this protocol allow fine-grained timeout control
-    per operation. This enables features like adaptive timeouts that adjust
-    based on operation latency.
+    per operation, so a caller can set an explicit timeout for a single
+    operation where the backend supports it.
 
     All backends support some timeout mechanism, but granularity varies:
     - Per-operation: HTTP, DynamoDB, PostgreSQL

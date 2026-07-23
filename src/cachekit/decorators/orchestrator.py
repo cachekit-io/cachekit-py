@@ -8,7 +8,6 @@ from ..monitoring.pool_monitor import OptimizedPoolMonitor
 
 # Import EXISTING modules - no duplication
 from ..reliability import (
-    AdaptiveTimeout,
     AsyncMetricsCollector,
     BackpressureController,
     CircuitBreaker,
@@ -29,7 +28,6 @@ class FeatureOrchestrator:
         >>> orch = FeatureOrchestrator(
         ...     namespace="test",
         ...     circuit_breaker_enabled=False,
-        ...     adaptive_timeout_enabled=False,
         ...     backpressure_enabled=False,
         ... )
         >>> orch.namespace
@@ -60,24 +58,20 @@ class FeatureOrchestrator:
         self,
         namespace: str,
         circuit_breaker_enabled: bool = True,
-        adaptive_timeout_enabled: bool = True,
         backpressure_enabled: bool = True,
         collect_stats: bool = True,
         enable_structured_logging: bool = True,
         circuit_breaker_config: Optional[dict[str, Any]] = None,
-        adaptive_timeout_config: Optional[dict[str, Any]] = None,
         backpressure_config: Optional[dict[str, Any]] = None,
     ):
         self.namespace = namespace
         self._circuit_breaker_enabled = circuit_breaker_enabled
-        self._adaptive_timeout_enabled = adaptive_timeout_enabled
         self._backpressure_enabled = backpressure_enabled
         self._collect_stats = collect_stats
         self._enable_structured_logging = enable_structured_logging
 
         # Initialize EXISTING modules
         self._circuit_breaker = None
-        self._adaptive_timeout = None
         self._load_control = None
         self._metrics_collector = None
         self._correlation_tracker = None
@@ -99,9 +93,6 @@ class FeatureOrchestrator:
                 # Already a CircuitBreakerConfig object
                 self._circuit_breaker = CircuitBreaker(config=circuit_breaker_config, namespace=namespace)
 
-        if adaptive_timeout_enabled:
-            self._adaptive_timeout = AdaptiveTimeout(**(adaptive_timeout_config or {}))
-
         if backpressure_enabled:
             self._load_control = BackpressureController(**(backpressure_config or {}))
 
@@ -118,11 +109,6 @@ class FeatureOrchestrator:
     def circuit_breaker(self) -> Optional[CircuitBreaker]:
         """Get circuit breaker if enabled."""
         return self._circuit_breaker
-
-    @property
-    def adaptive_timeout(self) -> Optional[AdaptiveTimeout]:
-        """Get adaptive timeout if enabled."""
-        return self._adaptive_timeout
 
     @property
     def load_control(self) -> Optional[BackpressureController]:
@@ -169,15 +155,6 @@ class FeatureOrchestrator:
         # BackpressureController uses context manager (acquire), not can_accept_request
         # For now, always return True and let acquire handle backpressure
         return True
-
-    def get_timeout(self, operation_type: str = "default") -> float:
-        """Get current timeout for operation type."""
-        # Guard clause: No adaptive timeout means use default
-        if not self._adaptive_timeout:
-            return 5.0  # Default timeout
-
-        # AdaptiveTimeout.get_timeout() doesn't take arguments
-        return self._adaptive_timeout.get_timeout()
 
     def start_request(self) -> Optional[str]:
         """Start request tracking."""
@@ -397,26 +374,6 @@ class FeatureOrchestrator:
                 serializer=serializer,
                 size_bytes=size_bytes,
                 hit=hit,
-            )
-
-    def record_duration(self, duration: float):
-        """Record operation duration."""
-        # AdaptiveTimeout doesn't have record_success method, just skip for now
-        pass
-
-    def get_adaptive_lock_timeouts(self):
-        """Get adaptive lock timeouts if available."""
-        return None  # Return None to use defaults
-
-    def record_lock_operation(self, duration: float, success: bool):
-        """Record lock operation performance."""
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation="lock",
-                namespace=self.namespace,
-                serializer="rust",
-                success=success,
-                duration_ms=duration * 1000,
             )
 
     def check_health(self) -> dict[str, Any]:
