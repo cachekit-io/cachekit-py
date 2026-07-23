@@ -14,7 +14,7 @@ import pytest
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.validation import ConfigurationError
 from cachekit.serializers.base import SerializationError
-from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
 from cachekit.serializers.orjson_serializer import OrjsonSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -321,6 +321,63 @@ class TestEncryptionDowngradeFailClosed:
             assert handler.deserialize_data(blob, cache_key="plain:key") == data
         finally:
             reset_settings()
+
+
+class TestEncryptionWrapperSelfGuard:
+    """LAB-271 (defense-in-depth behind LAB-241): EncryptionWrapper.deserialize must
+    fail closed on its own, independent of the handler-level downgrade guard.
+
+    The handler guard (TestEncryptionDowngradeFailClosed above) is the reachable
+    attack surface; these tests bypass it and drive the wrapper directly, so a
+    future refactor that calls the wrapper from a new path cannot silently
+    reintroduce the plaintext downgrade.
+    """
+
+    @pytest.fixture
+    def wrapper(self):
+        return EncryptionWrapper(master_key=b"k" * 32, tenant_id="tenant-a")
+
+    def test_plaintext_claiming_metadata_fails_closed(self, wrapper):
+        """Forged `encrypted: false` metadata driven straight at the wrapper MUST raise.
+
+        The wrapper is encryption-mandatory: the old passthrough to the base
+        serializer was the exact downgrade LAB-241 closed one layer up.
+        """
+        attacker_bytes, plain_meta = StandardSerializer().serialize({"attacker": "controlled"})
+        assert plain_meta.encrypted is False
+
+        class UnreachableSerializer:
+            """Fails the test if the wrapper ever routes to plaintext deserialize."""
+
+            def deserialize(self, data, metadata=None):
+                pytest.fail("EncryptionWrapper routed plaintext-claiming input to the base serializer")
+
+        wrapper.serializer = UnreachableSerializer()
+
+        with pytest.raises(DecryptionAuthenticationError, match="claiming plaintext"):
+            wrapper.deserialize(attacker_bytes, plain_meta, cache_key="victim:key")
+
+    def test_non_authenticating_ciphertext_fails_closed(self, wrapper):
+        """Tampered ciphertext with honest `encrypted: true` metadata fails AES-GCM auth."""
+        encrypted, metadata = wrapper.serialize({"secret": 1}, cache_key="victim:key")
+        tampered = bytes(encrypted[:-1]) + bytes([encrypted[-1] ^ 0x01])
+
+        with pytest.raises(DecryptionAuthenticationError, match="Decryption failed"):
+            wrapper.deserialize(tampered, metadata, cache_key="victim:key")
+
+    def test_wrong_tenant_fails_closed(self, wrapper):
+        """Ciphertext for another tenant is refused before any decrypt attempt."""
+        encrypted, metadata = wrapper.serialize({"secret": 1}, cache_key="victim:key")
+        other = EncryptionWrapper(master_key=b"k" * 32, tenant_id="tenant-b")
+
+        with pytest.raises(DecryptionAuthenticationError, match="Tenant mismatch"):
+            other.deserialize(encrypted, metadata, cache_key="victim:key")
+
+    def test_legitimate_encrypted_roundtrip_unaffected(self, wrapper):
+        """Regression guard: the honest encrypted round-trip still works."""
+        data = {"user": "alice", "n": 7}
+        encrypted, metadata = wrapper.serialize(data, cache_key="user:alice")
+        assert wrapper.deserialize(encrypted, metadata, cache_key="user:alice") == data
 
 
 class TestEncryptedRoundTrip:
