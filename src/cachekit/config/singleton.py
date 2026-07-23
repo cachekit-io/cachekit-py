@@ -35,8 +35,8 @@ def get_settings() -> CachekitConfig:
         >>> settings = get_settings()
         >>> settings.default_ttl
         3600
-        >>> settings.enable_compression
-        True
+        >>> settings.l1_max_size_mb
+        100
 
     Note:
         This function is thread-safe and uses double-checked locking for performance.

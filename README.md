@@ -358,8 +358,9 @@ exposition setup.
 <summary><strong>Thread Safety Details</strong></summary>
 
 **Per-Function Statistics:**
-- Statistics tracked per decorated function (shared across all calls)
+- Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
 - Thread-safe via RLock (all methods safe for concurrent access)
+- Fork-safe: a forked child starts with zeroed counters and its own session ID
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -426,8 +427,8 @@ CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)
 
 # Optional Configuration
 CACHEKIT_DEFAULT_TTL=3600
-CACHEKIT_MAX_CHUNK_SIZE_MB=100
-CACHEKIT_ENABLE_COMPRESSION=true
+CACHEKIT_MAX_VALUE_SIZE=104857600
+CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!NOTE]

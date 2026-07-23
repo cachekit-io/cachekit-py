@@ -20,7 +20,7 @@ Serializer (MessagePack / Arrow / Orjson — your choice)
     ↓  [Rust ByteStorage takes over here]
 LZ4 compression  (fast, ~500MB/s)
     ↓
-Blake3 integrity hash  (~GB/s, detects corruption)
+xxHash3-64 integrity hash  (~GB/s, detects corruption)
     ↓
 [Optional] AES-256-GCM encryption  (if @cache.secure)
     ↓
@@ -38,7 +38,7 @@ The Rust layer is transparent — you configure serializers and encryption at th
 | Operation | Python | Rust (ByteStorage) |
 |-----------|--------|---------------------|
 | LZ4 compression | ~50-100 MB/s | ~500 MB/s |
-| Blake3 hashing | ~500 MB/s | ~15 GB/s |
+| xxHash3-64 hashing | ~35 GB/s (`xxhash` C ext) | ~35 GB/s |
 | AES-256-GCM | ~200 MB/s | ~1-4 GB/s (AES-NI) |
 
 For most workloads the bottleneck is Redis RTT (~2-50ms), not serialization. The Rust layer matters for large payloads (DataFrames, bulk data) where serialization time approaches network time.
@@ -57,19 +57,51 @@ LZ4 is chosen for its speed/ratio balance:
 | Already-compressed data | ~1x (negligible overhead) |
 | Random bytes | ~1x |
 
-Compression runs automatically. It can be toggled via the `CACHEKIT_ENABLE_COMPRESSION` environment variable.
+ByteStorage LZ4 compression of serialized envelopes (MessagePack, orjson) runs automatically and is not configurable. Arrow (DataFrame) payloads use a separate Arrow IPC codec, selectable via the `CACHEKIT_ARROW_COMPRESSION` environment variable (`zstd`, `lz4`, or `none`) — that setting applies only to Arrow payloads and does not disable ByteStorage LZ4 for other serializers.
 
 ---
 
-## Blake3 Integrity
+## xxHash3-64 Integrity
 
-Every value stored includes a Blake3 hash. On retrieval:
+Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On retrieval:
 
-1. Hash of retrieved bytes is computed
-2. Stored hash is compared
+1. Checksum of retrieved bytes is computed
+2. Stored checksum is compared
 3. Mismatch → `BackendError` (corrupted data, never returned to caller)
 
 This protects against Redis memory corruption, storage bugs, and bit rot.
+
+> **Non-cryptographic — corruption detection only.** xxHash3-64 is not a cryptographic
+> hash and the comparison is a plain equality check: an attacker with backend write
+> access can forge a valid checksum for arbitrary bytes in microseconds. On the
+> plaintext `@cache` path the stored bytes are therefore attacker-forgeable.
+> Tamper-resistance comes from AES-256-GCM (`@cache.secure` / `CACHEKIT_MASTER_KEY`),
+> never from this checksum. See
+> [zero-knowledge-encryption.md](zero-knowledge-encryption.md#corruption-vs-tamper-telemetry-and-fail-closed-mode)
+> for the corruption-vs-tamper telemetry split.
+
+### Standalone checksum API
+
+> **Available since v0.12.0.** On earlier releases,
+> `from cachekit._rust_serializer import checksum` raises `ImportError`.
+
+The same primitive is exposed directly — decoupled from LZ4 compression — for
+serializers where compression is ineffective (Arrow IPC, compact JSON):
+
+```python
+from cachekit._rust_serializer import checksum, verify_checksum
+
+digest = checksum(b"payload")  # 8 bytes, big-endian
+assert len(digest) == 8
+assert verify_checksum(b"payload", digest) is True
+assert verify_checksum(b"tampered", digest) is False
+```
+
+`verify_checksum` raises `ValueError` unless the expected checksum is exactly
+8 bytes. Both functions accept any buffer-protocol object (`bytes`, `bytearray`,
+`memoryview`), so a serializer holding its payload as a `memoryview` can hash it
+without a `bytes` copy. The output is byte-identical to the checksum embedded in
+every ByteStorage envelope and to `xxhash.xxh3_64_digest` from the `xxhash` package.
 
 ---
 
@@ -99,7 +131,7 @@ The Rust ByteStorage layer is orthogonal to the serializer. Mix and match:
 | Typed models | [Pydantic](../serializers/pydantic.md) | Optional |
 | Custom types | [Custom](../serializers/custom.md) | Optional |
 
-All serializers pass through the same ByteStorage pipeline (LZ4 + Blake3 + optional AES-256-GCM).
+All serializers pass through the same ByteStorage pipeline (LZ4 + xxHash3-64 + optional AES-256-GCM).
 
 ---
 

@@ -7,7 +7,7 @@ The default L2 backend. Connects to Redis via environment variable or explicit c
 ## Basic Usage
 
 ```python notest
-# notest: RedisBackend() requires DI container setup not available in doc tests
+# notest: calling the cached function requires a running Redis
 from cachekit.backends import RedisBackend
 from cachekit import cache
 
@@ -39,17 +39,22 @@ from cachekit.backends.redis.config import RedisBackendConfig
 config = RedisBackendConfig(
     redis_url="redis://prod.example.com:6379",
     connection_pool_size=25,
-    socket_keepalive=True,
+    socket_timeout=5.0,
+    socket_connect_timeout=5.0,
     disable_hiredis=False,
 )
 
 backend = RedisBackend(config)
 ```
 
+An explicit `redis_url` (or config) gets its own per-instance connection pool bound to that URL — it is never overridden by `CACHEKIT_REDIS_URL`/`REDIS_URL` from the environment.
+
 | Field | Default | Description |
 |-------|---------|-------------|
 | `redis_url` | `redis://localhost:6379` | Redis connection URL |
 | `connection_pool_size` | `10` | Maximum connections in the pool |
+| `socket_timeout` | `5.0` | Socket read/write timeout in seconds (env: `CACHEKIT_SOCKET_TIMEOUT`) |
+| `socket_connect_timeout` | `5.0` | Socket connect timeout in seconds (env: `CACHEKIT_SOCKET_CONNECT_TIMEOUT`) |
 | `socket_keepalive` | `True` | Enable TCP keepalive for connections |
 | `disable_hiredis` | `False` | Use pure Python parser instead of hiredis |
 

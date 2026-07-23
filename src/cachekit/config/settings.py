@@ -31,15 +31,12 @@ class CachekitConfig(BaseSettings):
     """Backend-agnostic cache configuration.
 
     This configuration class provides validation for generic cache parameters
-    including chunking, compression, TTL limits, and monitoring.
+    including TTL limits, size limits, and monitoring.
 
     Backend-specific configuration (connection URLs, pool sizes, etc.) is
     handled by backend-specific config classes.
 
     Attributes:
-        max_chunk_size_mb: Maximum size of each cached chunk in megabytes
-        enable_compression: Whether to compress data before storing
-        compression_level: Zlib compression level (1-9)
         retry_on_timeout: Whether to retry operations on timeout
         max_retries: Maximum number of retry attempts
         retry_delay_ms: Delay between retries in milliseconds
@@ -62,10 +59,10 @@ class CachekitConfig(BaseSettings):
         >>> config = CachekitConfig()
         >>> config.default_ttl
         3600
-        >>> config.enable_compression
-        True
-        >>> config.max_chunk_size_mb
-        50
+        >>> config.l1_max_size_mb
+        100
+        >>> config.max_value_size
+        104857600
 
         Override via constructor:
 
@@ -101,21 +98,6 @@ class CachekitConfig(BaseSettings):
     )
 
     # Generic cache configuration (backend-agnostic)
-    max_chunk_size_mb: int = Field(
-        default=50,
-        gt=0,
-        description="Maximum size of each cached chunk in megabytes",
-    )
-    enable_compression: bool = Field(
-        default=True,
-        description="Whether to compress data before storing",
-    )
-    compression_level: int = Field(
-        default=6,
-        ge=1,
-        le=9,
-        description="Zlib compression level (1-9, where 9 is highest compression)",
-    )
     arrow_compression: Literal["zstd", "lz4", "none"] = Field(
         default="zstd",
         description=(
@@ -238,6 +220,15 @@ class CachekitConfig(BaseSettings):
         default=None,
         description="Master encryption key (hex-encoded, minimum 32 bytes for AES-256)",
     )
+    encryption_fail_closed: bool = Field(
+        default=False,
+        description=(
+            "Fail closed on decrypt authentication failures (env: CACHEKIT_ENCRYPTION_FAIL_CLOSED). "
+            "When True, AES-GCM authentication failures and key-fingerprint mismatches raise "
+            "DecryptionAuthenticationError to the caller instead of silently recomputing. "
+            "Per-decorator EncryptionConfig(fail_closed=...) overrides this fleet-wide default."
+        ),
+    )
 
     # Backend provider configuration (for testing)
     backend_provider_class: Optional[str] = Field(
@@ -259,11 +250,6 @@ class CachekitConfig(BaseSettings):
         if not self.retry_on_timeout and self.max_retries > 0:
             # This is potentially inconsistent but not necessarily wrong
             # We'll allow it but could log a warning in the future
-            pass
-
-        # Check compression settings
-        if not self.enable_compression and self.compression_level != 6:
-            # This is allowed but might be worth noting
             pass
 
         # Check TTL bounds
@@ -341,7 +327,7 @@ class CachekitConfig(BaseSettings):
             .. code-block:: bash
 
                 export CACHEKIT_DEFAULT_TTL=7200
-                export CACHEKIT_MAX_CHUNK_SIZE_MB=100
+                export CACHEKIT_L1_MAX_SIZE_MB=200
 
             .. code-block:: python
 

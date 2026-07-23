@@ -76,12 +76,16 @@ CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
 # Cache Behavior
 CACHEKIT_DEFAULT_TTL=3600
-CACHEKIT_MAX_CHUNK_SIZE_MB=50
-CACHEKIT_ENABLE_COMPRESSION=true
-CACHEKIT_COMPRESSION_LEVEL=6
+CACHEKIT_MAX_VALUE_SIZE=104857600
+CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption (for @cache.secure)
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
+# Fail closed on decrypt authentication failures (default: false = fail open/recompute).
+# When true, AES-GCM auth failures and key-fingerprint mismatches raise
+# DecryptionAuthenticationError to the caller instead of silently recomputing.
+# Per-decorator fail_closed=True/False overrides this fleet-wide default.
+CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
 
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
@@ -156,6 +160,33 @@ def fetch_data(user_id: int):
 
 `@cache.io()` automatically creates a `CachekitIOBackend` from environment variables. It applies production-grade defaults (see the [intent preset table](#intent-presets) below).
 
+### Stale-While-Revalidate (`stale_ttl`)
+
+`@cache.io` supports past-TTL stale-while-revalidate ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#stale-while-revalidate)): for a `stale_ttl`-second window after the fresh TTL lapses, the backend keeps serving the old value (flagged stale) and the SDK re-runs your function **in the background** — no request ever blocks on the recompute at a TTL boundary.
+
+```python notest
+from cachekit import cache
+
+# Default: @cache.io enables SWR with stale_ttl = ttl.
+@cache.io(ttl=300)
+def build_index():
+    return expensive_scan()
+
+# Size the window explicitly, or pass stale_ttl=0 to opt out.
+@cache.io(ttl=300, stale_ttl=900)
+def report():
+    return expensive_report()
+```
+
+Rules and behavior:
+
+- Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
+- **CachekitIO only** — other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set.
+- Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
+- A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
+- The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
+- Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
+
 ### File Backend Environment Variables
 
 ```bash
@@ -228,7 +259,7 @@ def my_function():
 | `enabled` | bool | `True` | Enable L1 in-memory cache |
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) |
-| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL (0.1-1.0) |
+| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
 | `invalidation_enabled` | bool | `True` | Enable invalidation event broadcasts |
 | `namespace_index` | bool | `True` | Enable fast namespace-based invalidation |
 
@@ -236,6 +267,40 @@ def my_function():
 - **Freshness**: When to serve stale data + trigger background refresh (SWR)
 - **Expiry**: Hard deadline when entry is deleted from cache
 - **Namespace**: Logical grouping for bulk invalidation (see [L1 Invalidation Guide](features/l1-invalidation.md))
+
+### L1-Only Mode (`backend=None`)
+
+With `backend=None` the decorator caches raw Python objects in process memory (no
+serialization — tuples, sets, and frozensets keep their types). `L1CacheConfig` is
+honored as follows:
+
+- **`max_size_mb`** bounds the cache by *estimated bytes*, not entry count. Sizes of
+  raw objects are estimated best-effort (builtin containers are walked recursively;
+  other objects are counted via `sys.getsizeof`). A single value larger than the whole
+  budget is returned to the caller but never cached.
+- **SWR requires a `ttl`.** With `swr_enabled=True` and a `ttl` set, a cache hit past
+  `ttl * swr_threshold_ratio` (±10% jitter) serves the cached value immediately and
+  refreshes it in the background — via `asyncio.create_task` for `async def` functions,
+  or a daemon thread for sync functions. A successful refresh restarts both the
+  freshness clock and the TTL. With `ttl=None` entries never go stale, so no refresh
+  is ever scheduled — they are stored with a one-year (31,536,000&nbsp;s) sentinel
+  expiry rather than truly indefinitely, and can still be evicted earlier under
+  byte pressure.
+- **Refresh failures are non-fatal**: the stale value keeps being served until hard
+  expiry, and the next qualifying hit retries the refresh.
+
+```python notest
+import asyncio
+from cachekit import cache
+from cachekit.config import L1CacheConfig
+
+@cache(ttl=60, backend=None, l1=L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5))
+async def load_dashboard():
+    return await fetch_expensive_data()  # illustrative - not defined
+
+# After ~30s (50% of TTL, ±10% jitter), the next call returns the cached value
+# instantly and schedules a background refresh — callers never block on revalidation.
+```
 
 ### Intent Presets
 
@@ -285,7 +350,7 @@ def secure_function():
 | `dev()` | ✓ | ❌ | ❌ | 100 MB | Verbose logs, no Prometheus |
 | `production()` | ✓ | ✓ | ✓ | 100 MB | Full observability |
 | `secure()` | ✓ | ✓ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)) |
+| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 ---
 
@@ -347,7 +412,7 @@ For production with Redis:
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
 export CACHEKIT_CONNECTION_POOL_SIZE=20
 export CACHEKIT_DEFAULT_TTL=3600
-export CACHEKIT_ENABLE_COMPRESSION=true
+export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 ### Secure Production (Encryption Enabled)
@@ -357,7 +422,7 @@ For production with sensitive data:
 ```bash
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-export CACHEKIT_ENABLE_COMPRESSION=true
+export CACHEKIT_ARROW_COMPRESSION=zstd
 export LOG_LEVEL=WARNING
 ```
 
@@ -504,30 +569,27 @@ export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
 
 ## Performance Configuration
 
-### Memory Usage
+### Value Size Limit
 
 ```bash
-# Limit cache chunk size (affects L2 large value handling)
-export CACHEKIT_MAX_CHUNK_SIZE_MB=50  # Default is 50MB
+# Reject values whose serialized envelope exceeds this many bytes (L2 ceiling)
+export CACHEKIT_MAX_VALUE_SIZE=104857600  # Default is 100MB
 
-# Reduce for memory-constrained environments
-export CACHEKIT_MAX_CHUNK_SIZE_MB=10
+# Tighten for memory-constrained environments
+export CACHEKIT_MAX_VALUE_SIZE=10485760   # 10MB
 ```
 
 ### Compression
 
-Enable compression for large values:
+Arrow payloads are compressed automatically. Select the codec:
 
 ```bash
-# Enable compression (recommended for >1KB values)
-export CACHEKIT_ENABLE_COMPRESSION=true
-
-# Compression level (1-9, higher = more compression)
-export CACHEKIT_COMPRESSION_LEVEL=6  # Default
+# zstd (default), lz4, or none
+export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression has 100-500μs overhead but saves network bandwidth for large values (>1KB).
+> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads.
 
 ### Connection Pooling
 

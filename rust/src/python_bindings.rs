@@ -4,6 +4,7 @@
 //! All business logic is delegated to cachekit-core.
 
 use cachekit_core::ByteStorage;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -38,9 +39,11 @@ impl PyByteStorage {
     /// Returns:
     ///     Bytes: Serialized StorageEnvelope
     pub fn store(&self, py: Python, data: &[u8], format: Option<String>) -> PyResult<Py<PyBytes>> {
-        let envelope_bytes = self
-            .inner
-            .store(data, format)
+        // Detach from the GIL: LZ4 + xxh3 on a large payload otherwise blocks every
+        // Python thread for the full compression duration (cachekit-core#45).
+        // Sound: `data` borrows an immutable `bytes` buffer kept alive by this call.
+        let envelope_bytes = py
+            .detach(|| self.inner.store(data, format))
             .map_err(|e| PyValueError::new_err(format!("Storage failed: {}", e)))?;
 
         Ok(PyBytes::new(py, &envelope_bytes).into())
@@ -53,22 +56,23 @@ impl PyByteStorage {
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
-    pub fn retrieve(&self, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
-        self.inner
-            .retrieve(envelope_bytes)
+    pub fn retrieve(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
+        // Detach from the GIL for decompression + checksum (see store()).
+        py.detach(|| self.inner.retrieve(envelope_bytes))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
     }
 
     /// Get compression ratio for given data
-    pub fn estimate_compression(&self, data: &[u8]) -> PyResult<f64> {
-        self.inner
-            .estimate_compression(data)
+    pub fn estimate_compression(&self, py: Python, data: &[u8]) -> PyResult<f64> {
+        // Full-payload LZ4 pass — same GIL-blocking profile as store().
+        py.detach(|| self.inner.estimate_compression(data))
             .map_err(|e| PyValueError::new_err(format!("Compression estimation failed: {}", e)))
     }
 
     /// Validate envelope without extracting data
-    pub fn validate(&self, envelope_bytes: &[u8]) -> PyResult<bool> {
-        Ok(self.inner.validate(envelope_bytes))
+    pub fn validate(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<bool> {
+        // Full decompression + checksum under the hood — same GIL-blocking profile.
+        Ok(py.detach(|| self.inner.validate(envelope_bytes)))
     }
 
     /// Get security limits for clients
@@ -338,6 +342,47 @@ pub fn derive_tenant_keys_py(master_key: &[u8], tenant_id: &str) -> PyResult<PyT
 #[pyo3(name = "key_fingerprint")]
 pub fn key_fingerprint_py(key: &[u8]) -> Vec<u8> {
     key_fingerprint(key).to_vec()
+}
+
+/// Compute the standalone xxHash3-64 checksum of `data` (8 bytes, big-endian).
+///
+/// Accepts any buffer-protocol object — `bytes`, `bytearray`, `memoryview`,
+/// Arrow buffers — so a serializer holding its payload as a `memoryview`
+/// (e.g. Arrow IPC) can hash it directly, without forcing a `bytes` copy.
+///
+/// NON-cryptographic: detects corruption, not tampering. For tamper-resistance
+/// use @cache.secure (AES-256-GCM), never this checksum. Produces the exact
+/// bytes embedded in every StorageEnvelope, without the LZ4 compression
+/// overhead — for serializers where compression is ineffective (Arrow IPC, JSON).
+#[pyfunction]
+#[pyo3(name = "checksum")]
+pub fn checksum_py(py: Python, data: PyBuffer<u8>) -> PyResult<Py<PyBytes>> {
+    let data = data.to_vec(py)?;
+    Ok(PyBytes::new(py, &cachekit_core::checksum(&data)).into())
+}
+
+/// Verify `data` against an expected 8-byte xxHash3-64 checksum.
+///
+/// Both arguments accept any buffer-protocol object (`bytes`, `bytearray`,
+/// `memoryview`, …) — the Arrow verify path slices a `memoryview` (`mv[8:]`),
+/// so a bytes-only signature would break the moment a serializer moves onto
+/// this FFI.
+///
+/// NON-cryptographic: detects corruption, not tampering (see `checksum`).
+/// Raises ValueError if `expected` is not exactly 8 bytes — a truncated
+/// checksum must fail loudly, never return a wrong verdict.
+#[pyfunction]
+#[pyo3(name = "verify_checksum")]
+pub fn verify_checksum_py(
+    py: Python,
+    data: PyBuffer<u8>,
+    expected: PyBuffer<u8>,
+) -> PyResult<bool> {
+    let expected: [u8; 8] = expected.to_vec(py)?.try_into().map_err(|v: Vec<u8>| {
+        PyValueError::new_err(format!("expected must be exactly 8 bytes, got {}", v.len()))
+    })?;
+    let data = data.to_vec(py)?;
+    Ok(cachekit_core::verify_checksum(&data, &expected))
 }
 
 /// Register encryption module with Python

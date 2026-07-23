@@ -98,7 +98,17 @@ def cache(
         func: The function to decorate (when used without parentheses)
         config: DecoratorConfig object for RORO-style configuration
         _intent: Internal parameter for intent variants (fast/safe/secure)
-        **manual_overrides: Any manual parameter overrides (including serializer)
+        **manual_overrides: Any manual parameter overrides (including serializer).
+            Notable: ``stale_ttl`` (LAB-381 stale-while-revalidate) — a stale-grace
+            window in seconds past the fresh ``ttl``. During the window an expired
+            entry is served immediately and the function re-runs in the background,
+            so no request pays the recompute at a TTL boundary. Requires a positive
+            ``ttl`` and an SWR-capable backend (CachekitIO); ``ttl + stale_ttl``
+            is capped at 2,592,000 s (30 days). ``@cache.io`` defaults it to
+            ``ttl`` — pass ``stale_ttl=0`` to opt out. The background recompute
+            sees a snapshot of the caller's ``contextvars`` (so contextvar-based
+            tenant extraction works), but no other request-scoped resources —
+            open sessions/connections from the request must not be relied on.
 
     Returns:
         Decorated function with intelligent caching
@@ -156,12 +166,12 @@ def cache(
             from cachekit.config.nested import EncryptionConfig
 
             _enc_passthrough = isinstance(manual_overrides.get("encryption"), EncryptionConfig)
-            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"}
+            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
             if not _enc_passthrough and (_enc_keys & manual_overrides.keys()):
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in manual_overrides:
                     enc_overrides["enabled"] = manual_overrides.pop("encryption")
-                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid"):
+                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
                     if _k in manual_overrides:
                         enc_overrides[_k] = manual_overrides.pop(_k)
                 manual_overrides["encryption"] = replace(EncryptionConfig(), **enc_overrides)

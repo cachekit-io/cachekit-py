@@ -91,6 +91,17 @@ class PerRequestRedisBackend:
         self._tenant_id = url_encode(tenant_id, safe="")
         self._original_tenant_id = tenant_id
 
+    @property
+    def key_prefix(self) -> str:
+        """Wire-level key prefix (contract for interop mode's fail-closed guard).
+
+        Every key this wrapper touches is rewritten to ``t:{tenant}:{key}`` —
+        invisible to other SDKs reading the same Redis, so interop mode MUST
+        reject this backend (see cachekit.interop.ensure_interop_backend_compatible).
+        Backends that rewrite keys on the wire MUST expose the prefix here.
+        """
+        return f"t:{self._tenant_id}:"
+
     def _scoped_key(self, key: str) -> str:
         """Generate tenant-scoped key with URL-encoded tenant ID.
 
@@ -448,12 +459,12 @@ class RedisBackendProvider:
             BackendError: If Redis connection fails
         """
         try:
-            # Fix #1: Create connection pool ONCE
-            self._pool = redis.ConnectionPool.from_url(
-                redis_url,
-                max_connections=pool_size,
-                decode_responses=False,  # We handle bytes explicitly
-            )
+            # Fix #1: Create connection pool ONCE. Shared builder wires the
+            # finite socket timeouts, so the ping below fails fast on an
+            # unreachable Redis instead of blocking on the OS TCP timeout.
+            from cachekit.backends.redis.client import create_connection_pool
+
+            self._pool = create_connection_pool(redis_url, max_connections=pool_size)
 
             # Create singleton Redis client from pool
             self._client = redis.Redis(connection_pool=self._pool)

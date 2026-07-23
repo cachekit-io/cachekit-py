@@ -28,6 +28,21 @@ class EncryptionError(SerializationError):
     pass
 
 
+class DecryptionAuthenticationError(EncryptionError):
+    """Tamper-class decrypt failure: cryptographic authentication did not hold.
+
+    Raised when the AES-GCM tag fails to verify (tampered ciphertext, wrong
+    key, or AAD/cache_key mismatch), when the entry's tenant does not match the
+    handler's tenant, or — in fail-closed mode — when the stored key fingerprint
+    does not match the current key. Distinct from plain :class:`EncryptionError`
+    / :class:`SerializationError`, which cover corruption and format problems.
+    Classification and the fail-open/fail-closed policy live in
+    ``cachekit.cache_handler.handle_decrypt_failure``.
+    """
+
+    pass
+
+
 class EncryptionWrapper:
     """Encryption wrapper that composes any SerializerProtocol with AES-256-GCM encryption layer.
 
@@ -80,7 +95,7 @@ class EncryptionWrapper:
         >>> wrapper.deserialize(encrypted, metadata, cache_key=wrong_key)  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        EncryptionError: Decryption failed: ...
+        DecryptionAuthenticationError: Decryption failed: ...
 
         Encryption is always enabled (no opt-out):
 
@@ -88,13 +103,14 @@ class EncryptionWrapper:
         True
     """
 
-    __slots__ = ("tenant_id", "serializer", "encryptor", "tenant_keys", "encryption_key_fingerprint")
+    __slots__ = ("tenant_id", "serializer", "encryptor", "tenant_keys", "encryption_key_fingerprint", "fail_closed")
 
     def __init__(
         self,
         serializer: Optional[SerializerProtocol] = None,
         master_key: Optional[bytes] = None,
         tenant_id: str = "default",
+        fail_closed: bool = False,
     ):
         """Initialize encryption wrapper.
 
@@ -103,8 +119,16 @@ class EncryptionWrapper:
                            Defaults to StandardSerializer (cross-language MessagePack).
             master_key: 256-bit master key for encryption. If None, reads from environment.
             tenant_id: Tenant identifier for key isolation
+            fail_closed: Treat key-fingerprint mismatch as a hard authentication
+                failure (raise DecryptionAuthenticationError before attempting
+                decryption) instead of warn-and-attempt. This flag gates ONLY the
+                fingerprint pre-check on this wrapper; the read-path policy of
+                raising vs recomputing lives on the handler
+                (CacheSerializationHandler.encryption_fail_closed), which passes
+                the same resolved value here. Default False = warn-and-attempt.
         """
         self.tenant_id = tenant_id
+        self.fail_closed = fail_closed
 
         # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
         # compatibility. Encrypted data may be shared across SDKs via secrets manager,
@@ -212,6 +236,12 @@ class EncryptionWrapper:
         # Serialize with base serializer
         try:
             raw_data, raw_metadata = self.serializer.serialize(obj)
+        except ValueError:
+            # Interop/v1 data-model rejections (InteropError, a ValueError) must
+            # reach the caller unlaundered — wrapping them as SerializationError
+            # would route them into the silent "caching failed" fallbacks and
+            # violate the spec's fail-loud contract on the encrypted path.
+            raise
         except Exception as e:
             raise SerializationError(f"Serialization failed: {e}") from e
 
@@ -272,15 +302,15 @@ class EncryptionWrapper:
             >>> wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:99")  # doctest: +IGNORE_EXCEPTION_DETAIL
             Traceback (most recent call last):
                 ...
-            EncryptionError: Decryption failed: ...
+            DecryptionAuthenticationError: Decryption failed: ...
 
-            Tenant mismatch raises EncryptionError:
+            Tenant mismatch raises DecryptionAuthenticationError (tamper-class):
 
             >>> other_wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-2")
             >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")  # doctest: +IGNORE_EXCEPTION_DETAIL
             Traceback (most recent call last):
                 ...
-            EncryptionError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
+            DecryptionAuthenticationError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
         """
         # Handle unencrypted data (fallback case)
         # Check encrypted flag (orthogonal to format - encryption is a wrapper, not a format)
@@ -299,9 +329,12 @@ class EncryptionWrapper:
                 "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
             )
 
-        # Verify tenant match for security
+        # Verify tenant match for security. Tamper-class (DecryptionAuthenticationError):
+        # an entry claiming another tenant at this cache key is either cross-tenant
+        # substitution or config drift — it must count as auth_tamper telemetry and be
+        # honored by the fail-closed policy, not vanish into the corruption bucket.
         if metadata.tenant_id != self.tenant_id:
-            raise EncryptionError(
+            raise DecryptionAuthenticationError(
                 f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"
             )
 
@@ -309,20 +342,29 @@ class EncryptionWrapper:
         if metadata.key_fingerprint != self.encryption_key_fingerprint:
             metadata_fp = metadata.key_fingerprint[:12] if metadata.key_fingerprint else "unknown"
             current_fp = self.encryption_key_fingerprint[:12] if self.encryption_key_fingerprint else "unknown"
+            if self.fail_closed:
+                raise DecryptionAuthenticationError(
+                    f"Key fingerprint mismatch: data encrypted with key {metadata_fp}..., "
+                    f"current key is {current_fp}... Refusing to attempt decryption "
+                    f"(encryption.fail_closed=True). Possible key rotation, misconfiguration, "
+                    f"or tampering with the stored entry."
+                )
             logger.warning(
                 f"Key fingerprint mismatch: data encrypted with key "
-                f"{metadata_fp}..., current key is {current_fp}... (key rotation?)"
+                f"{metadata_fp}..., current key is {current_fp}... (key rotation?). "
+                f"Attempting decryption anyway; it will fail AES-GCM authentication if the "
+                f"key genuinely differs. Set encryption.fail_closed=True to raise instead."
             )
-            # Continue anyway - might be old data with rotated key
+
+        # Create the same AAD used during encryption (with cache_key binding)
+        raw_metadata = SerializationMetadata(
+            serialization_format=metadata.format,  # Preserve original wire format from base serializer
+            encoding=metadata.encoding,
+            compressed=metadata.compressed,
+            original_type=metadata.original_type,
+        )
 
         try:
-            # Create the same AAD used during encryption (with cache_key binding)
-            raw_metadata = SerializationMetadata(
-                serialization_format=metadata.format,  # Preserve original wire format from base serializer
-                encoding=metadata.encoding,
-                compressed=metadata.compressed,
-                original_type=metadata.original_type,
-            )
             aad = self._create_aad(raw_metadata, cache_key)
 
             # Decrypt using tenant keys (keys remain in Rust memory, never copied to Python)
@@ -334,18 +376,27 @@ class EncryptionWrapper:
             # into an owned buffer), so coercing here costs nothing the cipher wasn't already paying.
             decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
 
-            # Deserialize the decrypted data using base serializer
-            return self.serializer.deserialize(decrypted_data, raw_metadata)
-
         except Exception as e:
-            raise EncryptionError(f"Decryption failed: {e}") from e
+            # AES-GCM tag verification failed: tampered ciphertext, wrong key, or
+            # AAD/cache_key mismatch. Tamper-class failure — distinct from the
+            # post-decrypt deserialize errors below, which occur on AUTHENTICATED
+            # plaintext and therefore indicate corruption/bugs, not tampering.
+            raise DecryptionAuthenticationError(f"Decryption failed: {e}") from e
+
+        try:
+            # Deserialize the decrypted (authenticated) data using base serializer
+            return self.serializer.deserialize(decrypted_data, raw_metadata)
+        except Exception as e:
+            raise EncryptionError(f"Deserialization failed after successful decryption: {e}") from e
 
     def _create_aad(self, metadata: SerializationMetadata, cache_key: str) -> bytes:
         """Create length-prefixed AAD v0x03 with cache_key binding.
 
-        Format: [version_byte(0x03)][len1(4)][tenant_id][len2(4)][cache_key][len3(4)][format][len4(4)][compressed]
+        Format: [version_byte(0x03)][len1(4)][tenant_id][len2(4)][cache_key][len3(4)][format][len4(4)][compressed][len5(4)][original_type]
         - Version byte: 0x03 (includes cache_key binding)
         - Each length is 4-byte big-endian integer
+        - The 5th component (original_type) is appended only when metadata.original_type is set —
+          a conformant reader MUST include it for serializers that set it (e.g. AutoSerializer)
         - Mathematically impossible to collide (unambiguous parsing)
 
         SECURITY CRITICAL (Protocol v1.0.1, Section 5.6):

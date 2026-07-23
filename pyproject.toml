@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.11.1"
+version = "0.14.0"
 description = "Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance"
 readme = "README.md"
 license = {text = "MIT"}
@@ -156,6 +156,7 @@ addopts = [
     "--doctest-modules",              # Validate docstring examples
     "--doctest-continue-on-failure",  # Report all doctest failures, not just first
     "--markdown-docs",                # Validate markdown documentation examples
+    "--benchmark-skip",               # pytest-benchmark tests run only via --benchmark-only (make benchmark)
 ]
 markers = [
     "asyncio: Async tests using pytest-asyncio",

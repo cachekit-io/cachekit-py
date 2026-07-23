@@ -534,12 +534,18 @@ class L1Cache:
 class L1CacheManager:
     """Manager for multiple L1 cache instances by namespace."""
 
-    def __init__(self, default_max_memory_mb: int = 100):
+    def __init__(self, default_max_memory_mb: int | None = None):
         """Initialize L1 cache manager.
 
         Args:
-            default_max_memory_mb: Default memory limit per namespace
+            default_max_memory_mb: Default memory limit per namespace. None reads
+                l1_max_size_mb from global settings (env: CACHEKIT_L1_MAX_SIZE_MB),
+                so the configured budget is actually enforced (issue #163).
         """
+        if default_max_memory_mb is None:
+            from cachekit.config.singleton import get_settings
+
+            default_max_memory_mb = get_settings().l1_max_size_mb
         self._caches: dict[str, L1Cache] = {}
         self._lock = threading.Lock()
         self._default_max_memory_mb = default_max_memory_mb
@@ -548,22 +554,36 @@ class L1CacheManager:
         self._cleanup_thread: Optional[threading.Thread] = None
         self._stop_cleanup = threading.Event()
 
-    def get_cache(self, namespace: str = "default") -> L1Cache:
+    def get_cache(self, namespace: str = "default", max_size_mb: int | None = None) -> L1Cache:
         """Get or create L1 cache for namespace.
 
         Args:
             namespace: Cache namespace
+            max_size_mb: Memory budget for this namespace's cache. Only applied on
+                first creation — namespaces share one L1Cache instance, so the first
+                configuration wins. None uses the manager default.
 
         Returns:
             L1Cache instance for namespace
         """
         with self._lock:
-            if namespace not in self._caches:
-                cache = L1Cache(max_memory_mb=self._default_max_memory_mb, namespace=namespace)
+            cache = self._caches.get(namespace)
+            if cache is None:
+                budget = max_size_mb if max_size_mb is not None else self._default_max_memory_mb
+                cache = L1Cache(max_memory_mb=budget, namespace=namespace)
                 self._caches[namespace] = cache
-                logger.info("Created L1 cache for namespace: %s", namespace)
-
-            return self._caches[namespace]
+                logger.info("Created L1 cache for namespace: %s (max_memory=%dMB)", namespace, budget)
+            elif max_size_mb is not None and cache.max_memory_bytes != max_size_mb * 1024 * 1024:
+                # Explicit so a conflicting config isn't silently ignored: the namespace
+                # cache already exists with a different budget and cannot be resized.
+                logger.warning(
+                    "L1 cache for namespace %r already exists with a %d byte budget; "
+                    "ignoring requested %d MB (first configuration wins per namespace)",
+                    namespace,
+                    cache.max_memory_bytes,
+                    max_size_mb,
+                )
+            return cache
 
     def start_background_cleanup(self, interval_seconds: float = 30.0) -> None:
         """Start background thread to clean up expired entries.
@@ -638,21 +658,26 @@ def get_l1_cache_manager() -> L1CacheManager:
     global _global_l1_manager
 
     if _global_l1_manager is None:
+        from cachekit.config.singleton import get_settings
+
         _global_l1_manager = L1CacheManager()
-        # Start background cleanup by default
-        _global_l1_manager.start_background_cleanup()
+        # Start background cleanup by default, at the configured interval
+        _global_l1_manager.start_background_cleanup(interval_seconds=get_settings().l1_cleanup_interval_seconds)
 
     return _global_l1_manager
 
 
-def get_l1_cache(namespace: str = "default") -> L1Cache:
+def get_l1_cache(namespace: str = "default", max_size_mb: int | None = None) -> L1Cache:
     """Get L1 cache for namespace.
 
     Args:
         namespace: Cache namespace
+        max_size_mb: Memory budget in MB. Applied only when this namespace's cache
+            is first created (first configuration wins); None uses the settings
+            default (l1_max_size_mb / CACHEKIT_L1_MAX_SIZE_MB).
 
     Returns:
         L1Cache instance
     """
     manager = get_l1_cache_manager()
-    return manager.get_cache(namespace)
+    return manager.get_cache(namespace, max_size_mb=max_size_mb)

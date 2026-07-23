@@ -90,7 +90,7 @@ def your_function(args):
 - **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
-- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection
+- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
 - **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
 
 #### Performance Parameters
@@ -611,9 +611,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 **Key Fields:**
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
-- **`enable_compression`** (`bool`, default: `True`) - Enable LZ4 compression (env: `CACHEKIT_ENABLE_COMPRESSION`)
-- **`compression_level`** (`int`, default: `6`) - Zlib compression level 1–9 (env: `CACHEKIT_COMPRESSION_LEVEL`)
-- **`max_chunk_size_mb`** (`int`, default: `50`) - Maximum cache chunk size in MB (env: `CACHEKIT_MAX_CHUNK_SIZE_MB`)
+- **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
 - **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
@@ -745,9 +743,8 @@ CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 # Cache Behavior
 CACHEKIT_DEFAULT_TTL=3600
-CACHEKIT_MAX_CHUNK_SIZE_MB=50
-CACHEKIT_ENABLE_COMPRESSION=true
-CACHEKIT_COMPRESSION_LEVEL=6
+CACHEKIT_MAX_VALUE_SIZE=104857600
+CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption (for @cache.secure)
 CACHEKIT_MASTER_KEY=<hex-encoded-32-bytes-minimum>
@@ -812,8 +809,23 @@ either from the in-memory L1 layer or from the backend L2 layer, never both. `ma
 `currsize` are kept only for `lru_cache` API parity and are always `None` because the cache
 lives in an external store, not a bounded in-process dict.
 
-Statistics are tracked per decorated function (shared across all calls) and are thread-safe.
-`cache_clear()` resets the counters and rotates `session_id`.
+Statistics are tracked per function identity (`module.qualname`) and are thread-safe.
+Re-applying a decorator to the same function — even with different options — reuses the
+existing counters from a process-global registry rather than resetting them, so `session_id`
+stays stable and the counters reported to the CachekitIO backend stay monotonic (counters
+that reset under an unchanged session ID would trip the server's anti-replay validation).
+`cache_clear()` resets the counters and rotates `session_id`. A forked child process starts
+with zeroed counters and a session ID derived from its own process UUID; the parent's
+statistics are unaffected.
+
+> **Decorate once, at module scope — as performance advice.** Rebuilding the wrapper per
+> call (e.g. `cache.io(namespace=...)(fn)` inside a request handler or loop) repeats the
+> decoration-time setup on every request and, in L1-only mode (`backend=None`), discards
+> the in-process object cache each time — every call becomes a miss. Session telemetry is
+> unaffected either way: the rebuilt wrapper reuses the same statistics tracker. If the
+> wrapped callable must vary per call, build the decorated wrapper once, cache it (e.g. in
+> a module-level holder or `functools.lru_cache` keyed by namespace), and route the
+> per-call state through an argument or a thread-local.
 
 A minimal stats endpoint that surfaces `cache_info()` over HTTP:
 

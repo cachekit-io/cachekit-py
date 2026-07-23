@@ -4,6 +4,7 @@ Tests that EncryptionWrapper can wrap any serializer (OrjsonSerializer, ArrowSer
 to enable zero-knowledge caching for any data type.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -117,6 +118,70 @@ class TestEncryptionWrapperComposability:
         # Only client can decrypt
         decrypted = client_wrapper.deserialize(encrypted_blob, metadata, cache_key=cache_key)
         assert decrypted == sensitive_data
+
+    def test_auto_serializer_binds_true_compressed_flag_into_aad(self, master_key):
+        """Regression (#166): AutoSerializer's ByteStorage paths must bind compressed="True" into AAD v0x03.
+
+        AutoSerializer LZ4-compresses via ByteStorage but never set compressed=True in its
+        metadata, so EncryptionWrapper authenticated "False" while a conformant reader
+        (protocol spec/encryption.md: create_aad(..., compressed=true) for enveloped
+        payloads) computes "True" — AES-GCM authentication failed on legitimate entries.
+        """
+        wrapper = EncryptionWrapper(serializer=AutoSerializer(), master_key=master_key, tenant_id="test-tenant")
+        cache_key = "test:encryption:auto:compressed"
+        data = {"user": "alice", "score": 100}
+
+        encrypted, metadata = wrapper.serialize(data, cache_key=cache_key)
+
+        # Writer metadata reflects the ByteStorage LZ4 envelope (parity with StandardSerializer)
+        assert metadata.compressed is True
+
+        # Conformant reader: hand-built AAD v0x03 per spec (compressed="True") must authenticate.
+        # AutoSerializer's msgpack path sets original_type="msgpack", appended as 5th component.
+        components = [b"test-tenant", cache_key.encode(), b"msgpack", b"True", b"msgpack"]
+        spec_aad = bytes([0x03]) + b"".join(len(c).to_bytes(4, "big") + c for c in components)
+        envelope = wrapper.encryptor.decrypt_with_keys(encrypted, spec_aad, wrapper.tenant_keys)
+
+        # Recovered ByteStorage envelope round-trips to the original object
+        assert AutoSerializer().deserialize(bytes(envelope), metadata) == data
+
+        # Full wrapper round-trip still works with the stored metadata
+        assert wrapper.deserialize(encrypted, metadata, cache_key=cache_key) == data
+
+    @pytest.mark.parametrize("integrity", [True, False])
+    def test_compressed_flag_reflects_bytestorage_codec(self, integrity):
+        """compressed=True iff the ByteStorage LZ4 envelope actually wrapped the payload (#166).
+
+        Ground truth comes from the bytes themselves (retrieve() succeeds iff the envelope
+        is present), not from the implementation's own flag formula — so a future helper
+        that changes its codec policy without updating the metadata fails here instead of
+        silently poisoning the AAD. Covers every AutoSerializer path: msgpack default,
+        Series, the DataFrame msgpack-columnar fallback (pyarrow absent), and the
+        checksum-only numpy path (never LZ4, so False regardless of integrity checking).
+        """
+        from cachekit._rust_serializer import ByteStorage
+
+        def is_enveloped(data) -> bool:
+            try:
+                ByteStorage("msgpack").retrieve(bytes(data))
+                return True
+            except Exception:
+                return False
+
+        serializer = AutoSerializer(enable_integrity_checking=integrity)
+        serializer._arrow_serializer = None  # force the msgpack-columnar DataFrame fallback path
+
+        cases = [
+            ({"a": 1}, "msgpack", integrity),
+            (pd.Series([1, 2, 3]), "series", integrity),
+            (pd.DataFrame({"a": [1, 2, 3]}), "dataframe", integrity),
+            (np.array([1, 2, 3]), "numpy", False),  # checksum-only envelope, never LZ4
+        ]
+        for obj, expected_type, expected_compressed in cases:
+            data, meta = serializer.serialize(obj)
+            assert meta.original_type == expected_type
+            assert meta.compressed is expected_compressed
+            assert is_enveloped(data) is expected_compressed, f"{expected_type}: metadata.compressed lies about the bytes"
 
     def test_encryption_metadata_preserves_format_information(self, master_key):
         """Encryption metadata correctly preserves underlying serialization format."""

@@ -22,7 +22,16 @@ class L1CacheConfig:
 
     Attributes:
         enabled: Enable L1 in-memory cache (default: True)
-        max_size_mb: Maximum L1 cache size in megabytes (default: 100)
+        max_size_mb: Per-namespace L1 budget in MB. None (default) inherits the global
+            CACHEKIT_L1_MAX_SIZE_MB setting (issue #163); an int overrides it per decorator.
+            In L1-only mode (backend=None) this is a best-effort byte bound on raw object sizes.
+        swr_enabled: Enable stale-while-revalidate background refresh (default: True).
+            Requires a ttl; in L1-only mode async functions refresh via an asyncio
+            task and sync functions via a daemon thread.
+        swr_threshold_ratio: Fraction of TTL after which a hit triggers a background
+            refresh, in (0.0, 1.0] (default: 0.5)
+        invalidation_enabled: Enable invalidation event broadcasts (default: True)
+        namespace_index: Enable fast namespace-based invalidation (default: True)
 
     Examples:
         Create with defaults:
@@ -30,8 +39,8 @@ class L1CacheConfig:
         >>> config = L1CacheConfig()
         >>> config.enabled
         True
-        >>> config.max_size_mb
-        100
+        >>> config.max_size_mb is None  # inherits CACHEKIT_L1_MAX_SIZE_MB
+        True
 
         Custom configuration validates successfully:
 
@@ -47,7 +56,7 @@ class L1CacheConfig:
     """
 
     enabled: bool = True
-    max_size_mb: int = 100
+    max_size_mb: int | None = None
     swr_enabled: bool = True
     swr_threshold_ratio: float = 0.5
     invalidation_enabled: bool = True
@@ -57,10 +66,13 @@ class L1CacheConfig:
         """Validate L1 cache configuration.
 
         Raises:
-            ConfigurationError: If max_size_mb < 1
+            ConfigurationError: If max_size_mb < 1 or swr_threshold_ratio is
+                outside (0.0, 1.0]
         """
-        if self.max_size_mb < 1:
+        if self.max_size_mb is not None and self.max_size_mb < 1:
             raise ConfigurationError(f"L1 max_size_mb must be >= 1, got {self.max_size_mb}")
+        if not (0.0 < self.swr_threshold_ratio <= 1.0):
+            raise ConfigurationError(f"L1 swr_threshold_ratio must be in (0.0, 1.0], got {self.swr_threshold_ratio}")
 
 
 @dataclass(frozen=True)
@@ -304,6 +316,13 @@ class EncryptionConfig:
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
         deployment_uuid: Optional deployment-specific UUID for single-tenant mode (default: None)
+        fail_closed: Tri-state tamper-failure policy (default: None = defer to the
+                 CACHEKIT_ENCRYPTION_FAIL_CLOSED env setting, which defaults to False).
+                 True = raise DecryptionAuthenticationError to the caller on AES-GCM
+                 authentication failure or key-fingerprint mismatch instead of silently
+                 recomputing (fail closed). False = explicit per-decorator opt-out of a
+                 fleet-wide fail-closed setting (fail open: warn, record the
+                 cachekit_decrypt_failures_total metric, recompute).
 
     Examples:
         Unset by default (defers to auto-detection, no encryption forced):
@@ -346,6 +365,7 @@ class EncryptionConfig:
     tenant_extractor: Callable[..., str] | None = None
     single_tenant_mode: bool = False
     deployment_uuid: str | None = None
+    fail_closed: bool | None = None
 
     def validate(self) -> None:
         """Validate encryption configuration.

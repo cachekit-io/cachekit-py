@@ -1,6 +1,6 @@
 [package]
 name = "cachekit-rs"
-version = "0.11.1"
+version = "0.14.0"
 edition = "2021"
 authors = ["cachekit Contributors"]
 description = "High-performance storage engine for caching with compression and encryption"
@@ -20,7 +20,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Compression, checksums, encryption (https://crates.io/crates/cachekit-core)
-cachekit-core = { version = "0.2.0", features = ["compression", "checksum", "messagepack", "encryption"] }
+cachekit-core = { version = "0.3.0", features = ["compression", "checksum", "messagepack", "encryption"] }
 
 # Python integration - optional for Rust-only builds
 pyo3 = { workspace = true, optional = true }

@@ -153,6 +153,38 @@ export CACHEKIT_MASTER_KEY=new_key
 # Restart app → re-populates cache with new key
 ```
 
+### Enabling Encryption on an Existing (Plaintext) Cache
+
+When you turn encryption on over a cache that already holds plaintext entries, those
+entries are **rejected, never read**. The read path fails closed: the entry raises a
+`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
+and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+
+```text
+read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+```
+
+There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
+plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
+an attacker with backend write access is indistinguishable from a legacy one — any
+"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
+fail-closed read path exists to prevent. If you need to read plaintext entries, use a
+handler with `encryption=False` (which never had keys to protect).
+
+For large caches, choose between lazy migration and eager eviction based on your
+workload: lazy migration spreads recomputation over reads (each legacy entry pays one
+recompute on first access), while an eager flush concentrates it into a cold-start miss
+wave — throttle or batch the eviction if the recompute cost is high. Either way, scope
+eviction to cachekit's keys so unrelated data in the same Redis database survives:
+
+```bash
+# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
+redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+
+# FLUSHDB is only safe when the database is dedicated to cachekit
+# then deploy with CACHEKIT_MASTER_KEY set
+```
+
 ### L1 Cache Conflict
 ```python notest
 @cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption + L1 cache (stores encrypted bytes)
@@ -305,6 +337,124 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
         └─ Increments per encryption
            Prevents nonce reuse even across reboots
 ```
+
+### Fail-Closed Read Path (Encryption Downgrade Protection)
+
+The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
+and the serializer name — is plaintext and is **not** covered by the AES-GCM
+authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
+into the tag, but the header itself stays outside that boundary so a reader can parse
+it before it has a key.
+
+An attacker with backend write access (the threat actor in the protocol's threat
+model) could exploit that gap by planting a frame whose header claims
+`encrypted: false` plus an arbitrary plaintext payload — a classic encryption
+downgrade (CWE-757). cachekit therefore never lets header metadata select the read
+path when encryption is configured:
+
+```text
+Handler configured with encryption:
+  entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
+  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+```
+
+The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
+of what the stored frame claims. Configuration decides the read path; stored (i.e.
+attacker-writable) data never does.
+
+### Cleartext Frame Header Fields (Accepted Exposure)
+
+Encrypted entries expose three fields in the plaintext header: `tenant_id`,
+`encryption_algorithm`, and `key_fingerprint`. This exposure is deliberate and
+accepted:
+
+- **`tenant_id`** — required *before* decryption to derive the per-tenant key
+  (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
+  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
+  binds it into the GCM tag, so a modified header fails authentication.
+- **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
+  clearer diagnostics during key rotation. It reveals nothing about key material.
+- **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
+  algorithm adds no security (Kerckhoffs's principle).
+
+Relocating these fields would be a cross-SDK wire-format change owned by the
+[protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
+exposure rather than diverging from the shared frame format.
+
+### Corruption vs Tamper: Telemetry and Fail-Closed Mode
+
+Three failure classes surface on the decrypt read path, and cachekit distinguishes
+them (cachekit-py#170):
+
+- **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
+  the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
+  between cache keys), or the entry claims a different tenant. Raised as
+  `DecryptionAuthenticationError`. This is the signal an active attack would produce.
+- **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
+  handler's configuration: a plaintext claim under an encryption-enabled handler (the
+  CWE-757 downgrade guard) or a missing `tenant_id`. Benign during a lazy
+  plaintext→encrypted migration; a spike outside a migration window is suspect. Always
+  fails open (miss + evict) so migration keeps working — even in fail-closed mode.
+- **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
+  serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
+  Storage rot and bugs, not evidence of tampering.
+
+All are counted on the Prometheus counter
+`cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
+`reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
+noise. Baseline `suspicious_envelope` around migration windows.
+
+**Default (fail open):** a decrypt failure of any class logs a warning, evicts the
+poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
+degrades to a cache miss. The tampering is visible only in logs and the metric.
+
+**Fail closed (opt-in):** `auth_tamper` failures raise
+`DecryptionAuthenticationError` to *your* caller instead of silently recomputing, and
+a key-fingerprint mismatch refuses to even attempt decryption. The poisoned **L2**
+entry is deliberately **not** evicted (it is evidence); a poisoned L1 copy *is*
+invalidated so remediating L2 immediately clears every process. Other classes still
+fail open — only authentication failures escalate. Enable it fleet-wide or
+per-function:
+
+```bash
+# Fleet-wide (all decorators, overridable per-function)
+export CACHEKIT_ENCRYPTION_FAIL_CLOSED=1
+```
+
+```python notest
+# Per-function (overrides the env setting in either direction)
+@cache.secure(master_key="a" * 64, fail_closed=True)
+def get_payment_token(user_id: int): ...
+
+# Or via explicit EncryptionConfig
+from cachekit.config.nested import EncryptionConfig
+config = EncryptionConfig(enabled=True, master_key="a" * 64,
+                          single_tenant_mode=True, fail_closed=True)
+```
+
+> **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
+> silent self-heal — rotating `CACHEKIT_MASTER_KEY` without clearing the cache makes
+> **every** pre-rotation entry raise `DecryptionAuthenticationError` on read (the
+> fingerprint mismatch refuses decryption, and the entry is retained, not evicted).
+> Follow the documented rotation procedure: flush (or namespace-version) the cache
+> *before* rotating. This is the deliberate cost of failing closed; the default
+> fail-open mode self-heals rotations as ordinary misses.
+
+Note the boundary with the integrity checksum: the ByteStorage **xxHash3-64 checksum
+is corruption detection only** — it is not cryptographic and an attacker who can write
+to the backend can trivially forge a valid checksum for arbitrary bytes. On the
+plaintext `@cache` path the stored bytes are therefore attacker-forgeable; tamper
+resistance exists **only** under encryption, where AES-256-GCM authenticates every
+byte. `fail_closed` governs the authenticated path — it cannot add tamper resistance
+to plaintext caching.
+
+**Config-drift reads:** if a handler has encryption *disabled* but reads a stale
+*encrypted* entry (e.g. encryption was recently turned off), cachekit decrypts it via
+the globally configured master key — the same signature appears under
+misconfiguration or a planted entry, so every occurrence increments
+`cachekit_config_drift_reads_total{reason="encryption_disabled"}` and the first read
+of each key logs a warning (once per key, so a hot key can't flood the logs). If you
+didn't recently disable encryption for that function, investigate.
 
 ---
 

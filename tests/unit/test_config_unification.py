@@ -25,8 +25,8 @@ class TestConfigSeparation:
 
         # Verify generic cache fields ARE present
         assert hasattr(cache_config, "default_ttl")
-        assert hasattr(cache_config, "max_chunk_size_mb")
-        assert hasattr(cache_config, "enable_compression")
+        assert hasattr(cache_config, "max_value_size")
+        assert hasattr(cache_config, "l1_max_size_mb")
 
     def test_redis_backend_config_loads_from_env(self, monkeypatch):
         """Test that RedisBackendConfig loads Redis-specific settings."""

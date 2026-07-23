@@ -70,6 +70,16 @@ class MemcachedBackend:
         )
         self._key_prefix = self._config.key_prefix
 
+    @property
+    def key_prefix(self) -> str:
+        """Wire-level key prefix (contract for interop mode's fail-closed guard).
+
+        Backends that rewrite keys on the wire MUST expose the prefix here so
+        interop mode can reject them: a prefixed key is invisible to other SDKs
+        and breaks cross-SDK key identity (see cachekit.interop).
+        """
+        return self._key_prefix
+
     def _prefixed_key(self, key: str) -> str:
         """Apply key prefix if configured."""
         if self._key_prefix:
@@ -173,6 +183,39 @@ class MemcachedBackend:
             return self._client.get(self._prefixed_key(key)) is not None
         except Exception as exc:
             raise classify_memcached_error(exc, operation="exists", key=key) from exc
+
+    async def refresh_ttl(self, key: str, ttl: int) -> bool:
+        """Refresh a key's TTL via the Memcached ``touch`` command.
+
+        Memcached ships ONLY this half of TTLInspectableBackend, by design: the classic
+        text/binary protocol has no command to *read* a key's remaining TTL, and pymemcache's
+        ``HashClient`` exposes no meta protocol (``mg <key> t``, memcached >= 1.6). Without a
+        ``get_ttl``, Memcached is not a TTLInspectableBackend, so ``refresh_ttl_on_get`` does
+        NOT auto-refresh on it (the decorator warns once and no-ops — see
+        docs/backends/memcached.md). This method is still callable directly to extend a key's
+        life, exactly like the ``touch`` command it wraps.
+
+        Args:
+            key: Cache key to refresh.
+            ttl: New TTL in seconds. 0 means no expiry; values are clamped to the 30-day
+                Memcached maximum, matching ``set``.
+
+        Returns:
+            True if the key existed and its TTL was updated, False if the key was not found.
+
+        Raises:
+            BackendError: If the Memcached operation fails.
+        """
+        expire = 0
+        if ttl > 0:
+            expire = min(ttl, MAX_MEMCACHED_TTL)
+
+        try:
+            # noreply=False so the server's hit/miss reply is read (matches set/delete);
+            # touch returns True if the expiry was updated, False if the key was not found.
+            return bool(self._client.touch(self._prefixed_key(key), expire=expire, noreply=False))
+        except Exception as exc:
+            raise classify_memcached_error(exc, operation="refresh_ttl", key=key) from exc
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Memcached health by pinging each server with a get.
