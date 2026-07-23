@@ -9,10 +9,16 @@ state-machine tests keep exercising real behavior without resurrecting the
 wrapper in ``src``.
 """
 
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
+
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.reliability.circuit_breaker import CircuitBreaker
+
+T = TypeVar("T")
 
 
-def guarded_call(breaker, operation, *args, **kwargs):
+def guarded_call(breaker: CircuitBreaker, operation: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a sync operation through the breaker using its public API.
 
     Raises ``BackendError`` (TRANSIENT) when the breaker would reject the
@@ -29,7 +35,7 @@ def guarded_call(breaker, operation, *args, **kwargs):
     return result
 
 
-async def guarded_call_async(breaker, operation, *args, **kwargs):
+async def guarded_call_async(breaker: CircuitBreaker, operation: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T:
     """Async counterpart of :func:`guarded_call` (awaits the operation)."""
     if not breaker.should_attempt_call():
         raise BackendError("Circuit breaker is OPEN", error_type=BackendErrorType.TRANSIENT)

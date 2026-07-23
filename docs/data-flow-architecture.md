@@ -54,7 +54,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  @cache                          # Zero-config (90% of use cases, L1+L2)    │
 │  @cache.minimal                  # Speed-critical (low latency)             │
 │  @cache.production               # Reliability-critical (circuit breaker)   │
-│  @cache.secure                   # Security-critical (encryption, L2-only)  │
+│  @cache.secure                   # Security-critical (encrypted L1+L2)      │
 │  @cache(l1=True, l2=None)        # L1-only mode (local dev, no Redis)       │
 │                                                                             │
 │  Intent Resolution → Config Dictionary (includes l1_enabled, l2_backend)    │
@@ -358,8 +358,8 @@ def custom_function():
 | **default** | ✓ | ✓ | RedisBackend | ✓ | General purpose caching (L1+L2) |
 | **minimal** | ✗ | ✓ | RedisBackend | ✗ | Low-latency hot paths |
 | **production** | ✓ | ✓ | RedisBackend | ✓ | Mission-critical reliability |
-| **secure** | ✓ | ✗ | RedisBackend | ✓ | Encrypted sensitive data (L2-only) |
-| **dev** | ✗ | ✓ | None | ✗ | Local development (no Redis) |
+| **secure** | ✓ | ✓ | RedisBackend | ✓ | Encrypted sensitive data (L1 stores ciphertext) |
+| **dev** | ✓ | ✓ | None | ✗ | Local development (no Redis) |
 | **test** | ✗ | ✓ | None | ✗ | Test environments (no Redis) |
 | **io** | ✓ | ✓ | CachekitIOBackend | ✓ | Managed cloud backend (cachekit.io) |
 

@@ -34,6 +34,7 @@ from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationErro
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
+    from cachekit.reliability.load_control import BackpressureController
     from cachekit.serializers.base import SerializerProtocol
 
 # Serializer string names whose wire format is language-agnostic and therefore safe to
@@ -1681,8 +1682,8 @@ class StandardCacheHandler:
     def __init__(
         self,
         backend: BaseBackend,
-        backpressure_controller=None,
-        ttl_refresh_threshold=0.5,
+        backpressure_controller: BackpressureController | None = None,
+        ttl_refresh_threshold: float = 0.5,
     ):
         """Initialize with backend and optional features.
 

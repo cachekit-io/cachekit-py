@@ -194,7 +194,7 @@ class CircuitBreaker:
         # (see FeatureOrchestrator.should_allow_request / record_success /
         # record_failure): the caller does its own work between the check and
         # the record, which a single wrapping call() cannot accommodate.
-        if breaker.get_state() is CircuitState.OPEN:
+        if not breaker.should_attempt_call():
             return cached_value  # Fail fast — circuit is open
         try:
             result = redis_client.get("key")
