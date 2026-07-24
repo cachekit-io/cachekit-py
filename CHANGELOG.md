@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.16.0](https://github.com/cachekit-io/cachekit-py/compare/v0.15.0...v0.16.0) (2026-07-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* L1CacheConfig.invalidation_enabled is removed. The flag was read by nothing and toggled no behavior; constructors passing it now raise TypeError instead of silently lying.
+
+### Bug Fixes
+
+* **security:** EncryptionWrapper.deserialize fails closed on plaintext-claiming input (LAB-271) ([#242](https://github.com/cachekit-io/cachekit-py/issues/242)) ([6fcb115](https://github.com/cachekit-io/cachekit-py/commit/6fcb115d19d924cd7676b371fdc2e2afd2186424))
+
+
+### Code Refactoring
+
+* remove unwired cross-instance invalidation package (LAB-520) ([#237](https://github.com/cachekit-io/cachekit-py/issues/237)) ([c56ac0a](https://github.com/cachekit-io/cachekit-py/commit/c56ac0a0987eb8f3e4925034765431d060794277))
+
+## [0.15.0](https://github.com/cachekit-io/cachekit-py/compare/v0.14.0...v0.15.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the no-op `adaptive_timeout` decorator kwarg, the `TimeoutConfig` nested config, `DecoratorConfig.timeout`, and `ProfileConfig.adaptive_timeout` are removed; `CircuitBreaker.call()` and `.call_async()` are removed (use should_allow_request() + record_success() / record_failure()). All were non-functional or dead in production.
+
+### Code Refactoring
+
+* remove non-functional adaptive timeout, dead CircuitBreaker.call, unused tenacity (LAB-522) ([#239](https://github.com/cachekit-io/cachekit-py/issues/239)) ([5ade101](https://github.com/cachekit-io/cachekit-py/commit/5ade10126f590f4469d99874beea6ecc6fdfab68))
+
+## [0.14.0](https://github.com/cachekit-io/cachekit-py/compare/v0.13.0...v0.14.0) (2026-07-22)
+
+
+### Features
+
+* **cache:** stale-while-revalidate for cache.io — client transport + decorator surface (LAB-381) ([#228](https://github.com/cachekit-io/cachekit-py/issues/228)) ([7841ff0](https://github.com/cachekit-io/cachekit-py/commit/7841ff0d26870399c7e0fe2ddd62922d4f458280))
+
+
+### Bug Fixes
+
+* **decorators:** bind session counters to function identity, not wrapper instance ([#233](https://github.com/cachekit-io/cachekit-py/issues/233)) ([83b7c92](https://github.com/cachekit-io/cachekit-py/commit/83b7c9298d07f55ed893b7d8bbac0b17a7da00c5))
+* **swr:** LAB-381 panel fast-follow — contextvar propagation, CWE-532 redaction, orphan cut ([#235](https://github.com/cachekit-io/cachekit-py/issues/235)) ([9e276b6](https://github.com/cachekit-io/cachekit-py/commit/9e276b67f82742ad94f576321ae7bb7695214dfd))
+
 ## [0.13.0](https://github.com/cachekit-io/cachekit-py/compare/v0.12.0...v0.13.0) (2026-07-21)
 
 

@@ -66,8 +66,6 @@ def cache(
             >>> config = DecoratorConfig.production(ttl=600, backend=None)
             >>> config.circuit_breaker.enabled
             True
-            >>> config.timeout.enabled
-            True
 
         Intent-based secure (security-critical with encryption):
             >>> config = DecoratorConfig.secure(
@@ -98,7 +96,17 @@ def cache(
         func: The function to decorate (when used without parentheses)
         config: DecoratorConfig object for RORO-style configuration
         _intent: Internal parameter for intent variants (fast/safe/secure)
-        **manual_overrides: Any manual parameter overrides (including serializer)
+        **manual_overrides: Any manual parameter overrides (including serializer).
+            Notable: ``stale_ttl`` (LAB-381 stale-while-revalidate) — a stale-grace
+            window in seconds past the fresh ``ttl``. During the window an expired
+            entry is served immediately and the function re-runs in the background,
+            so no request pays the recompute at a TTL boundary. Requires a positive
+            ``ttl`` and an SWR-capable backend (CachekitIO); ``ttl + stale_ttl``
+            is capped at 2,592,000 s (30 days). ``@cache.io`` defaults it to
+            ``ttl`` — pass ``stale_ttl=0`` to opt out. The background recompute
+            sees a snapshot of the caller's ``contextvars`` (so contextvar-based
+            tenant extraction works), but no other request-scoped resources —
+            open sessions/connections from the request must not be relied on.
 
     Returns:
         Decorated function with intelligent caching

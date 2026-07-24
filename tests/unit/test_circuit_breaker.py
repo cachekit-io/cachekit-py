@@ -2,7 +2,7 @@
 
 import threading
 from datetime import timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import redis
@@ -14,6 +14,8 @@ from cachekit.reliability.circuit_breaker import (
     CircuitBreakerConfig,
     CircuitState,
 )
+
+from ..utils.circuit_breaker_helpers import guarded_call, guarded_call_async
 
 
 class TestCircuitBreakerConfig:
@@ -115,7 +117,7 @@ class TestCircuitBreaker:
         def mock_operation():
             return "success"
 
-        result = breaker.call(mock_operation)
+        result = guarded_call(breaker, mock_operation)
 
         assert result == "success"
         assert breaker.state == CircuitState.CLOSED
@@ -132,14 +134,14 @@ class TestCircuitBreaker:
         # Fail less than threshold
         for _ in range(2):
             with pytest.raises(redis.ConnectionError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
         assert breaker.state == CircuitState.CLOSED
         assert breaker.failure_count == 2
 
         # One more failure should open circuit
         with pytest.raises(redis.ConnectionError):
-            breaker.call(failing_operation)
+            guarded_call(breaker, failing_operation)
 
         assert breaker.state == CircuitState.OPEN
         assert breaker.failure_count == 3
@@ -157,7 +159,7 @@ class TestCircuitBreaker:
         # Raise PERMANENT error multiple times - should not open circuit
         for _ in range(5):
             with pytest.raises(BackendError):
-                breaker.call(permanent_error_operation)
+                guarded_call(breaker, permanent_error_operation)
 
         assert breaker.state == CircuitState.CLOSED
         assert breaker.failure_count == 0
@@ -174,12 +176,12 @@ class TestCircuitBreaker:
 
         # First failure
         with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            guarded_call(breaker, failing_operation)
         assert breaker.state == CircuitState.CLOSED
 
         # Second failure should open circuit
         with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            guarded_call(breaker, failing_operation)
         assert breaker.state == CircuitState.OPEN
 
     def test_open_state_fails_fast(self):
@@ -194,14 +196,14 @@ class TestCircuitBreaker:
             raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
         with pytest.raises(BackendError):
-            breaker.call(failing_operation)
+            guarded_call(breaker, failing_operation)
 
         assert breaker.state == CircuitState.OPEN
 
         # Now it should fail fast without calling the function
         mock_operation = MagicMock()
         with pytest.raises(BackendError) as exc_info:
-            breaker.call(mock_operation)
+            guarded_call(breaker, mock_operation)
 
         assert "Circuit breaker is OPEN" in str(exc_info.value)
         mock_operation.assert_not_called()
@@ -219,7 +221,7 @@ class TestCircuitBreaker:
                 raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
             with pytest.raises(BackendError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             assert breaker.state == CircuitState.OPEN
 
@@ -230,7 +232,7 @@ class TestCircuitBreaker:
             def successful_operation():
                 return "success"
 
-            result = breaker.call(successful_operation)
+            result = guarded_call(breaker, successful_operation)
             assert result == "success"
             assert breaker.state == CircuitState.HALF_OPEN
 
@@ -252,7 +254,7 @@ class TestCircuitBreaker:
                 raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
             with pytest.raises(BackendError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             # Advance past timeout to trigger HALF_OPEN
             traveller.shift(timedelta(seconds=0.2))
@@ -261,13 +263,13 @@ class TestCircuitBreaker:
                 return "success"
 
             # First success in HALF_OPEN
-            result = breaker.call(successful_operation)
+            result = guarded_call(breaker, successful_operation)
             assert result == "success"
             assert breaker.state == CircuitState.HALF_OPEN
             assert breaker.success_count == 1
 
             # Second success should close circuit
-            result = breaker.call(successful_operation)
+            result = guarded_call(breaker, successful_operation)
             assert result == "success"
             assert breaker.state == CircuitState.CLOSED
 
@@ -284,14 +286,14 @@ class TestCircuitBreaker:
                 raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
             with pytest.raises(BackendError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             # Advance past timeout to trigger HALF_OPEN
             traveller.shift(timedelta(seconds=0.2))
 
             # Any failure in HALF_OPEN should immediately reopen circuit
             with pytest.raises(BackendError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             assert breaker.state == CircuitState.OPEN
 
@@ -308,21 +310,21 @@ class TestCircuitBreaker:
                 raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
 
             with pytest.raises(BackendError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             # Advance past timeout
             traveller.shift(timedelta(seconds=0.2))
 
             # First request should be allowed (transitions to HALF_OPEN)
             slow_operation = MagicMock(return_value="success")
-            result = breaker.call(slow_operation)
+            result = guarded_call(breaker, slow_operation)
             assert result == "success"
             assert breaker.state == CircuitState.HALF_OPEN
 
             # Additional requests should be rejected (no more permits)
             fast_operation = MagicMock()
             with pytest.raises(BackendError) as exc_info:
-                breaker.call(fast_operation)
+                guarded_call(breaker, fast_operation)
 
             assert "Circuit breaker is OPEN" in str(exc_info.value)
             fast_operation.assert_not_called()
@@ -336,7 +338,7 @@ class TestCircuitBreaker:
         async def async_operation():
             return "async_success"
 
-        result = await breaker.call_async(async_operation)
+        result = await guarded_call_async(breaker, async_operation)
         assert result == "async_success"
         assert breaker.state == CircuitState.CLOSED
 
@@ -353,7 +355,7 @@ class TestCircuitBreaker:
 
         # Should fail and open circuit
         with pytest.raises(BackendError):
-            await breaker.call_async(failing_async_operation)
+            await guarded_call_async(breaker, failing_async_operation)
 
         assert breaker.state == CircuitState.OPEN
 
@@ -371,7 +373,7 @@ class TestCircuitBreaker:
                 def operation():
                     return f"success_{thread_id}"
 
-                result = breaker.call(operation)
+                result = guarded_call(breaker, operation)
                 results.append(result)
             except Exception as e:
                 errors.append(e)
@@ -403,7 +405,7 @@ class TestCircuitBreaker:
                 raise redis.ConnectionError("Connection failed")
 
             with pytest.raises(redis.ConnectionError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
             assert breaker.state == CircuitState.OPEN
 
@@ -419,7 +421,7 @@ class TestCircuitBreaker:
                     def operation():
                         return "success"
 
-                    result = breaker.call(operation)
+                    result = guarded_call(breaker, operation)
                     results.append(result)
                 except Exception as e:
                     errors.append(e)
@@ -451,7 +453,7 @@ class TestCircuitBreaker:
             raise redis.ConnectionError("Connection failed")
 
         with pytest.raises(redis.ConnectionError):
-            breaker.call(failing_operation)
+            guarded_call(breaker, failing_operation)
 
         assert breaker.state == CircuitState.OPEN
         assert breaker.failure_count == 1
@@ -475,31 +477,6 @@ class TestCircuitBreaker:
         assert stats["namespace"] == "test_stats"
         assert stats["config"]["failure_threshold"] == 2
         assert stats["config"]["success_threshold"] == 1
-
-    @patch("cachekit.reliability.circuit_breaker.cache_operations")
-    def test_metrics_integration(self, mock_counter):
-        """Test integration with Prometheus metrics."""
-        from cachekit.backends.errors import BackendError, BackendErrorType
-
-        config = CircuitBreakerConfig(failure_threshold=1)
-        breaker = CircuitBreaker(config, namespace="test")
-
-        # Open the circuit
-        def failing_operation():
-            raise BackendError("Connection failed", error_type=BackendErrorType.TRANSIENT)
-
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
-
-        # Try to call while circuit is open
-        with pytest.raises(BackendError):
-            breaker.call(failing_operation)
-
-        # Should have recorded rejection metric
-        mock_counter.labels.assert_called_with(
-            operation="circuit_breaker_open", status="rejected", serializer="", namespace="test"
-        )
-        mock_counter.labels().inc.assert_called()
 
     def test_properties_thread_safety(self):
         """Test that property accessors are thread-safe."""

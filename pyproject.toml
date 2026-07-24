@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.13.0"
+version = "0.16.0"
 description = "Production-ready Redis caching for Python with intelligent reliability features and Rust-powered performance"
 readme = "README.md"
 license = {text = "MIT"}
@@ -57,8 +57,6 @@ dependencies = [
     # Configuration and validation
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    # Error handling
-    "tenacity>=8.0.0",
     # Monitoring and observability
     "prometheus-client>=0.22.1",
     "psutil>=7.0.0",

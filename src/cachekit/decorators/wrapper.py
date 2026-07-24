@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import functools
 import inspect
@@ -53,6 +54,10 @@ _logger = logging.getLogger(__name__)
 # the refresh is skipped (stale keeps being served) and a later hit retries.
 _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
 
+# Backed-mode (L2) SWR revalidation pool — deliberately separate from the L1
+# constant above so the two features can be tuned independently (LAB-381 panel).
+_L2_SWR_MAX_CONCURRENT_REFRESHES = 32
+
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     """Callback for background TTL refresh tasks to handle errors.
@@ -67,7 +72,7 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     try:
         exc = task.exception()
         if exc is not None:
-            _logger.debug("Background TTL refresh failed for %s: %s", cache_key, exc)
+            _logger.debug("Background TTL refresh failed for %s: %s", redact_cache_key(cache_key), exc)
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
@@ -283,6 +288,77 @@ class _FunctionStats:
             # Clear session ID - will be regenerated with new clear count on next operation
             self.session_id = None
 
+    def _reset_for_new_process(self) -> None:
+        """Discard state inherited across fork(): fresh lock, zeroed counters, new session.
+
+        Only called from the post-fork handler while the child is still
+        single-threaded. The lock must be replaced, not acquired: a parent
+        thread holding it at fork time leaves it permanently locked in the
+        child. session_id=None re-derives lazily from the child's own
+        process UUID (see decorators.session), so the child never reports
+        under the parent's session ID with reset counters — which the
+        server's anti-replay validation would reject.
+        """
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._l1_hits = 0
+        self._l2_hits = 0
+        self._l2_cumulative_latency_ms = 0.0
+        self._l2_cached_avg_ms = 0.0
+        self._last_operation_at = None
+        self._clear_count = 0
+        self.session_id = None
+
+
+# Process-global registry: one _FunctionStats per function identifier.
+# Session IDs are derived from process UUID + module.qualname and are thus
+# stable across re-decorations — a fresh counter object per decoration
+# (factory / per-call patterns) would send counters that go backwards under
+# an unchanged session ID, which the server's anti-replay validation rejects
+# by silently stripping the session tag. Strong references are deliberate:
+# counters must outlive any individual wrapper so a rebuilt wrapper
+# continues the same monotonic sequence.
+_function_stats_registry: dict[str, _FunctionStats] = {}
+_function_stats_registry_lock = threading.Lock()
+
+
+def _get_function_stats(function_identifier: str, l1_enabled: bool) -> _FunctionStats:
+    """Get or create the shared stats tracker for a function identifier.
+
+    Re-decorating the same function reuses the existing tracker. The most
+    recent decoration's l1_enabled wins: the flag only feeds the rate-limit
+    classification header, and the newest decoration reflects the current
+    configuration.
+    """
+    with _function_stats_registry_lock:
+        stats = _function_stats_registry.get(function_identifier)
+        if stats is None:
+            stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+            _function_stats_registry[function_identifier] = stats
+        else:
+            stats.l1_enabled = l1_enabled
+        return stats
+
+
+def _reset_stats_after_fork() -> None:
+    """Reset every registered stats tracker in a newly forked child.
+
+    The child inherits the parent's counters and cached session IDs;
+    reporting them would either continue the parent's session from another
+    process or reset counters under the parent's session ID — both corrupt
+    server-side session telemetry. The child is single-threaded here, so
+    wholesale lock replacement is safe.
+    """
+    global _function_stats_registry_lock
+    _function_stats_registry_lock = threading.Lock()
+    for stats in _function_stats_registry.values():
+        stats._reset_for_new_process()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_stats_after_fork)
+
 
 # Lazy logger initialization to avoid import-time container access
 def logger():
@@ -294,6 +370,7 @@ def create_cache_wrapper(
     func: F,
     config: Any = None,  # DecoratorConfig | None (avoid circular import)
     ttl: int | None = None,
+    stale_ttl: int | None = None,
     namespace: str | None = None,
     # Serialization & Security
     serializer: Union[str, SerializerProtocol] = "default",  # type: ignore[name-defined]
@@ -313,7 +390,6 @@ def create_cache_wrapper(
     # Reliability features
     circuit_breaker: bool = True,
     circuit_breaker_config: CircuitBreakerConfig | None = None,
-    adaptive_timeout: bool = True,
     backpressure: bool = True,
     max_concurrent_requests: int = 100,
     # Monitoring features
@@ -371,7 +447,6 @@ def create_cache_wrapper(
                  or alternative storage (HTTP, DynamoDB, etc.).
         circuit_breaker: Enable circuit breaker for fault tolerance
         circuit_breaker_config: Circuit breaker configuration
-        adaptive_timeout: Enable adaptive timeout
         backpressure: Enable backpressure control
         max_concurrent_requests: Max concurrent requests (backpressure)
         collect_stats: Enable statistics collection
@@ -402,6 +477,7 @@ def create_cache_wrapper(
 
         # Override all parameters from DecoratorConfig
         ttl = config.ttl if ttl is None else ttl
+        stale_ttl = config.stale_ttl if stale_ttl is None else stale_ttl
         namespace = config.namespace if namespace is None else namespace
         serializer = config.serializer
         integrity_checking = config.integrity_checking
@@ -415,9 +491,6 @@ def create_cache_wrapper(
 
         # Circuit breaker settings
         circuit_breaker = config.circuit_breaker.enabled
-
-        # Timeout settings
-        adaptive_timeout = config.timeout.enabled
 
         # Backpressure settings
         backpressure = config.backpressure.enabled
@@ -451,7 +524,6 @@ def create_cache_wrapper(
 
     # Fast mode: Disable monitoring overhead, keep performance features
     use_circuit_breaker = circuit_breaker and not fast_mode
-    use_adaptive_timeout = adaptive_timeout and not fast_mode
     use_backpressure = backpressure and not fast_mode
     use_collect_stats = collect_stats and not fast_mode
     # use_enable_tracing = enable_tracing and not fast_mode  # Not used after CacheConfig removal
@@ -536,7 +608,6 @@ def create_cache_wrapper(
         namespace=namespace or "default",
         circuit_breaker_enabled=use_circuit_breaker,
         circuit_breaker_config=cb_config_dict or {},  # Use empty dict as default
-        adaptive_timeout_enabled=use_adaptive_timeout,
         backpressure_enabled=use_backpressure,
         backpressure_config={"max_concurrent": max_concurrent_requests} if use_backpressure else None,
         collect_stats=use_collect_stats,
@@ -594,6 +665,189 @@ def create_cache_wrapper(
     # With ttl=None entries never go stale, so there is nothing to revalidate.
     _l1_swr_active = _object_cache is not None and _l1_config.swr_enabled and ttl is not None and ttl > 0
 
+    # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
+    # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
+    # its fresh TTL and labels the read stale; we return the stale value immediately
+    # and re-run the wrapped function in the background. Requires an SWR-capable
+    # backend (CachekitIO — the server signals freshness on read).
+    _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
+    _l2_swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
+    _stale_ttl: int | None = None
+    if stale_ttl is not None:
+        from ..config.validation import ConfigurationError
+
+        # Type-check BEFORE the zero opt-out test: bool is an int subclass and
+        # False == 0 == 0.0, so without this ordering True silently means a
+        # 1-second window and False/0.0 silently opt out unvalidated.
+        if isinstance(stale_ttl, bool) or not isinstance(stale_ttl, int) or stale_ttl < 0:
+            raise ConfigurationError(f"stale_ttl must be a non-negative integer, got {stale_ttl!r}")
+        if stale_ttl != 0:  # integer 0 = explicit SWR opt-out
+            if ttl is None or ttl <= 0:
+                raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
+            if ttl + stale_ttl > _max_total_ttl:
+                raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
+            if not _l2_swr_backend_capable:
+                raise ConfigurationError(
+                    "stale_ttl requires an SWR-capable backend (CachekitIO). "
+                    "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
+                )
+            _stale_ttl = stale_ttl
+    elif (
+        config is not None
+        and getattr(config, "swr_by_default", False)
+        and ttl is not None
+        and ttl > 0
+        and _l2_swr_backend_capable
+    ):
+        # Preset default (io()): stale window = ttl, capped so the total stays
+        # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
+        # above the cap leaves no window headroom -> no default (never negative).
+        _default_window = min(ttl, _max_total_ttl - ttl)
+        _stale_ttl = _default_window if _default_window > 0 else None
+
+    _l2_swr_active = _stale_ttl is not None
+
+    # Background revalidation machinery — mirrors the L1-only SWR shapes below:
+    # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
+    # keys can't spawn unbounded work. Cross-client single-flight rides the
+    # backend's async lock as a non-blocking lease (contested = serve stale, no
+    # wait, no retry — _try_acquire_lock already treats 409 AND 200+null as
+    # contested, LAB-240). The lease is best-effort per spec.
+    _l2_swr_inflight: set[str] = set()
+    _l2_swr_tasks: set[asyncio.Task[None]] = set()
+    _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
+    _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
+    _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
+
+    def _put_l1(cache_key: str, serialized_data: Any) -> None:
+        """Backfill L1 with serialized bytes (str payloads encoded) under the fresh TTL."""
+        if _l1_cache and cache_key:
+            _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
+            _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+
+    def _l2_swr_try_begin(cache_key: str) -> bool:
+        """Claim a revalidation slot for this key; False = already in flight or at capacity.
+
+        The check-then-add on _l2_swr_inflight is not atomic across OS threads; a rare
+        duplicate schedule is benign (the backend lease or last-write-wins between two
+        freshly computed values absorbs it — spec explicitly allows duplicates).
+        """
+        nonlocal _l2_swr_inflight, _l2_swr_tasks, _l2_swr_slots, _l2_swr_pid
+        if _l2_swr_pid != os.getpid():
+            # Forked child: inherited in-flight keys would never clear (the parent
+            # threads that call _l2_swr_end don't survive fork), permanently starving
+            # those keys of revalidation, and the inherited semaphore may carry
+            # consumed slots or a lock captured mid-acquire (even a non-blocking
+            # acquire would then hang). Replace wholesale. Sibling threads racing
+            # this swap are as benign as the dedup race above: worst case one
+            # duplicate schedule or one lost slot, both self-healing.
+            _l2_swr_inflight = set()
+            _l2_swr_tasks = set()
+            _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
+            _l2_swr_pid = os.getpid()
+        if cache_key in _l2_swr_inflight:
+            return False
+        if not _l2_swr_slots.acquire(blocking=False):
+            return False
+        _l2_swr_inflight.add(cache_key)
+        return True
+
+    def _l2_swr_end(cache_key: str) -> None:
+        _l2_swr_inflight.discard(cache_key)
+        _l2_swr_slots.release()
+
+    async def _l2_swr_recompute_store_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+        result = await func(*call_args, **call_kwargs)
+        serialized_data = operation_handler.serialization_handler.serialize_data(
+            result, call_args, call_kwargs, cache_key=cache_key
+        )
+        await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+            cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
+        )
+        # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
+        _put_l1(cache_key, serialized_data)
+
+    async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+        """Background revalidation for async functions. Failures are silent by design:
+        the caller already got the stale value; the entry hard-expires at evict_at and
+        the next request takes the ordinary synchronous miss path (spec degradation)."""
+        try:
+            _acquire_lock = getattr(_backend, "acquire_lock", None)
+            if _acquire_lock is not None:
+                async with _acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
+                    if not got_lease:
+                        return  # another client is revalidating — stale already served
+                    await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+            else:
+                await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+        except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
+        finally:
+            _l2_swr_end(cache_key)
+
+    def _l2_swr_revalidate_sync(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+        """Background revalidation for sync functions (daemon thread).
+
+        ponytail: per-process single-flight only — the distributed lease API is
+        async-only; the lease is a spec SHOULD and duplicate revalidation is benign
+        (last-write-wins between fresh values). Add a sync lease if cross-client
+        duplicate recomputes ever measurably matter.
+        """
+        try:
+            result = func(*call_args, **call_kwargs)
+            serialized_data = operation_handler.serialization_handler.serialize_data(
+                result, call_args, call_kwargs, cache_key=cache_key
+            )
+            operation_handler.cache_handler.set(  # type: ignore[attr-defined]
+                cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
+            )
+            _put_l1(cache_key, serialized_data)
+        except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
+        finally:
+            _l2_swr_end(cache_key)
+
+    def _l2_swr_schedule(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], *, is_async: bool) -> None:
+        """Kick off background revalidation for a stale hit (at most one per key).
+
+        Arguments are deep-copied before scheduling (same contract as the L1-only
+        SWR path): the cache key was computed from the arguments at call time, and
+        the refresh runs later — it must not see mutations the caller makes after
+        receiving the stale value, or it would store the new state under the old
+        key. Not-copyable arguments skip the refresh (stale keeps being served; a
+        later hit retries). Any scheduling failure releases the slot so the key
+        never becomes permanently unrevalidatable.
+        """
+        if not _l2_swr_try_begin(cache_key):
+            return
+        try:
+            call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
+        except Exception as exc:
+            _l2_swr_end(cache_key)
+            _logger.debug("SWR revalidation skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc)
+            return
+        try:
+            if is_async:
+                task = asyncio.create_task(_l2_swr_revalidate_async(cache_key, call_args, call_kwargs))
+                _l2_swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
+                task.add_done_callback(_l2_swr_tasks.discard)
+            else:
+                # Snapshot the caller's context (captured in-request, where e.g. a
+                # ContextVarExtractor's tenant var is set) so the daemon thread sees
+                # the same contextvars the async path inherits via create_task —
+                # without this, encryption tenant extraction fails off-request and
+                # the refresh silently no-ops (LAB-381 panel, MAJ).
+                ctx = contextvars.copy_context()
+                threading.Thread(
+                    target=ctx.run,
+                    args=(_l2_swr_revalidate_sync, cache_key, call_args, call_kwargs),
+                    daemon=True,
+                    name="cachekit-swr-revalidate",  # no key material (CWE-532)
+                ).start()
+        except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
+            _l2_swr_end(cache_key)
+            _logger.debug("SWR revalidation could not be scheduled for %s: %s", redact_cache_key(cache_key), exc)
+
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
     # Generated lazily on first use or regenerated after cache_clear()
@@ -621,9 +875,9 @@ def create_cache_wrapper(
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
     _cached_keys: set[str] = set()
 
-    # Create stats tracker (session ID will be lazy-initialized on first use)
-    # Pass l1_enabled for rate limit classification header
-    _stats = _FunctionStats(function_identifier=function_identifier, l1_enabled=l1_enabled)
+    # Shared stats tracker from the process-global registry (session ID lazy-initialized
+    # on first use). Re-decoration reuses the same counters — see _get_function_stats.
+    _stats = _get_function_stats(function_identifier, l1_enabled)
 
     # L1-only SWR: strong refs to in-flight refresh tasks. asyncio only keeps weak
     # refs to tasks, so a fire-and-forget refresh could be GC'd mid-flight otherwise.
@@ -635,6 +889,7 @@ def create_cache_wrapper(
     # function; at capacity the refresh is skipped (stale keeps being served)
     # and a later qualifying hit retries.
     _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+    _l1_swr_pid = os.getpid()  # owner process — see _l2_swr_try_begin's fork note
 
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
@@ -649,7 +904,14 @@ def create_cache_wrapper(
         refresh (version) is cancelled so a later call retries, and the caller
         must not schedule a refresh.
         """
+        nonlocal _l1_swr_tasks, _l1_swr_slots, _l1_swr_pid
         assert _object_cache is not None  # noqa: S101 - only called when scheduling a refresh
+        if _l1_swr_pid != os.getpid():
+            # Forked child: same wholesale reset as _l2_swr_try_begin — the inherited
+            # semaphore is parent state (consumed slots, possibly a poisoned lock).
+            _l1_swr_tasks = set()
+            _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
+            _l1_swr_pid = os.getpid()
         if not _l1_swr_slots.acquire(blocking=False):
             _object_cache.cancel_refresh(cache_key, version)
             return None
@@ -658,7 +920,9 @@ def create_cache_wrapper(
         except Exception as exc:
             _l1_swr_slots.release()
             _object_cache.cancel_refresh(cache_key, version)
-            _logger.debug("L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", cache_key, exc)
+            _logger.debug(
+                "L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc
+            )
             return None
 
     def _l1_swr_task_done(task: asyncio.Task[None], cache_key: str) -> None:
@@ -694,7 +958,7 @@ def create_cache_wrapper(
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
                 _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
-                _logger.debug("L1-only SWR background refresh failed for %s: %s", cache_key, exc)
+                _logger.debug("L1-only SWR background refresh failed for %s: %s", redact_cache_key(cache_key), exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -730,7 +994,6 @@ def create_cache_wrapper(
         features.set_correlation_id(correlation_id)
 
         cache_key = None  # Initialize to avoid UnboundLocalError
-        func_start_time: float | None = None  # Initialize for exception handlers
 
         # Create tracing span for cache operation
         span_attributes = {
@@ -857,15 +1120,13 @@ def create_cache_wrapper(
                 if _backend is None:
                     _backend = get_backend_provider().get_backend()
 
-                # Setup cache handler strategy on first use with adaptive timeout
+                # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
                     _backend,
-                    timeout_provider=features.get_timeout,
                     backpressure_controller=features.backpressure,
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
-                backend = _backend
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -963,12 +1224,19 @@ def create_cache_wrapper(
         try:
             refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
 
-            # Use operation handler for all cache access (uses backend internally)
-            cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
+            # Use operation handler for all cache access (uses backend internally).
+            # With SWR active the read carries the server's freshness signal
+            # (LAB-381): a stale hit is served immediately and revalidated on a
+            # background daemon thread below.
+            _sync_l2_stale = False
+            if _l2_swr_active:
+                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
+                cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
+            else:
+                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
 
-            # Record duration for adaptive timeout
             duration = time.time() - start_time
-            features.record_duration(duration)
 
             if cached_result is not None:
                 # Cached result is a tuple (True, actual_value)
@@ -1014,6 +1282,10 @@ def create_cache_wrapper(
                 duration_ms = duration * 1000
                 _stats.record_l2_hit(duration_ms)
 
+                # SWR: stale hit — serve now, revalidate on a daemon thread.
+                if _sync_l2_stale:
+                    _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
+
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
@@ -1048,18 +1320,13 @@ def create_cache_wrapper(
 
         try:
             # Execute the original function
-            func_start_time = time.time() if features.collect_stats else None
             result = func(*args, **kwargs)
-
-            if features.collect_stats and func_start_time is not None:
-                func_latency = (time.time() - func_start_time) * 1000
-                features.record_duration(func_latency)
 
             # Serialize and cache the result
             try:
                 # Store using operation handler (pass args/kwargs for tenant extraction)
                 # Returns serialized bytes for L1 cache storage
-                serialized_bytes = operation_handler.store_result(cache_key, result, ttl, args, kwargs)
+                serialized_bytes = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
                 if _l1_cache and cache_key and serialized_bytes:
@@ -1118,9 +1385,6 @@ def create_cache_wrapper(
         except Exception as e:
             # Other exceptions - record and re-raise
             features.record_failure(e)
-            if features.collect_stats and "func_start_time" in locals() and func_start_time is not None:
-                func_latency = (time.time() - func_start_time) * 1000
-                features.record_duration(func_latency)
             raise
         finally:
             # Clear correlation ID after operation
@@ -1143,7 +1407,6 @@ def create_cache_wrapper(
         try:
             # Get cache key early for consistent usage - note this may fail for complex types
             cache_key = None
-            func_start_time: float | None = None  # Initialize for exception handlers
             try:
                 # Interop mode takes priority (mutually exclusive with key= and fast_mode)
                 if interop is not None:
@@ -1319,7 +1582,6 @@ def create_cache_wrapper(
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
                 _backend,
-                timeout_provider=features.get_timeout,
                 backpressure_controller=features.backpressure,
                 ttl_refresh_threshold=ttl_refresh_threshold,
             )
@@ -1333,9 +1595,18 @@ def create_cache_wrapper(
                 correlation_id = features.create_correlation_id()
 
             try:
-                # Route through get_cached_value_async so corrupt/tampered entries inherit
-                # eviction + the cache_get_deserialize metric instead of persisting (#159)
-                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                # Route through the operation handler so corrupt/tampered entries inherit
+                # eviction + the cache_get_deserialize metric instead of persisting (#159),
+                # and fail-closed tamper errors propagate (LAB-108). With SWR active the
+                # read also carries the server's freshness signal (LAB-381): a stale hit
+                # is served immediately and revalidated in the background below.
+                _l2_is_stale = False
+                if _l2_swr_active:
+                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                    _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                else:
+                    cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
                     # Cache hit: (True, value, raw serialized envelope for L1 backfill)
@@ -1354,8 +1625,10 @@ def create_cache_wrapper(
                             duration_ms=get_duration_ms,
                         )
 
-                    # Update L1 cache with Redis value (serialized bytes) for subsequent fast access
-                    if _l1_cache and cache_key and cached_data:
+                    # Update L1 cache with Redis value (serialized bytes) for subsequent fast access.
+                    # Never record a stale-window value as fresh in L1 (spec: local caches
+                    # MUST NOT extend service past the server's bounds).
+                    if _l1_cache and cache_key and cached_data and not _l2_is_stale:
                         # cached_data is already serialized bytes from Redis
                         cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                         _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
@@ -1379,6 +1652,11 @@ def create_cache_wrapper(
 
                     # Record L2 hit with latency for cache_info()
                     _stats.record_l2_hit(get_duration_ms)
+
+                    # SWR: stale hit — value already in hand; revalidate in the
+                    # background so no request pays the recompute at a TTL boundary.
+                    if _l2_is_stale:
+                        _l2_swr_schedule(cache_key, args, kwargs, is_async=True)
 
                     return result
 
@@ -1478,12 +1756,7 @@ def create_cache_wrapper(
                                 )
 
                         # Execute the original function (with or without lock)
-                        func_start_time = time.perf_counter() if features.collect_stats else None
                         result = await func(*args, **kwargs)
-
-                        if features.collect_stats and func_start_time is not None:
-                            func_latency = (time.perf_counter() - func_start_time) * 1000
-                            features.record_duration(func_latency)
 
                         # Serialize and cache the result
                         try:
@@ -1496,14 +1769,11 @@ def create_cache_wrapper(
                                 cache_key,
                                 serialized_data,
                                 ttl=ttl,
+                                stale_ttl=_stale_ttl,
                             )
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                            if _l1_cache and cache_key:
-                                serialized_bytes = (
-                                    serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-                                )
-                                _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                            _put_l1(cache_key, serialized_data)
                             _cached_keys.add(cache_key)
 
                             # Record successful cache set
@@ -1568,12 +1838,7 @@ def create_cache_wrapper(
 
             try:
                 # Execute the original function
-                func_start_time = time.perf_counter() if features.collect_stats else None
                 result = await func(*args, **kwargs)
-
-                if features.collect_stats and func_start_time is not None:
-                    func_latency = (time.perf_counter() - func_start_time) * 1000
-                    features.record_duration(func_latency)
 
                 # Serialize and cache the result
                 try:
@@ -1586,14 +1851,11 @@ def create_cache_wrapper(
                         cache_key,
                         serialized_data,
                         ttl=ttl,
+                        stale_ttl=_stale_ttl,
                     )
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    if _l1_cache and cache_key:
-                        serialized_bytes = (
-                            serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-                        )
-                        _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
+                    _put_l1(cache_key, serialized_data)
                     _cached_keys.add(cache_key)
 
                     # Record successful cache set
@@ -1629,9 +1891,6 @@ def create_cache_wrapper(
             except Exception as e:
                 # Function execution failed - record and re-raise
                 features.record_failure(e)
-                if features.collect_stats and "func_start_time" in locals() and func_start_time is not None:
-                    func_latency = (time.perf_counter() - func_start_time) * 1000
-                    features.record_duration(func_latency)
                 raise
         finally:
             # Clear correlation ID after operation (matches sync wrapper)
@@ -1777,22 +2036,20 @@ def create_cache_wrapper(
         Returns hit/miss statistics for the decorated function.
 
         Threading behavior:
-            When used with threading/multiprocessing, statistics are tracked
-            per-function (shared across all invocations), not per-thread.
-            The internal _FunctionStats object is shared by all threads calling
-            the same decorated function, with thread-safe locking via RLock.
+            Statistics are tracked per function identity (``module.qualname``),
+            shared across all threads and all decorator applications, with
+            thread-safe locking via RLock. Re-applying a decorator to the same
+            function reuses the existing counters rather than resetting them —
+            the session ID is stable across re-decorations, and counters that
+            reset under an unchanged session ID would trip the server's
+            anti-replay validation. Consequently, decorating the same function
+            twice (even with different options) reports combined statistics
+            from one shared tracker.
 
-            For per-thread statistics, create separate decorated instances:
-
-                # Global shared stats
-                @cache()
-                def shared_func(x): ...
-
-                # Per-thread stats (different function instances)
-                def get_thread_func():
-                    @cache()
-                    def thread_func(x): ...
-                    return thread_func
+        Fork behavior:
+            A forked child process starts with zeroed counters and derives a
+            new session ID from its own process UUID; the parent's statistics
+            are unaffected.
 
         Returns:
             CacheInfo: Named tuple with hits, misses, maxsize, currsize

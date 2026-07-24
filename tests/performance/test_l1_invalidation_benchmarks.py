@@ -45,7 +45,6 @@ def test_get_with_swr_hit_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -123,7 +122,6 @@ def test_get_with_swr_stale_detection_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -204,7 +202,6 @@ def test_invalidate_by_key_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -274,7 +271,6 @@ def test_invalidate_by_namespace_with_index_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,  # Index enabled
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -349,7 +345,6 @@ def test_invalidate_by_namespace_without_index_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=False,  # Index DISABLED
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -431,7 +426,6 @@ def test_invalidate_all_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -510,7 +504,6 @@ def test_complete_refresh_latency() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -576,7 +569,6 @@ def test_version_mismatch_fast_fail() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -652,7 +644,6 @@ def test_concurrent_invalidation_throughput() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)
@@ -776,7 +767,6 @@ def test_l1_invalidation_total_sla() -> None:
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,
-        invalidation_enabled=True,
         namespace_index=True,
     )
     cache = L1Cache(max_memory_mb=100, config=config)

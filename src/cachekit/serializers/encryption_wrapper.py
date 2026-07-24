@@ -286,7 +286,11 @@ class EncryptionWrapper:
         Raises:
             ValueError: If cache_key is empty when data is encrypted
             TypeError: If cache_key is not a string
-            EncryptionError: If decryption fails (including cache_key mismatch)
+            DecryptionAuthenticationError: If the entry claims plaintext
+                (``metadata.encrypted=False`` — this wrapper never returns
+                unauthenticated bytes), the tenant mismatches, or AES-GCM
+                authentication fails
+            EncryptionError: If deserialization fails after authenticated decryption
 
         Examples:
             Successful roundtrip with matching cache_key:
@@ -311,11 +315,35 @@ class EncryptionWrapper:
             Traceback (most recent call last):
                 ...
             DecryptionAuthenticationError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
+
+            An entry claiming plaintext is refused outright — the wrapper is
+            encryption-mandatory and fails closed on its own (LAB-271,
+            defense-in-depth behind the handler-level LAB-241 guard):
+
+            >>> from cachekit.serializers.base import SerializationFormat
+            >>> plain_meta = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK)
+            >>> plain_meta.encrypted
+            False
+            >>> wrapper.deserialize(b"attacker-controlled bytes", plain_meta, cache_key="cart:user:42")  # doctest: +IGNORE_EXCEPTION_DETAIL
+            Traceback (most recent call last):
+                ...
+            DecryptionAuthenticationError: EncryptionWrapper.deserialize received an entry claiming plaintext ...
         """
-        # Handle unencrypted data (fallback case)
-        # Check encrypted flag (orthogonal to format - encryption is a wrapper, not a format)
+        # SECURITY (LAB-271, defense-in-depth behind the LAB-241 handler guard):
+        # this wrapper is encryption-mandatory, so an entry claiming plaintext can
+        # never be legitimate input here. The frame header carrying this flag is
+        # NOT covered by the AES-GCM tag and may be forged; benign migration reads
+        # are converted to miss+evict by CacheSerializationHandler.deserialize_data
+        # before this wrapper is ever invoked. Reaching this branch means a caller
+        # bypassed that guard — fail closed rather than return unauthenticated bytes.
         if not metadata.encrypted:
-            return self.serializer.deserialize(data, metadata)
+            raise DecryptionAuthenticationError(
+                "EncryptionWrapper.deserialize received an entry claiming plaintext "
+                "(metadata.encrypted=False). This wrapper is encryption-mandatory and "
+                "never returns unauthenticated bytes: the plaintext flag lives in the "
+                "unauthenticated frame header and may be forged. Route legitimate "
+                "plaintext reads through CacheSerializationHandler, not this wrapper."
+            )
 
         # SECURITY: Validate cache_key type and value for encrypted data
         if not isinstance(cache_key, str):

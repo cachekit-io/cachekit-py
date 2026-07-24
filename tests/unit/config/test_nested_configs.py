@@ -1,9 +1,8 @@
 """Unit tests for nested configuration classes.
 
-Tests all 6 nested config classes:
+Tests all 5 nested config classes:
 - L1CacheConfig: max_size_mb >= 1, defaults, frozen immutability
 - CircuitBreakerConfig: thresholds >= 1, defaults
-- TimeoutConfig: min <= initial <= max, 0 < percentile <= 100
 - BackpressureConfig: max_concurrent >= 1
 - MonitoringConfig: boolean flags, no validation constraints
 - EncryptionConfig: master_key required if enabled, tenant mode mutual exclusivity
@@ -19,7 +18,6 @@ from cachekit.config.nested import (
     EncryptionConfig,
     L1CacheConfig,
     MonitoringConfig,
-    TimeoutConfig,
 )
 from cachekit.config.validation import ConfigurationError
 
@@ -123,80 +121,6 @@ class TestCircuitBreakerConfig:
         config = CircuitBreakerConfig(half_open_requests=0)
         with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
             config.validate()
-
-
-@pytest.mark.unit
-class TestTimeoutConfig:
-    """Test TimeoutConfig validation and defaults."""
-
-    def test_defaults(self) -> None:
-        """Test default values."""
-        config = TimeoutConfig()
-        assert config.enabled is True
-        assert config.initial == 1.0
-        assert config.min == 0.1
-        assert config.max == 5.0
-        assert config.window_size == 1000
-        assert config.percentile == 95.0
-
-    def test_custom_values(self) -> None:
-        """Test custom configuration."""
-        config = TimeoutConfig(enabled=False, initial=2.0, min=0.5, max=10.0, window_size=500, percentile=99.0)
-        assert config.enabled is False
-        assert config.initial == 2.0
-        assert config.min == 0.5
-        assert config.max == 10.0
-        assert config.window_size == 500
-        assert config.percentile == 99.0
-
-    def test_frozen_immutability(self) -> None:
-        """Test frozen dataclass prevents mutation."""
-        config = TimeoutConfig()
-        with pytest.raises(AttributeError, match="cannot assign to field"):
-            config.enabled = False  # type: ignore[misc]
-
-    def test_validate_success(self) -> None:
-        """Test validation passes for valid config."""
-        config = TimeoutConfig(min=0.1, initial=1.0, max=5.0, percentile=95.0)
-        config.validate()  # Should not raise
-
-    def test_validate_initial_below_min(self) -> None:
-        """Test validation fails when initial < min."""
-        config = TimeoutConfig(min=1.0, initial=0.5, max=5.0)
-        with pytest.raises(ConfigurationError, match="min .* <= initial .* <= max"):
-            config.validate()
-
-    def test_validate_initial_above_max(self) -> None:
-        """Test validation fails when initial > max."""
-        config = TimeoutConfig(min=0.1, initial=10.0, max=5.0)
-        with pytest.raises(ConfigurationError, match="min .* <= initial .* <= max"):
-            config.validate()
-
-    def test_validate_percentile_zero(self) -> None:
-        """Test validation fails when percentile = 0."""
-        config = TimeoutConfig(percentile=0.0)
-        with pytest.raises(ConfigurationError, match="percentile must be 0.0-100.0, got 0.0"):
-            config.validate()
-
-    def test_validate_percentile_negative(self) -> None:
-        """Test validation fails when percentile < 0."""
-        config = TimeoutConfig(percentile=-5.0)
-        with pytest.raises(ConfigurationError, match="percentile must be 0.0-100.0, got -5.0"):
-            config.validate()
-
-    def test_validate_percentile_above_100(self) -> None:
-        """Test validation fails when percentile > 100."""
-        config = TimeoutConfig(percentile=101.0)
-        with pytest.raises(ConfigurationError, match="percentile must be 0.0-100.0, got 101.0"):
-            config.validate()
-
-    def test_validate_percentile_boundary_valid(self) -> None:
-        """Test validation passes at percentile boundary (0 < p <= 100)."""
-        config = TimeoutConfig(percentile=100.0)
-        config.validate()  # Should not raise
-
-        config = TimeoutConfig(percentile=0.01)
-        config.validate()  # Should not raise
 
 
 @pytest.mark.unit

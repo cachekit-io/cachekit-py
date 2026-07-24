@@ -97,7 +97,7 @@ class TestBackpressureIntegration:
         backpressure_controller = BackpressureController(max_concurrent=max_concurrent, timeout=0.1)
 
         # Create handler with backpressure controller
-        handler = StandardCacheHandler(mock_backend, timeout_provider=None, backpressure_controller=backpressure_controller)
+        handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
         # Verify backpressure controller is set
         assert handler.backpressure_controller is backpressure_controller
@@ -126,7 +126,7 @@ class TestBackpressureIntegration:
         backpressure_controller = BackpressureController(max_concurrent=2, queue_size=1, timeout=0.05)
 
         # Create handler with backpressure controller
-        handler = StandardCacheHandler(mock_backend, timeout_provider=None, backpressure_controller=backpressure_controller)
+        handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
         # Track results and exceptions
         results = []
@@ -177,7 +177,7 @@ class TestBackpressureIntegration:
         backpressure_controller = BackpressureController(max_concurrent=10)
 
         # Create handler with backpressure controller
-        handler = StandardCacheHandler(mock_backend, timeout_provider=None, backpressure_controller=backpressure_controller)
+        handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
         # Test async operations (internally call sync backend methods)
         result = await handler.get_async("test_key")
@@ -207,7 +207,7 @@ class TestBackpressureIntegration:
         backpressure_controller = BackpressureController(max_concurrent=10)
 
         # Create handler with backpressure controller
-        handler = StandardCacheHandler(mock_backend, timeout_provider=None, backpressure_controller=backpressure_controller)
+        handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
         # Record initial semaphore state
         initial_permits = backpressure_controller._semaphore._value

@@ -20,6 +20,8 @@ from cachekit.reliability import (
     CircuitState,
 )
 
+from ..utils.circuit_breaker_helpers import guarded_call
+
 
 class TestCircuitBreakerRaceConditions:
     """Test circuit breaker race condition prevention."""
@@ -43,7 +45,7 @@ class TestCircuitBreakerRaceConditions:
             # Force breaker into OPEN state
             mock_func = MagicMock(side_effect=Exception("Redis error"))
             try:
-                breaker.call(mock_func)
+                guarded_call(breaker, mock_func)
             except Exception:
                 pass  # Expected
 
@@ -66,7 +68,7 @@ class TestCircuitBreakerRaceConditions:
 
                 # Check if request is allowed (triggers potential transition)
                 try:
-                    _result = breaker.call(mock_success_func)
+                    _result = guarded_call(breaker, mock_success_func)
                     # If we get here, we were allowed through
                     with transition_lock:
                         if breaker._state == CircuitState.HALF_OPEN:
@@ -110,7 +112,7 @@ class TestCircuitBreakerRaceConditions:
             # Force into OPEN state
             mock_func = MagicMock(side_effect=Exception("Redis error"))
             try:
-                breaker.call(mock_func)
+                guarded_call(breaker, mock_func)
             except Exception:
                 pass
 
@@ -198,7 +200,7 @@ class TestCircuitBreakerRaceConditions:
                 mock_func.side_effect = Exception("Simulated failure")
 
             try:
-                _result = breaker.call(mock_func)
+                _result = guarded_call(breaker, mock_func)
                 with observation_lock:
                     state_observations.append(
                         {"state": breaker._state, "result": "success", "permits": breaker._half_open_permits}
@@ -259,7 +261,7 @@ class TestCircuitBreakerRaceConditions:
                     mock_func = MagicMock(return_value="success")
 
                 try:
-                    _result = breaker.call(mock_func)
+                    _result = guarded_call(breaker, mock_func)
                     with change_lock:
                         state_changes.append(("success", breaker._state))
                 except Exception:
@@ -303,7 +305,7 @@ class TestCircuitBreakerRaceConditions:
             # Force into OPEN state
             mock_func = MagicMock(side_effect=Exception("Redis error"))
             try:
-                breaker.call(mock_func)
+                guarded_call(breaker, mock_func)
             except Exception:
                 pass
 
@@ -326,7 +328,7 @@ class TestCircuitBreakerRaceConditions:
                 mock_success_func = MagicMock(return_value="success")
 
                 try:
-                    _result = breaker.call(mock_success_func)
+                    _result = guarded_call(breaker, mock_success_func)
                     with transition_lock:
                         transitions_attempted.append(True)
                     return True

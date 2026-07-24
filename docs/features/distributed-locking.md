@@ -124,8 +124,6 @@ def operation(x):
 # If the lock's blocking_timeout expires before slow_compute() finishes,
 # waiting pods fall through without the lock.
 # Solution: Ensure your function completes within the backend's lock timeout.
-# The AdaptiveTimeoutManager adjusts lock timeouts automatically based on
-# observed lock operation durations.
 ```
 
 ### Lock Holder Crashes
@@ -215,15 +213,6 @@ async def acquire_lock(
 4. On context exit: DEL lock key (only if still holder)
    Lock auto-expires via Redis TTL if holder crashes
 ```
-
-### Adaptive Lock Timeouts
-
-Lock timeouts are managed by `AdaptiveTimeoutManager`, which adjusts based on:
-- Average lock operation duration
-- Lock contention levels (inferred from wait times)
-- Success rate trends
-
-This prevents both premature timeouts (function takes longer than expected) and excessive waits (hanging on a crashed holder).
 
 ### Integration with Cache Layers
 ```
@@ -318,7 +307,6 @@ A: Check Prometheus: `rate(cachekit_cache_misses_total[1m])` spike = stampede ri
 ## See Also
 
 - [Circuit Breaker](circuit-breaker.md) - Prevents cascading failures
-- [Adaptive Timeouts](adaptive-timeouts.md) - Auto-tune Redis timeouts
 - [Prometheus Metrics](prometheus-metrics.md) - Monitor lock performance
 - [Comparison Guide](../comparison.md) - Only cachekit + dogpile.cache have locking
 
