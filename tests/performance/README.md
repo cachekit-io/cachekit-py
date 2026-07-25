@@ -91,14 +91,11 @@ Tests per-request wrapper creation overhead:
 ### 7. `test_large_object_memory.py` - **Memory Regression Guards** (CI-gated: `performance and slow`)
 
 Deterministic peak-memory bounds for large-object caching, at two scopes (#169):
-
-- **Serializer-only** (`test_store_path...` / `test_load_path...`): serializer layer in
-  isolation via tracemalloc. Store ~2x logical, load ~1.1x, wire ~1x.
-- **Backend-inclusive** (`test_file_backend_*`): the read path end-to-end through the File
-  backend (backend read → unwrap → deserialize). The mmap fast path allocates ~1.1x on the
-  Python heap and costs ~2x peak RSS (mapped pages + df); the non-mmap default-serializer
-  path currently costs ~5x on the heap. Subprocess RSS uses `VmHWM`, not `ru_maxrss`
-  (which survives fork+exec and inherits the parent's watermark — false passes).
+**serializer-only** (`test_store_path...` / `test_load_path...`, tracemalloc in isolation)
+and **backend-inclusive** (`test_file_backend_*`, the read path end-to-end through the
+File backend, tracemalloc + subprocess peak RSS). Bounds, measured multipliers, and the
+metric-choice rationale (VmHWM vs `ru_maxrss`, tracemalloc/RSS blind spots) live in the
+module and per-test docstrings — the single source of truth.
 
 **Key Insight**: The headline low-read-memory claim maps to the backend-inclusive numbers;
 serializer-only numbers can stay green while a backend read path regrows a full-payload copy.

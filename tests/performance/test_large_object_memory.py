@@ -1,23 +1,19 @@
 """Memory regression guards for large-object (Arrow/DataFrame) caching.
 
 These lock in the fixes that removed the base64+JSON wrapper inflation and the
-Arrow serializer's copy chain. They assert DETERMINISTIC, environment-independent
-metrics (Python-tracked peak via tracemalloc + on-wire size), not process RSS — so
-they are stable in CI yet fail loudly if the regressions return:
+Arrow serializer's copy chain, asserting DETERMINISTIC metrics only: tracemalloc
+peaks and on-wire size in-process, and — for allocations tracemalloc cannot see
+(Rust, Arrow pool, mmap residency) — peak RSS via VmHWM in dedicated subprocesses.
 
 - base64+JSON wrap drove store tracemalloc peak to ~5.7x logical and the wire to 1.33x.
 - the read path's base64-decode + JSON-parse + full-body slice drove read peak to ~5.4x.
 
 Pre-fix these assertions fail; post-fix store peak is ~2x, read ~1.1x, wire ~1x.
 
-Two measurement scopes live here (cachekit-py#169):
-
-- serializer-only (`test_store_path...`/`test_load_path...`): the serializer layer in
-  isolation, with the read input allocated before measurement starts.
-- backend-inclusive (`test_file_backend_*`): the read path END-TO-END through the File
-  backend (backend read -> unwrap -> deserialize), so a regression reintroducing a
-  full-payload copy in a BACKEND read path fails even while the serializer-only
-  numbers stay green. The headline low-read-memory claim maps to these.
+Two measurement scopes live here — serializer-only (`test_store_path...` /
+`test_load_path...`) and backend-inclusive (`test_file_backend_*`, cachekit-py#169);
+see the "Backend-inclusive read paths" section banner below for the split and why
+the headline low-read-memory claim maps to the backend-inclusive numbers.
 """
 
 from __future__ import annotations
@@ -202,11 +198,14 @@ def test_file_backend_read_python_allocations_bounded(tmp_path: Path) -> None:
     """END-TO-END DataFrame read through the File backend (mmap fast path, #171).
 
     The whole pipeline — get_buffer mmap -> envelope unwrap -> Arrow deserialize ->
-    pandas — should allocate ~1.1x logical on the Python heap (just the output df;
-    the mapped payload and Arrow-pool buffers are not Python allocations). If any
-    stage rematerializes the payload as bytes — get_buffer regressing to os.read
-    (file bytes + payload slice, measures ~1.9x via fault injection), a bytes()
-    coercion of the zero-copy view — the peak clears the 1.6x bound and this fails.
+    pandas — allocates ~0.0x logical on the Python heap: the mapped payload and the
+    Arrow-pool buffers are not Python allocations, and ``to_pandas(self_destruct,
+    split_blocks)`` hands back numpy views over pool buffers rather than copies, so
+    even the output df is invisible to tracemalloc. Any stage rematerializing the
+    payload as Python bytes trips the 0.5x bound (fault-injected: a bytes() coercion
+    of the zero-copy view measures ~1.0x; get_buffer regressing to os.read measures
+    ~1.9x). If a pyarrow upgrade makes to_pandas copy again, this fails LOUD at
+    ~1.0x — recalibrate consciously; the guard never silently widens.
     """
     df = _numeric_df(50)
     logical = _logical(df)
@@ -229,9 +228,10 @@ def test_file_backend_read_python_allocations_bounded(tmp_path: Path) -> None:
 
     assert hit is not None, "end-to-end File read missed (errors read as miss — check logs)"
     pd.testing.assert_frame_equal(hit[1], df)
-    assert peak / logical < 1.6, (
-        f"File-backend end-to-end read peak {peak / logical:.2f}x logical — a full-payload "
-        f"read-side copy is back in the backend path (expected ~1.1x zero-copy, ~2x+ with a copy)"
+    assert peak / logical < 0.5, (
+        f"File-backend end-to-end read peak {peak / logical:.2f}x logical — a full-payload copy is "
+        f"back in the read path (expected ~0.0x zero-copy; ~1x = bytes() coercion, ~2x = os.read "
+        f"fallback, ~1x with neither = pyarrow to_pandas stopped returning views — recalibrate)"
     )
 
 
@@ -288,7 +288,7 @@ def test_file_backend_end_to_end_read_peak_rss_bounded(tmp_path: Path) -> None:
     tracemalloc) — measures ~3x and blows the 2.6x bound (verified by fault
     injection). The one class this metric cannot see: mmap falling back to os.read
     swaps file-backed pages for anonymous heap at the same ~2x total — that one is
-    caught by the tracemalloc test above (~1.1x -> ~1.9x). Payload is uncompressed
+    caught by the tracemalloc test above (~0.0x -> ~1.9x). Payload is uncompressed
     Arrow IPC of incompressible float64 (compression="none", the mmap-friendly
     on-disk format), so on-disk size ~= logical size and the ratios are meaningful.
     """
@@ -358,8 +358,8 @@ def test_file_backend_end_to_end_read_peak_rss_bounded(tmp_path: Path) -> None:
     base_kib, peak_kib = (int(v) for v in read.stdout.split())
     read_cost = (peak_kib - base_kib) * 1024
     payload_bytes = payload_mb * _MB
-    print(f"\n  end-to-end File read RSS: base {base_kib / 1024:.0f} MiB, read cost {read_cost / payload_bytes:.2f}x payload")
     assert read_cost < payload_bytes * 2.6, (
-        f"end-to-end File read peak RSS {read_cost / payload_bytes:.2f}x payload above baseline — "
-        f"a full-payload read-side copy is back (expected ~2x: mapped pages + df; ~3x with a heap copy)"
+        f"end-to-end File read peak RSS {read_cost / payload_bytes:.2f}x payload above baseline "
+        f"({base_kib / 1024:.0f} MiB) — a full-payload read-side copy is back "
+        f"(expected ~2x: mapped pages + df; ~3x with a heap copy)"
     )
