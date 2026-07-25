@@ -410,6 +410,7 @@ class FileBackend:
         file_path = self._key_to_path(key)
         temp_path = self._generate_temp_path(file_path)
 
+        committed = False
         try:
             # Check entry count BEFORE write (security: prevent file persisting on error)
             with self._lock:
@@ -426,7 +427,7 @@ class FileBackend:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 self.config.permissions,
             )
-            f: Any = None
+            f: BinaryIO | None = None
             try:
                 # Acquire exclusive write lock
                 self._acquire_file_lock(fd, exclusive=True)
@@ -459,14 +460,12 @@ class FileBackend:
             # Commit under the process lock: atomic rename + eviction bookkeeping only.
             with self._lock:
                 os.rename(temp_path, file_path)
+                committed = True
 
                 # Trigger eviction if over threshold
                 self._maybe_evict()
 
         except OSError as exc:
-            # Clean up temp file if it exists
-            self._safe_unlink(temp_path)
-
             raise BackendError(
                 f"Failed to write cache file: {exc}",
                 error_type=self._classify_os_error(exc, is_directory=False),
@@ -474,11 +473,13 @@ class FileBackend:
                 operation="set_streaming",
                 key=key,
             ) from exc
-        except BaseException:
-            # Producer or limit failure: discard the partial write, re-raise unwrapped
-            # (BufferWritableBackend contract — serialization errors keep their type).
-            self._safe_unlink(temp_path)
-            raise
+        finally:
+            # Any failure — backend I/O, size limit, or a producer exception (which
+            # propagates unwrapped per the BufferWritableBackend contract, so callers keep
+            # its type and log it once) — discards the partial write. finally (not a
+            # BaseException catch) so even KeyboardInterrupt can't leak a temp file.
+            if not committed:
+                self._safe_unlink(temp_path)
 
     def delete(self, key: str) -> bool:
         """Delete key from file storage.
