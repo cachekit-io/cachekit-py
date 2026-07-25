@@ -57,15 +57,29 @@ _TARGET_BATCH_BYTES = 8 * 1024 * 1024
 _RELEASE_POOL_THRESHOLD = 4 * 1024 * 1024
 
 
-def _bounded_chunksize(table: pa.Table) -> int | None:  # type: ignore[name-defined]
-    """Rows per IPC record-batch so each batch is ~_TARGET_BATCH_BYTES, regardless of width.
+def _write_bounded_batches(writer: pa.ipc.RecordBatchFileWriter, table: pa.Table) -> None:  # type: ignore[name-defined]
+    """Write ``table`` as record batches whose ACTUAL bytes stay <= _TARGET_BATCH_BYTES.
 
-    Returns None for empty tables (nothing to chunk). Never returns 0.
+    A uniform rows-per-batch estimate (nbytes // num_rows) breaks on skewed/variable-width
+    frames: a clustered run of wide rows (e.g. JSON-blob cells) can overshoot the target
+    ~12x (#161), spiking the per-batch zstd working set in exactly the OOM regime this
+    bound exists to prevent. Instead, binary-search the largest row count whose slice
+    actually fits the byte budget — Table.slice() is zero-copy and .nbytes accounts for
+    slice offsets, so each probe is O(columns), not O(bytes). Batch bytes are monotone in
+    row count, so the search is valid; a single row wider than the target gets its own
+    batch (rows can't split). Empty tables write no batches (schema-only IPC file).
     """
-    if table.num_rows <= 0:
-        return None
-    bytes_per_row = max(1, table.nbytes // table.num_rows)
-    return max(1, _TARGET_BATCH_BYTES // bytes_per_row)
+    offset, total = 0, table.num_rows
+    while offset < total:
+        lo, hi, rows = 2, total - offset, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if table.slice(offset, mid).nbytes <= _TARGET_BATCH_BYTES:
+                rows, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        writer.write_table(table.slice(offset, rows))
+        offset += rows
 
 
 class ArrowSerializer:
@@ -227,14 +241,14 @@ class ArrowSerializer:
             # Serialize to Arrow IPC. Compression (when enabled) runs per record-batch, so
             # writing in bounded batches keeps the compressor's working set bounded (one big
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
-            # payload). Size each batch to ~8 MiB regardless of schema width. compression=None
+            # payload). Batches are sized by actual bytes (<= 8 MiB), not a uniform row-count
+            # estimate, so the bound holds for skewed/wide frames too (#161). compression=None
             # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
             # plaintext, pandas return only).
-            max_chunksize = _bounded_chunksize(table)
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
-                writer.write_table(table, max_chunksize=max_chunksize)
+                _write_bounded_batches(writer, table)
             del table  # free the Arrow table before materializing the IPC bytes (lowers peak)
 
             # Always integrity-protect: hash over the buffer's memoryview (no copy), then
