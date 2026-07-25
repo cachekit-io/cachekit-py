@@ -370,6 +370,9 @@ class ArrowSerializer:
             sink.seek(end_pos)
             pa.default_memory_pool().release_unused()  # return per-batch working memory to the OS
             return self.serialization_metadata()
+        # NOTE: unlike serialize(), ValueError is deliberately NOT wrapped here — the
+        # _HashingSink budget ValueError must reach the caller with its original type
+        # (the max_value_size mid-stream abort contract; the handler and tests match on it).
         except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
             raise SerializationError(f"Failed to serialize DataFrame to Arrow IPC format: {e}") from e
 

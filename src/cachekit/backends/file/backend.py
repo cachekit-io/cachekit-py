@@ -410,69 +410,75 @@ class FileBackend:
         file_path = self._key_to_path(key)
         temp_path = self._generate_temp_path(file_path)
 
-        with self._lock:
-            try:
-                # Check entry count BEFORE write (security: prevent file persisting on error)
+        try:
+            # Check entry count BEFORE write (security: prevent file persisting on error)
+            with self._lock:
                 self._check_entry_capacity(file_path)
 
-                # Write to temp file with O_NOFOLLOW for security
-                fd = os.open(
-                    temp_path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    self.config.permissions,
-                )
-                f: Any = None
+            # Stream OUTSIDE self._lock: unlike set()'s bounded os.write, the producer runs
+            # the whole serialization here (minutes for multi-GB frames), and holding the
+            # process-wide lock would block every other FileBackend op for that window. The
+            # in-process lock isn't what makes this safe anyway — the temp path is unique
+            # per pid+ns, the flock gives cross-process exclusion, and the rename commit
+            # below is atomic. Write to temp file with O_NOFOLLOW for security.
+            fd = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                self.config.permissions,
+            )
+            f: Any = None
+            try:
+                # Acquire exclusive write lock
+                self._acquire_file_lock(fd, exclusive=True)
                 try:
-                    # Acquire exclusive write lock
-                    self._acquire_file_lock(fd, exclusive=True)
-                    try:
-                        f = os.fdopen(fd, "wb")  # buffered writer; takes ownership of fd
-                        f.write(header)
-                        write_payload(f)
-                        f.flush()
+                    f = os.fdopen(fd, "wb")  # buffered writer; takes ownership of fd
+                    f.write(header)
+                    write_payload(f)
+                    f.flush()
 
-                        # Enforce max_value_mb on the real on-disk size (fstat, not tell():
-                        # the producer may have seeked back to patch bytes it already wrote).
-                        payload_size = os.fstat(fd).st_size - HEADER_SIZE
-                        max_bytes = self.config.max_value_mb * 1024 * 1024
-                        if payload_size > max_bytes:
-                            raise BackendError(
-                                f"Value size {payload_size} exceeds max_value_mb ({self.config.max_value_mb}MB)",
-                                BackendErrorType.PERMANENT,
-                            )
+                    # Enforce max_value_mb on the real on-disk size (fstat, not tell():
+                    # the producer may have seeked back to patch bytes it already wrote).
+                    payload_size = os.fstat(fd).st_size - HEADER_SIZE
+                    max_bytes = self.config.max_value_mb * 1024 * 1024
+                    if payload_size > max_bytes:
+                        raise BackendError(
+                            f"Value size {payload_size} exceeds max_value_mb ({self.config.max_value_mb}MB)",
+                            BackendErrorType.PERMANENT,
+                        )
 
-                        # fsync to ensure data is on disk
-                        os.fsync(fd)
-                    finally:
-                        self._release_file_lock(fd)
+                    # fsync to ensure data is on disk
+                    os.fsync(fd)
                 finally:
-                    if f is not None:
-                        f.close()
-                    else:
-                        os.close(fd)
+                    self._release_file_lock(fd)
+            finally:
+                if f is not None:
+                    f.close()
+                else:
+                    os.close(fd)
 
-                # Atomic rename (POSIX guarantees atomicity)
+            # Commit under the process lock: atomic rename + eviction bookkeeping only.
+            with self._lock:
                 os.rename(temp_path, file_path)
 
                 # Trigger eviction if over threshold
                 self._maybe_evict()
 
-            except OSError as exc:
-                # Clean up temp file if it exists
-                self._safe_unlink(temp_path)
+        except OSError as exc:
+            # Clean up temp file if it exists
+            self._safe_unlink(temp_path)
 
-                raise BackendError(
-                    f"Failed to write cache file: {exc}",
-                    error_type=self._classify_os_error(exc, is_directory=False),
-                    original_exception=exc,
-                    operation="set_streaming",
-                    key=key,
-                ) from exc
-            except BaseException:
-                # Producer or limit failure: discard the partial write, re-raise unwrapped
-                # (BufferWritableBackend contract — serialization errors keep their type).
-                self._safe_unlink(temp_path)
-                raise
+            raise BackendError(
+                f"Failed to write cache file: {exc}",
+                error_type=self._classify_os_error(exc, is_directory=False),
+                original_exception=exc,
+                operation="set_streaming",
+                key=key,
+            ) from exc
+        except BaseException:
+            # Producer or limit failure: discard the partial write, re-raise unwrapped
+            # (BufferWritableBackend contract — serialization errors keep their type).
+            self._safe_unlink(temp_path)
+            raise
 
     def delete(self, key: str) -> bool:
         """Delete key from file storage.
@@ -704,16 +710,8 @@ class FileBackend:
         only bytes [6:14] are rewritten, so the payload and all other header fields are
         untouched (and cross-SDK File readers stay compatible).
         """
-        # Same TTL bounds as set() (security: prevent integer overflow/underflow).
-        if ttl == 0:
-            new_expiry = 0
-        elif ttl < 0 or ttl > MAX_TTL_SECONDS:
-            raise BackendError(
-                f"TTL {ttl} out of range [0, {MAX_TTL_SECONDS}] (max 10 years)",
-                BackendErrorType.PERMANENT,
-            )
-        else:
-            new_expiry = int(time.time() + ttl)
+        # Same TTL bounds as set()/set_streaming (security: prevent integer overflow/underflow).
+        new_expiry = self._expiry_from_ttl(ttl)
 
         file_path = self._key_to_path(key)
 

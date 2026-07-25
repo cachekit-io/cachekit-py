@@ -260,6 +260,8 @@ class TestFileBackendSetStreaming:
     def test_ttl_zero_and_none_mean_no_expiry(self, file_backend) -> None:
         file_backend.set_streaming("k", lambda f: f.write(b"x"), ttl=None)
         assert file_backend.get("k") == b"x"
+        file_backend.set_streaming("k2", lambda f: f.write(b"y"), ttl=0)
+        assert file_backend.get("k2") == b"y"
 
     def test_invalid_ttl_rejected_before_writing(self, file_backend, tmp_path) -> None:
         with pytest.raises(BackendError, match="out of range"):

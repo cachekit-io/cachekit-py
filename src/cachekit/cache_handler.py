@@ -1477,7 +1477,11 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes (for L1 cache storage), or None if serialization failed
+            Serialized bytes when the buffered path stored the value (eligible for L1
+            backfill), or None when there is nothing for L1: the value was STREAMED to the
+            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
+            failed (logged, never retried buffered), or serialization failed. None is NOT
+            a failure signal.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1547,7 +1551,11 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes (for L1 cache storage), or None if serialization failed
+            Serialized bytes when the buffered path stored the value (eligible for L1
+            backfill), or None when there is nothing for L1: the value was STREAMED to the
+            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
+            failed (logged, never retried buffered), or serialization failed. None is NOT
+            a failure signal.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
