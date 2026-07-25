@@ -20,8 +20,9 @@ import platform
 import struct
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 
@@ -330,29 +331,8 @@ class FileBackend:
 
         file_path = self._key_to_path(key)
 
-        # Calculate expiry timestamp (0 = never expire)
-        if ttl is None or ttl == 0:
-            expiry_timestamp = 0
-        else:
-            # Validate TTL bounds (security: prevent integer overflow/underflow)
-            if ttl < 0 or ttl > MAX_TTL_SECONDS:
-                raise BackendError(
-                    f"TTL {ttl} out of range [0, {MAX_TTL_SECONDS}] (max 10 years)",
-                    BackendErrorType.PERMANENT,
-                )
-            expiry_timestamp = int(time.time() + ttl)
-
-        # Build header (14 bytes)
-        header = (
-            MAGIC  # [0:2] Magic bytes
-            + bytes([FORMAT_VERSION])  # [2:3] Version
-            + bytes([RESERVED])  # [3:4] Reserved
-            + struct.pack(">H", 0)  # [4:6] Flags (no compression/encryption yet)
-            + struct.pack(">Q", expiry_timestamp)  # [6:14] Expiry timestamp
-        )
-
-        # Combine header + payload
-        file_data = header + value
+        # Combine header (14 bytes) + payload
+        file_data = self._build_header(self._expiry_from_ttl(ttl)) + value
 
         # Generate temp file name
         temp_path = self._generate_temp_path(file_path)
@@ -360,15 +340,7 @@ class FileBackend:
         with self._lock:
             try:
                 # Check entry count BEFORE write (security: prevent file persisting on error)
-                # Allow overwrites (existing key doesn't increase count)
-                if self.config.max_entry_count > 0:
-                    _, entry_count = self._calculate_cache_size()
-                    # Only check if this is a NEW entry (not overwriting existing)
-                    if not os.path.exists(file_path) and entry_count >= self.config.max_entry_count:
-                        raise BackendError(
-                            f"Entry count {entry_count} would exceed max_entry_count ({self.config.max_entry_count})",
-                            BackendErrorType.PERMANENT,
-                        )
+                self._check_entry_capacity(file_path)
 
                 # Write to temp file with O_NOFOLLOW for security
                 fd = os.open(
@@ -409,6 +381,98 @@ class FileBackend:
                     operation="set",
                     key=key,
                 ) from exc
+
+    def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: int | None = None) -> None:
+        """Store a streamed value with the same atomicity, locking, and limits as ``set`` (LAB-766).
+
+        ``write_payload`` receives a writable, seekable buffered binary file positioned at the
+        start of the payload region (just past this backend's 14-byte header) and must write the
+        complete payload — record batch by record batch, so the full value never exists in
+        memory. The temp-file + atomic-rename pattern from ``set`` is preserved: a failed stream
+        never leaves a partial value visible under ``key``, and any previous value for the key
+        survives. Producer exceptions propagate unwrapped (after the temp file is discarded) so
+        serialization errors keep their type for the caller.
+
+        ``max_value_mb`` is enforced AFTER the stream completes (``fstat`` on the temp file,
+        before the rename): a streaming write cannot know its size upfront. The caller-side byte
+        budget (CACHEKIT_MAX_VALUE_SIZE, enforced incrementally by the serializer) bounds the
+        transient disk usage of an over-limit attempt.
+
+        Args:
+            key: Cache key to store
+            write_payload: Callable that writes the complete payload to the provided file
+            ttl: Time-to-live in seconds (None or 0 = never expire), same semantics as ``set``
+
+        Raises:
+            BackendError: If the write fails (disk full, permissions, size/TTL limits, etc.)
+        """
+        header = self._build_header(self._expiry_from_ttl(ttl))
+        file_path = self._key_to_path(key)
+        temp_path = self._generate_temp_path(file_path)
+
+        with self._lock:
+            try:
+                # Check entry count BEFORE write (security: prevent file persisting on error)
+                self._check_entry_capacity(file_path)
+
+                # Write to temp file with O_NOFOLLOW for security
+                fd = os.open(
+                    temp_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    self.config.permissions,
+                )
+                f: Any = None
+                try:
+                    # Acquire exclusive write lock
+                    self._acquire_file_lock(fd, exclusive=True)
+                    try:
+                        f = os.fdopen(fd, "wb")  # buffered writer; takes ownership of fd
+                        f.write(header)
+                        write_payload(f)
+                        f.flush()
+
+                        # Enforce max_value_mb on the real on-disk size (fstat, not tell():
+                        # the producer may have seeked back to patch bytes it already wrote).
+                        payload_size = os.fstat(fd).st_size - HEADER_SIZE
+                        max_bytes = self.config.max_value_mb * 1024 * 1024
+                        if payload_size > max_bytes:
+                            raise BackendError(
+                                f"Value size {payload_size} exceeds max_value_mb ({self.config.max_value_mb}MB)",
+                                BackendErrorType.PERMANENT,
+                            )
+
+                        # fsync to ensure data is on disk
+                        os.fsync(fd)
+                    finally:
+                        self._release_file_lock(fd)
+                finally:
+                    if f is not None:
+                        f.close()
+                    else:
+                        os.close(fd)
+
+                # Atomic rename (POSIX guarantees atomicity)
+                os.rename(temp_path, file_path)
+
+                # Trigger eviction if over threshold
+                self._maybe_evict()
+
+            except OSError as exc:
+                # Clean up temp file if it exists
+                self._safe_unlink(temp_path)
+
+                raise BackendError(
+                    f"Failed to write cache file: {exc}",
+                    error_type=self._classify_os_error(exc, is_directory=False),
+                    original_exception=exc,
+                    operation="set_streaming",
+                    key=key,
+                ) from exc
+            except BaseException:
+                # Producer or limit failure: discard the partial write, re-raise unwrapped
+                # (BufferWritableBackend contract — serialization errors keep their type).
+                self._safe_unlink(temp_path)
+                raise
 
     def delete(self, key: str) -> bool:
         """Delete key from file storage.
@@ -703,6 +767,50 @@ class FileBackend:
                 ) from exc
 
     # Private helper methods
+
+    @staticmethod
+    def _expiry_from_ttl(ttl: int | None) -> int:
+        """Expiry timestamp for a TTL (0 = never expire), with TTL bounds validation.
+
+        Raises:
+            BackendError: If TTL is negative or exceeds MAX_TTL_SECONDS (security:
+                prevent integer overflow/underflow in the packed uint64 timestamp)
+        """
+        if ttl is None or ttl == 0:
+            return 0
+        if ttl < 0 or ttl > MAX_TTL_SECONDS:
+            raise BackendError(
+                f"TTL {ttl} out of range [0, {MAX_TTL_SECONDS}] (max 10 years)",
+                BackendErrorType.PERMANENT,
+            )
+        return int(time.time() + ttl)
+
+    @staticmethod
+    def _build_header(expiry_timestamp: int) -> bytes:
+        """Build the 14-byte on-disk entry header."""
+        return (
+            MAGIC  # [0:2] Magic bytes
+            + bytes([FORMAT_VERSION])  # [2:3] Version
+            + bytes([RESERVED])  # [3:4] Reserved
+            + struct.pack(">H", 0)  # [4:6] Flags (no compression/encryption yet)
+            + struct.pack(">Q", expiry_timestamp)  # [6:14] Expiry timestamp
+        )
+
+    def _check_entry_capacity(self, file_path: str) -> None:
+        """Reject a NEW entry when max_entry_count is reached (overwrites always pass).
+
+        Raises:
+            BackendError: If storing a new entry would exceed max_entry_count
+        """
+        if self.config.max_entry_count <= 0:
+            return
+        _, entry_count = self._calculate_cache_size()
+        # Only check if this is a NEW entry (not overwriting existing)
+        if not os.path.exists(file_path) and entry_count >= self.config.max_entry_count:
+            raise BackendError(
+                f"Entry count {entry_count} would exceed max_entry_count ({self.config.max_entry_count})",
+                BackendErrorType.PERMANENT,
+            )
 
     def _key_to_path(self, key: str) -> str:
         """Convert cache key to file path using blake2b hash.

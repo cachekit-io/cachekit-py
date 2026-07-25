@@ -587,7 +587,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads.
+> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads. Writes are independent of this setting: plaintext Arrow values stream to the File backend record batch by record batch (compressed or not), never materializing the full payload in memory; encrypted values and other backends use the buffered write path.
 
 ### Connection Pooling
 

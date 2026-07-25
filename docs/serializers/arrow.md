@@ -158,6 +158,13 @@ ArrowSerializer uses memory-mapped deserialization, which means:
 - Default deserialization: +15 MB memory allocation
 - Arrow deserialization: +2 MB memory allocation
 
+**Writes stream on the File backend.** When the cache backend supports streaming writes
+(File backend only today) and the value is plaintext (no encryption), serialization streams
+~8 MiB record batches directly into the cache file instead of materializing the whole Arrow
+IPC payload in memory first — cutting write peak RSS from ~5.6x to ~2.3x the DataFrame's
+logical size. Wire backends (Redis, CachekitIO, Memcached) and encrypted values use the
+buffered path unchanged. See [File Backend](../backends/file.md#bounded-memory-large-values-arrow).
+
 ## Polars Support
 
 Polars DataFrames are supported via the `__arrow_c_stream__` interface (Arrow C Data Interface). This means zero-copy interchange between polars and Arrow — no intermediate conversion.

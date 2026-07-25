@@ -11,9 +11,16 @@ import hashlib
 import threading
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeGuard, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, BinaryIO, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
-from cachekit.backends.base import BackendError, BaseBackend, BufferHandle, BufferReadableBackend, TTLInspectableBackend
+from cachekit.backends.base import (
+    BackendError,
+    BaseBackend,
+    BufferHandle,
+    BufferReadableBackend,
+    BufferWritableBackend,
+    TTLInspectableBackend,
+)
 from cachekit.backends.provider import (
     BackendProviderInterface,
     DefaultBackendProvider,
@@ -219,6 +226,15 @@ def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBacken
         True if backend implements BufferReadableBackend (used for the mmap Arrow read fast path).
     """
     return hasattr(backend, "get_buffer")
+
+
+def supports_streaming_write(backend: BaseBackend) -> TypeGuard[BufferWritableBackend]:
+    """Type guard: backend can accept an incrementally-streamed value via set_streaming (LAB-766, File only).
+
+    Returns:
+        True if backend implements BufferWritableBackend (used for the streaming Arrow write path).
+    """
+    return hasattr(backend, "set_streaming")
 
 
 class SWRCapableBackend(Protocol):
@@ -932,6 +948,54 @@ class CacheSerializationHandler:
             and getattr(self._base_serializer, "return_format", None) == "pandas"
         )
 
+    def supports_streaming_write(self) -> bool:
+        """True iff writes can stream the envelope to a capable backend (LAB-766).
+
+        Eligible only for PLAINTEXT Arrow:
+        - encrypted values can never stream (AES-256-GCM emits its auth tag only after the
+          whole ciphertext exists, so the secure path stays on buffered ``set(bytes)``);
+        - interop/v1 stores raw documents with no CK envelope (different serializer, no benefit);
+        - non-Arrow serializers materialize their output in one shot anyway.
+
+        The backend must also support streaming writes (File only today); that is checked
+        separately at the cache-handler layer, so True here on a non-streaming backend simply
+        means the write falls back to the buffered path.
+        """
+        return not self.encryption and not self.interop_mode and self._serializer_string_name == "arrow"
+
+    def write_serialized_to(self, sink: BinaryIO, data: Any) -> None:
+        """Streaming twin of :meth:`serialize_data` (LAB-766): write the SAME envelope bytes into
+        ``sink`` without ever materializing the payload in memory.
+
+        Only valid when :meth:`supports_streaming_write` is True (plaintext Arrow — no
+        encryption wrapper, so no tenant extraction / AAD / cache_key binding applies). The
+        envelope is byte-identical to a buffered ``serialize_data`` of the same value: frame
+        prefix first (metadata is deterministic per serializer config), then the Arrow
+        serializer streams ``[checksum][IPC record batches]`` directly into the sink.
+
+        The L2 oversized-entry ceiling (``max_value_size``, issue #163) is enforced
+        incrementally mid-stream instead of on the finished blob — same limit, same ValueError,
+        but an over-limit stream aborts early instead of materializing first.
+
+        Raises:
+            TypeError: If data is not a DataFrame or dict of arrays
+            ValueError: If the envelope would exceed max_value_size
+            SerializationError: If Arrow serialization fails
+        """
+        from cachekit.serializers.arrow_serializer import ArrowSerializer  # already loaded on the arrow path
+
+        serializer = self._base_serializer
+        if not isinstance(serializer, ArrowSerializer):
+            # supports_streaming_write() gates callers to the arrow serializer; anything else
+            # here is a caller bug — fail loud rather than stream a wrong envelope.
+            raise SerializationError(f"write_serialized_to requires the arrow serializer, got {type(serializer).__name__}")
+
+        metadata = serializer.serialization_metadata()
+        prefix = SerializationWrapper.wrap_prefix(metadata.to_dict(), self._serializer_string_name)
+        sink.write(prefix)
+        budget = get_settings().max_value_size - len(prefix)
+        serializer.serialize_to_sink(data, sink, max_bytes=budget)
+
     def deserialize_data(self, data: str | bytes | memoryview, cache_key: str = "") -> Any:
         """Deserialize data from cache storage with cache_key verification.
 
@@ -1423,6 +1487,28 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling store_result")
 
+            # Streaming write fast path (LAB-766): plaintext Arrow to a streaming-writable
+            # backend (File) writes the envelope without ever materializing it. SWR
+            # (stale_ttl) stays buffered — no streaming backend signals freshness today.
+            # getattr guards custom CacheHandlerStrategy impls that predate set_streaming.
+            if stale_ttl is None and self.serialization_handler.supports_streaming_write():
+                set_streaming = getattr(self._cache_handler, "set_streaming", None)
+                if set_streaming is not None:
+                    streamed = set_streaming(
+                        cache_key,
+                        lambda sink: self.serialization_handler.write_serialized_to(sink, result),
+                        ttl,
+                    )
+                    if streamed is not None:
+                        # Streamed (True) or attempt failed and was logged (False — do NOT
+                        # retry buffered: that re-materializes the payload this path exists
+                        # to avoid). Either way return None: a multi-GB envelope must never
+                        # be copied into L1 (mirrors the mmap read path's L1 exclusion, #171).
+                        if streamed:
+                            get_logger().cache_stored(cache_key, ttl)
+                        return None
+                    # None: backend can't stream — fall through to the buffered path.
+
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
             # Only thread the SWR kwarg when set: strategy implementations without
@@ -1470,6 +1556,25 @@ class CacheOperationHandler:
         try:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling store_result_async")
+
+            # Streaming write fast path (LAB-766) — async twin of store_result's gate. The
+            # whole stream (pyarrow serialization included) runs in the handler's thread
+            # pool, which also moves the blocking serialize OFF the event loop (the buffered
+            # path below serializes on the loop thread).
+            if self.serialization_handler.supports_streaming_write():
+                set_streaming_async = getattr(self._cache_handler, "set_streaming_async", None)
+                if set_streaming_async is not None:
+                    streamed = await set_streaming_async(
+                        cache_key,
+                        lambda sink: self.serialization_handler.write_serialized_to(sink, result),
+                        ttl,
+                    )
+                    if streamed is not None:
+                        # See store_result: never retry buffered on failure, never hand the
+                        # envelope to L1 on success.
+                        if streamed:
+                            get_logger().cache_stored(cache_key, ttl)
+                        return None
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
@@ -1605,6 +1710,16 @@ class CacheHandlerStrategy(Protocol):
 
     def set(self, key: str, value: Union[str, bytes], ttl: Optional[int] = None, **metadata) -> bool:
         """Set value in cache with TTL and optional metadata."""
+        ...
+
+    def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
+        """Stream a value to a streaming-writable backend (LAB-766); None when unsupported."""
+        ...
+
+    async def set_streaming_async(
+        self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None
+    ) -> Optional[bool]:
+        """Async variant of set_streaming."""
         ...
 
     def delete(self, key: str) -> bool:
@@ -1858,6 +1973,47 @@ class StandardCacheHandler:
             return False
         except Exception as e:
             get_logger().error(f"Unexpected error setting key {key}: {e}")
+            return False
+
+    def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
+        """Stream a value to a streaming-writable backend (LAB-766).
+
+        Returns:
+            None when the backend doesn't implement BufferWritableBackend — the caller falls
+            back to the buffered ``set``. True on success. False when the streaming attempt
+            failed (logged, mirroring ``set``'s degradation contract); the caller must NOT
+            retry with the buffered path — that would re-materialize the very payload this
+            path exists to keep out of memory.
+        """
+        if not supports_streaming_write(self.backend):
+            return None
+        try:
+            self._with_backpressure_and_timeout(self.backend.set_streaming, key, write_payload, ttl)
+            return True
+        except BackendError as e:
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            return False
+        except Exception as e:
+            # Producer-side failure (serialization error, max_value_size budget): the backend
+            # already discarded its partial write; surface the real cause, not a backend error.
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
+            return False
+
+    async def set_streaming_async(
+        self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None
+    ) -> Optional[bool]:
+        """Async variant of :meth:`set_streaming`: the whole stream — pyarrow serialization
+        included — runs in the thread pool, keeping blocking IPC writes off the event loop."""
+        if not supports_streaming_write(self.backend):
+            return None
+        try:
+            await self._with_backpressure_and_timeout_async(self.backend.set_streaming, key, write_payload, ttl)
+            return True
+        except BackendError as e:
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            return False
+        except Exception as e:
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
             return False
 
     def delete(self, key: str) -> bool:
