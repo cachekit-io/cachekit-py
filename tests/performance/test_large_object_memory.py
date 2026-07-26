@@ -36,6 +36,10 @@ from cachekit.serializers.wrapper import SerializationWrapper
 
 _MB = 1024 * 1024
 
+# Measurement subprocesses finish in seconds; a wedged child must fail the test
+# (TimeoutExpired), not hang the CI job to its ceiling. Generous for slow runners.
+_SUBPROCESS_TIMEOUT_S = 300
+
 # Subprocess peak-RSS reads use VmHWM from /proc/self/status, NOT resource.ru_maxrss:
 # on Linux ru_maxrss lives in the signal struct and SURVIVES fork+exec, so a child
 # spawned from a fat pytest process inherits the parent's watermark — the child's
@@ -150,7 +154,7 @@ def test_byte_storage_store_has_no_full_payload_copy():
         print(vmhwm_kib())
         """
     )
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_S)  # noqa: S603 (trusted: sys.executable + literal code)
     assert result.returncode == 0, f"store subprocess failed: {result.stderr}"
     peak = int(result.stdout.strip()) * 1024
     payload_bytes = payload_mb * 1024 * 1024
@@ -350,9 +354,9 @@ def test_file_backend_end_to_end_read_peak_rss_bounded(tmp_path: Path) -> None:
         )
     )
 
-    write = subprocess.run([sys.executable, "-c", write_script], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+    write = subprocess.run([sys.executable, "-c", write_script], capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_S)  # noqa: S603 (trusted: sys.executable + literal code)
     assert write.returncode == 0, f"write subprocess failed: {write.stderr}"
-    read = subprocess.run([sys.executable, "-c", read_script], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+    read = subprocess.run([sys.executable, "-c", read_script], capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_S)  # noqa: S603 (trusted: sys.executable + literal code)
     assert read.returncode == 0, f"read subprocess failed: {read.stderr}"
 
     base_kib, peak_kib = (int(v) for v in read.stdout.split())
