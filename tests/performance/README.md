@@ -88,7 +88,19 @@ Tests per-request wrapper creation overhead:
 
 **Key Insight**: Per-request pattern adds negligible overhead (<0.15% of network latency).
 
-### 7. `stats_utils.py` - **Statistical Utilities**
+### 7. `test_large_object_memory.py` - **Memory Regression Guards** (CI-gated: `performance and slow`)
+
+Deterministic peak-memory bounds for large-object caching, at two scopes (#169):
+**serializer-only** (`test_store_path...` / `test_load_path...`, tracemalloc in isolation)
+and **backend-inclusive** (`test_file_backend_*`, the read path end-to-end through the
+File backend, tracemalloc + subprocess peak RSS). Bounds, measured multipliers, and the
+metric-choice rationale (VmHWM vs `ru_maxrss`, tracemalloc/RSS blind spots) live in the
+module and per-test docstrings — the single source of truth.
+
+**Key Insight**: The headline low-read-memory claim maps to the backend-inclusive numbers;
+serializer-only numbers can stay green while a backend read path regrows a full-payload copy.
+
+### 8. `stats_utils.py` - **Statistical Utilities**
 
 Provides rigorous performance measurement tools:
 

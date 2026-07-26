@@ -57,15 +57,29 @@ _TARGET_BATCH_BYTES = 8 * 1024 * 1024
 _RELEASE_POOL_THRESHOLD = 4 * 1024 * 1024
 
 
-def _bounded_chunksize(table: pa.Table) -> int | None:  # type: ignore[name-defined]
-    """Rows per IPC record-batch so each batch is ~_TARGET_BATCH_BYTES, regardless of width.
+def _write_bounded_batches(writer: pa.ipc.RecordBatchFileWriter, table: pa.Table) -> None:  # type: ignore[name-defined]
+    """Write ``table`` as record batches whose ACTUAL bytes stay <= _TARGET_BATCH_BYTES.
 
-    Returns None for empty tables (nothing to chunk). Never returns 0.
+    A uniform rows-per-batch estimate (nbytes // num_rows) breaks on skewed/variable-width
+    frames: a clustered run of wide rows (e.g. JSON-blob cells) can overshoot the target
+    ~12x (#161), spiking the per-batch zstd working set in exactly the OOM regime this
+    bound exists to prevent. Instead, binary-search the largest row count whose slice
+    actually fits the byte budget — Table.slice() is zero-copy and .nbytes accounts for
+    slice offsets, so each probe is O(columns), not O(bytes). Batch bytes are monotone in
+    row count, so the search is valid; a single row wider than the target gets its own
+    batch (rows can't split). Empty tables write no batches (schema-only IPC file).
     """
-    if table.num_rows <= 0:
-        return None
-    bytes_per_row = max(1, table.nbytes // table.num_rows)
-    return max(1, _TARGET_BATCH_BYTES // bytes_per_row)
+    offset, total = 0, table.num_rows
+    while offset < total:
+        lo, hi, rows = 2, total - offset, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if table.slice(offset, mid).nbytes <= _TARGET_BATCH_BYTES:
+                rows, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        writer.write_table(table.slice(offset, rows))
+        offset += rows
 
 
 class _HashingSink:
@@ -299,14 +313,14 @@ class ArrowSerializer:
             # Serialize to Arrow IPC. Compression (when enabled) runs per record-batch, so
             # writing in bounded batches keeps the compressor's working set bounded (one big
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
-            # payload). Size each batch to ~8 MiB regardless of schema width. compression=None
+            # payload). Batches are sized by actual bytes (<= 8 MiB), not a uniform row-count
+            # estimate, so the bound holds for skewed/wide frames too (#161). compression=None
             # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
             # plaintext, pandas return only).
-            max_chunksize = _bounded_chunksize(table)
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
-                writer.write_table(table, max_chunksize=max_chunksize)
+                _write_bounded_batches(writer, table)
             del table  # free the Arrow table before materializing the IPC bytes (lowers peak)
 
             # Always integrity-protect: hash over the buffer's memoryview (no copy), then
@@ -332,9 +346,9 @@ class ArrowSerializer:
         """Stream-serialize a DataFrame into ``sink``, never materializing the full payload (LAB-766).
 
         Writes the exact bytes ``serialize`` returns — [8-byte xxHash3-64 checksum][Arrow IPC] —
-        but the IPC record batches (~8 MiB each, see ``_bounded_chunksize``) go straight to the
-        sink instead of accumulating in a ``pa.BufferOutputStream``, which is what held ~3.75x
-        the payload in memory on the buffered path. The checksum covers all IPC bytes yet is
+        but the IPC record batches (~8 MiB actual bytes each, see ``_write_bounded_batches``) go
+        straight to the sink instead of accumulating in a ``pa.BufferOutputStream``, which is what
+        held ~3.75x the payload in memory on the buffered path. The checksum covers all IPC bytes yet is
         stored FIRST, so it is hashed incrementally while streaming and patched in place
         afterwards: ``sink`` must therefore be seekable (``tell``/``seek``). Seeks are anchored
         with ``tell()``, never absolute offsets — the sink may sit inside backend framing.
@@ -355,13 +369,12 @@ class ArrowSerializer:
         """
         try:
             table = self._to_table(obj)
-            max_chunksize = _bounded_chunksize(table)
             checksum_pos = sink.tell()
             sink.write(b"\x00" * 8)  # checksum placeholder, patched below
             hashing_sink = _HashingSink(sink, max_bytes - 8 if max_bytes is not None else None)
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(hashing_sink, table.schema, options=write_options) as writer:
-                writer.write_table(table, max_chunksize=max_chunksize)
+                _write_bounded_batches(writer, table)
             del table  # free the Arrow table promptly (mirrors serialize)
 
             end_pos = sink.tell()

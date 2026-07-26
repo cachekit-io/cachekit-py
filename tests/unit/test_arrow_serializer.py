@@ -462,6 +462,70 @@ class TestConfigurableCompression:
         assert ArrowSerializer._resolve_compression("auto") == "zstd"
 
 
+class TestBoundedBatching:
+    """Record batches must honor the byte budget for SKEWED frames, not just uniform ones.
+
+    The pre-fix estimate (nbytes // num_rows, rows-only cap) let a clustered run of wide
+    rows produce a ~100 MiB batch against the 8 MiB target (#161) — and zstd's working
+    set scales with batch size, so the OOM bound this feature exists for silently broke.
+    """
+
+    # IPC padding/offset-shifting can nudge a read-back batch slightly past the slice's
+    # in-memory nbytes; the guarantee we defend is "no order-of-magnitude overshoot".
+    TOLERANCE = 1.05
+
+    @staticmethod
+    def _read_batches(data: bytes) -> list:
+        """Strip the 8-byte checksum envelope and return decompressed IPC record batches."""
+        reader = pa.ipc.open_file(pa.py_buffer(memoryview(data)[8:]))
+        return [reader.get_batch(i) for i in range(reader.num_record_batches)]
+
+    def test_skewed_frame_batches_stay_bounded(self):
+        """Issue #161's exact case: 100k tiny rows + 50 clustered 2 MiB cells."""
+        from cachekit.serializers.arrow_serializer import _TARGET_BATCH_BYTES
+
+        df = pd.DataFrame({"blob": ["y"] * 100_000 + ["x" * 2_000_000] * 50})
+        serializer = ArrowSerializer()
+        data, meta = serializer.serialize(df)
+
+        batches = self._read_batches(data)
+        worst = max(b.nbytes for b in batches)
+        assert worst <= _TARGET_BATCH_BYTES * self.TOLERANCE, (
+            f"batch of {worst / 2**20:.1f} MiB exceeds the {_TARGET_BATCH_BYTES / 2**20:.0f} MiB "
+            f"target (pre-fix overshoot was ~12.5x)"
+        )
+        pd.testing.assert_frame_equal(serializer.deserialize(data, meta), df)
+
+    def test_uniform_frame_batching_not_fragmented(self):
+        """Common case unchanged: uniform frames still get few, near-target batches."""
+        import math
+
+        from cachekit.serializers.arrow_serializer import _TARGET_BATCH_BYTES
+
+        df = pd.DataFrame({f"c{i}": [float(j) for j in range(500_000)] for i in range(8)})  # ~32 MiB
+        table_nbytes = pa.Table.from_pandas(df, preserve_index=None).nbytes
+        data, meta = ArrowSerializer().serialize(df)
+
+        batches = self._read_batches(data)
+        assert all(b.nbytes <= _TARGET_BATCH_BYTES * self.TOLERANCE for b in batches)
+        # Byte-aware batching must not fragment: batches are maximal, so the count stays
+        # at the minimum the budget allows (uniform estimate gave the same).
+        assert len(batches) <= math.ceil(table_nbytes / _TARGET_BATCH_BYTES) + 1
+        pd.testing.assert_frame_equal(ArrowSerializer().deserialize(data, meta), df)
+
+    def test_single_row_wider_than_target_gets_own_batch(self):
+        """A row that can't fit the budget must still serialize (1-row batch, no hang)."""
+        from cachekit.serializers.arrow_serializer import _TARGET_BATCH_BYTES
+
+        df = pd.DataFrame({"blob": ["small"] * 10 + ["x" * (12 * 2**20)] + ["small"] * 10})
+        serializer = ArrowSerializer()
+        data, meta = serializer.serialize(df)
+
+        for batch in self._read_batches(data):
+            assert batch.nbytes <= _TARGET_BATCH_BYTES * self.TOLERANCE or batch.num_rows == 1
+        pd.testing.assert_frame_equal(serializer.deserialize(data, meta), df)
+
+
 class TestIntegrityAlwaysOn:
     """DATA IS SACRED: corruption is always detected, even with integrity_checking=False."""
 
