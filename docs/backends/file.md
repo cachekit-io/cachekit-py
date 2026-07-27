@@ -85,6 +85,27 @@ backend = FileBackend(config)
 - Cross-process: No (single-process only)
 - Platform support: Full on Linux/macOS, limited on Windows (no O_NOFOLLOW)
 
+## Bounded-Memory Large Values (Arrow)
+
+FileBackend is the only backend that implements **both** large-value capability protocols,
+making it the right choice for caching DataFrames bigger than your RAM headroom:
+
+- **Streaming writes** (`BufferWritableBackend.set_streaming`): plaintext Arrow values are
+  serialized record batch by record batch straight into the cache file (temp file + atomic
+  rename), so the full serialized payload never exists in memory. Write peak RSS is ~2.3x the
+  DataFrame's logical size, versus ~5.6x on the buffered path every other backend uses.
+- **Zero-copy reads** (`BufferReadableBackend.get_buffer`): with `compression="none"`, cached
+  entries are served back through a POSIX mmap without materializing the payload on the heap.
+
+Both engage automatically — no API change — whenever the serializer is plaintext Arrow
+(`serializer_name="arrow"`, no encryption). **Encrypted values are excluded from both paths**:
+AES-256-GCM needs the whole ciphertext to produce/verify its auth tag, so the secure path
+stays on buffered `set()`/`get()`. Streamed values also intentionally skip the L1 in-memory
+cache — holding a multi-GB envelope in-process would defeat the point.
+
+Other backends (Redis, CachekitIO, Memcached) fall back transparently to buffered
+`set(bytes)` with no behaviour change.
+
 ## TTL Inspection & Sliding Expiration
 
 FileBackend implements the `TTLInspectableBackend` protocol (`get_ttl` / `refresh_ttl`) by

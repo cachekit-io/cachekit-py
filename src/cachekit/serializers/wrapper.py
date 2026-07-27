@@ -70,6 +70,27 @@ class SerializationWrapper:
     """
 
     @staticmethod
+    def wrap_prefix(metadata: dict[str, Any], serializer_name: str, version: str = "2.0") -> bytes:
+        """Build the v3 frame prefix (everything before the payload): MAGIC | VERSION | HDR_LEN | HEADER.
+
+        The prefix depends only on the metadata/serializer name, never on the payload bytes, so
+        the streaming write path (LAB-766) can emit it before a single payload byte exists and
+        the stored frame stays byte-identical to a buffered ``wrap`` of the same payload.
+        """
+        header = json.dumps(
+            {"s": serializer_name, "m": metadata, "v": version},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return b"".join(
+            (
+                _MAGIC,
+                bytes((_FRAME_VERSION,)),
+                len(header).to_bytes(_HEADER_LEN_BYTES, "big"),
+                header,
+            )
+        )
+
+    @staticmethod
     def wrap(data: bytes, metadata: dict[str, Any], serializer_name: str, version: str = "2.0") -> bytes:
         """Frame serialized data with a metadata header for cache storage.
 
@@ -83,20 +104,8 @@ class SerializationWrapper:
         Returns:
             v3 binary frame bytes: MAGIC | VERSION | HDR_LEN | HEADER(json) | PAYLOAD(raw).
         """
-        header = json.dumps(
-            {"s": serializer_name, "m": metadata, "v": version},
-            ensure_ascii=False,
-        ).encode("utf-8")
         # Single allocation; the payload is copied exactly once.
-        return b"".join(
-            (
-                _MAGIC,
-                bytes((_FRAME_VERSION,)),
-                len(header).to_bytes(_HEADER_LEN_BYTES, "big"),
-                header,
-                data,
-            )
-        )
+        return SerializationWrapper.wrap_prefix(metadata, serializer_name, version) + data
 
     @staticmethod
     def unwrap(

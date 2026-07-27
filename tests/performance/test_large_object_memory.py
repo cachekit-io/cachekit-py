@@ -130,6 +130,73 @@ def test_full_roundtrip_through_cache_handler_is_correct_and_compact():
 
 @pytest.mark.slow
 @pytest.mark.performance
+def test_streaming_write_path_peak_rss_bounded():
+    """LAB-766: the File-backend streaming write path never materializes the envelope.
+
+    Peak RSS in a dedicated subprocess (tracemalloc cannot see pyarrow's C++ pools,
+    which is exactly where the buffered path's residual lives). A 400MB incompressible
+    frame is stored through the REAL write flow (store_result -> set_streaming ->
+    FileBackend), record batch by record batch.
+
+    Measured on the reference box: streaming peaks at ~2.3x logical (frame + the Arrow
+    table conversion + interpreter); the buffered path peaks at ~5.6x (BufferOutputStream
+    doubling-growth + memory-pool retention + envelope + wrap copies). The 3.2x bound
+    sits between them with margin on both sides: a full-payload materialization
+    returning to this path re-adds ~2-3x and trips it loudly.
+    """
+    frame_mb = 400
+    script = textwrap.dedent(
+        f"""
+        import resource, tempfile
+
+        import numpy as np
+        import pandas as pd
+
+        from cachekit.backends.file import FileBackend
+        from cachekit.backends.file.config import FileBackendConfig
+        from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, StandardCacheHandler
+        from cachekit.key_generator import CacheKeyGenerator
+        from cachekit.serializers.arrow_serializer import ArrowSerializer
+
+        _MB = 1024 * 1024
+        cols = 20
+        rows = {frame_mb} * _MB // (8 * cols)
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({{f"c{{i}}": rng.standard_normal(rows) for i in range(cols)}})
+        logical = int(df.memory_usage(deep=True, index=True).sum())
+
+        with tempfile.TemporaryDirectory() as d:
+            backend = FileBackend(FileBackendConfig(cache_dir=d, max_size_mb=4096, max_value_mb=2048))
+            sh = CacheSerializationHandler(serializer_name="arrow")
+            sh._base_serializer = ArrowSerializer(compression=None)  # uncompressed: on-disk ~1x, mmap-readable
+            op = CacheOperationHandler(sh, CacheKeyGenerator())
+            op.set_cache_handler(StandardCacheHandler(backend))
+
+            ret = op.store_result("k", df, ttl=60)
+            assert ret is None, "streaming path did not engage (fell back to buffered set)"
+            # Sanity via on-disk size, NOT backend.get(): a full readback would materialize
+            # the envelope and pollute the ru_maxrss high-water mark this test measures.
+            import os as _os
+
+            (entry,) = [f for f in _os.scandir(d) if ".tmp." not in f.name]
+            assert entry.stat().st_size > logical * 0.95, "streamed entry missing/truncated"
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # KiB on Linux
+        print(logical, peak)
+        """
+    )
+    env = dict(os.environ, CACHEKIT_MAX_VALUE_SIZE=str(2 * 1024**3))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)  # noqa: S603 (trusted: sys.executable + literal code)
+    assert result.returncode == 0, f"streaming-write subprocess failed: {result.stderr}"
+    logical, peak = (int(v) for v in result.stdout.split())
+    assert peak < logical * 3.2, (
+        f"streaming write peak RSS {peak / logical:.2f}x logical — the envelope is being "
+        f"materialized again on the write path (streaming ~2.3x, buffered ~5.6x)"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.performance
 @pytest.mark.skipif(sys.platform != "linux", reason="peak-RSS via /proc/self/status VmHWM is Linux-only")
 def test_byte_storage_store_has_no_full_payload_copy():
     """Rust-side allocation guard for ByteStorage.store() (cachekit-core#45).
