@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.17.0](https://github.com/cachekit-io/cachekit-py/compare/v0.16.0...v0.17.0) (2026-07-29)
+
+
+### Features
+
+* **envelope:** pick up cachekit-core 0.4.0 bin envelopes (LAB-900) ([#249](https://github.com/cachekit-io/cachekit-py/issues/249)) ([fa9ea36](https://github.com/cachekit-io/cachekit-py/commit/fa9ea36ce0b3d8e0bd15166d9207f87b9ebb91d9))
+
+
+### Bug Fixes
+
+* **serializers:** byte-aware Arrow batch sizing holds the memory bound on skewed frames (LAB-110) ([#244](https://github.com/cachekit-io/cachekit-py/issues/244)) ([e67db58](https://github.com/cachekit-io/cachekit-py/commit/e67db58c5c8e2d99bea6514b9066e76404466789))
+
+
+### Performance Improvements
+
+* **arrow:** stream serialize-to-backend writes via BufferWritableBackend (LAB-766) ([#247](https://github.com/cachekit-io/cachekit-py/issues/247)) ([539fde9](https://github.com/cachekit-io/cachekit-py/commit/539fde98c0f954efd03b5f25a36b676966789a2d))
+
 ## [0.16.0](https://github.com/cachekit-io/cachekit-py/compare/v0.15.0...v0.16.0) (2026-07-24)
 
 
