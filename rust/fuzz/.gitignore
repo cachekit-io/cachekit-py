@@ -13,7 +13,6 @@ coverage/
 
 # Build artifacts
 target/
-Cargo.lock
 
 # Crash reports and triage output
 crash-*.txt

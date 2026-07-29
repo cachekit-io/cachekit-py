@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Step 1: Create ByteStorage envelope (compression + checksum)
-    let envelope = match StorageEnvelope::new(plaintext.to_vec(), "msgpack".to_string()) {
+    let envelope = match StorageEnvelope::new(plaintext, "msgpack".to_string()) {
         Ok(env) => env,
         Err(_) => return, // Plaintext too large
     };

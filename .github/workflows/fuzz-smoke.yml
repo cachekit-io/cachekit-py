@@ -27,20 +27,44 @@ jobs:
   fuzz-smoke:
     name: Fuzz Smoke Test (60s per target)
     runs-on: cachekit
-    timeout-minutes: 20
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
+    # so no cross-run cache) + ~10 min one-shot ASAN build of all targets
+    # + ~1 min per fuzz target (count derived from `cargo fuzz list`, ~14 min
+    # today) + slack.
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Install Rust nightly
       run: |
-        # Pin nightly: cargo-fuzz 0.13.1 → rustix uses rustc_layout_scalar_valid_range_*
-        # attributes reserved after nightly-2026-04-27. Last known-good date.
+        # Pin nightly: cargo-fuzz's rustix dependency uses
+        # rustc_layout_scalar_valid_range_* attributes reserved after
+        # nightly-2026-04-27. Last known-good date.
         rustup toolchain install nightly-2026-04-27
         rustup default nightly-2026-04-27
 
     - name: Install cargo-fuzz
-      run: cargo install --locked cargo-fuzz
+      # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
+      # release immediate code exec on the self-hosted runner.
+      run: cargo install --locked cargo-fuzz --version 0.13.2
+
+    - name: Verify fuzz lockfile is current
+      run: |
+        cd rust/fuzz
+        # `cargo fuzz build/run` have no --locked passthrough, so the committed
+        # Cargo.lock is advisory to them: on any manifest/lock drift cargo would
+        # silently re-resolve every transitive to newest-on-crates.io, on a
+        # self-hosted runner. This is the only step that enforces the lock —
+        # it fails loudly on drift, and warms the empty CARGO_HOME besides.
+        cargo +nightly-2026-04-27 fetch --locked
+
+    - name: Build all fuzz targets
+      run: |
+        cd rust/fuzz
+        # One cargo invocation builds every [[bin]] target, sharing dependency
+        # compilation. A target that fails to compile fails the job here.
+        cargo +nightly-2026-04-27 fuzz build
 
     - name: Run fuzzing smoke tests
       id: fuzz
@@ -50,28 +74,38 @@ jobs:
         # Create artifacts directory
         mkdir -p artifacts
 
-        # Fuzz targets that compile against cachekit-core 0.1.1.
-        # 9 encryption/advanced targets are disabled — cachekit-core API
-        # changed (encrypt_aes_gcm → encrypt_with_keys etc.) and the
-        # fuzz targets haven't been updated. See #114.
-        FUZZ_TARGETS=(
-          byte_storage_compress
-          byte_storage_decompress
-          byte_storage_format_injection
-          encryption_key_derivation
-        )
+        # Every target `cargo fuzz list` reports runs — no hand-maintained
+        # allow-list in this workflow to drift out of date.
+        # Resolve the list in a standalone assignment: `for t in $(cmd)` does
+        # not propagate a failing $(cmd) under `set -e`, and an empty list
+        # would loop zero times and go green having fuzzed nothing.
+        TARGETS=$(cargo +nightly-2026-04-27 fuzz list)
+        if [ -z "$TARGETS" ]; then
+          echo "::error::cargo fuzz list returned no targets"
+          exit 1
+        fi
 
-        for target in "${FUZZ_TARGETS[@]}"; do
+        # `cargo fuzz list` enumerates the [[bin]] stanzas in Cargo.toml, NOT the
+        # files in fuzz_targets/. So a new fuzz_targets/*.rs added without its
+        # stanza is never built and never run, and this job still goes green —
+        # the same silent-dark mode the old hardcoded array caused. Nothing in
+        # cargo enforces that the two agree, so assert it here.
+        SRC_COUNT=$(find fuzz_targets -maxdepth 1 -name '*.rs' | wc -l)
+        LIST_COUNT=$(printf '%s\n' "$TARGETS" | wc -l)
+        if [ "$SRC_COUNT" -ne "$LIST_COUNT" ]; then
+          echo "::error::fuzz_targets/ holds $SRC_COUNT sources but Cargo.toml declares $LIST_COUNT [[bin]] targets — add the missing [[bin]] stanza so the new target actually runs"
+          exit 1
+        fi
+
+        # A non-zero exit (crash found, or target failed to run) fails the
+        # job immediately: green must mean "fuzzed and clean".
+        for target in $TARGETS; do
           echo "Fuzzing $target..."
-
-          if ! cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60; then
-            echo "::warning::Fuzz target '$target' found potential issues"
-            # Continue to test other targets even if one fails
-            touch artifacts/.fuzz_failures
-          fi
+          cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60
         done
 
-        # Check if any crashes were found
+        # Belt-and-braces: fail on any crash artifact even if the runs above
+        # all exited zero.
         if find artifacts -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' | grep -q .; then
           echo "::error::Fuzzing discovered crashes or errors. See artifacts for details."
           exit 1
@@ -85,5 +119,9 @@ jobs:
       with:
         name: fuzz-crash-artifacts
         path: rust/fuzz/artifacts/
-        retention-days: 30
+        # Short window deliberately: this repo is public and this job runs on
+        # pull_request, so the artifact is a working libFuzzer reproducer for an
+        # unfixed defect in the shipped compression/AES-GCM path, downloadable by
+        # anyone. 3 days is enough to triage; 30 is a month-long public window.
+        retention-days: 3
         if-no-files-found: warn

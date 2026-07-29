@@ -1,22 +1,26 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use cachekit_storage::byte_storage::StorageEnvelope;
+use cachekit_storage::byte_storage::{ByteStorageError, StorageEnvelope};
 use arbitrary::Arbitrary;
 
 #[derive(Arbitrary, Debug)]
 struct ChecksumTestCase {
     /// Data to compress (will be used for valid envelope)
     data: Vec<u8>,
-    /// Bit flip position in compressed_data (0-255)
-    flip_byte_idx: u8,
+    /// Bit flip position in compressed_data, reduced mod payload length.
+    /// u32, not u8: payloads run to 4096 bytes, so a u8 index would confine
+    /// every flip this target ever generates to the first 256 bytes.
+    flip_byte_idx: u32,
     /// Bit flip mask
     flip_mask: u8,
 }
 
 fuzz_target!(|test_case: ChecksumTestCase| {
     // Attack: Checksum collision via data corruption
-    // Validates: Blake3 integrity verification detects mismatches
+    // Validates: the xxHash3-64 integrity check (8-byte, NON-cryptographic —
+    // it detects corruption, it does not resist a chosen-collision attacker)
+    // rejects a mutated payload, or else returns the original bytes unchanged.
 
     // Limit data size for fuzzing performance
     if test_case.data.len() > 4096 {
@@ -24,7 +28,7 @@ fuzz_target!(|test_case: ChecksumTestCase| {
     }
 
     // Create valid envelope first
-    let envelope = match StorageEnvelope::new(test_case.data.clone(), "msgpack".to_string()) {
+    let envelope = match StorageEnvelope::new(&test_case.data, "msgpack".to_string()) {
         Ok(env) => env,
         Err(_) => return, // Skip if data too large
     };
@@ -49,21 +53,25 @@ fuzz_target!(|test_case: ChecksumTestCase| {
         corrupted_envelope.compressed_data[idx] ^= test_case.flip_mask;
     }
 
-    // Corrupted envelope should be rejected (checksum mismatch)
+    // The invariant is reject-or-return-original. Asserting only on the Err arm
+    // would let the one bug this target exists to find — corrupted bytes
+    // extracting *successfully* as different data — pass silently.
     match corrupted_envelope.extract() {
-        Ok(_) => {
-            // If it succeeded, data must be unchanged (flip reverted or no-op)
-            // This is only acceptable if flip_mask was 0 or flipped back to original
-        }
-        Err(err) => {
-            // Expected: Checksum validation should fail
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("Checksum validation failed") || err_msg.contains("decompression failed"),
-                "Error should indicate checksum or decompression failure: {}",
-                err_msg
-            );
-        }
+        Ok(recovered) => assert_eq!(
+            recovered, test_case.data,
+            "corrupted envelope extracted successfully but returned different data \
+             — integrity check bypassed"
+        ),
+        Err(err) => assert!(
+            matches!(
+                err,
+                ByteStorageError::ChecksumMismatch | ByteStorageError::DecompressionFailed
+            ),
+            // Match the variant, not err.to_string(): asserting on Display text
+            // makes a #[error(...)] reword in a core release fail this gate on a
+            // false crash.
+            "corruption must surface as ChecksumMismatch or DecompressionFailed, got: {err:?}"
+        ),
     }
 
     // Test with completely wrong checksum
@@ -74,21 +82,24 @@ fuzz_target!(|test_case: ChecksumTestCase| {
         format: envelope.format.clone(),
     };
 
-    // Should be rejected unless original checksum happened to be all 0xFF
+    // Should be rejected unless the genuine checksum happened to be all 0xFF —
+    // which is the only case the Ok arm may accept, so assert exactly that.
     match wrong_checksum_envelope.extract() {
-        Ok(_) => {
-            // Only acceptable if original checksum was [0xFF; 8]
-        }
-        Err(err) => {
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("Checksum") || err_msg.contains("failed"),
-                "Wrong checksum should be detected: {}",
-                err_msg
-            );
-        }
+        Ok(_) => assert_eq!(
+            envelope.checksum, [0xFF; 8],
+            "forged all-0xFF checksum accepted over a payload whose real checksum \
+             was {:?} — integrity check bypassed",
+            envelope.checksum
+        ),
+        Err(err) => assert!(
+            matches!(
+                err,
+                ByteStorageError::ChecksumMismatch | ByteStorageError::DecompressionFailed
+            ),
+            "forged checksum must surface as ChecksumMismatch or DecompressionFailed, got: {err:?}"
+        ),
     }
 
-    // Success: Checksum validation detects corruption
-    // Invariant: Blake3 integrity must catch data tampering
+    // Invariant: the xxHash3-64 integrity check must catch data tampering — a
+    // mutated payload either fails to extract or yields the original bytes.
 });

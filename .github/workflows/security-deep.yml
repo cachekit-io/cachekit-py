@@ -49,7 +49,10 @@ jobs:
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
     runs-on: cachekit
-    timeout-minutes: 200
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
+    # no cross-run cache) + ~10 min ASAN builds + 3 x 60 min fuzz time
+    # (-max_total_time is pure fuzz time, excluding builds) + slack.
+    timeout-minutes: 240
     env:
       # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
       # toolchain across overlay/hostPath boundaries on the ARC runner pod
@@ -61,51 +64,72 @@ jobs:
 
     - name: Install nightly Rust
       run: |
-        # Pin nightly: cargo-fuzz 0.13.1 → rustix uses rustc_layout_scalar_valid_range_*
-        # attributes reserved after nightly-2026-04-27. Last known-good date.
-        # Same pin as fuzz-smoke.yml.
+        # Pin nightly: cargo-fuzz's rustix dependency uses
+        # rustc_layout_scalar_valid_range_* attributes reserved after
+        # nightly-2026-04-27. Last known-good date. Same pin as fuzz-smoke.yml.
         rustup toolchain install nightly-2026-04-27
         rustup default nightly-2026-04-27
 
     - name: Install cargo-fuzz
-      run: cargo install --locked cargo-fuzz
+      # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
+      # release immediate code exec on the self-hosted runner. Same pattern as
+      # kani-verifier above and fuzz-smoke.yml.
+      run: cargo install --locked cargo-fuzz --version 0.13.2
 
+    - name: Verify fuzz lockfile is current
+      run: |
+        cd rust/fuzz
+        # See fuzz-smoke.yml: cargo fuzz has no --locked passthrough, so this is
+        # the only step enforcing the committed lock against manifest drift.
+        cargo +nightly-2026-04-27 fetch --locked
+
+    - name: Build fuzz targets
+      run: |
+        cd rust/fuzz
+        # Build before fuzzing so a compile error surfaces in ~10 min as a build
+        # failure, not three hours in as a confusing fuzz-step error.
+        cargo +nightly-2026-04-27 fuzz build
+
+    # The fuzz crate (cachekit-storage-fuzz) declares no [features] table — its
+    # cachekit-core feature set is fixed in rust/fuzz/Cargo.toml. Passing
+    # --features here makes cargo error out before any fuzzing happens, and the
+    # old `|| true` swallowed exactly that for three core versions. A non-zero
+    # exit (build failure or crash) must fail the job; a clean hour exits 0 via
+    # -max_total_time.
+    #
+    # Deliberate subset for the time budget: these three cover the highest-value
+    # attack surfaces (compression bombs, envelope decode, key derivation); every
+    # target gets 60 s on every PR via fuzz-smoke.yml.
     - name: Fuzz byte_storage_compress (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run byte_storage_compress --no-default-features --features compression,checksum || true
+        cargo fuzz run byte_storage_compress -- -max_total_time=3600
 
     - name: Fuzz byte_storage_decompress (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run byte_storage_decompress --no-default-features --features compression,checksum || true
+        cargo fuzz run byte_storage_decompress -- -max_total_time=3600
 
-    # NOTE: encryption_roundtrip and 8 other encryption targets are stale against
-    # cachekit-core 0.1.1 (encrypt_aes_gcm → encrypt_with_keys). See #114. Using
-    # encryption_key_derivation, which compiles, until those targets are migrated.
     - name: Fuzz encryption_key_derivation (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run encryption_key_derivation --no-default-features --features encryption || true
+        cargo fuzz run encryption_key_derivation -- -max_total_time=3600
 
-    - name: Check for crashes
-      run: |
-        cd rust/fuzz
-        CRASHES=$(find artifacts -name "crash-*" 2>/dev/null | wc -l)
-        if [ "$CRASHES" -gt 0 ]; then
-          echo "❌ Found $CRASHES crashes during fuzzing"
-          find artifacts -name "crash-*" -exec echo "Crash: {}" \;
-          exit 1
-        fi
-        echo "✅ No crashes found during fuzzing"
-
-    - name: Generate coverage report
-      run: |
-        cd rust
-        for target in byte_storage_compress byte_storage_decompress encryption_key_derivation; do
-          echo "=== Coverage for $target ==="
-          cargo fuzz coverage $target || true
-        done
+    # No "Check for crashes" step: now that `|| true` is gone, a crash fails its
+    # own fuzz step and kills the job, so a trailing check could only ever run in
+    # the no-crash case and print ✅ — a named green step incapable of failing,
+    # which is the exact manufactured-evidence pattern this PR removes. (It also
+    # ran `find artifacts` without creating the dir, swallowing the error.) The
+    # fuzz steps' exit codes are the signal; this upload preserves the evidence,
+    # which would otherwise die with the ephemeral runner.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: extended-fuzz-crash-artifacts
+        path: rust/fuzz/artifacts/
+        retention-days: 30
+        if-no-files-found: warn
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
