@@ -215,7 +215,20 @@ fn compress_bytes(data: &[u8]) -> PyResult<Vec<u8>> {
 |:----------|:---------------|
 | Compression | LZ4 (fast, ~3:1 ratio) |
 | Integrity | xxHash3-64 checksums |
-| Envelope | `[version:1][format:1][checksum:8][compressed_data]` |
+| Envelope | `rmp_serde` MessagePack positional `fixarray(4)`: `[compressed_data, checksum, original_size, format]` |
+
+The envelope has no version field or discriminator — the MessagePack marker on
+element `[0]` is self-describing. Since cachekit-core 0.4.0 (protocol 1.1),
+`compressed_data` encodes as MessagePack `bin` (`0xc4`/`0xc5`/`0xc6`); envelopes
+written before 0.4.0 encoded it as an array of integers and remain readable
+forever (dual-read is proven in both directions). `checksum` stays an array of
+8 integers by deliberate spec exclusion. Normative rules and rationale:
+[protocol `spec/wire-format.md`][protocol-wire] and
+[`decisions/envelope-bin-encoding.md`][protocol-bin-decision]; byte-verified
+locally in `tests/unit/protocol/test_envelope_wire_vectors.py`.
+
+[protocol-wire]: https://github.com/cachekit-io/protocol/blob/main/spec/wire-format.md
+[protocol-bin-decision]: https://github.com/cachekit-io/protocol/blob/main/decisions/envelope-bin-encoding.md
 
 ### Backend Architecture
 
