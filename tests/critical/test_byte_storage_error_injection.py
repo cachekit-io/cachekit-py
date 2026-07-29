@@ -350,23 +350,26 @@ class TestByteStorageErrorInjection(RedisIsolationMixin):
 
     @pytest.mark.slow
     def test_final_envelope_size_security_check(self):
-        """CRITICAL: ByteStorage must check final envelope size after serialization."""
+        """CRITICAL: ByteStorage must check final envelope size after serialization.
+
+        Since cachekit-core 0.4.0 the envelope encodes compressed_data as msgpack
+        bin (~1.004x payload for incompressible input, protocol 1.1), so the input
+        must sit just under the 512MiB input cap for the LZ4 incompressible-block
+        overhead to push the final envelope over the limit. (Pre-0.4.0, array-of-ints
+        inflation tripped this at 500MB.)
+        """
         from cachekit._rust_serializer import ByteStorage
 
         storage = ByteStorage("msgpack")
 
-        # Create data that when serialized as envelope might exceed limits
-        # This is tricky - need data that compresses poorly and has large metadata
-        # For this test, we'll verify the check exists by using a very large input
-        # that would create a large envelope
-
-        # Use data near the limit that won't compress well
+        # Incompressible input just under the 512MiB input cap: passes the input
+        # check, but the final envelope (input * ~1.0039 + header) exceeds the cap.
         import random
 
         random.seed(42)
-        near_limit_data = bytes([random.randint(0, 255) for _ in range(500 * 1024 * 1024)])  # 500MB random (incompressible)
+        # Chunked: randbytes() overflows past 256MiB (getrandbits takes a C int).
+        near_limit_data = b"".join(random.randbytes(128 * 1024 * 1024) for _ in range(4))[:-16]
 
-        # This should trigger either input limit OR final envelope limit
         with pytest.raises(ValueError) as exc_info:
             storage.store(near_limit_data, None)
 

@@ -105,16 +105,13 @@ class TestWireFormatFixture:
 class TestFfiDualRead:
     """Both envelope encodings decode via the real FFI retrieve path, byte-identically."""
 
-    @pytest.mark.parametrize("vector", LEGACY_VECTORS, ids=lambda v: v["name"])
-    def test_legacy_envelope_decodes(self, vector):
-        """Legacy-read proof: pre-0.4.0 array-of-ints envelopes decode forever."""
-        storage = ByteStorage("msgpack")
-        payload, fmt = storage.retrieve(bytes.fromhex(vector["envelope_hex"]))
-        assert bytes(payload) == bytes.fromhex(vector["input_hex"])
-        assert fmt == vector["format"]
+    @pytest.mark.parametrize("vector", VECTORS, ids=lambda v: v["name"])
+    def test_envelope_decodes(self, vector):
+        """Dual-read proof: legacy (array-of-ints) AND bin envelopes decode, byte-identically.
 
-    @pytest.mark.parametrize("vector", BIN_VECTORS, ids=lambda v: v["name"])
-    def test_bin_envelope_decodes(self, vector):
+        The plain-named vectors pin the pre-0.4.0 legacy encoding, which stays a
+        permanently accepted read format; their ``*_bin`` twins pin the 0.4.0 writer.
+        """
         storage = ByteStorage("msgpack")
         payload, fmt = storage.retrieve(bytes.fromhex(vector["envelope_hex"]))
         assert bytes(payload) == bytes.fromhex(vector["input_hex"])

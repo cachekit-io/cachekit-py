@@ -221,7 +221,8 @@ The envelope has no version field or discriminator — the MessagePack marker on
 element `[0]` is self-describing. Since cachekit-core 0.4.0 (protocol 1.1),
 `compressed_data` encodes as MessagePack `bin` (`0xc4`/`0xc5`/`0xc6`); envelopes
 written before 0.4.0 encoded it as an array of integers and remain readable
-forever (dual-read is proven in both directions). `checksum` stays an array of
+forever (both encodings are byte-verified against the protocol vectors in
+`tests/unit/protocol/test_envelope_wire_vectors.py`). `checksum` stays an array of
 8 integers by deliberate spec exclusion. Normative rules and rationale:
 [protocol `spec/wire-format.md`][protocol-wire] and
 [`decisions/envelope-bin-encoding.md`][protocol-bin-decision]; byte-verified
