@@ -84,17 +84,23 @@ async def async_cached_function(x):
 
 ## Distributed Locking (async only)
 
+`acquire_lock` is an async context manager (LockableBackend protocol). It yields
+`True` if the lock was acquired, `False` if `blocking_timeout` elapsed first, and
+releases the lock automatically on context exit. This is a **best-effort lease**,
+not mutual exclusion: it expires server-side at `timeout` even if the holder is
+still working (no notification, no fencing token) — do not rely on it for
+correctness of non-idempotent operations.
+
 ```python notest
 backend = CachekitIOBackend()
 
-lock_id = await backend.acquire_lock("my-lock", timeout=5)
-if lock_id:
-    try:
-        # do work
-        pass
-    finally:
-        await backend.release_lock("my-lock", lock_id)
+async with backend.acquire_lock("my-key", timeout=30.0, blocking_timeout=5.0) as acquired:
+    if acquired:
+        pass  # do work; lock auto-releases on context exit
 ```
+
+The `@cache` decorators use this automatically on cache miss for **async**
+functions — see [Distributed Locking](../features/distributed-locking.md).
 
 ## TTL Inspection (async only)
 
