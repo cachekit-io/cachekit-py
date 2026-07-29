@@ -64,9 +64,9 @@ jobs:
 
     - name: Install nightly Rust
       run: |
-        # Pin nightly: cargo-fuzz 0.13.1 → rustix uses rustc_layout_scalar_valid_range_*
-        # attributes reserved after nightly-2026-04-27. Last known-good date.
-        # Same pin as fuzz-smoke.yml.
+        # Pin nightly: cargo-fuzz's rustix dependency uses
+        # rustc_layout_scalar_valid_range_* attributes reserved after
+        # nightly-2026-04-27. Last known-good date. Same pin as fuzz-smoke.yml.
         rustup toolchain install nightly-2026-04-27
         rustup default nightly-2026-04-27
 
@@ -76,6 +76,20 @@ jobs:
       # kani-verifier above and fuzz-smoke.yml.
       run: cargo install --locked cargo-fuzz --version 0.13.2
 
+    - name: Verify fuzz lockfile is current
+      run: |
+        cd rust/fuzz
+        # See fuzz-smoke.yml: cargo fuzz has no --locked passthrough, so this is
+        # the only step enforcing the committed lock against manifest drift.
+        cargo +nightly-2026-04-27 fetch --locked
+
+    - name: Build fuzz targets
+      run: |
+        cd rust/fuzz
+        # Build before fuzzing so a compile error surfaces in ~10 min as a build
+        # failure, not three hours in as a confusing fuzz-step error.
+        cargo +nightly-2026-04-27 fuzz build
+
     # The fuzz crate (cachekit-storage-fuzz) declares no [features] table — its
     # cachekit-core feature set is fixed in rust/fuzz/Cargo.toml. Passing
     # --features here makes cargo error out before any fuzzing happens, and the
@@ -83,9 +97,9 @@ jobs:
     # exit (build failure or crash) must fail the job; a clean hour exits 0 via
     # -max_total_time.
     #
-    # Deliberate 3-of-14 subset: time budget. These three cover the highest-value
-    # attack surfaces (compression bombs, envelope decode, key derivation); the
-    # full target set gets 60 s each on every PR via fuzz-smoke.yml.
+    # Deliberate subset for the time budget: these three cover the highest-value
+    # attack surfaces (compression bombs, envelope decode, key derivation); every
+    # target gets 60 s on every PR via fuzz-smoke.yml.
     - name: Fuzz byte_storage_compress (1 hour)
       run: |
         cd rust
@@ -101,19 +115,13 @@ jobs:
         cd rust
         cargo fuzz run encryption_key_derivation -- -max_total_time=3600
 
-    - name: Check for crashes
-      run: |
-        cd rust/fuzz
-        CRASHES=$(find artifacts -name "crash-*" 2>/dev/null | wc -l)
-        if [ "$CRASHES" -gt 0 ]; then
-          echo "❌ Found $CRASHES crashes during fuzzing"
-          find artifacts -name "crash-*" -exec echo "Crash: {}" \;
-          exit 1
-        fi
-        echo "✅ No crashes found during fuzzing"
-
-    # A crash now fails the fuzz step itself, killing the job before the check
-    # above — without this upload the reproducer dies with the ephemeral runner.
+    # No "Check for crashes" step: now that `|| true` is gone, a crash fails its
+    # own fuzz step and kills the job, so a trailing check could only ever run in
+    # the no-crash case and print ✅ — a named green step incapable of failing,
+    # which is the exact manufactured-evidence pattern this PR removes. (It also
+    # ran `find artifacts` without creating the dir, swallowing the error.) The
+    # fuzz steps' exit codes are the signal; this upload preserves the evidence,
+    # which would otherwise die with the ephemeral runner.
     - name: Upload crash artifacts
       if: failure()
       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
