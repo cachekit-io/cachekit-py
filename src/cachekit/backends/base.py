@@ -269,9 +269,8 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: Redis, PostgreSQL, DynamoDB
-    - Local-only: SQLite, FileSystem (single-process locking)
-    - Not supported: HTTP (stateless), Memcached, S3
+    - Supported: RedisBackend, CachekitIOBackend (SaaS ``POST /v1/cache/{key}/lock``)
+    - Not supported: FileBackend, L1-only (in-memory)
 
     Contract — bare cache key:
         ``acquire_lock`` receives the **bare cache key**, identical to what
