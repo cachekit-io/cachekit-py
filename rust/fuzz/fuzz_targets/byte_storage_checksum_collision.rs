@@ -24,7 +24,7 @@ fuzz_target!(|test_case: ChecksumTestCase| {
     }
 
     // Create valid envelope first
-    let envelope = match StorageEnvelope::new(test_case.data.clone(), "msgpack".to_string()) {
+    let envelope = match StorageEnvelope::new(&test_case.data, "msgpack".to_string()) {
         Ok(env) => env,
         Err(_) => return, // Skip if data too large
     };
@@ -59,7 +59,7 @@ fuzz_target!(|test_case: ChecksumTestCase| {
             // Expected: Checksum validation should fail
             let err_msg = err.to_string();
             assert!(
-                err_msg.contains("Checksum validation failed") || err_msg.contains("decompression failed"),
+                err_msg.contains("integrity check failed") || err_msg.contains("decompression failed"),
                 "Error should indicate checksum or decompression failure: {}",
                 err_msg
             );

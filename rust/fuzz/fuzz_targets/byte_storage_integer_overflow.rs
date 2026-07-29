@@ -45,7 +45,7 @@ fuzz_target!(|test_case: OverflowTestCase| {
             // Verify error message is descriptive
             let err_msg = err.to_string();
             assert!(
-                err_msg.contains("Security violation") || err_msg.contains("failed"),
+                err_msg.contains("exceeds") || err_msg.contains("failed"),
                 "Error message should be descriptive: {}",
                 err_msg
             );

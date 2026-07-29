@@ -27,7 +27,10 @@ jobs:
   fuzz-smoke:
     name: Fuzz Smoke Test (60s per target)
     runs-on: cachekit
-    timeout-minutes: 20
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
+    # so no cross-run cache) + ~10 min one-shot ASAN build of all targets
+    # + 14 targets x 60 s fuzzing = ~14 min + slack.
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -42,6 +45,13 @@ jobs:
     - name: Install cargo-fuzz
       run: cargo install --locked cargo-fuzz
 
+    - name: Build all fuzz targets
+      run: |
+        cd rust/fuzz
+        # One cargo invocation builds every [[bin]] target, sharing dependency
+        # compilation. A target that fails to compile fails the job here.
+        cargo +nightly-2026-04-27 fuzz build
+
     - name: Run fuzzing smoke tests
       id: fuzz
       run: |
@@ -50,28 +60,17 @@ jobs:
         # Create artifacts directory
         mkdir -p artifacts
 
-        # Fuzz targets that compile against cachekit-core 0.1.1.
-        # 9 encryption/advanced targets are disabled — cachekit-core API
-        # changed (encrypt_aes_gcm → encrypt_with_keys etc.) and the
-        # fuzz targets haven't been updated. See #114.
-        FUZZ_TARGETS=(
-          byte_storage_compress
-          byte_storage_decompress
-          byte_storage_format_injection
-          encryption_key_derivation
-        )
-
-        for target in "${FUZZ_TARGETS[@]}"; do
+        # Every [[bin]] target in fuzz/Cargo.toml runs — the list is derived,
+        # not hand-maintained, so new targets can't silently go dark.
+        # A non-zero exit (crash found, or target failed to run) fails the
+        # job immediately: green must mean "fuzzed and clean".
+        for target in $(cargo +nightly-2026-04-27 fuzz list); do
           echo "Fuzzing $target..."
-
-          if ! cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60; then
-            echo "::warning::Fuzz target '$target' found potential issues"
-            # Continue to test other targets even if one fails
-            touch artifacts/.fuzz_failures
-          fi
+          cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60
         done
 
-        # Check if any crashes were found
+        # Belt-and-braces: fail on any crash artifact even if the runs above
+        # all exited zero.
         if find artifacts -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' | grep -q .; then
           echo "::error::Fuzzing discovered crashes or errors. See artifacts for details."
           exit 1

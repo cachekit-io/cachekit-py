@@ -70,23 +70,26 @@ jobs:
     - name: Install cargo-fuzz
       run: cargo install --locked cargo-fuzz
 
+    # The fuzz crate (cachekit-storage-fuzz) declares no [features] table — its
+    # cachekit-core feature set is fixed in rust/fuzz/Cargo.toml. Passing
+    # --features here makes cargo error out before any fuzzing happens, and the
+    # old `|| true` swallowed exactly that for three core versions. A non-zero
+    # exit (build failure or crash) must fail the job; a clean hour exits 0 via
+    # -max_total_time.
     - name: Fuzz byte_storage_compress (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run byte_storage_compress --no-default-features --features compression,checksum || true
+        cargo fuzz run byte_storage_compress -- -max_total_time=3600
 
     - name: Fuzz byte_storage_decompress (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run byte_storage_decompress --no-default-features --features compression,checksum || true
+        cargo fuzz run byte_storage_decompress -- -max_total_time=3600
 
-    # NOTE: encryption_roundtrip and 8 other encryption targets are stale against
-    # cachekit-core 0.1.1 (encrypt_aes_gcm → encrypt_with_keys). See #114. Using
-    # encryption_key_derivation, which compiles, until those targets are migrated.
     - name: Fuzz encryption_key_derivation (1 hour)
       run: |
         cd rust
-        timeout 3600 cargo fuzz run encryption_key_derivation --no-default-features --features encryption || true
+        cargo fuzz run encryption_key_derivation -- -max_total_time=3600
 
     - name: Check for crashes
       run: |
