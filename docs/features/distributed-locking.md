@@ -20,9 +20,6 @@ async def expensive_query(key):
 # 999 pods wait for L2 cache to be populated
 ```
 
-Locking requires an **async** decorated function and a `LockableBackend`
-(`RedisBackend` or `CachekitIOBackend`) — see the note below.
-
 ---
 
 ## Quick Start
@@ -73,13 +70,6 @@ result = asyncio.run(compute_report("daily"))
 assert result["computed"] is True
 ```
 
-```python notest
-# Sync variant of the same function: NO stampede protection.
-@cache(ttl=300)
-def compute_report_sync(report_id):
-    return expensive_operation()  # Every concurrent cold-key caller executes this
-```
-
 ---
 
 ## What It Does
@@ -105,37 +95,14 @@ Pod A releases lock
 → Database handles 1 query instead of 1000 (GOOD)
 ```
 
----
-
-## Why You'd Want It
-
-**Production scenario**: Popular data being cached. Cache expires simultaneously across all pods.
-
-**Without locking**:
-```
-Cache miss
-1000 pods hit database simultaneously
-Database gets 1000 queries for same data
-Database overloaded
-Queries timeout
-Stampede cascades
-```
-
-**With locking**:
-```
-Cache miss
-1000 pods contend for lock
-1 pod wins, queries database (normal load)
-999 pods wait
-Database serves 1 query
-Lock released, cache populated
-999 pods read from cache
-No overload, no cascade
-```
-
 **Real example**: News site, trending story expires from cache
 - Without locking: 10,000 requests = 10,000 DB queries
 - With locking: 10,000 requests = 1 DB query
+
+Single-flight behaviour assumes the function completes within the 5 s
+`blocking_timeout` and the lock backend is reachable — see
+[Lock Timing](#lock-timing-30-second-expiry-5-second-wait) for the
+degradation paths.
 
 ---
 
@@ -162,53 +129,48 @@ per decorator):
 | `lock_timeout` | **30 s** | How long the winner holds the lock before it self-expires. Protects against a crashed holder deadlocking everyone. |
 | `blocking_timeout` | **5 s** | How long waiters poll to acquire the lock before giving up. |
 
-Two behavioural edges to design around:
+Three behavioural edges to design around:
 
 1. **Waiter fallthrough at 5 s.** A waiter that can't acquire the lock within
    5 seconds re-checks the cache one last time and, if it's still empty,
-   **executes the function itself without the lock**. So a computation slower
-   than 5 seconds gets a bounded number of extra recomputes (one per waiter
-   that times out) — degraded stampede protection, not an unbounded stampede,
-   and never an error.
+   **executes the function itself without the lock**. The bound is the full
+   waiter count: for a function slower than 5 seconds, every waiter times out
+   and recomputes, so protection is effectively nil. Keep execution time under
+   5 s for full single-flight behaviour.
 2. **Lock self-expiry at 30 s.** If the function runs longer than 30 seconds,
    the lock expires while the winner is still computing and another pod may
-   start a concurrent recompute. Keep expensive functions well under 30 s, or
-   split the work.
+   start a concurrent recompute. This applies whether the holder is slow or
+   crashed — the expiry is the crash-recovery safety net (Redis key TTL /
+   CachekitIO server-side expiry). Keep expensive functions well under 30 s,
+   or split the work.
+3. **Lock backend errors degrade to no lock.** If lock acquisition or release
+   raises a backend error (lock backend outage, authentication failure), the
+   wrapper logs a warning and **executes the function without the lock** — for
+   every caller, i.e. a full stampede. The lock is best-effort stampede
+   mitigation, never load-bearing mutual exclusion: do not rely on it for
+   correctness of non-idempotent operations.
 
 ---
 
 ## What Can Go Wrong
-
-### Function Slower Than the 5 s Blocking Timeout
-```python notest
-@cache(ttl=300)
-async def operation(x):
-    return slow_compute(x)  # Takes 10 seconds
-
-# Waiters poll for 5 s (blocking_timeout), then fall through:
-# each re-checks the cache and, still empty, executes the function itself.
-# Solution: keep execution time under 5 s for full single-flight behaviour.
-```
 
 ### Lock Holder Crashes
 ```python
 # Pod A acquires lock
 # Pod A crashes while holding lock
 # Waiters poll up to 5 s (blocking_timeout), then fall through and recompute;
-# the lock itself self-expires after 30 s (lock_timeout) as the safety net
-# (Redis key TTL / CachekitIO server-side expiry).
+# the lock itself self-expires after 30 s (lock_timeout) as the safety net.
 ```
 
-### TTL Expires During Lock Wait
+### TTL Shorter Than Compute Time
 ```python
-@cache(ttl=5)  # 5 second TTL
+@cache(ttl=1)  # 1 second TTL
 async def operation(x):
-    time.sleep(2)
     return slow_compute(x)  # Takes 2 seconds
 
-# Lock acquired, Pod B waits 2 seconds
-# TTL expires while Pod B waits
-# Solution: Ensure TTL > function execution time
+# Winner computes for 2 s; the cached value expires 1 s after the write,
+# so waiters that fell through keep finding an empty cache.
+# Solution: Ensure TTL comfortably exceeds function execution time
 ```
 
 ---
@@ -252,13 +214,14 @@ async def generate_stats(date):
     return stats_engine.compute(date)
 ```
 
-The SaaS lock is protocol-level (`POST /v1/cache/{key}/lock`) and available to
-every authenticated API key — no extra configuration or plan tier required.
+The SaaS lock is available to every authenticated API key — no extra
+configuration or plan tier required.
 
 ### Disabling for Cheap Operations
 ```python notest
 # Use a non-LockableBackend for operations where stampede isn't a concern,
 # or just accept the minimal overhead — locking only activates on cache miss.
+# (A sync function like this never locks anyway — zero lock overhead.)
 
 @cache(ttl=300)
 def cheap_lookup(x):
@@ -277,7 +240,7 @@ The `LockableBackend` protocol defines how backends provide distributed locking:
 ```python notest
 async def acquire_lock(
     self,
-    key: str,              # Lock key, e.g. "lock:function_name:args_hash"
+    key: str,              # Bare cache key (same key as get/set); backend derives lock namespace
     timeout: float,        # How long to hold the lock (seconds)
     blocking_timeout: Optional[float] = None,  # Max wait to acquire (None = non-blocking)
 ) -> AsyncIterator[bool]:
@@ -310,28 +273,17 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
    Server-side expiry (timeout_ms) is the safety net if the holder crashes
 ```
 
-### Integration with Cache Layers
-```
-L1 miss, L2 miss detected
-Distributed lock acquisition begins (via backend.acquire_lock)
-Only one pod wins lock
-That pod calls function
-Function executes
-Result written to L1 and L2
-Lock released
-Other pods read from L2 (now populated)
-```
-
 ### Performance Impact
-- **Lock already held**: Waiters poll with exponential backoff for up to `blocking_timeout` (5 s)
+- **Lock already held**: Waiters poll for up to `blocking_timeout` (5 s) — fixed 0.1 s interval on Redis, exponential backoff + jitter on CachekitIO
 - **Lock acquisition**: <10ms (Redis SET NX operation)
 - **Lock release**: <5ms (Redis DEL operation)
 - **Waiting cost**: Function execution cost saved * (pods_waiting - 1)
 
-**Example**: 1000 pods, 10s function call, 999 waiting
-- Cost without locking: 10,000 seconds total CPU
-- Cost with locking: 10 seconds + lock overhead ≈ ~60 seconds total CPU
-- Savings: 99.4% reduction
+**Example**: 1000 pods, 3s function call, 999 waiting
+- Cost without locking: 3,000 seconds total CPU
+- Cost with locking: 3 seconds + lock overhead
+- (A 10s function would gain nothing: every waiter falls through at 5 s and
+  recomputes — see [Lock Timing](#lock-timing-30-second-expiry-5-second-wait).)
 
 ---
 
@@ -341,9 +293,9 @@ Other pods read from L2 (now populated)
 ```python
 @cache(ttl=300)  # Both enabled
 async def operation(x):
-    # L2 backend down while holding lock
-    # Circuit breaker catches error
-    # Lock TTL ensures lock eventually expires
+    # L2 backend down: lock acquisition fails too (the lock lives in L2),
+    # so every caller executes without the lock while the circuit breaker
+    # keeps the function serving. Locking resumes when the backend recovers.
     return compute(x)
 ```
 
@@ -361,29 +313,11 @@ async def fetch_sensitive(x):
 
 ## Monitoring & Debugging
 
-### Metrics Available
-```prometheus
-cachekit_lock_acquisitions_total{function="get_leaderboard"}
-  # How many times lock was acquired
-
-cachekit_lock_timeouts_total{function="get_leaderboard"}
-  # How many times lock timeout occurred
-
-cachekit_lock_wait_duration_seconds{function="get_leaderboard"}
-  # How long waiting pods waited for lock
-```
-
-### Detecting Stampedes
-```python
-# If metrics show:
-# - High cache_misses_total
-# - Low lock_acquisitions_total (relative to misses)
-# → Stampede is happening
-
-# Check log:
-# - "lock_timeout" errors
-# → Lock timeout is too short relative to function execution time
-```
+Lock waiters that time out log a `Failed to acquire lock for {key} after 5.0s`
+warning; lock backend errors log a `Lock operation failed … executing without
+lock` warning. For miss-rate monitoring (stampede detection), use the `status`
+label on `redis_cache_operations_total` — see
+[Prometheus Metrics](prometheus-metrics.md).
 
 ---
 
@@ -398,7 +332,7 @@ A: Two things to check:
 2. The backend must implement `LockableBackend` (`RedisBackend`, `CachekitIOBackend`). Check with `from cachekit.backends.base import LockableBackend; isinstance(backend, LockableBackend)`.
 
 **Q: How do I know if stampedes are happening?**
-A: Check Prometheus: `rate(cachekit_cache_misses_total[1m])` spike = stampede risk.
+A: Check Prometheus: a spike in `rate(redis_cache_operations_total{status="miss"}[1m])` = stampede risk. See [Prometheus Metrics](prometheus-metrics.md).
 
 ---
 

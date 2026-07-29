@@ -86,8 +86,10 @@ async def async_cached_function(x):
 
 `acquire_lock` is an async context manager (LockableBackend protocol). It yields
 `True` if the lock was acquired, `False` if `blocking_timeout` elapsed first, and
-releases the lock automatically on context exit (server-side expiry via `timeout`
-is the safety net if the holder crashes):
+releases the lock automatically on context exit. This is a **best-effort lease**,
+not mutual exclusion: it expires server-side at `timeout` even if the holder is
+still working (no notification, no fencing token) — do not rely on it for
+correctness of non-idempotent operations.
 
 ```python notest
 backend = CachekitIOBackend()
