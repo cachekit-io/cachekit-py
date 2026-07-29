@@ -29,7 +29,8 @@ jobs:
     runs-on: cachekit
     # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
     # so no cross-run cache) + ~10 min one-shot ASAN build of all targets
-    # + 14 targets x 60 s fuzzing = ~14 min + slack.
+    # + ~1 min per fuzz target (count derived from `cargo fuzz list`, ~14 min
+    # today) + slack.
     timeout-minutes: 45
 
     steps:
@@ -43,7 +44,9 @@ jobs:
         rustup default nightly-2026-04-27
 
     - name: Install cargo-fuzz
-      run: cargo install --locked cargo-fuzz
+      # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
+      # release immediate code exec on the self-hosted runner.
+      run: cargo install --locked cargo-fuzz --version 0.13.2
 
     - name: Build all fuzz targets
       run: |
@@ -62,9 +65,18 @@ jobs:
 
         # Every [[bin]] target in fuzz/Cargo.toml runs — the list is derived,
         # not hand-maintained, so new targets can't silently go dark.
+        # Resolve the list in a standalone assignment: `for t in $(cmd)` does
+        # not propagate a failing $(cmd) under `set -e`, and an empty list
+        # would loop zero times and go green having fuzzed nothing.
+        TARGETS=$(cargo +nightly-2026-04-27 fuzz list)
+        if [ -z "$TARGETS" ]; then
+          echo "::error::cargo fuzz list returned no targets"
+          exit 1
+        fi
+
         # A non-zero exit (crash found, or target failed to run) fails the
         # job immediately: green must mean "fuzzed and clean".
-        for target in $(cargo +nightly-2026-04-27 fuzz list); do
+        for target in $TARGETS; do
           echo "Fuzzing $target..."
           cargo +nightly-2026-04-27 fuzz run "$target" -- -max_total_time=60
         done

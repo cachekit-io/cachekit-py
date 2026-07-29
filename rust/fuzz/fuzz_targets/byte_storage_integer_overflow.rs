@@ -40,15 +40,11 @@ fuzz_target!(|test_case: OverflowTestCase| {
             // Decompression succeeded - envelope passed all validation checks
             // This should only happen for valid sizes within limits
         }
-        Err(err) => {
-            // Expected for oversized allocations (u32::MAX, beyond 512MB, etc.)
-            // Verify error message is descriptive
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("exceeds") || err_msg.contains("failed"),
-                "Error message should be descriptive: {}",
-                err_msg
-            );
+        Err(_) => {
+            // Expected for oversized allocations (u32::MAX, beyond 512MB, etc.).
+            // Every 0.4.0 ByteStorageError message matches a string check here,
+            // so asserting on the text would be a tautology — the invariant this
+            // target enforces is "no panic on extreme sizes", not the wording.
         }
     }
 

@@ -82,7 +82,7 @@ fuzz_target!(|test_case: ChecksumTestCase| {
         Err(err) => {
             let err_msg = err.to_string();
             assert!(
-                err_msg.contains("Checksum") || err_msg.contains("failed"),
+                err_msg.contains("integrity check failed") || err_msg.contains("decompression failed"),
                 "Wrong checksum should be detected: {}",
                 err_msg
             );

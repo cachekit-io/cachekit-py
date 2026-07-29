@@ -16,6 +16,10 @@ rmp-serde = "1"
 
 # Fuzz targets use cachekit-core's internal module paths (byte_storage::, encryption::)
 # not the thin PyO3 wrapper's flat re-exports.
+# Exact pin, deliberately stricter than the parent crate's caret requirement:
+# this [workspace] resolves independently of rust/Cargo.toml, so the pin is the
+# only thing guaranteeing we fuzz the same core version the wrapper ships.
+# Bump it in the same diff as every parent-crate core bump.
 [dependencies.cachekit_storage]
 package = "cachekit-core"
 version = "=0.4.0"

@@ -49,7 +49,10 @@ jobs:
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
     runs-on: cachekit
-    timeout-minutes: 200
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
+    # no cross-run cache) + ~10 min ASAN builds + 3 x 60 min fuzz time
+    # (-max_total_time is pure fuzz time, excluding builds) + slack.
+    timeout-minutes: 240
     env:
       # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
       # toolchain across overlay/hostPath boundaries on the ARC runner pod
@@ -68,7 +71,10 @@ jobs:
         rustup default nightly-2026-04-27
 
     - name: Install cargo-fuzz
-      run: cargo install --locked cargo-fuzz
+      # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
+      # release immediate code exec on the self-hosted runner. Same pattern as
+      # kani-verifier above and fuzz-smoke.yml.
+      run: cargo install --locked cargo-fuzz --version 0.13.2
 
     # The fuzz crate (cachekit-storage-fuzz) declares no [features] table — its
     # cachekit-core feature set is fixed in rust/fuzz/Cargo.toml. Passing
@@ -76,6 +82,10 @@ jobs:
     # old `|| true` swallowed exactly that for three core versions. A non-zero
     # exit (build failure or crash) must fail the job; a clean hour exits 0 via
     # -max_total_time.
+    #
+    # Deliberate 3-of-14 subset: time budget. These three cover the highest-value
+    # attack surfaces (compression bombs, envelope decode, key derivation); the
+    # full target set gets 60 s each on every PR via fuzz-smoke.yml.
     - name: Fuzz byte_storage_compress (1 hour)
       run: |
         cd rust
@@ -102,13 +112,16 @@ jobs:
         fi
         echo "✅ No crashes found during fuzzing"
 
-    - name: Generate coverage report
-      run: |
-        cd rust
-        for target in byte_storage_compress byte_storage_decompress encryption_key_derivation; do
-          echo "=== Coverage for $target ==="
-          cargo fuzz coverage $target || true
-        done
+    # A crash now fails the fuzz step itself, killing the job before the check
+    # above — without this upload the reproducer dies with the ephemeral runner.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: extended-fuzz-crash-artifacts
+        path: rust/fuzz/artifacts/
+        retention-days: 30
+        if-no-files-found: warn
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
