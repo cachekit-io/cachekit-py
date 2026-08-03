@@ -4,7 +4,7 @@
 
 > **Python caching, batteries included**
 
-Production-ready caching for Python with intelligent reliability features and Rust-powered performance.
+Backend-agnostic caching with intent-based decorators, optional zero-knowledge encryption, and Rust-powered performance.
 
 [![PyPI Version][pypi-badge]][pypi-url]
 [![Python Versions][python-badge]][pypi-url]
