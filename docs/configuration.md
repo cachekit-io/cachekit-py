@@ -152,7 +152,7 @@ from cachekit import cache
 
 os.environ["CACHEKIT_API_KEY"] = "ck_live_your_key_here"
 
-# All production-grade features enabled: L1, circuit breaker, adaptive timeout, monitoring
+# All production-grade features enabled: L1, circuit breaker, monitoring
 @cache.io(ttl=300)
 def fetch_data(user_id: int):
     return expensive_api_call(user_id)
@@ -243,7 +243,6 @@ from cachekit.config import L1CacheConfig
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,  # Refresh at 50% of TTL
-        invalidation_enabled=True,
         namespace_index=True,
     ),
     backend=None
@@ -260,7 +259,6 @@ def my_function():
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
-| `invalidation_enabled` | bool | `True` | Enable invalidation event broadcasts |
 | `namespace_index` | bool | `True` | Enable fast namespace-based invalidation |
 
 **L1 Cache Concepts:**
@@ -589,7 +587,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
 > [!TIP]
-> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads.
+> Compression saves network bandwidth for large values. `none` can enable zero-copy mmap reads on the File backend — eligibility also requires a plaintext (unencrypted) Arrow payload read back as pandas (`return_format="pandas"`) and a backend that supports buffer reads. Writes are independent of this setting: plaintext Arrow values stream to the File backend record batch by record batch (compressed or not), never materializing the full payload in memory; encrypted values and other backends use the buffered write path.
 
 ### Connection Pooling
 

@@ -1,10 +1,9 @@
 """Reliability components for backend cache operations.
 
 Provides async metrics collection, health checks, circuit breakers,
-adaptive timeouts, and reliability profiles.
+and reliability profiles.
 """
 
-from .adaptive_timeout import AdaptiveTimeout, AdaptiveTimeoutManager
 from .async_metrics import AsyncMetricsCollector, get_async_metrics_collector
 from .circuit_breaker import (
     CacheOperationMetrics,
@@ -23,8 +22,6 @@ from .profiles import (
 )
 
 __all__ = [
-    "AdaptiveTimeout",
-    "AdaptiveTimeoutManager",
     "AsyncMetricsCollector",
     "BackendErrorClassifier",
     "BackpressureController",

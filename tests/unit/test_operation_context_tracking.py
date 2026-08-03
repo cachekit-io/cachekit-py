@@ -20,7 +20,6 @@ class TestOperationContextTracking:
         orchestrator = FeatureOrchestrator(
             namespace="test",
             circuit_breaker_enabled=False,
-            adaptive_timeout_enabled=False,
             backpressure_enabled=False,
             collect_stats=True,
         )

@@ -2,7 +2,7 @@
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
-> **For multi-pod deployments**: Ensure L1 caches remain consistent across pods with automatic invalidation and intelligent freshness management.
+> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
 
 ---
 
@@ -147,78 +147,20 @@ This is automatic and transparent - no configuration needed.
 
 ---
 
-## Multi-Level Invalidation API
+## Invalidation API
 
-CacheKit supports invalidation at three granularity levels, allowing you to target exactly what needs refreshing:
+Invalidation is exposed per decorated function via `invalidate_cache()`:
 
-### Level 1: Global Invalidation
+### Specific Call Invalidation
 
-Clear the **entire L1 cache** across all pods:
-
-```python notest
-from cachekit import cache
-
-# Invalidate all entries
-cache.invalidate_all()
-```
-
-**Use cases:**
-- Schema migrations
-- Security breaches requiring complete refresh
-- Emergency cache flush
-
-**Returns:** Number of entries invalidated
-
-**Effect across pods:** Broadcast via Redis Pub/Sub - all pods receive invalidation event and clear their L1 caches.
-
-### Level 2: Namespace Invalidation
-
-Clear all entries in a **specific namespace**:
-
-```python notest
-from cachekit import cache
-
-# Clear all user-related caches
-cache.invalidate_namespace("users")
-
-# Clear all product caches
-cache.invalidate_namespace("products")
-```
-
-**Use cases:**
-- Bulk updates (all users updated)
-- Tenant deletion
-- Category refresh
-
-**Returns:** Number of entries invalidated
-
-**Effect across pods:** Only entries matching the namespace are cleared.
-
-**How namespaces work:**
-- Namespaces are automatic based on function signature
-- You can also set custom namespace per decorator
-
-```python notest
-from cachekit import cache
-
-@cache(namespace="users")
-def get_user(user_id: int):
-    return db.query(f"SELECT * FROM users WHERE id={user_id}")
-
-# Later, invalidate all user caches
-cache.invalidate_namespace("users")
-```
-
-### Level 3: Per-Function Invalidation
-
-Clear cache for a **specific function call**:
+Clear the cache for a **specific function call**:
 
 ```python notest
 from cachekit import cache
 
 @cache
 def get_user(user_id: int):
-    return db.query(f"SELECT * FROM users WHERE id={user_id}")
+    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
 
 # Clear cache only for user #123
 get_user.invalidate_cache(user_id=123)
@@ -233,9 +175,34 @@ for uid in [1, 2, 3]:
 - User data refresh
 - Post cache invalidation
 
-**Returns:** Boolean indicating success
+**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local.
 
-**Effect across pods:** Only the specific cache key is cleared.
+### Whole-Function Invalidation
+
+Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry this process has written for that function:
+
+```python notest
+@cache
+def get_user(user_id: int):
+    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
+
+# Clear all get_user entries written by this process (L1 + L2)
+get_user.invalidate_cache()
+```
+
+**Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
+
+---
+
+## Multi-Instance Semantics
+
+CacheKit does **not** ship cross-instance L1 invalidation in Python. When running multiple processes or pods against a shared L2 backend:
+
+- `invalidate_cache(args...)` deletes the key from shared L2, so any pod's next **L1 miss** fetches fresh data.
+- Pods that still hold the entry in L1 keep serving it until their **L1 TTL** expires (L1 expires 1 second before L2 by design).
+- Worst-case staleness after an invalidation is therefore bounded by the entry's remaining TTL. Size TTLs accordingly for data where cross-pod staleness matters.
+
+The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel; an equivalent for Python (paired with server-side key tracking for whole-function invalidation) is a potential future feature. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for current per-SDK support.
 
 ---
 
@@ -256,8 +223,6 @@ config = L1CacheConfig(
     swr_enabled=True,                # Enable SWR (default: True)
     swr_threshold_ratio=0.5,         # Refresh at X% of TTL (default: 0.5 = 50%)
 
-    # Invalidation Settings
-    invalidation_enabled=True,       # Enable invalidation channels (default: True)
     namespace_index=True,            # Enable O(1) namespace lookups (default: True)
 )
 ```
@@ -268,7 +233,6 @@ config = L1CacheConfig(
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL (0.1-1.0) |
-| `invalidation_enabled` | bool | `True` | Enable invalidation broadcasts |
 | `namespace_index` | bool | `True` | Enable fast namespace lookups |
 
 ### Intent Presets
@@ -306,21 +270,22 @@ def test_function():
 
 **Feature Behavior by Preset:**
 
-| Preset | SWR | Invalidation | Namespace Index |
-|--------|-----|--------------|-----------------|
-| `minimal()` | ❌ | ❌ | ❌ |
-| `test()` | ❌ | ❌ | ❌ |
-| `dev()` | ✓ | ❌ | ❌ |
-| `production()` | ✓ | ✓ | ✓ |
-| `secure()` | ✓ | ✓ | ✓ |
+| Preset | SWR | Namespace Index |
+|--------|-----|-----------------|
+| `minimal()` | ❌ | ❌ |
+| `test()` | ❌ | ❌ |
+| `dev()` | ✓ | ❌ |
+| `production()` | ✓ | ✓ |
+| `secure()` | ✓ | ✓ |
+| `io()` | ✓ | ✓ |
 
 ---
 
 ## Common Patterns
 
-### Pattern 1: Multi-Pod Consistency
+### Pattern 1: Invalidate on Write
 
-Ensure all pods serve fresh data after an update:
+Delete the cached entry when the underlying data changes:
 
 ```python notest
 from cachekit import cache
@@ -335,43 +300,30 @@ def update_user(user_id: int, data: dict):
     # Update database
     database.update_user(user_id, data)
 
-    # Invalidate cache - broadcasts to all pods
+    # Remove from local L1 and shared L2
     get_user.invalidate_cache(user_id=user_id)
 
     return {"status": "updated"}
 ```
 
-### Pattern 2: Bulk Operations
+In multi-pod deployments, other pods pick up the fresh value on their next L1 miss; until then they may serve their L1 copy for at most the remaining TTL (see [Multi-Instance Semantics](#multi-instance-semantics)).
 
-Invalidate multiple related caches:
+### Pattern 2: Bulk Invalidation per Function
+
+Clear everything this process cached for a function:
 
 ```python notest
 @cache(namespace="products")
 def get_product(product_id: int):
     return db.get_product(product_id)
 
-@cache(namespace="products")
-def get_product_reviews(product_id: int):
-    return db.get_reviews(product_id)
-
-# Category discount: invalidate all product caches
+# Category discount: drop all product entries written by this process
 def apply_category_discount(category_id: int, discount: float):
     db.update_category_discount(category_id, discount)
-
-    # One call clears both get_product and get_product_reviews
-    cache.invalidate_namespace("products")
+    get_product.invalidate_cache()
 ```
 
-### Pattern 3: Emergency Shutdown
-
-Clear all caches when disaster occurs:
-
-```python notest
-from cachekit import cache
-
-# On security breach, schema change, etc.
-cache.invalidate_all()
-```
+For bulk updates where cross-process consistency matters, prefer short TTLs over relying on invalidation: whole-function invalidation only tracks keys written by the local process.
 
 ---
 
@@ -394,32 +346,15 @@ SWR keeps most hits at L1 speed, even when serving slightly stale data.
 
 For typical workloads (1000s of keys), overhead is <1MB.
 
-### Broadcast Overhead
-
-Invalidation broadcasts are:
-- **Asynchronous**: Don't block the invalidating pod
-- **Fire-and-forget**: Delivered via Redis Pub/Sub (at-most-once)
-- **Per-pod local**: Each pod handles its own L1 deletion
-
 ---
 
 ## Troubleshooting
 
-### Problem: Stale data persists after invalidation
+### Problem: Another pod serves stale data after invalidation
 
-**Cause:** Invalidation broadcast not received (Redis disconnected)
+**Cause:** Expected behavior — L1 invalidation is process-local. The invalidating process deletes the key from shared L2, but other pods keep their L1 copy until it expires.
 
-**Solution:**
-```python notest
-# Check if invalidation channel is connected
-from cachekit.l1_cache import get_l1_cache_manager
-
-manager = get_l1_cache_manager()
-if manager.invalidation_channel and manager.invalidation_channel.is_available():
-    print("Invalidation channel connected")
-else:
-    print("WARNING: Invalidation not broadcasting - data may become stale")
-```
+**Solution:** Bound acceptable staleness with the entry's TTL. If a class of data cannot tolerate any cross-pod staleness window, don't cache it in L1 (`l1=L1CacheConfig(enabled=False)`).
 
 ### Problem: SWR refresh failing
 
@@ -429,9 +364,9 @@ else:
 
 ### Problem: High memory usage despite max_size_mb limit
 
-**Cause:** L1 cache eviction strategy, or invalidation_enabled=False preventing eviction
+**Cause:** L1 cache eviction churn under a working set larger than the configured budget
 
-**Solution:** Check L1 cache hit rate and consider reducing `max_size_mb` or increasing TTL to reduce churn.
+**Solution:** Check L1 cache hit rate and either increase `max_size_mb` to fit the working set or reduce TTL so entries expire before LRU has to evict them.
 
 ---
 

@@ -1,7 +1,7 @@
 """Unit tests for DecoratorConfig intent presets.
 
 Tests all 5 intent presets:
-- .minimal(): circuit_breaker disabled, timeout disabled, monitoring off
+- .minimal(): circuit_breaker disabled, monitoring off
 - .production(): all protections enabled, full monitoring
 - .secure(): encryption enabled, master_key required, L1 enabled (stores encrypted bytes for performance)
 - .dev(): monitoring on, Prometheus off
@@ -29,9 +29,6 @@ class TestMinimalPreset:
 
         # Circuit breaker disabled
         assert config.circuit_breaker.enabled is False
-
-        # Timeout disabled
-        assert config.timeout.enabled is False
 
         # Backpressure still enabled (basic protection)
         assert config.backpressure.enabled is True
@@ -74,7 +71,6 @@ class TestProductionPreset:
 
         # All protections enabled
         assert config.circuit_breaker.enabled is True
-        assert config.timeout.enabled is True
         assert config.backpressure.enabled is True
 
         # Full monitoring
@@ -107,7 +103,6 @@ class TestSecurePreset:
 
         # All protections enabled
         assert config.circuit_breaker.enabled is True
-        assert config.timeout.enabled is True
         assert config.backpressure.enabled is True
 
         # Full monitoring
@@ -162,7 +157,6 @@ class TestDevPreset:
 
         # Protections enabled for realistic testing
         assert config.circuit_breaker.enabled is True
-        assert config.timeout.enabled is True
         assert config.backpressure.enabled is True
 
         # Monitoring enabled, Prometheus disabled
@@ -194,7 +188,6 @@ class TestTestPreset:
 
         # All protections disabled for determinism
         assert config.circuit_breaker.enabled is False
-        assert config.timeout.enabled is False
         assert config.backpressure.enabled is False
 
         # All monitoring disabled

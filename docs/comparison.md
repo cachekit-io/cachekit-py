@@ -106,7 +106,6 @@ def expensive_computation(x: int) -> dict:
 > - **Circuit breaker**: Redis down? Cache gracefully, don't cascade failures
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: Client-side AES-256-GCM, Redis never sees plaintext
-> - **Adaptive timeouts**: Auto-adjust to Redis latency, not static
 > - **Metrics**: Prometheus counters for hits/misses/errors
 
 ```python
@@ -218,16 +217,6 @@ def expensive_compute(key):
     # Others wait for L2 cache to be populated
     # No cascade of simultaneous DB queries
     return compute_expensive_value(key)
-```
-
-**Adaptive Timeouts**: Auto-tune to your infrastructure
-```python
-@cache(ttl=300)  # Adaptive timeout enabled by default
-def get_data(key):
-    # Monitors Redis latency (P99)
-    # If Redis is slower today → increase timeout automatically
-    # No need to tune timeout constants for environment
-    return fetch_data(key)
 ```
 
 **Limitations of alternatives**:

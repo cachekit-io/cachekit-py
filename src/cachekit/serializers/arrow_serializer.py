@@ -22,7 +22,7 @@ Type checker cannot statically verify optional imports; suppressed via pyright c
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata
 
@@ -57,15 +57,79 @@ _TARGET_BATCH_BYTES = 8 * 1024 * 1024
 _RELEASE_POOL_THRESHOLD = 4 * 1024 * 1024
 
 
-def _bounded_chunksize(table: pa.Table) -> int | None:  # type: ignore[name-defined]
-    """Rows per IPC record-batch so each batch is ~_TARGET_BATCH_BYTES, regardless of width.
+def _write_bounded_batches(writer: pa.ipc.RecordBatchFileWriter, table: pa.Table) -> None:  # type: ignore[name-defined]
+    """Write ``table`` as record batches whose ACTUAL bytes stay <= _TARGET_BATCH_BYTES.
 
-    Returns None for empty tables (nothing to chunk). Never returns 0.
+    A uniform rows-per-batch estimate (nbytes // num_rows) breaks on skewed/variable-width
+    frames: a clustered run of wide rows (e.g. JSON-blob cells) can overshoot the target
+    ~12x (#161), spiking the per-batch zstd working set in exactly the OOM regime this
+    bound exists to prevent. Instead, binary-search the largest row count whose slice
+    actually fits the byte budget — Table.slice() is zero-copy and .nbytes accounts for
+    slice offsets, so each probe is O(columns), not O(bytes). Batch bytes are monotone in
+    row count, so the search is valid; a single row wider than the target gets its own
+    batch (rows can't split). Empty tables write no batches (schema-only IPC file).
     """
-    if table.num_rows <= 0:
-        return None
-    bytes_per_row = max(1, table.nbytes // table.num_rows)
-    return max(1, _TARGET_BATCH_BYTES // bytes_per_row)
+    offset, total = 0, table.num_rows
+    while offset < total:
+        lo, hi, rows = 2, total - offset, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if table.slice(offset, mid).nbytes <= _TARGET_BATCH_BYTES:
+                rows, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        writer.write_table(table.slice(offset, rows))
+        offset += rows
+
+
+class _HashingSink:
+    """Forward-only adapter pyarrow's IPC writer streams into (LAB-766): forwards each write to
+    the underlying sink while hashing it (xxHash3-64) and enforcing an optional byte budget, so
+    the checksum over the streamed IPC bytes is known the moment streaming completes — without
+    ever holding those bytes together in memory.
+    """
+
+    # pyarrow's PythonFile wrapper probes these before writing.
+    closed = False
+
+    def __init__(self, raw: BinaryIO, budget: int | None) -> None:
+        self._raw = raw
+        self._hasher = xxhash.xxh3_64()
+        self._budget = budget
+        self._written = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, data: bytes) -> int:
+        n = data.nbytes if isinstance(data, memoryview) else len(data)
+        self._written += n
+        if self._budget is not None and self._written > self._budget:
+            # Reject BEFORE forwarding: earlier chunks may be on disk (the backend discards
+            # its partial write), but no bytes past the budget ever leave this process.
+            raise ValueError(
+                f"Streaming serialization exceeded its {self._budget}-byte payload budget "
+                f"(CACHEKIT_MAX_VALUE_SIZE); refusing to cache. Increase CACHEKIT_MAX_VALUE_SIZE "
+                f"to cache larger values."
+            )
+        self._hasher.update(data)
+        self._raw.write(data)
+        return n
+
+    def tell(self) -> int:
+        return self._written
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def digest(self) -> bytes:
+        return self._hasher.digest()
 
 
 class ArrowSerializer:
@@ -84,7 +148,9 @@ class ArrowSerializer:
 
     Memory profile (bounded, low-copy):
     - Serialize: builds the compressed IPC once and prepends the checksum; the source Arrow
-      table is freed before the IPC bytes are materialized.
+      table is freed before the IPC bytes are materialized. On a streaming-writable backend
+      (File), ``serialize_to_sink`` skips even that: record batches stream straight into the
+      cache file and the full payload never exists in memory (LAB-766).
     - Deserialize: the envelope is sliced with a memoryview (no full-body copy), wrapped via
       pa.py_buffer (zero-copy), and Arrow->pandas conversion uses self_destruct + split_blocks
       to free Arrow buffers during conversion. zstd is decompressed transparently by the reader.
@@ -176,6 +242,56 @@ class ArrowSerializer:
             raise ValueError(f"Invalid compression: {compression!r}. Valid options: 'auto', 'zstd', 'lz4', None ('none').")
         return compression
 
+    @staticmethod
+    def _to_table(obj: Any) -> pa.Table:  # type: ignore[name-defined]
+        """Convert a supported object to an Arrow Table (shared by the buffered and streaming paths).
+
+        preserve_index=None (pyarrow default): a RangeIndex is stored as cheap
+        schema metadata (no materialized column / extra copy) and restored as a
+        RangeIndex; named/MultiIndex are still preserved as columns. preserve_index=True
+        would force even a RangeIndex into a materialized column.
+
+        Raises:
+            TypeError: If obj is not a DataFrame (pandas, polars) or dict of arrays
+        """
+        if HAS_PANDAS and isinstance(obj, pd.DataFrame):
+            return pa.Table.from_pandas(obj, preserve_index=None)
+        if hasattr(obj, "__arrow_c_stream__"):  # polars DataFrame (zero-copy C Stream)
+            return pa.table(obj)
+        if isinstance(obj, dict):
+            # dict of arrays (columnar). Normalize pyarrow's raw conversion errors
+            # (e.g. dict-of-scalars -> "'int' object is not iterable") into the
+            # documented TypeError so callers get a consistent, actionable message.
+            try:
+                return pa.table(obj)
+            except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as e:
+                raise TypeError(
+                    f"ArrowSerializer only supports DataFrames "
+                    f"(pandas.DataFrame, polars.DataFrame) or dict of arrays (columnar). "
+                    f"Got a dict that is not convertible to an Arrow table: {e}. "
+                    f"For scalar values or nested dicts, use AutoSerializer."
+                ) from e
+        raise TypeError(
+            f"ArrowSerializer only supports DataFrames "
+            f"(pandas.DataFrame, polars.DataFrame) or dict of arrays. "
+            f"Got: {type(obj).__name__}. "
+            f"For scalar values or nested dicts, use AutoSerializer."
+        )
+
+    def serialization_metadata(self) -> SerializationMetadata:
+        """Metadata a serialize() call will produce, computable BEFORE any payload byte exists.
+
+        The streaming write path (LAB-766) needs this upfront: the cache envelope's metadata
+        header is written before the payload streams. Deterministic per serializer config —
+        never payload-dependent. ``serialize`` returns exactly this object.
+        """
+        return SerializationMetadata(
+            serialization_format=SerializationFormat.ARROW,
+            compressed=self.compression is not None,  # reflects the configured codec (None = uncompressed)
+            encrypted=False,  # Encryption is EncryptionWrapper's responsibility
+            original_type="arrow",
+        )
+
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:  # type: ignore[name-defined]
         """Serialize DataFrame to Arrow IPC format bytes with optional xxHash3-64 integrity protection.
 
@@ -192,49 +308,19 @@ class ArrowSerializer:
             SerializationError: If Arrow conversion fails
         """
         try:
-            # Convert to Arrow Table (supports pandas, polars, dict of arrays).
-            # preserve_index=None (pyarrow default): a RangeIndex is stored as cheap
-            # schema metadata (no materialized column / extra copy) and restored as a
-            # RangeIndex; named/MultiIndex are still preserved as columns. preserve_index=True
-            # would force even a RangeIndex into a materialized column.
-            table = None
-            if HAS_PANDAS and isinstance(obj, pd.DataFrame):
-                table = pa.Table.from_pandas(obj, preserve_index=None)
-            elif hasattr(obj, "__arrow_c_stream__"):  # polars DataFrame (zero-copy C Stream)
-                table = pa.table(obj)
-            elif isinstance(obj, dict):
-                # dict of arrays (columnar). Normalize pyarrow's raw conversion errors
-                # (e.g. dict-of-scalars -> "'int' object is not iterable") into the
-                # documented TypeError so callers get a consistent, actionable message.
-                try:
-                    table = pa.table(obj)
-                except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as e:
-                    raise TypeError(
-                        f"ArrowSerializer only supports DataFrames "
-                        f"(pandas.DataFrame, polars.DataFrame) or dict of arrays (columnar). "
-                        f"Got a dict that is not convertible to an Arrow table: {e}. "
-                        f"For scalar values or nested dicts, use AutoSerializer."
-                    ) from e
-
-            if table is None:
-                raise TypeError(
-                    f"ArrowSerializer only supports DataFrames "
-                    f"(pandas.DataFrame, polars.DataFrame) or dict of arrays. "
-                    f"Got: {type(obj).__name__}. "
-                    f"For scalar values or nested dicts, use AutoSerializer."
-                )
+            table = self._to_table(obj)
 
             # Serialize to Arrow IPC. Compression (when enabled) runs per record-batch, so
             # writing in bounded batches keeps the compressor's working set bounded (one big
             # batch makes the codec allocate a full-size working buffer — measured ~3.6x the
-            # payload). Size each batch to ~8 MiB regardless of schema width. compression=None
+            # payload). Batches are sized by actual bytes (<= 8 MiB), not a uniform row-count
+            # estimate, so the bound holds for skewed/wide frames too (#161). compression=None
             # writes uncompressed IPC, which the File backend reads zero-copy via mmap (#171,
             # plaintext, pandas return only).
-            max_chunksize = _bounded_chunksize(table)
             sink = pa.BufferOutputStream()
             write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
             with pa.ipc.new_file(sink, table.schema, options=write_options) as writer:
-                writer.write_table(table, max_chunksize=max_chunksize)
+                _write_bounded_batches(writer, table)
             del table  # free the Arrow table before materializing the IPC bytes (lowers peak)
 
             # Always integrity-protect: hash over the buffer's memoryview (no copy), then
@@ -252,13 +338,55 @@ class ArrowSerializer:
                 del buf
                 pa.default_memory_pool().release_unused()
 
-            return envelope, SerializationMetadata(
-                serialization_format=SerializationFormat.ARROW,
-                compressed=self.compression is not None,  # reflects the configured codec (None = uncompressed)
-                encrypted=False,  # Encryption is EncryptionWrapper's responsibility
-                original_type="arrow",
-            )
+            return envelope, self.serialization_metadata()
         except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError) as e:
+            raise SerializationError(f"Failed to serialize DataFrame to Arrow IPC format: {e}") from e
+
+    def serialize_to_sink(self, obj: Any, sink: BinaryIO, max_bytes: int | None = None) -> SerializationMetadata:
+        """Stream-serialize a DataFrame into ``sink``, never materializing the full payload (LAB-766).
+
+        Writes the exact bytes ``serialize`` returns — [8-byte xxHash3-64 checksum][Arrow IPC] —
+        but the IPC record batches (~8 MiB actual bytes each, see ``_write_bounded_batches``) go
+        straight to the sink instead of accumulating in a ``pa.BufferOutputStream``, which is what
+        held ~3.75x the payload in memory on the buffered path. The checksum covers all IPC bytes yet is
+        stored FIRST, so it is hashed incrementally while streaming and patched in place
+        afterwards: ``sink`` must therefore be seekable (``tell``/``seek``). Seeks are anchored
+        with ``tell()``, never absolute offsets — the sink may sit inside backend framing.
+
+        Args:
+            obj: DataFrame (pandas, polars) or dict of arrays (columnar)
+            sink: Writable, seekable binary sink positioned where the envelope should start
+            max_bytes: Optional envelope byte budget; exceeding it raises ValueError mid-stream
+                (bounds disk churn on values that would be rejected as oversized anyway)
+
+        Returns:
+            The same SerializationMetadata ``serialize`` would return.
+
+        Raises:
+            TypeError: If obj is not a DataFrame or dict of arrays
+            ValueError: If the envelope would exceed ``max_bytes``
+            SerializationError: If Arrow conversion fails
+        """
+        try:
+            table = self._to_table(obj)
+            checksum_pos = sink.tell()
+            sink.write(b"\x00" * 8)  # checksum placeholder, patched below
+            hashing_sink = _HashingSink(sink, max_bytes - 8 if max_bytes is not None else None)
+            write_options = pa.ipc.IpcWriteOptions(compression=self.compression) if self.compression else None
+            with pa.ipc.new_file(hashing_sink, table.schema, options=write_options) as writer:
+                _write_bounded_batches(writer, table)
+            del table  # free the Arrow table promptly (mirrors serialize)
+
+            end_pos = sink.tell()
+            sink.seek(checksum_pos)
+            sink.write(hashing_sink.digest())
+            sink.seek(end_pos)
+            pa.default_memory_pool().release_unused()  # return per-batch working memory to the OS
+            return self.serialization_metadata()
+        # NOTE: unlike serialize(), ValueError is deliberately NOT wrapped here — the
+        # _HashingSink budget ValueError must reach the caller with its original type
+        # (the max_value_size mid-stream abort contract; the handler and tests match on it).
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
             raise SerializationError(f"Failed to serialize DataFrame to Arrow IPC format: {e}") from e
 
     def deserialize(self, data: bytes | memoryview, metadata: SerializationMetadata | None = None) -> Any:

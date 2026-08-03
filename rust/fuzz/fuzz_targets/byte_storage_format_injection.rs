@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Create envelope with potentially malicious format
     let test_data = vec![b'x'; 100];
-    let envelope = match StorageEnvelope::new(test_data, format.clone()) {
+    let envelope = match StorageEnvelope::new(&test_data, format.clone()) {
         Ok(env) => env,
         Err(_) => return, // Skip if envelope creation fails (acceptable)
     };
@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
 
     for pattern in &injection_patterns {
         let pattern_data = vec![b'y'; 50];
-        if let Ok(env) = StorageEnvelope::new(pattern_data, pattern.to_string()) {
+        if let Ok(env) = StorageEnvelope::new(&pattern_data, pattern.to_string()) {
             // Format stored as-is
             assert_eq!(env.format, *pattern);
 

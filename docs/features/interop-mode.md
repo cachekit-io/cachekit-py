@@ -2,7 +2,7 @@
 
 # Interop Mode — Cross-SDK Cache Sharing
 
-**Available since v0.12.0** · Implements [interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)
+**Released** — see the [changelog](../../CHANGELOG.md) for the interop entry · Implements [interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)
 
 ## TL;DR
 
@@ -30,6 +30,50 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 | Operation identity | Derived from the Python function path | **Explicit, user-supplied** |
 | Value format | CK v3 frame + ByteStorage envelope (LZ4 + xxHash3-64) | **Plain MessagePack, no envelope** |
 | Cross-SDK reads | ❌ Python-only | ✅ py / rs / ts |
+
+## Choosing a Decorator Form
+
+`interop=` is an ordinary [`DecoratorConfig`](../api-reference.md) field, so it rides **every** entry point — bare `@cache`, any intent preset, or the RORO `config=` form. Presets change the *runtime* profile (circuit breaker, monitoring, L1 tuning), never the wire bytes: in interop mode the value encoder is always the canonical interop MessagePack encoder, whatever the preset says.
+
+| Form | Bytes on the wire | Why |
+| :--- | :--- | :--- |
+| `@cache(interop=..., namespace=...)` | ✅ Spec-identical | Baseline — key and value bytes come only from the interop/v1 spec |
+| `@cache.production(interop=..., ...)` | ✅ Spec-identical | **Recommended.** Reliability profile (circuit breaker, monitoring) affects runtime only, never bytes |
+| `@cache.minimal(interop=..., ...)` | ✅ Spec-identical | Its `integrity_checking=False` is a no-op here — see [Encryption](#encryption) |
+| `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key + deployment UUID |
+| `@cache.io(interop=..., ...)` | ✅ Composes in code | ⚠️ Don't run against CachekitIO until the saas#91 validator deploy is live — see the note at the bottom |
+| `@cache.local(...)` / `@cache(backend=None)` | ❌ Rejected loudly | No shared medium: `.local` raises `TypeError` (it accepts no `interop=`), `backend=None` raises `ConfigurationError` at decoration time |
+
+**Recommended form** — spec-identical bytes plus the production reliability profile:
+
+```python notest
+from cachekit import cache
+
+@cache.production(interop="get_user", namespace="users", ttl=300)
+def get_user(user_id: int):
+    return db.fetch(user_id)  # illustrative
+```
+
+All three configuration styles accept it — bare `@cache(interop=..., ...)` (see the TL;DR), an intent preset (above), or RORO:
+
+```python
+from cachekit import DecoratorConfig
+
+# RORO — interop= is a plain DecoratorConfig field
+config = DecoratorConfig.production(interop="get_user", namespace="users", ttl=300)
+assert config.interop == "get_user"
+assert config.circuit_breaker.enabled  # production profile intact
+```
+
+## Operation Names Are a Contract (Shared Entries)
+
+Interop keys are **deliberately function-identity-free**: the key is built from `(namespace, operation, args)` and nothing else — no module path, no function name, no decorator settings. That is the property that makes cross-SDK sharing work at all: a Rust service can't know your Python module path, so the key must not contain one.
+
+The flip side: two *differently decorated* Python functions that declare the same `(namespace, operation)` and receive matching arguments read and write **the same entry — including L1** (same key, same process-wide per-namespace cache). There is nothing function-shaped to include: `generate_interop_key(namespace, operation, args)` takes no function at all — see [Manual Key/Value Helpers](#manual-keyvalue-helpers) for the byte-pinned demonstration.
+
+Treat operation names like queue names or topic names: a **cross-team contract**, not a local variable. Two teams binding `users:get_user` had better agree on the argument list and the meaning of the cached value — the cache will not referee. If two functions must not share entries, give them different operation names.
+
+**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and deployment UUID. The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
 
 ## The Cross-SDK Contract
 
@@ -62,6 +106,10 @@ Three constraints, all fail-closed:
 - **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. To share encrypted entries across SDKs, configure the same master key **and** the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) everywhere.
 - **The shared tenant must be explicit and canonical.** The machine-local auto-generated deployment UUID is rejected (it differs per host — nothing else could ever decrypt), and the configured value must already be in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys).
 - **Config decides, bytes never do.** With encryption enabled, stored bytes are always treated as ciphertext and authenticated before any decode. There is no header to forge, so the CWE-757 downgrade class (see the auto-mode fail-closed read path in [zero-knowledge-encryption.md](zero-knowledge-encryption.md)) cannot exist here.
+
+One thing no guardrail can catch: two *binders* of the same `(namespace, operation)` with different encryption configs. That mismatch is silent — see [Operation Names Are a Contract](#operation-names-are-a-contract-shared-entries).
+
+**Integrity checking is a no-op in interop mode.** Interop values bypass the ByteStorage envelope entirely (no envelope, hence no metadata header and no xxHash3-64 checksum), so `.minimal`'s `integrity_checking=False` and `.production`'s `True` have no effect on interop entries. Without encryption, that means interop entries have **no corruption detection at all**: corrupted bytes that still parse as valid MessagePack are returned as valid values — under `.production` just as under `.minimal`. Tamper and corruption protection, when you need it, is AES-256-GCM: enable encryption, and every read is authenticated before decode.
 
 ## Guardrails (all loud, none silent)
 

@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.17.1](https://github.com/cachekit-io/cachekit-py/compare/v0.17.0...v0.17.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* **fuzz:** fuzz the codec that ships — core 0.4.0, all 14 targets, fail loudly (LAB-1136) ([#251](https://github.com/cachekit-io/cachekit-py/issues/251)) ([511b1e5](https://github.com/cachekit-io/cachekit-py/commit/511b1e520dc84a6722c5903e519d407d1647f408))
+
+## [0.17.0](https://github.com/cachekit-io/cachekit-py/compare/v0.16.0...v0.17.0) (2026-07-29)
+
+
+### Features
+
+* **envelope:** pick up cachekit-core 0.4.0 bin envelopes (LAB-900) ([#249](https://github.com/cachekit-io/cachekit-py/issues/249)) ([fa9ea36](https://github.com/cachekit-io/cachekit-py/commit/fa9ea36ce0b3d8e0bd15166d9207f87b9ebb91d9))
+
+
+### Bug Fixes
+
+* **serializers:** byte-aware Arrow batch sizing holds the memory bound on skewed frames (LAB-110) ([#244](https://github.com/cachekit-io/cachekit-py/issues/244)) ([e67db58](https://github.com/cachekit-io/cachekit-py/commit/e67db58c5c8e2d99bea6514b9066e76404466789))
+
+
+### Performance Improvements
+
+* **arrow:** stream serialize-to-backend writes via BufferWritableBackend (LAB-766) ([#247](https://github.com/cachekit-io/cachekit-py/issues/247)) ([539fde9](https://github.com/cachekit-io/cachekit-py/commit/539fde98c0f954efd03b5f25a36b676966789a2d))
+
+## [0.16.0](https://github.com/cachekit-io/cachekit-py/compare/v0.15.0...v0.16.0) (2026-07-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* L1CacheConfig.invalidation_enabled is removed. The flag was read by nothing and toggled no behavior; constructors passing it now raise TypeError instead of silently lying.
+
+### Bug Fixes
+
+* **security:** EncryptionWrapper.deserialize fails closed on plaintext-claiming input (LAB-271) ([#242](https://github.com/cachekit-io/cachekit-py/issues/242)) ([6fcb115](https://github.com/cachekit-io/cachekit-py/commit/6fcb115d19d924cd7676b371fdc2e2afd2186424))
+
+
+### Code Refactoring
+
+* remove unwired cross-instance invalidation package (LAB-520) ([#237](https://github.com/cachekit-io/cachekit-py/issues/237)) ([c56ac0a](https://github.com/cachekit-io/cachekit-py/commit/c56ac0a0987eb8f3e4925034765431d060794277))
+
+## [0.15.0](https://github.com/cachekit-io/cachekit-py/compare/v0.14.0...v0.15.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the no-op `adaptive_timeout` decorator kwarg, the `TimeoutConfig` nested config, `DecoratorConfig.timeout`, and `ProfileConfig.adaptive_timeout` are removed; `CircuitBreaker.call()` and `.call_async()` are removed (use should_allow_request() + record_success() / record_failure()). All were non-functional or dead in production.
+
+### Code Refactoring
+
+* remove non-functional adaptive timeout, dead CircuitBreaker.call, unused tenacity (LAB-522) ([#239](https://github.com/cachekit-io/cachekit-py/issues/239)) ([5ade101](https://github.com/cachekit-io/cachekit-py/commit/5ade10126f590f4469d99874beea6ecc6fdfab68))
+
 ## [0.14.0](https://github.com/cachekit-io/cachekit-py/compare/v0.13.0...v0.14.0) (2026-07-22)
 
 

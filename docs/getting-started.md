@@ -103,7 +103,8 @@ def get_user_profile(user_id):
 
 > [!TIP]
 > **Namespace benefits**: Logical grouping in Redis keys, easier debugging with `redis-cli KEYS "users:*"`,
-> bulk operations via pattern matching, future cross-pod L1 invalidation support
+> bulk operations via pattern matching (backend-side only — other processes' L1 entries are untouched and
+> expire via TTL)
 
 **New powers unlocked**: TTL tuning for data freshness, namespace isolation
 
@@ -206,7 +207,7 @@ def critical_business_function(request_id: str):
 > @cache.minimal     # Maximum speed, minimal overhead
 > ```
 
-**New powers unlocked**: Circuit breaker, adaptive timeouts, backpressure control, comprehensive monitoring
+**New powers unlocked**: Circuit breaker, backpressure control, comprehensive monitoring
 
 ---
 

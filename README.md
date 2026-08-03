@@ -47,7 +47,6 @@ That's it. You get:
 | **Prometheus metrics** | Built-in observability |
 | **MessagePack serialization** | Efficient with optional compression |
 | **Zero-knowledge encryption** | Client-side AES-256-GCM |
-| **Adaptive timeouts** | Auto-tune to system load |
 
 ---
 
@@ -166,7 +165,6 @@ def get_user_profile(user_id: int):
 | Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |
 |:--------|:----------------:|:------------:|:-------------:|:-------------------:|:---------------:|
 | Circuit Breaker | - | ✅ | - | ✅ | ✅ |
-| Adaptive Timeouts | - | ✅ | - | ✅ | ✅ |
 | Backpressure | ✅ | ✅ | - | ✅ | ✅ |
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
@@ -402,7 +400,6 @@ info = expensive_func.cache_info()
 | [Distributed Locking][distributed-locking-url] | Cache stampede prevention |
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
-| [Adaptive Timeouts][adaptive-timeouts-url] | Auto-tune to infrastructure |
 
 ---
 
@@ -485,7 +482,6 @@ MIT License - see [LICENSE][license-file-url] for details.
 [distributed-locking-url]: docs/features/distributed-locking.md
 [prometheus-url]: docs/features/prometheus-metrics.md
 [encryption-url]: docs/features/zero-knowledge-encryption.md
-[adaptive-timeouts-url]: docs/features/adaptive-timeouts.md
 [contributing-url]: CONTRIBUTING.md
 [license-file-url]: LICENSE
 [github-url]: https://github.com/cachekit-io/cachekit-py

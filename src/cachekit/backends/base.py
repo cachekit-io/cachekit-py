@@ -4,13 +4,14 @@ This module defines the storage backend contract using PEP 544 protocol-based ab
 All L2 backends (Redis, HTTP, etc.) must implement BaseBackend protocol.
 
 Optional capability protocols (TTLInspectableBackend, LockableBackend,
-TimeoutConfigurableBackend) enable advanced features with graceful degradation.
+TimeoutConfigurableBackend, BufferReadableBackend, BufferWritableBackend)
+enable advanced features with graceful degradation.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Any, Optional, Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Callable
+from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
 
 # Re-export BackendError for convenience (public API)
 from cachekit.backends.errors import BackendError  # noqa: F401
@@ -213,6 +214,53 @@ class BufferReadableBackend(Protocol):
 
 
 @runtime_checkable
+class BufferWritableBackend(Protocol):
+    """Optional protocol for backends that can accept a value written incrementally through a
+    seekable sink, instead of one materialized ``bytes`` blob (LAB-766, write-side twin of
+    ``BufferReadableBackend``).
+
+    Lets large values (e.g. multi-GB Arrow IPC) reach storage without the whole serialized
+    payload ever existing in memory. Only the File backend implements this today; backends that
+    don't are simply written via ``set`` as usual (the caller falls back transparently).
+
+    Why a writer callback and not an ``Iterable[bytes]``: the Arrow envelope stores an
+    xxHash3-64 checksum BEFORE the payload it covers, so the producer must patch bytes it has
+    already emitted once the stream is complete. A forward-only chunk iterator cannot express
+    that without serializing twice; a seekable sink can. This deliberately scopes the protocol
+    to random-access backends (File) — a forward-only transport (chunked HTTP upload) needs a
+    different contract and is out of scope until a backend demands it.
+
+    Contract:
+    - ``write_payload`` receives a writable, seekable binary sink positioned at the START of
+      the payload region. Producers MUST anchor seeks with ``tell()`` (never absolute offset 0):
+      backends may keep private framing before the payload.
+    - The value becomes visible under ``key`` only if ``write_payload`` returns successfully;
+      on any exception the backend discards the partial write, leaves any previous value for
+      the key intact, and re-raises the producer's exception unwrapped (so serialization errors
+      keep their type for the caller's error handling).
+    - ``ttl`` semantics are identical to ``set``.
+    - A successful ``set_streaming(key, w, ttl)`` is observably identical to
+      ``set(key, full_bytes, ttl)`` for the same payload bytes — same readback via
+      ``get``/``get_buffer``, same expiry, same size-limit enforcement (violations raise
+      ``BackendError`` and nothing is stored).
+    """
+
+    def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> None:
+        """Store the payload produced by ``write_payload`` under ``key``, never holding it whole.
+
+        Args:
+            key: Cache key to store
+            write_payload: Callable that writes the complete payload to the provided sink
+            ttl: Time-to-live in seconds (None = no expiry), same semantics as ``set``
+
+        Raises:
+            BackendError: If the backend operation fails (I/O, size limits, TTL bounds)
+            Exception: Whatever ``write_payload`` raises, unwrapped (partial write discarded)
+        """
+        ...
+
+
+@runtime_checkable
 class LockableBackend(Protocol):
     """Optional protocol for backends supporting distributed locking.
 
@@ -221,9 +269,8 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: Redis, PostgreSQL, DynamoDB
-    - Local-only: SQLite, FileSystem (single-process locking)
-    - Not supported: HTTP (stateless), Memcached, S3
+    - Supported: RedisBackend, CachekitIOBackend (SaaS ``POST /v1/cache/{key}/lock``)
+    - Not supported: FileBackend, L1-only (in-memory)
 
     Contract — bare cache key:
         ``acquire_lock`` receives the **bare cache key**, identical to what
@@ -289,8 +336,8 @@ class TimeoutConfigurableBackend(Protocol):
     """Optional protocol for per-operation timeout configuration.
 
     Backends implementing this protocol allow fine-grained timeout control
-    per operation. This enables features like adaptive timeouts that adjust
-    based on operation latency.
+    per operation, so a caller can set an explicit timeout for a single
+    operation where the backend supports it.
 
     All backends support some timeout mechanism, but granularity varies:
     - Per-operation: HTTP, DynamoDB, PostgreSQL

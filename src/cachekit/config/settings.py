@@ -105,7 +105,9 @@ class CachekitConfig(BaseSettings):
             "'zstd'/'lz4' shrink the stored payload but must be decompressed into the heap on read. "
             "'none' stores uncompressed Arrow IPC, which lets the File backend serve plaintext "
             "DataFrame reads via a zero-copy mmap (low steady-state read RSS; peak transiently "
-            "higher) at the cost of a larger payload. Env: CACHEKIT_ARROW_COMPRESSION."
+            "higher) at the cost of a larger payload. Writes are codec-independent: plaintext "
+            "Arrow streams to the File backend without materializing the payload (encrypted "
+            "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),
     )
     retry_on_timeout: bool = Field(

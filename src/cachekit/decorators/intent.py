@@ -66,8 +66,6 @@ def cache(
             >>> config = DecoratorConfig.production(ttl=600, backend=None)
             >>> config.circuit_breaker.enabled
             True
-            >>> config.timeout.enabled
-            True
 
         Intent-based secure (security-critical with encryption):
             >>> config = DecoratorConfig.secure(

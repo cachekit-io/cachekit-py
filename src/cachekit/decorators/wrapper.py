@@ -390,7 +390,6 @@ def create_cache_wrapper(
     # Reliability features
     circuit_breaker: bool = True,
     circuit_breaker_config: CircuitBreakerConfig | None = None,
-    adaptive_timeout: bool = True,
     backpressure: bool = True,
     max_concurrent_requests: int = 100,
     # Monitoring features
@@ -448,7 +447,6 @@ def create_cache_wrapper(
                  or alternative storage (HTTP, DynamoDB, etc.).
         circuit_breaker: Enable circuit breaker for fault tolerance
         circuit_breaker_config: Circuit breaker configuration
-        adaptive_timeout: Enable adaptive timeout
         backpressure: Enable backpressure control
         max_concurrent_requests: Max concurrent requests (backpressure)
         collect_stats: Enable statistics collection
@@ -494,9 +492,6 @@ def create_cache_wrapper(
         # Circuit breaker settings
         circuit_breaker = config.circuit_breaker.enabled
 
-        # Timeout settings
-        adaptive_timeout = config.timeout.enabled
-
         # Backpressure settings
         backpressure = config.backpressure.enabled
         max_concurrent_requests = config.backpressure.max_concurrent_requests
@@ -529,7 +524,6 @@ def create_cache_wrapper(
 
     # Fast mode: Disable monitoring overhead, keep performance features
     use_circuit_breaker = circuit_breaker and not fast_mode
-    use_adaptive_timeout = adaptive_timeout and not fast_mode
     use_backpressure = backpressure and not fast_mode
     use_collect_stats = collect_stats and not fast_mode
     # use_enable_tracing = enable_tracing and not fast_mode  # Not used after CacheConfig removal
@@ -614,7 +608,6 @@ def create_cache_wrapper(
         namespace=namespace or "default",
         circuit_breaker_enabled=use_circuit_breaker,
         circuit_breaker_config=cb_config_dict or {},  # Use empty dict as default
-        adaptive_timeout_enabled=use_adaptive_timeout,
         backpressure_enabled=use_backpressure,
         backpressure_config={"max_concurrent": max_concurrent_requests} if use_backpressure else None,
         collect_stats=use_collect_stats,
@@ -1001,7 +994,6 @@ def create_cache_wrapper(
         features.set_correlation_id(correlation_id)
 
         cache_key = None  # Initialize to avoid UnboundLocalError
-        func_start_time: float | None = None  # Initialize for exception handlers
 
         # Create tracing span for cache operation
         span_attributes = {
@@ -1128,15 +1120,13 @@ def create_cache_wrapper(
                 if _backend is None:
                     _backend = get_backend_provider().get_backend()
 
-                # Setup cache handler strategy on first use with adaptive timeout
+                # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
                     _backend,
-                    timeout_provider=features.get_timeout,
                     backpressure_controller=features.backpressure,
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
-                backend = _backend
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -1246,9 +1236,7 @@ def create_cache_wrapper(
             else:
                 cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
 
-            # Record duration for adaptive timeout
             duration = time.time() - start_time
-            features.record_duration(duration)
 
             if cached_result is not None:
                 # Cached result is a tuple (True, actual_value)
@@ -1332,12 +1320,7 @@ def create_cache_wrapper(
 
         try:
             # Execute the original function
-            func_start_time = time.time() if features.collect_stats else None
             result = func(*args, **kwargs)
-
-            if features.collect_stats and func_start_time is not None:
-                func_latency = (time.time() - func_start_time) * 1000
-                features.record_duration(func_latency)
 
             # Serialize and cache the result
             try:
@@ -1402,9 +1385,6 @@ def create_cache_wrapper(
         except Exception as e:
             # Other exceptions - record and re-raise
             features.record_failure(e)
-            if features.collect_stats and "func_start_time" in locals() and func_start_time is not None:
-                func_latency = (time.time() - func_start_time) * 1000
-                features.record_duration(func_latency)
             raise
         finally:
             # Clear correlation ID after operation
@@ -1427,7 +1407,6 @@ def create_cache_wrapper(
         try:
             # Get cache key early for consistent usage - note this may fail for complex types
             cache_key = None
-            func_start_time: float | None = None  # Initialize for exception handlers
             try:
                 # Interop mode takes priority (mutually exclusive with key= and fast_mode)
                 if interop is not None:
@@ -1603,7 +1582,6 @@ def create_cache_wrapper(
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
                 _backend,
-                timeout_provider=features.get_timeout,
                 backpressure_controller=features.backpressure,
                 ttl_refresh_threshold=ttl_refresh_threshold,
             )
@@ -1778,12 +1756,7 @@ def create_cache_wrapper(
                                 )
 
                         # Execute the original function (with or without lock)
-                        func_start_time = time.perf_counter() if features.collect_stats else None
                         result = await func(*args, **kwargs)
-
-                        if features.collect_stats and func_start_time is not None:
-                            func_latency = (time.perf_counter() - func_start_time) * 1000
-                            features.record_duration(func_latency)
 
                         # Serialize and cache the result
                         try:
@@ -1865,12 +1838,7 @@ def create_cache_wrapper(
 
             try:
                 # Execute the original function
-                func_start_time = time.perf_counter() if features.collect_stats else None
                 result = await func(*args, **kwargs)
-
-                if features.collect_stats and func_start_time is not None:
-                    func_latency = (time.perf_counter() - func_start_time) * 1000
-                    features.record_duration(func_latency)
 
                 # Serialize and cache the result
                 try:
@@ -1923,9 +1891,6 @@ def create_cache_wrapper(
             except Exception as e:
                 # Function execution failed - record and re-raise
                 features.record_failure(e)
-                if features.collect_stats and "func_start_time" in locals() and func_start_time is not None:
-                    func_latency = (time.perf_counter() - func_start_time) * 1000
-                    features.record_duration(func_latency)
                 raise
         finally:
             # Clear correlation ID after operation (matches sync wrapper)

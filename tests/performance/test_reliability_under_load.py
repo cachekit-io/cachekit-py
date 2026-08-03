@@ -3,7 +3,6 @@
 Tests that exercise the production reliability features:
 - Circuit breaker (failure injection, recovery testing)
 - Backpressure (hitting max_concurrent limits)
-- Adaptive timeout (slow function handling)
 
 CRITICAL: These tests validate that reliability features work under production stress.
 They measure performance degradation when things go wrong, not just happy path.
@@ -253,93 +252,7 @@ def test_backpressure_limit() -> None:
 
 
 # =============================================================================
-# Test 3: Adaptive Timeout Under Slow Functions
-# =============================================================================
-
-
-@pytest.mark.performance
-def test_adaptive_timeout_behavior() -> None:
-    """Measure adaptive timeout behavior with slow functions.
-
-    Tests:
-    - Initial timeout enforcement
-    - Timeout adaptation based on observed latencies
-    - Performance impact of timeout checks
-
-    This validates that adaptive timeout doesn't kill performance.
-    """
-    from cachekit.config.nested import TimeoutConfig
-
-    # Config with adaptive timeout enabled
-    config = DecoratorConfig(
-        backend=None,  # L1-only
-        timeout=TimeoutConfig(
-            enabled=True,
-            initial=0.5,  # 500ms initial timeout
-            min=0.1,  # 100ms min
-            max=2.0,  # 2s max
-        ),
-    )
-
-    call_count = 0
-    function_duration_ms = 50  # Normal function
-
-    @cache(config=config)
-    def normal_function(item_id: int) -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
-        time.sleep(function_duration_ms / 1000)
-        return {"id": item_id, "result": "data"}
-
-    print("\n" + "=" * 80)
-    print("ADAPTIVE TIMEOUT - PERFORMANCE IMPACT")
-    print("=" * 80)
-    print("\nConfig:")
-    print("  timeout_initial: 500ms")
-    print("  timeout_min: 100ms")
-    print("  timeout_max: 2000ms")
-    print(f"  function_duration: {function_duration_ms}ms")
-
-    # Warm up adaptive timeout (let it learn)
-    print("\nPhase 1: Warm-up (adaptive timeout learning)")
-    for i in range(50):
-        normal_function(i)
-
-    # Measure latency with adaptive timeout active
-    print("\nPhase 2: Measuring with adaptive timeout active")
-    latencies = []
-    for i in range(100, 200):
-        start = time.perf_counter_ns()
-        normal_function(i)
-        end = time.perf_counter_ns()
-        latencies.append(end - start)
-
-    mean = statistics.mean(latencies)
-    median = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-
-    print("\nLatencies:")
-    print(f"  Mean:    {mean / 1_000_000:.2f} ms")
-    print(f"  Median:  {median / 1_000_000:.2f} ms")
-    print(f"  P95:     {p95 / 1_000_000:.2f} ms")
-    print("\nContext:")
-    print(f"  Function execution: {function_duration_ms}ms")
-    print(f"  Measured overhead:  {(mean / 1_000_000) - function_duration_ms:.2f}ms")
-
-    # Validate timeout overhead is reasonable (<10% of function execution time)
-    overhead_ms = (mean / 1_000_000) - function_duration_ms
-    overhead_pct = (overhead_ms / function_duration_ms) * 100
-    max_overhead_pct = 20  # Allow 20% overhead
-
-    assert overhead_pct < max_overhead_pct, f"Timeout overhead {overhead_pct:.1f}% exceeds {max_overhead_pct}% target"
-
-    print("\n✅ Adaptive timeout validated:")
-    print(f"   - Overhead: {overhead_ms:.2f}ms ({overhead_pct:.1f}%)")
-    print(f"   - Within acceptable range (<{max_overhead_pct}%)")
-
-
-# =============================================================================
-# Test 4: Full Stack Under Load (All Features Enabled)
+# Test 3: Full Stack Under Load (All Features Enabled)
 # =============================================================================
 
 
@@ -351,7 +264,6 @@ def test_full_stack_under_load() -> None:
     Tests:
     - Circuit breaker monitoring overhead
     - Backpressure semaphore overhead
-    - Adaptive timeout overhead
     - Stats collection overhead
     - L1 + L2 coordination
 
@@ -373,7 +285,6 @@ def test_full_stack_under_load() -> None:
         CircuitBreakerConfig,
         L1CacheConfig,
         MonitoringConfig,
-        TimeoutConfig,
     )
 
     # Production config - ALL features enabled
@@ -381,7 +292,6 @@ def test_full_stack_under_load() -> None:
         backend=backend,
         l1=L1CacheConfig(enabled=True),
         circuit_breaker=CircuitBreakerConfig(enabled=True),
-        timeout=TimeoutConfig(enabled=True),
         backpressure=BackpressureConfig(enabled=True, max_concurrent_requests=50),
         monitoring=MonitoringConfig(collect_stats=True),
     )
@@ -401,7 +311,6 @@ def test_full_stack_under_load() -> None:
     print("  ✓ L1 in-memory cache")
     print("  ✓ L2 Redis backend")
     print("  ✓ Circuit breaker")
-    print("  ✓ Adaptive timeout")
     print("  ✓ Backpressure")
     print("  ✓ Stats collection")
 

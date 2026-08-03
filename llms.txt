@@ -17,7 +17,7 @@ def get_user(user_id: int):
 def get_price(symbol: str):
     return fetch_price(symbol)
 
-@cache.production         # Reliability-critical: circuit breaker + adaptive timeouts
+@cache.production         # Reliability-critical: circuit breaker
 def process_payment(amount):
     return gateway.charge(amount)
 
@@ -94,14 +94,14 @@ class MyBackend:
 
 ## Intent Presets
 
-| Preset | Circuit Breaker | Adaptive Timeouts | Monitoring | Encryption |
-|--------|:-:|:-:|:-:|:-:|
-| `@cache` / `@cache.minimal` | - | - | - | - |
-| `@cache.production` | Yes | Yes | Full | - |
-| `@cache.secure` | Yes | Yes | Full | AES-256-GCM |
-| `@cache.io()` | Yes | Yes | Full | - |
-| `@cache.dev` | - | - | Verbose | - |
-| `@cache.test` | - | - | - | - |
+| Preset | Circuit Breaker | Monitoring | Encryption |
+|--------|:-:|:-:|:-:|
+| `@cache` / `@cache.minimal` | - | - | - |
+| `@cache.production` | Yes | Full | - |
+| `@cache.secure` | Yes | Full | AES-256-GCM |
+| `@cache.io()` | Yes | Full | - |
+| `@cache.dev` | - | Verbose | - |
+| `@cache.test` | - | - | - |
 
 ## Serializers
 
@@ -178,7 +178,6 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Circuit Breaker](docs/features/circuit-breaker.md): Cascading failure prevention
 - [Distributed Locking](docs/features/distributed-locking.md): Cache stampede prevention
 - [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM
-- [Adaptive Timeouts](docs/features/adaptive-timeouts.md): Auto-tune to system load
 - [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability
 - [Architecture](docs/data-flow-architecture.md): L1+L2 internals
 

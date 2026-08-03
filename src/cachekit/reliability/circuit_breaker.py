@@ -12,17 +12,15 @@ using RLock and double-checked locking for thread safety.
 import logging
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType
 
 # Import metrics from the metrics collection module
 from cachekit.reliability.metrics_collection import (
-    cache_operations,
     circuit_breaker_state,
 )
 
@@ -191,11 +189,20 @@ class CircuitBreaker:
         config = CircuitBreakerConfig(failure_threshold=10, timeout_seconds=60)
         breaker = CircuitBreaker(config, namespace="user_api")
 
+        # Guard the operation with the breaker's state, then record the outcome.
+        # This is the split check/record pattern the SDK uses internally
+        # (see FeatureOrchestrator.should_allow_request / record_success /
+        # record_failure): the caller does its own work between the check and
+        # the record, which a single wrapping call() cannot accommodate.
+        if not breaker.should_attempt_call():
+            return cached_value  # Fail fast — circuit is open
         try:
-            result = breaker.call(redis_client.get, "key")
-        except redis.ConnectionError:
-            # Circuit is open, use fallback
-            return cached_value
+            result = redis_client.get("key")
+            breaker.record_success()
+            return result
+        except redis.ConnectionError as err:
+            breaker.record_failure(err)
+            raise
     """
 
     def __init__(self, config: CircuitBreakerConfig, namespace: str = "default"):
@@ -211,73 +218,6 @@ class CircuitBreaker:
 
         # Initialize Prometheus metric for this namespace
         circuit_breaker_state.labels(namespace=namespace).set(self._state.value)
-
-    def call(self, func: Callable, *args, **kwargs) -> Any:
-        """Execute function with circuit breaker protection.
-
-        This is the main entry point for protected operations. The circuit breaker
-        will check its state and either allow the request, reject it immediately,
-        or allow it as a test request during recovery.
-
-        Args:
-            func: The function to execute (typically a backend operation)
-            *args: Positional arguments to pass to func
-            **kwargs: Keyword arguments to pass to func
-
-        Returns:
-            The result of func if successful
-
-        Raises:
-            BackendError: If circuit is OPEN (failing fast)
-            Exception: Any exception raised by func (circuit may open as a result)
-        """
-        if not self._allow_request():
-            # Circuit is open or half-open with no permits - fail fast
-            cache_operations.labels(
-                operation="circuit_breaker_open",
-                status="rejected",
-                serializer="",
-                namespace=self.namespace,
-            ).inc()
-            raise BackendError("Circuit breaker is OPEN", error_type=BackendErrorType.TRANSIENT)
-
-        try:
-            # Execute the protected function
-            result = func(*args, **kwargs)
-            self._on_success()  # Record success for state management
-            return result
-        except Exception as e:
-            # Check if it's a BackendError with an excluded error type
-            if isinstance(e, BackendError) and e.error_type in self.config.excluded_error_types:
-                # Don't count as failure, but still propagate
-                raise
-            # All other exceptions count as failures
-            self._on_failure(e)
-            raise  # Always re-raise to preserve error handling
-
-    async def call_async(self, func: Callable, *args, **kwargs) -> Any:
-        """Execute async function with circuit breaker protection."""
-        if not self._allow_request():
-            cache_operations.labels(
-                operation="circuit_breaker_open",
-                status="rejected",
-                serializer="",
-                namespace=self.namespace,
-            ).inc()
-            raise BackendError("Circuit breaker is OPEN", error_type=BackendErrorType.TRANSIENT)
-
-        try:
-            result = await func(*args, **kwargs)
-            self._on_success()
-            return result
-        except Exception as e:
-            # Check if it's a BackendError with an excluded error type
-            if isinstance(e, BackendError) and e.error_type in self.config.excluded_error_types:
-                # Don't count as failure, but still propagate
-                raise
-            # All other exceptions count as failures
-            self._on_failure(e)
-            raise
 
     def _allow_request(self) -> bool:
         """Check if request should be allowed based on circuit state.
@@ -359,7 +299,19 @@ class CircuitBreaker:
                     self._transition_to_closed()
 
     def _on_failure(self, error: Exception):
-        """Handle failed operation."""
+        """Handle failed operation.
+
+        Failures whose ``error_type`` is listed in ``config.excluded_error_types``
+        (e.g. PERMANENT config errors) do not count toward tripping the breaker.
+        The exclusion is enforced here — the single point every path routes
+        through (the orchestrator's live ``record_failure`` and the public
+        ``record_failure`` helper) — so it holds everywhere, not just in a
+        dedicated wrapper.
+        """
+        # Excluded error types never count as failures.
+        if isinstance(error, BackendError) and error.error_type in self.config.excluded_error_types:
+            return
+
         with self._lock:
             # Decrement permits if in HALF_OPEN state
             if self._state == CircuitState.HALF_OPEN:
@@ -429,11 +381,13 @@ class CircuitBreaker:
             logger.info(f"Circuit breaker {self.namespace} manually reset to CLOSED")
 
     def record_failure(self, error: Optional[Exception] = None):
-        """Record a failure for testing purposes.
+        """Record a failed operation.
 
-        This method is primarily intended for unit testing the circuit breaker's
-        state machine logic. In production code, failures are recorded automatically
-        through the call() method.
+        Public helper for tests and direct users of CircuitBreaker; delegates to
+        the internal ``_on_failure``. The SDK's own reliability path records
+        outcomes through that same internal method (driven by
+        FeatureOrchestrator), so errors whose ``error_type`` is in
+        ``config.excluded_error_types`` never count toward tripping the breaker.
 
         Args:
             error: Optional exception to record. If not provided, uses a generic Exception.
@@ -441,11 +395,11 @@ class CircuitBreaker:
         self._on_failure(error or Exception("Test failure"))
 
     def record_success(self):
-        """Record a success for testing purposes.
+        """Record a successful operation.
 
-        This method is primarily intended for unit testing the circuit breaker's
-        state machine logic. In production code, successes are recorded automatically
-        through the call() method.
+        Public helper for tests and direct users of CircuitBreaker; delegates to
+        the internal ``_on_success``. The SDK's own reliability path records
+        outcomes through that same internal method (driven by FeatureOrchestrator).
         """
         self._on_success()
 

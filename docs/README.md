@@ -53,7 +53,6 @@ Choose how data is stored:
 | Feature | Description |
 |:--------|:------------|
 | [Circuit Breaker](features/circuit-breaker.md) | Automatic failure protection |
-| [Adaptive Timeouts](features/adaptive-timeouts.md) | Smart timeout management |
 | [Distributed Locking](features/distributed-locking.md) | Prevent thundering herd |
 | [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) | Client-side AES-256-GCM |
 | [Prometheus Metrics](features/prometheus-metrics.md) | Production observability |

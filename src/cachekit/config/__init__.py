@@ -17,7 +17,6 @@ from .nested import (
     EncryptionConfig,
     L1CacheConfig,
     MonitoringConfig,
-    TimeoutConfig,
 )
 from .settings import CachekitConfig
 
@@ -37,7 +36,6 @@ __all__ = [
     "EncryptionConfig",
     "L1CacheConfig",
     "MonitoringConfig",
-    "TimeoutConfig",
     # Backend management
     "set_default_backend",
     "get_default_backend",

@@ -23,12 +23,12 @@ $(shell mkdir -p $(LOG_FUZZ_DIR))
 # Timestamp for log files (inherited from parent, or generated here)
 TIMESTAMP ?= $(shell date +%Y%m%d_%H%M%S)
 
-# All fuzz targets (complete list)
-FUZZ_TARGETS := byte_storage_compress byte_storage_decompress encryption_roundtrip \
-	byte_storage_corrupted_envelope byte_storage_integer_overflow byte_storage_checksum_collision \
-	byte_storage_empty_data byte_storage_format_injection encryption_key_derivation \
-	encryption_nonce_reuse encryption_truncated_ciphertext encryption_aad_injection \
-	encryption_large_payload integration_layered_security
+# All fuzz targets, derived from the [[bin]] stanzas in Cargo.toml — the same
+# source `cargo fuzz list` reads. Previously a hand-maintained list, i.e. the
+# identical drift hazard the CI workflow just removed: a new target added here
+# but not there (or vice versa) goes silently unfuzzed. Recursive `=`, not `:=`,
+# so the grep runs only when a fuzzing target actually uses it.
+FUZZ_TARGETS = $(shell grep -A1 '^\[\[bin\]\]' Cargo.toml | sed -n 's/^name = "\(.*\)"/\1/p')
 
 # Helper function to check if a binary exists
 define require_binary
@@ -71,7 +71,7 @@ quick: ## Run quick fuzzing smoke test (60s per target, ~14min total)
 	@{ \
 		for target in $(FUZZ_TARGETS); do \
 			echo "$(YELLOW)Fuzzing $$target (60s)...$(RESET)"; \
-			cargo +nightly fuzz run $$target -- -max_total_time=60 || true; \
+			cargo +nightly fuzz run $$target -- -max_total_time=60 || exit 1; \
 		done && \
 		echo "$(YELLOW)Checking for crashes...$(RESET)" && \
 		CRASHES=$$(find artifacts -name "crash-*" 2>/dev/null | wc -l) && \
@@ -92,7 +92,7 @@ deep: ## Run deep fuzzing (8 hours per target, production-grade)
 	@{ \
 		for target in $(FUZZ_TARGETS); do \
 			echo "$(YELLOW)Deep fuzzing $$target (8 hours)...$(RESET)"; \
-			cargo +nightly fuzz run $$target -- -max_total_time=28800 || true; \
+			cargo +nightly fuzz run $$target -- -max_total_time=28800 || exit 1; \
 		done && \
 		echo "$(YELLOW)Checking for crashes...$(RESET)" && \
 		CRASHES=$$(find artifacts -name "crash-*" 2>/dev/null | wc -l) && \

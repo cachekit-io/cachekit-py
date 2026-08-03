@@ -21,6 +21,7 @@ from cachekit.reliability.circuit_breaker import (
     CircuitState,
 )
 
+from ..utils.circuit_breaker_helpers import guarded_call, guarded_call_async
 from ..utils.redis_test_helpers import RedisIsolationMixin
 
 pytestmark = pytest.mark.critical
@@ -199,7 +200,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         # Call with excluded error type multiple times
         for _ in range(10):
             try:
-                breaker.call(failing_with_excluded)
+                guarded_call(breaker, failing_with_excluded)
             except BackendError:
                 pass  # Expected
 
@@ -213,7 +214,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
 
         for _ in range(3):
             try:
-                breaker.call(failing_with_transient_error)
+                guarded_call(breaker, failing_with_transient_error)
             except BackendError:
                 pass
 
@@ -290,7 +291,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
             raise redis.ConnectionError("Redis down")
 
         # Successful calls work normally
-        result = breaker.call(successful_operation)
+        result = guarded_call(breaker, successful_operation)
         assert result == "success"
         assert call_count == 1
         assert breaker.state == CircuitState.CLOSED
@@ -298,7 +299,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         # Failing calls increment failure count
         for _ in range(3):
             with pytest.raises(redis.ConnectionError):
-                breaker.call(failing_operation)
+                guarded_call(breaker, failing_operation)
 
         assert breaker.state == CircuitState.OPEN
         assert call_count == 4  # 1 success + 3 failures
@@ -307,7 +308,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
         from cachekit.backends.errors import BackendError
 
         with pytest.raises(BackendError, match="Circuit breaker is OPEN"):
-            breaker.call(successful_operation)
+            guarded_call(breaker, successful_operation)
 
         # Call count shouldn't increase (fast fail)
         assert call_count == 4, "Circuit OPEN should fail fast without calling function"
@@ -378,7 +379,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
             return "success"
 
         async def run_test():
-            result = await breaker.call_async(async_operation)
+            result = await guarded_call_async(breaker, async_operation)
             assert result == "success"
             assert breaker.state.name == "CLOSED"
             return True
@@ -400,7 +401,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
             # Record 2 failures to open circuit
             for _ in range(2):
                 try:
-                    await breaker.call_async(failing_async_operation)
+                    await guarded_call_async(breaker, failing_async_operation)
                 except ValueError:
                     pass  # Expected
 
@@ -409,7 +410,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
 
             # Next call should be rejected immediately
             try:
-                await breaker.call_async(failing_async_operation)
+                await guarded_call_async(breaker, failing_async_operation)
                 raise AssertionError("Should have raised ConnectionError")
             except Exception as e:
                 assert "Circuit breaker is OPEN" in str(e)
@@ -435,7 +436,7 @@ class TestCircuitBreakerStateMachine(RedisIsolationMixin):
             # Raise excluded error type 3 times
             for _ in range(3):
                 try:
-                    await breaker.call_async(async_op_with_excluded_error)
+                    await guarded_call_async(breaker, async_op_with_excluded_error)
                 except BackendError:
                     pass  # Expected
 

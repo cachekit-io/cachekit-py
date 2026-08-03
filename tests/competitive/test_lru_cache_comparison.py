@@ -428,7 +428,6 @@ class TestCompetitiveClaimsEvidence:
         - Distributed locking (redis-cache has none)
         - L1+L2 caching (aiocache is L2-only)
         - Zero-knowledge encryption (aiocache has none)
-        - Adaptive timeouts (aiocache has static timeouts)
         """
 
         # All claims are tested in separate test files

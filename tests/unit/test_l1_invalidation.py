@@ -11,7 +11,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_by_key_removes_entry(self):
         """Test that invalidate_by_key removes specific entry."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put multiple entries
@@ -38,7 +38,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_by_key_returns_false_for_missing(self):
         """Test that invalidate_by_key returns False for non-existent key."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         result = cache.invalidate_by_key("nonexistent")
@@ -46,7 +46,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_by_namespace_clears_matching(self):
         """Test that invalidate_by_namespace clears all entries in namespace."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries in different namespaces
@@ -79,7 +79,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_by_namespace_empty_namespace(self):
         """Test invalidate_by_namespace on empty namespace returns 0."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         count = cache.invalidate_by_namespace("nonexistent")
@@ -87,7 +87,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_all_clears_everything(self):
         """Test that invalidate_all removes all entries."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries
@@ -111,7 +111,7 @@ class TestL1CacheInvalidation:
 
     def test_namespace_index_tracks_entries(self):
         """Test that namespace index correctly tracks entries."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Verify namespace index exists
@@ -136,7 +136,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidation_increments_version(self):
         """Test that invalidation increments entry version to prevent stale refresh."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         key = "test_key"
@@ -155,7 +155,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidation_clears_refreshing_flag(self):
         """Test that invalidation clears _refreshing_keys flag."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         key = "test_key"
@@ -176,7 +176,7 @@ class TestL1CacheInvalidation:
     def test_no_index_falls_back_to_scan(self):
         """Test that namespace invalidation works without index (O(n) scan fallback)."""
         # Config WITHOUT namespace_index
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=False)
+        config = L1CacheConfig(namespace_index=False)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Verify index does NOT exist
@@ -203,7 +203,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_all_increments_all_versions(self):
         """Test that invalidate_all increments version for all keys."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries
@@ -226,7 +226,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_all_clears_namespace_index(self):
         """Test that invalidate_all clears namespace index."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries
@@ -244,7 +244,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_all_clears_refreshing_flags(self):
         """Test that invalidate_all clears all refreshing flags."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Manually add keys to refreshing set
@@ -264,7 +264,7 @@ class TestL1CacheInvalidation:
 
     def test_namespace_index_updated_on_overwrite(self):
         """Test that namespace index is updated when entry is overwritten with different namespace."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         key = "test_key"
@@ -286,7 +286,7 @@ class TestL1CacheInvalidation:
 
         CRITICAL: This is the version token mechanism test.
         """
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         key = "test_key"
@@ -318,7 +318,7 @@ class TestL1CacheInvalidation:
 
     def test_invalidate_by_namespace_with_no_namespace_entries(self):
         """Test that entries without namespace are not affected by namespace invalidation."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries with and without namespace
@@ -339,7 +339,7 @@ class TestL1CacheInvalidation:
 
     def test_multiple_namespaces_independent(self):
         """Test that multiple namespaces are independent."""
-        config = L1CacheConfig(invalidation_enabled=True, namespace_index=True)
+        config = L1CacheConfig(namespace_index=True)
         cache = L1Cache(max_memory_mb=10, config=config)
 
         # Put entries in different namespaces
