@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/cachekit-io/cachekit-py/compare/v0.17.0...v0.17.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* **fuzz:** fuzz the codec that ships — core 0.4.0, all 14 targets, fail loudly (LAB-1136) ([#251](https://github.com/cachekit-io/cachekit-py/issues/251)) ([511b1e5](https://github.com/cachekit-io/cachekit-py/commit/511b1e520dc84a6722c5903e519d407d1647f408))
+
 ## [0.17.0](https://github.com/cachekit-io/cachekit-py/compare/v0.16.0...v0.17.0) (2026-07-29)
 
 
