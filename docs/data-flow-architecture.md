@@ -375,6 +375,14 @@ def custom_function():
 ns:{namespace}:func:{module}.{qualname}:args:{blake2b_hash}
 ```
 
+> **SDK convention, not a server contract.** The CachekitIO backend validates
+> keys security-only (length cap, charset whitelist, `..` rejection,
+> `ns:{namespace}:` prefix shape) and otherwise stores them as opaque strings —
+> the `func:`/`args:` structure exists for deterministic generation and
+> function-level invalidation inside this SDK. Other SDKs use shorter formats
+> (TypeScript/Rust: `{ns}:{hash}`) against the same server. See
+> `protocol/spec/cache-key-format.md` → Server-Side Requirements.
+
 **Example:**
 ```python
 @cache(namespace="users")
