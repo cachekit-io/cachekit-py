@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "cachekit"
 version = "0.17.1"
-description = "Backend-agnostic caching for Python — intent-based decorators, optional zero-knowledge encryption, Rust-powered core. Works standalone (L1), with Redis, Memcached, File, or CacheKit Cloud."
+description = "Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CacheKit Cloud."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
