@@ -236,8 +236,10 @@ Configure L1 (in-memory) cache behavior through `L1CacheConfig`:
 from cachekit import cache
 from cachekit.config import L1CacheConfig
 
-# Enable SWR (stale-while-revalidate) with custom threshold
+# Enable SWR (stale-while-revalidate) with custom threshold.
+# SWR requires a ttl — with ttl=None entries never go stale, so no refresh fires.
 @cache(
+    ttl=3600,
     l1=L1CacheConfig(  # Correct parameter name is 'l1', not 'l1_config'
         enabled=True,
         max_size_mb=100,

@@ -96,14 +96,16 @@ SWR is controlled by two settings:
 from cachekit import cache
 from cachekit.config import L1CacheConfig
 
-# Default: SWR enabled, refresh at 50% of TTL
-@cache(backend=None)
+# Default: SWR enabled, refresh at 50% of TTL.
+# A ttl is required — with ttl=None entries never go stale, so SWR never fires.
+@cache(ttl=3600, backend=None)
 def my_function():
     """SWR configured with defaults."""
     pass
 
 # Custom: Refresh at 25% of TTL (refresh more frequently)
 @cache(
+    ttl=3600,
     l1=L1CacheConfig(
         swr_enabled=True,
         swr_threshold_ratio=0.25  # Refresh at 25% of TTL
@@ -114,15 +116,16 @@ def aggressive_refresh():
     """Refreshes more often, better freshness."""
     pass
 
-# Disable SWR: Always wait for fresh data
+# Disable SWR: no background refresh
 @cache(
+    ttl=3600,
     l1=L1CacheConfig(
         swr_enabled=False
     ),
     backend=None
 )
 def always_fresh():
-    """Returns stale data only on L2 miss/timeout."""
+    """Serves the cached value until hard expiry, then re-runs synchronously."""
     pass
 ```
 
@@ -227,8 +230,8 @@ config = L1CacheConfig(
 |-------|------|---------|---------|
 | `enabled` | bool | `True` | Enable/disable L1 cache completely |
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
-| `swr_enabled` | bool | `True` | Enable stale-while-revalidate |
-| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL (0.1-1.0) |
+| `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
+| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
 | `namespace_index` | bool | `True` | Enable fast namespace lookups |
 
 ### Intent Presets
