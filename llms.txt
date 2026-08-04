@@ -1,6 +1,6 @@
 # cachekit
 
-> Production-ready caching for Python with intelligent reliability features, pluggable backends, and Rust-powered performance.
+> Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CachekitIO.
 
 cachekit provides decorator-based caching with circuit breaker, distributed locking, Prometheus metrics, L1+L2 dual-layer caching, and optional zero-knowledge encryption. Supports 4 built-in backends (Redis, Memcached, File, CachekitIO) plus custom backends via the BaseBackend protocol.
 
