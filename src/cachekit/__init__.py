@@ -1,10 +1,11 @@
 r"""cachekit - Caching decorator for Python applications.
 
-A robust, production-ready Python library that provides intelligent caching
-capabilities with advanced features like multi-serialization support,
-distributed locking, and automatic corruption detection.
+Backend-agnostic caching with intent-based decorators — circuit breaker,
+distributed locking, Prometheus metrics, and optional zero-knowledge
+AES-256-GCM encryption, on a Rust-powered core.
 
-Supports pluggable backends: Redis (default), CachekitIO SaaS, File, and custom.
+Zero-config L1 in-memory by default; pluggable backends: Redis, Memcached,
+File, CachekitIO SaaS, and custom via the BaseBackend protocol.
 
 Key Features:
 - **Intelligent @cache decorator** with auto-detection and intent-based optimization
@@ -22,7 +23,7 @@ auto-detection and intent-based optimization:
 - FeatureOrchestrator: Manages enterprise-grade reliability and monitoring features
 - Flexible configuration interface with intelligent auto-detection
 - Enhanced error handling with comprehensive safety checks
-- Pluggable backend abstraction (Redis, CachekitIO, File, custom)
+- Pluggable backend abstraction (Redis, Memcached, File, CachekitIO, custom)
 
 Born from production debugging of caching failures:
 - UTF-8 corruption prevention with intelligent binary data handling
