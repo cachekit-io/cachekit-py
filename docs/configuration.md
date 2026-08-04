@@ -245,7 +245,6 @@ from cachekit.config import L1CacheConfig
         max_size_mb=100,
         swr_enabled=True,
         swr_threshold_ratio=0.5,  # Refresh at 50% of TTL
-        namespace_index=True,
     ),
     backend=None
 )
@@ -261,12 +260,10 @@ def my_function():
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) — [L1-only mode](#l1-only-mode-backendnone) only |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` — L1-only mode only |
-| `namespace_index` | bool | `True` | Enable fast namespace-based invalidation |
 
 **L1 Cache Concepts:**
 - **Freshness**: When to serve stale data + trigger background refresh (SWR, [L1-only mode](#l1-only-mode-backendnone) only — with a backend configured these fields have no effect)
 - **Expiry**: Hard deadline when entry is deleted from cache
-- **Namespace**: Logical grouping for bulk invalidation (see [L1 Invalidation Guide](features/l1-invalidation.md))
 
 ### L1-Only Mode (`backend=None`)
 
@@ -343,14 +340,14 @@ def secure_function():
 
 **Feature Matrix by Intent:**
 
-| Intent | SWR | Invalidation | Namespace Index | Max Size | Notes |
-|--------|-----|--------------|-----------------|----------|-------|
-| `minimal()` | ❌ | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
-| `test()` | ❌ | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
-| `dev()` | L1-only¹ | ❌ | ❌ | 100 MB | Verbose logs, no Prometheus |
-| `production()` | L1-only¹ | ✓ | ✓ | 100 MB | Full observability |
-| `secure()` | L1-only¹ | ✓ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| Intent | SWR | Invalidation | Max Size | Notes |
+|--------|-----|--------------|----------|-------|
+| `minimal()` | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
+| `test()` | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
+| `dev()` | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
+| `production()` | L1-only¹ | ✓ | 100 MB | Full observability |
+| `secure()` | L1-only¹ | ✓ | 100 MB | AES-256-GCM encryption required |
+| `io()` | ✓ | ✓ | 100 MB | Managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
 

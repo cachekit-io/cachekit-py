@@ -8,7 +8,7 @@ import logging
 import math
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -27,7 +27,6 @@ class CacheEntry:
     value: bytes
     expires_at: float
     size_bytes: int
-    namespace: Optional[str] = None
 
     def is_expired(self) -> bool:
         """Check if entry has expired."""
@@ -60,7 +59,6 @@ class L1Cache:
         max_memory_mb: int = 100,
         ttl_buffer_seconds: float = 1.0,
         namespace: str = "default",
-        config: Optional[Any] = None,
     ):
         """Initialize L1 cache.
 
@@ -68,7 +66,6 @@ class L1Cache:
             max_memory_mb: Maximum memory usage in MB (default 100MB)
             ttl_buffer_seconds: Buffer time before Redis TTL expiry (default 1s)
             namespace: Cache namespace for isolation
-            config: Optional L1CacheConfig for invalidation features (namespace index)
         """
         self.max_memory_bytes = max_memory_mb * 1024 * 1024
         self.ttl_buffer_seconds = ttl_buffer_seconds
@@ -87,10 +84,6 @@ class L1Cache:
         self._misses = 0
         self._evictions = 0
         self._expired_evictions = 0
-
-        # Namespace index for O(1) invalidation (optional)
-        if config and config.namespace_index:
-            self._namespace_index: dict[str, set[str]] = defaultdict(set)
 
         logger.info(
             "L1Cache initialized: namespace=%s, max_memory=%dMB, ttl_buffer=%.1fs",
@@ -151,7 +144,6 @@ class L1Cache:
         value: bytes,
         redis_ttl: Optional[float] = None,
         expires_at: Optional[float] = None,
-        namespace: Optional[str] = None,
     ) -> None:
         """Store value in L1 cache with TTL.
 
@@ -160,7 +152,6 @@ class L1Cache:
             value: Bytes to cache (encrypted or plaintext msgpack, not deserialized object)
             redis_ttl: TTL in seconds from Redis (used to calculate expiry)
             expires_at: Absolute expiry timestamp (overrides redis_ttl)
-            namespace: Optional namespace for invalidation support
 
         Raises:
             TypeError: if `value` is not exactly `bytes`. L1 stores raw bytes only; a memoryview
@@ -219,21 +210,14 @@ class L1Cache:
             if key in self._cache:
                 old_entry = self._cache[key]
                 self._current_memory_bytes -= old_entry.size_bytes
-                # Remove old namespace index entry
-                if hasattr(self, "_namespace_index") and old_entry.namespace:
-                    self._namespace_index[old_entry.namespace].discard(key)
 
             # Evict entries if needed to make room
             self._evict_for_space(size)
 
             # Store new entry
-            entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size, namespace=namespace)
+            entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size)
             self._cache[key] = entry
             self._current_memory_bytes += size
-
-            # Update namespace index
-            if hasattr(self, "_namespace_index") and namespace:
-                self._namespace_index[namespace].add(key)
 
             # Move to end (most recently used)
             self._cache.move_to_end(key)
@@ -247,10 +231,6 @@ class L1Cache:
         if key in self._cache:
             entry = self._cache.pop(key)
             self._current_memory_bytes -= entry.size_bytes
-
-            # Update namespace index
-            if hasattr(self, "_namespace_index") and entry.namespace:
-                self._namespace_index[entry.namespace].discard(key)
 
     def _evict_for_space(self, needed_bytes: int) -> None:
         """Evict LRU entries to make space for new entry.
@@ -288,67 +268,6 @@ class L1Cache:
         """
         with self._lock:
             self._remove_entry(key)
-
-    def invalidate_by_key(self, key: str) -> bool:
-        """Invalidate a specific cache key.
-
-        Args:
-            key: Cache key to invalidate
-
-        Returns:
-            True if key was found and removed, False otherwise
-        """
-        with self._lock:
-            if key in self._cache:
-                self._remove_entry(key)
-                return True
-            return False
-
-    def invalidate_by_namespace(self, namespace: str) -> int:
-        """Invalidate all entries in a namespace.
-
-        Args:
-            namespace: Namespace to invalidate
-
-        Returns:
-            Number of entries invalidated
-        """
-        with self._lock:
-            # Use namespace index if available (O(1) lookup + O(k) delete)
-            if hasattr(self, "_namespace_index"):
-                keys_to_remove = list(self._namespace_index.get(namespace, set()))
-                for key in keys_to_remove:
-                    self._remove_entry(key)
-                # Clear namespace index entry
-                if namespace in self._namespace_index:
-                    del self._namespace_index[namespace]
-                return len(keys_to_remove)
-
-            # Fallback: scan all entries (O(n))
-            keys_to_remove = [key for key, entry in self._cache.items() if entry.namespace == namespace]
-            for key in keys_to_remove:
-                self._remove_entry(key)
-            return len(keys_to_remove)
-
-    def invalidate_all(self) -> int:
-        """Invalidate all entries in cache.
-
-        Returns:
-            Number of entries invalidated
-        """
-        with self._lock:
-            count = len(self._cache)
-
-            # Clear all data structures
-            self._cache.clear()
-            self._current_memory_bytes = 0
-
-            # Clear namespace index
-            if hasattr(self, "_namespace_index"):
-                self._namespace_index.clear()
-
-            logger.info("L1Cache invalidated all %d entries for namespace: %s", count, self.namespace)
-            return count
 
     def clear(self) -> None:
         """Clear all entries from L1 cache."""

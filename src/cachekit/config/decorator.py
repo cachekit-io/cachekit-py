@@ -337,7 +337,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
-                namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
             backpressure=BackpressureConfig(enabled=True),
@@ -377,7 +376,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
@@ -442,7 +440,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,  # L1 stores encrypted bytes. Enabled: ~50ns hits vs 2-7ms Redis
                 swr_enabled=True,
-                namespace_index=True,
             ),
             encryption=EncryptionConfig(
                 enabled=True,
@@ -490,7 +487,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
@@ -530,7 +526,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
-                namespace_index=False,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=False),
             backpressure=BackpressureConfig(enabled=False),
@@ -603,7 +598,6 @@ class DecoratorConfig:
             l1=L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
-                namespace_index=True,
             ),
             circuit_breaker=CircuitBreakerConfig(enabled=True),
             backpressure=BackpressureConfig(enabled=True),
