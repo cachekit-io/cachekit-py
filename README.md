@@ -164,7 +164,7 @@ def get_user_profile(user_id: int):
 | Backpressure | ✅ | ✅ | - | ✅ | ✅ |
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
-| L1 SWR | - | ✅ | - | ✅ | ✅ |
+| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | ✅ |
 | L1 Invalidation | - | - | - | ✅ | ✅ |
 | L1 Namespace Index | - | - | - | ✅ | ✅ |
 | Prometheus Metrics | - | - | - | ✅ | ✅ |
@@ -173,6 +173,8 @@ def get_user_profile(user_id: int):
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
 > 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+>
+> **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
 > **`@cache.io()`** mirrors `@cache.production` (full reliability + observability) but routes to the managed CachekitIO SaaS backend instead of Redis. **`@cache.local()`** is a separate in-process path backed by `ObjectCache` (raw object references, entry-count LRU, no serialization) — the reliability and encryption features listed above do not apply to it.
 
