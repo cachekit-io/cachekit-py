@@ -1,6 +1,6 @@
 r"""cachekit - Caching decorator for Python applications.
 
-A robust Python library that provides intelligent caching
+A robust, production-ready Python library that provides intelligent caching
 capabilities with advanced features like multi-serialization support,
 distributed locking, and automatic corruption detection.
 

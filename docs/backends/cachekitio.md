@@ -2,7 +2,7 @@
 
 # CachekitIO Backend
 
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
 `CachekitIOBackend` connects to the cachekit.io managed cache API over HTTP/2. It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
 
@@ -158,7 +158,7 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 ## Encrypted SaaS Pattern (Zero-Knowledge)
 
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
 Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over managed SaaS storage. The backend stores opaque ciphertext — it never sees plaintext data or your master key.
 

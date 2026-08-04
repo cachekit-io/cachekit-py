@@ -20,7 +20,7 @@ cachekit supports four backends. Pick the one that fits your infrastructure:
 | File | Local dev, testing | None |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 
-By default `@cache` auto-detects your backend from env vars, falling back to Redis at localhost (12-factor convention). CachekitIO is a managed alternative (currently in closed alpha). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
+By default `@cache` auto-detects your backend from env vars, falling back to Redis at localhost (12-factor convention). CachekitIO is a managed alternative (currently in closed beta). File backend is intended for local development and testing only. Memcached is an optional backend (`pip install cachekit[memcached]`).
 
 ### Redis Backend
 
@@ -39,7 +39,7 @@ def fetch_data():
 
 ### CachekitIO Backend
 
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
 Zero-ops managed caching via the cachekit.io SaaS API. No Redis to provision or maintain.
 
@@ -101,7 +101,7 @@ REQUESTS_CA_BUNDLE=  # Unset to avoid SSL issues
 
 ## CachekitIO Configuration
 
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
 Configure the CachekitIO managed backend through environment variables. All fields use the `CACHEKIT_` prefix.
 
@@ -332,7 +332,7 @@ def test_function():
 def secure_function():
     pass
 
-# cachekit.io SaaS - production-grade via managed API (closed alpha)
+# cachekit.io SaaS - production-grade via managed API (closed beta)
 # Requires: CACHEKIT_API_KEY env var
 # @cache.io(ttl=300)
 # def io_function():
@@ -348,7 +348,7 @@ def secure_function():
 | `dev()` | ✓ | ❌ | ❌ | 100 MB | Verbose logs, no Prometheus |
 | `production()` | ✓ | ✓ | ✓ | 100 MB | Full observability |
 | `secure()` | ✓ | ✓ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed alpha — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| `io()` | ✓ | ✓ | ✓ | 100 MB | Managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 ---
 
