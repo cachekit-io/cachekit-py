@@ -469,8 +469,12 @@ def test_l1_invalidation_total_sla() -> None:
     get_latencies = []
     for i in range(10_000):
         start = time.perf_counter_ns()
-        cache.get(f"sla:key:{i % 1000}")
+        found, _ = cache.get(f"sla:key:{i % 1000}")
         end = time.perf_counter_ns()
+        # A miss returns early and is *faster* than a hit, so an unasserted miss
+        # would let this benchmark pass the SLA while measuring the wrong path.
+        if not found:
+            raise AssertionError(f"SLA setup error: expected an L1 hit for sla:key:{i % 1000}")
         get_latencies.append(end - start)
     results["get_hit_p95"] = statistics.quantiles(get_latencies, n=20)[18]
 
