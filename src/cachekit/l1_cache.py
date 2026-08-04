@@ -6,7 +6,6 @@ dramatically reducing network latency while maintaining Redis as the source of t
 
 import logging
 import math
-import random
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -28,7 +27,6 @@ class CacheEntry:
     value: bytes
     expires_at: float
     size_bytes: int
-    cached_at: Optional[float] = None
     namespace: Optional[str] = None
 
     def is_expired(self) -> bool:
@@ -70,7 +68,7 @@ class L1Cache:
             max_memory_mb: Maximum memory usage in MB (default 100MB)
             ttl_buffer_seconds: Buffer time before Redis TTL expiry (default 1s)
             namespace: Cache namespace for isolation
-            config: Optional L1CacheConfig for SWR and invalidation features
+            config: Optional L1CacheConfig for invalidation features (namespace index)
         """
         self.max_memory_bytes = max_memory_mb * 1024 * 1024
         self.ttl_buffer_seconds = ttl_buffer_seconds
@@ -90,24 +88,15 @@ class L1Cache:
         self._evictions = 0
         self._expired_evictions = 0
 
-        # SWR configuration
-        self._swr_enabled = config.swr_enabled if config else True
-        self._swr_threshold_ratio = config.swr_threshold_ratio if config else 0.5
-
-        # SWR state tracking
-        self._refreshing_keys: set[str] = set()
-        self._entry_version: dict[str, int] = {}
-
         # Namespace index for O(1) invalidation (optional)
         if config and config.namespace_index:
             self._namespace_index: dict[str, set[str]] = defaultdict(set)
 
         logger.info(
-            "L1Cache initialized: namespace=%s, max_memory=%dMB, ttl_buffer=%.1fs, swr=%s",
+            "L1Cache initialized: namespace=%s, max_memory=%dMB, ttl_buffer=%.1fs",
             namespace,
             max_memory_mb,
             ttl_buffer_seconds,
-            self._swr_enabled,
         )
 
     def _estimate_size(self, value: bytes) -> int:
@@ -155,100 +144,6 @@ class L1Cache:
             self._hits += 1
 
             return True, entry.value
-
-    def get_with_swr(self, key: str, ttl: float) -> tuple[bool, Optional[bytes], bool, int]:
-        """Get value with stale-while-revalidate support.
-
-        Args:
-            key: Cache key
-            ttl: TTL in seconds for SWR threshold calculation
-
-        Returns:
-            Tuple of (hit, value, needs_refresh, version):
-            - hit: Whether key was found in cache
-            - value: Cached bytes or None
-            - needs_refresh: Whether background refresh should be triggered
-            - version: Entry version at time of read (for refresh completion check)
-        """
-        with self._lock:
-            if key not in self._cache:
-                self._misses += 1
-                return False, None, False, 0
-
-            entry = self._cache[key]
-
-            # Check hard expiry
-            if entry.is_expired():
-                self._remove_entry(key)
-                self._misses += 1
-                self._expired_evictions += 1
-                return False, None, False, 0
-
-            # LRU: Move to end
-            self._cache.move_to_end(key)
-            self._hits += 1
-
-            # Current version for this key
-            version = self._entry_version.get(key, 0)
-
-            # Check SWR threshold with jitter to prevent cross-pod stampede
-            needs_refresh = False
-            if self._swr_enabled and entry.cached_at:
-                # Add ±10% jitter to threshold to stagger refreshes across pods
-                jitter = random.uniform(0.9, 1.1)  # noqa: S311
-                threshold = ttl * self._swr_threshold_ratio * jitter
-                elapsed = time.time() - entry.cached_at
-
-                # Check if refresh needed and not already refreshing
-                if elapsed > threshold and key not in self._refreshing_keys:
-                    self._refreshing_keys.add(key)
-                    needs_refresh = True
-
-            return True, entry.value, needs_refresh, version
-
-    def complete_refresh(self, key: str, version: int, new_value: bytes, new_cached_at: float) -> bool:
-        """Complete a background refresh.
-
-        Args:
-            key: Cache key
-            version: Version token from get_with_swr call
-            new_value: New value bytes
-            new_cached_at: Timestamp when value was cached
-
-        Returns:
-            True if write succeeded, False if version mismatch (entry was invalidated)
-        """
-        with self._lock:
-            # Remove from refreshing set regardless of outcome
-            self._refreshing_keys.discard(key)
-
-            # Version check: was this entry invalidated while we were refreshing?
-            current_version = self._entry_version.get(key, 0)
-            if current_version != version:
-                # Entry was invalidated during refresh - don't resurrect stale data
-                logger.debug("Refresh aborted for key %s: version mismatch (%d != %d)", key, version, current_version)
-                return False
-
-            # Update entry in place
-            if key in self._cache:
-                entry = self._cache[key]
-                entry.value = new_value
-                entry.cached_at = new_cached_at
-                logger.debug("Refresh completed for key %s", key)
-                return True
-
-            # Entry was evicted but version matches - still safe to write
-            # This handles the case where LRU eviction happened during refresh
-            return False
-
-    def cancel_refresh(self, key: str) -> None:
-        """Cancel a background refresh.
-
-        Args:
-            key: Cache key to cancel refresh for
-        """
-        with self._lock:
-            self._refreshing_keys.discard(key)
 
     def put(
         self,
@@ -332,7 +227,7 @@ class L1Cache:
             self._evict_for_space(size)
 
             # Store new entry
-            entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size, cached_at=current_time, namespace=namespace)
+            entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size, namespace=namespace)
             self._cache[key] = entry
             self._current_memory_bytes += size
 
@@ -352,12 +247,6 @@ class L1Cache:
         if key in self._cache:
             entry = self._cache.pop(key)
             self._current_memory_bytes -= entry.size_bytes
-
-            # Increment version to prevent stale refresh resurrection
-            self._entry_version[key] = self._entry_version.get(key, 0) + 1
-
-            # Cancel any in-progress refresh
-            self._refreshing_keys.discard(key)
 
             # Update namespace index
             if hasattr(self, "_namespace_index") and entry.namespace:
@@ -450,14 +339,9 @@ class L1Cache:
         with self._lock:
             count = len(self._cache)
 
-            # Increment version for all keys to prevent stale refresh resurrection
-            for key in self._cache:
-                self._entry_version[key] = self._entry_version.get(key, 0) + 1
-
             # Clear all data structures
             self._cache.clear()
             self._current_memory_bytes = 0
-            self._refreshing_keys.clear()
 
             # Clear namespace index
             if hasattr(self, "_namespace_index"):

@@ -4,6 +4,9 @@
 
 > L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
 
+> [!IMPORTANT]
+> The within-TTL SWR described on this page runs **only in L1-only mode** (`backend=None`): past the freshness threshold, the SDK serves the cached value and **re-runs your function** in the background. With a backend configured (Redis, File, Memcached), `swr_enabled` has no effect — there is no within-TTL SWR in backed modes. The one backed SWR that exists is `@cache.io`'s past-TTL [`stale_ttl` mode](../configuration.md#stale-while-revalidate-stale_ttl), which uses the CachekitIO backend's read-side freshness signal.
+
 ---
 
 ## Freshness vs Expiry: Two Distinct Timers
@@ -27,36 +30,29 @@ Time →  T0          T1800 (50%)        T3600 (100%)
 | **Freshness** | When to refresh | Serve immediately + trigger background refresh |
 | **Expiry** | When to delete | Hard deadline - entry removed from cache |
 
-### Key Concept: SWR Does NOT Extend TTL
+### Key Concept: A Successful Refresh Restarts Both Timers
 
-When stale data is refreshed in the background, the **original expiry time remains unchanged**:
+A background refresh **re-runs your function** and stores the fresh result — there is no other source of truth in L1-only mode, so the refreshed entry restarts **both** the freshness clock and the hard-expiry deadline:
 
 ```python
 # Original cache entry (1 hour TTL)
 cached_at = 0
 expires_at = 3600  # Hard expiry time
 
-# At T=1800 (50% of TTL): User gets hit, SWR triggers
-# Returns stale data immediately
-# Background refresh completes at T=1850
-cached_at = 1850   # Reset for next freshness check
-expires_at = 3600  # UNCHANGED - still expires at T=3600
+# At T=1800 (50% of TTL): caller gets a hit, SWR triggers
+# Returns the cached value immediately
+# Background re-run of your function completes at T=1850
+cached_at = 1850   # Freshness clock restarts
+expires_at = 5450  # Hard expiry restarts too (1850 + 3600)
 ```
 
-**Why?** SWR refreshes *content* from L2, not *lifetime*. L1 and L2 TTLs are synchronized at write time and stay synchronized.
-
-**Edge Case: L2 Miss During SWR Refresh**
-
-If Redis evicts the entry or it's manually deleted during refresh:
-1. Background refresh finds cache miss in L2
-2. L1 entry is deleted immediately
-3. Next request calls the original function (full cache miss)
+If the background refresh fails (your function raises), the entry is left as-is: the cached value keeps being served until its original hard expiry, and the next qualifying hit retries the refresh.
 
 ---
 
 ## Stale-While-Revalidate (SWR) Explained
 
-SWR is an optimization that improves perceived latency by serving stale data while fetching fresh data in the background.
+SWR is an optimization that improves perceived latency by serving the cached value while **re-running your function** in the background to compute a fresh one.
 
 ### SWR State Machine
 
@@ -100,14 +96,16 @@ SWR is controlled by two settings:
 from cachekit import cache
 from cachekit.config import L1CacheConfig
 
-# Default: SWR enabled, refresh at 50% of TTL
-@cache(backend=None)
+# Default: SWR enabled, refresh at 50% of TTL.
+# A ttl is required — with ttl=None entries never go stale, so SWR never fires.
+@cache(ttl=3600, backend=None)
 def my_function():
     """SWR configured with defaults."""
     pass
 
 # Custom: Refresh at 25% of TTL (refresh more frequently)
 @cache(
+    ttl=3600,
     l1=L1CacheConfig(
         swr_enabled=True,
         swr_threshold_ratio=0.25  # Refresh at 25% of TTL
@@ -118,26 +116,27 @@ def aggressive_refresh():
     """Refreshes more often, better freshness."""
     pass
 
-# Disable SWR: Always wait for fresh data
+# Disable SWR: no background refresh
 @cache(
+    ttl=3600,
     l1=L1CacheConfig(
         swr_enabled=False
     ),
     backend=None
 )
 def always_fresh():
-    """Returns stale data only on L2 miss/timeout."""
+    """Serves the cached value until hard expiry, then re-runs synchronously."""
     pass
 ```
 
 ### Jitter: Preventing Thundering Herd
 
-When you have many concurrent requests to the same key at the stale threshold, all would trigger refresh simultaneously, overwhelming the backend.
+Only one refresh runs per key at a time — an in-flight marker dedups concurrent triggers for the same key. But when many *keys* were cached together, they all cross the stale threshold together, and their refreshes would re-run many functions at once.
 
-CacheKit applies **jitter** (±10% randomness) to the threshold to spread refresh attempts:
+CacheKit applies **jitter** (±10% randomness) to the threshold to stagger refreshes across keys:
 
 ```python notest
-# Without jitter: All 1000 requests refresh at T=1800
+# Without jitter: 1000 keys cached at T=0 all refresh at T=1800
 # With jitter: Refreshes spread from T=1620 to T=1980
 
 refresh_threshold = ttl * swr_threshold_ratio * random.uniform(0.9, 1.1)
@@ -231,8 +230,8 @@ config = L1CacheConfig(
 |-------|------|---------|---------|
 | `enabled` | bool | `True` | Enable/disable L1 cache completely |
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
-| `swr_enabled` | bool | `True` | Enable stale-while-revalidate |
-| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL (0.1-1.0) |
+| `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
+| `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
 | `namespace_index` | bool | `True` | Enable fast namespace lookups |
 
 ### Intent Presets
@@ -274,10 +273,13 @@ def test_function():
 |--------|-----|-----------------|
 | `minimal()` | ❌ | ❌ |
 | `test()` | ❌ | ❌ |
-| `dev()` | ✓ | ❌ |
-| `production()` | ✓ | ✓ |
-| `secure()` | ✓ | ✓ |
-| `io()` | ✓ | ✓ |
+| `dev()` | L1-only¹ | ❌ |
+| `production()` | L1-only¹ | ✓ |
+| `secure()` | L1-only¹ | ✓ |
+| `io()` | ✓² | ✓ |
+
+¹ Within-TTL SWR runs only in L1-only mode (`backend=None`) — with a backend configured, `swr_enabled` has no effect (see the callout at the top of this page).
+² `@cache.io` ships past-TTL SWR via [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) (default-on), using the CachekitIO backend's freshness signal — a different mechanism from the L1-only within-TTL refresh described here.
 
 ---
 
@@ -329,20 +331,17 @@ For bulk updates where cross-process consistency matters, prefer short TTLs over
 
 ## Performance Notes
 
-### SWR Latency Characteristics
+### SWR Latency Characteristics (L1-only mode)
 
 - **Fresh hit** (~50ns): Return from L1 memory
-- **Stale hit** (~100ns): Return from L1 + start background refresh (non-blocking)
-- **L2 hit** (~2ms): Miss L1, fetch from Redis
-- **L2 miss** (~5-50ms): Fetch from original source, populate L1+L2
+- **Stale hit** (~100ns): Return from L1 + schedule background re-run of your function (non-blocking)
 
-SWR keeps most hits at L1 speed, even when serving slightly stale data.
+SWR keeps hits at L1 speed, even when serving slightly stale data. In backed modes (no within-TTL SWR) the usual tiers apply: **L2 hit** ~2ms (miss L1, fetch from Redis), **L2 miss** ~5-50ms (run your function, populate L1+L2).
 
 ### Memory Impact
 
 - Namespace indexing: ~100 bytes per unique namespace
-- Version tracking: ~8 bytes per cached key
-- Refreshing flag: ~8 bytes per key in refresh state
+- L1-only SWR bookkeeping: a per-entry version counter plus ~8 bytes per key with a refresh in flight
 
 For typical workloads (1000s of keys), overhead is <1MB.
 
@@ -358,9 +357,9 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 ### Problem: SWR refresh failing
 
-**Cause:** L2 (Redis) timeout or network issue
+**Cause:** Your function raised during the background re-run (L1-only mode)
 
-**Behavior:** Stale L1 data continues to be served until TTL expiry. This is by design - SWR is resilient to L2 failures.
+**Behavior:** The cached value continues to be served until its hard expiry, and the next qualifying hit retries the refresh. This is by design - a failed refresh never evicts a servable value.
 
 ### Problem: High memory usage despite max_size_mb limit
 

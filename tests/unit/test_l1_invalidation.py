@@ -1,7 +1,5 @@
 """Unit tests for L1Cache invalidation functionality."""
 
-import pytest
-
 from cachekit.config.nested import L1CacheConfig
 from cachekit.l1_cache import L1Cache
 
@@ -134,45 +132,6 @@ class TestL1CacheInvalidation:
         assert "ns1" not in cache._namespace_index
         assert len(cache._namespace_index["ns2"]) == 1
 
-    def test_invalidation_increments_version(self):
-        """Test that invalidation increments entry version to prevent stale refresh."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
-        cache = L1Cache(max_memory_mb=10, config=config)
-
-        key = "test_key"
-        cache.put(key, b"value", redis_ttl=100.0)
-
-        # Get initial version
-        initial_version = cache._entry_version.get(key, 0)
-        assert initial_version == 0
-
-        # Invalidate
-        cache.invalidate_by_key(key)
-
-        # Verify version incremented
-        new_version = cache._entry_version.get(key, 0)
-        assert new_version == initial_version + 1
-
-    def test_invalidation_clears_refreshing_flag(self):
-        """Test that invalidation clears _refreshing_keys flag."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
-        cache = L1Cache(max_memory_mb=10, config=config)
-
-        key = "test_key"
-
-        # Manually add to refreshing set (simulate SWR trigger)
-        cache._refreshing_keys.add(key)
-        assert key in cache._refreshing_keys
-
-        # Put entry
-        cache.put(key, b"value", redis_ttl=100.0)
-
-        # Invalidate
-        cache.invalidate_by_key(key)
-
-        # Verify refreshing flag cleared
-        assert key not in cache._refreshing_keys
-
     def test_no_index_falls_back_to_scan(self):
         """Test that namespace invalidation works without index (O(n) scan fallback)."""
         # Config WITHOUT namespace_index
@@ -201,29 +160,6 @@ class TestL1CacheInvalidation:
         hit3, val3 = cache.get("key3")
         assert hit3 is True
 
-    def test_invalidate_all_increments_all_versions(self):
-        """Test that invalidate_all increments version for all keys."""
-        config = L1CacheConfig(namespace_index=True)
-        cache = L1Cache(max_memory_mb=10, config=config)
-
-        # Put entries
-        cache.put("key1", b"value1", redis_ttl=100.0)
-        cache.put("key2", b"value2", redis_ttl=100.0)
-        cache.put("key3", b"value3", redis_ttl=100.0)
-
-        # Get initial versions (all 0)
-        assert cache._entry_version.get("key1", 0) == 0
-        assert cache._entry_version.get("key2", 0) == 0
-        assert cache._entry_version.get("key3", 0) == 0
-
-        # Invalidate all
-        cache.invalidate_all()
-
-        # Verify all versions incremented
-        assert cache._entry_version["key1"] == 1
-        assert cache._entry_version["key2"] == 1
-        assert cache._entry_version["key3"] == 1
-
     def test_invalidate_all_clears_namespace_index(self):
         """Test that invalidate_all clears namespace index."""
         config = L1CacheConfig(namespace_index=True)
@@ -242,26 +178,6 @@ class TestL1CacheInvalidation:
         # Verify index cleared
         assert len(cache._namespace_index) == 0
 
-    def test_invalidate_all_clears_refreshing_flags(self):
-        """Test that invalidate_all clears all refreshing flags."""
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
-        cache = L1Cache(max_memory_mb=10, config=config)
-
-        # Manually add keys to refreshing set
-        cache._refreshing_keys.add("key1")
-        cache._refreshing_keys.add("key2")
-        assert len(cache._refreshing_keys) == 2
-
-        # Put entries
-        cache.put("key1", b"value1", redis_ttl=100.0)
-        cache.put("key2", b"value2", redis_ttl=100.0)
-
-        # Invalidate all
-        cache.invalidate_all()
-
-        # Verify refreshing set cleared
-        assert len(cache._refreshing_keys) == 0
-
     def test_namespace_index_updated_on_overwrite(self):
         """Test that namespace index is updated when entry is overwritten with different namespace."""
         config = L1CacheConfig(namespace_index=True)
@@ -279,42 +195,6 @@ class TestL1CacheInvalidation:
         # Verify index updated
         assert key not in cache._namespace_index.get("ns1", set())
         assert key in cache._namespace_index["ns2"]
-
-    @pytest.mark.critical
-    def test_invalidate_during_swr_prevents_resurrection(self):
-        """Test that invalidation during SWR refresh prevents stale data resurrection.
-
-        CRITICAL: This is the version token mechanism test.
-        """
-        config = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.5, namespace_index=True)
-        cache = L1Cache(max_memory_mb=10, config=config)
-
-        key = "test_key"
-        old_value = b"old_value"
-        new_value = b"new_value"
-
-        # Put initial value
-        cache.put(key, old_value, redis_ttl=100.0)
-
-        # Get version
-        version = cache._entry_version.get(key, 0)
-        assert version == 0
-
-        # Simulate: SWR triggered, then key invalidated before refresh completes
-        cache.invalidate_by_key(key)
-
-        # Version should be incremented
-        assert cache._entry_version[key] == 1
-
-        # Try to complete refresh with old version
-        success = cache.complete_refresh(key, version, new_value, 1000.0)
-
-        # Should fail (version mismatch)
-        assert success is False
-
-        # Entry should NOT exist
-        hit, val = cache.get(key)
-        assert hit is False
 
     def test_invalidate_by_namespace_with_no_namespace_entries(self):
         """Test that entries without namespace are not affected by namespace invalidation."""
