@@ -1,6 +1,6 @@
 r"""cachekit - Caching decorator for Python applications.
 
-A robust, production-ready Python library that provides intelligent caching
+A robust Python library that provides intelligent caching
 capabilities with advanced features like multi-serialization support,
 distributed locking, and automatic corruption detection.
 
@@ -52,7 +52,7 @@ Example Usage:
     def get_user_data(user_id: int) -> UserProfile:
         return db.fetch_user(user_id)
 
-    @cache.io()      # Managed SaaS backend (cachekit.io, closed alpha)
+    @cache.io()      # Managed SaaS backend (cachekit.io, closed beta)
     def get_remote_data(key: str):
         return fetch_remote(key)
 

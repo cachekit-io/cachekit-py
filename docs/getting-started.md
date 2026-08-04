@@ -181,7 +181,7 @@ def get_user(user_id):
 
 ---
 
-### Level 5: Production-Ready Features
+### Level 5: Production Reliability Features
 
 ```python
 from cachekit import cache
@@ -236,7 +236,7 @@ export REDIS_URL="redis://localhost:6379"
 export CACHEKIT_REDIS_URL="redis://localhost:6379"
 export CACHEKIT_CONNECTION_POOL_SIZE=20
 
-# CachekitIO Cloud (invite-only alpha)
+# CachekitIO Cloud (closed beta)
 export CACHEKIT_API_KEY=ck_your_api_key
 ```
 
@@ -249,7 +249,7 @@ Four paths depending on your situation:
 | Backend | When to use | Setup effort |
 |:--------|:------------|:-------------|
 | **Redis** (recommended) | Production, existing infra, full control | Medium — run Redis yourself |
-| **CachekitIO Cloud** (alpha) | Skip Redis ops, managed edge caching | Low — API key only |
+| **CachekitIO Cloud** (beta) | Skip Redis ops, managed edge caching | Low — API key only |
 | **Memcached** (optional) | High-throughput, existing Memcached infra | Low — `pip install cachekit[memcached]` |
 | **File / L1-only** | Local dev, tests, no external deps | None |
 
@@ -273,19 +273,19 @@ def get_user(user_id: int):
 ### CachekitIO Cloud
 
 > [!NOTE]
-> **cachekit.io is in closed alpha — [request access](https://cachekit.io)**
+> **cachekit.io is in closed beta — [request access](https://cachekit.io)**
 
 Managed edge caching — no Redis to run. Set your API key and switch the decorator to `@cache.io()`.
 
 ```bash
-# CachekitIO Cloud (invite-only alpha)
+# CachekitIO Cloud (closed beta)
 export CACHEKIT_API_KEY=ck_your_api_key
 ```
 
 ```python notest
 from cachekit import cache
 
-@cache.io(ttl=3600)  # cachekit.io is in closed alpha — request access at https://cachekit.io
+@cache.io(ttl=3600)  # cachekit.io is in closed beta — request access at https://cachekit.io
 def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```

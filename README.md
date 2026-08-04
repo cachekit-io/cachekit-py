@@ -15,20 +15,16 @@ Backend-agnostic caching with intent-based decorators — circuit breaker, distr
 
 ---
 
-> [!WARNING]
-> **Alpha Software** — cachekit is under active development. While we've been building and testing for ~6 months, the API is not yet stable and **breaking changes may occur** between releases. We're committed to making this library rock-solid, but we need your help!
+> [!NOTE]
+> **Status: beta** — CacheKit is in closed beta ahead of 1.0. APIs are stabilising; minor breaking changes may still occur between 0.x releases.
 >
-> 🐛 **Found a bug?** Please [open an issue][issues-url] — even small ones help us improve.
->
-> 💡 **Something feel off?** We want to hear about rough edges, confusing APIs, or missing features.
->
-> Your feedback directly shapes the path to 1.0. Cheers!
+> 🐛 **Found a bug or a rough edge?** Please [open an issue][issues-url] — your feedback directly shapes the path to 1.0.
 
 ---
 
 ## Why cachekit?
 
-**Simple to use, production-ready out of the box.**
+**Simple to use, works out of the box.**
 
 ```python
 from cachekit import cache
@@ -72,7 +68,7 @@ backend that fits your infrastructure — they're peers behind the same `@cache`
 | Backend | Best for | Select with |
 |---------|----------|-------------|
 | Redis | Self-hosted, full control | `REDIS_URL` / `CACHEKIT_REDIS_URL` |
-| CachekitIO | Managed, zero-ops (alpha) | `CACHEKIT_API_KEY` |
+| CachekitIO | Managed, zero-ops (beta) | `CACHEKIT_API_KEY` |
 | Memcached | High-throughput, existing infra | `CACHEKIT_MEMCACHED_SERVERS` |
 | File / L1-only | Local dev, tests, no external deps | `CACHEKIT_FILE_CACHE_DIR` / `backend=None` |
 
@@ -95,7 +91,7 @@ def expensive_api_call(user_id: int):
 ### More Backends
 
 <details>
-<summary><strong>CachekitIO — Managed SaaS (Alpha)</strong></summary>
+<summary><strong>CachekitIO — Managed SaaS (Beta)</strong></summary>
 
 ```python notest
 import os
@@ -109,7 +105,7 @@ def expensive_api_call(user_id: int):
     return fetch_user_data(user_id)
 ```
 
-*cachekit.io is in closed alpha — [request access](https://cachekit.io) to get started.*
+*cachekit.io is in closed beta — [request access](https://cachekit.io) to get started.*
 
 </details>
 
@@ -135,9 +131,9 @@ def expensive_api_call(user_id: int):
 
 ---
 
-> **CachekitIO Cloud (Alpha)**
+> **CachekitIO Cloud (Beta)**
 > Managed caching with zero infrastructure. L1+L2 caching, circuit breaker, and automatic failover — no Redis to manage.
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io) to get started.*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io) to get started.*
 
 ---
 
@@ -412,7 +408,7 @@ info = expensive_func.cache_info()
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
 
-# CachekitIO SaaS Backend (closed alpha — request access at cachekit.io)
+# CachekitIO SaaS Backend (closed beta — request access at cachekit.io)
 CACHEKIT_API_KEY="your-api-key"             # Required for @cache.io()  # pragma: allowlist secret
 CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
 

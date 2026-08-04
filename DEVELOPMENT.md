@@ -1,6 +1,6 @@
 # cachekit Development Guide
 
-> Production-ready universal caching for Python with intelligent reliability features and pluggable backends.
+> Universal caching for Python with intelligent reliability features and pluggable backends.
 
 ---
 

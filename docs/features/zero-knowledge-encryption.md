@@ -505,7 +505,7 @@ didn't recently disable encryption for that function, investigate.
 3. **Production implications**:
    - API caching: 5 μs encryption < network jitter
    - ML features: 2.5% overhead = rounding error
-   - **Zero-knowledge caching is production-ready**
+   - **Zero-knowledge caching is fast enough for production workloads**
 
 Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
 
