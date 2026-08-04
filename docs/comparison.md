@@ -498,7 +498,7 @@ A: lru_cache for simple in-process caching (5% of use cases). cachekit for every
 A: cachekit is the right level of abstraction - adds L1 cache, reliability, metrics, encryption. Raw Redis requires building all this yourself.
 
 **Q: Is cachekit production-ready?**
-A: Yes. Used in production by early adopters. Full test coverage, fuzzing validation, security audit completed.
+A: cachekit is in beta ahead of 1.0. It's used in production by early adopters, with full test coverage, fuzzing validation, and a completed security audit — but minor breaking changes may still occur between 0.x releases.
 
 **Q: Can I use cachekit with FastAPI?**
 A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrate with Prometheus/Grafana.

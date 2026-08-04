@@ -47,7 +47,7 @@ def custom_function():
 - **`@cache.secure`** - Security profile: EncryptionWrapper, comprehensive audit logging, zero-knowledge caching
 - **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
 - **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
-- **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed alpha — [request access](https://cachekit.io))*
+- **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
 - **`@cache`** - Auto-detection: Analyzes function name and signature to select optimal profile
 
 **Implementation Details:**
@@ -182,7 +182,7 @@ def critical_business_logic():
 
 ### `@cache.io` — cachekit.io SaaS Backend
 
-> *cachekit.io is in closed alpha — [request access](https://cachekit.io)*
+> *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
 **Profile for zero-infrastructure caching** via the cachekit.io edge network. Automatically configures `CachekitIOBackend` (HTTP) as the L2 backend with production-grade reliability settings (circuit breaker, L1 in-memory cache).
 

@@ -127,7 +127,7 @@ class BaseBackend(Protocol):
 - Existing Memcached infrastructure you want to reuse
 - Read-heavy workloads where sub-5ms latency is sufficient
 
-**Use [CachekitIOBackend](cachekitio.md) when** *(closed alpha — [request access](https://cachekit.io))*:
+**Use [CachekitIOBackend](cachekitio.md) when** *(closed beta — [request access](https://cachekit.io))*:
 - You want managed, zero-ops distributed caching
 - Multi-region caching without operating Redis
 - Building zero-knowledge architecture with `@cache.secure`
@@ -217,7 +217,7 @@ If no explicit backend and no module-level default, cachekit creates a RedisBack
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
 | **File** | 100μs-5ms | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Production default |
-| **CachekitIO** | ~10-50ms | Managed SaaS, zero-ops | HTTP/2, region-dependent; closed alpha |
+| **CachekitIO** | ~10-50ms | Managed SaaS, zero-ops | HTTP/2, region-dependent; closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
 | **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |
 | **Memcached** | 1-5ms | Alternative to Redis | No persistence |
