@@ -347,7 +347,7 @@ def secure_function():
 | `dev()` | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
 | `production()` | L1-only¹ | ✓ | 100 MB | Full observability |
 | `secure()` | L1-only¹ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | 100 MB | Managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| `io()` | ✓ | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
 
