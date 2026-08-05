@@ -221,8 +221,6 @@ config = L1CacheConfig(
     # SWR Settings
     swr_enabled=True,                # Enable SWR (default: True)
     swr_threshold_ratio=0.5,         # Refresh at X% of TTL (default: 0.5 = 50%)
-
-    namespace_index=True,            # Enable O(1) namespace lookups (default: True)
 )
 ```
 
@@ -232,7 +230,6 @@ config = L1CacheConfig(
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
-| `namespace_index` | bool | `True` | Enable fast namespace lookups |
 
 ### Intent Presets
 
@@ -241,7 +238,7 @@ CacheKit includes preconfigured presets for common use cases:
 ```python notest
 from cachekit import cache
 
-# Development: SWR only, no namespace indexing
+# Development: SWR only
 @cache.dev()
 def dev_function():
     pass
@@ -269,14 +266,14 @@ def test_function():
 
 **Feature Behavior by Preset:**
 
-| Preset | SWR | Namespace Index |
-|--------|-----|-----------------|
-| `minimal()` | ❌ | ❌ |
-| `test()` | ❌ | ❌ |
-| `dev()` | L1-only¹ | ❌ |
-| `production()` | L1-only¹ | ✓ |
-| `secure()` | L1-only¹ | ✓ |
-| `io()` | ✓² | ✓ |
+| Preset | SWR |
+|--------|-----|
+| `minimal()` | ❌ |
+| `test()` | ❌ |
+| `dev()` | L1-only¹ |
+| `production()` | L1-only¹ |
+| `secure()` | L1-only¹ |
+| `io()` | ✓² |
 
 ¹ Within-TTL SWR runs only in L1-only mode (`backend=None`) — with a backend configured, `swr_enabled` has no effect (see the callout at the top of this page).
 ² `@cache.io` ships past-TTL SWR via [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) (default-on), using the CachekitIO backend's freshness signal — a different mechanism from the L1-only within-TTL refresh described here.
@@ -340,7 +337,6 @@ SWR keeps hits at L1 speed, even when serving slightly stale data. In backed mod
 
 ### Memory Impact
 
-- Namespace indexing: ~100 bytes per unique namespace
 - L1-only SWR bookkeeping: a per-entry version counter plus ~8 bytes per key with a refresh in flight
 
 For typical workloads (1000s of keys), overhead is <1MB.
