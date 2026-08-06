@@ -387,6 +387,7 @@ info = expensive_func.cache_info()
 | [Comparison Guide][comparison-url] | How cachekit compares to lru_cache, aiocache, cachetools |
 | [Getting Started][getting-started-url] | Progressive tutorial from basics to advanced |
 | [API Reference][api-reference-url] | Complete API documentation |
+| [Skyline (live example)][skyline-url] | Canonical example project: this SDK ingests the Bluesky firehose and writes the analytics entries a TypeScript edge Worker serves live, on one shared interop namespace |
 
 ### Feature Deep Dives
 
@@ -472,6 +473,7 @@ MIT License - see [LICENSE][license-file-url] for details.
 [uv-url]: https://github.com/astral-sh/uv
 [security-url]: SECURITY.md
 [comparison-url]: docs/comparison.md
+[skyline-url]: https://github.com/cachekit-io/bluesky-thinking
 [getting-started-url]: docs/getting-started.md
 [api-reference-url]: docs/api-reference.md
 [serializer-guide-url]: docs/serializers/index.md
