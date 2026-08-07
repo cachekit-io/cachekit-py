@@ -34,7 +34,6 @@ from pydantic import SecretStr, ValidationError
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
-    EncryptionError,
     EncryptionWrapper,
 )
 
@@ -106,26 +105,56 @@ class TestPreviousMasterKeysConfig:
             assert K1.hex() not in rendered
             assert "REDACTED" in rendered
 
+    def test_validation_errors_never_echo_key_material(self, monkeypatch):
+        """CWE-532: a rejected keyring config must not leak key hex into the
+        ValidationError (str/errors/json all reach startup logs and error
+        trackers). Covers all three env-sourced reject paths — raw env strings
+        are exactly the representation pydantic would otherwise echo."""
+        cases = [
+            {"CACHEKIT_PREVIOUS_MASTER_KEYS": ",".join(f"{i:02x}" * 32 for i in range(1, 5))},  # cap
+            {"CACHEKIT_MASTER_KEY": "aa" * 32, "CACHEKIT_PREVIOUS_MASTER_KEYS": "aa" * 32},  # subset
+            {"CACHEKIT_PREVIOUS_MASTER_KEYS": "aa" * 31},  # short key
+        ]
+        for env in cases:
+            for key, value in env.items():
+                monkeypatch.setenv(key, value)
+            with pytest.raises(ValidationError) as exc_info:
+                CachekitConfig()
+            for rendered in (str(exc_info.value), str(exc_info.value.errors()), exc_info.value.json()):
+                assert "aa" * 31 not in rendered
+                assert "01" * 32 not in rendered
+            # Chain severed: the original error (raw inputs recoverable via
+            # .errors()) must not hang off __context__/__cause__ for error
+            # trackers that walk exception chains.
+            assert exc_info.value.__context__ is None
+            assert exc_info.value.__cause__ is None
+            for key in env:
+                monkeypatch.delenv(key)
+
 
 class _KeyringSpy:
-    """Delegates to the real Rust Keyring, recording every decrypt_at index.
+    """Delegates to the real Rust Keyring, recording every decrypt call.
 
     The real keyring and encryptor are captured at construction: PyO3 extracts
     concrete pyclass types at the FFI boundary, so a Python spy object must
-    never itself be passed into Rust.
+    never itself be passed into Rust. (Fingerprints are cached on the wrapper
+    at construction, before instrumentation, so no fingerprint delegate is
+    needed.)
     """
 
     def __init__(self, real_keyring: Any, real_encryptor: Any):
         self._real = real_keyring
         self._encryptor = real_encryptor
         self.decrypt_at_indices: list[int] = []
-
-    def encryption_fingerprints(self, tenant_id: str) -> list[bytes]:
-        return self._real.encryption_fingerprints(tenant_id)
+        self.sequential_decrypt_calls = 0
 
     def decrypt_at(self, index: int, encryptor: Any, ciphertext: bytes, tenant_id: str, aad: bytes) -> bytes:
         self.decrypt_at_indices.append(index)
         return self._real.decrypt_at(index, self._encryptor, ciphertext, tenant_id, aad)
+
+    def decrypt(self, encryptor: Any, ciphertext: bytes, tenant_id: str, aad: bytes) -> bytes:
+        self.sequential_decrypt_calls += 1
+        return self._real.decrypt(self._encryptor, ciphertext, tenant_id, aad)
 
 
 class _EncryptorSpy:
@@ -273,23 +302,39 @@ class TestNoMatchSemanticsUnchanged:
 
 
 class TestWrapperKeyringConfig:
-    """Wrapper-level keyring construction re-validates behind the FFI boundary."""
+    """Wrapper-level keyring construction re-validates behind the FFI boundary.
 
-    def test_cap_exceeded_raises_encryption_error(self):
-        with pytest.raises(EncryptionError, match="keyring configuration"):
+    Violations raise ValueError — config-class, NEVER EncryptionError: an
+    EncryptionError (a SerializationError) would be classified as corruption by
+    handle_decrypt_failure and fail OPEN even under fail_closed=True, turning a
+    misconfigured keyring into silent 100% misses plus entry-by-entry eviction
+    (the LAB-241/LAB-683 config-vs-crypto error class).
+    """
+
+    def test_cap_exceeded_raises_value_error(self):
+        with pytest.raises(ValueError, match="Keyring configuration invalid"):
             EncryptionWrapper(
                 master_key=K2,
                 tenant_id=TENANT,
                 previous_master_keys=[b"\x0a" * 32, b"\x0b" * 32, b"\x0c" * 32, b"\x0d" * 32],
             )
 
-    def test_current_key_in_decrypt_only_list_raises_encryption_error(self):
-        with pytest.raises(EncryptionError, match="keyring configuration"):
+    def test_current_key_in_decrypt_only_list_raises_value_error(self):
+        with pytest.raises(ValueError, match="Keyring configuration invalid"):
             EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1, K2])
 
     def test_short_previous_key_raises_with_master_key_parity_message(self):
-        with pytest.raises(EncryptionError, match="identical to master_key"):
+        with pytest.raises(ValueError, match="identical to master_key"):
             EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[b"\x0a" * 31])
+
+    def test_keyring_config_errors_are_not_serialization_errors(self):
+        """The read path fails LOUD on keyring misconfig — never miss+evict."""
+        from cachekit.serializers.base import SerializationError
+
+        for previous in ([K1, K2], [b"\x0a" * 31]):
+            with pytest.raises(ValueError) as exc_info:
+                EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=previous)
+            assert not isinstance(exc_info.value, SerializationError)
 
 
 class TestEndToEndRotation:
@@ -395,6 +440,77 @@ class TestEndToEndRotation:
             self._reset()
 
 
+class TestInteropRotation:
+    """Interop entries carry no key fingerprint → sequential keyring attempts
+    (spec 'Decrypt — without per-entry key identity'), same operator surface."""
+
+    def _handler(self, monkeypatch, master_hex: str, previous_hex: str | None):
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", master_hex)
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
+        if previous_hex is None:
+            monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
+        else:
+            monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", previous_hex)
+        reset_settings()
+        return CacheSerializationHandler(encryption=True, single_tenant_mode=True, interop_mode=True)
+
+    def test_interop_rotation_round_trip_then_drop(self, monkeypatch):
+        from cachekit.config.singleton import reset_settings
+
+        try:
+            writer = self._handler(monkeypatch, K1.hex(), None)
+            entry = writer.serialize_data({"v": 9}, cache_key="ns:app:func:f:args:x:v1")
+
+            rotated = self._handler(monkeypatch, K2.hex(), K1.hex())
+            assert rotated.deserialize_data(entry, cache_key="ns:app:func:f:args:x:v1") == {"v": 9}
+
+            cutover = self._handler(monkeypatch, K2.hex(), None)
+            with pytest.raises(DecryptionAuthenticationError, match="Decryption failed"):
+                cutover.deserialize_data(entry, cache_key="ns:app:func:f:args:x:v1")
+        finally:
+            reset_settings()
+
+    def test_interop_rotation_uses_sequential_decrypt_not_fingerprints(self, monkeypatch):
+        """The interop read path routes through Keyring.decrypt (sequential),
+        never decrypt_at (fingerprint selection needs a stored fingerprint)."""
+        from cachekit.config.singleton import reset_settings
+
+        try:
+            writer = self._handler(monkeypatch, K1.hex(), None)
+            entry = writer.serialize_data({"v": 9}, cache_key="ns:app:func:f:args:x:v1")
+
+            rotated = self._handler(monkeypatch, K2.hex(), K1.hex())
+            wrapper = rotated._get_cached_encryption_wrapper("00000000-0000-0000-0000-00000000abcd")
+            keyring_spy, encryptor_spy = _instrument(wrapper)
+
+            assert rotated.deserialize_data(entry, cache_key="ns:app:func:f:args:x:v1") == {"v": 9}
+            assert keyring_spy.sequential_decrypt_calls == 1
+            assert keyring_spy.decrypt_at_indices == []
+            assert encryptor_spy.decrypt_with_keys_calls == 0
+        finally:
+            reset_settings()
+
+    def test_interop_single_key_stays_on_cached_hot_path(self, monkeypatch):
+        """No rotation configured → interop reads keep the cached tenant keys
+        (no per-read HKDF through the keyring)."""
+        from cachekit.config.singleton import reset_settings
+
+        try:
+            handler = self._handler(monkeypatch, K1.hex(), None)
+            entry = handler.serialize_data({"v": 9}, cache_key="ns:app:func:f:args:x:v1")
+            wrapper = handler._get_cached_encryption_wrapper("00000000-0000-0000-0000-00000000abcd")
+            keyring_spy, encryptor_spy = _instrument(wrapper)
+
+            assert handler.deserialize_data(entry, cache_key="ns:app:func:f:args:x:v1") == {"v": 9}
+            assert keyring_spy.sequential_decrypt_calls == 0
+            assert encryptor_spy.decrypt_with_keys_calls == 1
+        finally:
+            reset_settings()
+
+
 class TestDeadBindingRemoved:
     """LAB-275: the KeyRotationState PyO3 binding had zero Python callers."""
 
@@ -404,9 +520,9 @@ class TestDeadBindingRemoved:
 
     def test_keyring_exposes_no_key_material(self):
         """FFI hygiene: the Keyring binding's public surface is construction,
-        fingerprints (safe), and decrypt_at (returns plaintext) — nothing that
-        hands key bytes back to Python."""
+        fingerprints (safe), and the two decrypt entry points (return
+        plaintext) — nothing that hands key bytes back to Python."""
         from cachekit._rust_serializer import Keyring
 
         public = {name for name in dir(Keyring) if not name.startswith("_")}
-        assert public == {"encryption_fingerprints", "decrypt_at"}
+        assert public == {"encryption_fingerprints", "decrypt_at", "decrypt"}

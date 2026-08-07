@@ -315,6 +315,11 @@ Rules enforced at config load — rejected, never truncated or silently fixed:
 An empty decrypt-only list is legal — that is the hard cut-over used for
 compromise response (old entries become unreadable immediately).
 
+[Interop-mode](../../README.md) entries store no per-entry key fingerprint
+(no CK frame), so rotation there attempts keyring keys sequentially — current
+key first, identical AAD per attempt — instead of fingerprint selection. Same
+environment variables, same rotation window, same fail policy on exhaustion.
+
 ---
 
 ## Technical Deep Dive

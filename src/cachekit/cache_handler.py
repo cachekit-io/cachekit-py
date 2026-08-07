@@ -1165,9 +1165,14 @@ class CacheSerializationHandler:
                 wrapper = self._get_cached_encryption_wrapper(tenant_id)
                 # Synthesize the metadata the wrapper needs: interop AAD is pinned
                 # to format=msgpack, compressed=False, NO original_type (exactly
-                # four AAD components). tenant/fingerprint come from config — an
-                # attacker cannot influence them because nothing is read from the
-                # stored bytes except the ciphertext itself.
+                # four AAD components). tenant comes from config — an attacker
+                # cannot influence it because nothing is read from the stored
+                # bytes except the ciphertext itself. Interop entries carry no
+                # per-entry key fingerprint, so keyring rotation uses sequential
+                # attempts (current key first, identical AAD per attempt) via
+                # deserialize_without_key_identity — the spec's "Decrypt —
+                # without per-entry key identity" row — instead of the
+                # fingerprint selection CK-frame entries get.
                 metadata = SerializationMetadata(
                     serialization_format=SerializationFormat.MSGPACK,
                     compressed=False,
@@ -1175,9 +1180,8 @@ class CacheSerializationHandler:
                     encrypted=True,
                     tenant_id=tenant_id,
                     encryption_algorithm="AES-256-GCM",
-                    key_fingerprint=wrapper.encryption_key_fingerprint,
                 )
-                return wrapper.deserialize(data, metadata, cache_key)
+                return wrapper.deserialize_without_key_identity(data, metadata, cache_key)
             return self._base_serializer.deserialize(data)
         except (ValueError, SerializationError):
             raise

@@ -319,6 +319,30 @@ impl PyKeyring {
             .decrypt_at(index, &encryptor.inner, ciphertext, tenant_id, aad)
             .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
     }
+
+    /// Decrypt by sequential keyring attempts: current key first, then each
+    /// decrypt-only key in order, with the identical `aad` for every attempt.
+    ///
+    /// For entries WITHOUT per-entry key identity (interop mode — no CK frame,
+    /// so no stored key fingerprint), per the spec's "Decrypt — without
+    /// per-entry key identity" row. Only an AES-GCM authentication failure
+    /// advances to the next key; structural and configuration errors are
+    /// terminal. Exhaustion surfaces as a plain authentication failure — the
+    /// caller's existing fail-open/fail-closed policy applies, no new failure
+    /// mode. Entries WITH a stored fingerprint must use fingerprint selection
+    /// (`decrypt_at`), never this method.
+    #[pyo3(name = "decrypt")]
+    pub fn decrypt(
+        &self,
+        encryptor: &PyZeroKnowledgeEncryptor,
+        ciphertext: &[u8],
+        tenant_id: &str,
+        aad: &[u8],
+    ) -> PyResult<Vec<u8>> {
+        self.inner
+            .decrypt(&encryptor.inner, ciphertext, tenant_id, aad)
+            .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
+    }
 }
 
 // Note: Error conversions are done inline with .map_err() to avoid orphan rule violations

@@ -117,14 +117,16 @@ class EncryptionWrapper:
         {'pin': 1234}
 
         Rotation is forward-only — the current key re-appearing in the
-        decrypt-only list is a rejected configuration:
+        decrypt-only list is a rejected configuration. It raises ValueError
+        (config-class, fail-loud), deliberately NOT EncryptionError, so the
+        read path can never classify a misconfigured keyring as corruption:
 
         >>> EncryptionWrapper(
         ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"y" * 32]
         ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        EncryptionError: Invalid keyring configuration: ...
+        ValueError: Keyring configuration invalid: ...
     """
 
     __slots__ = (
@@ -162,9 +164,12 @@ class EncryptionWrapper:
                 the same resolved value here. Default False = warn-and-attempt.
             previous_master_keys: Decrypt-only previous master keys for key
                 rotation (max 3). If None, reads CACHEKIT_PREVIOUS_MASTER_KEYS
-                from settings. Entries written under a listed key stay readable
-                — selected by exact derived-key fingerprint match, never by
-                trial decryption. Writes always use master_key.
+                from settings — deliberately ALSO when master_key was passed
+                explicitly: the env var is the fleet-wide rotation surface, so
+                a programmatic master_key still combines with env previous
+                keys. Pass [] to opt out. Entries written under a listed key
+                stay readable — selected by exact derived-key fingerprint
+                match, never by trial decryption. Writes always use master_key.
         """
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
@@ -207,16 +212,21 @@ class EncryptionWrapper:
         # of 3, per-key hex/length validation, and the forward-only subset check
         # at load; the Rust Keyring re-validates all three behind the FFI boundary
         # for wrappers constructed with explicit parameters.
+        # Keyring config errors below raise ValueError, NEVER EncryptionError:
+        # EncryptionError is a SerializationError, which the read-path policy
+        # (handle_decrypt_failure) classifies as corruption → fail-open miss +
+        # evict — a misconfigured keyring would silently erode the cache and
+        # mask itself as misses (the LAB-241/LAB-683 config-vs-crypto error
+        # class). ValueError takes the established fail-loud path instead
+        # (serialize_data/deserialize_data re-raise it), exactly like the
+        # settings-load ValidationError.
         if previous_master_keys is None:
             settings = get_settings()
-            try:
-                previous_master_keys = [bytes.fromhex(key.get_secret_value()) for key in settings.previous_master_keys]
-            except ValueError as e:
-                raise EncryptionError(f"Invalid previous master key format in configuration: {e}") from e
+            previous_master_keys = [bytes.fromhex(key.get_secret_value()) for key in settings.previous_master_keys]
 
         for position, previous_key in enumerate(previous_master_keys):
             if len(previous_key) < 32:
-                raise EncryptionError(
+                raise ValueError(
                     f"Previous master key at position {position} must be at least 32 bytes (256 bits), "
                     f"got {len(previous_key)} — per-key requirements are identical to master_key."
                 )
@@ -225,13 +235,11 @@ class EncryptionWrapper:
         self.encryptor = ZeroKnowledgeEncryptor()
 
         # Keyring for rotation-window reads: master keys live behind the FFI
-        # boundary (zeroized on drop in Rust). Re-validates cap/subset/length —
-        # a config error here (e.g. master_key listed as decrypt-only) is a
-        # keyring misconfiguration, deliberately distinct from key derivation.
-        try:
-            self._keyring = Keyring(master_key, list(previous_master_keys))
-        except ValueError as e:
-            raise EncryptionError(f"Invalid keyring configuration: {e}") from e
+        # boundary (zeroized on drop in Rust). Re-validates cap/subset/length
+        # behind the FFI for wrappers constructed with explicit parameters;
+        # violations raise ValueError from the binding and propagate as-is
+        # (see the config-error taxonomy note above).
+        self._keyring = Keyring(master_key, list(previous_master_keys))
 
         # Derive tenant-specific keys with domain separation
         try:
@@ -254,6 +262,20 @@ class EncryptionWrapper:
             )
         except Exception as e:
             raise EncryptionError(f"Failed to derive tenant keys: {e}") from e
+
+        # Setup-time drift guard: keyring entry 0 must be byte-identical to the
+        # cached tenant-keys fingerprint written into frame metadata. The two
+        # values come from independent FFI paths; if a cachekit-core skew ever
+        # diverged them, every read would silently route to the no-match path
+        # (fail-closed: total read outage; fail-open: warning storm). Fail loud
+        # at construction instead — ValueError, not EncryptionError, for the
+        # same taxonomy reason as the keyring config errors above.
+        if self._keyring_fingerprints[0] != self.encryption_key_fingerprint:
+            raise ValueError(
+                "cachekit-core invariant violation: keyring entry 0 fingerprint does not match "
+                "derive_tenant_keys' encryption fingerprint for the same master key and tenant. "
+                "This indicates a version skew between the keyring and key-derivation paths."
+            )
 
     def serialize(self, obj: Any, cache_key: str = "") -> tuple[bytes, SerializationMetadata]:
         """Serialize and encrypt an object with cache_key binding.
@@ -513,6 +535,86 @@ class EncryptionWrapper:
 
         try:
             # Deserialize the decrypted (authenticated) data using base serializer
+            return self.serializer.deserialize(decrypted_data, raw_metadata)
+        except Exception as e:
+            raise EncryptionError(f"Deserialization failed after successful decryption: {e}") from e
+
+    def deserialize_without_key_identity(self, data: bytes | memoryview, metadata: SerializationMetadata, cache_key: str) -> Any:
+        """Decrypt and deserialize an entry that carries NO per-entry key identity.
+
+        Interop/v1 entries store no CK frame and therefore no key_fingerprint,
+        so fingerprint-based keyring selection is impossible. Per the spec's
+        "Decrypt — without per-entry key identity" row, keyring entries are
+        attempted sequentially — current key first, then each decrypt-only key
+        in order, rebuilding the identical AAD for every attempt (the no-retry
+        rule binds AAD inputs, not key count). Only an AES-GCM authentication
+        failure advances to the next key; exhaustion surfaces as a plain
+        authentication failure into the existing fail-open/fail-closed policy.
+
+        Entries WITH a stored fingerprint must go through :meth:`deserialize`
+        (fingerprint selection is mandatory for them — never trial decryption).
+
+        Args:
+            data: nonce||ciphertext||tag bytes as stored by any SDK
+            metadata: Caller-synthesized metadata fixing the AAD inputs
+                (interop pins format=msgpack, compressed=False, no
+                original_type) and the post-decrypt deserialize format
+            cache_key: Cache key for AAD binding (SECURITY CRITICAL)
+
+        Raises:
+            TypeError: If cache_key is not a string
+            ValueError: If cache_key is empty
+            DecryptionAuthenticationError: When no keyring entry authenticates
+                the ciphertext
+            EncryptionError: If deserialization fails after authenticated
+                decryption
+
+        Examples:
+            A value encrypted under a retired key remains readable without any
+            stored key identity, as long as the key is retained decrypt-only:
+
+            >>> writer = EncryptionWrapper(master_key=b"o" * 32, tenant_id="t-interop", previous_master_keys=[])
+            >>> enc, meta = writer.serialize({"v": 7}, cache_key="ns:interop:k")
+            >>> meta.key_fingerprint = None  # interop entries store no frame metadata
+            >>> rotated = EncryptionWrapper(
+            ...     master_key=b"p" * 32, tenant_id="t-interop", previous_master_keys=[b"o" * 32]
+            ... )
+            >>> rotated.deserialize_without_key_identity(enc, meta, cache_key="ns:interop:k")
+            {'v': 7}
+        """
+        if not isinstance(cache_key, str):
+            raise TypeError(
+                f"cache_key must be a string, got {type(cache_key).__name__}. "
+                "AAD v0x03 verification requires a string cache_key."
+            )
+        if not cache_key:
+            raise ValueError(
+                "cache_key is required to decrypt data. "
+                "AAD v0x03 verification requires cache_key to prevent ciphertext substitution attacks."
+            )
+
+        raw_metadata = SerializationMetadata(
+            serialization_format=metadata.format,
+            encoding=metadata.encoding,
+            compressed=metadata.compressed,
+            original_type=metadata.original_type,
+        )
+
+        try:
+            aad = self._create_aad(raw_metadata, cache_key)
+            if len(self._keyring_fingerprints) == 1:
+                # Single-entry keyring: "sequential" is exactly the current key.
+                # Use the cached derived tenant keys so the no-rotation interop
+                # hot path pays no per-read HKDF derivation.
+                decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
+            else:
+                decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), self.tenant_id, aad)
+        except Exception as e:
+            # Exhaustion of all keyring entries is an AES-GCM authentication
+            # failure — tamper-class, same taxonomy as the fingerprint path.
+            raise DecryptionAuthenticationError(f"Decryption failed: {e}") from e
+
+        try:
             return self.serializer.deserialize(decrypted_data, raw_metadata)
         except Exception as e:
             raise EncryptionError(f"Deserialization failed after successful decryption: {e}") from e

@@ -22,9 +22,11 @@ from typing import Annotated, Any, Literal, Optional
 from pydantic import (
     Field,
     SecretStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
@@ -135,7 +137,48 @@ class CachekitConfig(BaseSettings):
         case_sensitive=False,
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
+        # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
+        # Without this, any validation failure on this model (bad TTL bounds,
+        # keyring misconfig, ...) embeds the full raw input — including
+        # env-sourced master_key and previous_master_keys hex — in startup
+        # logs. errors()/json() ignore this flag; __init__ below sanitizes
+        # those surfaces.
+        hide_input_in_errors=True,
     )
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Construct settings, sanitizing validation errors (CWE-532).
+
+        hide_input_in_errors only affects __str__; ValidationError.errors() and
+        .json() still snapshot the raw input — for env-sourced settings that is
+        the cleartext master_key and previous_master_keys hex, which error
+        trackers serialize. Rebuild the error with every input redacted and
+        drop the original from the exception chain (it holds the raw values).
+        The re-raised error is still a ValidationError (a ValueError), so
+        fail-loud propagation paths are unchanged.
+        """
+        sanitized_error: ValidationError | None = None
+        try:
+            super().__init__(**kwargs)
+        except ValidationError as e:
+            sanitized: list[InitErrorDetails] = []
+            for err in e.errors(include_url=False):
+                detail: InitErrorDetails = {
+                    "type": err["type"],
+                    "loc": err["loc"],
+                    "input": "[REDACTED]",
+                }
+                ctx = err.get("ctx")
+                if ctx:
+                    detail["ctx"] = ctx
+                sanitized.append(detail)
+            sanitized_error = ValidationError.from_exception_data(e.title, sanitized, hide_input=True)
+        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
+        # `raise ... from None` only suppresses display; the original (with raw
+        # inputs recoverable via .errors()) would still hang off __context__
+        # for anything that walks exception chains.
+        if sanitized_error is not None:
+            raise sanitized_error
 
     # Generic cache configuration (backend-agnostic)
     arrow_compression: Literal["zstd", "lz4", "none"] = Field(
