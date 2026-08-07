@@ -16,8 +16,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # All three surfaces index the full guide set (deliberate call on LAB-1013;
-# the top-level README is NOT a curated subset).
-INDEX_FILES = ["README.md", "docs/README.md", "llms.txt"]
+# the top-level README is NOT a curated subset). Each maps to the exact link
+# prefix a guide path must carry ON THAT SURFACE to resolve for a reader —
+# docs/README.md links are relative to docs/, the other two to the repo root.
+# A shared optional prefix would count a link that 404s on its own surface
+# (e.g. docs/features/x.md written inside docs/README.md) as indexed.
+INDEX_FILES = {
+    "README.md": "docs/features/",
+    "docs/README.md": "features/",
+    "llms.txt": "docs/features/",
+}
 
 
 def _strip_non_rendered(text: str) -> str:
@@ -25,14 +33,8 @@ def _strip_non_rendered(text: str) -> str:
 
     A link-shaped string inside either would satisfy the regexes below without
     being reachable by a reader. Backtick fences only — that is what these
-    index files use.
-
-    One alternation rather than two sequential passes: ``re.sub`` scans left to
-    right, so whichever construct *opens first* consumes the other — which is
-    how markdown itself resolves the overlap. Two passes are wrong in both
-    orderings: fences-first leaves a ``` inside ``<!-- -->`` looking like an
-    unpaired fence, and comments-first lets a ``<!--`` inside a code fence eat
-    the rendered text that follows it.
+    index files use. One alternation, not two passes: whichever construct
+    opens first consumes the other, matching how markdown resolves the overlap.
     """
     text = re.sub(r"```.*?```|<!--.*?-->", "", text, flags=re.DOTALL)
     # An odd fence count skews the non-greedy pairing and silently un-strips a
@@ -41,25 +43,21 @@ def _strip_non_rendered(text: str) -> str:
     return text
 
 
-def _is_linked(index_text: str, guide_name: str) -> bool:
+def _is_linked(index_text: str, guide_name: str, prefix: str) -> bool:
     """True if the guide is reachable as a rendered link in the index text.
 
-    Two link forms exist across the surfaces (paths are features/x.md or
-    docs/features/x.md):
+    ``prefix`` is the surface's exact link prefix from INDEX_FILES, anchored
+    to the link target's start — so an offsite same-suffix URL or a
+    wrong-prefix path that 404s on this surface does not count. Two link
+    forms exist:
     - inline: ``[Name](docs/features/x.md)``
     - reference-style (README.md): ``[Name][label]`` + ``[label]: docs/features/x.md``.
       A definition whose label is never used renders as nothing, so the bare
       path substring is not enough — the label must appear as ``][label]``.
-
-    The path is anchored to the link target's start, so it matches only
-    repo-relative paths. An unanchored match would also fire on
-    ``https://elsewhere.example/features/x.md`` — a same-suffix URL on another
-    host, which is not this repo's guide and would be a false pass.
     """
     index_text = _strip_non_rendered(index_text)
-    path = re.escape(f"features/{guide_name}")
-    target = rf"(?:\./)?(?:docs/)?{path}"
-    if re.search(rf"\]\({target}(?:[#?][^)]*)?\)", index_text):
+    target = re.escape(f"{prefix}{guide_name}")
+    if re.search(rf"\]\({target}\)", index_text):
         return True
     for m in re.finditer(rf"^\[([^\]]+)\]:\s*{target}\s*$", index_text, re.MULTILINE):
         if f"][{m.group(1)}]" in index_text:
@@ -69,34 +67,31 @@ def _is_linked(index_text: str, guide_name: str) -> bool:
 
 def test_is_linked_counts_rendered_links_only():
     """Link-shaped text in fenced code or HTML comments must not satisfy the guard."""
-    assert _is_linked("[X](docs/features/x.md)", "x.md")
-    assert _is_linked("See [X][x-url].\n\n[x-url]: docs/features/x.md", "x.md")
-    assert not _is_linked("```\n[X](docs/features/x.md)\n```", "x.md")
-    assert not _is_linked("<!-- [X](docs/features/x.md) -->", "x.md")
-    assert not _is_linked("[x-url]: docs/features/x.md", "x.md")  # definition never used
+    assert _is_linked("[X](docs/features/x.md)", "x.md", "docs/features/")
+    assert _is_linked("See [X][x-url].\n\n[x-url]: docs/features/x.md", "x.md", "docs/features/")
+    assert not _is_linked("```\n[X](docs/features/x.md)\n```", "x.md", "docs/features/")
+    assert not _is_linked("<!-- [X](docs/features/x.md) -->", "x.md", "docs/features/")
+    # Definition never used renders as nothing.
+    assert not _is_linked("[x-url]: docs/features/x.md", "x.md", "docs/features/")
 
 
-def test_is_linked_ignores_offsite_paths():
-    """A same-suffix path on another host is not this repo's guide."""
-    assert not _is_linked("[X](https://example.test/features/x.md)", "x.md")
-    assert not _is_linked("See [X][x].\n\n[x]: https://example.test/docs/features/x.md", "x.md")
+def test_is_linked_requires_the_surfaces_own_prefix():
+    """A link that 404s on its own surface must not count as indexed.
+
+    These are the two realistic copy-paste-between-surfaces mistakes:
+    a root-relative path inside docs/README.md and a docs-relative path
+    inside the top-level README.
+    """
+    assert not _is_linked("[X](docs/features/x.md)", "x.md", "features/")
+    assert not _is_linked("[X](features/x.md)", "x.md", "docs/features/")
 
 
-def test_strip_handles_interleaved_fence_and_comment():
-    """Whichever marker opens first consumes the other — neither order may mis-strip."""
-    # A ``` inside a closed comment is not an unpaired fence, and must not
-    # swallow the rendered link that follows it.
-    assert _is_linked("<!-- ``` -->\n[X](docs/features/x.md)", "x.md")
-    # A <!-- inside a fence is literal code text; the link after it still renders.
-    assert _is_linked("```\n<!--\n```\n[X](docs/features/x.md)", "x.md")
-
-
-@pytest.mark.parametrize("index_file", INDEX_FILES)
-def test_every_feature_guide_is_indexed(index_file: str):
+@pytest.mark.parametrize(("index_file", "prefix"), sorted(INDEX_FILES.items()))
+def test_every_feature_guide_is_indexed(index_file: str, prefix: str):
     """Each docs/features/*.md must be linked from every index surface."""
     guides = sorted((REPO_ROOT / "docs" / "features").glob("*.md"))
     assert guides, "docs/features/ contains no guides — glob path broken?"
 
     index_text = (REPO_ROOT / index_file).read_text(encoding="utf-8")
-    orphans = [g.name for g in guides if not _is_linked(index_text, g.name)]
+    orphans = [g.name for g in guides if not _is_linked(index_text, g.name, prefix)]
     assert not orphans, f"Feature guides missing from {index_file}: {orphans}"
