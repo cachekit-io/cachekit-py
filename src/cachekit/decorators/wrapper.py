@@ -1219,6 +1219,13 @@ def create_cache_wrapper(
                     # message below is true, and swallowing it here degrades a
                     # misconfigured keyring into a silent L2 fall-through. Same
                     # re-raise as the L2 sites in cache_handler.py.
+                    #
+                    # The sync wrapper has no outer `finally`, so a raising exit
+                    # must reset the stats token by hand — exactly as the
+                    # DecryptionAuthenticationError sibling above does. (The
+                    # async L1 guard needs no reset; its wrapper's outer
+                    # `finally` covers every exit path.)
+                    reset_current_function_stats(token)
                     raise
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
