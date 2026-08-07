@@ -251,4 +251,8 @@ constraint-dependencies = [
     # PYSEC-2026-196 (entry-point path traversal), GHSA-58qw-9mgm-455v (tar/zip
     # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering).
     "pip>=26.1.2",
+    # h2 is a transitive dep (httpx[http2] -> h2). 4.4.1 fixes
+    # GHSA-6hr6-w5qg-qmwg (duplicate Host headers forwarded on HTTP/2 ->
+    # HTTP/1.1 downgrade — request smuggling primitive).
+    "h2>=4.4.1",
 ]
