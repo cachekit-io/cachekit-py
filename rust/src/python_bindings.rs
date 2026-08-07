@@ -109,32 +109,39 @@ pyo3::create_exception!(
     _rust_serializer,
     KeyringConfigurationError,
     PyValueError,
-    "A keyring configuration or ciphertext-structure failure on the decrypt path.\n\
+    "A LOCAL keyring configuration fault on the decrypt path.\n\
      \n\
-     Deliberately NOT an AES-GCM authentication failure. cachekit-core emits\n\
-     `AuthenticationFailed` for tag-verification failure and only that; every other\n\
-     decrypt-path error (bad tenant_id, keyring index out of range, short/garbled\n\
-     ciphertext, unsupported version) is an operator or caller fault. Collapsing the\n\
-     two would let a deploy mistake be recorded as `auth_tamper` and page an operator\n\
-     for an attack that never happened.\n\
+     Strictly limited to faults whose input is our own configuration: an invalid\n\
+     tenant_id reaching HKDF (`KeyDerivation`) and a keyring entry index that does\n\
+     not exist (`KeyringIndexOutOfRange`). These are deploy or caller bugs, and\n\
+     recording them as `auth_tamper` pages an operator for an attack that never\n\
+     happened.\n\
      \n\
-     Subclasses ValueError so it takes the established fail-loud path rather than the\n\
-     fail-open corruption path (see the taxonomy note in encryption_wrapper.py)."
+     Everything whose input is the STORED CIPHERTEXT stays on the tamper path,\n\
+     including short/garbled ciphertext. An attacker with backend write access can\n\
+     truncate an entry, and `decrypt_aes_gcm` rejects it on length BEFORE the tag\n\
+     check — so classifying structural errors as config would let the attacker\n\
+     choose whether the tamper alarm fires. This mirrors cachekit-rs, which maps\n\
+     only KeyDerivation | KeyringIndexOutOfRange to its Config class.\n\
+     \n\
+     Subclasses ValueError. Note that cachekit-py's read path routes on\n\
+     SerializationError, so callers that must not fail open re-raise this\n\
+     explicitly (see cache_handler.py)."
 );
 
 /// Map a cachekit-core decrypt-path error onto the Python exception taxonomy.
 ///
-/// `AuthenticationFailed` is the sole wrong-key / tamper signal — it keeps the
-/// plain `ValueError` the wrapper converts into `DecryptionAuthenticationError`.
-/// Everything else becomes `KeyringConfigurationError` so it cannot be recorded
-/// as `auth_tamper`.
+/// The split is by INPUT PROVENANCE, not by "is it AuthenticationFailed":
+/// attacker-supplied ciphertext faults must stay tamper-class, our own config
+/// faults must not. Mirrors the cachekit-rs mapping exactly so the three SDKs
+/// tell operators the same story.
 #[cfg(feature = "encryption")]
 fn decrypt_error_to_py(err: EncryptionError) -> PyErr {
     match err {
-        EncryptionError::AuthenticationFailed => {
-            PyValueError::new_err(format!("Decryption failed: {}", err))
+        EncryptionError::KeyDerivation(_) | EncryptionError::KeyringIndexOutOfRange { .. } => {
+            KeyringConfigurationError::new_err(format!("Keyring decrypt failed: {}", err))
         }
-        other => KeyringConfigurationError::new_err(format!("Keyring decrypt failed: {}", other)),
+        other => PyValueError::new_err(format!("Decryption failed: {}", other)),
     }
 }
 
@@ -480,10 +487,13 @@ pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTenantKeys>()?;
     m.add_class::<PyOperationMetrics>()?;
     m.add_class::<PyKeyring>()?;
-    m.add(
-        "KeyringConfigurationError",
-        m.py().get_type::<KeyringConfigurationError>(),
-    )?;
+    let keyring_config_error = m.py().get_type::<KeyringConfigurationError>();
+    // create_exception! sets __module__ to the bare "_rust_serializer"; without
+    // this the class cannot be pickled back to a parent process, so a
+    // ProcessPoolExecutor worker surfaces ModuleNotFoundError instead of the
+    // real failure.
+    keyring_config_error.setattr("__module__", "cachekit._rust_serializer")?;
+    m.add("KeyringConfigurationError", keyring_config_error)?;
     m.add_function(wrap_pyfunction!(derive_domain_key_py, m)?)?;
     m.add_function(wrap_pyfunction!(derive_tenant_keys_py, m)?)?;
     m.add_function(wrap_pyfunction!(key_fingerprint_py, m)?)?;

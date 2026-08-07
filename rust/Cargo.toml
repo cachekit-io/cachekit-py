@@ -25,8 +25,9 @@ cachekit-core = { version = "0.5.0", features = ["compression", "checksum", "mes
 # Python integration - optional for Rust-only builds
 pyo3 = { workspace = true, optional = true }
 
-# Wipe the PyO3-side copies of master key material on drop
-zeroize = "1"
+# Wipe the PyO3-side copies of master key material on drop. Only used behind
+# the encryption feature, so gated the same way pyo3 is.
+zeroize = { version = "1", optional = true }
 
 # Feature flags
 [features]
@@ -39,7 +40,7 @@ python = ["dep:pyo3"]
 compression = []
 checksum = []
 messagepack = []
-encryption = []
+encryption = ["dep:zeroize"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

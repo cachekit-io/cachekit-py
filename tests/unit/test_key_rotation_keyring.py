@@ -356,20 +356,24 @@ class TestDecryptErrorTaxonomy:
         keyring = Keyring(K1, [])
         encryptor = ZeroKnowledgeEncryptor()
 
-        # Structural: shorter than nonce(12) + tag(16). Fails identically under
-        # every key, so it is terminal and is not a wrong-key signal.
-        with pytest.raises(KeyringConfigurationError):
+        # Truncated ciphertext MUST stay tamper-class. decrypt_aes_gcm rejects on
+        # length BEFORE the tag check, so if this were config-class an attacker
+        # with backend write access could silence the tamper alarm just by
+        # truncating the entry — they would choose whether the alarm fires.
+        with pytest.raises(ValueError) as exc_info:
             keyring.decrypt(encryptor, b"short", TENANT, b"aad")
+        assert not isinstance(exc_info.value, KeyringConfigurationError)
 
-        # Caller bug: single-entry keyring has no index 5.
-        with pytest.raises(KeyringConfigurationError):
-            keyring.decrypt_at(5, encryptor, b"\x00" * 64, TENANT, b"aad")
-
-        # Well-formed length, garbage content: a real AES-GCM tag failure. This
-        # one MUST stay the plain ValueError the wrapper converts to tamper.
+        # Well-formed length, garbage content: a real AES-GCM tag failure. Also
+        # tamper-class.
         with pytest.raises(ValueError) as exc_info:
             keyring.decrypt_at(0, encryptor, b"\x00" * 64, TENANT, b"aad")
         assert not isinstance(exc_info.value, KeyringConfigurationError)
+
+        # Caller bug, input is our own config, not the stored bytes: single-entry
+        # keyring has no index 5. This is the config side.
+        with pytest.raises(KeyringConfigurationError):
+            keyring.decrypt_at(5, encryptor, b"\x00" * 64, TENANT, b"aad")
 
     def test_wrapper_does_not_relabel_config_error_as_tamper(self):
         from cachekit._rust_serializer import KeyringConfigurationError
@@ -386,14 +390,46 @@ class TestDecryptErrorTaxonomy:
             def decrypt_at(self, *args: Any, **kwargs: Any) -> bytes:
                 raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
 
-            def decrypt(self, *args: Any, **kwargs: Any) -> bytes:
-                raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
-
         reader._keyring = _ConfigFailKeyring()  # type: ignore[assignment]
 
         with pytest.raises(KeyringConfigurationError) as exc_info:
             reader.deserialize(enc, meta, cache_key="key:a")
         assert not isinstance(exc_info.value, DecryptionAuthenticationError)
+
+    def test_read_path_does_not_swallow_keyring_config_error(self):
+        """Regression: KeyringConfigurationError is a ValueError, NOT a
+        SerializationError, so the L2 read path's `except SerializationError`
+        misses it and the broad `except Exception` below would turn it into
+        `return None` — a silent fail-open miss with no metric and no eviction,
+        even under fail_closed. It must escape instead."""
+        from cachekit._rust_serializer import KeyringConfigurationError
+        from cachekit.cache_handler import CacheOperationHandler
+        from cachekit.serializers.base import SerializationError
+
+        # The whole reason the explicit re-raise is needed.
+        assert issubclass(KeyringConfigurationError, ValueError)
+        assert not issubclass(KeyringConfigurationError, SerializationError)
+
+        class _Backend:
+            def get(self, cache_key: str, refresh_ttl: Any = None) -> bytes:
+                return b"ciphertext"
+
+            def get_buffer(self, cache_key: str) -> None:
+                return None
+
+        class _SerHandler:
+            def supports_mmap_read(self) -> bool:
+                return False
+
+            def deserialize_data(self, data: Any, cache_key: str) -> Any:
+                raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
+
+        handler = CacheOperationHandler.__new__(CacheOperationHandler)
+        handler._cache_handler = _Backend()
+        handler.serialization_handler = _SerHandler()
+
+        with pytest.raises(KeyringConfigurationError):
+            handler.get_cached_value("key:a")
 
     def test_fingerprint_derivation_failure_is_not_a_serialization_error(self, monkeypatch):
         """Regression: the derivation call used to sit inside the try block whose
