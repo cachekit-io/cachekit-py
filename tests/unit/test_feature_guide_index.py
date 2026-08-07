@@ -20,6 +20,20 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INDEX_FILES = ["README.md", "docs/README.md", "llms.txt"]
 
 
+def _strip_non_rendered(text: str) -> str:
+    """Remove markdown content that never renders: fenced code blocks and HTML comments.
+
+    A link-shaped string inside either would satisfy the regexes below without
+    being reachable by a reader. Backtick fences only — that is what these
+    index files use.
+    """
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    # An odd fence count skews the non-greedy pairing and silently un-strips a
+    # block — the exact false-pass this helper exists to prevent. Fail loud.
+    assert "```" not in text, "unpaired ``` fence — stripping unreliable"
+    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+
 def _is_linked(index_text: str, guide_name: str) -> bool:
     """True if the guide is reachable as a rendered link in the index text.
 
@@ -30,6 +44,7 @@ def _is_linked(index_text: str, guide_name: str) -> bool:
       A definition whose label is never used renders as nothing, so the bare
       path substring is not enough — the label must appear as ``][label]``.
     """
+    index_text = _strip_non_rendered(index_text)
     target = re.escape(f"features/{guide_name}")
     if re.search(rf"\]\([^)]*{target}\)", index_text):
         return True
@@ -37,6 +52,15 @@ def _is_linked(index_text: str, guide_name: str) -> bool:
         if f"][{m.group(1)}]" in index_text:
             return True
     return False
+
+
+def test_is_linked_counts_rendered_links_only():
+    """Link-shaped text in fenced code or HTML comments must not satisfy the guard."""
+    assert _is_linked("[X](docs/features/x.md)", "x.md")
+    assert _is_linked("See [X][x-url].\n\n[x-url]: docs/features/x.md", "x.md")
+    assert not _is_linked("```\n[X](docs/features/x.md)\n```", "x.md")
+    assert not _is_linked("<!-- [X](docs/features/x.md) -->", "x.md")
+    assert not _is_linked("[x-url]: docs/features/x.md", "x.md")  # definition never used
 
 
 @pytest.mark.parametrize("index_file", INDEX_FILES)
