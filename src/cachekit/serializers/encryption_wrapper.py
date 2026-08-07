@@ -14,7 +14,7 @@ import logging
 from typing import Any, Optional
 
 # Import zero-knowledge encryption from Rust
-from cachekit._rust_serializer import ZeroKnowledgeEncryptor, derive_tenant_keys
+from cachekit._rust_serializer import Keyring, ZeroKnowledgeEncryptor, derive_tenant_keys
 from cachekit.config import get_settings
 
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
@@ -34,7 +34,8 @@ class DecryptionAuthenticationError(EncryptionError):
     Raised when the AES-GCM tag fails to verify (tampered ciphertext, wrong
     key, or AAD/cache_key mismatch), when the entry's tenant does not match the
     handler's tenant, or — in fail-closed mode — when the stored key fingerprint
-    does not match the current key. Distinct from plain :class:`EncryptionError`
+    matches no keyring entry (neither the current key nor any decrypt-only
+    previous key). Distinct from plain :class:`EncryptionError`
     / :class:`SerializationError`, which cover corruption and format problems.
     Classification and the fail-open/fail-closed policy live in
     ``cachekit.cache_handler.handle_decrypt_failure``.
@@ -101,9 +102,41 @@ class EncryptionWrapper:
 
         >>> EncryptionWrapper(master_key=b"a" * 32).is_encryption_enabled
         True
+
+        Key rotation: an entry written under a retired master key stays readable
+        while that key is kept decrypt-only (max 3, env
+        CACHEKIT_PREVIOUS_MASTER_KEYS). Selection is by exact fingerprint match
+        of the HKDF-derived per-tenant encryption key — never trial decryption:
+
+        >>> writer = EncryptionWrapper(master_key=b"x" * 32, tenant_id="test-tenant", previous_master_keys=[])
+        >>> enc, meta = writer.serialize({"pin": 1234}, cache_key="users:1:pin")
+        >>> rotated = EncryptionWrapper(
+        ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"x" * 32]
+        ... )
+        >>> rotated.deserialize(enc, meta, cache_key="users:1:pin")
+        {'pin': 1234}
+
+        Rotation is forward-only — the current key re-appearing in the
+        decrypt-only list is a rejected configuration:
+
+        >>> EncryptionWrapper(
+        ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"y" * 32]
+        ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        EncryptionError: Invalid keyring configuration: ...
     """
 
-    __slots__ = ("tenant_id", "serializer", "encryptor", "tenant_keys", "encryption_key_fingerprint", "fail_closed")
+    __slots__ = (
+        "tenant_id",
+        "serializer",
+        "encryptor",
+        "tenant_keys",
+        "encryption_key_fingerprint",
+        "fail_closed",
+        "_keyring",
+        "_keyring_fingerprints",
+    )
 
     def __init__(
         self,
@@ -111,6 +144,7 @@ class EncryptionWrapper:
         master_key: Optional[bytes] = None,
         tenant_id: str = "default",
         fail_closed: bool = False,
+        previous_master_keys: Optional[list[bytes]] = None,
     ):
         """Initialize encryption wrapper.
 
@@ -126,6 +160,11 @@ class EncryptionWrapper:
                 raising vs recomputing lives on the handler
                 (CacheSerializationHandler.encryption_fail_closed), which passes
                 the same resolved value here. Default False = warn-and-attempt.
+            previous_master_keys: Decrypt-only previous master keys for key
+                rotation (max 3). If None, reads CACHEKIT_PREVIOUS_MASTER_KEYS
+                from settings. Entries written under a listed key stay readable
+                — selected by exact derived-key fingerprint match, never by
+                trial decryption. Writes always use master_key.
         """
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
@@ -142,10 +181,11 @@ class EncryptionWrapper:
 
         # Setup encryption — mandatory. EncryptionWrapper without encryption
         # is a security misconfiguration, not a valid operating mode.
-        # _setup_encryption sets: self.encryptor, self.tenant_keys, self.encryption_key_fingerprint
-        self._setup_encryption(master_key)
+        # _setup_encryption sets: self.encryptor, self.tenant_keys,
+        # self.encryption_key_fingerprint, self._keyring, self._keyring_fingerprints
+        self._setup_encryption(master_key, previous_master_keys)
 
-    def _setup_encryption(self, master_key: Optional[bytes]) -> None:
+    def _setup_encryption(self, master_key: Optional[bytes], previous_master_keys: Optional[list[bytes]]) -> None:
         """Setup encryption components with key derivation."""
         # Get master key from settings if not provided
         if master_key is None:
@@ -162,8 +202,36 @@ class EncryptionWrapper:
         if len(master_key) < 32:
             raise EncryptionError("Master key must be at least 32 bytes (256 bits)")
 
+        # Decrypt-only previous keys from settings if not provided (key rotation,
+        # spec/encryption.md → "Key Rotation (Keyring)"). Settings enforce the cap
+        # of 3, per-key hex/length validation, and the forward-only subset check
+        # at load; the Rust Keyring re-validates all three behind the FFI boundary
+        # for wrappers constructed with explicit parameters.
+        if previous_master_keys is None:
+            settings = get_settings()
+            try:
+                previous_master_keys = [bytes.fromhex(key.get_secret_value()) for key in settings.previous_master_keys]
+            except ValueError as e:
+                raise EncryptionError(f"Invalid previous master key format in configuration: {e}") from e
+
+        for position, previous_key in enumerate(previous_master_keys):
+            if len(previous_key) < 32:
+                raise EncryptionError(
+                    f"Previous master key at position {position} must be at least 32 bytes (256 bits), "
+                    f"got {len(previous_key)} — per-key requirements are identical to master_key."
+                )
+
         # Initialize encryptor
         self.encryptor = ZeroKnowledgeEncryptor()
+
+        # Keyring for rotation-window reads: master keys live behind the FFI
+        # boundary (zeroized on drop in Rust). Re-validates cap/subset/length —
+        # a config error here (e.g. master_key listed as decrypt-only) is a
+        # keyring misconfiguration, deliberately distinct from key derivation.
+        try:
+            self._keyring = Keyring(master_key, list(previous_master_keys))
+        except ValueError as e:
+            raise EncryptionError(f"Invalid keyring configuration: {e}") from e
 
         # Derive tenant-specific keys with domain separation
         try:
@@ -172,9 +240,16 @@ class EncryptionWrapper:
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()
 
+            # Python only ever holds the per-entry fingerprints of the
+            # HKDF-derived per-tenant encryption keys, current key first — the
+            # exact values compared against the frame's key_fingerprint
+            # metadata on decrypt (never the master-key fingerprints).
+            self._keyring_fingerprints = [fp.hex() for fp in self._keyring.encryption_fingerprints(self.tenant_id)]
+
             logger.info(
                 f"Encryption initialized for tenant '{self.tenant_id}' "
                 f"(key fingerprint: {self.encryption_key_fingerprint[:12]}..., "
+                f"decrypt-only previous keys: {len(previous_master_keys)}, "
                 f"hardware acceleration: {self.encryptor.hardware_acceleration_enabled()})"
             )
         except Exception as e:
@@ -366,8 +441,23 @@ class EncryptionWrapper:
                 f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"
             )
 
-        # Verify key fingerprint for rotation detection
-        if metadata.key_fingerprint != self.encryption_key_fingerprint:
+        # Keyring selection by exact fingerprint match (spec/encryption.md →
+        # "Key Rotation (Keyring)"): the frame's key_fingerprint is compared
+        # against each keyring entry's HKDF-derived per-tenant encryption-key
+        # fingerprint, current key first — never trial-decrypted across the
+        # keyring. Index 0 is the current key; higher indices are decrypt-only
+        # previous keys retained for the rotation window. A match is binding:
+        # the matched entry is the only key used, and its authentication
+        # failure is terminal (no further keyring entries — see decrypt below).
+        try:
+            keyring_index = self._keyring_fingerprints.index(metadata.key_fingerprint)
+        except ValueError:
+            keyring_index = None
+
+        # No keyring entry matches: pre-keyring mismatch semantics, unchanged —
+        # fail-closed raises before attempting decryption; fail-open warns and
+        # attempts the current key only.
+        if keyring_index is None:
             metadata_fp = metadata.key_fingerprint[:12] if metadata.key_fingerprint else "unknown"
             current_fp = self.encryption_key_fingerprint[:12] if self.encryption_key_fingerprint else "unknown"
             if self.fail_closed:
@@ -402,7 +492,17 @@ class EncryptionWrapper:
             # `unwrap` may hand us a memoryview; the AES-GCM binding requires owned bytes, and an
             # encrypted value can never be zero-copy anyway (decrypt reads the whole ciphertext
             # into an owned buffer), so coercing here costs nothing the cipher wasn't already paying.
-            decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
+            if keyring_index is not None and keyring_index > 0:
+                # Decrypt-only keyring entry (rotation-window read): decrypt with
+                # exactly the matched entry. Binding match — decrypt_at never
+                # falls back across entries, and any failure raises out of this
+                # block straight into the fail-open/fail-closed policy.
+                decrypted_data = self._keyring.decrypt_at(keyring_index, self.encryptor, bytes(data), self.tenant_id, aad)
+            else:
+                # Current key (keyring index 0) or fail-open no-match attempt:
+                # the cached derived tenant keys keep the hot path free of
+                # per-read HKDF derivation.
+                decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
 
         except Exception as e:
             # AES-GCM tag verification failed: tampered ciphertext, wrong key, or

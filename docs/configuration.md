@@ -81,6 +81,12 @@ CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Encryption (for @cache.secure)
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
+# Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
+# same per-key requirements as CACHEKIT_MASTER_KEY). Entries written under a
+# listed key stay readable through the rotation window; writes always use
+# CACHEKIT_MASTER_KEY. More than 3 keys, or the current master key re-appearing
+# in this list, is rejected at load.
+CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>,<older-key-hex>
 # Fail closed on decrypt authentication failures (default: false = fail open/recompute).
 # When true, AES-GCM auth failures and key-fingerprint mismatches raise
 # DecryptionAuthenticationError to the caller instead of silently recomputing.

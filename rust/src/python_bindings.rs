@@ -96,11 +96,10 @@ impl PyByteStorage {
 
 #[cfg(feature = "encryption")]
 use cachekit_core::{
-    encryption::{
-        key_derivation::{derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys},
-        key_rotation::KeyRotationState,
+    encryption::key_derivation::{
+        derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys,
     },
-    ZeroKnowledgeEncryptor,
+    Keyring, ZeroKnowledgeEncryptor,
 };
 
 /// Python wrapper for ZeroKnowledgeEncryptor
@@ -253,56 +252,72 @@ impl PyOperationMetrics {
     }
 }
 
-/// Python wrapper for KeyRotationState
+/// Python wrapper for the master-key rotation Keyring (spec/encryption.md →
+/// "Key Rotation (Keyring)").
+///
+/// Master-key material enters once at construction (config ingestion) and
+/// never leaves: the only values crossing back to Python are per-tenant
+/// fingerprints (safe to expose) and decrypted plaintext. All keyring key
+/// material zeroizes on drop inside cachekit-core, decrypt-only entries
+/// included.
 #[cfg(feature = "encryption")]
-#[pyclass(name = "KeyRotationState")]
-pub struct PyKeyRotationState {
-    inner: KeyRotationState,
+#[pyclass(name = "Keyring")]
+pub struct PyKeyring {
+    inner: Keyring,
 }
 
 #[cfg(feature = "encryption")]
 #[pymethods]
-impl PyKeyRotationState {
+impl PyKeyring {
+    /// Build a keyring from the current master key plus decrypt-only previous
+    /// keys. cachekit-core validates the cap (max 3 decrypt-only keys, never
+    /// truncated), rejects the current key re-appearing in the decrypt-only
+    /// list (detectable subset of the forward-only invariant), and enforces
+    /// minimum key length.
     #[new]
-    pub fn new(key: &[u8]) -> PyResult<Self> {
-        if key.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "Key must be 32 bytes, got {}",
-                key.len()
-            )));
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(key);
-        Ok(Self {
-            inner: KeyRotationState::new(key_array),
-        })
+    pub fn new(current: &[u8], decrypt_only: Vec<Vec<u8>>) -> PyResult<Self> {
+        let refs: Vec<&[u8]> = decrypt_only.iter().map(|key| key.as_slice()).collect();
+        let inner = Keyring::new(current, &refs)
+            .map_err(|e| PyValueError::new_err(format!("Keyring configuration invalid: {}", e)))?;
+        Ok(Self { inner })
     }
 
-    /// Start key rotation with new key
-    #[pyo3(name = "start_rotation")]
-    pub fn start_rotation(&mut self, new_key: &[u8]) -> PyResult<()> {
-        if new_key.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "Key must be 32 bytes, got {}",
-                new_key.len()
-            )));
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(new_key);
-        self.inner.start_rotation(key_array);
-        Ok(())
+    /// Per-entry fingerprints of the HKDF-derived per-tenant **encryption**
+    /// key, in attempt order (current key first). This is the value
+    /// cachekit-py stores as CK frame metadata, so fingerprint-based keyring
+    /// selection compares like with like. Entry count is `len()` of this list.
+    #[pyo3(name = "encryption_fingerprints")]
+    pub fn encryption_fingerprints(&self, tenant_id: &str) -> PyResult<Vec<Vec<u8>>> {
+        let fingerprints = self.inner.encryption_fingerprints(tenant_id).map_err(|e| {
+            PyValueError::new_err(format!("Keyring fingerprint derivation failed: {}", e))
+        })?;
+        Ok(fingerprints.into_iter().map(|fp| fp.to_vec()).collect())
     }
 
-    /// Complete key rotation (remove old key)
-    #[pyo3(name = "complete_rotation")]
-    pub fn complete_rotation(&mut self) {
-        self.inner.complete_rotation();
-    }
-
-    /// Check if rotation is currently in progress
-    #[pyo3(name = "is_rotating")]
-    pub fn is_rotating(&self) -> bool {
-        self.inner.is_rotating()
+    /// Decrypt with the keyring entry at `index` (0 = current key).
+    ///
+    /// For fingerprint-based selection: a fingerprint match is binding — if
+    /// the matched entry fails AES-GCM authentication the failure is terminal,
+    /// and the caller must not retry other keyring entries. This method never
+    /// falls back across entries.
+    ///
+    /// The out-of-range and key-derivation errors below are caller bugs /
+    /// configuration errors, unreachable when `index` comes from a match
+    /// against this keyring's own `encryption_fingerprints` (the wrapper
+    /// derives fingerprints for the same `tenant_id` at construction, so a
+    /// bad tenant fails there, not here).
+    #[pyo3(name = "decrypt_at")]
+    pub fn decrypt_at(
+        &self,
+        index: usize,
+        encryptor: &PyZeroKnowledgeEncryptor,
+        ciphertext: &[u8],
+        tenant_id: &str,
+        aad: &[u8],
+    ) -> PyResult<Vec<u8>> {
+        self.inner
+            .decrypt_at(index, &encryptor.inner, ciphertext, tenant_id, aad)
+            .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
     }
 }
 
@@ -391,7 +406,7 @@ pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZeroKnowledgeEncryptor>()?;
     m.add_class::<PyTenantKeys>()?;
     m.add_class::<PyOperationMetrics>()?;
-    m.add_class::<PyKeyRotationState>()?;
+    m.add_class::<PyKeyring>()?;
     m.add_function(wrap_pyfunction!(derive_domain_key_py, m)?)?;
     m.add_function(wrap_pyfunction!(derive_tenant_keys_py, m)?)?;
     m.add_function(wrap_pyfunction!(key_fingerprint_py, m)?)?;
