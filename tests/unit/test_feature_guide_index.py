@@ -26,12 +26,19 @@ def _strip_non_rendered(text: str) -> str:
     A link-shaped string inside either would satisfy the regexes below without
     being reachable by a reader. Backtick fences only — that is what these
     index files use.
+
+    One alternation rather than two sequential passes: ``re.sub`` scans left to
+    right, so whichever construct *opens first* consumes the other — which is
+    how markdown itself resolves the overlap. Two passes are wrong in both
+    orderings: fences-first leaves a ``` inside ``<!-- -->`` looking like an
+    unpaired fence, and comments-first lets a ``<!--`` inside a code fence eat
+    the rendered text that follows it.
     """
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"```.*?```|<!--.*?-->", "", text, flags=re.DOTALL)
     # An odd fence count skews the non-greedy pairing and silently un-strips a
     # block — the exact false-pass this helper exists to prevent. Fail loud.
     assert "```" not in text, "unpaired ``` fence — stripping unreliable"
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return text
 
 
 def _is_linked(index_text: str, guide_name: str) -> bool:
@@ -43,12 +50,18 @@ def _is_linked(index_text: str, guide_name: str) -> bool:
     - reference-style (README.md): ``[Name][label]`` + ``[label]: docs/features/x.md``.
       A definition whose label is never used renders as nothing, so the bare
       path substring is not enough — the label must appear as ``][label]``.
+
+    The path is anchored to the link target's start, so it matches only
+    repo-relative paths. An unanchored match would also fire on
+    ``https://elsewhere.example/features/x.md`` — a same-suffix URL on another
+    host, which is not this repo's guide and would be a false pass.
     """
     index_text = _strip_non_rendered(index_text)
-    target = re.escape(f"features/{guide_name}")
-    if re.search(rf"\]\([^)]*{target}\)", index_text):
+    path = re.escape(f"features/{guide_name}")
+    target = rf"(?:\./)?(?:docs/)?{path}"
+    if re.search(rf"\]\({target}(?:[#?][^)]*)?\)", index_text):
         return True
-    for m in re.finditer(rf"^\[([^\]]+)\]:\s*\S*{target}\s*$", index_text, re.MULTILINE):
+    for m in re.finditer(rf"^\[([^\]]+)\]:\s*{target}\s*$", index_text, re.MULTILINE):
         if f"][{m.group(1)}]" in index_text:
             return True
     return False
@@ -61,6 +74,21 @@ def test_is_linked_counts_rendered_links_only():
     assert not _is_linked("```\n[X](docs/features/x.md)\n```", "x.md")
     assert not _is_linked("<!-- [X](docs/features/x.md) -->", "x.md")
     assert not _is_linked("[x-url]: docs/features/x.md", "x.md")  # definition never used
+
+
+def test_is_linked_ignores_offsite_paths():
+    """A same-suffix path on another host is not this repo's guide."""
+    assert not _is_linked("[X](https://example.test/features/x.md)", "x.md")
+    assert not _is_linked("See [X][x].\n\n[x]: https://example.test/docs/features/x.md", "x.md")
+
+
+def test_strip_handles_interleaved_fence_and_comment():
+    """Whichever marker opens first consumes the other — neither order may mis-strip."""
+    # A ``` inside a closed comment is not an unpaired fence, and must not
+    # swallow the rendered link that follows it.
+    assert _is_linked("<!-- ``` -->\n[X](docs/features/x.md)", "x.md")
+    # A <!-- inside a fence is literal code text; the link after it still renders.
+    assert _is_linked("```\n<!--\n```\n[X](docs/features/x.md)", "x.md")
 
 
 @pytest.mark.parametrize("index_file", INDEX_FILES)
