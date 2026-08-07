@@ -573,7 +573,11 @@ def get_data():
 A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 
 **Q: Key rotation failing**
-A: Ensure CACHEKIT_MASTER_KEY_ROTATION is formatted correctly.
+A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
+the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
+current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
+rotation pattern above: keep the retiring key decrypt-only for the full rotation
+window before dropping it.
 
 **Q: Performance degraded after enabling encryption**
 A: Expected 100-500μs overhead. Profile to confirm acceptable.

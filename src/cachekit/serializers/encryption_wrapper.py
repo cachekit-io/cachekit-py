@@ -14,7 +14,12 @@ import logging
 from typing import Any, Optional
 
 # Import zero-knowledge encryption from Rust
-from cachekit._rust_serializer import Keyring, ZeroKnowledgeEncryptor, derive_tenant_keys
+from cachekit._rust_serializer import (
+    Keyring,
+    KeyringConfigurationError,
+    ZeroKnowledgeEncryptor,
+    derive_tenant_keys,
+)
 from cachekit.config import get_settings
 
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
@@ -247,21 +252,30 @@ class EncryptionWrapper:
 
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()
-
-            # Python only ever holds the per-entry fingerprints of the
-            # HKDF-derived per-tenant encryption keys, current key first — the
-            # exact values compared against the frame's key_fingerprint
-            # metadata on decrypt (never the master-key fingerprints).
-            self._keyring_fingerprints = [fp.hex() for fp in self._keyring.encryption_fingerprints(self.tenant_id)]
-
-            logger.info(
-                f"Encryption initialized for tenant '{self.tenant_id}' "
-                f"(key fingerprint: {self.encryption_key_fingerprint[:12]}..., "
-                f"decrypt-only previous keys: {len(previous_master_keys)}, "
-                f"hardware acceleration: {self.encryptor.hardware_acceleration_enabled()})"
-            )
         except Exception as e:
             raise EncryptionError(f"Failed to derive tenant keys: {e}") from e
+
+        # Deliberately OUTSIDE the try above. The binding raises ValueError
+        # ("Keyring fingerprint derivation failed: ...") here, which is a keyring
+        # CONFIG failure, and the handler above would relabel it EncryptionError —
+        # a SerializationError, which handle_decrypt_failure classifies as
+        # corruption and fails open. A keyring that cannot derive fingerprints
+        # would then present as silent misses plus entry-by-entry eviction: the
+        # exact LAB-241/LAB-683 failure class this PR exists to remove. Let the
+        # ValueError propagate (taxonomy note at the top of __init__).
+        #
+        # Python only ever holds the per-entry fingerprints of the HKDF-derived
+        # per-tenant encryption keys, current key first — the exact values
+        # compared against the frame's key_fingerprint metadata on decrypt
+        # (never the master-key fingerprints).
+        self._keyring_fingerprints = [fp.hex() for fp in self._keyring.encryption_fingerprints(self.tenant_id)]
+
+        logger.info(
+            f"Encryption initialized for tenant '{self.tenant_id}' "
+            f"(key fingerprint: {self.encryption_key_fingerprint[:12]}..., "
+            f"decrypt-only previous keys: {len(previous_master_keys)}, "
+            f"hardware acceleration: {self.encryptor.hardware_acceleration_enabled()})"
+        )
 
         # Setup-time drift guard: keyring entry 0 must be byte-identical to the
         # cached tenant-keys fingerprint written into frame metadata. The two
@@ -526,6 +540,12 @@ class EncryptionWrapper:
                 # per-read HKDF derivation.
                 decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
 
+        except KeyringConfigurationError:
+            # Same taxonomy split as the sequential path below: decrypt_at raises
+            # this for a keyring index out of range or a key-derivation failure,
+            # neither of which is tamper. Propagates as a ValueError (fail-loud)
+            # instead of being recorded as `auth_tamper`.
+            raise
         except Exception as e:
             # AES-GCM tag verification failed: tampered ciphertext, wrong key, or
             # AAD/cache_key mismatch. Tamper-class failure — distinct from the
@@ -609,6 +629,13 @@ class EncryptionWrapper:
                 decrypted_data = self.encryptor.decrypt_with_keys(bytes(data), aad, self.tenant_keys)
             else:
                 decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), self.tenant_id, aad)
+        except KeyringConfigurationError:
+            # Config / ciphertext-structure failure, NOT tamper. Propagates as a
+            # ValueError (KeyringConfigurationError subclasses it) so it takes
+            # the fail-loud path. Converting it below would record `auth_tamper`
+            # and page an operator for an attack that never happened — a bad
+            # tenant_id or a short ciphertext is a deploy bug, not an intrusion.
+            raise
         except Exception as e:
             # Exhaustion of all keyring entries is an AES-GCM authentication
             # failure — tamper-class, same taxonomy as the fingerprint path.

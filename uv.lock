@@ -306,7 +306,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pyarrow", marker = "extra == 'data'", specifier = ">=21.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pydantic-settings", specifier = ">=2.6.0" },
+    { name = "pydantic-settings", specifier = ">=2.7.0" },
     { name = "pymemcache", marker = "extra == 'memcached'", specifier = ">=4.0.0" },
     { name = "redis", extras = ["hiredis"], specifier = ">=4.0.0" },
     { name = "xxhash", specifier = ">=3.5.0" },

@@ -282,6 +282,7 @@ dependencies = [
  "pprof",
  "proptest",
  "pyo3",
+ "zeroize",
 ]
 
 [[package]]

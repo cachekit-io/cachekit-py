@@ -99,8 +99,44 @@ use cachekit_core::{
     encryption::key_derivation::{
         derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys,
     },
-    Keyring, ZeroKnowledgeEncryptor,
+    EncryptionError, Keyring, ZeroKnowledgeEncryptor,
 };
+#[cfg(feature = "encryption")]
+use zeroize::Zeroizing;
+
+#[cfg(feature = "encryption")]
+pyo3::create_exception!(
+    _rust_serializer,
+    KeyringConfigurationError,
+    PyValueError,
+    "A keyring configuration or ciphertext-structure failure on the decrypt path.\n\
+     \n\
+     Deliberately NOT an AES-GCM authentication failure. cachekit-core emits\n\
+     `AuthenticationFailed` for tag-verification failure and only that; every other\n\
+     decrypt-path error (bad tenant_id, keyring index out of range, short/garbled\n\
+     ciphertext, unsupported version) is an operator or caller fault. Collapsing the\n\
+     two would let a deploy mistake be recorded as `auth_tamper` and page an operator\n\
+     for an attack that never happened.\n\
+     \n\
+     Subclasses ValueError so it takes the established fail-loud path rather than the\n\
+     fail-open corruption path (see the taxonomy note in encryption_wrapper.py)."
+);
+
+/// Map a cachekit-core decrypt-path error onto the Python exception taxonomy.
+///
+/// `AuthenticationFailed` is the sole wrong-key / tamper signal — it keeps the
+/// plain `ValueError` the wrapper converts into `DecryptionAuthenticationError`.
+/// Everything else becomes `KeyringConfigurationError` so it cannot be recorded
+/// as `auth_tamper`.
+#[cfg(feature = "encryption")]
+fn decrypt_error_to_py(err: EncryptionError) -> PyErr {
+    match err {
+        EncryptionError::AuthenticationFailed => {
+            PyValueError::new_err(format!("Decryption failed: {}", err))
+        }
+        other => KeyringConfigurationError::new_err(format!("Keyring decrypt failed: {}", other)),
+    }
+}
 
 /// Python wrapper for ZeroKnowledgeEncryptor
 #[cfg(feature = "encryption")]
@@ -274,8 +310,21 @@ impl PyKeyring {
     /// truncated), rejects the current key re-appearing in the decrypt-only
     /// list (detectable subset of the forward-only invariant), and enforces
     /// minimum key length.
+    ///
+    /// Note the two different length floors: cachekit-core accepts any key of
+    /// **at least 16 bytes**, while cachekit-py requires **32 bytes** for both
+    /// the current and every previous key (enforced Python-side in
+    /// `encryption_wrapper.py`). The stricter Python floor is deliberate and is
+    /// the one operators are held to; the core minimum is stated here only so
+    /// the FFI contract is not mistaken for the product contract.
     #[new]
     pub fn new(current: &[u8], decrypt_only: Vec<Vec<u8>>) -> PyResult<Self> {
+        // `decrypt_only` is a fresh PyO3-side allocation of real key material.
+        // `Keyring::new` copies what it needs (and zeroizes its own copies on
+        // drop), so without this wrapper these vectors would be freed with the
+        // previous master keys still in the heap pages.
+        let decrypt_only: Vec<Zeroizing<Vec<u8>>> =
+            decrypt_only.into_iter().map(Zeroizing::new).collect();
         let refs: Vec<&[u8]> = decrypt_only.iter().map(|key| key.as_slice()).collect();
         let inner = Keyring::new(current, &refs)
             .map_err(|e| PyValueError::new_err(format!("Keyring configuration invalid: {}", e)))?;
@@ -317,7 +366,7 @@ impl PyKeyring {
     ) -> PyResult<Vec<u8>> {
         self.inner
             .decrypt_at(index, &encryptor.inner, ciphertext, tenant_id, aad)
-            .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
+            .map_err(decrypt_error_to_py)
     }
 
     /// Decrypt by sequential keyring attempts: current key first, then each
@@ -341,7 +390,7 @@ impl PyKeyring {
     ) -> PyResult<Vec<u8>> {
         self.inner
             .decrypt(&encryptor.inner, ciphertext, tenant_id, aad)
-            .map_err(|e| PyValueError::new_err(format!("Decryption failed: {}", e)))
+            .map_err(decrypt_error_to_py)
     }
 }
 
@@ -431,6 +480,10 @@ pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTenantKeys>()?;
     m.add_class::<PyOperationMetrics>()?;
     m.add_class::<PyKeyring>()?;
+    m.add(
+        "KeyringConfigurationError",
+        m.py().get_type::<KeyringConfigurationError>(),
+    )?;
     m.add_function(wrap_pyfunction!(derive_domain_key_py, m)?)?;
     m.add_function(wrap_pyfunction!(derive_tenant_keys_py, m)?)?;
     m.add_function(wrap_pyfunction!(key_fingerprint_py, m)?)?;

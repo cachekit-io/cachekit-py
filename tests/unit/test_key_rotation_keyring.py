@@ -337,8 +337,99 @@ class TestWrapperKeyringConfig:
             assert not isinstance(exc_info.value, SerializationError)
 
 
+class TestDecryptErrorTaxonomy:
+    """A misconfigured keyring must never be reported as tamper.
+
+    `handle_decrypt_failure` records `DecryptionAuthenticationError` as
+    `auth_tamper`, which the docs tell operators to alert on as a security
+    event. Collapsing config/structural failures into it pages someone for an
+    attack that never happened, and under fail_closed raises to the caller.
+    """
+
+    def test_binding_separates_auth_failure_from_config_failure(self):
+        from cachekit._rust_serializer import (
+            Keyring,
+            KeyringConfigurationError,
+            ZeroKnowledgeEncryptor,
+        )
+
+        keyring = Keyring(K1, [])
+        encryptor = ZeroKnowledgeEncryptor()
+
+        # Structural: shorter than nonce(12) + tag(16). Fails identically under
+        # every key, so it is terminal and is not a wrong-key signal.
+        with pytest.raises(KeyringConfigurationError):
+            keyring.decrypt(encryptor, b"short", TENANT, b"aad")
+
+        # Caller bug: single-entry keyring has no index 5.
+        with pytest.raises(KeyringConfigurationError):
+            keyring.decrypt_at(5, encryptor, b"\x00" * 64, TENANT, b"aad")
+
+        # Well-formed length, garbage content: a real AES-GCM tag failure. This
+        # one MUST stay the plain ValueError the wrapper converts to tamper.
+        with pytest.raises(ValueError) as exc_info:
+            keyring.decrypt_at(0, encryptor, b"\x00" * 64, TENANT, b"aad")
+        assert not isinstance(exc_info.value, KeyringConfigurationError)
+
+    def test_wrapper_does_not_relabel_config_error_as_tamper(self):
+        from cachekit._rust_serializer import KeyringConfigurationError
+
+        writer = EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
+        enc, meta = writer.serialize({"v": 42}, cache_key="key:a")
+
+        # K1 is a decrypt-only entry here, so the read takes the fingerprint
+        # path (decrypt_at) — the path CodeRabbit did not flag but which shares
+        # the binding, and therefore the defect.
+        reader = EncryptionWrapper(master_key=K2, tenant_id=TENANT, previous_master_keys=[K1])
+
+        class _ConfigFailKeyring:
+            def decrypt_at(self, *args: Any, **kwargs: Any) -> bytes:
+                raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
+
+            def decrypt(self, *args: Any, **kwargs: Any) -> bytes:
+                raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
+
+        reader._keyring = _ConfigFailKeyring()  # type: ignore[assignment]
+
+        with pytest.raises(KeyringConfigurationError) as exc_info:
+            reader.deserialize(enc, meta, cache_key="key:a")
+        assert not isinstance(exc_info.value, DecryptionAuthenticationError)
+
+    def test_fingerprint_derivation_failure_is_not_a_serialization_error(self, monkeypatch):
+        """Regression: the derivation call used to sit inside the try block whose
+        handler raises EncryptionError — a SerializationError, which the read
+        policy treats as corruption and fails open (silent miss + evict)."""
+        import cachekit.serializers.encryption_wrapper as ew
+        from cachekit.serializers.base import SerializationError
+
+        class _BadKeyring:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def encryption_fingerprints(self, tenant_id: str) -> list[bytes]:
+                raise ValueError("Keyring fingerprint derivation failed: simulated")
+
+        monkeypatch.setattr(ew, "Keyring", _BadKeyring)
+
+        with pytest.raises(ValueError) as exc_info:
+            ew.EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
+        assert not isinstance(exc_info.value, SerializationError)
+
+
 class TestEndToEndRotation:
     """AC round-trip through CacheSerializationHandler with env configuration."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_deployment_uuid(self, monkeypatch):
+        """Pin the tenant identity these tests derive their keys from.
+
+        Unset, `CacheSerializationHandler._get_deterministic_deployment_uuid`
+        falls through to `~/.cachekit/deployment_uuid` and CREATES that file.
+        Two problems: the suite writes to the developer's and the CI runner's
+        home directory, and the derived key then depends on filesystem state
+        outside the test. `TestInteropRotation._handler` already pins it.
+        """
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
 
     def _reset(self):
         from cachekit.config.singleton import reset_settings
