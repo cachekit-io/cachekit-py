@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.18.0](https://github.com/cachekit-io/cachekit-py/compare/v0.17.1...v0.18.0) (2026-08-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* L1CacheConfig.namespace_index is removed. The flag was read by nothing and toggled no behavior, but it shipped in v0.17.1 and docs/configuration.md documented a copy-pasteable L1CacheConfig(..., namespace_index=True) example — L1CacheConfig is a frozen dataclass, so constructors still passing it now raise TypeError instead of silently lying. L1Cache.invalidate_by_key(), .invalidate_by_namespace() and .invalidate_all() are removed with it; per-key L1Cache.invalidate() is unaffected. Same removal shape as L1CacheConfig.invalidation_enabled in v0.16.0 (LAB-520).
+
+### Features
+
+* **encryption:** keyring rotation — previous_master_keys + fingerprint selection (LAB-684) ([#261](https://github.com/cachekit-io/cachekit-py/issues/261)) ([e1b05ce](https://github.com/cachekit-io/cachekit-py/commit/e1b05ce1b5f30c63d86ab0cab6f4ddbc9af8cef6))
+
+
+### Bug Fixes
+
+* **l1:** delete dead backed-mode SWR machinery; docs stop claiming backed SWR (LAB-388) ([#256](https://github.com/cachekit-io/cachekit-py/issues/256)) ([878ad08](https://github.com/cachekit-io/cachekit-py/commit/878ad0860a340477257d2ac4f19f3f107f0789b4))
+
+
+### Code Refactoring
+
+* delete dead L1 namespace-index/bulk-invalidation machinery (LAB-1433) ([#258](https://github.com/cachekit-io/cachekit-py/issues/258)) ([2607faf](https://github.com/cachekit-io/cachekit-py/commit/2607fafd3d0dcd974e94788b7e5d46ee676701d4))
+
 ## [0.17.1](https://github.com/cachekit-io/cachekit-py/compare/v0.17.0...v0.17.1) (2026-07-29)
 
 
