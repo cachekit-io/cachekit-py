@@ -15,7 +15,12 @@ from .base import (
     SerializerProtocol,
     SuspiciousCacheEntryError,
 )
-from .encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
+from .encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+)
 from .standard_serializer import StandardSerializer
 
 if TYPE_CHECKING:
@@ -230,6 +235,7 @@ __all__ = [
     "ArrowSerializer",
     "AutoSerializer",
     "DecryptionAuthenticationError",
+    "KeyringConfigurationError",
     "EncryptionError",
     "EncryptionWrapper",
     "OrjsonSerializer",

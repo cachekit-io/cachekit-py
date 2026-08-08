@@ -9,11 +9,8 @@ pub use cachekit_core::{ByteStorage, OperationMetrics, StorageEnvelope};
 #[cfg(feature = "encryption")]
 pub use cachekit_core::{
     derive_domain_key,
-    encryption::{
-        key_derivation::{derive_tenant_keys, key_fingerprint, TenantKeys},
-        key_rotation::KeyRotationState,
-    },
-    EncryptionError, ZeroKnowledgeEncryptor,
+    encryption::key_derivation::{derive_tenant_keys, key_fingerprint, TenantKeys},
+    EncryptionError, Keyring, ZeroKnowledgeEncryptor,
 };
 
 // Python bindings (gated behind python feature)

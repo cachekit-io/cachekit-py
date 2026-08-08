@@ -17,14 +17,23 @@ Note:
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
     Field,
     SecretStr,
+    ValidationError,
+    field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_core import InitErrorDetails
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
+# at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
+# rejected at load — never silently truncated. Mirrors cachekit-core's
+# MAX_DECRYPT_ONLY_KEYS, which re-validates behind the FFI boundary.
+MAX_PREVIOUS_MASTER_KEYS = 3
 
 
 class CachekitConfig(BaseSettings):
@@ -87,6 +96,39 @@ class CachekitConfig(BaseSettings):
         True
         >>> "deadbeef" not in repr(secure)
         True
+
+        Key rotation: decrypt-only previous master keys (comma-separated hex via
+        env CACHEKIT_PREVIOUS_MASTER_KEYS) keep entries written under a retired
+        key readable — and are masked in repr like master_key:
+
+        >>> rotated = CachekitConfig(
+        ...     master_key=SecretStr("bb" * 32),
+        ...     previous_master_keys=[SecretStr("aa" * 32)],
+        ... )
+        >>> len(rotated.previous_master_keys)
+        1
+        >>> "aa" * 32 not in repr(rotated)
+        True
+
+        More than 3 previous keys is rejected at load — never truncated:
+
+        >>> CachekitConfig(
+        ...     previous_master_keys=[SecretStr(f"{i:02x}" * 32) for i in range(1, 5)],
+        ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        pydantic_core._pydantic_core.ValidationError: ... at most 3 decrypt-only keys ...
+
+        The current master_key re-appearing in previous_master_keys is rejected
+        (forward-only rotation — re-promotion risks AES-GCM nonce reuse):
+
+        >>> CachekitConfig(
+        ...     master_key=SecretStr("aa" * 32),
+        ...     previous_master_keys=[SecretStr("aa" * 32)],
+        ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        pydantic_core._pydantic_core.ValidationError: ... must not appear in previous_master_keys ...
     """
 
     model_config = SettingsConfigDict(
@@ -95,7 +137,48 @@ class CachekitConfig(BaseSettings):
         case_sensitive=False,
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
+        # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
+        # Without this, any validation failure on this model (bad TTL bounds,
+        # keyring misconfig, ...) embeds the full raw input — including
+        # env-sourced master_key and previous_master_keys hex — in startup
+        # logs. errors()/json() ignore this flag; __init__ below sanitizes
+        # those surfaces.
+        hide_input_in_errors=True,
     )
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Construct settings, sanitizing validation errors (CWE-532).
+
+        hide_input_in_errors only affects __str__; ValidationError.errors() and
+        .json() still snapshot the raw input — for env-sourced settings that is
+        the cleartext master_key and previous_master_keys hex, which error
+        trackers serialize. Rebuild the error with every input redacted and
+        drop the original from the exception chain (it holds the raw values).
+        The re-raised error is still a ValidationError (a ValueError), so
+        fail-loud propagation paths are unchanged.
+        """
+        sanitized_error: ValidationError | None = None
+        try:
+            super().__init__(**kwargs)
+        except ValidationError as e:
+            sanitized: list[InitErrorDetails] = []
+            for err in e.errors(include_url=False):
+                detail: InitErrorDetails = {
+                    "type": err["type"],
+                    "loc": err["loc"],
+                    "input": "[REDACTED]",
+                }
+                ctx = err.get("ctx")
+                if ctx:
+                    detail["ctx"] = ctx
+                sanitized.append(detail)
+            sanitized_error = ValidationError.from_exception_data(e.title, sanitized, hide_input=True)
+        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
+        # `raise ... from None` only suppresses display; the original (with raw
+        # inputs recoverable via .errors()) would still hang off __context__
+        # for anything that walks exception chains.
+        if sanitized_error is not None:
+            raise sanitized_error
 
     # Generic cache configuration (backend-agnostic)
     arrow_compression: Literal["zstd", "lz4", "none"] = Field(
@@ -222,6 +305,18 @@ class CachekitConfig(BaseSettings):
         default=None,
         description="Master encryption key (hex-encoded, minimum 32 bytes for AES-256)",
     )
+    previous_master_keys: Annotated[list[SecretStr], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Decrypt-only previous master keys for key rotation (env: "
+            "CACHEKIT_PREVIOUS_MASTER_KEYS, comma-separated hex). Entries written "
+            "under a listed key stay readable through the rotation window; writes "
+            "always use master_key. At most 3 keys — more is rejected at load, "
+            "never truncated. Per-key validation is identical to master_key "
+            "(hex-encoded, minimum 32 bytes). Spec: protocol spec/encryption.md "
+            "→ 'Key Rotation (Keyring)'."
+        ),
+    )
     encryption_fail_closed: bool = Field(
         default=False,
         description=(
@@ -237,6 +332,71 @@ class CachekitConfig(BaseSettings):
         default=None,
         description="Backend provider class path (e.g., 'cachekit.backends.redis.provider.RedisBackendProvider')",
     )
+
+    @field_validator("previous_master_keys", mode="before")
+    @classmethod
+    def _split_previous_master_keys(cls, value: Any) -> Any:
+        """Parse the env representation: comma-separated hex, blanks ignored.
+
+        NoDecode on the field disables pydantic-settings' default JSON parsing
+        for complex types, so the raw env string arrives here intact.
+        """
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def validate_previous_master_keys(self) -> CachekitConfig:
+        """Keyring configuration validation at load (spec: 'Key Rotation (Keyring)').
+
+        - At most MAX_PREVIOUS_MASTER_KEYS entries — rejected, never truncated.
+        - Per-key validation identical to master_key: hex-encoded, ≥32 bytes decoded.
+        - master_key must not re-appear in the decrypt-only list: a key that ever
+          occupied the encrypting slot is never re-promoted (the detectable subset
+          of the spec's forward-only invariant — re-promotion would resume a used,
+          unknowable AES-GCM nonce budget). Compared as decoded bytes, so hex case
+          differences cannot smuggle the current key past the check.
+
+        Raises:
+            ValueError: On any keyring configuration violation (pydantic wraps
+                this in a ValidationError at load).
+        """
+        if len(self.previous_master_keys) > MAX_PREVIOUS_MASTER_KEYS:
+            raise ValueError(
+                f"previous_master_keys accepts at most {MAX_PREVIOUS_MASTER_KEYS} decrypt-only keys, "
+                f"got {len(self.previous_master_keys)}. The keyring cap is never silently truncated; "
+                f"drop retired keys explicitly (protocol spec/encryption.md → 'Key Rotation (Keyring)')."
+            )
+
+        previous_key_bytes: list[bytes] = []
+        for position, key in enumerate(self.previous_master_keys):
+            try:
+                decoded = bytes.fromhex(key.get_secret_value())
+            except ValueError as e:
+                raise ValueError(f"previous_master_keys[{position}] is not valid hex: {e}") from e
+            if len(decoded) < 32:
+                raise ValueError(
+                    f"previous_master_keys[{position}] must be at least 32 bytes (256 bits) decoded, got {len(decoded)}"
+                )
+            previous_key_bytes.append(decoded)
+
+        if self.master_key is not None:
+            try:
+                master_key_bytes = bytes.fromhex(self.master_key.get_secret_value())
+            except ValueError:
+                # An invalid master_key is not this validator's concern — it fails
+                # loudly at EncryptionWrapper setup, exactly as before this field
+                # existed. Only the subset check is skipped.
+                master_key_bytes = None
+            if master_key_bytes is not None and master_key_bytes in previous_key_bytes:
+                raise ValueError(
+                    "master_key must not appear in previous_master_keys: this configuration is the "
+                    "detectable signature of re-promoting a retired key to the current (encrypting) "
+                    "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
+                    "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
+                )
+
+        return self
 
     @model_validator(mode="after")
     def validate_interdependent_fields(self) -> CachekitConfig:
@@ -279,6 +439,9 @@ class CachekitConfig(BaseSettings):
                 else:
                     attrs.append(f"{k}='[REDACTED]'")
                 continue
+            if k == "previous_master_keys":
+                attrs.append(f"{k}=[{len(self.previous_master_keys)} key(s) REDACTED]")
+                continue
             attrs.append(f"{k}={v!r}")
         return f"{self.__class__.__name__}({', '.join(attrs)})"
 
@@ -298,6 +461,9 @@ class CachekitConfig(BaseSettings):
                 else:
                     attrs.append(f"{k}=[REDACTED]")
                 continue
+            if k == "previous_master_keys":
+                attrs.append(f"{k}=[{len(self.previous_master_keys)} key(s) REDACTED]")
+                continue
             attrs.append(f"{k}={v}")
         return " ".join(attrs)
 
@@ -311,6 +477,8 @@ class CachekitConfig(BaseSettings):
         # Mask master_key if present
         if config_dict.get("master_key"):
             config_dict["master_key"] = "[REDACTED]"
+        if config_dict.get("previous_master_keys"):
+            config_dict["previous_master_keys"] = f"[{len(self.previous_master_keys)} key(s) REDACTED]"
         return config_dict
 
     @classmethod

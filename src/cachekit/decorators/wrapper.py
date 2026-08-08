@@ -36,7 +36,7 @@ from ..l1_cache import get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError, KeyringConfigurationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -1213,6 +1213,20 @@ def create_cache_wrapper(
                         reset_current_function_stats(token)
                         raise
                     # Fail open: fall through to L2
+                except KeyringConfigurationError:
+                    # LOCAL keyring config fault — not a poisoned L1 entry, so
+                    # neither the invalidate nor the "deserialization failed"
+                    # message below is true, and swallowing it here degrades a
+                    # misconfigured keyring into a silent L2 fall-through. Same
+                    # re-raise as the L2 sites in cache_handler.py.
+                    #
+                    # The sync wrapper has no outer `finally`, so a raising exit
+                    # must reset the stats token by hand — exactly as the
+                    # DecryptionAuthenticationError sibling above does. (The
+                    # async L1 guard needs no reset; its wrapper's outer
+                    # `finally` covers every exit path.)
+                    reset_current_function_stats(token)
+                    raise
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
                     logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
@@ -1558,6 +1572,9 @@ def create_cache_wrapper(
                         except DecryptionAuthenticationError:
                             raise
                         # Fail open: fall through to L2
+                    except KeyringConfigurationError:
+                        # LOCAL keyring config fault — see the sync L1 guard above.
+                        raise
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
                         logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")

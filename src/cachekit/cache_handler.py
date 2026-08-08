@@ -37,7 +37,10 @@ from cachekit.serializers.base import (
     SerializationMetadata,
     SuspiciousCacheEntryError,
 )
-from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+from cachekit.serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    KeyringConfigurationError,
+)
 from cachekit.serializers.wrapper import SerializationWrapper
 
 if TYPE_CHECKING:
@@ -1165,9 +1168,14 @@ class CacheSerializationHandler:
                 wrapper = self._get_cached_encryption_wrapper(tenant_id)
                 # Synthesize the metadata the wrapper needs: interop AAD is pinned
                 # to format=msgpack, compressed=False, NO original_type (exactly
-                # four AAD components). tenant/fingerprint come from config — an
-                # attacker cannot influence them because nothing is read from the
-                # stored bytes except the ciphertext itself.
+                # four AAD components). tenant comes from config — an attacker
+                # cannot influence it because nothing is read from the stored
+                # bytes except the ciphertext itself. Interop entries carry no
+                # per-entry key fingerprint, so keyring rotation uses sequential
+                # attempts (current key first, identical AAD per attempt) via
+                # deserialize_without_key_identity — the spec's "Decrypt —
+                # without per-entry key identity" row — instead of the
+                # fingerprint selection CK-frame entries get.
                 metadata = SerializationMetadata(
                     serialization_format=SerializationFormat.MSGPACK,
                     compressed=False,
@@ -1175,9 +1183,8 @@ class CacheSerializationHandler:
                     encrypted=True,
                     tenant_id=tenant_id,
                     encryption_algorithm="AES-256-GCM",
-                    key_fingerprint=wrapper.encryption_key_fingerprint,
                 )
-                return wrapper.deserialize(data, metadata, cache_key)
+                return wrapper.deserialize_without_key_identity(data, metadata, cache_key)
             return self._base_serializer.deserialize(data)
         except (ValueError, SerializationError):
             raise
@@ -1361,6 +1368,16 @@ class CacheOperationHandler:
                 # Return a tuple (True, value) to distinguish from "no cache entry"
                 return (True, deserialized)
             return None
+        except KeyringConfigurationError:
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
+            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # `except Exception` below, which would otherwise swallow it into
+            # `return None`: a silent fail-open miss with no metric and no
+            # eviction, even under fail_closed=True. That is precisely the
+            # LAB-241/LAB-683 failure class. Not routed through
+            # handle_decrypt_failure because there is no policy decision to make
+            # here — a misconfigured keyring always raises.
+            raise
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
@@ -1388,6 +1405,16 @@ class CacheOperationHandler:
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized), is_stale)
+        except KeyringConfigurationError:
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
+            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # `except Exception` below, which would otherwise swallow it into
+            # `return None`: a silent fail-open miss with no metric and no
+            # eviction, even under fail_closed=True. That is precisely the
+            # LAB-241/LAB-683 failure class. Not routed through
+            # handle_decrypt_failure because there is no policy decision to make
+            # here — a misconfigured keyring always raises.
+            raise
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
@@ -1414,6 +1441,16 @@ class CacheOperationHandler:
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized, cached_data), is_stale)
+        except KeyringConfigurationError:
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
+            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # `except Exception` below, which would otherwise swallow it into
+            # `return None`: a silent fail-open miss with no metric and no
+            # eviction, even under fail_closed=True. That is precisely the
+            # LAB-241/LAB-683 failure class. Not routed through
+            # handle_decrypt_failure because there is no policy decision to make
+            # here — a misconfigured keyring always raises.
+            raise
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
@@ -1451,6 +1488,16 @@ class CacheOperationHandler:
                 # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
                 return (True, deserialized, cached_data)
             return None
+        except KeyringConfigurationError:
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
+            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # `except Exception` below, which would otherwise swallow it into
+            # `return None`: a silent fail-open miss with no metric and no
+            # eviction, even under fail_closed=True. That is precisely the
+            # LAB-241/LAB-683 failure class. Not routed through
+            # handle_decrypt_failure because there is no policy decision to make
+            # here — a misconfigured keyring always raises.
+            raise
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None

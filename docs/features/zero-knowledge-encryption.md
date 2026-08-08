@@ -144,13 +144,17 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ### Key Rotation
 
 ```bash
-# Changed CACHEKIT_MASTER_KEY
+# Changed CACHEKIT_MASTER_KEY without retaining the old key
 # Old encrypted data in Redis → Can't decrypt
 # Error: "Decryption failed: authentication tag verification failed"
-# Solution: Clear cache before rotating keys
-redis-cli FLUSHDB  # Clear Redis
-export CACHEKIT_MASTER_KEY=new_key
-# Restart app → re-populates cache with new key
+# Solution: keep the retiring key decrypt-only for the rotation window
+export CACHEKIT_MASTER_KEY=new_key                 # encrypts + decrypts
+export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separated, max 3)
+# Restart app → old entries stay readable, new writes use the new key.
+# Old-key entries age out via TTL; drop the old key from the list once the
+# window (≥ longest TTL in use) has passed. Rotation is forward-only: never
+# re-promote a retired key to CACHEKIT_MASTER_KEY — a configuration where the
+# current key also appears in the previous-keys list is rejected at load.
 ```
 
 ### Enabling Encryption on an Existing (Plaintext) Cache
@@ -281,18 +285,40 @@ data_b = get_user_data(123)  # Same user_id, different tenant, different encrypt
 ```
 
 ### Key Rotation Pattern
-```python notest
-# Gradual key rotation (for zero-downtime)
-@cache.secure(ttl=3600, master_key="a" * 64, backend=None)
-def get_data(x):
-    return sensitive_data(x)  # illustrative - sensitive_data not defined
 
-# 1. Add new key to CACHEKIT_MASTER_KEY_ROTATION
-# 2. Old key still decrypts old data
-# 3. New data encrypted with new key
-# 4. Eventually old data expires from cache
-# 5. Remove old key from rotation list
+Zero-downtime rotation via the keyring: one **current** master key
+(`CACHEKIT_MASTER_KEY`, encrypts and decrypts) plus up to **3 decrypt-only**
+previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
+per-key requirements as the master key). Entries carry the fingerprint of
+their HKDF-derived per-tenant encryption key, so reads select the exact
+keyring entry that wrote them — never trial decryption.
+
+```bash
+# 1. Promote the new key; retain the old key decrypt-only
+export CACHEKIT_MASTER_KEY=<new-key-hex>
+export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
+# 2. Old entries still decrypt (selected by key fingerprint); new writes use the new key
+# 3. Old-key entries age out via TTL (or re-encrypt on the next write)
+# 4. After the window (≥ longest TTL in use), drop the old key
+unset CACHEKIT_PREVIOUS_MASTER_KEYS
 ```
+
+Rules enforced at config load — rejected, never truncated or silently fixed:
+
+- **Cap**: at most 3 decrypt-only keys.
+- **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, ≥32 bytes).
+- **Forward-only**: the current master key must not re-appear in the
+  decrypt-only list. A key that has ever encrypted is never re-promoted —
+  that would resume a used AES-GCM nonce budget and risk catastrophic nonce
+  reuse. Backing out a rotation means rotating *forward* to a fresh key.
+
+An empty decrypt-only list is legal — that is the hard cut-over used for
+compromise response (old entries become unreadable immediately).
+
+[Interop-mode](../../README.md) entries store no per-entry key fingerprint
+(no CK frame), so rotation there attempts keyring keys sequentially — current
+key first, identical AAD per attempt — instead of fingerprint selection. Same
+environment variables, same rotation window, same fail policy on exhaustion.
 
 ---
 
@@ -433,12 +459,13 @@ config = EncryptionConfig(enabled=True, master_key="a" * 64,
 ```
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
-> silent self-heal — rotating `CACHEKIT_MASTER_KEY` without clearing the cache makes
-> **every** pre-rotation entry raise `DecryptionAuthenticationError` on read (the
-> fingerprint mismatch refuses decryption, and the entry is retained, not evicted).
-> Follow the documented rotation procedure: flush (or namespace-version) the cache
-> *before* rotating. This is the deliberate cost of failing closed; the default
-> fail-open mode self-heals rotations as ordinary misses.
+> silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
+> in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise
+> `DecryptionAuthenticationError` on read (the fingerprint matches no keyring entry,
+> decryption is refused, and the entry is retained, not evicted). Follow the keyring
+> rotation pattern above: keep the retiring key decrypt-only for the full window.
+> This is the deliberate cost of failing closed; the default fail-open mode treats
+> keyless entries as ordinary misses.
 
 Note the boundary with the integrity checksum: the ByteStorage **xxHash3-64 checksum
 is corruption detection only** — it is not cryptographic and an attacker who can write
@@ -546,7 +573,11 @@ def get_data():
 A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 
 **Q: Key rotation failing**
-A: Ensure CACHEKIT_MASTER_KEY_ROTATION is formatted correctly.
+A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
+the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
+current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
+rotation pattern above: keep the retiring key decrypt-only for the full rotation
+window before dropping it.
 
 **Q: Performance degraded after enabling encryption**
 A: Expected 100-500μs overhead. Profile to confirm acceptable.

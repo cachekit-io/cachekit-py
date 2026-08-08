@@ -96,12 +96,54 @@ impl PyByteStorage {
 
 #[cfg(feature = "encryption")]
 use cachekit_core::{
-    encryption::{
-        key_derivation::{derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys},
-        key_rotation::KeyRotationState,
+    encryption::key_derivation::{
+        derive_domain_key, derive_tenant_keys, key_fingerprint, TenantKeys,
     },
-    ZeroKnowledgeEncryptor,
+    EncryptionError, Keyring, ZeroKnowledgeEncryptor,
 };
+#[cfg(feature = "encryption")]
+use zeroize::Zeroizing;
+
+#[cfg(feature = "encryption")]
+pyo3::create_exception!(
+    _rust_serializer,
+    KeyringConfigurationError,
+    PyValueError,
+    "A LOCAL keyring configuration fault on the decrypt path.\n\
+     \n\
+     Strictly limited to faults whose input is our own configuration: an invalid\n\
+     tenant_id reaching HKDF (`KeyDerivation`) and a keyring entry index that does\n\
+     not exist (`KeyringIndexOutOfRange`). These are deploy or caller bugs, and\n\
+     recording them as `auth_tamper` pages an operator for an attack that never\n\
+     happened.\n\
+     \n\
+     Everything whose input is the STORED CIPHERTEXT stays on the tamper path,\n\
+     including short/garbled ciphertext. An attacker with backend write access can\n\
+     truncate an entry, and `decrypt_aes_gcm` rejects it on length BEFORE the tag\n\
+     check — so classifying structural errors as config would let the attacker\n\
+     choose whether the tamper alarm fires. This mirrors cachekit-rs, which maps\n\
+     only KeyDerivation | KeyringIndexOutOfRange to its Config class.\n\
+     \n\
+     Subclasses ValueError. Note that cachekit-py's read path routes on\n\
+     SerializationError, so callers that must not fail open re-raise this\n\
+     explicitly (see cache_handler.py)."
+);
+
+/// Map a cachekit-core decrypt-path error onto the Python exception taxonomy.
+///
+/// The split is by INPUT PROVENANCE, not by "is it AuthenticationFailed":
+/// attacker-supplied ciphertext faults must stay tamper-class, our own config
+/// faults must not. Mirrors the cachekit-rs mapping exactly so the three SDKs
+/// tell operators the same story.
+#[cfg(feature = "encryption")]
+fn decrypt_error_to_py(err: EncryptionError) -> PyErr {
+    match err {
+        EncryptionError::KeyDerivation(_) | EncryptionError::KeyringIndexOutOfRange { .. } => {
+            KeyringConfigurationError::new_err(format!("Keyring decrypt failed: {}", err))
+        }
+        other => PyValueError::new_err(format!("Decryption failed: {}", other)),
+    }
+}
 
 /// Python wrapper for ZeroKnowledgeEncryptor
 #[cfg(feature = "encryption")]
@@ -253,56 +295,109 @@ impl PyOperationMetrics {
     }
 }
 
-/// Python wrapper for KeyRotationState
+/// Python wrapper for the master-key rotation Keyring (spec/encryption.md →
+/// "Key Rotation (Keyring)").
+///
+/// Master-key material enters once at construction (config ingestion) and
+/// never leaves: the only values crossing back to Python are per-tenant
+/// fingerprints (safe to expose) and decrypted plaintext. All keyring key
+/// material zeroizes on drop inside cachekit-core, decrypt-only entries
+/// included.
 #[cfg(feature = "encryption")]
-#[pyclass(name = "KeyRotationState")]
-pub struct PyKeyRotationState {
-    inner: KeyRotationState,
+#[pyclass(name = "Keyring")]
+pub struct PyKeyring {
+    inner: Keyring,
 }
 
 #[cfg(feature = "encryption")]
 #[pymethods]
-impl PyKeyRotationState {
+impl PyKeyring {
+    /// Build a keyring from the current master key plus decrypt-only previous
+    /// keys. cachekit-core validates the cap (max 3 decrypt-only keys, never
+    /// truncated), rejects the current key re-appearing in the decrypt-only
+    /// list (detectable subset of the forward-only invariant), and enforces
+    /// minimum key length.
+    ///
+    /// Note the two different length floors: cachekit-core accepts any key of
+    /// **at least 16 bytes**, while cachekit-py requires **32 bytes** for both
+    /// the current and every previous key (enforced Python-side in
+    /// `encryption_wrapper.py`). The stricter Python floor is deliberate and is
+    /// the one operators are held to; the core minimum is stated here only so
+    /// the FFI contract is not mistaken for the product contract.
     #[new]
-    pub fn new(key: &[u8]) -> PyResult<Self> {
-        if key.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "Key must be 32 bytes, got {}",
-                key.len()
-            )));
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(key);
-        Ok(Self {
-            inner: KeyRotationState::new(key_array),
-        })
+    pub fn new(current: &[u8], decrypt_only: Vec<Vec<u8>>) -> PyResult<Self> {
+        // `decrypt_only` is a fresh PyO3-side allocation of real key material.
+        // `Keyring::new` copies what it needs (and zeroizes its own copies on
+        // drop), so without this wrapper these vectors would be freed with the
+        // previous master keys still in the heap pages.
+        let decrypt_only: Vec<Zeroizing<Vec<u8>>> =
+            decrypt_only.into_iter().map(Zeroizing::new).collect();
+        let refs: Vec<&[u8]> = decrypt_only.iter().map(|key| key.as_slice()).collect();
+        let inner = Keyring::new(current, &refs)
+            .map_err(|e| PyValueError::new_err(format!("Keyring configuration invalid: {}", e)))?;
+        Ok(Self { inner })
     }
 
-    /// Start key rotation with new key
-    #[pyo3(name = "start_rotation")]
-    pub fn start_rotation(&mut self, new_key: &[u8]) -> PyResult<()> {
-        if new_key.len() != 32 {
-            return Err(PyValueError::new_err(format!(
-                "Key must be 32 bytes, got {}",
-                new_key.len()
-            )));
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(new_key);
-        self.inner.start_rotation(key_array);
-        Ok(())
+    /// Per-entry fingerprints of the HKDF-derived per-tenant **encryption**
+    /// key, in attempt order (current key first). This is the value
+    /// cachekit-py stores as CK frame metadata, so fingerprint-based keyring
+    /// selection compares like with like. Entry count is `len()` of this list.
+    #[pyo3(name = "encryption_fingerprints")]
+    pub fn encryption_fingerprints(&self, tenant_id: &str) -> PyResult<Vec<Vec<u8>>> {
+        let fingerprints = self.inner.encryption_fingerprints(tenant_id).map_err(|e| {
+            PyValueError::new_err(format!("Keyring fingerprint derivation failed: {}", e))
+        })?;
+        Ok(fingerprints.into_iter().map(|fp| fp.to_vec()).collect())
     }
 
-    /// Complete key rotation (remove old key)
-    #[pyo3(name = "complete_rotation")]
-    pub fn complete_rotation(&mut self) {
-        self.inner.complete_rotation();
+    /// Decrypt with the keyring entry at `index` (0 = current key).
+    ///
+    /// For fingerprint-based selection: a fingerprint match is binding — if
+    /// the matched entry fails AES-GCM authentication the failure is terminal,
+    /// and the caller must not retry other keyring entries. This method never
+    /// falls back across entries.
+    ///
+    /// The out-of-range and key-derivation errors below are caller bugs /
+    /// configuration errors, unreachable when `index` comes from a match
+    /// against this keyring's own `encryption_fingerprints` (the wrapper
+    /// derives fingerprints for the same `tenant_id` at construction, so a
+    /// bad tenant fails there, not here).
+    #[pyo3(name = "decrypt_at")]
+    pub fn decrypt_at(
+        &self,
+        index: usize,
+        encryptor: &PyZeroKnowledgeEncryptor,
+        ciphertext: &[u8],
+        tenant_id: &str,
+        aad: &[u8],
+    ) -> PyResult<Vec<u8>> {
+        self.inner
+            .decrypt_at(index, &encryptor.inner, ciphertext, tenant_id, aad)
+            .map_err(decrypt_error_to_py)
     }
 
-    /// Check if rotation is currently in progress
-    #[pyo3(name = "is_rotating")]
-    pub fn is_rotating(&self) -> bool {
-        self.inner.is_rotating()
+    /// Decrypt by sequential keyring attempts: current key first, then each
+    /// decrypt-only key in order, with the identical `aad` for every attempt.
+    ///
+    /// For entries WITHOUT per-entry key identity (interop mode — no CK frame,
+    /// so no stored key fingerprint), per the spec's "Decrypt — without
+    /// per-entry key identity" row. Only an AES-GCM authentication failure
+    /// advances to the next key; structural and configuration errors are
+    /// terminal. Exhaustion surfaces as a plain authentication failure — the
+    /// caller's existing fail-open/fail-closed policy applies, no new failure
+    /// mode. Entries WITH a stored fingerprint must use fingerprint selection
+    /// (`decrypt_at`), never this method.
+    #[pyo3(name = "decrypt")]
+    pub fn decrypt(
+        &self,
+        encryptor: &PyZeroKnowledgeEncryptor,
+        ciphertext: &[u8],
+        tenant_id: &str,
+        aad: &[u8],
+    ) -> PyResult<Vec<u8>> {
+        self.inner
+            .decrypt(&encryptor.inner, ciphertext, tenant_id, aad)
+            .map_err(decrypt_error_to_py)
     }
 }
 
@@ -391,7 +486,14 @@ pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZeroKnowledgeEncryptor>()?;
     m.add_class::<PyTenantKeys>()?;
     m.add_class::<PyOperationMetrics>()?;
-    m.add_class::<PyKeyRotationState>()?;
+    m.add_class::<PyKeyring>()?;
+    let keyring_config_error = m.py().get_type::<KeyringConfigurationError>();
+    // create_exception! sets __module__ to the bare "_rust_serializer"; without
+    // this the class cannot be pickled back to a parent process, so a
+    // ProcessPoolExecutor worker surfaces ModuleNotFoundError instead of the
+    // real failure.
+    keyring_config_error.setattr("__module__", "cachekit._rust_serializer")?;
+    m.add("KeyringConfigurationError", keyring_config_error)?;
     m.add_function(wrap_pyfunction!(derive_domain_key_py, m)?)?;
     m.add_function(wrap_pyfunction!(derive_tenant_keys_py, m)?)?;
     m.add_function(wrap_pyfunction!(key_fingerprint_py, m)?)?;

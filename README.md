@@ -290,6 +290,12 @@ def get_patient_data(hospital_id: int):
 > [!CAUTION]
 > When handling PII, medical, or financial data, always use `@cache.secure` to enforce encryption.
 
+**Zero-downtime key rotation**: promote a new `CACHEKIT_MASTER_KEY` and keep the
+retiring key readable via `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex,
+max 3 decrypt-only keys). Entries are selected by exact key fingerprint — never
+trial decryption — and old entries age out via TTL, no cache flush required. See
+[Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md#key-rotation-pattern).
+
 cachekit employs comprehensive security tooling:
 
 - **Supply Chain Security**: cargo-deny for license compliance + RustSec scanning
