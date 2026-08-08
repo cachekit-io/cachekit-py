@@ -48,15 +48,16 @@ def _is_linked(index_text: str, guide_name: str, prefix: str) -> bool:
 
     ``prefix`` is the surface's exact link prefix from INDEX_FILES, anchored
     to the link target's start — so an offsite same-suffix URL or a
-    wrong-prefix path that 404s on this surface does not count. Two link
-    forms exist:
+    wrong-prefix path that 404s on this surface does not count. A trailing
+    ``#fragment`` or ``?query`` still resolves to the same file, so it counts;
+    any other character after ``.md`` does not. Two link forms exist:
     - inline: ``[Name](docs/features/x.md)``
     - reference-style (README.md): ``[Name][label]`` + ``[label]: docs/features/x.md``.
       A definition whose label is never used renders as nothing, so the bare
       path substring is not enough — the label must appear as ``][label]``.
     """
     index_text = _strip_non_rendered(index_text)
-    target = re.escape(f"{prefix}{guide_name}")
+    target = re.escape(f"{prefix}{guide_name}") + r"(?:[#?][^)\s]*)?"
     if re.search(rf"\]\({target}\)", index_text):
         return True
     for m in re.finditer(rf"^\[([^\]]+)\]:\s*{target}\s*$", index_text, re.MULTILINE):
@@ -73,6 +74,15 @@ def test_is_linked_counts_rendered_links_only():
     assert not _is_linked("<!-- [X](docs/features/x.md) -->", "x.md", "docs/features/")
     # Definition never used renders as nothing.
     assert not _is_linked("[x-url]: docs/features/x.md", "x.md", "docs/features/")
+
+
+def test_is_linked_accepts_fragment_and_query_suffixes():
+    """#fragment / ?query target the same file — indexed; other suffixes are not it."""
+    assert _is_linked("[X](docs/features/x.md#anchor)", "x.md", "docs/features/")
+    assert _is_linked("[X](docs/features/x.md?plain=1)", "x.md", "docs/features/")
+    assert _is_linked("See [X][x].\n\n[x]: docs/features/x.md#anchor", "x.md", "docs/features/")
+    # A longer filename sharing the prefix is a different file.
+    assert not _is_linked("[X](docs/features/x.mdx)", "x.md", "docs/features/")
 
 
 def test_is_linked_requires_the_surfaces_own_prefix():
