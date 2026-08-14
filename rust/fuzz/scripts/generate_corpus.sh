@@ -8,11 +8,19 @@ set -euo pipefail
 # default. (A previous version wrote a category tree, corpus/byte_storage/…,
 # which no target ever read: LAB-1149.)
 #
-# Deterministic: same script version → byte-identical seeds, so re-runs
-# produce clean git diffs. Valid StorageEnvelope seeds are byte-exact against
-# cachekit-core 0.4.0's wire format (raw LZ4 block + xxHash3-64 big-endian
-# checksum + rmp-serde array-form msgpack), verified against the crate's
-# pinned empty-input checksum test vector.
+# Deterministic *within a pinned dependency set*: same script version + the
+# versions pinned below → byte-identical seeds, so re-runs produce clean git
+# diffs. The LZ4 block format fixes how a block is decoded, not how an encoder
+# searches for matches, so a different liblz4 build may emit different — still
+# valid — bytes for the same input. Regenerating under an unpinned lz4 can
+# therefore produce a legitimate-but-noisy diff; that is a diff to inspect, not
+# a corruption.
+#
+# Valid StorageEnvelope seeds are byte-exact against cachekit-core 0.4.0's wire
+# format (raw LZ4 block + xxHash3-64 big-endian checksum + rmp-serde array-form
+# msgpack), verified against the crate's pinned empty-input checksum test
+# vector. That framing is format-pinned and version-independent; only the
+# compressed payload bytes carry the encoder caveat above.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUZZ_DIR="$(dirname "$SCRIPT_DIR")"
@@ -29,12 +37,19 @@ fi
 # msgpack for envelope framing; lz4 + xxhash to mint envelopes whose checksum
 # actually verifies — those are the seeds that reach extract()'s deepest
 # branch (checksum check runs AFTER decompression; random bytes never get
-# there). With uv: uv run --no-project --with lz4 --with xxhash --with msgpack …
+# there).
+#
+# Versions pinned because the committed seeds are byte-exact artifacts: this
+# set reproduces corpus/ with a clean `git status` (verified 2026-08-14). Bump
+# them deliberately and re-inspect the resulting diff.
+PINNED_DEPS=("msgpack==1.2.1" "lz4==4.4.5" "xxhash==4.0.0")
+UV_RUN_HINT="uv run --no-project ${PINNED_DEPS[*]/#/--with } bash scripts/generate_corpus.sh"
+
 for mod in msgpack lz4.block xxhash; do
     if ! python3 -c "import $mod" 2>/dev/null; then
         echo "ERROR: Python module '$mod' is required"
-        echo "Install with: pip install msgpack lz4 xxhash"
-        echo "Or run via uv: uv run --no-project --with msgpack --with lz4 --with xxhash bash scripts/generate_corpus.sh"
+        echo "Install with: pip install ${PINNED_DEPS[*]}"
+        echo "Or run via uv: $UV_RUN_HINT"
         exit 1
     fi
 done
@@ -58,6 +73,18 @@ written = {}
 def seed(target: str, name: str, data: bytes) -> None:
     d = corpus / target
     d.mkdir(parents=True, exist_ok=True)
+    # First write to this target clears the seeds a previous script version
+    # owned. Without it, renaming or dropping a seed leaves the old file
+    # committed forever: validate_corpus.sh checks presence and size, not
+    # provenance, so the orphan is invisible — corpus drift in the opposite
+    # direction to LAB-1149.
+    #
+    # Scoped to `*.bin`, the naming this script owns. libFuzzer writes its
+    # discoveries as extensionless hex digests, so growth runs and committed
+    # crash reproducers survive regeneration untouched.
+    if target not in written:
+        for stale in d.glob("*.bin"):
+            stale.unlink()
     (d / name).write_bytes(data)
     written[target] = written.get(target, 0) + 1
 

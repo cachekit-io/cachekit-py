@@ -21,8 +21,10 @@ cargo install cargo-fuzz
 
 ### Basic Fuzzing Workflow
 
-Run from the repository root (`make fuzz-*` delegates to `rust/fuzz/Makefile`;
-equivalently `cd rust/fuzz && make quick|target|deep|coverage`):
+Run from the repository root. The root Makefile's `fuzz-quick`, `fuzz-target`,
+`fuzz-deep` and `fuzz-coverage` goals delegate to `rust/fuzz/Makefile`, whose
+own goals drop the prefix — `cd rust/fuzz && make quick` is equivalent to
+`make fuzz-quick` from the root:
 
 ```bash
 # Quick smoke test (60s per target, ~14min total)
@@ -115,13 +117,15 @@ corpus argument). The full contract — seed provenance, growth, regression
 seeds — lives in [`corpus/CORPUS_INFO.md`](corpus/CORPUS_INFO.md).
 
 ### Corpus Scripts
+
 ```bash
-# (Re)generate the deterministic per-target seed set
-# Needs python3 with msgpack, lz4, xxhash — or via uv:
-#   uv run --no-project --with msgpack --with lz4 --with xxhash bash scripts/generate_corpus.sh
+# (Re)generate the deterministic per-target seed set.
+# Needs python3 with msgpack, lz4, xxhash at the versions pinned in the
+# script — or via uv:
+#   uv run --no-project --with msgpack==1.2.1 --with lz4==4.4.5 --with xxhash==4.0.0 bash scripts/generate_corpus.sh
 cd rust/fuzz && ./scripts/generate_corpus.sh
 
-# Minimize corpus after growth runs (cargo fuzz cmin per target)
+# Minimize corpus after growth runs (cargo +nightly fuzz cmin per target)
 cd rust/fuzz && ./scripts/minimize_corpus.sh
 
 # Validate: every Cargo.toml target has seeds, total < 10MB
@@ -136,6 +140,7 @@ reproducer into `corpus/<target>/` so it is re-tested on every future run.
 ## CI Integration
 
 ### Smoke Tests (PR Validation)
+
 `.github/workflows/fuzz-smoke.yml` runs on every pull request:
 - 60 seconds per target (~14 minutes total)
 - Starts from the committed seeds in `corpus/<target>/` (cargo-fuzz's default
@@ -149,7 +154,9 @@ make fuzz-quick
 ```
 
 ### Deep Fuzzing (Production Validation)
+
 Run before releases or periodically:
+
 ```bash
 # 8 hours on one target (repo root)
 make fuzz-target TARGET=encryption_key_derivation TIME=28800

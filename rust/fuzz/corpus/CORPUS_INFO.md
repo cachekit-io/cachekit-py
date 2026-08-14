@@ -4,7 +4,7 @@ Committed seed inputs for the fuzz targets in this crate.
 
 ## Layout: one directory per target
 
-```
+```text
 corpus/<target-name>/
 ```
 
@@ -15,9 +15,11 @@ fuzzer: an earlier category tree (`byte_storage/`, `encryption/`, …) sat here
 for months without a single target ever reading it (LAB-1149).
 
 No file counts or sizes are recorded here — a written-down count is stale the
-day someone adds a seed. For live numbers run:
+day someone adds a seed. For live numbers run, from `rust/fuzz/` (one level up
+from this file — the scripts resolve their paths relative to that directory):
 
 ```bash
+cd rust/fuzz
 ./scripts/validate_corpus.sh
 ```
 
@@ -41,11 +43,16 @@ CI budget.
 
 ## Maintenance
 
+All three run from `rust/fuzz/`, not from this directory:
+
 ```bash
-# Regenerate the deterministic seed set (safe: same version → same bytes)
+cd rust/fuzz
+
+# Regenerate the deterministic seed set. Byte-identical under the dependency
+# versions pinned at the top of the script; see its header for the caveat.
 ./scripts/generate_corpus.sh
 
-# Deduplicate / shrink after growth runs
+# Deduplicate / shrink after growth runs (needs a nightly toolchain)
 ./scripts/minimize_corpus.sh
 
 # Check layout and size budget

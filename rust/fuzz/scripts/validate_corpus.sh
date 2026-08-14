@@ -32,13 +32,36 @@ fi
 
 # The grep/sed above silently drops a stanza whose `name` line drifts from the
 # exact expected format — and a dropped target would stop requiring seeds here
-# while still fuzzing (cold) in CI. Assert parity against fuzz_targets/*.rs,
-# the same cross-check fuzz-smoke.yml applies to `cargo fuzz list`.
-TARGET_COUNT=$(printf '%s\n' "$TARGETS" | wc -l | tr -d ' ')
-SRC_COUNT=$(find "$FUZZ_DIR/fuzz_targets" -maxdepth 1 -name '*.rs' | wc -l | tr -d ' ')
-if [ "$TARGET_COUNT" -ne "$SRC_COUNT" ]; then
-    echo "ERROR: derived $TARGET_COUNT targets from Cargo.toml but fuzz_targets/ holds $SRC_COUNT sources"
-    echo "       — a [[bin]] stanza is missing or its name line no longer matches 'name = \"…\"'"
+# while still fuzzing (cold) in CI. Catch that directly: every [[bin]] stanza
+# must yield exactly one name. Comparing counts against fuzz_targets/*.rs
+# cannot do this job — a shared helper module in that directory is not a target
+# and would fail the check spuriously, while a duplicated or misspelled name
+# keeps the count equal and slips through.
+STANZA_COUNT=$(grep -c '^\[\[bin\]\]' "$FUZZ_DIR/Cargo.toml" || true)
+NAME_COUNT=$(printf '%s\n' "$TARGETS" | grep -c . || true)
+if [ "$NAME_COUNT" -ne "$STANZA_COUNT" ]; then
+    echo "ERROR: Cargo.toml has $STANZA_COUNT [[bin]] stanzas but only $NAME_COUNT yielded a name"
+    echo "       — a stanza's name line no longer matches 'name = \"…\"' on the line directly after [[bin]]"
+    exit 1
+fi
+
+# Duplicate names would make one target silently shadow another's seed check.
+DUPES=$(printf '%s\n' "$TARGETS" | sort | uniq -d)
+if [ -n "$DUPES" ]; then
+    echo "ERROR: duplicate [[bin]] names in Cargo.toml:"
+    printf '       - %s\n' "$DUPES"
+    exit 1
+fi
+
+# Each declared target must have a source file. Extra .rs files are fine —
+# they are helper modules, not targets.
+missing_src=""
+for target in $TARGETS; do
+    [ -f "$FUZZ_DIR/fuzz_targets/$target.rs" ] || missing_src="$missing_src $target"
+done
+if [ -n "$missing_src" ]; then
+    echo "ERROR: [[bin]] targets with no fuzz_targets/<name>.rs source:"
+    for t in $missing_src; do echo "       - $t"; done
     exit 1
 fi
 

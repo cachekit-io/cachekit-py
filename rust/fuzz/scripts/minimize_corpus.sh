@@ -33,7 +33,13 @@ fi
 
 # Targets derived from the [[bin]] stanzas in Cargo.toml — the single source
 # of truth `cargo fuzz list`, the Makefile, and validate_corpus.sh all read.
-mapfile -t FUZZ_TARGETS < <(grep -A1 '^\[\[bin\]\]' "$FUZZ_DIR/Cargo.toml" | sed -n 's/^name = "\(.*\)"/\1/p')
+# Read loop rather than `mapfile`: mapfile is bash 4+, and macOS still ships
+# bash 3.2 as /bin/bash, where this script would otherwise die before doing any
+# work. validate_corpus.sh derives the same list without it.
+FUZZ_TARGETS=()
+while IFS= read -r _target; do
+    [ -n "$_target" ] && FUZZ_TARGETS+=("$_target")
+done < <(grep -A1 '^\[\[bin\]\]' "$FUZZ_DIR/Cargo.toml" | sed -n 's/^name = "\(.*\)"/\1/p')
 if [ "${#FUZZ_TARGETS[@]}" -eq 0 ]; then
     echo "ERROR: no [[bin]] targets found in $FUZZ_DIR/Cargo.toml"
     exit 1
@@ -50,9 +56,13 @@ minimize_target() {
         return
     fi
 
-    # Count files before minimization
-    local before_count=$(find "$corpus_path" -type f | wc -l | tr -d ' ')
-    local before_size=$(du -sh "$corpus_path" 2>/dev/null | cut -f1 || echo "0B")
+    # Count files before minimization. Declaration split from assignment:
+    # `local x=$(...)` returns the exit status of `local`, not of the command
+    # substitution, so a failing find/du would sail past `set -e` (SC2155).
+    local before_count before_size
+    before_count=$(find "$corpus_path" -type f | wc -l | tr -d ' ')
+    before_size=$({ du -sh "$corpus_path" 2>/dev/null | cut -f1; } || true)
+    before_size=${before_size:-0B}
 
     if [ "$before_count" -eq 0 ]; then
         echo "⏭️  Skipping $target (empty corpus)"
@@ -64,15 +74,22 @@ minimize_target() {
 
     # Run corpus minimization — a failed cmin fails the script (targets are
     # derived from Cargo.toml, so "target may not exist" is a real error).
+    # `+nightly` for the same reason every cargo-fuzz call in the Makefile
+    # carries it: cmin builds the instrumented target, which needs the -Z flags
+    # only nightly accepts. Bare `cargo fuzz cmin` fails outright when the
+    # default toolchain is stable.
     cd "$FUZZ_DIR"
-    if ! cargo fuzz cmin "$target"; then
+    if ! cargo +nightly fuzz cmin "$target"; then
         echo "❌ Minimization failed for $target"
+        echo "   cargo-fuzz needs a nightly toolchain: rustup toolchain install nightly"
         exit 1
     fi
 
-    local after_count=$(find "$corpus_path" -type f | wc -l | tr -d ' ')
-    local after_size=$(du -sh "$corpus_path" 2>/dev/null | cut -f1 || echo "0B")
-    local removed=$((before_count - after_count))
+    local after_count after_size removed
+    after_count=$(find "$corpus_path" -type f | wc -l | tr -d ' ')
+    after_size=$({ du -sh "$corpus_path" 2>/dev/null | cut -f1; } || true)
+    after_size=${after_size:-0B}
+    removed=$((before_count - after_count))
     echo "✅ Minimized $target: ${before_count} → ${after_count} files (-${removed}), ${before_size} → ${after_size}"
 }
 
