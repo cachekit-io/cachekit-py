@@ -17,23 +17,15 @@ if ! command -v cargo-fuzz &> /dev/null; then
     exit 1
 fi
 
-# All fuzz targets (must match Cargo.toml)
-FUZZ_TARGETS=(
-    "byte_storage_compress"
-    "byte_storage_decompress"
-    "encryption_roundtrip"
-    "byte_storage_corrupted_envelope"
-    "byte_storage_integer_overflow"
-    "byte_storage_checksum_collision"
-    "byte_storage_empty_data"
-    "byte_storage_format_injection"
-    "encryption_key_derivation"
-    "encryption_nonce_reuse"
-    "encryption_truncated_ciphertext"
-    "encryption_aad_injection"
-    "encryption_large_payload"
-    "integration_layered_security"
-)
+# Targets derived from the [[bin]] stanzas in Cargo.toml — the same source
+# `cargo fuzz list`, the Makefile, and validate_corpus.sh read. A
+# hand-maintained copy here is the drift hazard that buried the original
+# corpus (LAB-1149).
+mapfile -t FUZZ_TARGETS < <(grep -A1 '^\[\[bin\]\]' "$FUZZ_DIR/Cargo.toml" | sed -n 's/^name = "\(.*\)"/\1/p')
+if [ "${#FUZZ_TARGETS[@]}" -eq 0 ]; then
+    echo "ERROR: no [[bin]] targets found in $FUZZ_DIR/Cargo.toml"
+    exit 1
+fi
 
 # Function to minimize corpus for a single target
 minimize_target() {
@@ -58,18 +50,18 @@ minimize_target() {
     echo ""
     echo "Minimizing $target corpus (${before_count} files, ${before_size})..."
 
-    # Run corpus minimization
+    # Run corpus minimization — a failed cmin fails the script (targets are
+    # derived from Cargo.toml, so "target may not exist" is a real error).
     cd "$FUZZ_DIR"
-    if cargo fuzz cmin "$target" 2>&1 | grep -E "(Minimizing|files|testcases)"; then
-        # Count files after minimization
-        local after_count=$(find "$corpus_path" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
-        local after_size=$(du -sh "$corpus_path" 2>/dev/null | cut -f1 || echo "0B")
-
-        local removed=$((before_count - after_count))
-        echo "✅ Minimized $target: ${before_count} → ${after_count} files (-${removed}), ${before_size} → ${after_size}"
-    else
-        echo "⚠️  Minimization failed for $target (target may not exist yet)"
+    if ! cargo fuzz cmin "$target"; then
+        echo "❌ Minimization failed for $target"
+        exit 1
     fi
+
+    local after_count=$(find "$corpus_path" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
+    local after_size=$(du -sh "$corpus_path" 2>/dev/null | cut -f1 || echo "0B")
+    local removed=$((before_count - after_count))
+    echo "✅ Minimized $target: ${before_count} → ${after_count} files (-${removed}), ${before_size} → ${after_size}"
 }
 
 # Main execution

@@ -52,7 +52,7 @@ cd rust && make fuzz-coverage
 - Tests: u32::MAX, MAX_UNCOMPRESSED_SIZE ± 1, suspicious compression ratios
 
 **byte_storage_checksum_collision.rs**
-- Attack: Data corruption with manipulated Blake3 checksums
+- Attack: Data corruption with manipulated xxHash3-64 checksums
 - Validates: Integrity verification detects mismatches
 - Tests: Bit flips, truncation, zero checksums, partial corruption
 
@@ -103,41 +103,52 @@ cd rust && make fuzz-coverage
 ## Corpus Management
 
 ### Directory Structure
+
+One committed seed directory per fuzz target, named exactly after the
+`[[bin]]` stanza in `Cargo.toml`:
+
 ```
 rust/fuzz/corpus/
-├── byte_storage/
-│   ├── valid_envelopes/         # Valid MessagePack envelopes
-│   ├── corrupted_envelopes/     # Known corruption patterns
-│   ├── size_edge_cases/         # MIN, MAX, boundary sizes
-│   └── format_strings/          # Valid + malicious format identifiers
-├── encryption/
-│   ├── key_material/            # Valid 32-byte keys, edge cases
-│   ├── tenant_ids/              # Realistic + malicious tenant IDs
-│   ├── aad_patterns/            # Normal + injected AAD
-│   └── ciphertext_samples/      # Valid + truncated ciphertext
-└── integration/
-    └── layered_data/            # Compressed-then-encrypted samples
+├── CORPUS_INFO.md               # Layout contract and maintenance guide
+├── byte_storage_compress/       # Raw plaintext seeds
+├── byte_storage_decompress/     # Valid + corrupted StorageEnvelope bytes
+├── …                            # One directory per [[bin]] target
+└── integration_layered_security/
 ```
+
+This is the layout `cargo fuzz run <target>` loads by default — locally and
+in CI, with no corpus argument. Seeds are shaped per target's input format
+(e.g. `32-byte key ++ plaintext` for encryption targets); the envelope seeds
+are byte-exact against cachekit-core's wire format so their xxHash3-64
+checksums verify, reaching branches random inputs essentially never hit.
+See `corpus/CORPUS_INFO.md` for the full contract.
 
 ### Corpus Scripts
 ```bash
-# Generate initial corpus from test fixtures
+# (Re)generate the deterministic per-target seed set
+# Needs python3 with msgpack, lz4, xxhash — or via uv:
+#   uv run --no-project --with msgpack --with lz4 --with xxhash bash scripts/generate_corpus.sh
 cd rust/fuzz && ./scripts/generate_corpus.sh
 
-# Minimize corpus (deduplicate, reduce size)
+# Minimize corpus after growth runs (cargo fuzz cmin per target)
 cd rust/fuzz && ./scripts/minimize_corpus.sh
 
-# Validate corpus integrity (< 10MB total)
+# Validate: every Cargo.toml target has seeds, total < 10MB
 cd rust/fuzz && ./scripts/validate_corpus.sh
 ```
 
 **Corpus Size Limit**: Total corpus should remain under 10MB for fast CI smoke tests.
+
+**Regression seeds**: when a crash is found and fixed, commit the minimized
+reproducer into `corpus/<target>/` so it is re-tested on every future run.
 
 ## CI Integration
 
 ### Smoke Tests (PR Validation)
 `.github/workflows/fuzz-smoke.yml` runs on every pull request:
 - 60 seconds per target (~14 minutes total)
+- Starts from the committed seeds in `corpus/<target>/` (cargo-fuzz's default
+  corpus path) instead of cold-starting from random bytes
 - Catches fuzzing regressions before merge
 - Uploads crash artifacts on failure
 
@@ -261,11 +272,13 @@ All fuzz targets enforce fail-closed behavior:
 
 When adding new fuzz targets:
 1. Follow naming convention: `<module>_<attack_vector>.rs`
-2. Add target to `Cargo.toml` [[bin]] section
-3. Create corpus subdirectory with `.gitkeep`
+2. Add target to `Cargo.toml` [[bin]] section — the Makefile, CI, and corpus
+   scripts all derive the target list from these stanzas; there is no separate
+   list to update
+3. Add seeds for the target to `scripts/generate_corpus.sh` and run it —
+   `validate_corpus.sh` fails until `corpus/<target>/` has seeds
 4. Document attack vector in this README
-5. Add target to `FUZZ_TARGETS` list in `rust/Makefile`
-6. Verify with `make fuzz-target TARGET=your_new_target`
+5. Verify with `make fuzz-target TARGET=your_new_target`
 
 ## References
 

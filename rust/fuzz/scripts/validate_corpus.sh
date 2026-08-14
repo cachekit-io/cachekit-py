@@ -1,8 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Corpus validation script for cachekit fuzzing
-# Reports corpus health metrics and validates integrity
+# Corpus validation for cachekit fuzzing.
+#
+# The corpus contract: one seed directory per [[bin]] target in Cargo.toml,
+# at corpus/<target>/ — the layout `cargo fuzz run <target>` loads by default.
+# This script fails if any target has no seeds (the drift that buried the
+# original corpus: LAB-1149) or if the total exceeds the 10MB CI budget.
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "Usage: $0"
+    echo ""
+    echo "Validate the per-target fuzzing corpus."
+    echo ""
+    echo "Checks:"
+    echo "  - Every [[bin]] target in Cargo.toml has a non-empty corpus/<target>/"
+    echo "  - Total corpus size within the 10MB CI budget"
+    echo "  - Flags individual seeds over 1MB"
+    exit 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUZZ_DIR="$(dirname "$SCRIPT_DIR")"
@@ -12,136 +28,72 @@ echo "=== Cachekit Fuzzing Corpus Validator ==="
 echo "Corpus directory: $CORPUS_DIR"
 echo ""
 
-# Check if corpus directory exists
 if [ ! -d "$CORPUS_DIR" ]; then
     echo "ERROR: Corpus directory does not exist: $CORPUS_DIR"
     exit 1
 fi
 
-# Validate single category
-validate_category() {
-    local category=$1
-    local category_path="$CORPUS_DIR/$category"
-
-    if [ ! -d "$category_path" ]; then
-        echo "⏭️  Skipping $category (directory not found)"
-        return
-    fi
-
-    echo "📊 Category: $category"
-
-    # Count files (excluding .gitkeep)
-    local file_count=$(find "$category_path" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
-    local dir_count=$(find "$category_path" -mindepth 1 -type d | wc -l | tr -d ' ')
-
-    # Get size metrics
-    local total_size=$(du -sh "$category_path" 2>/dev/null | cut -f1 || echo "0B")
-    local total_bytes=$(du -sb "$category_path" 2>/dev/null | cut -f1 || echo "0")
-
-    # Calculate average file size
-    local avg_size="N/A"
-    if [ "$file_count" -gt 0 ] && [ "$total_bytes" -gt 0 ]; then
-        avg_size=$(awk "BEGIN {printf \"%.1f\", $total_bytes / $file_count / 1024}")
-        avg_size="${avg_size}KB"
-    fi
-
-    echo "  Files: $file_count"
-    echo "  Subdirectories: $dir_count"
-    echo "  Total size: $total_size"
-    echo "  Average file size: $avg_size"
-
-    # Validate file integrity
-    if [ "$file_count" -gt 0 ]; then
-        # Check for empty files
-        local empty_count=$(find "$category_path" -type f ! -name '.gitkeep' -size 0 | wc -l | tr -d ' ')
-        if [ "$empty_count" -gt 0 ]; then
-            echo "  ⚠️  Warning: $empty_count empty files found"
-        fi
-
-        # Check for very large files (>1MB)
-        local large_files=$(find "$category_path" -type f ! -name '.gitkeep' -size +1M)
-        if [ -n "$large_files" ]; then
-            local large_count=$(echo "$large_files" | wc -l | tr -d ' ')
-            echo "  ⚠️  Warning: $large_count files exceed 1MB"
-            echo "$large_files" | while read -r file; do
-                local size=$(du -sh "$file" | cut -f1)
-                echo "      - $(basename "$file"): $size"
-            done
-        fi
-
-        # List subdirectories with counts
-        if [ "$dir_count" -gt 0 ]; then
-            echo "  Subdirectory breakdown:"
-            find "$category_path" -mindepth 1 -maxdepth 1 -type d | while read -r subdir; do
-                local sub_count=$(find "$subdir" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
-                local sub_size=$(du -sh "$subdir" 2>/dev/null | cut -f1 || echo "0B")
-                echo "    - $(basename "$subdir"): $sub_count files, $sub_size"
-            done
-        fi
-    else
-        echo "  ℹ️  Empty corpus (run generate_corpus.sh to populate)"
-    fi
-
-    echo ""
-}
-
-# Main execution
-main() {
-    echo "=== Corpus Structure Validation ==="
-    echo ""
-
-    # Validate each major category
-    validate_category "byte_storage"
-    validate_category "encryption"
-    validate_category "integration"
-
-    # Overall corpus statistics
-    echo "=== Overall Corpus Statistics ==="
-    local total_files=$(find "$CORPUS_DIR" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
-    local total_size=$(du -sh "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0B")
-    local total_mb=$(du -sm "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0")
-
-    echo "Total files: $total_files"
-    echo "Total size: $total_size (${total_mb}MB)"
-    echo ""
-
-    # Validate against 10MB target
-    if [ "$total_mb" -gt 10 ]; then
-        echo "❌ VALIDATION FAILED: Corpus size (${total_mb}MB) exceeds 10MB target"
-        echo "   Run minimize_corpus.sh to reduce size"
-        exit 1
-    elif [ "$total_mb" -gt 8 ]; then
-        echo "⚠️  WARNING: Corpus size (${total_mb}MB) is approaching 10MB limit"
-        echo "   Consider running minimize_corpus.sh"
-    else
-        echo "✅ VALIDATION PASSED: Corpus size (${total_mb}MB) is within 10MB target"
-    fi
-
-    # Check for recommended minimum corpus size
-    if [ "$total_files" -lt 10 ]; then
-        echo "⚠️  WARNING: Corpus has only $total_files files (recommend 50+)"
-        echo "   Run generate_corpus.sh to populate corpus"
-    else
-        echo "✅ Corpus has sufficient samples ($total_files files)"
-    fi
-
-    echo ""
-    echo "=== Validation Complete ==="
-}
-
-# Usage information
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    echo "Usage: $0"
-    echo ""
-    echo "Validate fuzzing corpus integrity and report health metrics."
-    echo ""
-    echo "Checks:"
-    echo "  - Corpus size (must be < 10MB for CI)"
-    echo "  - File counts per category"
-    echo "  - Empty files"
-    echo "  - Oversized files (> 1MB)"
-    echo "  - Directory structure"
-    exit 0
+# Same target derivation as the Makefile and CI: the [[bin]] stanzas are the
+# single source of truth, so a new target automatically becomes a required
+# corpus directory here.
+TARGETS=$(grep -A1 '^\[\[bin\]\]' "$FUZZ_DIR/Cargo.toml" | sed -n 's/^name = "\(.*\)"/\1/p')
+if [ -z "$TARGETS" ]; then
+    echo "ERROR: no [[bin]] targets found in $FUZZ_DIR/Cargo.toml"
+    exit 1
 fi
 
-main "$@"
+failures=0
+
+for target in $TARGETS; do
+    target_dir="$CORPUS_DIR/$target"
+
+    if [ ! -d "$target_dir" ]; then
+        echo "❌ $target: corpus/$target/ missing"
+        echo "   Run scripts/generate_corpus.sh (and add seeds for new targets to it)"
+        failures=$((failures + 1))
+        continue
+    fi
+
+    file_count=$(find "$target_dir" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
+    if [ "$file_count" -eq 0 ]; then
+        echo "❌ $target: corpus/$target/ has no seeds"
+        failures=$((failures + 1))
+        continue
+    fi
+
+    size=$(du -sh "$target_dir" 2>/dev/null | cut -f1 || echo "0B")
+    echo "✅ $target: $file_count seeds, $size"
+
+    # Oversized seeds slow every fuzz run that loads them
+    large_files=$(find "$target_dir" -type f -size +1M)
+    if [ -n "$large_files" ]; then
+        echo "   ⚠️  seeds over 1MB:"
+        echo "$large_files" | while read -r f; do
+            echo "      - $(basename "$f"): $(du -sh "$f" | cut -f1)"
+        done
+    fi
+done
+
+echo ""
+echo "=== Overall Corpus Statistics ==="
+total_files=$(find "$CORPUS_DIR" -type f ! -name '.gitkeep' ! -name 'CORPUS_INFO.md' | wc -l | tr -d ' ')
+total_size=$(du -sh "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0B")
+total_mb=$(du -sm "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0")
+echo "Total seeds: $total_files"
+echo "Total size: $total_size (${total_mb}MB)"
+echo ""
+
+if [ "$total_mb" -gt 10 ]; then
+    echo "❌ VALIDATION FAILED: corpus size (${total_mb}MB) exceeds 10MB CI budget"
+    echo "   Run minimize_corpus.sh or drop oversized seeds"
+    failures=$((failures + 1))
+elif [ "$total_mb" -gt 8 ]; then
+    echo "⚠️  WARNING: corpus size (${total_mb}MB) is approaching the 10MB budget"
+fi
+
+if [ "$failures" -gt 0 ]; then
+    echo "❌ VALIDATION FAILED: $failures problem(s) above"
+    exit 1
+fi
+
+echo "✅ VALIDATION PASSED: every target has seeds, size within budget"
