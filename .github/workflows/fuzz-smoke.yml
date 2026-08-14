@@ -104,8 +104,12 @@ jobs:
         # files in fuzz_targets/. So a new fuzz_targets/*.rs added without its
         # stanza is never built and never run, and this job still goes green —
         # the same silent-dark mode the old hardcoded array caused. Nothing in
-        # cargo enforces that the two agree, so assert it here.
-        SRC_COUNT=$(find fuzz_targets -maxdepth 1 -name '*.rs' | wc -l)
+        # cargo enforces that the two agree, so assert it here. Count only
+        # fuzz_target! sources: validate_corpus.sh deliberately tolerates a
+        # shared helper module in fuzz_targets/, and an unfiltered count would
+        # fail this job on the same tree that just passed validation — 12
+        # minutes later, with a misleading "add the missing stanza" error.
+        SRC_COUNT=$(grep -l 'fuzz_target!' fuzz_targets/*.rs | wc -l)
         LIST_COUNT=$(printf '%s\n' "$TARGETS" | wc -l)
         if [ "$SRC_COUNT" -ne "$LIST_COUNT" ]; then
           echo "::error::fuzz_targets/ holds $SRC_COUNT sources but Cargo.toml declares $LIST_COUNT [[bin]] targets — add the missing [[bin]] stanza so the new target actually runs"

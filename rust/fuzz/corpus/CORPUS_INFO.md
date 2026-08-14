@@ -15,8 +15,9 @@ fuzzer: an earlier category tree (`byte_storage/`, `encryption/`, …) sat here
 for months without a single target ever reading it (LAB-1149).
 
 No file counts or sizes are recorded here — a written-down count is stale the
-day someone adds a seed. For live numbers run, from `rust/fuzz/` (one level up
-from this file — the scripts resolve their paths relative to that directory):
+day someone adds a seed. For live numbers run, from the repository root (the
+scripts resolve their paths relative to `rust/fuzz/`, one level up from this
+file):
 
 ```bash
 cd rust/fuzz
@@ -43,7 +44,8 @@ CI budget.
 
 ## Maintenance
 
-All three run from `rust/fuzz/`, not from this directory:
+All three below run from the repository root — the `cd rust/fuzz` is part of
+the recipe, since the scripts resolve their paths relative to `rust/fuzz/`:
 
 ```bash
 cd rust/fuzz

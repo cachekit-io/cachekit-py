@@ -122,7 +122,7 @@ seeds — lives in [`corpus/CORPUS_INFO.md`](corpus/CORPUS_INFO.md).
 # (Re)generate the deterministic per-target seed set.
 # Needs python3 with msgpack, lz4, xxhash at the versions pinned in the
 # script — or via uv:
-#   uv run --no-project --with msgpack==1.2.1 --with lz4==4.4.5 --with xxhash==4.0.0 bash scripts/generate_corpus.sh
+#   cd rust/fuzz && uv run --no-project --with msgpack==1.2.1 --with lz4==4.4.5 --with xxhash==4.0.0 bash scripts/generate_corpus.sh
 cd rust/fuzz && ./scripts/generate_corpus.sh
 
 # Minimize corpus after growth runs (cargo +nightly fuzz cmin per target)
