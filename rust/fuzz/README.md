@@ -17,24 +17,28 @@ This fuzzing suite provides **14 fuzz targets** covering:
 ```bash
 # Install cargo-fuzz (libfuzzer-based)
 cargo install cargo-fuzz
-
-# Install AFL++ (optional, for mutation-based fuzzing)
-cargo install cargo-afl
 ```
 
 ### Basic Fuzzing Workflow
+
+Run from the repository root (`make fuzz-*` delegates to `rust/fuzz/Makefile`;
+equivalently `cd rust/fuzz && make quick|target|deep|coverage`):
+
 ```bash
 # Quick smoke test (60s per target, ~14min total)
-cd rust && make fuzz-quick
+make fuzz-quick
 
 # Fuzz single target for development
-cd rust && make fuzz-target TARGET=byte_storage_corrupted_envelope
+make fuzz-target TARGET=byte_storage_corrupted_envelope
 
-# Deep fuzzing (8 hours per target, production validation)
-cd rust && make fuzz-deep TARGET=encryption_key_derivation
+# Deep fuzzing of one target (8 hours, production validation)
+make fuzz-target TARGET=encryption_key_derivation TIME=28800
+
+# Deep fuzzing of every target (8 hours each)
+make fuzz-deep
 
 # Generate coverage report
-cd rust && make fuzz-coverage
+make fuzz-coverage
 ```
 
 ## Fuzz Targets
@@ -89,7 +93,7 @@ cd rust && make fuzz-coverage
 - Tests: Null bytes, control characters, Unicode, 1-bit AAD modification
 
 **encryption_large_payload.rs**
-- Attack: Production-scale payloads (1MB, 10MB, 100MB)
+- Attack: Production-scale payloads (seeded up to 256KB; harness accepts up to 100MB)
 - Validates: Performance and correctness at scale
 - Tests: Large allocations, memory efficiency, no artificial 4KB limits
 
@@ -104,24 +108,11 @@ cd rust && make fuzz-coverage
 
 ### Directory Structure
 
-One committed seed directory per fuzz target, named exactly after the
-`[[bin]]` stanza in `Cargo.toml`:
-
-```
-rust/fuzz/corpus/
-├── CORPUS_INFO.md               # Layout contract and maintenance guide
-├── byte_storage_compress/       # Raw plaintext seeds
-├── byte_storage_decompress/     # Valid + corrupted StorageEnvelope bytes
-├── …                            # One directory per [[bin]] target
-└── integration_layered_security/
-```
-
-This is the layout `cargo fuzz run <target>` loads by default — locally and
-in CI, with no corpus argument. Seeds are shaped per target's input format
-(e.g. `32-byte key ++ plaintext` for encryption targets); the envelope seeds
-are byte-exact against cachekit-core's wire format so their xxHash3-64
-checksums verify, reaching branches random inputs essentially never hit.
-See `corpus/CORPUS_INFO.md` for the full contract.
+One committed seed directory per fuzz target — `corpus/<target>/`, named
+exactly after the `[[bin]]` stanza in `Cargo.toml`, because that is the
+layout `cargo fuzz run <target>` loads by default (locally and in CI, no
+corpus argument). The full contract — seed provenance, growth, regression
+seeds — lives in [`corpus/CORPUS_INFO.md`](corpus/CORPUS_INFO.md).
 
 ### Corpus Scripts
 ```bash
@@ -153,15 +144,15 @@ reproducer into `corpus/<target>/` so it is re-tested on every future run.
 - Uploads crash artifacts on failure
 
 ```bash
-# Simulate CI smoke tests locally
-cd rust && make fuzz-quick
+# Simulate CI smoke tests locally (repo root)
+make fuzz-quick
 ```
 
 ### Deep Fuzzing (Production Validation)
 Run before releases or periodically:
 ```bash
-# 8 hours per target (production-grade validation)
-cd rust && make fuzz-deep TARGET=encryption_key_derivation
+# 8 hours on one target (repo root)
+make fuzz-target TARGET=encryption_key_derivation TIME=28800
 ```
 
 ## Crash Triage
@@ -189,23 +180,11 @@ cargo fuzz run byte_storage_corrupted_envelope artifacts/crash-xyz
 cargo fuzz cmin byte_storage_corrupted_envelope
 ```
 
-## AFL++ Fuzzing (Alternative Engine)
-
-AFL++ provides mutation-based fuzzing complementary to libfuzzer's coverage-guided approach:
-
-```bash
-# Build AFL++ target
-cd rust && cargo afl build --features afl
-
-# Run AFL++ fuzzer
-cd rust && make fuzz-afl TARGET=byte_storage_corrupted_envelope
-```
-
 ## Coverage Reporting
 
 ```bash
-# Generate LLVM coverage report
-cd rust && make fuzz-coverage
+# Generate LLVM coverage report (repo root)
+make fuzz-coverage
 
 # View HTML report
 open rust/fuzz/coverage/html/index.html
@@ -262,12 +241,6 @@ All fuzz targets enforce fail-closed behavior:
 - **Panic** = Test failure (fuzzer reports bug)
 - **Undefined behavior** = Instant failure (sanitizers catch)
 
-### Multi-Engine Strategy
-
-- **Libfuzzer** (default): Coverage-guided, fast iteration, LLVM sanitizers
-- **AFL++**: Mutation-based, finds different bug classes, mature tooling
-- Both engines share corpus for cross-pollination
-
 ## Contributing
 
 When adding new fuzz targets:
@@ -284,5 +257,4 @@ When adding new fuzz targets:
 
 - [Rust Fuzz Book](https://rust-fuzz.github.io/book/)
 - [libfuzzer documentation](https://llvm.org/docs/LibFuzzer.html)
-- [AFL++ documentation](https://aflplus.plus/)
 - [cachekit security architecture](../../SECURITY.md)

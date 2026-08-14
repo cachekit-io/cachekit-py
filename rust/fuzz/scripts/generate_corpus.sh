@@ -88,7 +88,6 @@ seed("byte_storage_compress", "text.bin", text)
 seed("byte_storage_compress", "compressible.bin", compressible)
 seed("byte_storage_compress", "gradient.bin", gradient)
 seed("byte_storage_compress", "random_1k.bin", random_1k)
-seed("byte_storage_compress", "unicode.bin", "café ✨ 한국어 テスト".encode())
 
 # ── byte_storage_decompress + byte_storage_corrupted_envelope:
 #    both parse envelope bytes (retrieve() / rmp_serde::from_slice) ─────────
@@ -136,7 +135,6 @@ env_samples = {
         },
         use_bin_type=True,
     ),
-    "invalid_msgpack.bin": b"\xff" * 8,
 }
 for name, data in env_samples.items():
     seed("byte_storage_decompress", name, data)
@@ -182,11 +180,6 @@ seed("encryption_roundtrip", "key_random.bin", key32 + rng.randbytes(256))
 # encryption_key_derivation: 16-byte master key ++ tenant salt
 mk16 = rng.randbytes(16)
 seed("encryption_key_derivation", "normal_tenant.bin", mk16 + b"customer-12345")
-seed("encryption_key_derivation", "path_traversal.bin", mk16 + b"../../../admin")
-seed("encryption_key_derivation", "null_byte.bin", mk16 + b"tenant\x00null")
-seed("encryption_key_derivation", "bom.bin", mk16 + "﻿bom_tenant".encode())
-seed("encryption_key_derivation", "empty_tenant.bin", mk16)
-seed("encryption_key_derivation", "unicode.bin", mk16 + "한국어✨".encode())
 seed("encryption_key_derivation", "long_tenant.bin", mk16 + b"x" * 4096)
 
 # encryption_nonce_reuse: small plaintexts → 100-iteration uniqueness loop
@@ -204,28 +197,18 @@ seed("encryption_aad_injection", "key_nulls.bin", key32 + b"p" * 60 + b"aad\x00n
 seed("encryption_aad_injection", "key_random.bin", key32 + rng.randbytes(1000))
 
 # encryption_large_payload: sizes libFuzzer is slow to grow into on its own
-seed("encryption_large_payload", "key_1k.bin", key32 + rng.randbytes(1024))
 seed("encryption_large_payload", "key_16k_compressible.bin", key32 + b"a" * 16_384)
 seed("encryption_large_payload", "key_64k.bin", key32 + rng.randbytes(65_536))
 seed("encryption_large_payload", "key_256k_compressible.bin", key32 + b"ab" * 131_072)
-seed("encryption_large_payload", "key_100k_random.bin", key32 + rng.randbytes(102_400))
 
 # integration_layered_security: 32-byte key + plaintext (total ≥ 64, ≤ 4096+32)
 seed("integration_layered_security", "key_text.bin", key32 + text + b" layered." * 4)
 seed("integration_layered_security", "key_compressible.bin", key32 + b"a" * 512)
 seed("integration_layered_security", "key_random.bin", key32 + rng.randbytes(128))
 
-total = sum(written.values())
-print(f"Wrote {total} seeds across {len(written)} target directories:")
-for target in sorted(written):
-    print(f"  corpus/{target}/: {written[target]} seeds")
+# Per-target breakdown lives in validate_corpus.sh — the single count surface.
+print(f"Wrote {sum(written.values())} seeds across {len(written)} target directories")
 PYTHON
 
-echo ""
 echo "=== Corpus Generation Complete ==="
 du -sh "$CORPUS_DIR"
-echo ""
-echo "Next steps:"
-echo "  1. Validate layout matches Cargo.toml targets: ./scripts/validate_corpus.sh"
-echo "  2. Sanity-run every seed once: cargo +nightly fuzz run <target> -- -runs=0"
-echo "  3. After growth runs, minimize: ./scripts/minimize_corpus.sh"

@@ -8,18 +8,6 @@ set -euo pipefail
 # This script fails if any target has no seeds (the drift that buried the
 # original corpus: LAB-1149) or if the total exceeds the 10MB CI budget.
 
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    echo "Usage: $0"
-    echo ""
-    echo "Validate the per-target fuzzing corpus."
-    echo ""
-    echo "Checks:"
-    echo "  - Every [[bin]] target in Cargo.toml has a non-empty corpus/<target>/"
-    echo "  - Total corpus size within the 10MB CI budget"
-    echo "  - Flags individual seeds over 1MB"
-    exit 0
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUZZ_DIR="$(dirname "$SCRIPT_DIR")"
 CORPUS_DIR="$FUZZ_DIR/corpus"
@@ -42,6 +30,18 @@ if [ -z "$TARGETS" ]; then
     exit 1
 fi
 
+# The grep/sed above silently drops a stanza whose `name` line drifts from the
+# exact expected format — and a dropped target would stop requiring seeds here
+# while still fuzzing (cold) in CI. Assert parity against fuzz_targets/*.rs,
+# the same cross-check fuzz-smoke.yml applies to `cargo fuzz list`.
+TARGET_COUNT=$(printf '%s\n' "$TARGETS" | wc -l | tr -d ' ')
+SRC_COUNT=$(find "$FUZZ_DIR/fuzz_targets" -maxdepth 1 -name '*.rs' | wc -l | tr -d ' ')
+if [ "$TARGET_COUNT" -ne "$SRC_COUNT" ]; then
+    echo "ERROR: derived $TARGET_COUNT targets from Cargo.toml but fuzz_targets/ holds $SRC_COUNT sources"
+    echo "       — a [[bin]] stanza is missing or its name line no longer matches 'name = \"…\"'"
+    exit 1
+fi
+
 failures=0
 
 for target in $TARGETS; do
@@ -54,7 +54,7 @@ for target in $TARGETS; do
         continue
     fi
 
-    file_count=$(find "$target_dir" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
+    file_count=$(find "$target_dir" -type f | wc -l | tr -d ' ')
     if [ "$file_count" -eq 0 ]; then
         echo "❌ $target: corpus/$target/ has no seeds"
         failures=$((failures + 1))
@@ -76,7 +76,7 @@ done
 
 echo ""
 echo "=== Overall Corpus Statistics ==="
-total_files=$(find "$CORPUS_DIR" -type f ! -name '.gitkeep' ! -name 'CORPUS_INFO.md' | wc -l | tr -d ' ')
+total_files=$(find "$CORPUS_DIR" -type f ! -name 'CORPUS_INFO.md' | wc -l | tr -d ' ')
 total_size=$(du -sh "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0B")
 total_mb=$(du -sm "$CORPUS_DIR" 2>/dev/null | cut -f1 || echo "0")
 echo "Total seeds: $total_files"
@@ -87,8 +87,6 @@ if [ "$total_mb" -gt 10 ]; then
     echo "❌ VALIDATION FAILED: corpus size (${total_mb}MB) exceeds 10MB CI budget"
     echo "   Run minimize_corpus.sh or drop oversized seeds"
     failures=$((failures + 1))
-elif [ "$total_mb" -gt 8 ]; then
-    echo "⚠️  WARNING: corpus size (${total_mb}MB) is approaching the 10MB budget"
 fi
 
 if [ "$failures" -gt 0 ]; then

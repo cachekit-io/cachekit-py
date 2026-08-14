@@ -68,6 +68,7 @@ quick: ## Run quick fuzzing smoke test (60s per target, ~14min total)
 	@echo "$(YELLOW)Logging to $(LOG_FUZZ_DIR)/quick_$(TIMESTAMP).log$(RESET)"
 	$(call require_binary,cargo,Install Rust: https://rustup.rs)
 	$(call warn_if_missing,cargo-fuzz,Install: cargo install cargo-fuzz)
+	@if [ -z "$(strip $(FUZZ_TARGETS))" ]; then echo "$(YELLOW)❌ no [[bin]] targets derived from Cargo.toml — a zero-target loop would report green having fuzzed nothing$(RESET)"; exit 1; fi
 	@{ \
 		for target in $(FUZZ_TARGETS); do \
 			echo "$(YELLOW)Fuzzing $$target (60s)...$(RESET)"; \
@@ -89,6 +90,7 @@ deep: ## Run deep fuzzing (8 hours per target, production-grade)
 	@echo "$(YELLOW)Logging to $(LOG_FUZZ_DIR)/deep_$(TIMESTAMP).log$(RESET)"
 	$(call require_binary,cargo,Install Rust: https://rustup.rs)
 	$(call warn_if_missing,cargo-fuzz,Install: cargo install cargo-fuzz)
+	@if [ -z "$(strip $(FUZZ_TARGETS))" ]; then echo "$(YELLOW)❌ no [[bin]] targets derived from Cargo.toml — a zero-target loop would report green having fuzzed nothing$(RESET)"; exit 1; fi
 	@{ \
 		for target in $(FUZZ_TARGETS); do \
 			echo "$(YELLOW)Deep fuzzing $$target (8 hours)...$(RESET)"; \

@@ -59,6 +59,16 @@ jobs:
         # it fails loudly on drift, and warms the empty CARGO_HOME besides.
         cargo +nightly-2026-04-27 fetch --locked
 
+    - name: Validate corpus layout
+      run: |
+        cd rust/fuzz
+        # Every [[bin]] target must have committed seeds in corpus/<target>/ —
+        # a target without them fuzzes cold from random bytes and the run is
+        # far shallower than its green badge suggests (LAB-1149). Pure bash,
+        # fails loudly on a missing/empty seed directory or a blown 10MB
+        # budget. Without this step the seed requirement is manual-only.
+        bash scripts/validate_corpus.sh
+
     - name: Build all fuzz targets
       run: |
         cd rust/fuzz
