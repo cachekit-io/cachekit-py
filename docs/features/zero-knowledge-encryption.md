@@ -47,9 +47,17 @@ happens when it isn't, and which backend you actually reach.
 | Encryption | Forced ON in code (`EncryptionConfig.enabled=True`) | Auto-detected from the env var (tri-state `enabled=None`) |
 | **No master key present** | **Fails closed** — raises `ValueError` at decoration time | **Fails open** — silently caches plaintext to the SaaS |
 | Integrity checking | Forced `True`, cannot be overridden | On by preset default |
-| Backend | Env auto-detect — **not pinned to the SaaS**, see footgun below; pass `backend=` explicitly | `CachekitIOBackend` guaranteed (preset creates its own, ignores `backend=`; requires `CACHEKIT_API_KEY` at decoration time) |
+| Backend | Env auto-detect — **not pinned to the SaaS**, see footgun below; pass `backend=` explicitly | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
 | Tenant mode | `single_tenant_mode` handled automatically | Handled automatically (auto-detect path) |
 | Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`) |
+
+**`@cache.io()` does not take a `backend=` argument.** The preset always
+constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
+decorator is silently discarded, and `backend=None` flips the wrapper into
+L1-only mode (in-process memory — the SaaS is never contacted, despite the
+`.io` name). Calling `DecoratorConfig.io(backend=...)` directly raises
+`TypeError` (duplicate keyword argument). To target any other backend, use a
+different preset with an explicit `backend=`.
 
 **Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
 explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
