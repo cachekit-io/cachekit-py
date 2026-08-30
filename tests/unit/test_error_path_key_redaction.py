@@ -17,8 +17,10 @@ import pytest
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheInvalidator, StandardCacheHandler
-from cachekit.hash_utils import redact_cache_key
+from cachekit.decorators.orchestrator import _redact_key_for_log
+from cachekit.hash_utils import SENTINEL_KEYS, redact_cache_key
 from cachekit.key_generator import CacheKeyGenerator
+from cachekit.logging import UltraOptimizedStructuredLogger
 
 TENANT_KEY = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
 
@@ -180,3 +182,46 @@ class TestKeyCarryingBackendErrorRedaction:
             assert await handler.get_async(TENANT_KEY) is None
 
         _assert_redacted(caplog, TENANT_KEY)
+
+
+class TestStructuredLoggerCacheOperationRedaction:
+    """``UltraOptimizedStructuredLogger.cache_operation`` is a direct sink.
+
+    ``cache_hit``/``cache_miss``/``cache_stored`` all funnel through it, so this
+    one method is the whole surface. It must apply the *same* pass-through policy
+    as the orchestrator sink: a value that arrives already redacted, or is a known
+    sentinel, is emitted verbatim. Hashing it a second time would mint a different
+    digest for the same key and break correlation between the two sinks
+    (CodeRabbit PR #264).
+    """
+
+    def _emit(self, caplog: pytest.LogCaptureFixture, cache_key: str) -> str:
+        logger = UltraOptimizedStructuredLogger("test.cache_operation")
+
+        with caplog.at_level(logging.INFO, logger="test.cache_operation"):
+            logger.cache_operation("get", cache_key, hit=True)
+
+        records = [r for r in caplog.records if hasattr(r, "structured")]
+        assert records, "cache_operation emitted no structured record"
+        return records[-1].structured["cache_key"]
+
+    def test_raw_key_is_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        assert self._emit(caplog, TENANT_KEY) == redact_cache_key(TENANT_KEY)
+
+    def test_already_redacted_key_passes_through(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The digest must survive a second hop unchanged — this is the correlation contract."""
+        pre_redacted = redact_cache_key(TENANT_KEY)
+
+        assert self._emit(caplog, pre_redacted) == pre_redacted
+
+    @pytest.mark.parametrize("sentinel", sorted(SENTINEL_KEYS))
+    def test_sentinels_stay_readable(self, sentinel: str, caplog: pytest.LogCaptureFixture) -> None:
+        assert self._emit(caplog, sentinel) == sentinel
+
+    def test_digest_matches_the_orchestrator_sink(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Both sinks must render one key as one digest, or logs cannot be joined."""
+        assert self._emit(caplog, TENANT_KEY) == _redact_key_for_log(TENANT_KEY)
+
+    def test_falsy_key_emits_empty_string(self, caplog: pytest.LogCaptureFixture) -> None:
+        """No key means nothing to redact — must not become a digest of ``""``."""
+        assert self._emit(caplog, "") == ""

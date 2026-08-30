@@ -1,10 +1,9 @@
 import contextvars
 import logging
-import re
 import uuid
 from typing import Any, Optional
 
-from ..cache_handler import redact_cache_key
+from ..hash_utils import redact_key_for_log
 from ..monitoring.correlation_tracking import CorrelationTracker
 from ..monitoring.pool_monitor import OptimizedPoolMonitor
 
@@ -21,30 +20,10 @@ logger = logging.getLogger(__name__)
 _operation_context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar("operation_context", default=None)
 
 
-# Only values that provably carry no caller data pass through unredacted: the
-# known sentinels, and the exact output format of redact_cache_key(). A broad
-# "<...>" match would let a raw key like "<tenant-42-alice-secret>" through.
-_SENTINEL_KEYS = frozenset({"unknown", "<generation_failed>"})
-_REDACTED_KEY_RE = re.compile(r"<redacted:[0-9a-f]{16}>\Z")
-
-
-def _redact_key_for_log(cache_key: object) -> str:
-    """Redact a cache key for logging unless it is a known sentinel or already redacted.
-
-    Cache keys embed caller-supplied tenant/user identifiers and must never reach
-    logs verbatim (CWE-532, issue #163). Real keys are canonical ``ns:...`` strings;
-    sentinels (``unknown``, ``<generation_failed>``) and redact_cache_key() output
-    (``<redacted:{16 hex}>``) carry no caller data and stay readable as-is.
-
-    Matching the strict generated format keeps redaction idempotent —
-    handle_cache_error's redacted output flows through log_cache_operation's
-    redaction a second time — without opening a pass-through for arbitrary
-    angle-bracketed strings.
-    """
-    key_str = str(cache_key)
-    if key_str in _SENTINEL_KEYS or _REDACTED_KEY_RE.fullmatch(key_str):
-        return key_str
-    return redact_cache_key(key_str)
+# The redaction policy moved to hash_utils so cachekit.logging can apply the same
+# pass-through rules without importing this module (both sinks must emit the same
+# digest for a given key, or log correlation breaks). Alias kept for existing callers.
+_redact_key_for_log = redact_key_for_log
 
 
 class FeatureOrchestrator:
