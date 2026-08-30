@@ -1,6 +1,7 @@
-# Free-Threaded CPython (3.13t / 3.14t)
+# Free-Threaded CPython
 
-Status as of LAB-511 (2026-08): **tested, not yet declared**.
+Status as of LAB-511 (2026-08): **tested on 3.14t, not yet declared**.
+(3.13t is not in the CI matrix — no claim is made for it.)
 
 - The core test suites (`tests/unit/`, `tests/critical/`) run green on
   free-threaded CPython 3.14 with the GIL verified disabled, gated by the

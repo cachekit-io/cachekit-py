@@ -19,10 +19,8 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 # OrjsonSerializer requires the [json] extra — absent e.g. in the free-threaded
-# CI lane until orjson ships free-threaded wheels (LAB-511).
-pytest.importorskip("orjson")
-
-from cachekit.serializers.orjson_serializer import OrjsonSerializer  # noqa: E402
+# CI lane (LAB-511). Skipped per-test, NOT module-level: the rest of this
+# module pins encryption invariants that must keep running without orjson.
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +149,7 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
 
     def test_orjson_string_accepted_with_encryption(self, monkeypatch):
         """String serializer 'orjson' (cross-SDK) is accepted under encryption (Issue #134)."""
+        pytest.importorskip("orjson")
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.config.singleton import reset_settings
 
@@ -167,6 +166,9 @@ class TestCacheSerializationHandlerEncryptionSerializerValidation:
 
     def test_cross_sdk_instance_accepted_and_threaded_into_wrapper(self, monkeypatch):
         """A cross_sdk_compatible serializer instance is accepted AND used by the wrapper (Issue #134)."""
+        pytest.importorskip("orjson")
+        from cachekit.serializers.orjson_serializer import OrjsonSerializer
+
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         from cachekit.config.singleton import reset_settings
 
