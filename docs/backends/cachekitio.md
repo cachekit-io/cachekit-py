@@ -212,9 +212,11 @@ zero-knowledge bytes on the wire — **but the failure mode is inverted**:
   the same code silently caches **plaintext** to the SaaS.
 
 Use `.secure` + explicit backend when encryption is a security requirement (PII,
-PHI, compliance claims — the "SaaS out of HIPAA/PCI scope" argument only holds on
-this path). Use `.io()` + env when encryption is a fleet-wide opt-in convenience
-and plaintext caching is an acceptable state.
+PHI, compliance arguments — a HIPAA/PCI DSS scope-*reduction* argument can only be
+made on this path, and even then is subject to assessment and your surrounding
+controls; encryption alone does not remove regulated data from scope). Use `.io()`
++ env when encryption is a fleet-wide opt-in convenience and plaintext caching is
+an acceptable state.
 
 Two caveats, covered in depth in
 [Which Path](../features/zero-knowledge-encryption.md#which-path-cachesecure-vs-cacheio--cachekit_master_key):

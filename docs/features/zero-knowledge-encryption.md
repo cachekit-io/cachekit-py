@@ -54,10 +54,12 @@ happens when it isn't, and which backend you actually reach.
 **Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
 explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
 opt-in convenience** → set `CACHEKIT_MASTER_KEY` and let auto-detect do it (this
-applies to every preset, not just `.io`). Compliance claims — "the SaaS is out of
-HIPAA/PCI scope because it only ever stores ciphertext" — should only be hung on
-the fail-closed path: on the auto-detect path, one missing env var quietly puts
-plaintext on the backend.
+applies to every preset, not just `.io`). Compliance arguments — "the SaaS only
+ever stores ciphertext" — should only be hung on the fail-closed path: on the
+auto-detect path, one missing env var quietly puts plaintext on the backend. Even
+on the fail-closed path, client-side encryption may *reduce* HIPAA/PCI DSS scope
+subject to assessment and your surrounding controls — it does not remove regulated
+data from scope on its own (see [Compliance Implications](#compliance-implications)).
 
 > [!WARNING]
 > **`@cache.secure` does NOT pin the SaaS backend.** Backend resolution is the
@@ -71,15 +73,6 @@ plaintext on the backend.
 > set at once) surfaces as a `ConfigurationError` at first call, not at import.
 > When the SaaS is the requirement, pass `backend=CachekitIOBackend()` explicitly
 > — auditable in code and immune to environment drift.
-
-> [!IMPORTANT]
-> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
-> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
-> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
-> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
-> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
-> key-mismatched entries (miss + recompute) unless you opt in. See
-> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ```python notest
 from cachekit import cache
@@ -96,6 +89,15 @@ def get_patient_record(patient_id: str):
 def get_dashboard_stats(org_id: str):
     return compute_stats(org_id)  # illustrative
 ```
+
+> [!IMPORTANT]
+> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
+> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
+> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
+> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
+> key-mismatched entries (miss + recompute) unless you opt in. See
+> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ---
 
