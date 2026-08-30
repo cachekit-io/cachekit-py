@@ -167,11 +167,14 @@ class FileBackend:
                     self._acquire_file_lock(fd, exclusive=False)
 
                     try:
-                        # Read entire file
-                        file_data = os.read(fd, os.fstat(fd).st_size)
+                        # Header-first read (LAB-770): reading the 14-byte header separately,
+                        # then the payload in one os.read, avoids the full-payload
+                        # file_data[HEADER_SIZE:] slice copy (~1x payload off the read peak).
+                        st_size = os.fstat(fd).st_size
+                        header = os.read(fd, HEADER_SIZE)
 
                         # Validate header
-                        if len(file_data) < HEADER_SIZE:
+                        if len(header) < HEADER_SIZE:
                             # Corrupted file, delete it
                             os.close(fd)
                             fd_closed = True
@@ -179,10 +182,10 @@ class FileBackend:
                             return None
 
                         # Parse header
-                        magic = file_data[0:2]
-                        version = file_data[2]
-                        # flags = struct.unpack(">H", file_data[4:6])[0]  # uint16 BE (reserved for future)
-                        expiry_timestamp = struct.unpack(">Q", file_data[6:14])[0]  # uint64 BE
+                        magic = header[0:2]
+                        version = header[2]
+                        # flags = struct.unpack(">H", header[4:6])[0]  # uint16 BE (reserved for future)
+                        expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
 
                         # Validate magic and version
                         if magic != MAGIC or version != FORMAT_VERSION:
@@ -200,9 +203,8 @@ class FileBackend:
                             self._safe_unlink(file_path)
                             return None
 
-                        # Extract payload
-                        payload = file_data[HEADER_SIZE:]
-                        return payload
+                        # Read payload directly — exactly the bytes after the header
+                        return os.read(fd, st_size - HEADER_SIZE)
 
                     finally:
                         self._release_file_lock(fd)

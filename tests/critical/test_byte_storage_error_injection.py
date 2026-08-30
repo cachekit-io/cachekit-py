@@ -375,3 +375,121 @@ class TestByteStorageErrorInjection(RedisIsolationMixin):
 
         error_msg = str(exc_info.value).lower()
         assert "exceeds maximum size" in error_msg or "too large" in error_msg
+
+
+class TestByteStorageBufferProtocol:
+    """retrieve() accepts the buffer protocol (LAB-770) — no bytes() coercion needed.
+
+    The zero-copy read path hands retrieve() a memoryview (SerializationWrapper.unwrap
+    slices one past the frame header); the PyO3 boundary must take it directly, plus
+    fall back to a copy for writable or non-contiguous exporters.
+    """
+
+    def test_retrieve_accepts_readonly_memoryview(self):
+        """Zero-copy path: memoryview over bytes round-trips identically to bytes."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"buffer-protocol-roundtrip" * 1000
+        envelope = storage.store(payload, None)
+
+        data, fmt = storage.retrieve(memoryview(envelope))
+        assert data == payload
+        assert fmt == "msgpack"
+
+    def test_retrieve_accepts_offset_memoryview(self):
+        """The exact shape unwrap produces: a view sliced past a frame prefix."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"offset-view" * 500
+        envelope = storage.store(payload, None)
+
+        framed = b"JUNKHDR" + envelope
+        data, _ = storage.retrieve(memoryview(framed)[7:])
+        assert data == payload
+
+    def test_retrieve_accepts_writable_buffer(self):
+        """Copy-fallback path: bytearray (writable exporter) still round-trips."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"writable-exporter" * 500
+        envelope = storage.store(payload, None)
+
+        data, _ = storage.retrieve(bytearray(envelope))
+        assert data == payload
+        data, _ = storage.retrieve(memoryview(bytearray(envelope)))
+        assert data == payload
+
+    def test_retrieve_accepts_non_contiguous_view(self):
+        """Copy-fallback path: a strided view is copied, not misread."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"strided-view" * 500
+        envelope = storage.store(payload, None)
+
+        interleaved = bytes(b for byte in envelope for b in (byte, 0xFF))
+        data, _ = storage.retrieve(memoryview(interleaved)[::2])
+        assert data == payload
+
+    def test_retrieve_rejects_corrupt_memoryview(self):
+        """Error semantics are unchanged for buffer-protocol inputs."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        with pytest.raises(ValueError):
+            storage.retrieve(memoryview(b"not an envelope"))
+
+    def test_retrieve_memoryview_is_zero_copy(self):
+        """The readonly path BORROWS — a bytes() coercion or to_vec creeping back fails here.
+
+        tracemalloc sees only Python-heap allocations: retrieve's output bytes (~1x
+        payload for incompressible input). A revert to copy-the-envelope adds another
+        ~1x. This is the non-slow guard; the end-to-end bound lives in
+        tests/performance/test_large_object_memory.py.
+        """
+        import gc
+        import os
+        import tracemalloc
+
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = os.urandom(8 * 1024 * 1024)  # incompressible: envelope ~= payload
+        envelope = storage.store(payload, None)
+        view = memoryview(envelope)
+
+        gc.collect()
+        tracemalloc.start()
+        data, _ = storage.retrieve(view)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+
+        assert data == payload
+        assert peak / len(payload) < 1.5, (
+            f"retrieve(memoryview) peak {peak / len(payload):.2f}x payload — the zero-copy borrow "
+            f"regressed to a full envelope copy (expected ~1x: just the output bytes)"
+        )
+
+    def test_standard_serializer_deserialize_memoryview(self):
+        """End-to-end: deserialize() takes unwrap's memoryview without re-coercing."""
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        serializer = StandardSerializer()
+        obj = {"key": [1, 2, 3], "blob": b"x" * 4096}
+        data, _ = serializer.serialize(obj)
+
+        assert serializer.deserialize(memoryview(data)) == obj
+
+    def test_standard_serializer_deserialize_non_u8_buffer_raises_serialization_error(self):
+        """A non-u8 exporter (rejected as BufferError at the PyO3 boundary) keeps the
+        documented SerializationError contract — pre-LAB-770 the bytes() coercion
+        surfaced these as ValueError -> SerializationError."""
+        np = pytest.importorskip("numpy")
+        from cachekit.serializers.base import SerializationError
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        with pytest.raises(SerializationError):
+            StandardSerializer().deserialize(np.zeros(4))

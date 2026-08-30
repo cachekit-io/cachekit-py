@@ -52,13 +52,45 @@ impl PyByteStorage {
     /// Retrieve and validate stored bytes
     ///
     /// Args:
-    ///     envelope_bytes: Serialized StorageEnvelope bytes
+    ///     envelope_bytes: Serialized StorageEnvelope — any buffer-protocol object
+    ///         (`bytes`, `memoryview`, `bytearray`), so callers holding a zero-copy
+    ///         `memoryview` (SerializationWrapper.unwrap) never re-coerce to `bytes` (LAB-770)
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
-    pub fn retrieve(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
+    pub fn retrieve(
+        &self,
+        py: Python,
+        envelope_bytes: PyBuffer<u8>,
+    ) -> PyResult<(Vec<u8>, String)> {
+        let owned: Vec<u8>;
+        let data: &[u8] = if envelope_bytes.readonly() && envelope_bytes.is_c_contiguous() {
+            if envelope_bytes.item_count() == 0 {
+                // buf_ptr may be NULL for an empty buffer; from_raw_parts requires non-null.
+                &[]
+            } else {
+                // SAFETY: readonly + C-contiguous checked above, and `envelope_bytes` holds
+                // the Py_buffer view alive for the whole call (resizing an exported bytearray
+                // raises BufferError in the mutator, so the pointer cannot dangle). Residual:
+                // a thread mutating memory behind a readonly view over a still-mutable
+                // exporter during the detached read is a data race on this slice — UB —
+                // accepted per CPython hashlib's own GIL-release idiom; the slice is parsed
+                // once into an owned envelope in safe Rust, so a torn read fails checksum
+                // rather than corrupting memory.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        envelope_bytes.buf_ptr() as *const u8,
+                        envelope_bytes.item_count(),
+                    )
+                }
+            }
+        } else {
+            // Writable or non-contiguous exporter: copy to owned bytes (fail-safe fallback).
+            owned = envelope_bytes.to_vec(py)?;
+            &owned
+        };
         // Detach from the GIL for decompression + checksum (see store()).
-        py.detach(|| self.inner.retrieve(envelope_bytes))
+        py.detach(|| self.inner.retrieve(data))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
     }
 
