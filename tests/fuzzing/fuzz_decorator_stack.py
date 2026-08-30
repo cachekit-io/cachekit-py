@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atheris fuzz target for decorator stack (full integration)."""
+"""Atheris fuzz target for the cache decorator stack (L1-only integration)."""
 
 from __future__ import annotations
 
@@ -7,45 +7,36 @@ import sys
 
 import atheris
 
+# Pre-import third-party deps so instrument_imports() below skips them
+# (already in sys.modules = not instrumented). Atheris-instrumented pydantic
+# bytecode segfaults CPython 3.11 in _decorators.merge_seqs during
+# pydantic_settings' CLI-provider model construction (pulled in transitively
+# via cachekit.hiredis_compat) — the SIGSEGV killed every nightly target
+# during startup, before a single fuzz iteration (LAB-1140/LAB-2528). We fuzz
+# cachekit's code; third-party coverage is not the goal.
+import pydantic  # noqa: F401
+import pydantic_settings  # noqa: F401
+
 with atheris.instrument_imports():
-    from cachekit.decorators.main import redis_cache
-    from cachekit.serializers.raw import RawSerializer
+    from cachekit import cache
+
+
+# L1-only (backend=None): no network, deterministic — fuzzes the full
+# decorator/key-generation/serialization/L1 stack on every call.
+@cache(backend=None)
+def _cached_identity(value: bytes) -> bytes:
+    return value
 
 
 def TestOneInput(data: bytes) -> None:
-    """Fuzz the complete cache decorator stack."""
+    """Fuzz the decorator stack: miss path, then hit path, must both roundtrip."""
     fdp = atheris.FuzzedDataProvider(data)
+    payload = bytes(fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 1024)))
 
-    try:
-        # Generate test function names to avoid collision
-        func_id = fdp.ConsumeIntInRange(0, 1000000)
-
-        # Create a simple cached function with RawSerializer
-        @redis_cache(
-            redis_url="redis://localhost:6379",
-            serializer=RawSerializer(),
-            default_ttl=3600,
-        )
-        def cached_func(value: bytes) -> bytes:
-            """Simple cached function that returns input."""
-            return value
-
-        # Test with random payload
-        payload = fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 1024))
-
-        # Attempt to call the function
-        # May fail if Redis is unavailable, which is expected
-        try:
-            result = cached_func(payload)
-            # If it works, verify roundtrip
-            assert result == payload, "Decorator roundtrip failed"
-        except (ConnectionError, TimeoutError, OSError):
-            # Expected when Redis is unavailable
-            pass
-
-    except (ValueError, OverflowError, RuntimeError, AttributeError, TypeError):
-        # Expected exceptions for malformed input or missing Redis
-        pass
+    # First call may miss or hit L1; second call for the same args must hit.
+    # Both must return the payload byte-identically.
+    assert _cached_identity(payload) == payload, "Decorator roundtrip failed (first call)"
+    assert _cached_identity(payload) == payload, "Decorator roundtrip failed (cached call)"
 
 
 if __name__ == "__main__":

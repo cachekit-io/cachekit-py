@@ -3,52 +3,66 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import uuid
 
 import atheris
 
+# Pre-import third-party deps so instrument_imports() below skips them
+# (already in sys.modules = not instrumented). Atheris-instrumented pydantic
+# bytecode segfaults CPython 3.11 in _decorators.merge_seqs during
+# pydantic_settings' CLI-provider model construction (pulled in transitively
+# via cachekit.hiredis_compat) — the SIGSEGV killed every nightly target
+# during startup, before a single fuzz iteration (LAB-1140/LAB-2528). We fuzz
+# cachekit's code; third-party coverage is not the goal.
+import pydantic  # noqa: F401
+import pydantic_settings  # noqa: F401
+
 with atheris.instrument_imports():
-    from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+    from cachekit.serializers.encryption_wrapper import (
+        DecryptionAuthenticationError,
+        EncryptionWrapper,
+    )
+
+# Fixed test key for reproducibility (mirrors the doctest fixtures).
+_MASTER_KEY = b"0" * 32
 
 
 def TestOneInput(data: bytes) -> None:
-    """Fuzz EncryptionWrapper encrypt/decrypt with tenant isolation."""
+    """Fuzz encrypt/decrypt roundtrip, AAD cache-key binding, and tenant isolation."""
     fdp = atheris.FuzzedDataProvider(data)
 
-    # Get master key from environment or use a test key
-    master_key_hex = os.environ.get("CACHEKIT_MASTER_KEY")
-    if master_key_hex:
-        master_key = bytes.fromhex(master_key_hex)
-    else:
-        # Use a fixed test key for reproducibility
-        master_key = b"0" * 32
+    payload = bytes(fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 4096)))
+    tenant_a = str(uuid.UUID(bytes=bytes(fdp.ConsumeBytes(16)).ljust(16, b"\0")))
+    tenant_b = str(uuid.UUID(bytes=bytes(fdp.ConsumeBytes(16)).ljust(16, b"\0")))
+    # Prefix guarantees the non-empty cache_key serialize() requires.
+    cache_key = "ns:fuzz:" + fdp.ConsumeUnicodeNoSurrogates(64)
 
+    wrapper_a = EncryptionWrapper(master_key=_MASTER_KEY, tenant_id=tenant_a)
+
+    # Roundtrip under the same tenant + cache_key must be lossless.
+    encrypted, metadata = wrapper_a.serialize(payload, cache_key=cache_key)
+    decrypted = wrapper_a.deserialize(encrypted, metadata, cache_key=cache_key)
+    assert decrypted == payload, "Encryption roundtrip failed: data mismatch"
+
+    # AAD binding: a different cache_key must fail authentication.
     try:
-        serializer = EncryptionWrapper(master_key=master_key)
-
-        # Fuzz payload and tenant ID
-        payload = fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 4096))
-        tenant_id_bytes = fdp.ConsumeBytes(16)
-        tenant_id = str(uuid.UUID(bytes=tenant_id_bytes))
-
-        # Test encryption roundtrip
-        encrypted = serializer.serialize(payload, tenant_id=tenant_id)
-        decrypted = serializer.deserialize(encrypted, tenant_id=tenant_id)
-
-        # Verify roundtrip
-        assert decrypted == payload, "Roundtrip failed: data mismatch"
-
-        # Test tenant isolation: same data with different tenant_id should produce different ciphertext
-        other_tenant_bytes = fdp.ConsumeBytes(16)
-        other_tenant_id = str(uuid.UUID(bytes=other_tenant_bytes))
-        if tenant_id != other_tenant_id:
-            encrypted_other = serializer.serialize(payload, tenant_id=other_tenant_id)
-            assert encrypted != encrypted_other, "Tenant isolation failed: ciphertexts match"
-    except (ValueError, OverflowError, RuntimeError, AttributeError):
-        # Expected exceptions for malformed input
+        wrapper_a.deserialize(encrypted, metadata, cache_key=cache_key + "x")
+        raise RuntimeError("AAD binding failed: decrypt succeeded with wrong cache_key")
+    except DecryptionAuthenticationError:
         pass
+
+    # Tenant isolation: different tenant → different ciphertext, and
+    # cross-tenant decryption must fail authentication.
+    if tenant_a != tenant_b:
+        wrapper_b = EncryptionWrapper(master_key=_MASTER_KEY, tenant_id=tenant_b)
+        encrypted_b, _ = wrapper_b.serialize(payload, cache_key=cache_key)
+        assert encrypted != encrypted_b, "Tenant isolation failed: ciphertexts match"
+        try:
+            wrapper_b.deserialize(encrypted, metadata, cache_key=cache_key)
+            raise RuntimeError("Tenant isolation failed: cross-tenant decrypt succeeded")
+        except DecryptionAuthenticationError:
+            pass
 
 
 if __name__ == "__main__":
