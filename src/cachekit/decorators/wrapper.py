@@ -22,6 +22,7 @@ from ..cache_handler import (
     get_logger,
     handle_decrypt_failure,
     redact_cache_key,
+    supports_swr,
     warn_ttl_refresh_unsupported,
 )
 from ..interop import (
@@ -32,7 +33,7 @@ from ..interop import (
     validate_interop_config,
 )
 from ..key_generator import CacheKeyGenerator
-from ..l1_cache import get_l1_cache
+from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers.base import SerializationError
@@ -671,7 +672,9 @@ def create_cache_wrapper(
     # and re-run the wrapped function in the background. Requires an SWR-capable
     # backend (CachekitIO — the server signals freshness on read).
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
-    _l2_swr_backend_capable = _backend is not None and hasattr(_backend, "get_with_freshness")
+    # Class-level capability check (shared with the read-path fallback): an
+    # instance-level hasattr would read Mock/proxy objects as SWR-capable.
+    _l2_swr_backend_capable = _backend is not None and supports_swr(_backend)
     _stale_ttl: int | None = None
     if stale_ttl is not None:
         from ..config.validation import ConfigurationError
@@ -724,6 +727,55 @@ def create_cache_wrapper(
         if _l1_cache and cache_key:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
             _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+
+    def _l1_backfill_ttl(fresh_for: int | None) -> Any:
+        """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
+        freshness (LAB-557, spec/saas-api.md#remaining-freshness).
+
+        Unbounded, a read near the end of the server's freshness window restarts
+        the clock and serves from L1 as fresh past the server's fresh_until.
+        fresh_for=None (pre-signal server / no expiry / non-SWR backend) keeps
+        legacy behavior; fresh_for=0 makes L1Cache.put skip the entry entirely
+        (effective expiry <= now — nothing fresh remains to record).
+
+        The signal may only ever SHORTEN the L1 lifetime: with ttl=None the
+        legacy baseline is L1Cache's own default (DEFAULT_L1_TTL_SECONDS), so a
+        long server remainder is clamped to it — returning raw fresh_for would
+        EXTEND local service up to the 30-day cap and turn the bound into the
+        very freshness-extension it exists to prevent (expert-panel finding,
+        CWE-613: server-side DELETE-as-revocation relies on the ≤300s ageout).
+        """
+        if fresh_for is None:
+            return ttl
+        return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
+
+    async def _l2_double_check(cache_key: str) -> tuple[Any, bool, int | None]:
+        """Post-lock L2 double-check read, freshness-aware on a capable backend
+        (LAB-557): a hit found after a lock wait gets the same stale-exclusion
+        and remaining-freshness bound on its L1 BACKFILL as the primary hit path
+        (the entry another client just wrote is usually full-window fresh, but
+        an L2 read error on the primary path can land here with the OLD entry
+        still live and late in its window). Deliberate asymmetry: a stale hit
+        here is served WITHOUT scheduling a revalidation — spec-permitted
+        (subsequent stale reads MAY re-trigger), and this path is already a
+        double-fault rarity. Returns (cached_result, is_stale, fresh_for);
+        miss/error = (None, False, None), same degradation contract as
+        get_cached_value_async.
+        """
+        if _l2_swr_backend_capable:
+            hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+            return hit if hit is not None else (None, False, None)
+        return await operation_handler.get_cached_value_async(cache_key), False, None
+
+    def _l1_backfill_from_l2(cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None) -> None:
+        """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
+        invariants at every call site in lockstep: a stale-labelled hit is never
+        recorded (spec: local caches MUST NOT record stale as fresh), and a
+        fresh hit's local lifetime is bounded by _l1_backfill_ttl."""
+        if _l1_cache and cache_key and cached_data and not is_stale:
+            cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+            _l1_cache.put(cache_key, cached_bytes, redis_ttl=_l1_backfill_ttl(fresh_for))
+            _cached_keys.add(cache_key)
 
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
@@ -1239,11 +1291,17 @@ def create_cache_wrapper(
             refresh_ttl = ttl if refresh_ttl_on_get and ttl else None
 
             # Use operation handler for all cache access (uses backend internally).
-            # With SWR active the read carries the server's freshness signal
-            # (LAB-381): a stale hit is served immediately and revalidated on a
-            # background daemon thread below.
+            # A freshness-capable backend (CachekitIO) always takes the freshness
+            # read — not just when SWR is configured — so every hit carries the
+            # server's staleness label (LAB-381/LAB-557); a stale hit is served
+            # immediately and (with SWR active) revalidated on a background daemon
+            # thread below. The freshness path drops refresh_ttl, which is a
+            # documented no-op on the sync path anyway (StandardCacheHandler.get),
+            # and skips the mmap fast path (CachekitIO is not buffer-readable).
+            # The sync hit path performs no L1 backfill, so the fresh_for bound
+            # (tuple slot 2) has no consumer here.
             _sync_l2_stale = False
-            if _l2_swr_active:
+            if _l2_swr_backend_capable:
                 _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
@@ -1297,7 +1355,9 @@ def create_cache_wrapper(
                 _stats.record_l2_hit(duration_ms)
 
                 # SWR: stale hit — serve now, revalidate on a daemon thread.
-                if _sync_l2_stale:
+                # Gated on _l2_swr_active: without a configured stale window this
+                # decorator serves the mixed-reader hit but owns no revalidation.
+                if _sync_l2_stale and _l2_swr_active:
                     _l2_swr_schedule(cache_key, args, kwargs, is_async=False)
 
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
@@ -1614,14 +1674,18 @@ def create_cache_wrapper(
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
                 # eviction + the cache_get_deserialize metric instead of persisting (#159),
-                # and fail-closed tamper errors propagate (LAB-108). With SWR active the
-                # read also carries the server's freshness signal (LAB-381): a stale hit
-                # is served immediately and revalidated in the background below.
+                # and fail-closed tamper errors propagate (LAB-108). A freshness-capable
+                # backend (CachekitIO) always takes the freshness read — not just when SWR
+                # is configured — so every hit carries the server's staleness label and
+                # remaining-freshness bound (LAB-381/LAB-557): a stale hit is never
+                # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
                 _l2_is_stale = False
-                if _l2_swr_active:
+                _l2_fresh_for: int | None = None
+                if _l2_swr_backend_capable:
                     _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
                     cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                    _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
                 else:
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
@@ -1642,14 +1706,9 @@ def create_cache_wrapper(
                             duration_ms=get_duration_ms,
                         )
 
-                    # Update L1 cache with Redis value (serialized bytes) for subsequent fast access.
-                    # Never record a stale-window value as fresh in L1 (spec: local caches
-                    # MUST NOT extend service past the server's bounds).
-                    if _l1_cache and cache_key and cached_data and not _l2_is_stale:
-                        # cached_data is already serialized bytes from Redis
-                        cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
-                        _cached_keys.add(cache_key)
+                    # Update L1 cache with the L2 value (serialized bytes) for subsequent
+                    # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
+                    _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
                     # Handle TTL refresh if configured and threshold met
                     if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
@@ -1672,7 +1731,10 @@ def create_cache_wrapper(
 
                     # SWR: stale hit — value already in hand; revalidate in the
                     # background so no request pays the recompute at a TTL boundary.
-                    if _l2_is_stale:
+                    # Gated on _l2_swr_active (not just the read gate above): a
+                    # decorator without a configured stale window serves a
+                    # stale-labelled mixed-reader hit but owns no revalidation.
+                    if _l2_is_stale and _l2_swr_active:
                         _l2_swr_schedule(cache_key, args, kwargs, is_async=True)
 
                     return result
@@ -1717,21 +1779,14 @@ def create_cache_wrapper(
                         if lock_acquired:
                             # Lock acquired - double-check cache
                             # Another request may have populated it while we waited.
-                            # Routed through get_cached_value_async: corrupt entries evict (#159).
+                            # Routed through the operation handler: corrupt entries evict (#159),
+                            # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
-                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
                                     _found, result, cached_data = cached_result
-
-                                    # Update L1 cache with serialized bytes
-                                    if _l1_cache and cache_key and cached_data:
-                                        cached_bytes = (
-                                            cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                                        )
-                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
-                                        _cached_keys.add(cache_key)
-
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
                                 # Fail-closed tamper raise from get_cached_value_async
@@ -1746,20 +1801,13 @@ def create_cache_wrapper(
                             # Another request may have populated it while we waited
                             logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
                             try:
-                                # Routed through get_cached_value_async: corrupt entries evict (#159)
-                                cached_result = await operation_handler.get_cached_value_async(cache_key)
+                                # Routed through the operation handler: corrupt entries evict (#159),
+                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
                                     _found, result, cached_data = cached_result
-
-                                    # Update L1 cache with serialized bytes
-                                    if _l1_cache and cache_key and cached_data:
-                                        cached_bytes = (
-                                            cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                                        )
-                                        _l1_cache.put(cache_key, cached_bytes, redis_ttl=ttl)
-                                        _cached_keys.add(cache_key)
-
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
                                 # Fail-closed tamper raise from get_cached_value_async

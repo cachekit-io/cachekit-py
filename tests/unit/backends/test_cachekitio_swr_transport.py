@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import (
+    FRESH_FOR_HEADER,
     FRESHNESS_HEADER,
     LEGACY_TTL_HEADER,
     STALE_TTL_HEADER,
@@ -62,7 +63,7 @@ class TestFreshnessRead:
     def test_header_mapping(self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_stale: bool) -> None:
         with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
             result = backend.get_with_freshness("k")
-        assert result == (b"payload", expected_stale)
+        assert result == (b"payload", expected_stale, None)
 
     def test_miss_returns_none(self, backend: CachekitIOBackend) -> None:
         err = BackendError(
@@ -82,6 +83,37 @@ class TestFreshnessRead:
         with patch.object(backend, "_request_sync", side_effect=err):
             with pytest.raises(BackendError):
                 backend.get_with_freshness("k")
+
+
+class TestFreshForRead:
+    """X-CacheKit-Fresh-For mapping (LAB-557, spec/saas-api.md#remaining-freshness):
+    absent = None (pre-signal server, legacy); unparseable/negative = 0 (never
+    extend local service on drift — mirrors unrecognized-freshness → stale)."""
+
+    @pytest.mark.parametrize(
+        ("headers", "expected_fresh_for"),
+        [
+            (None, None),  # pre-signal server: no header → no bound
+            ({FRESH_FOR_HEADER: "30"}, 30),
+            ({FRESH_FOR_HEADER: "0"}, 0),  # freshness exhausted → do not backfill
+            ({FRESH_FOR_HEADER: "garbage"}, 0),  # drift → conservative 0
+            ({FRESH_FOR_HEADER: "-5"}, 0),  # negative → conservative 0
+            ({FRESH_FOR_HEADER: "2.5"}, 0),  # non-integer → conservative 0
+        ],
+    )
+    def test_fresh_for_mapping(
+        self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_fresh_for: int | None
+    ) -> None:
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+            result = backend.get_with_freshness("k")
+        assert result is not None
+        assert result[2] == expected_fresh_for
+
+    def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
+        """A stale-window read carries 0 remaining freshness (server emits both headers)."""
+        headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+            assert backend.get_with_freshness("k") == (b"payload", True, 0)
 
 
 class TestStaleGraceWrite:
@@ -116,12 +148,13 @@ class _SWRBackend:
     def __init__(self) -> None:
         self.set_calls: list[tuple] = []
         self.freshness: bool = False
+        self.fresh_for: int | None = None
 
     def get(self, key: str):
         return b"plain-get"
 
     def get_with_freshness(self, key: str):
-        return (b"swr-get", self.freshness)
+        return (b"swr-get", self.freshness, self.fresh_for)
 
     def set(self, key: str, value: bytes, ttl=None, stale_ttl=None) -> None:
         self.set_calls.append((key, value, ttl, stale_ttl))
@@ -153,14 +186,14 @@ class TestHandlerPlumbing:
         backend = _SWRBackend()
         backend.freshness = True
         handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
-        assert handler.get_with_freshness("k") == (b"swr-get", True)
+        assert handler.get_with_freshness("k") == (b"swr-get", True, None)
 
     def test_get_with_freshness_fallback_reads_as_fresh(self) -> None:
         """Non-SWR backends degrade to plain get(), always fresh."""
         backend = _PlainBackend()
         backend.store["k"] = b"value"
         handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
-        assert handler.get_with_freshness("k") == (b"value", False)
+        assert handler.get_with_freshness("k") == (b"value", False, None)
         assert handler.get_with_freshness("missing") is None
 
     def test_set_threads_stale_ttl_to_swr_backend(self) -> None:
@@ -180,7 +213,7 @@ class TestHandlerPlumbing:
         backend = _SWRBackend()
         backend.freshness = True
         handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
-        assert await handler.get_with_freshness_async("k") == (b"swr-get", True)
+        assert await handler.get_with_freshness_async("k") == (b"swr-get", True, None)
         assert await handler.set_async("k", b"v", ttl=300, stale_ttl=600) is True
         assert backend.set_calls == [("k", b"v", 300, 600)]
 
@@ -216,5 +249,5 @@ class TestHandlerDegradation:
         backend = _PlainBackend()
         backend.store["k"] = b"value"
         handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
-        assert await handler.get_with_freshness_async("k") == (b"value", False)
+        assert await handler.get_with_freshness_async("k") == (b"value", False, None)
         assert await handler.get_with_freshness_async("missing") is None
