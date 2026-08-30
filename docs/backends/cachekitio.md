@@ -198,6 +198,31 @@ CACHEKIT_API_KEY=ck_live_...
 
 See [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md) for full details on key derivation and serialization format implications.
 
+### `.secure` + explicit backend vs `.io()` + env var — which one?
+
+There is a second path to encrypted SaaS caching: `@cache.io()` with
+`CACHEKIT_MASTER_KEY` set. Encryption is then auto-detected downstream — the same
+zero-knowledge bytes on the wire — **but the failure mode is inverted**:
+
+- `@cache.secure(backend=CachekitIOBackend())` — **fails closed.** Encryption is
+  forced on in code; a missing master key (param or `CACHEKIT_MASTER_KEY`) raises
+  `ValueError` at decoration time. Nothing plaintext can ever reach the backend.
+- `@cache.io()` + `CACHEKIT_MASTER_KEY` — **fails open.** If the env var is absent,
+  the same code silently caches **plaintext** to the SaaS. Nothing raises; the only
+  difference is the missing env var.
+
+Use `.secure` + explicit backend when encryption is a security requirement (PII,
+PHI, compliance claims — the "SaaS out of HIPAA/PCI scope" argument only holds on
+this path). Use `.io()` + env when encryption is a fleet-wide opt-in convenience
+and plaintext caching is an acceptable state.
+
+Two caveats, covered in depth in
+[Which Path](../features/zero-knowledge-encryption.md#which-path-cachesecure-vs-cacheio--cachekit_master_key):
+`.secure` does **not** pin the SaaS backend (env auto-detect can silently route
+encrypted values to Redis — pass `backend=` explicitly, as above), and fail-closed
+on a *missing key* is separate from `fail_closed` on a *decrypt failure*, which
+defaults to off.
+
 ## See Also
 
 - [Backend Guide](README.md) — Backend comparison and resolution priority
