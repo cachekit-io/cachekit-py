@@ -147,17 +147,22 @@ jobs:
       run: |
         uv sync --group dev --group fuzz --python 3.11
 
-    # Exit-code contract — no `|| true`, every non-zero exit fails the job:
+    # Exit-code contract — no `|| true`, every non-zero exit fails the job.
+    # (scripts/fuzz-python.sh carries the same contract for local runs; keep
+    # the budgets and flags in the two files in sync.)
     #   - Pass is libFuzzer exiting 0 when -max_total_time=600 expires cleanly.
     #   - A crash, OOM, or uncaught Python exception exits non-zero and fails
     #     the job. atheris.Setup(sys.argv, ...) forwards flags to libFuzzer, so
     #     -artifact_prefix drops the reproducer in tests/fuzzing/artifacts/.
     #     No corpus dir is passed, so that directory only ever holds crash
     #     artifacts — a file there is always a finding, never corpus growth.
-    #   - `timeout 15m` exit 124 is a deliberate FAILURE, not budget
-    #     exhaustion: the fuzz budget is 600 s and budget exhaustion exits 0
-    #     above, so a target still alive at 15 min is hung (e.g. stuck in
-    #     native code where libFuzzer's own watchdog can't fire).
+    #   - A hung input is caught by libFuzzer's own per-input watchdog
+    #     (-timeout=60), which writes a timeout-* reproducer and exits
+    #     non-zero. `timeout -k 30s 15m` is the backstop for hangs in native
+    #     code where that watchdog can't fire: exit 124 is a deliberate
+    #     FAILURE, not budget exhaustion — the fuzz budget is 600 s and budget
+    #     exhaustion exits 0 above, so a target still alive at 15 min is hung
+    #     (and libFuzzer traps SIGTERM, hence the -k hard kill).
     #   - Zero matched targets fails the job: a glob that stops matching must
     #     not "pass" having fuzzed nothing (LAB-1136 post-mortem pattern).
     - name: Run Atheris fuzz targets (10 min each)
@@ -171,8 +176,8 @@ jobs:
         fi
         for fuzz_target in "${targets[@]}"; do
           echo "Fuzzing $fuzz_target..."
-          timeout 15m uv run --python 3.11 python "$fuzz_target" \
-            -max_total_time=600 -artifact_prefix=tests/fuzzing/artifacts/
+          timeout -k 30s 15m uv run --python 3.11 python "$fuzz_target" \
+            -max_total_time=600 -timeout=60 -artifact_prefix=tests/fuzzing/artifacts/
         done
 
     # No "Report fuzzing results" step: now that `|| true` is gone, a crash
@@ -189,7 +194,10 @@ jobs:
       with:
         name: atheris-crash-artifacts
         path: tests/fuzzing/artifacts/
-        retention-days: 30
+        # Public repo: a crash reproducer is a ready-made PoC for anyone while
+        # it is retrievable. 7 days covers triage of a nightly red without
+        # leaving a month-long public exploit window.
+        retention-days: 7
         if-no-files-found: warn
 
   miri-full:

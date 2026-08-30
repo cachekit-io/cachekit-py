@@ -3,20 +3,36 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
+import importlib
 import sys
 import uuid
 
 import atheris
 
 # Pre-import third-party deps so instrument_imports() below skips them
-# (already in sys.modules = not instrumented). Atheris-instrumented pydantic
-# bytecode segfaults CPython 3.11 in _decorators.merge_seqs during
-# pydantic_settings' CLI-provider model construction (pulled in transitively
-# via cachekit.hiredis_compat) — the SIGSEGV killed every nightly target
-# during startup, before a single fuzz iteration (LAB-1140/LAB-2528). We fuzz
-# cachekit's code; third-party coverage is not the goal.
-import pydantic  # noqa: F401
-import pydantic_settings  # noqa: F401
+# (already in sys.modules = not instrumented) — we fuzz cachekit's code;
+# third-party coverage is not the goal, and atheris-instrumented third-party
+# bytecode is a proven startup-crash class: instrumented pydantic segfaults
+# CPython 3.11 in _decorators.merge_seqs during pydantic_settings'
+# CLI-provider model construction (pulled in transitively via
+# cachekit.hiredis_compat). That SIGSEGV killed every nightly target during
+# startup, before a single fuzz iteration (LAB-1140/LAB-2528). Optional deps
+# use suppress: absent is fine, instrumented is the trap.
+for _mod in (
+    "pydantic",
+    "pydantic_settings",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "redis",
+    "msgpack",
+    "xxhash",
+    "prometheus_client",
+):
+    with contextlib.suppress(ImportError):
+        importlib.import_module(_mod)
 
 with atheris.instrument_imports():
     from cachekit.serializers.encryption_wrapper import (
@@ -52,14 +68,20 @@ def TestOneInput(data: bytes) -> None:
     except DecryptionAuthenticationError:
         pass
 
-    # Tenant isolation: different tenant → different ciphertext, and
-    # cross-tenant decryption must fail authentication.
+    # Tenant isolation. Metadata is cleartext an attacker controls, so the
+    # honest cross-tenant check FORGES it (tenant_id + key_fingerprint claim
+    # tenant B) — that gets past the unauthenticated metadata comparisons and
+    # must still die at the AES-GCM layer, where tenant separation is real
+    # (HKDF tenant-derived key + tenant-bound AAD).
     if tenant_a != tenant_b:
         wrapper_b = EncryptionWrapper(master_key=_MASTER_KEY, tenant_id=tenant_b)
-        encrypted_b, _ = wrapper_b.serialize(payload, cache_key=cache_key)
+        encrypted_b, metadata_b = wrapper_b.serialize(payload, cache_key=cache_key)
         assert encrypted != encrypted_b, "Tenant isolation failed: ciphertexts match"
+        forged = copy.copy(metadata)
+        forged.tenant_id = metadata_b.tenant_id
+        forged.key_fingerprint = metadata_b.key_fingerprint
         try:
-            wrapper_b.deserialize(encrypted, metadata, cache_key=cache_key)
+            wrapper_b.deserialize(encrypted, forged, cache_key=cache_key)
             raise RuntimeError("Tenant isolation failed: cross-tenant decrypt succeeded")
         except DecryptionAuthenticationError:
             pass
