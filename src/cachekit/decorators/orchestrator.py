@@ -3,6 +3,7 @@ import logging
 import uuid
 from typing import Any, Optional
 
+from ..cache_handler import redact_cache_key
 from ..monitoring.correlation_tracking import CorrelationTracker
 from ..monitoring.pool_monitor import OptimizedPoolMonitor
 
@@ -17,6 +18,20 @@ logger = logging.getLogger(__name__)
 
 # Thread-local operation context for automatic operation tracking
 _operation_context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar("operation_context", default=None)
+
+
+def _redact_key_for_log(cache_key: object) -> str:
+    """Redact a cache key for logging unless it is a sentinel or already redacted.
+
+    Cache keys embed caller-supplied tenant/user identifiers and must never reach
+    logs verbatim (CWE-532, issue #163). Real keys are canonical ``ns:...`` strings;
+    sentinels (``unknown``, ``<generation_failed>``) and pre-redacted values
+    (``<redacted:...>``) carry no caller data and stay readable as-is.
+    """
+    key_str = str(cache_key)
+    if key_str == "unknown" or (key_str.startswith("<") and key_str.endswith(">")):
+        return key_str
+    return redact_cache_key(key_str)
 
 
 class FeatureOrchestrator:
@@ -271,9 +286,12 @@ class FeatureOrchestrator:
         pass
 
     def log_cache_operation(self, **kwargs):
-        """Log cache operation with structured logging."""
+        """Log cache operation with structured logging. Redacts ``key`` (CWE-532)."""
         if self._enable_structured_logging and kwargs:
             operation = kwargs.get("operation", "unknown")
+            # Redact in kwargs itself — it is splatted into the structured payload below.
+            if "key" in kwargs:
+                kwargs["key"] = _redact_key_for_log(kwargs["key"])
             key = kwargs.get("key", "unknown")
             self.log_structured("info", f"Cache operation: {operation}", cache_key=key, **kwargs)
 
@@ -414,7 +432,8 @@ class FeatureOrchestrator:
         Args:
             error: The exception that occurred
             operation: Operation type (e.g., "key_generation", "cache_get", "cache_set")
-            cache_key: Cache key involved (use "unknown" if unavailable)
+            cache_key: Cache key involved (use "unknown" if unavailable). Pass the
+                raw key — it is redacted here before any logging (CWE-532).
             namespace: Cache namespace (defaults to orchestrator namespace)
             span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
@@ -432,6 +451,10 @@ class FeatureOrchestrator:
         """
         # Use orchestrator namespace if not provided
         namespace = namespace or self.namespace
+
+        # Redact once at the sink so every error path is covered by construction
+        # (CWE-532) — callers pass the raw key; sentinels pass through readable.
+        cache_key = _redact_key_for_log(cache_key)
 
         # 1. Record exception in span and metrics
         if span:

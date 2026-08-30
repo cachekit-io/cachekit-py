@@ -4,8 +4,11 @@ Tests the error handling orchestration without test theatre - validates
 actual behavior and contracts, not implementation details.
 """
 
+import logging
+
 import pytest
 
+from cachekit.cache_handler import redact_cache_key
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 
 
@@ -271,3 +274,93 @@ class TestErrorHandlerEdgeCases:
             )
 
         # Test passes if no exception
+
+
+class TestCacheKeyRedaction:
+    """Raw cache keys must never reach logs on any error path (CWE-532, LAB-304).
+
+    Keys embed caller-supplied tenant/user identifiers; the sink redacts once so
+    every caller is covered by construction.
+    """
+
+    # A canonical key carrying a tenant-identifying argument digest segment
+    TENANT_KEY = "ns:prod:func:app.get_user:args:tenant-42-alice-secret:v1"
+
+    def _orchestrator(self) -> FeatureOrchestrator:
+        return FeatureOrchestrator(
+            namespace="test",
+            circuit_breaker_enabled=False,
+            enable_structured_logging=True,
+        )
+
+    @pytest.mark.parametrize("operation", ["cache_get", "key_generation", "backend_connection", "client_creation"])
+    def test_non_cache_set_failure_never_logs_raw_key(self, operation: str, caplog: pytest.LogCaptureFixture) -> None:
+        """The tenant key must not appear verbatim in any log record — structured or backwards-compat."""
+        with caplog.at_level(logging.INFO):
+            self._orchestrator().handle_cache_error(
+                error=ConnectionError("backend down"),
+                operation=operation,
+                cache_key=self.TENANT_KEY,
+                duration_ms=1.0,
+            )
+
+        assert caplog.records, "error handler must log"
+        for record in caplog.records:
+            assert self.TENANT_KEY not in record.getMessage()
+            structured = getattr(record, "structured", None)
+            if structured is not None:
+                assert self.TENANT_KEY not in str(structured)
+
+    def test_backwards_compat_log_carries_correlatable_digest(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Redaction keeps failures correlatable: the blake2b digest replaces the raw key."""
+        with caplog.at_level(logging.WARNING):
+            self._orchestrator().handle_cache_error(
+                error=ConnectionError("backend down"),
+                operation="cache_get",
+                cache_key=self.TENANT_KEY,
+            )
+
+        digest = redact_cache_key(self.TENANT_KEY)
+        assert any(digest in record.getMessage() for record in caplog.records)
+
+    def test_cache_set_digest_unchanged_from_lab_109(self, caplog: pytest.LogCaptureFixture) -> None:
+        """cache_set callers now pass the raw key; the sink must emit the SAME digest
+        the call-site redaction produced before (LAB-109 behaviour intact)."""
+        with caplog.at_level(logging.WARNING):
+            self._orchestrator().handle_cache_error(
+                error=OSError("disk full"),
+                operation="cache_set",
+                cache_key=self.TENANT_KEY,
+            )
+
+        digest = redact_cache_key(self.TENANT_KEY)
+        assert any(digest in record.getMessage() for record in caplog.records)
+        assert not any(self.TENANT_KEY in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize("sentinel", ["unknown", "<generation_failed>", "<redacted:deadbeefdeadbeef>"])
+    def test_sentinels_pass_through_unredacted(self, sentinel: str, caplog: pytest.LogCaptureFixture) -> None:
+        """Non-key sentinels carry no caller data and stay readable (no double-redaction)."""
+        with caplog.at_level(logging.WARNING):
+            self._orchestrator().handle_cache_error(
+                error=ValueError("boom"),
+                operation="key_generation",
+                cache_key=sentinel,
+            )
+
+        assert any(sentinel in record.getMessage() for record in caplog.records)
+
+    def test_structured_log_cache_operation_redacts_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Direct log_cache_operation callers (circuit-breaker, hit logs) are covered too."""
+        with caplog.at_level(logging.INFO):
+            self._orchestrator().log_cache_operation(
+                operation="circuit_breaker_open",
+                key=self.TENANT_KEY,
+                error="Circuit breaker is OPEN",
+            )
+
+        assert caplog.records
+        for record in caplog.records:
+            assert self.TENANT_KEY not in record.getMessage()
+            structured = getattr(record, "structured", None)
+            if structured is not None:
+                assert self.TENANT_KEY not in str(structured)

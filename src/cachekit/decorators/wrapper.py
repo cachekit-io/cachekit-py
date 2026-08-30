@@ -1373,7 +1373,7 @@ def create_cache_wrapper(
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
-                    cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                    cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
                     duration_ms=set_duration_ms,
                     serializer="rust",
@@ -1815,7 +1815,7 @@ def create_cache_wrapper(
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
-                                cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                                cache_key=cache_key or "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
                                 correlation_id=correlation_id,
@@ -1897,7 +1897,7 @@ def create_cache_wrapper(
                     features.handle_cache_error(
                         error=e,
                         operation="cache_set",
-                        cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                        cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
                         correlation_id=correlation_id,

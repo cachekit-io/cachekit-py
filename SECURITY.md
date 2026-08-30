@@ -187,6 +187,10 @@ When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Sid
 
 See [SSRF Protection](docs/features/ssrf-protection.md) for full details, including custom host configuration for development environments.
 
+### Cache Key Redaction in Logs (CWE-532)
+
+Cache keys can embed caller-supplied tenant/user identifiers, so they never reach logs verbatim ([CWE-532][cwe-532]). Every log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction.
+
 ### Lock Token Transport (CWE-532)
 
 The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Lock-Id` request header when releasing a lock (`DELETE /v1/cache/{key}/lock`), **never** in the URL query string. Query strings are routinely captured by access logs, proxy/CDN logs, and OpenTelemetry `http.url` spans ([CWE-532][cwe-532]); a leaked token could be replayed to release a lock within its short TTL. The CacheKit SaaS backend dual-reads the header and the legacy `?lock_id=` query during migration, preferring the header (removed in protocol 2.0).
