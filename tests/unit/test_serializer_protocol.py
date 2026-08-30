@@ -7,9 +7,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from cachekit.serializers.arrow_serializer import ArrowSerializer
-from cachekit.serializers.auto_serializer import AutoSerializer
-from cachekit.serializers.base import SerializationFormat, SerializationMetadata, SerializerProtocol
+import pytest
+
+# ArrowSerializer requires the [data] extra — absent e.g. in the free-threaded
+# CI lane until pyarrow ships free-threaded wheels (LAB-511).
+pytest.importorskip("pyarrow")
+
+from cachekit.serializers.arrow_serializer import ArrowSerializer  # noqa: E402
+from cachekit.serializers.auto_serializer import AutoSerializer  # noqa: E402
+from cachekit.serializers.base import SerializationFormat, SerializationMetadata, SerializerProtocol  # noqa: E402
 
 
 class TestSerializerProtocolCompliance:

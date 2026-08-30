@@ -56,19 +56,27 @@ def _ensure_session_initialized() -> None:
 
     current_pid = os.getpid()
 
-    # Fast path: session already initialized for this process
-    if _session_pid == current_pid and _session_id is not None:
+    # Fast path: session already initialized for this process. Gates on EVERY
+    # published field, not just pid+id: assignment order below only guarantees
+    # visibility order under the GIL. On free-threaded CPython with a weak
+    # memory model (e.g. ARM64) a lock-free reader may observe the stores out
+    # of order — pid+id set while start_ms still reads None — and a pid+id
+    # gate would admit it straight into get_session_start_ms()'s RuntimeError,
+    # silently dropping the session headers upstream. Observing a partial
+    # publish here just means falling through to the lock, where the
+    # in-flight initializer completes before the double-check re-runs.
+    if _session_pid == current_pid and _session_id is not None and _session_start_ms is not None:
         return
 
     with _session_lock:
-        # Double-check inside lock (another thread might have initialized)
-        if _session_pid == current_pid and _session_id is not None:
+        # Double-check inside lock (another thread might have initialized).
+        # Same full-field gate as the fast path: entering the lock does not
+        # retroactively order stores a GIL-less writer made before we blocked.
+        if _session_pid == current_pid and _session_id is not None and _session_start_ms is not None:
             return
 
-        # _session_pid is assigned LAST: the fast path above reads without the
-        # lock and admits readers once pid+id are set, so all other fields must
-        # already be populated by then (a reader admitted between id and
-        # start_ms assignments would find start_ms still None).
+        # _session_pid is assigned LAST as defense in depth for GIL builds,
+        # but the readers above no longer rely on assignment order.
         _session_start_ms = int(time.time() * 1000)
         _session_id = str(uuid.uuid4())
         _session_pid = current_pid

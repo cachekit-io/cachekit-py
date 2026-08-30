@@ -16,12 +16,15 @@ serializer. Series never use arrow, so they hit the columnar path unconditionall
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import SerializationError
+
+# Requires the [data] extra — absent e.g. in the free-threaded CI lane until
+# numpy/pandas ship free-threaded wheels (LAB-511).
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
 
 
 def _no_arrow() -> AutoSerializer:

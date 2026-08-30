@@ -14,12 +14,15 @@ consistent with msgpack-off).
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import xxhash
 
 from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import SerializationError
+
+# Requires the [data] extra — absent e.g. in the free-threaded CI lane until
+# numpy ships free-threaded wheels usable here (LAB-511).
+np = pytest.importorskip("numpy")
 
 
 @pytest.mark.unit

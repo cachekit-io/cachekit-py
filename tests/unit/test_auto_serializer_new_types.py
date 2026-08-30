@@ -375,6 +375,10 @@ class TestAutoSerializerCorruptionDetection:
 
     def test_partial_truncation_detection(self):
         """Test that truncated data raises appropriate errors."""
+        # Truncated msgpack can misparse into the numpy-envelope branch, whose
+        # error classification differs without the [data] extra installed
+        # (RuntimeError from the numpy guard instead of SerializationError).
+        pytest.importorskip("numpy")
 
         serializer = AutoSerializer()
         valid_uuid = UUID("12345678-1234-5678-1234-567812345678")

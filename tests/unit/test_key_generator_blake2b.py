@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 import pytest
 
 from cachekit.key_generator import CacheKeyGenerator
+
+# Requires the [data] extra — absent e.g. in the free-threaded CI lane until
+# numpy ships free-threaded wheels usable here (LAB-511).
+np = pytest.importorskip("numpy")
 
 
 class TestBlake2bKeyGeneration:

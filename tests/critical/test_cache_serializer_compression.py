@@ -1,10 +1,12 @@
 """Test CacheSerializer compression functionality"""
 
-import numpy as np
 import pytest
 
+# Requires the [data] extra — absent e.g. in the free-threaded CI lane (LAB-511).
+np = pytest.importorskip("numpy")
+
 # Import from compatibility wrapper
-from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer
+from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer  # noqa: E402
 
 
 @pytest.mark.skipif(not CACHE_SERIALIZER_AVAILABLE, reason="Cache serializer not available")

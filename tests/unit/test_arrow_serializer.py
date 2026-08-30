@@ -5,12 +5,15 @@ Tests DataFrame serialization, return_format variants, error handling, and perfo
 
 from __future__ import annotations
 
-import pandas as pd
-import pyarrow as pa
 import pytest
 
-from cachekit.serializers.arrow_serializer import ArrowSerializer
-from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata
+# ArrowSerializer requires the [data] extra — absent e.g. in the free-threaded
+# CI lane until pandas/pyarrow ship free-threaded wheels (LAB-511).
+pd = pytest.importorskip("pandas")
+pa = pytest.importorskip("pyarrow")
+
+from cachekit.serializers.arrow_serializer import ArrowSerializer  # noqa: E402
+from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata  # noqa: E402
 
 
 class TestArrowSerializerBasics:

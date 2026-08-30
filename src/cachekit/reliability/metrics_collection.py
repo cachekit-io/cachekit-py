@@ -288,11 +288,19 @@ class AsyncMetricsCollector:
             self._stats["dropped_count"] = 0
 
     def flush(self, timeout: float = 2.0):
-        """Flush all pending metrics with timeout."""
+        """Flush all pending metrics with timeout.
+
+        Waits for the worker to finish PROCESSING, not merely dequeue:
+        Queue.empty() flips the moment the worker get()s the last item —
+        before _process_metric runs — so polling empty() can return with the
+        final metric still mid-flight. Unobservable in practice under the
+        GIL's coarse scheduling, routine under free-threaded CPython
+        (LAB-511). unfinished_tasks only reaches zero at task_done(), which
+        the worker calls after processing and the stats update.
+        """
         if self._worker_thread and self._worker_thread.is_alive():
-            # Wait for queue to be processed
             start_time = time.time()
-            while not self._metric_queue.empty() and (time.time() - start_time) < timeout:
+            while self._metric_queue.unfinished_tasks and (time.time() - start_time) < timeout:
                 time.sleep(0.01)
 
     def shutdown(self, timeout: float = 2.0):

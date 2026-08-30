@@ -15,9 +15,14 @@ from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.validation import ConfigurationError
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
-from cachekit.serializers.orjson_serializer import OrjsonSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
+
+# OrjsonSerializer requires the [json] extra — absent e.g. in the free-threaded
+# CI lane until orjson ships free-threaded wheels (LAB-511).
+pytest.importorskip("orjson")
+
+from cachekit.serializers.orjson_serializer import OrjsonSerializer  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

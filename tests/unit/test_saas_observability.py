@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
+from contextlib import contextmanager
 
 import pytest
 
@@ -647,6 +649,79 @@ class TestForkSessionIsolation:
         assert result["process_uuid"] != parent_process_uuid
         # Parent state is untouched by the fork.
         assert wrapped.cache_info().session_id == parent.session_id
+
+
+class TestMidPublishMemoryOrdering:
+    """LAB-511: a reader observing a partially published session identity must recover.
+
+    Under the GIL the assignment order in _ensure_session_initialized makes the
+    partial state (pid+id visible, start_ms not yet) unobservable; on free-threaded
+    CPython with a weak memory model the stores can become visible out of order.
+    Rather than trying to win a hardware race, these tests pin the exact state such
+    a reader would see and assert it recovers via the lock path instead of hitting
+    the "should never happen" RuntimeError that made backend.py silently drop the
+    session headers (the LAB-506 telemetry loss, resurfacing GIL-free).
+    """
+
+    @contextmanager
+    def _mid_publish_state(self):
+        from cachekit.decorators import session as session_module
+
+        saved = (
+            session_module._session_pid,
+            session_module._session_id,
+            session_module._session_start_ms,
+        )
+        session_module._session_pid = os.getpid()
+        session_module._session_id = str(uuid.uuid4())
+        session_module._session_start_ms = None
+        try:
+            yield
+        finally:
+            (
+                session_module._session_pid,
+                session_module._session_id,
+                session_module._session_start_ms,
+            ) = saved
+
+    def test_get_session_start_ms_recovers_from_partial_publish(self):
+        from cachekit.decorators.session import get_session_start_ms
+
+        with self._mid_publish_state():
+            start_ms = get_session_start_ms()  # pre-fix: RuntimeError
+
+        assert isinstance(start_ms, int)
+        assert start_ms > 0
+
+    def test_session_identity_fully_published_after_recovery(self):
+        from cachekit.decorators import session as session_module
+        from cachekit.decorators.session import get_session_id
+
+        with self._mid_publish_state():
+            get_session_id()
+            # Recovery runs the full initialization under the lock: every field
+            # of the identity is populated, none left half-published.
+            assert session_module._session_pid == os.getpid()
+            assert session_module._session_id is not None
+            assert session_module._session_start_ms is not None
+
+    def test_session_headers_present_mid_publish(self):
+        with self._mid_publish_state():
+            headers = get_session_headers()
+
+        assert headers["X-CacheKit-Session-ID"]
+        assert headers["X-CacheKit-Session-Start"].isdigit()
+
+    def test_no_header_dropped_when_init_observed_mid_publish(self):
+        """The end-to-end regression: backend.py catches session errors and sends
+        NO session headers — the silent telemetry loss LAB-506 exists to prevent."""
+        with self._mid_publish_state():
+            stats = _FunctionStats("lab511.mid_publish_probe")
+            stats.record_miss()
+            headers = _inject_metrics_headers(stats)
+
+        assert "X-CacheKit-Session-ID" in headers
+        assert "X-CacheKit-Session-Start" in headers
 
 
 class TestSessionIDUnification:

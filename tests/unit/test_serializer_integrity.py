@@ -5,11 +5,16 @@ Tests that OrjsonSerializer and ArrowSerializer detect data corruption via xxHas
 
 from __future__ import annotations
 
-import pandas as pd
 import pytest
 
-from cachekit.serializers import ArrowSerializer, OrjsonSerializer
-from cachekit.serializers.base import SerializationError
+# Requires the [data] + [json] extras — absent e.g. in the free-threaded CI
+# lane until pandas/pyarrow/orjson ship free-threaded wheels (LAB-511).
+pd = pytest.importorskip("pandas")
+pytest.importorskip("pyarrow")
+pytest.importorskip("orjson")
+
+from cachekit.serializers import ArrowSerializer, OrjsonSerializer  # noqa: E402
+from cachekit.serializers.base import SerializationError  # noqa: E402
 
 
 class TestOrjsonSerializerIntegrity:

@@ -358,6 +358,14 @@ exposition setup.
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
 
+**Free-threaded CPython (3.13t/3.14t):** the core suites run green on
+free-threaded 3.14 with the GIL verified disabled (CI job
+`test-freethreaded`), and the Rust extension declares free-threaded safety
+(`gil_used = false`). Free-threaded wheels are **not yet published** and
+free-threaded builds are not officially supported — blocked on upstream
+wheels (orjson, hiredis; numpy/pandas/pyarrow for `[data]`). Details and the
+full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
+
 **Per-Function Statistics:**
 - Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
 - Thread-safe via RLock (all methods safe for concurrent access)
