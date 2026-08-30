@@ -20,12 +20,6 @@ logger = logging.getLogger(__name__)
 _operation_context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar("operation_context", default=None)
 
 
-# The redaction policy moved to hash_utils so cachekit.logging can apply the same
-# pass-through rules without importing this module (both sinks must emit the same
-# digest for a given key, or log correlation breaks). Alias kept for existing callers.
-_redact_key_for_log = redact_key_for_log
-
-
 class FeatureOrchestrator:
     """Orchestrates existing reliability and monitoring features.
 
@@ -283,7 +277,7 @@ class FeatureOrchestrator:
             operation = kwargs.get("operation", "unknown")
             # Redact in kwargs itself — it is splatted into the structured payload below.
             if "key" in kwargs:
-                kwargs["key"] = _redact_key_for_log(kwargs["key"])
+                kwargs["key"] = redact_key_for_log(kwargs["key"])
             key = kwargs.get("key", "unknown")
             self.log_structured("info", f"Cache operation: {operation}", cache_key=key, **kwargs)
 
@@ -446,7 +440,7 @@ class FeatureOrchestrator:
 
         # Redact once at the sink so every error path is covered by construction
         # (CWE-532) — callers pass the raw key; sentinels pass through readable.
-        cache_key = _redact_key_for_log(cache_key)
+        cache_key = redact_key_for_log(cache_key)
 
         # 1. Record exception in span and metrics
         if span:

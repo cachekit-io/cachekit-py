@@ -17,8 +17,8 @@ import pytest
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheInvalidator, StandardCacheHandler
-from cachekit.decorators.orchestrator import _redact_key_for_log
-from cachekit.hash_utils import SENTINEL_KEYS, redact_cache_key
+from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.hash_utils import _SENTINEL_KEYS, redact_cache_key
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.logging import UltraOptimizedStructuredLogger
 
@@ -214,13 +214,39 @@ class TestStructuredLoggerCacheOperationRedaction:
 
         assert self._emit(caplog, pre_redacted) == pre_redacted
 
-    @pytest.mark.parametrize("sentinel", sorted(SENTINEL_KEYS))
+    @pytest.mark.parametrize("sentinel", sorted(_SENTINEL_KEYS))
     def test_sentinels_stay_readable(self, sentinel: str, caplog: pytest.LogCaptureFixture) -> None:
+        """Covers ``system`` too — health.py logs under that label, and hashing it
+        turned a readable operator field into an opaque digest."""
         assert self._emit(caplog, sentinel) == sentinel
 
     def test_digest_matches_the_orchestrator_sink(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Both sinks must render one key as one digest, or logs cannot be joined."""
-        assert self._emit(caplog, TENANT_KEY) == _redact_key_for_log(TENANT_KEY)
+        """Both sinks must render one key as one digest, or logs cannot be joined.
+
+        Drives the orchestrator sink for real rather than re-calling the shared
+        helper — comparing the helper against itself would pass even if the two
+        sinks diverged, which is the only thing this test exists to catch.
+        """
+        from_logging_sink = self._emit(caplog, TENANT_KEY)
+
+        caplog.clear()
+        orchestrator = FeatureOrchestrator(
+            namespace="test",
+            circuit_breaker_enabled=False,
+            backpressure_enabled=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            orchestrator.handle_cache_error(
+                error=ValueError("boom"),
+                operation="get",
+                cache_key=TENANT_KEY,
+            )
+
+        orchestrator_messages = " ".join(r.getMessage() for r in caplog.records)
+        assert from_logging_sink in orchestrator_messages, (
+            f"sinks disagree: logging emitted {from_logging_sink!r}, orchestrator logged {orchestrator_messages!r}"
+        )
+        assert TENANT_KEY not in orchestrator_messages
 
     def test_falsy_key_emits_empty_string(self, caplog: pytest.LogCaptureFixture) -> None:
         """No key means nothing to redact — must not become a digest of ``""``."""

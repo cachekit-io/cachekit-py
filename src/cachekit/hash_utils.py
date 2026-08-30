@@ -27,8 +27,13 @@ def redact_cache_key(cache_key: object) -> str:
     return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 
 
-#: Key placeholders that carry no caller data and stay readable in logs.
-SENTINEL_KEYS = frozenset({"unknown", "<generation_failed>"})
+#: Placeholders that occupy the cache_key field but are not keys and carry no
+#: caller data, so they stay readable. ``system`` is the label health.py logs its
+#: checks under; hashing it turned a readable operator-facing field into an
+#: opaque digest and silently broke any dashboard filtering on it. None of these
+#: is a well-formed cache key (real keys are ``ns:...``), so nothing caller-supplied
+#: can impersonate one.
+_SENTINEL_KEYS = frozenset({"unknown", "<generation_failed>", "system"})
 
 #: Matches exactly what redact_cache_key() emits — keep the two in step.
 _REDACTED_KEY_RE = re.compile(r"<redacted:[0-9a-f]{16}>\Z")
@@ -44,17 +49,20 @@ def redact_key_for_log(cache_key: object) -> str:
 
     Matching the strict generated format makes redaction idempotent, so one key can
     cross several sinks — ``handle_cache_error`` into ``log_cache_operation``, or a
-    caller handing an already-redacted value straight to ``SimpleLogger`` — and still
-    emit a single digest that correlates across all of them. Re-hashing would mint a
-    fresh digest per hop and break that correlation, without opening a pass-through
-    for arbitrary angle-bracketed strings.
+    caller handing an already-redacted value to ``SimpleLogger`` — and still emit a
+    single digest that correlates across all of them. Re-hashing would mint a fresh
+    digest per hop and break that correlation, without opening a pass-through for
+    arbitrary angle-bracketed strings.
 
-    Lives beside redact_cache_key() in this leaf module so both the decorator
-    orchestrator and ``cachekit.logging`` share one policy without importing each
-    other.
+    Prefer this over :func:`redact_cache_key` at any *sink*. Reach for the bare
+    function only where the input is known-raw and cannot already be redacted.
+
+    Lives beside redact_cache_key() in this leaf module so the decorator
+    orchestrator, ``cachekit.logging`` and the backend loggers share one policy
+    without importing each other.
     """
     key_str = str(cache_key)
-    if key_str in SENTINEL_KEYS or _REDACTED_KEY_RE.fullmatch(key_str):
+    if key_str in _SENTINEL_KEYS or _REDACTED_KEY_RE.fullmatch(key_str):
         return key_str
     return redact_cache_key(key_str)
 

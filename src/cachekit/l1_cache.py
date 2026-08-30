@@ -205,7 +205,7 @@ class L1Cache:
                     self._remove_entry(key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
-                key,
+                redact_cache_key(key),
                 size,
                 self.max_memory_bytes,
             )

@@ -10,7 +10,8 @@ import pytest
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import redact_cache_key
-from cachekit.decorators.orchestrator import FeatureOrchestrator, _redact_key_for_log
+from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.hash_utils import redact_key_for_log
 
 
 class TestErrorHandlerOrchestration:
@@ -409,14 +410,14 @@ class TestCacheKeyRedaction:
 
     def test_pass_through_is_strict_allow_list(self) -> None:
         """Only known sentinels and redact_cache_key() output pass through unredacted."""
-        assert _redact_key_for_log("unknown") == "unknown"
-        assert _redact_key_for_log("<generation_failed>") == "<generation_failed>"
+        assert redact_key_for_log("unknown") == "unknown"
+        assert redact_key_for_log("<generation_failed>") == "<generation_failed>"
 
         already_redacted = redact_cache_key("anything")
-        assert _redact_key_for_log(already_redacted) == already_redacted
+        assert redact_key_for_log(already_redacted) == already_redacted
 
         # Arbitrary bracketed strings are NOT sentinels — they get redacted...
-        once = _redact_key_for_log("<tenant-42-alice-secret>")
+        once = redact_key_for_log("<tenant-42-alice-secret>")
         assert once == redact_cache_key("<tenant-42-alice-secret>")
         # ...and redaction stays idempotent through a second pass.
-        assert _redact_key_for_log(once) == once
+        assert redact_key_for_log(once) == once
