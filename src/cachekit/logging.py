@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from cachekit.config import get_settings
+from cachekit.hash_utils import redact_cache_key
 
 # Configure base logger
 logger = logging.getLogger(__name__)
@@ -251,11 +252,11 @@ class UltraOptimizedStructuredLogger:
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
-        # Mask cache key if needed
-        if self.mask_sensitive and cache_key:
-            display_key = self._mask_sensitive_data(cache_key)
-        else:
-            display_key = cache_key[:50] if cache_key else ""  # Truncate long keys
+        # Always redact: cache keys embed caller-supplied tenant/user identifiers
+        # (CWE-532, LAB-304). PII-pattern masking (SSN/email/...) does not catch
+        # them, and a raw [:50] prefix is exactly the leak — so neither is an
+        # alternative to the digest.
+        display_key = redact_cache_key(cache_key) if cache_key else ""
 
         # Determine log level based on error presence
         level = "ERROR" if "error" in kwargs else "INFO"
@@ -405,12 +406,6 @@ class UltraOptimizedStructuredLogger:
         if hasattr(self._context, "correlation_id") and self._context.correlation_id:
             context["correlation_id"] = self._context.correlation_id
         return context
-
-    def _mask_sensitive_data(self, data: str) -> str:
-        """Mask sensitive data if enabled."""
-        if self.mask_sensitive:
-            return mask_sensitive_patterns(data)
-        return data
 
     # Compatibility methods for tests
     def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):

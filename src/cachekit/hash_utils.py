@@ -18,6 +18,10 @@ def redact_cache_key(cache_key: object) -> str:
 
     Lives in this leaf module so backend/L1 modules can use it without importing
     cache_handler (which imports them).
+
+    The exact output format (``<redacted:{16 hex}>``) is pinned by
+    ``decorators.orchestrator._REDACTED_KEY_RE`` and
+    ``test_pass_through_is_strict_allow_list`` — change them together.
     """
     return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 

@@ -416,7 +416,7 @@ class TestCacheKeyRedaction:
         assert _redact_key_for_log(already_redacted) == already_redacted
 
         # Arbitrary bracketed strings are NOT sentinels — they get redacted...
-        assert _redact_key_for_log("<tenant-42-alice-secret>") == redact_cache_key("<tenant-42-alice-secret>")
-        # ...and redaction stays idempotent through a second pass.
         once = _redact_key_for_log("<tenant-42-alice-secret>")
+        assert once == redact_cache_key("<tenant-42-alice-secret>")
+        # ...and redaction stays idempotent through a second pass.
         assert _redact_key_for_log(once) == once

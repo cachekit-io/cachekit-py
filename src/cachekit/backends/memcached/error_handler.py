@@ -68,19 +68,24 @@ def classify_memcached_error(
             key=key,
         )
 
-    # Permanent — illegal input, client errors (don't retry)
+    # Permanent — illegal input, client errors (don't retry).
+    # Only the exception TYPE goes in the message: pymemcache embeds the raw
+    # cache key in illegal-input error text ("Key is too long: %r"), and the
+    # message reaches log sinks via str(e) (CWE-532). Full details stay on
+    # original_exception for programmatic access.
     if isinstance(exc, (MemcacheIllegalInputError, MemcacheClientError)):
         return BackendError(
-            message=f"Memcached permanent error during {operation}: {exc}",
+            message=f"Memcached permanent error during {operation}: {type(exc).__name__}",
             error_type=BackendErrorType.PERMANENT,
             original_exception=exc,
             operation=operation,
             key=key,
         )
 
-    # Unknown — safe default
+    # Unknown — safe default. Arbitrary exception text has unknown provenance
+    # and may embed the key, so only the type name goes in the message (CWE-532).
     return BackendError(
-        message=f"Memcached unknown error during {operation}: {exc}",
+        message=f"Memcached unknown error during {operation}: {type(exc).__name__}",
         error_type=BackendErrorType.UNKNOWN,
         original_exception=exc,
         operation=operation,

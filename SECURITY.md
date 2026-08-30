@@ -189,7 +189,7 @@ See [SSRF Protection](docs/features/ssrf-protection.md) for full details, includ
 
 ### Cache Key Redaction in Logs (CWE-532)
 
-Cache keys can embed caller-supplied tenant/user identifiers, so they never reach logs verbatim ([CWE-532][cwe-532]). Every log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction.
+Cache keys can embed caller-supplied tenant/user identifiers, so they never reach logs verbatim ([CWE-532][cwe-532]). Every log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction. `BackendError` redacts its `key` at construction, so `str(e)` is safe at any log sink; backend error *messages* carry no raw key either — wrapped third-party exception text of unknown provenance (e.g. pymemcache illegal-input errors, which echo the key) is reduced to the exception type name, with the original exception preserved on `original_exception` for programmatic access.
 
 ### Lock Token Transport (CWE-532)
 
