@@ -8,8 +8,9 @@ import logging
 
 import pytest
 
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import redact_cache_key
-from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.decorators.orchestrator import FeatureOrchestrator, _redact_key_for_log
 
 
 class TestErrorHandlerOrchestration:
@@ -364,3 +365,58 @@ class TestCacheKeyRedaction:
             structured = getattr(record, "structured", None)
             if structured is not None:
                 assert self.TENANT_KEY not in str(structured)
+
+    def test_backend_error_carrying_raw_key_is_sanitised(self, caplog: pytest.LogCaptureFixture) -> None:
+        """BackendError text must not leak its key attribute through {error} interpolation.
+
+        BackendError.__str__ appends a key= segment; redacting the separate
+        cache_key argument does not touch that value (CodeRabbit PR #264).
+        """
+        error = BackendError(
+            "backend down",
+            error_type=BackendErrorType.TRANSIENT,
+            operation="get",
+            key=self.TENANT_KEY,
+        )
+        with caplog.at_level(logging.INFO):
+            self._orchestrator().handle_cache_error(
+                error=error,
+                operation="cache_get",
+                cache_key=self.TENANT_KEY,
+                duration_ms=1.0,
+            )
+
+        assert caplog.records, "error handler must log"
+        for record in caplog.records:
+            assert self.TENANT_KEY not in record.getMessage()
+            structured = getattr(record, "structured", None)
+            if structured is not None:
+                assert self.TENANT_KEY not in str(structured)
+
+    def test_angle_bracketed_raw_key_is_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A raw key that merely looks bracketed must not ride the sentinel pass-through."""
+        bracketed = "<tenant-42-alice-secret>"
+        with caplog.at_level(logging.WARNING):
+            self._orchestrator().handle_cache_error(
+                error=ConnectionError("backend down"),
+                operation="cache_get",
+                cache_key=bracketed,
+            )
+
+        digest = redact_cache_key(bracketed)
+        assert any(digest in record.getMessage() for record in caplog.records)
+        assert not any(bracketed in record.getMessage() for record in caplog.records)
+
+    def test_pass_through_is_strict_allow_list(self) -> None:
+        """Only known sentinels and redact_cache_key() output pass through unredacted."""
+        assert _redact_key_for_log("unknown") == "unknown"
+        assert _redact_key_for_log("<generation_failed>") == "<generation_failed>"
+
+        already_redacted = redact_cache_key("anything")
+        assert _redact_key_for_log(already_redacted) == already_redacted
+
+        # Arbitrary bracketed strings are NOT sentinels — they get redacted...
+        assert _redact_key_for_log("<tenant-42-alice-secret>") == redact_cache_key("<tenant-42-alice-secret>")
+        # ...and redaction stays idempotent through a second pass.
+        once = _redact_key_for_log("<tenant-42-alice-secret>")
+        assert _redact_key_for_log(once) == once

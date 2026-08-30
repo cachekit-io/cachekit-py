@@ -25,6 +25,7 @@ does not regress the on-wire Redis lock name — the Redis backend now owns the
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -33,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cachekit import cache
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.hash_utils import redact_cache_key
 
 
@@ -309,3 +311,51 @@ class TestRedisBackendOwnsLockSuffixOnWire:
         assert ":lock:lock" not in wire_name, (
             f"double ':lock' suffix in Redis wire name: {wire_name!r} — both wrapper and backend appended the suffix"
         )
+
+
+class _LockFailingBackend(_RecordingLockableBackend):
+    """acquire_lock records the key, then fails with a key-carrying BackendError."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        timeout: float = 10.0,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[bool]:
+        """Raise a BackendError that embeds the cache key, as real backends do."""
+        self.lock_keys.append(key)
+        raise BackendError(
+            "lock backend down",
+            error_type=BackendErrorType.TRANSIENT,
+            operation="acquire_lock",
+            key=key,
+        )
+        yield True  # pragma: no cover — unreachable, satisfies the generator contract
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestLockFailureWarningRedactsKey:
+    """The 'Lock operation failed' warning interpolates ``{e}`` — a BackendError
+    carrying the cache key must not leak it into the log (CodeRabbit PR #264)."""
+
+    async def test_lock_failure_warning_never_logs_raw_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _LockFailingBackend()
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> dict[str, int]:
+            return {"x": x}
+
+        with caplog.at_level(logging.WARNING):
+            result = await my_func(7)
+
+        # Fallback contract intact: lock failure degrades to lock-free execution.
+        assert result == {"x": 7}
+        assert len(backend.lock_keys) == 1
+        raw_key = backend.lock_keys[0]
+
+        lock_warnings = [r.getMessage() for r in caplog.records if "Lock operation failed" in r.getMessage()]
+        assert lock_warnings, "lock failure must be logged"
+        assert not any(raw_key in m for m in lock_warnings), f"raw cache key leaked into lock warning: {lock_warnings!r}"
+        assert any(redact_cache_key(raw_key) in m for m in lock_warnings), "digest must keep the failure correlatable"

@@ -147,3 +147,36 @@ class TestCacheInvalidatorRedaction:
 
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
+
+
+class TestKeyCarryingBackendErrorRedaction:
+    """A BackendError that carries the raw key must not leak it through ``{e}``.
+
+    ``BackendError.__str__`` includes a ``key=`` segment; the get() sinks
+    interpolate the exception verbatim, so the exception text itself must be
+    redacted (CodeRabbit PR #264).
+    """
+
+    def _key_carrying_error(self) -> BackendError:
+        return BackendError(
+            "backend down",
+            error_type=BackendErrorType.TRANSIENT,
+            operation="get",
+            key=TENANT_KEY,
+        )
+
+    def test_sync_get_failure_redacts_key_in_exception_text(self, caplog: pytest.LogCaptureFixture) -> None:
+        handler = StandardCacheHandler(backend=_FailingBackend(self._key_carrying_error()))
+
+        with caplog.at_level(logging.ERROR):
+            assert handler.get(TENANT_KEY) is None
+
+        _assert_redacted(caplog, TENANT_KEY)
+
+    async def test_async_get_failure_redacts_key_in_exception_text(self, caplog: pytest.LogCaptureFixture) -> None:
+        handler = StandardCacheHandler(backend=_FailingBackend(self._key_carrying_error()))
+
+        with caplog.at_level(logging.ERROR):
+            assert await handler.get_async(TENANT_KEY) is None
+
+        _assert_redacted(caplog, TENANT_KEY)
