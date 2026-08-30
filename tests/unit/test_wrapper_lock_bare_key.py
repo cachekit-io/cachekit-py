@@ -33,6 +33,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cachekit import cache
+from cachekit.hash_utils import redact_cache_key
 
 
 class _RecordingLockableBackend:
@@ -196,14 +197,16 @@ class TestWrapperLockTimeoutFallback:
         assert len(backend.lock_keys) == 1
         bare_key = backend.lock_keys[0]
 
-        # The warning must reference the bare cache_key (no ``:lock`` smuggled in)
-        # so operators reading logs see the same key shape that ``get``/``set`` use.
+        # The warning must reference the redacted digest of the BARE cache_key —
+        # a ``:lock``-suffixed key would digest differently, so the bare-key
+        # contract is still pinned. Raw keys never reach logs (CWE-532, LAB-304).
         timeout_warnings = [r for r in caplog.records if "Failed to acquire lock" in r.message]
         assert len(timeout_warnings) == 1, (
             f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
         )
         msg = timeout_warnings[0].message
-        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert redact_cache_key(bare_key) in msg, f"warning must name the bare cache_key's digest; got {msg!r}"
+        assert bare_key not in msg, f"warning leaked the raw cache_key: {msg!r}"
         assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
 
 
@@ -238,14 +241,16 @@ class TestWrapperLockOperationFailureFallback:
         assert len(backend.lock_keys) == 1
         bare_key = backend.lock_keys[0]
 
-        # The lock-operation-failed warning must reference the bare cache_key —
-        # not a ``:lock``-suffixed variant — matching the protocol contract.
+        # The lock-operation-failed warning must reference the redacted digest of
+        # the bare cache_key — a ``:lock``-suffixed key would digest differently.
+        # Raw keys never reach logs (CWE-532, LAB-304).
         lock_failed_warnings = [r for r in caplog.records if "Lock operation failed" in r.message]
         assert len(lock_failed_warnings) == 1, (
             f"expected one lock-operation-failed warning; got {[r.message for r in caplog.records]!r}"
         )
         msg = lock_failed_warnings[0].message
-        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert redact_cache_key(bare_key) in msg, f"warning must name the bare cache_key's digest; got {msg!r}"
+        assert bare_key not in msg, f"warning leaked the raw cache_key: {msg!r}"
         assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
 
 

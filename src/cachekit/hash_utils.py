@@ -3,9 +3,23 @@
 Uses BLAKE3 for hashing (approximately 2-3 GB/s throughput).
 """
 
+import hashlib
 from typing import Union
 
 import blake3
+
+
+def redact_cache_key(cache_key: object) -> str:
+    """Redact a cache key for log/error messages.
+
+    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
+    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
+    across the sync and async cache-set failure paths without leaking the key itself.
+
+    Lives in this leaf module so backend/L1 modules can use it without importing
+    cache_handler (which imports them).
+    """
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 
 
 def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:

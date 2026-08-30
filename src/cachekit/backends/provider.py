@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from cachekit.hash_utils import redact_cache_key
+
 if TYPE_CHECKING:
     import redis
     import redis.asyncio as redis_async
@@ -59,21 +61,21 @@ class SimpleLogger:
         self._logger.error(message)
 
     def cache_hit(self, key: str, source: str = "Redis"):
-        """Log cache hits."""
-        self._logger.debug(f"{source} cache hit for key: {key}")
+        """Log cache hits. Keys are redacted — they embed caller identifiers (CWE-532)."""
+        self._logger.debug(f"{source} cache hit for key: {redact_cache_key(key)}")
 
     def cache_miss(self, key: str):
-        """Log cache misses."""
-        self._logger.debug(f"Cache miss for key: {key}")
+        """Log cache misses. Keys are redacted — they embed caller identifiers (CWE-532)."""
+        self._logger.debug(f"Cache miss for key: {redact_cache_key(key)}")
 
     def cache_stored(self, key: str, ttl=None):
-        """Log cache storage operations."""
+        """Log cache storage operations. Keys are redacted — they embed caller identifiers (CWE-532)."""
         ttl_info = f" with TTL {ttl}" if ttl else ""
-        self._logger.debug(f"Cached result for key: {key}{ttl_info}")
+        self._logger.debug(f"Cached result for key: {redact_cache_key(key)}{ttl_info}")
 
     def cache_invalidated(self, key: str, source: str = "Redis"):
-        """Log cache invalidation."""
-        self._logger.debug(f"Invalidated {source} cache for key: {key}")
+        """Log cache invalidation. Keys are redacted — they embed caller identifiers (CWE-532)."""
+        self._logger.debug(f"Invalidated {source} cache for key: {redact_cache_key(key)}")
 
 
 class DefaultLoggerProvider(LoggerProvider):

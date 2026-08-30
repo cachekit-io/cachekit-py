@@ -1229,7 +1229,7 @@ def create_cache_wrapper(
                     raise
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
-                    logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                    logger().warning(f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {e}")
                     _l1_cache.invalidate(cache_key)
 
         # Continue with the rest of the sync wrapper logic...
@@ -1386,7 +1386,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="backend_connection",
-                cache_key=cache_key,
+                cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=0.0,
                 correlation_id=correlation_id,
@@ -1577,7 +1577,7 @@ def create_cache_wrapper(
                         raise
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
-                        logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                        logger().warning(f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {e}")
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)
@@ -1661,7 +1661,7 @@ def create_cache_wrapper(
                                 task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
                         except Exception as e:
                             # TTL refresh is optional, don't fail on error
-                            _logger.debug("TTL refresh failed for %s: %s", cache_key, e)
+                            _logger.debug("TTL refresh failed for %s: %s", redact_cache_key(cache_key), e)
                     elif refresh_ttl_on_get and ttl:
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
@@ -1744,7 +1744,9 @@ def create_cache_wrapper(
                         else:
                             # Lock timeout - double-check cache before giving up
                             # Another request may have populated it while we waited
-                            logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
+                            logger().warning(
+                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                            )
                             try:
                                 # Routed through get_cached_value_async: corrupt entries evict (#159)
                                 cached_result = await operation_handler.get_cached_value_async(cache_key)
@@ -1769,7 +1771,7 @@ def create_cache_wrapper(
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
-                                    f"Cache check after lock timeout failed for {cache_key}, executing without lock"
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
                                 )
 
                         # Execute the original function (with or without lock)
@@ -1846,12 +1848,14 @@ def create_cache_wrapper(
                             raise e.original_exception from e
 
                     # Lock operation failed - execute without lock
-                    logger().warning(f"Lock operation failed for {cache_key}, executing without lock: {e}")
+                    logger().warning(f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {e}")
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
             if not hasattr(_backend, "acquire_lock"):
-                logger().debug(f"Backend doesn't support locking for {cache_key}, executing without thundering herd protection")
+                logger().debug(
+                    f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
+                )
 
             try:
                 # Execute the original function
@@ -1944,7 +1948,7 @@ def create_cache_wrapper(
                     try:
                         _backend.delete(key)
                     except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), e)
                         continue  # keep key tracked for retry
                 _cached_keys.discard(key)
             return
@@ -1971,7 +1975,7 @@ def create_cache_wrapper(
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), e)
             else:
                 invalidator.invalidate_cache(func, args, kwargs, namespace)
 
@@ -2002,7 +2006,7 @@ def create_cache_wrapper(
                     try:
                         _backend.delete(key)
                     except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), e)
                         continue
                 _cached_keys.discard(key)
             return
@@ -2030,7 +2034,7 @@ def create_cache_wrapper(
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), e)
             else:
                 await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
 

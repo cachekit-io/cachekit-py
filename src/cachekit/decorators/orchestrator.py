@@ -27,6 +27,9 @@ def _redact_key_for_log(cache_key: object) -> str:
     logs verbatim (CWE-532, issue #163). Real keys are canonical ``ns:...`` strings;
     sentinels (``unknown``, ``<generation_failed>``) and pre-redacted values
     (``<redacted:...>``) carry no caller data and stay readable as-is.
+
+    The broad ``<...>`` match also makes redaction idempotent — handle_cache_error's
+    redacted output flows through log_cache_operation's redaction a second time.
     """
     key_str = str(cache_key)
     if key_str == "unknown" or (key_str.startswith("<") and key_str.endswith(">")):
