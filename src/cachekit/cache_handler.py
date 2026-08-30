@@ -1908,7 +1908,7 @@ class StandardCacheHandler:
             if remaining_ttl is not None and remaining_ttl < refresh_ttl * self.ttl_refresh_threshold:
                 await self.backend.refresh_ttl(key, refresh_ttl)
                 get_logger().debug(
-                    f"Refreshed TTL for {key}: {refresh_ttl}s "
+                    f"Refreshed TTL for {redact_cache_key(key)}: {refresh_ttl}s "
                     f"(remaining: {remaining_ttl}s, threshold: {self.ttl_refresh_threshold})"
                 )
         except Exception as e:
