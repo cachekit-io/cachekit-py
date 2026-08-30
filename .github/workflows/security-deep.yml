@@ -147,31 +147,50 @@ jobs:
       run: |
         uv sync --group dev --group fuzz --python 3.11
 
+    # Exit-code contract — no `|| true`, every non-zero exit fails the job:
+    #   - Pass is libFuzzer exiting 0 when -max_total_time=600 expires cleanly.
+    #   - A crash, OOM, or uncaught Python exception exits non-zero and fails
+    #     the job. atheris.Setup(sys.argv, ...) forwards flags to libFuzzer, so
+    #     -artifact_prefix drops the reproducer in tests/fuzzing/artifacts/.
+    #     No corpus dir is passed, so that directory only ever holds crash
+    #     artifacts — a file there is always a finding, never corpus growth.
+    #   - `timeout 15m` exit 124 is a deliberate FAILURE, not budget
+    #     exhaustion: the fuzz budget is 600 s and budget exhaustion exits 0
+    #     above, so a target still alive at 15 min is hung (e.g. stuck in
+    #     native code where libFuzzer's own watchdog can't fire).
+    #   - Zero matched targets fails the job: a glob that stops matching must
+    #     not "pass" having fuzzed nothing (LAB-1136 post-mortem pattern).
     - name: Run Atheris fuzz targets (10 min each)
       run: |
-        for fuzz_target in tests/fuzzing/fuzz_*.py; do
-          if [ -f "$fuzz_target" ]; then
-            echo "Fuzzing $fuzz_target..."
-            timeout 10m uv run --python 3.11 python "$fuzz_target" -max_total_time=600 || true
-          fi
-        done
-
-    - name: Upload crash corpus
-      if: always()
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-      with:
-        name: atheris-crashes-${{ github.run_id }}
-        path: tests/fuzzing/corpus/
-
-    - name: Report fuzzing results
-      if: always()
-      run: |
-        if [ -d tests/fuzzing/corpus/ ] && find tests/fuzzing/corpus/ -mindepth 1 ! -name '.gitignore' -print -quit | grep -q .; then
-          echo "⚠️  Crashes discovered during Atheris fuzzing!"
-          ls -lh tests/fuzzing/corpus/
+        mkdir -p tests/fuzzing/artifacts
+        shopt -s nullglob
+        targets=(tests/fuzzing/fuzz_*.py)
+        if [ "${#targets[@]}" -eq 0 ]; then
+          echo "::error::no Atheris targets matched tests/fuzzing/fuzz_*.py — refusing to pass having fuzzed nothing"
           exit 1
         fi
-        echo "✅ No crashes discovered during Atheris fuzzing"
+        for fuzz_target in "${targets[@]}"; do
+          echo "Fuzzing $fuzz_target..."
+          timeout 15m uv run --python 3.11 python "$fuzz_target" \
+            -max_total_time=600 -artifact_prefix=tests/fuzzing/artifacts/
+        done
+
+    # No "Report fuzzing results" step: now that `|| true` is gone, a crash
+    # fails its own fuzz step, so a trailing check could only ever run in the
+    # no-crash case and print ✅ — a named green step incapable of failing,
+    # the manufactured-evidence pattern the Extended Fuzzing job above already
+    # removed. (The old gate also inspected tests/fuzzing/corpus/, a directory
+    # nothing ever wrote to.) The fuzz steps' exit codes are the signal; this
+    # upload preserves the reproducer, which would otherwise die with the
+    # ephemeral runner.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: atheris-crash-artifacts
+        path: tests/fuzzing/artifacts/
+        retention-days: 30
+        if-no-files-found: warn
 
   miri-full:
     name: Miri Full Suite

@@ -73,6 +73,9 @@ target/
 benchmark_results/
 *.benchmark
 
+# Atheris/libFuzzer crash reproducers (see -artifact_prefix in scripts/fuzz-python.sh)
+tests/fuzzing/artifacts/
+
 # Temporary files
 *.log
 logs/
