@@ -49,11 +49,10 @@ happens when it isn't, and which backend you actually reach.
 | Integrity checking | Forced `True`, cannot be overridden | On by preset default |
 | Backend | Env auto-detect — **not pinned to the SaaS**, see footgun below; pass `backend=` explicitly | `CachekitIOBackend` guaranteed (preset creates its own, ignores `backend=`; requires `CACHEKIT_API_KEY` at decoration time) |
 | Tenant mode | `single_tenant_mode` handled automatically | Handled automatically (auto-detect path) |
-| SWR | Off unless requested | On by default (`stale_ttl` sized from `ttl`) |
+| Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`) |
 
 **Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
-explicit backend. The intent is auditable in code, and a missing key is a loud
-deploy-time failure instead of silent plaintext. Encryption as a **fleet-wide
+explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
 opt-in convenience** → set `CACHEKIT_MASTER_KEY` and let auto-detect do it (this
 applies to every preset, not just `.io`). Compliance claims — "the SaaS is out of
 HIPAA/PCI scope because it only ever stores ciphertext" — should only be hung on
@@ -80,7 +79,7 @@ plaintext on the backend.
 > separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
 > which **defaults to `False`** — so even `.secure` fails *open* on tampered or
 > key-mismatched entries (miss + recompute) unless you opt in. See
-> [Fail-Closed Read Path](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
+> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ```python notest
 from cachekit import cache
@@ -224,12 +223,14 @@ export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separat
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
 When you turn encryption on over a cache that already holds plaintext entries, those
-entries are **rejected, never read**. The read path fails closed: the entry raises a
-`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
-and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+entries are **rejected, never read**: the entry raises a `SerializationError`
+internally, the caller treats it as a miss, evicts the stale entry, recomputes,
+and re-stores the value encrypted. (This rejection is unconditional — it is not
+governed by the `fail_closed` setting, which applies only to authenticated-decrypt
+failures.) Migration is therefore lazy and self-healing:
 
 ```text
-read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+read plaintext entry → SerializationError (rejected, never deserialized) → evict → recompute → re-store encrypted
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
@@ -319,7 +320,7 @@ def get_patient_records(hospital_id: int):
     )
 
 df = get_patient_records(42)
-# DataFrame encrypted client-side, HIPAA-compliant zero-knowledge storage
+# DataFrame encrypted client-side — zero-knowledge storage
 ```
 
 ### Multi-Tenant Isolation
@@ -445,7 +446,7 @@ path when encryption is configured:
 ```text
 Handler configured with encryption:
   entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
-  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+  entry header claims plaintext  → SerializationError (plaintext never returned; miss + evict, independent of `fail_closed`)
 ```
 
 The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
@@ -686,7 +687,6 @@ export default {
     // NEVER sees plaintext (no decryption key)
     await KV.put(key, value);
 
-    // Compliance: GDPR, HIPAA, PCI-DSS satisfied
     // Backend cannot read user data even if compromised
     return new Response("OK");
   }
@@ -696,7 +696,7 @@ export default {
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
 - ✅ Multi-tenant isolation (per-tenant encryption keys)
-- ✅ GDPR/HIPAA/PCI-DSS compliance out of the box
+- ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
 ---

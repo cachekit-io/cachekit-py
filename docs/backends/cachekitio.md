@@ -206,10 +206,10 @@ zero-knowledge bytes on the wire — **but the failure mode is inverted**:
 
 - `@cache.secure(backend=CachekitIOBackend())` — **fails closed.** Encryption is
   forced on in code; a missing master key (param or `CACHEKIT_MASTER_KEY`) raises
-  `ValueError` at decoration time. Nothing plaintext can ever reach the backend.
+  `ValueError` at decoration time. No plaintext **values** can ever reach the
+  backend (cache keys and the frame header stay plaintext by design).
 - `@cache.io()` + `CACHEKIT_MASTER_KEY` — **fails open.** If the env var is absent,
-  the same code silently caches **plaintext** to the SaaS. Nothing raises; the only
-  difference is the missing env var.
+  the same code silently caches **plaintext** to the SaaS.
 
 Use `.secure` + explicit backend when encryption is a security requirement (PII,
 PHI, compliance claims — the "SaaS out of HIPAA/PCI scope" argument only holds on
