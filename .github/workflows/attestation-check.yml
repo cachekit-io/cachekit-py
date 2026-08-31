@@ -16,18 +16,29 @@ jobs:
       - name: Get latest release tag
         id: release
         run: |
-          # "the lookup failed" and "there are no releases" are different facts and
-          # must not share an exit path. The old `2>/dev/null || echo ""` collapsed
-          # an API hiccup or a bad token into the same green "skipping" as a repo
-          # with no releases at all, so a week of attestation verification could go
-          # un-run and still report success — indistinguishable from healthy.
-          # `// empty` keeps the genuinely-empty list an empty TAG without relying
-          # on how gh renders a null jq result.
-          if ! TAG=$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName // empty'); then
+          # Three outcomes, three exit paths. The old `2>/dev/null || echo ""`
+          # collapsed the first into the third, so a week with no attestation
+          # verification at all exited 0 and read as healthy:
+          #   1. lookup failed -> hard fail; we know nothing either way.
+          #   2. releases exist but none is GitHub's "latest" -> hard fail. On a repo
+          #      that publishes releases that is a tamper or misconfiguration signal,
+          #      and skipping it is the exact shape LAB-984 fell into.
+          #   3. zero releases at all -> skip; nothing has been published yet.
+          #
+          # `isLatest` is GitHub's own newest-non-draft-non-prerelease marker, so it
+          # pins the artifact users actually install. An unfiltered `--limit 1` can
+          # return a draft or prerelease, which would either verify an RC green while
+          # the stable wheel goes unchecked, or fail on a wheel PyPI never got.
+          if ! RELEASES=$(gh release list --repo "$REPO" --limit 30 --json tagName,isLatest); then
             echo "::error::gh release list failed for $REPO — cannot determine the latest release; refusing to report a green skip"
             exit 1
           fi
+          TAG=$(jq -r 'map(select(.isLatest))[0].tagName // empty' <<<"$RELEASES")
           if [ -z "$TAG" ]; then
+            if [ "$(jq -r 'length' <<<"$RELEASES")" -ne 0 ]; then
+              echo "::error::$REPO has releases but none is marked latest (all drafts/prereleases?) — refusing to skip a release that may need attesting"
+              exit 1
+            fi
             echo "$REPO has no published releases — nothing to attest, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -51,8 +62,13 @@ jobs:
           # `gh attestation` has no `list` subcommand — the old query errored in
           # ~8s every run (that was the real cause of the weekly red, not missing
           # attestations). Verify the actual published artifact instead.
-          VER="${{ steps.release.outputs.tag }}"
-          VER="${VER#v}"
+          #
+          # TAG/REPO arrive via env, never template-interpolated into this body: a
+          # git tag may legally contain `$(...)` or backticks, and whoever can name
+          # a tag is exactly the adversary this tripwire exists to catch —
+          # interpolating it would hand them code execution in a job holding
+          # GH_TOKEN and issues: write.
+          VER="${TAG#v}"
           echo "Verifying attestations for cachekit ${VER}"
           mkdir -p attest-check
           if ! pip download "cachekit==${VER}" --no-deps --only-binary :all: -d attest-check; then
@@ -67,21 +83,30 @@ jobs:
           fi
           for f in "${files[@]}"; do
             echo "Verifying attestation for $f"
-            gh attestation verify "$f" --repo ${{ github.repository }} || {
+            gh attestation verify "$f" --repo "$REPO" || {
               echo "::error::Attestation verification failed for $f"
               exit 1
             }
           done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
 
+      # Only a real verification failure opens an issue. Without the skip guard a
+      # failed *lookup* also landed here, filing a public "Attestation verification
+      # failed for " issue — empty tag, blaming attestations for an API outage that
+      # never reached the verify step. A guard that misreports is the same trust bug
+      # as the silence it replaced; for a lookup failure the red run is the signal.
       - name: Open issue on failure
-        if: failure()
+        if: failure() && steps.release.outputs.skip == 'false'
         run: |
           gh issue create \
-            --repo ${{ github.repository }} \
-            --title "Attestation verification failed for ${{ steps.release.outputs.tag }}" \
+            --repo "$REPO" \
+            --title "Attestation verification failed for $TAG" \
             --body "Weekly attestation health check failed. Verify that the release workflow produced valid attestations." \
             --label "bug"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}

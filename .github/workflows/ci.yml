@@ -158,26 +158,35 @@ jobs:
     # project/patch statuses codecov.yml declares, and every flag there sets
     # `carryforward: true` — so a silently-dropped upload does not remove the
     # status, it answers "is this PR's new code 80% covered?" with a previous
-    # run's numbers. A green patch status that measured none of the diff is the
-    # same manufactured-evidence class this ticket exists to remove, so an
-    # upload failure has to be red and visible. Fork PRs cannot mint the OIDC
-    # token this uses (`id-token: write` is never granted to them) and never
-    # reach the self-hosted `cachekit` runner unapproved, so this cannot redden
-    # an outside contribution.
+    # run's numbers.
+    #
+    # Scoped to same-repo events rather than a bare `true`, because of what the
+    # action actually does on a fork (read at the pinned SHA, not assumed): its
+    # `Get OIDC token` step is guarded `CC_USE_OIDC == 'true' && CC_FORK != 'true'`,
+    # so on a fork it never attempts OIDC, `CC_TOKEN` stays empty, and the upload
+    # proceeds TOKENLESS — Codecov's rate-limited path. A bare `true` would let a
+    # 429 nobody controls redden an outside contribution, which on a repo with no
+    # branch protection trains maintainers to merge over red CI: the opposite of
+    # what this ticket is hardening. The flag therefore applies exactly where OIDC
+    # really authenticates.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
       with:
         files: ./coverage.xml
         use_oidc: true
-        fail_ci_if_error: true
+        fail_ci_if_error: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
     # Stays false, deliberately: junit.xml feeds Codecov Test Analytics
     # (flaky-test history) only. Nothing gates on it and no status is computed
     # from it, so a Codecov-side outage here would redden otherwise-passing CI
-    # while hiding nothing. Losing a run of flake history is not a trust bug the
-    # way stale coverage is.
+    # while hiding nothing.
+    #
+    # `handle_no_reports_found` is left at its default (false) on both uploads on
+    # purpose: it would also swallow "the report was never written", which is the
+    # silent-degradation this ticket exists to remove. A second red step on an
+    # already-red job is noise; a green job that uploaded nothing is a trust bug.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
