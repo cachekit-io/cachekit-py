@@ -153,15 +153,31 @@ jobs:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
+    # fail_ci_if_error is deliberately split between these two uploads, not
+    # defaulted (LAB-2528 finding 3). coverage.xml is the ONLY input to the
+    # project/patch statuses codecov.yml declares, and every flag there sets
+    # `carryforward: true` — so a silently-dropped upload does not remove the
+    # status, it answers "is this PR's new code 80% covered?" with a previous
+    # run's numbers. A green patch status that measured none of the diff is the
+    # same manufactured-evidence class this ticket exists to remove, so an
+    # upload failure has to be red and visible. Fork PRs cannot mint the OIDC
+    # token this uses (`id-token: write` is never granted to them) and never
+    # reach the self-hosted `cachekit` runner unapproved, so this cannot redden
+    # an outside contribution.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
       with:
         files: ./coverage.xml
         use_oidc: true
-        fail_ci_if_error: false
+        fail_ci_if_error: true
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
+    # Stays false, deliberately: junit.xml feeds Codecov Test Analytics
+    # (flaky-test history) only. Nothing gates on it and no status is computed
+    # from it, so a Codecov-side outage here would redden otherwise-passing CI
+    # while hiding nothing. Losing a run of flake history is not a trust bug the
+    # way stale coverage is.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5

@@ -16,16 +16,28 @@ jobs:
       - name: Get latest release tag
         id: release
         run: |
-          TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          # "the lookup failed" and "there are no releases" are different facts and
+          # must not share an exit path. The old `2>/dev/null || echo ""` collapsed
+          # an API hiccup or a bad token into the same green "skipping" as a repo
+          # with no releases at all, so a week of attestation verification could go
+          # un-run and still report success — indistinguishable from healthy.
+          # `// empty` keeps the genuinely-empty list an empty TAG without relying
+          # on how gh renders a null jq result.
+          if ! TAG=$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName // empty'); then
+            echo "::error::gh release list failed for $REPO — cannot determine the latest release; refusing to report a green skip"
+            exit 1
+          fi
           if [ -z "$TAG" ]; then
-            echo "No releases found, skipping"
+            echo "$REPO has no published releases — nothing to attest, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Latest release: $TAG"
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
 
       - name: Set up Python
         if: steps.release.outputs.skip != 'true'
