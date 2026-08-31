@@ -169,6 +169,16 @@ jobs:
     # branch protection trains maintainers to merge over red CI: the opposite of
     # what this ticket is hardening. The flag therefore applies exactly where OIDC
     # really authenticates.
+    #
+    # ACCEPTED RESIDUAL RISK, stated because the scoping creates it: on a fork PR a
+    # dropped tokenless upload is still silent, and carryforward then answers the
+    # patch question with an earlier commit's numbers — a stale green on exactly the
+    # least-trusted contributions. Accepted because a fork PR cannot reach the
+    # self-hosted `cachekit` runner without a maintainer approving the run, so a
+    # human is already in that loop, and no fork PR has run here to date. The real
+    # fix is to stop depending on an external upload for the floor (a local
+    # `--cov-fail-under` on the PR pytest invocation); that is a coverage-policy
+    # change, tracked separately rather than smuggled into this diff.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5

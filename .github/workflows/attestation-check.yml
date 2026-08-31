@@ -29,14 +29,28 @@ jobs:
           # pins the artifact users actually install. An unfiltered `--limit 1` can
           # return a draft or prerelease, which would either verify an RC green while
           # the stable wheel goes unchecked, or fail on a wheel PyPI never got.
-          if ! RELEASES=$(gh release list --repo "$REPO" --limit 30 --json tagName,isLatest); then
+          if ! RELEASES=$(gh release list --repo "$REPO" --limit 100 --json tagName,isLatest); then
             echo "::error::gh release list failed for $REPO — cannot determine the latest release; refusing to report a green skip"
+            exit 1
+          fi
+          # Validate the payload in its own statement before anything branches on it.
+          # The `type=="array"` guard makes every non-array shape (null, an object,
+          # an error envelope) return null, which `jq -e` reports as a non-zero exit
+          # alongside parse errors and no-output — so empty or truncated stdout from
+          # a `gh` that still exited 0 lands on the annotated hard failure instead of
+          # a raw jq trace. Doing this inline as `[ "$(jq ...)" -ne 0 ]` would hide
+          # jq's exit code in a command substitution, suppress `set -e` inside the
+          # `if`, and — when `[` itself errored on non-numeric input — evaluate FALSE
+          # straight into the skip path: the same fail-open shape as the
+          # `|| echo ""` this commit removes.
+          if ! COUNT=$(jq -e 'if type == "array" then length else null end' <<<"$RELEASES"); then
+            echo "::error::gh release list returned no parseable release array for $REPO — refusing to report a green skip"
             exit 1
           fi
           TAG=$(jq -r 'map(select(.isLatest))[0].tagName // empty' <<<"$RELEASES")
           if [ -z "$TAG" ]; then
-            if [ "$(jq -r 'length' <<<"$RELEASES")" -ne 0 ]; then
-              echo "::error::$REPO has releases but none is marked latest (all drafts/prereleases?) — refusing to skip a release that may need attesting"
+            if [ "$COUNT" -ne 0 ]; then
+              echo "::error::$REPO has $COUNT release(s) but none is marked latest — refusing to skip a release that may need attesting"
               exit 1
             fi
             echo "$REPO has no published releases — nothing to attest, skipping"
@@ -57,6 +71,7 @@ jobs:
           python-version: '3.12'
 
       - name: Verify attestations
+        id: verify
         if: steps.release.outputs.skip != 'true'
         run: |
           # `gh attestation` has no `list` subcommand — the old query errored in
@@ -93,18 +108,22 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ steps.release.outputs.tag }}
 
-      # Only a real verification failure opens an issue. Without the skip guard a
-      # failed *lookup* also landed here, filing a public "Attestation verification
+      # Gated on the verify step's own outcome, not a bare `failure()`. Previously a
+      # failed *lookup* landed here and filed a public "Attestation verification
       # failed for " issue — empty tag, blaming attestations for an API outage that
-      # never reached the verify step. A guard that misreports is the same trust bug
-      # as the silence it replaced; for a lookup failure the red run is the signal.
+      # never reached the verify step; a setup-python or PyPI-lag failure did the
+      # same with a tag attached. A tripwire that cries wolf is the same trust bug
+      # as one that stays silent, so the title says "health check" (the step covers
+      # both the PyPI download and the attestation check) and the body sends the
+      # reader to the log to find out which. For any earlier failure the red run is
+      # the signal and no issue is filed.
       - name: Open issue on failure
-        if: failure() && steps.release.outputs.skip == 'false'
+        if: failure() && steps.verify.outcome == 'failure'
         run: |
           gh issue create \
             --repo "$REPO" \
-            --title "Attestation verification failed for $TAG" \
-            --body "Weekly attestation health check failed. Verify that the release workflow produced valid attestations." \
+            --title "Attestation health check failed for $TAG" \
+            --body "The weekly attestation health check failed for ${TAG}. Check the run log to see whether the wheel download or the attestation verification failed, then verify that the release workflow produced valid attestations." \
             --label "bug"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
