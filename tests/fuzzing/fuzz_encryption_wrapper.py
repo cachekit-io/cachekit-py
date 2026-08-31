@@ -59,6 +59,9 @@ def TestOneInput(data: bytes) -> None:
     # Roundtrip under the same tenant + cache_key must be lossless.
     encrypted, metadata = wrapper_a.serialize(payload, cache_key=cache_key)
     decrypted = wrapper_a.deserialize(encrypted, metadata, cache_key=cache_key)
+    # Explicit raise, not assert: -O / PYTHONOPTIMIZE strips assert, which would
+    # leave this target reporting no crashes while verifying nothing. Matches
+    # the AAD-binding and tenant-isolation oracles below, which already raise.
     if decrypted != payload:
         raise AssertionError("Encryption roundtrip failed: data mismatch")
 

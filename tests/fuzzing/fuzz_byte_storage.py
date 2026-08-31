@@ -55,6 +55,8 @@ def TestOneInput(data: bytes) -> None:
         payload = bytes(fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 4096)))
         envelope = _STORAGE.store(payload, "msgpack")
         retrieved, fmt = _STORAGE.retrieve(envelope)
+        # Explicit raise, not assert: -O / PYTHONOPTIMIZE strips assert, which
+        # would leave this target reporting no crashes while verifying nothing.
         if bytes(retrieved) != payload:
             raise AssertionError("ByteStorage roundtrip failed")
         if fmt != "msgpack":
