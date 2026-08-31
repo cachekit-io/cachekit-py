@@ -55,8 +55,10 @@ def TestOneInput(data: bytes) -> None:
         payload = bytes(fdp.ConsumeBytes(fdp.ConsumeIntInRange(0, 4096)))
         envelope = _STORAGE.store(payload, "msgpack")
         retrieved, fmt = _STORAGE.retrieve(envelope)
-        assert bytes(retrieved) == payload, "ByteStorage roundtrip failed"
-        assert fmt == "msgpack", f"format tag corrupted: {fmt}"
+        if bytes(retrieved) != payload:
+            raise AssertionError("ByteStorage roundtrip failed")
+        if fmt != "msgpack":
+            raise AssertionError(f"format tag corrupted: {fmt}")
     else:
         # Attacker-controlled envelope (cache content is untrusted): must
         # raise cleanly, never crash the interpreter.

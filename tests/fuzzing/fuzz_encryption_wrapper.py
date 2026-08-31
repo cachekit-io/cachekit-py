@@ -59,7 +59,8 @@ def TestOneInput(data: bytes) -> None:
     # Roundtrip under the same tenant + cache_key must be lossless.
     encrypted, metadata = wrapper_a.serialize(payload, cache_key=cache_key)
     decrypted = wrapper_a.deserialize(encrypted, metadata, cache_key=cache_key)
-    assert decrypted == payload, "Encryption roundtrip failed: data mismatch"
+    if decrypted != payload:
+        raise AssertionError("Encryption roundtrip failed: data mismatch")
 
     # AAD binding: a different cache_key must fail authentication.
     try:
@@ -76,7 +77,8 @@ def TestOneInput(data: bytes) -> None:
     if tenant_a != tenant_b:
         wrapper_b = EncryptionWrapper(master_key=_MASTER_KEY, tenant_id=tenant_b)
         encrypted_b, metadata_b = wrapper_b.serialize(payload, cache_key=cache_key)
-        assert encrypted != encrypted_b, "Tenant isolation failed: ciphertexts match"
+        if encrypted == encrypted_b:
+            raise AssertionError("Tenant isolation failed: ciphertexts match")
         forged = copy.copy(metadata)
         forged.tenant_id = metadata_b.tenant_id
         forged.key_fingerprint = metadata_b.key_fingerprint

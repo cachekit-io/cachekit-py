@@ -59,8 +59,10 @@ def TestOneInput(data: bytes) -> None:
 
     # First call stores (or hits L1); the repeat exercises the hit path when
     # the entry survived eviction. Both must return the payload unchanged.
-    assert _cached_identity(payload) == payload, "Decorator roundtrip failed (first call)"
-    assert _cached_identity(payload) == payload, "Decorator roundtrip failed (repeat call)"
+    if _cached_identity(payload) != payload:
+        raise AssertionError("Decorator roundtrip failed (first call)")
+    if _cached_identity(payload) != payload:
+        raise AssertionError("Decorator roundtrip failed (repeat call)")
 
 
 if __name__ == "__main__":
