@@ -25,12 +25,20 @@ jobs:
           #      and skipping it is the exact shape LAB-984 fell into.
           #   3. zero releases at all -> skip; nothing has been published yet.
           #
-          # `isLatest` is GitHub's own newest-non-draft-non-prerelease marker, so it
-          # pins the artifact users actually install. An unfiltered `--limit 1` can
-          # return a draft or prerelease, which would either verify an RC green while
-          # the stable wheel goes unchecked, or fail on a wheel PyPI never got.
-          if ! RELEASES=$(gh release list --repo "$REPO" --limit 100 --json tagName,isLatest); then
-            echo "::error::gh release list failed for $REPO — cannot determine the latest release; refusing to report a green skip"
+          # Two lookups, each answering exactly one question, because one call
+          # cannot answer both without guessing a page size. `gh release list`
+          # is a paged view over ALL releases (drafts included) — it answers
+          # "does this repo publish anything at all?", and --limit 1 is enough
+          # for that. `gh release view` with no tag resolves /releases/latest
+          # server-side: the same newest-non-draft-non-prerelease release the
+          # `isLatest` flag marks, but with no page window it can fall outside
+          # of. An earlier form filtered `isLatest` out of a --limit N listing,
+          # which meant picking an N and hard-failing a perfectly healthy repo
+          # once the latest release aged past it. A tripwire that cries wolf is
+          # the same trust bug as one that stays silent, so the window is gone
+          # rather than widened.
+          if ! RELEASES=$(gh release list --repo "$REPO" --limit 1 --json tagName); then
+            echo "::error::gh release list failed for $REPO — cannot determine whether any release exists; refusing to report a green skip"
             exit 1
           fi
           # Validate the payload in its own statement before anything branches on it.
@@ -47,14 +55,17 @@ jobs:
             echo "::error::gh release list returned no parseable release array for $REPO — refusing to report a green skip"
             exit 1
           fi
-          TAG=$(jq -r 'map(select(.isLatest))[0].tagName // empty' <<<"$RELEASES")
-          if [ -z "$TAG" ]; then
-            if [ "$COUNT" -ne 0 ]; then
-              echo "::error::$REPO has $COUNT release(s) but none is marked latest — refusing to skip a release that may need attesting"
-              exit 1
-            fi
+          if [ "$COUNT" -eq 0 ]; then
             echo "$REPO has no published releases — nothing to attest, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+          # Releases exist, so a latest MUST resolve. Both ways this can fail are
+          # incidents, not idle states: an API failure means we know nothing, and
+          # "releases exist but none is latest" (all drafts/prereleases) on a repo
+          # that publishes to PyPI is tamper or misconfiguration. Skipping either
+          # is the exact shape LAB-984 fell into, so both go red.
+          elif ! TAG=$(gh release view --repo "$REPO" --json tagName --jq '.tagName'); then
+            echo "::error::$REPO has release(s) but no resolvable latest release — refusing to skip a release that may need attesting"
+            exit 1
           else
             echo "Latest release: $TAG"
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
