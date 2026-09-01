@@ -422,6 +422,47 @@ class TestByteStorageBufferProtocol:
         data, _ = storage.retrieve(memoryview(bytearray(envelope)))
         assert data == payload
 
+    def test_retrieve_readonly_view_over_mutable_exporter_round_trips(self):
+        """A readonly VIEW whose backing storage is still mutable must not be borrowed
+        across the GIL release (data race). It takes the copy path — readonly() alone
+        is not the zero-copy gate; the exporter must be immutable bytes."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"readonly-view-mutable-backing" * 500
+        envelope = storage.store(payload, None)
+
+        ro_view = memoryview(bytearray(envelope)).toreadonly()
+        assert ro_view.readonly
+        data, _ = storage.retrieve(ro_view)
+        assert data == payload
+
+    def test_retrieve_spoofed_obj_attribute_round_trips(self):
+        """A PEP 688 exporter with a decoy bytes `.obj` attribute must not trick the
+        zero-copy gate: the pointer-range proof sees its memory is NOT inside the
+        decoy bytes and takes the copy path. Round-trip stays correct."""
+        import sys
+
+        if sys.version_info < (3, 12):
+            pytest.skip("__buffer__ protocol requires Python 3.12+")
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"spoofed-exporter" * 500
+        envelope = storage.store(payload, None)
+
+        class Spoof:
+            obj = b"decoy-bytes-not-the-buffer"
+
+            def __init__(self, backing: bytearray) -> None:
+                self.backing = backing
+
+            def __buffer__(self, flags: int) -> memoryview:
+                return memoryview(self.backing).toreadonly()
+
+        data, _ = storage.retrieve(Spoof(bytearray(envelope)))
+        assert data == payload
+
     def test_retrieve_accepts_non_contiguous_view(self):
         """Copy-fallback path: a strided view is copied, not misread."""
         from cachekit._rust_serializer import ByteStorage
@@ -443,12 +484,14 @@ class TestByteStorageBufferProtocol:
             storage.retrieve(memoryview(b"not an envelope"))
 
     def test_retrieve_memoryview_is_zero_copy(self):
-        """The readonly path BORROWS — a bytes() coercion or to_vec creeping back fails here.
+        """No PYTHON-side full-envelope copy on the memoryview path (LAB-770).
 
         tracemalloc sees only Python-heap allocations: retrieve's output bytes (~1x
-        payload for incompressible input). A revert to copy-the-envelope adds another
-        ~1x. This is the non-slow guard; the end-to-end bound lives in
-        tests/performance/test_large_object_memory.py.
+        payload for incompressible input). A bytes(data)-style coercion creeping back
+        in front of retrieve adds another ~1x and fails here. Known blind spot: a
+        Rust-side copy (to_vec) is invisible to tracemalloc (measured: borrow and
+        copy paths both read 1.00x), so the borrow itself is pinned by review of
+        retrieve() in rust/src/python_bindings.rs, not by this suite.
         """
         import gc
         import os

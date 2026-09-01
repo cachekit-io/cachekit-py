@@ -61,33 +61,52 @@ impl PyByteStorage {
     pub fn retrieve(
         &self,
         py: Python,
-        envelope_bytes: PyBuffer<u8>,
+        envelope_bytes: &Bound<'_, PyAny>,
     ) -> PyResult<(Vec<u8>, String)> {
         let owned: Vec<u8>;
-        let data: &[u8] = if envelope_bytes.readonly() && envelope_bytes.is_c_contiguous() {
-            if envelope_bytes.item_count() == 0 {
-                // buf_ptr may be NULL for an empty buffer; from_raw_parts requires non-null.
-                &[]
-            } else {
-                // SAFETY: readonly + C-contiguous checked above, and `envelope_bytes` holds
-                // the Py_buffer view alive for the whole call (resizing an exported bytearray
-                // raises BufferError in the mutator, so the pointer cannot dangle). Residual:
-                // a thread mutating memory behind a readonly view over a still-mutable
-                // exporter during the detached read is a data race on this slice — UB —
-                // accepted per CPython hashlib's own GIL-release idiom; the slice is parsed
-                // once into an owned envelope in safe Rust, so a torn read fails checksum
-                // rather than corrupting memory.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        envelope_bytes.buf_ptr() as *const u8,
-                        envelope_bytes.item_count(),
-                    )
-                }
-            }
+        let buf: PyBuffer<u8>;
+        let base_bytes: Option<Bound<'_, PyBytes>>;
+        let data: &[u8] = if let Ok(b) = envelope_bytes.cast::<PyBytes>() {
+            // `bytes` is immutable and kept alive by the Bound for the whole call:
+            // a safe zero-copy borrow with no data-race exposure.
+            b.as_bytes()
         } else {
-            // Writable or non-contiguous exporter: copy to owned bytes (fail-safe fallback).
-            owned = envelope_bytes.to_vec(py)?;
-            &owned
+            buf = PyBuffer::get(envelope_bytes)?;
+            // Zero-copy is only sound when the BACKING STORAGE is provably immutable —
+            // readonly() describes the view, not the exporter (memoryview(bytearray)
+            // .toreadonly() passes it while another thread can still mutate the bytearray
+            // during the detached read below: a data race, UB). The proof is a pointer-
+            // range check, not attribute trust: `.obj` naming a bytes object is spoofable
+            // by a PEP 688 __buffer__ exporter with a decoy attribute, so we borrow only
+            // when the buffer memory PROVABLY lies inside that immutable bytes object —
+            // true for the memoryview-over-bytes shape SerializationWrapper.unwrap
+            // produces, impossible to fake with memory the bytes doesn't own. `base_bytes`
+            // is held at function scope so the backing bytes outlives the detached read
+            // even if the exporter drops its own references mid-call.
+            base_bytes = envelope_bytes
+                .getattr("obj")
+                .ok()
+                .and_then(|base| base.cast_into::<PyBytes>().ok());
+            let provably_immutable = base_bytes.as_ref().is_some_and(|base| {
+                let start = base.as_bytes().as_ptr() as usize;
+                let ptr = buf.buf_ptr() as usize;
+                buf.readonly()
+                    && buf.is_c_contiguous()
+                    && buf.item_count() > 0
+                    && ptr >= start
+                    && ptr + buf.item_count() <= start + base.as_bytes().len()
+            });
+            if provably_immutable {
+                // SAFETY: non-null (len > 0), C-contiguous, element type validated u8 by
+                // PyBuffer extraction, and the range check above proves the memory sits
+                // inside an immutable `bytes` object kept alive by `base_bytes`.
+                unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count()) }
+            } else {
+                // Mutable, non-bytes-backed, non-contiguous, or empty exporter: copy to
+                // owned bytes (fail-safe fallback; empty also sidesteps NULL buf_ptr).
+                owned = buf.to_vec(py)?;
+                &owned
+            }
         };
         // Detach from the GIL for decompression + checksum (see store()).
         py.detach(|| self.inner.retrieve(data))
