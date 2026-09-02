@@ -81,10 +81,8 @@ def _write_fully(fd: int, data: bytes) -> None:
 
     A single write(2) may store fewer bytes than asked (POSIX permits it; Linux caps one call at
     ~2 GiB) and ``os.write`` only reports the count, so a lone call can silently truncate a large
-    value that is then fsync'd and renamed into place as a "successful" set. A truncated
-    encrypted payload later fails AES-GCM as tamper-class, which fail-closed retains as evidence
-    forever, so the write side must land every byte or fail. The memoryview slice advances
-    without copying. A write that makes no progress raises rather than spinning.
+    value that is then fsync'd and renamed into place as a "successful" set (see the
+    truncated-payload branch in ``get`` for what that costs). Raises EIO on zero progress.
     """
     view = memoryview(data)
     while view:
@@ -257,7 +255,8 @@ class FileBackend:
                         return payload
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -408,7 +407,7 @@ class FileBackend:
                     self._acquire_file_lock(fd, exclusive=True)
 
                     try:
-                        # Write all data (loops over short writes; never a silent partial file)
+                        # Write all data
                         _write_fully(fd, file_data)
 
                         # fsync to ensure data is on disk
@@ -624,7 +623,8 @@ class FileBackend:
                         return True
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -739,7 +739,8 @@ class FileBackend:
                             return None
                         return int(remaining)  # whole-second granularity, matching Redis TTL
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -802,7 +803,8 @@ class FileBackend:
                         os.fsync(fd)
                         return True
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)

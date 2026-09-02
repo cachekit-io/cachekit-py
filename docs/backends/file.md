@@ -141,7 +141,7 @@ the cached payload is left untouched.
 
 5. **Disk space**: FileBackend will evict least-recently-used entries when reaching 90% capacity. Ensure sufficient disk space beyond max_size_mb for temporary writes.
 
-6. **Corruption vs. tampering**: `set()` writes every byte or raises `BackendError` (short `write(2)` calls are retried, never silently truncated into a "successful" file). On read, a structurally broken file — short header, bad magic or version, expired, or a payload shorter than the size the file reported — is deleted and treated as a miss. Payload *content* is not checked here: a same-length modification is served as-is, and the serialization envelope (xxHash3 checksum, or the AES-256-GCM tag for encrypted values) decides whether it is corruption or tampering under your `encryption_fail_closed` policy.
+6. **Corruption vs. tampering**: `set()` writes every byte or raises `BackendError` (short `write(2)` calls are resumed until every byte lands, never silently truncated into a "successful" file). On read, an expired entry or a structurally broken file — short header, bad magic or version, or a payload shorter than the file's own `st_size` implies — is deleted and treated as a miss. Payload *content* is not checked here: a same-length modification is served as-is, and the serialization envelope (xxHash3 checksum, or the AES-256-GCM tag for encrypted values) decides whether it is corruption or tampering under your `encryption_fail_closed` policy.
 
 ## Performance Characteristics
 

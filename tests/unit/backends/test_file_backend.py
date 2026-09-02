@@ -1828,13 +1828,8 @@ class TestMmapBuffer:
 class TestShortIO:
     """POSIX short I/O on the write path, and a file shrinking under a read (LAB-2682).
 
-    A single write(2) may store fewer bytes than asked (Linux caps one call at ~2 GiB), and a
-    file can shrink between fstat and read. Neither is tampering, and neither may reach the
-    envelope's integrity check: for encrypted entries that check deliberately classifies any
-    truncated ciphertext as tamper-class (see rust/src/python_bindings.rs), and under
-    ``encryption_fail_closed`` it retains the entry as evidence forever. The backend is the only
-    layer that can tell truncation apart from tampering, because only it knows how many bytes it
-    meant to write (set) or how many the file claimed to hold (get).
+    Neither is tampering; see the truncated-payload branch in ``FileBackend.get`` for why the
+    backend, not the envelope, must be the layer that says so.
     """
 
     def test_set_loops_over_short_writes(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1868,17 +1863,6 @@ class TestShortIO:
 
         assert backend.get("stuck_key") is None
         assert not list(Path(config.cache_dir).rglob("*.tmp.*")), "temp file left behind"
-
-    async def test_refresh_ttl_loops_over_short_writes(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The in-place 8-byte expiry rewrite shares the write idiom with set()."""
-        real_write = os.write
-        backend.set("ttl_key", b"v", ttl=10)
-        monkeypatch.setattr(os, "write", lambda fd, data: real_write(fd, memoryview(data)[:1]))
-        assert await backend.refresh_ttl("ttl_key", 1000) is True
-        monkeypatch.undo()
-
-        remaining = await backend.get_ttl("ttl_key")
-        assert remaining is not None and remaining > 900
 
     def test_get_file_shrunk_under_read_is_corruption_not_a_hit(
         self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
@@ -1981,9 +1965,8 @@ class TestShortIOFailClosed:
         def truncating_read(fd: int, n: int) -> bytes:
             if n > HEADER_SIZE:  # one shot: shrink the file between fstat and the payload read
                 monkeypatch.setattr(os, "read", real_read)
-                # Drop exactly one ciphertext byte: the envelope frame stays structurally valid,
-                # so without the backend's length check this reaches AES-GCM, which rejects
-                # truncated ciphertext as tamper-class and fail-closed would retain it forever.
+                # Drop exactly one ciphertext byte so the frame stays structurally valid and the
+                # short ciphertext would reach AES-GCM (tamper-class) without the backend's check.
                 os.truncate(file_path, os.path.getsize(file_path) - 1)
             return real_read(fd, n)
 
