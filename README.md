@@ -294,7 +294,7 @@ def get_patient_data(hospital_id: int):
 retiring key readable via `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex,
 max 3 decrypt-only keys). Entries are selected by exact key fingerprint — never
 trial decryption — and old entries age out via TTL, no cache flush required. See
-[Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md#key-rotation-pattern).
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 cachekit employs comprehensive security tooling:
 
