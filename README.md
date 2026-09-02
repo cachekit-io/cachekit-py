@@ -235,7 +235,7 @@ def test_cached_function():
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
-- Untrusted-decode bounds: every cache read is a MessagePack decode of bytes the backend controls, so nesting depth and header-declared allocation are capped as cachekit-owned invariants (a forged nested-header entry is a bounded cache miss, not a memory blow-up) — verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/main/test-vectors/decode-bounds.json) vectors
+- Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/main/test-vectors/decode-bounds.json) vectors
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.

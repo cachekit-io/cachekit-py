@@ -344,36 +344,40 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
     (``PyList_New(n)``) *before* decoding the children. Nested headers stack those
     allocations depth-first, so the library's per-collection default cap
     (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
-    transient heap — measured 10 KB -> 67 MB. Two bounds close it:
+    transient heap — measured 10 KB -> 67 MB.
 
-    1. A header-only structural walk (``Unpacker.skip``) runs first. It allocates
-       nothing, costs a fraction of the decode, and rejects a document that nests
-       deeper than :data:`MSGPACK_MAX_NESTING` (``StackError``) or declares more
-       elements/bytes than the input can back (``OutOfData``). Every element that
-       survives is backed by >= 1 input byte, so the real decode's pre-allocation
-       is bounded by ~8 x len(data).
-    2. The collection/str/bin/ext caps are passed explicitly as ``len(data)`` —
-       the library's current default, made an owned invariant so a msgpack-python
-       change cannot silently lift it.
+    The bound is a header-only structural walk (``Unpacker.skip``) run before the
+    decode. It allocates nothing beyond one copy of the input (``feed`` copies into
+    the Unpacker's buffer — a known +1x transient; a zero-copy walk in the Rust
+    extension is the follow-up), costs a fraction of the decode, and rejects a
+    document that nests deeper than :data:`MSGPACK_MAX_NESTING` or declares more
+    elements/bytes than the input can back. Every element that survives is backed
+    by >= 1 input byte, so the real decode's pre-allocation is bounded by
+    ~8 x len(data). The explicit ``max_*_len=len(data)`` caps on ``unpackb`` are
+    unreachable once the walk passes; they are defence in depth against a
+    ``skip`` regression, not an independent bound.
 
-    Every rejection is a ``ValueError`` (``StackError``, ``FormatError``,
-    ``ExtraData``, or the over-claim ``ValueError`` raised here), which the read
-    paths already turn into a controlled cache miss. Trailing bytes are still
-    rejected by ``unpackb`` itself.
+    Every rejection is a ``ValueError`` (``FormatError``, ``ExtraData``, or the
+    depth / over-claim ``ValueError`` raised here), which the read paths already
+    turn into a controlled cache miss. Trailing bytes are still rejected by
+    ``unpackb`` itself.
 
     Examples:
         >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
         {'a': [1, 2]}
-        >>> unpackb_bounded(b"\\xdc\\x27\\x10" * 5000)  # 15 KB nested-header bomb
+        >>> unpackb_bounded(b"\\xdc\\x07\\xd0" * 5000)  # 15 KB nested-header bomb
         Traceback (most recent call last):
         ...
-        msgpack.exceptions.StackError
+        ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
     n = len(data)
     walker = msgpack.Unpacker(max_buffer_size=n)
     walker.feed(data)
     try:
         walker.skip()
+    except msgpack.exceptions.StackError as e:
+        # StackError carries an empty message; say what the bound is.
+        raise ValueError(f"Unpack failed: MessagePack document nests deeper than {MSGPACK_MAX_NESTING} levels") from e
     except msgpack.exceptions.OutOfData as e:
         # OutOfData is the one Unpacker error that is not a ValueError; normalise it to
         # the same contract unpackb uses for truncated input ("Unpack failed: incomplete input").

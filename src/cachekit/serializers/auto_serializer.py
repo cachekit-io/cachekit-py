@@ -569,6 +569,7 @@ class AutoSerializer:
                 return self._deserialize_series(unpacked_data)
 
         # For Rust-envelope formats, use the Rust layer
+        envelope_error: Exception | None = None
         if self.enable_integrity_checking:
             try:
                 # Use Rust layer for decompression and validation
@@ -578,7 +579,10 @@ class AutoSerializer:
                 raise
             except Exception as e:
                 # Not a ByteStorage envelope (e.g. written with integrity checking off):
-                # fall through to the Python-only paths below.
+                # fall through to the Python-only paths below, keeping the reason for the
+                # final error (a checksum mismatch also lands here — retrieve raises a plain
+                # ValueError for both; distinguishing them is a Rust-extension follow-up).
+                envelope_error = e
                 logger.debug(f"Rust envelope parsing failed, falling back to Python-only deserialization: {e}")
             else:
                 # The envelope verified (checksum matched), so its payload is exactly what was
@@ -629,9 +633,18 @@ class AutoSerializer:
         except SerializationError:
             # Re-raise SerializationError (corruption detection) without swallowing
             raise
-        except Exception:
-            # If msgpack fails for other reasons, try NumPy-specific deserialization
-            return self._deserialize_numpy(data)
+        except Exception as msgpack_error:
+            # If msgpack fails for other reasons, try NumPy-specific deserialization — and if
+            # that fails too, report every reason: the msgpack one is the decode-bound
+            # rejection for a forged entry and must not vanish behind the NumPy header error.
+            try:
+                return self._deserialize_numpy(data)
+            except Exception as numpy_error:
+                raise SerializationError(
+                    "Cache entry is not a decodable MessagePack or NumPy payload"
+                    f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
+                    f" (msgpack: {msgpack_error}) (numpy: {numpy_error})"
+                ) from msgpack_error
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
         """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.
