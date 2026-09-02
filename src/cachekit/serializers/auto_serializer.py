@@ -60,17 +60,9 @@ except ImportError:
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
+from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 logger = logging.getLogger(__name__)
-
-# What a corrupted or forged payload can make the decode helpers raise: msgpack's own
-# errors (ValueError subclasses, plus the UnpackException family), the object-hook
-# restorers on a malformed marker (ValueError/TypeError/AttributeError), and the
-# DataFrame/Series reconstructors indexing a dict that is not the shape they wrote
-# (KeyError/TypeError/ValueError). Anything else — above all RuntimeError for a missing
-# optional dependency — is an environment fault, not a bad cache entry, and must bubble.
-_PAYLOAD_DECODE_ERRORS = (msgpack.exceptions.UnpackException, ValueError, TypeError, KeyError, AttributeError)
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -611,7 +603,7 @@ class AutoSerializer:
                     return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
                 except SerializationError:
                     raise
-                except _PAYLOAD_DECODE_ERRORS as e:
+                except PAYLOAD_DECODE_ERRORS as e:
                     raise SerializationError(
                         f"Cache entry payload failed to decode inside a verified envelope (format={detected_format!r}): {e}"
                     ) from e
@@ -641,13 +633,13 @@ class AutoSerializer:
         except SerializationError:
             # Re-raise SerializationError (corruption detection) without swallowing
             raise
-        except _PAYLOAD_DECODE_ERRORS as msgpack_error:
+        except PAYLOAD_DECODE_ERRORS as msgpack_error:
             # If msgpack fails for other reasons, try NumPy-specific deserialization — and if
             # that fails too, report every reason: the msgpack one is the decode-bound
             # rejection for a forged entry and must not vanish behind the NumPy header error.
             try:
                 return self._deserialize_numpy(data)
-            except (SerializationError, *_PAYLOAD_DECODE_ERRORS) as numpy_error:
+            except (SerializationError, *PAYLOAD_DECODE_ERRORS) as numpy_error:
                 raise SerializationError(
                     "Cache entry is not a decodable MessagePack or NumPy payload"
                     f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
@@ -748,7 +740,8 @@ class AutoSerializer:
             raw_bytes = data[offset:]
             arr = np.frombuffer(raw_bytes, dtype=dtype_str).copy()
             return arr.reshape(shape)
-        except (ValueError, IndexError, UnicodeDecodeError) as e:
+        except (ValueError, TypeError, IndexError) as e:
+            # TypeError: np.frombuffer on a forged dtype string; UnicodeDecodeError is a ValueError.
             raise SerializationError(f"Failed to deserialize NumPy array: {e}") from e
 
     def _serialize_dataframe(self, df: pd.DataFrame) -> bytes:
@@ -935,7 +928,7 @@ class AutoSerializer:
             try:
                 unpackb_bounded(data, **self._msgpack_unpack_opts)
                 return True
-            except _PAYLOAD_DECODE_ERRORS:
+            except PAYLOAD_DECODE_ERRORS:
                 return False
 
 

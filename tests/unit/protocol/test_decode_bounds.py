@@ -39,8 +39,8 @@ FIXTURE_SHA256 = "fa8bc750a4911fe3663b9ab68f13438a3e924b6bc742e9f6763ca35ad24074
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 EXPECTED_COUNTS = {"reject_vectors": 10, "accept_vectors": 2}
 
-# Peak transient heap a rejected decode may cost: a small constant (Unpacker buffer)
-# plus a few multiples of the input. Unguarded, the nested_array32_input_len vector
+# Peak transient heap a rejected decode may cost: a small constant (tracemalloc + unpackb
+# overhead) plus a few multiples of the input. Unguarded, the nested_array32_input_len vector
 # peaks at ~8000x its input, so this discriminates by three orders of magnitude.
 PEAK_BUDGET = 2 * 1024 * 1024
 PEAK_PER_INPUT_BYTE = 4
@@ -124,10 +124,8 @@ class TestOwnedBounds:
     """SDK-local guards that go beyond the shared vectors."""
 
     def test_nesting_ceiling_is_exactly_the_pinned_constant(self) -> None:
-        # msgpack-python exposes no depth option; the C unpacker's fixed stack is the
-        # bound. If a release moves it, this fails and the constant + protocol note
-        # (spec/interop-mode.md → Decode bounds, 32 <= bound <= 1024) must be revisited.
-        assert MSGPACK_MAX_NESTING == 1024
+        # The walk rejects one level past MSGPACK_MAX_NESTING; a document AT the ceiling
+        # must still decode, so the constant may not exceed msgpack-python's C stack.
         at_bound = b"\x91" * MSGPACK_MAX_NESTING + b"\xc0"
         assert unpackb_bounded(at_bound) == json.loads("[" * MSGPACK_MAX_NESTING + "null" + "]" * MSGPACK_MAX_NESTING)
         with pytest.raises(ValueError, match=f"nests deeper than {MSGPACK_MAX_NESTING} levels"):

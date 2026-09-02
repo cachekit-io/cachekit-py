@@ -330,12 +330,22 @@ class SuspiciousCacheEntryError(SerializationError):
 # Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------
 
-#: Nesting depth msgpack-python's C unpacker accepts before raising ``StackError``.
-#: Not configurable through its API — pinned here and regression-tested
-#: (tests/unit/protocol/test_decode_bounds.py) so a dependency bump that moves it
-#: fails a test instead of silently changing the decode ceiling. The protocol
-#: requires every SDK's bound to sit in 32..=1024.
+#: cachekit's own nesting ceiling, enforced by the Rust ``check_msgpack_structure``
+#: walk before msgpack-python ever sees the document. Two constraints pin it: the
+#: protocol requires every SDK's bound to sit in 32..=1024, and it must not exceed
+#: msgpack-python's C unpacker stack (a document at the ceiling has to decode after
+#: passing the walk; tests/unit/protocol/test_decode_bounds.py checks exactly that).
 MSGPACK_MAX_NESTING = 1024
+
+#: Everything a corrupted or forged payload can make a decode raise, for serializers
+#: to turn into ``SerializationError``. msgpack's own errors are ``ValueError``
+#: subclasses; the AutoSerializer object hook and the NumPy/DataFrame/Series
+#: reconstructors add ``TypeError`` / ``OverflowError`` (``np.frombuffer`` on a forged
+#: dtype or itemsize), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
+#: the shape they wrote); ``BufferError`` is a non-u8 buffer exporter rejected at the
+#: PyO3 boundary (LAB-770). Anything else — above all ``RuntimeError`` for a missing
+#: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
+PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError)
 
 
 def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
@@ -348,18 +358,15 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
     (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
     transient heap — measured 10 KB -> 67 MB.
 
-    The bound is a header-only structural walk in the Rust extension
-    (``check_msgpack_structure``) run before the decode. It reads the input in
-    place — zero-copy for ``bytes`` and for the read-only ``memoryview`` of
-    ``bytes`` the read path carries — skips str/bin/ext payloads by offset, and
-    allocates one integer per open collection. It rejects a document that nests
-    deeper than :data:`MSGPACK_MAX_NESTING` or whose open headers declare more
-    elements or bytes than the remaining input can back. Every element that
-    survives is backed by >= 1 input byte, so the real decode's total container
-    pre-allocation is bounded by len(data) rather than by depth x declared length.
-    The explicit ``max_*_len=len(data)`` caps on ``unpackb`` are unreachable once
-    the walk passes; they are defence in depth against a walk regression, not an
-    independent bound.
+    The bound is the Rust extension's zero-copy, header-only walk
+    (``check_msgpack_structure``, documented there) run before the decode. It
+    rejects a document that nests deeper than :data:`MSGPACK_MAX_NESTING` or whose
+    open headers declare more elements or bytes than the remaining input can back.
+    Every element that survives is backed by >= 1 input byte, so the real decode's
+    total container pre-allocation is bounded by len(data) rather than by
+    depth x declared length. The explicit ``max_*_len=len(data)`` caps on
+    ``unpackb`` are unreachable once the walk passes; they are defence in depth
+    against a walk regression, not an independent bound.
 
     Every rejection is a ``ValueError`` (``FormatError``, ``ExtraData``, or the
     walk's own ``ValueError`` naming the violated bound), which the read paths
