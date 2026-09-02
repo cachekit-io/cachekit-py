@@ -132,17 +132,16 @@ We use MessagePack (safe binary serialization) with type preservation via schema
 ### Bounded Decompression (ByteStorage envelopes)
 
 The default read path is `decrypt → ByteStorage.retrieve (LZ4 + xxHash3) →
-MessagePack decode`. This SDK does **not** implement LZ4: `ByteStorage.retrieve`
-in `rust/src/python_bindings.rs` is a pass-through to cachekit-core's
-`ByteStorage::retrieve` → `StorageEnvelope::extract`, which bounds the
-decompressed output at `min(512 MiB, 1000 × compressed_len)` before
-decompressing. The envelope's self-declared `original_size` is not trusted, and
-the xxHash3-64 checksum is unkeyed so it does not gate a forging attacker. See
+MessagePack decode`. This SDK does **not** implement LZ4 — it delegates to
+cachekit-core's bounded `extract()`, which caps the decompressed output at
+`min(512 MiB, 1000 × compressed_len)` before decompressing rather than trusting
+the envelope's self-declared `original_size`. The xxHash3-64 checksum is
+unkeyed, so it detects corruption and does not gate a forging attacker. See
 [cachekit-core Decompression limits][core-decompress] for the numbers and the
 constrained-runtime caveat.
 
 The MessagePack size caps sit on the already-decompressed bytes, so they are
-downstream of this bound — the core bound is what protects them.
+downstream of that bound.
 
 ### Zero-Knowledge Encryption
 
@@ -320,34 +319,51 @@ Reports are archived in `reports/security/` for compliance and audit trails.
 ### Arrow IPC Decompression Is Unbounded
 
 > [!WARNING]
-> `ArrowSerializer` (`serializer="arrow"`, `@cache.io`) compresses with zstd by
-> default and its read path does **not** go through cachekit-core's bounded
-> `extract()`. `deserialize()` hands the body to
-> `pa.ipc.open_file(...).read_all()`, which decompresses with no size or ratio
-> limit. A 2.5 KB envelope expands to 64 MiB (26,112:1) — a ratio cachekit-core
-> rejects at 1000:1.
+> `ArrowSerializer` (`serializer="arrow"`, requires the `[data]` extra) does not
+> read through cachekit-core's bounded `extract()`. `deserialize()` hands the
+> body to `pa.ipc.open_file(...).read_all()`, which decompresses with no size or
+> ratio limit. Measured: a 2,570-byte envelope expands to 64 MiB (26,112:1), and
+> 8,714 bytes to 256 MiB (30,805:1) — ratios cachekit-core rejects at 1000:1.
+> Tracked in LAB-2730.
 
-The `[8-byte xxHash3-64][Arrow IPC]` envelope does not help: the checksum is
-unkeyed, so anyone who can write to the backend recomputes it. `max_value_size`
-does not help either — it is enforced on the **write** path only
-(`cache_handler.py`), so it is a producer-side quota, not a check on what comes
-back off the wire.
+Neither existing control covers it:
+
+- **The `[8-byte xxHash3-64][Arrow IPC]` prefix is not authentication.** It is
+  unkeyed, so a backend-write attacker recomputes it — and they need not
+  bother, because `deserialize()` also accepts raw `ARROW1` bodies with no
+  checksum at all (the legacy integrity-off branch).
+- **`max_value_size` is enforced on the write path only** (`cache_handler.py`),
+  so it is a producer-side quota, not a check on bytes coming back off the wire.
 
 **Exposure**: non-secure Arrow caches on a backend an attacker can write to.
-Secure (`@cache.secure`) caches decrypt through AES-256-GCM first, so a forged
-payload is rejected before it reaches the reader.
+`arrow_compression` defaults to `"zstd"`, so compression is on by default *once
+Arrow is selected*; Arrow itself is opt-in. Secure (`@cache.secure`) caches
+authenticate via AES-256-GCM before the reader sees anything, so they are not
+exposed.
 
-**Why it is not simply capped**: pyarrow exposes no read-side size limit, no
-allocation-limiting memory pool, and `write_table` emits a single record batch —
-so per-batch accumulation does not bound the common case, and a
-post-`read_all()` check happens after the allocation it is meant to prevent. A
-sound bound requires reading each buffer's uncompressed-length prefix from the
-record-batch Flatbuffers metadata before decompressing. That is tracked
-separately (LAB-2730).
+**A sound bound exists, and it costs the compression feature.** Uncompressed
+Arrow IPC allocates in proportion to its own length (measured ratio 1.000), so
+refusing bodies that declare `BodyCompression` on read makes `len(body)` a
+genuine pre-decompression bound. That requires writing `compression="none"` too,
+or every read of our own entries fails — which is a wire-size and L1-footprint
+decision, not a drive-by fix. Keeping compression instead means summing each
+buffer's uncompressed-length prefix before decompressing; `pa.ipc.read_message`
+exposes the first buffer's prefix but not the rest, so that needs a
+bounds-checked walk of the record-batch Flatbuffers metadata. LAB-2730 carries
+both options.
 
-**Mitigations available now**: use `compression=None` for Arrow caches read from
-untrusted backends, use `@cache.secure`, or run with an enforced process memory
-limit.
+Approaches that do **not** work, so nobody re-derives them: pyarrow exposes no
+read-side size limit and no allocation-limiting memory pool; accumulating
+`batch.nbytes` across `reader.get_batch(i)` is defeated because a forged
+envelope declares one batch (our writer chunks to ~8 MiB, an attacker does not);
+and a `table.nbytes` check after `read_all()` runs after the allocation it is
+meant to prevent.
+
+**Mitigations available now**: use `@cache.secure` for Arrow caches on
+untrusted backends, or run with an enforced process memory limit. Setting
+`compression=None` on the serializer does **not** mitigate — `deserialize()`
+decompresses according to the stored stream's own metadata and never consults
+that setting.
 
 ### Cryptographic Security
 
