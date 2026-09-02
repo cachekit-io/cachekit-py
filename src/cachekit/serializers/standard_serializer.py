@@ -345,7 +345,8 @@ class StandardSerializer:
             raise
         except (msgpack.exceptions.UnpackException, ValueError, TypeError, BufferError) as e:
             # BufferError: a non-u8 buffer exporter (e.g. numpy float array) rejected at the
-            # PyO3 boundary — pre-LAB-770 the bytes() coercion surfaced these as ValueError.
+            # PyO3 boundary. Pre-LAB-770 bytes() coerced these to raw bytes and envelope
+            # validation rejected the garbage as ValueError; same contract, new cause.
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
 

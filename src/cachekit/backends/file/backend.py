@@ -295,7 +295,10 @@ class FileBackend:
                         self._safe_unlink(file_path)
                         return None
                     header = _read_fully(fd, HEADER_SIZE)
-                    if header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                    # Re-check the length: st_size above was sampled before the read, so a
+                    # file truncated in between yields a short header here and header[2]
+                    # would raise IndexError straight past this backend's OSError handling.
+                    if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
                         self._safe_unlink(file_path)
                         return None
                     expiry_timestamp = struct.unpack(">Q", header[6:14])[0]

@@ -425,7 +425,12 @@ class TestByteStorageBufferProtocol:
     def test_retrieve_readonly_view_over_mutable_exporter_round_trips(self):
         """A readonly VIEW whose backing storage is still mutable must not be borrowed
         across the GIL release (data race). It takes the copy path — readonly() alone
-        is not the zero-copy gate; the exporter must be immutable bytes."""
+        is not the zero-copy gate; the exporter must be immutable bytes.
+
+        Round-trip equality is all this one can assert: the bytearray base fails the
+        `.obj`-is-`bytes` cast before borrowable_offset is consulted, so a weakened
+        range check would not show up here. The spoof test below is what pins that.
+        """
         from cachekit._rust_serializer import ByteStorage
 
         storage = ByteStorage("msgpack")
@@ -439,8 +444,16 @@ class TestByteStorageBufferProtocol:
 
     def test_retrieve_spoofed_obj_attribute_round_trips(self):
         """A PEP 688 exporter with a decoy bytes `.obj` attribute must not trick the
-        zero-copy gate: the pointer-range proof sees its memory is NOT inside the
-        decoy bytes and takes the copy path. Round-trip stays correct."""
+        zero-copy gate: the containment proof sees its memory is NOT inside the decoy
+        bytes and takes the copy path. Round-trip stays correct.
+
+        This test IS load-bearing for that proof. Because the borrow is a plain slice
+        of the base `bytes`, dropping the range check does not silently misread here:
+        the offset lands outside the decoy and the slice bounds check aborts (verified
+        by deleting the check and re-running — the old raw-pointer borrow passed green
+        under the same sabotage, reading out of bounds). The strided test below pins
+        is_c_contiguous() the same way.
+        """
         import sys
 
         if sys.version_info < (3, 12):
@@ -483,7 +496,7 @@ class TestByteStorageBufferProtocol:
         with pytest.raises(ValueError):
             storage.retrieve(memoryview(b"not an envelope"))
 
-    def test_retrieve_memoryview_is_zero_copy(self):
+    def test_retrieve_memoryview_adds_no_python_copy(self):
         """No PYTHON-side full-envelope copy on the memoryview path (LAB-770).
 
         tracemalloc sees only Python-heap allocations: retrieve's output bytes (~1x
@@ -528,8 +541,8 @@ class TestByteStorageBufferProtocol:
 
     def test_standard_serializer_deserialize_non_u8_buffer_raises_serialization_error(self):
         """A non-u8 exporter (rejected as BufferError at the PyO3 boundary) keeps the
-        documented SerializationError contract — pre-LAB-770 the bytes() coercion
-        surfaced these as ValueError -> SerializationError."""
+        documented SerializationError contract — pre-LAB-770 bytes() coerced these to
+        raw bytes and envelope validation rejected them as ValueError."""
         np = pytest.importorskip("numpy")
         from cachekit.serializers.base import SerializationError
         from cachekit.serializers.standard_serializer import StandardSerializer

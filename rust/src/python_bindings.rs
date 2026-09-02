@@ -21,6 +21,29 @@ impl Default for PyByteStorage {
     }
 }
 
+/// Offset into `base` at which `buf`'s memory starts, iff `buf` is a plain, immutable,
+/// C-contiguous window onto that `bytes` object — the shape `SerializationWrapper.unwrap`
+/// produces. `Some(off)` means `&base.as_bytes()[off..off + buf.item_count()]` is exactly
+/// the buffer's bytes, so the caller can borrow it with a safe slice instead of a raw one.
+///
+/// Every conjunct is load-bearing: `readonly` + a `bytes` base rule out a mutable exporter
+/// racing the GIL-released read; `is_c_contiguous` rules out a strided view whose logical
+/// bytes are not the contiguous span; the range check rules out a spoofed `.obj` naming a
+/// decoy `bytes` the memory does not belong to; and `checked_add` keeps that range check
+/// honest against a forged `Py_buffer` length rather than wrapping past it.
+fn borrowable_offset(buf: &PyBuffer<u8>, base: &Bound<'_, PyBytes>) -> Option<usize> {
+    let bytes = base.as_bytes();
+    let start = bytes.as_ptr() as usize;
+    let ptr = buf.buf_ptr() as usize;
+    let end = ptr.checked_add(buf.item_count())?;
+    (buf.readonly()
+        && buf.is_c_contiguous()
+        && buf.item_count() > 0
+        && ptr >= start
+        && end <= start + bytes.len())
+    .then(|| ptr - start)
+}
+
 #[pymethods]
 impl PyByteStorage {
     #[new]
@@ -68,44 +91,34 @@ impl PyByteStorage {
         let base_bytes: Option<Bound<'_, PyBytes>>;
         let data: &[u8] = if let Ok(b) = envelope_bytes.cast::<PyBytes>() {
             // `bytes` is immutable and kept alive by the Bound for the whole call:
-            // a safe zero-copy borrow with no data-race exposure.
+            // a zero-copy borrow with no data-race exposure.
             b.as_bytes()
         } else {
             buf = PyBuffer::get(envelope_bytes)?;
-            // Zero-copy is only sound when the BACKING STORAGE is provably immutable —
-            // readonly() describes the view, not the exporter (memoryview(bytearray)
-            // .toreadonly() passes it while another thread can still mutate the bytearray
-            // during the detached read below: a data race, UB). The proof is a pointer-
-            // range check, not attribute trust: `.obj` naming a bytes object is spoofable
-            // by a PEP 688 __buffer__ exporter with a decoy attribute, so we borrow only
-            // when the buffer memory PROVABLY lies inside that immutable bytes object —
-            // true for the memoryview-over-bytes shape SerializationWrapper.unwrap
-            // produces, impossible to fake with memory the bytes doesn't own. `base_bytes`
-            // is held at function scope so the backing bytes outlives the detached read
-            // even if the exporter drops its own references mid-call.
+            // Borrowing across the GIL release below is only sound when the BACKING
+            // STORAGE is immutable — readonly() describes the view, not the exporter
+            // (memoryview(bytearray).toreadonly() passes it while another thread can
+            // still mutate the bytearray). Attribute trust is not enough either: a
+            // PEP 688 __buffer__ exporter can name a decoy `bytes` in `.obj`. So the
+            // gate is a containment proof (borrowable_offset), and its payoff is that
+            // the borrow becomes expressible as an ORDINARY SLICE of that `bytes` —
+            // bounds-checked by Rust, no `unsafe`, nothing for a stale comment to
+            // misstate. Anything unproven falls back to a copy.
             base_bytes = envelope_bytes
                 .getattr("obj")
                 .ok()
                 .and_then(|base| base.cast_into::<PyBytes>().ok());
-            let provably_immutable = base_bytes.as_ref().is_some_and(|base| {
-                let start = base.as_bytes().as_ptr() as usize;
-                let ptr = buf.buf_ptr() as usize;
-                buf.readonly()
-                    && buf.is_c_contiguous()
-                    && buf.item_count() > 0
-                    && ptr >= start
-                    && ptr + buf.item_count() <= start + base.as_bytes().len()
+            let borrowed = base_bytes.as_ref().and_then(|base| {
+                borrowable_offset(&buf, base)
+                    .map(|off| &base.as_bytes()[off..off + buf.item_count()])
             });
-            if provably_immutable {
-                // SAFETY: non-null (len > 0), C-contiguous, element type validated u8 by
-                // PyBuffer extraction, and the range check above proves the memory sits
-                // inside an immutable `bytes` object kept alive by `base_bytes`.
-                unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count()) }
-            } else {
-                // Mutable, non-bytes-backed, non-contiguous, or empty exporter: copy to
-                // owned bytes (fail-safe fallback; empty also sidesteps NULL buf_ptr).
-                owned = buf.to_vec(py)?;
-                &owned
+            match borrowed {
+                Some(slice) => slice,
+                None => {
+                    // Mutable, non-bytes-backed, non-contiguous, or empty exporter.
+                    owned = buf.to_vec(py)?;
+                    &owned
+                }
             }
         };
         // Detach from the GIL for decompression + checksum (see store()).
