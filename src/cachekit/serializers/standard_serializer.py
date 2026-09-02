@@ -27,7 +27,7 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -339,7 +339,7 @@ class StandardSerializer:
                 msgpack_data = data
 
             # Deserialize MessagePack
-            return msgpack.unpackb(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise

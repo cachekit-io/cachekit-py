@@ -8,6 +8,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+import msgpack
+
 
 @runtime_checkable
 class SerializerProtocol(Protocol):
@@ -320,3 +322,60 @@ class SuspiciousCacheEntryError(SerializationError):
     """
 
     pass
+
+
+# ---------------------------------------------------------------------------
+# Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
+# ---------------------------------------------------------------------------
+
+#: Nesting depth msgpack-python's C unpacker accepts before raising ``StackError``.
+#: Not configurable through its API — pinned here and regression-tested
+#: (tests/unit/protocol/test_decode_bounds.py) so a dependency bump that moves it
+#: fails a test instead of silently changing the decode ceiling. The protocol
+#: requires every SDK's bound to sit in 32..=1024.
+MSGPACK_MAX_NESTING = 1024
+
+
+def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
+    """Decode one untrusted MessagePack document under cachekit-owned bounds.
+
+    Why not plain ``msgpack.unpackb``: a collection header costs 1-5 bytes but may
+    declare up to 2**32-1 elements, and the C unpacker pre-allocates the container
+    (``PyList_New(n)``) *before* decoding the children. Nested headers stack those
+    allocations depth-first, so the library's per-collection default cap
+    (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
+    transient heap — measured 10 KB -> 67 MB. Two bounds close it:
+
+    1. A header-only structural walk (``Unpacker.skip``) runs first. It allocates
+       nothing, costs a fraction of the decode, and rejects a document that nests
+       deeper than :data:`MSGPACK_MAX_NESTING` (``StackError``) or declares more
+       elements/bytes than the input can back (``OutOfData``). Every element that
+       survives is backed by >= 1 input byte, so the real decode's pre-allocation
+       is bounded by ~8 x len(data).
+    2. The collection/str/bin/ext caps are passed explicitly as ``len(data)`` —
+       the library's current default, made an owned invariant so a msgpack-python
+       change cannot silently lift it.
+
+    Every rejection is a ``ValueError`` (``StackError``, ``FormatError``,
+    ``ExtraData``, or the over-claim ``ValueError`` raised here), which the read
+    paths already turn into a controlled cache miss. Trailing bytes are still
+    rejected by ``unpackb`` itself.
+
+    Examples:
+        >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
+        {'a': [1, 2]}
+        >>> unpackb_bounded(b"\\xdc\\x27\\x10" * 5000)  # 15 KB nested-header bomb
+        Traceback (most recent call last):
+        ...
+        msgpack.exceptions.StackError
+    """
+    n = len(data)
+    walker = msgpack.Unpacker(max_buffer_size=n)
+    walker.feed(data)
+    try:
+        walker.skip()
+    except msgpack.exceptions.OutOfData as e:
+        # OutOfData is the one Unpacker error that is not a ValueError; normalise it to
+        # the same contract unpackb uses for truncated input ("Unpack failed: incomplete input").
+        raise ValueError("Unpack failed: MessagePack document declares more elements/bytes than the input can back") from e
+    return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)
