@@ -202,6 +202,18 @@ make test-cov
 - PyO3's cdylib architecture prevents LLVM coverage tracking across module boundaries
 - This is a known limitation, not a code quality issue
 
+## Review Guidance
+
+This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (see [LAB-1151](https://github.com/cachekit-io/cachekit-py/issues/linked) for governance details). The guidance below documents which paths benefit from security and maintainer review:
+
+**Security-sensitive paths** — consider requesting review from maintainers:
+- `/rust/` — memory safety, FFI boundaries, cryptography
+- `/src/cachekit/serializers/` and `/src/cachekit/reliability/` — serialization and fault tolerance
+- `/.github/workflows/`, `/pyproject.toml`, `/rust/Cargo.toml`, `/.pre-commit-config.yaml` — supply chain configuration
+- `/tests/security/`, `/tests/fuzz/`, `/SECURITY.md` — security documentation and testing
+
+This is a **single-maintainer org** using documentation instead of enforcement. GitHub's review rulesets on this repo require zero code-owner approvals, so the path guidance above is a routing suggestion for pull requests, not a GitHub-enforced gate.
+
 ## Pull Request Process
 
 1. **Ensure all checks pass**
