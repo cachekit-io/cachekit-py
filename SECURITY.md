@@ -129,6 +129,21 @@ We use MessagePack (safe binary serialization) with type preservation via schema
 + import msgpack  # Safe binary serialization
 ```
 
+### Bounded Decompression (ByteStorage envelopes)
+
+The default read path is `decrypt → ByteStorage.retrieve (LZ4 + xxHash3) →
+MessagePack decode`. This SDK does **not** implement LZ4: `ByteStorage.retrieve`
+in `rust/src/python_bindings.rs` is a pass-through to cachekit-core's
+`ByteStorage::retrieve` → `StorageEnvelope::extract`, which bounds the
+decompressed output at `min(512 MiB, 1000 × compressed_len)` before
+decompressing. The envelope's self-declared `original_size` is not trusted, and
+the xxHash3-64 checksum is unkeyed so it does not gate a forging attacker. See
+[cachekit-core Decompression limits][core-decompress] for the numbers and the
+constrained-runtime caveat.
+
+The MessagePack size caps sit on the already-decompressed bytes, so they are
+downstream of this bound — the core bound is what protects them.
+
 ### Zero-Knowledge Encryption
 
 When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the server never sees plaintext:
@@ -302,6 +317,38 @@ Reports are archived in `reports/security/` for compliance and audit trails.
 
 ## Known Limitations
 
+### Arrow IPC Decompression Is Unbounded
+
+> [!WARNING]
+> `ArrowSerializer` (`serializer="arrow"`, `@cache.io`) compresses with zstd by
+> default and its read path does **not** go through cachekit-core's bounded
+> `extract()`. `deserialize()` hands the body to
+> `pa.ipc.open_file(...).read_all()`, which decompresses with no size or ratio
+> limit. A 2.5 KB envelope expands to 64 MiB (26,112:1) — a ratio cachekit-core
+> rejects at 1000:1.
+
+The `[8-byte xxHash3-64][Arrow IPC]` envelope does not help: the checksum is
+unkeyed, so anyone who can write to the backend recomputes it. `max_value_size`
+does not help either — it is enforced on the **write** path only
+(`cache_handler.py`), so it is a producer-side quota, not a check on what comes
+back off the wire.
+
+**Exposure**: non-secure Arrow caches on a backend an attacker can write to.
+Secure (`@cache.secure`) caches decrypt through AES-256-GCM first, so a forged
+payload is rejected before it reaches the reader.
+
+**Why it is not simply capped**: pyarrow exposes no read-side size limit, no
+allocation-limiting memory pool, and `write_table` emits a single record batch —
+so per-batch accumulation does not bound the common case, and a
+post-`read_all()` check happens after the allocation it is meant to prevent. A
+sound bound requires reading each buffer's uncompressed-length prefix from the
+record-batch Flatbuffers metadata before decompressing. That is tracked
+separately (LAB-2730).
+
+**Mitigations available now**: use `compression=None` for Arrow caches read from
+untrusted backends, use `@cache.secure`, or run with an enforced process memory
+limit.
+
 ### Cryptographic Security
 
 > [!NOTE]
@@ -396,6 +443,7 @@ We appreciate responsible disclosure from the security community. Security resea
 [core-security]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md
 [core-supply-chain]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#supply-chain-security
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
+[core-decompress]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#decompression-limits
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
 [cwe-532]: https://cwe.mitre.org/data/definitions/532.html
