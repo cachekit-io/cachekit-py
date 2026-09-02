@@ -10,6 +10,8 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import msgpack
 
+from cachekit._rust_serializer import check_msgpack_structure
+
 
 @runtime_checkable
 class SerializerProtocol(Protocol):
@@ -346,21 +348,23 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
     (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
     transient heap — measured 10 KB -> 67 MB.
 
-    The bound is a header-only structural walk (``Unpacker.skip``) run before the
-    decode. It allocates nothing beyond one copy of the input (``feed`` copies into
-    the Unpacker's buffer — a known +1x transient; a zero-copy walk in the Rust
-    extension is the follow-up), costs a fraction of the decode, and rejects a
-    document that nests deeper than :data:`MSGPACK_MAX_NESTING` or declares more
-    elements/bytes than the input can back. Every element that survives is backed
-    by >= 1 input byte, so the real decode's pre-allocation is bounded by
-    ~8 x len(data). The explicit ``max_*_len=len(data)`` caps on ``unpackb`` are
-    unreachable once the walk passes; they are defence in depth against a
-    ``skip`` regression, not an independent bound.
+    The bound is a header-only structural walk in the Rust extension
+    (``check_msgpack_structure``) run before the decode. It reads the input in
+    place — zero-copy for ``bytes`` and for the read-only ``memoryview`` of
+    ``bytes`` the read path carries — skips str/bin/ext payloads by offset, and
+    allocates one integer per open collection. It rejects a document that nests
+    deeper than :data:`MSGPACK_MAX_NESTING` or whose open headers declare more
+    elements or bytes than the remaining input can back. Every element that
+    survives is backed by >= 1 input byte, so the real decode's total container
+    pre-allocation is bounded by len(data) rather than by depth x declared length.
+    The explicit ``max_*_len=len(data)`` caps on ``unpackb`` are unreachable once
+    the walk passes; they are defence in depth against a walk regression, not an
+    independent bound.
 
     Every rejection is a ``ValueError`` (``FormatError``, ``ExtraData``, or the
-    depth / over-claim ``ValueError`` raised here), which the read paths already
-    turn into a controlled cache miss. Trailing bytes are still rejected by
-    ``unpackb`` itself.
+    walk's own ``ValueError`` naming the violated bound), which the read paths
+    already turn into a controlled cache miss. Trailing bytes are still rejected
+    by ``unpackb`` itself.
 
     Examples:
         >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
@@ -368,18 +372,12 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         >>> unpackb_bounded(b"\\xdc\\x07\\xd0" * 5000)  # 15 KB nested-header bomb
         Traceback (most recent call last):
         ...
+        ValueError: Unpack failed: MessagePack document declares more elements than the input can back
+        >>> unpackb_bounded(b"\\x91" * 1025 + b"\\xc0")  # one level past the ceiling
+        Traceback (most recent call last):
+        ...
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
     n = len(data)
-    walker = msgpack.Unpacker(max_buffer_size=n)
-    walker.feed(data)
-    try:
-        walker.skip()
-    except msgpack.exceptions.StackError as e:
-        # StackError carries an empty message; say what the bound is.
-        raise ValueError(f"Unpack failed: MessagePack document nests deeper than {MSGPACK_MAX_NESTING} levels") from e
-    except msgpack.exceptions.OutOfData as e:
-        # OutOfData is the one Unpacker error that is not a ValueError; normalise it to
-        # the same contract unpackb uses for truncated input ("Unpack failed: incomplete input").
-        raise ValueError("Unpack failed: MessagePack document declares more elements/bytes than the input can back") from e
+    check_msgpack_structure(data, MSGPACK_MAX_NESTING)
     return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)

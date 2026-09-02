@@ -32,6 +32,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
 
+    // Untrusted-decode structural bound (LAB-2503) — zero-copy header walk that
+    // serializers/base.py::unpackb_bounded runs before every msgpack.unpackb
+    m.add_function(wrap_pyfunction!(
+        python_bindings::check_msgpack_structure_py,
+        m
+    )?)?;
+
     // Add encryption functionality if feature is enabled
     #[cfg(feature = "encryption")]
     {

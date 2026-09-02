@@ -83,7 +83,8 @@ def _peak_of(fn: Callable[..., Any], *args: Any) -> tuple[Any, BaseException | N
     tracemalloc.start()
     try:
         return fn(*args), None, tracemalloc.get_traced_memory()[1]
-    except Exception as e:  # noqa: BLE001 — the exception type is what we assert on
+    except (ValueError, SerializationError) as e:
+        # The only rejections the read path maps to a controlled miss; any other type propagates.
         return None, e, tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
@@ -107,8 +108,6 @@ class TestProtocolVectors:
         data = bytes.fromhex(vector["input_hex"])
         _, err, peak = _peak_of(DECODE_PATHS[path], data)
         assert err is not None, f"{vector['name']}: {path} decoded a reject vector"
-        # Every rejection is a controlled error the read path maps to a cache miss.
-        assert isinstance(err, (ValueError, SerializationError)), f"{vector['name']}: {path} raised {type(err).__name__}"
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(data), f"{vector['name']}: {path} peaked at {peak} bytes"
 
     @pytest.mark.parametrize("vector", VECTORS["accept_vectors"], ids=_vector_ids("accept_vectors"))

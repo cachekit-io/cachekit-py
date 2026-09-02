@@ -44,6 +44,148 @@ fn borrowable_offset(buf: &PyBuffer<u8>, base: &Bound<'_, PyBytes>) -> Option<us
     .then(|| ptr - start)
 }
 
+/// A read-only view of a Python buffer-protocol object's bytes, borrowed without a copy
+/// whenever that is provably sound and copied otherwise. Holds whatever keeps the memory
+/// alive (the `bytes` object, or the owned copy) so `as_slice` needs no `unsafe`.
+enum BytesView<'py> {
+    /// A `bytes` object: immutable and kept alive by the Bound — zero-copy.
+    Bytes(Bound<'py, PyBytes>),
+    /// A read-only, C-contiguous window onto a `bytes` object (the `memoryview`
+    /// `SerializationWrapper.unwrap` produces), proven by `borrowable_offset` — zero-copy.
+    Window(Bound<'py, PyBytes>, usize, usize),
+    /// Mutable, non-`bytes`-backed, strided, or empty exporter: the only safe answer is a copy.
+    Owned(Vec<u8>),
+}
+
+impl BytesView<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            BytesView::Bytes(b) => b.as_bytes(),
+            BytesView::Window(base, off, len) => &base.as_bytes()[*off..*off + *len],
+            BytesView::Owned(v) => v,
+        }
+    }
+}
+
+/// Borrow `obj`'s bytes zero-copy when the BACKING STORAGE is provably immutable, else copy.
+///
+/// `readonly()` describes the view, not the exporter (`memoryview(bytearray).toreadonly()`
+/// passes it while another thread can still mutate the bytearray), and a PEP 688
+/// `__buffer__` exporter can name a decoy `bytes` in `.obj` — so the gate is the containment
+/// proof in `borrowable_offset`, whose payoff is that the borrow is an ORDINARY SLICE of that
+/// `bytes`: bounds-checked by Rust, no `unsafe`, nothing for a stale comment to misstate.
+fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(BytesView::Bytes(b.clone()));
+    }
+    let buf = PyBuffer::<u8>::get(obj)?;
+    let base = obj
+        .getattr("obj")
+        .ok()
+        .and_then(|base| base.cast_into::<PyBytes>().ok());
+    if let Some(base) = base {
+        if let Some(off) = borrowable_offset(&buf, &base) {
+            return Ok(BytesView::Window(base, off, buf.item_count()));
+        }
+    }
+    Ok(BytesView::Owned(buf.to_vec(py)?))
+}
+
+/// Structural bound for one untrusted MessagePack document (LAB-2503; protocol
+/// spec/interop-mode.md → Decode bounds). Header-only: str/bin/ext payloads are skipped
+/// by offset, never read, and nothing is allocated beyond one `u64` per open collection.
+///
+/// Rejects, before any decoder pre-allocates a container:
+/// - nesting deeper than `max_depth`;
+/// - a header declaring more payload bytes than the input holds;
+/// - more pending elements (across every open collection) than remaining bytes can back —
+///   every element costs >= 1 byte, so a decoder's total container pre-allocation is then
+///   bounded by the input length instead of by `depth × declared_len`;
+/// - the reserved marker 0xc1 and input that ends mid-document.
+///
+/// Trailing bytes after the root element are left to the decoder (`ExtraData`).
+pub fn check_msgpack_structure(bytes: &[u8], max_depth: usize) -> Result<(), String> {
+    fn be(bytes: &[u8], pos: usize, width: usize) -> Result<u64, String> {
+        let end = pos
+            .checked_add(width)
+            .filter(|e| *e <= bytes.len())
+            .ok_or_else(|| "ends inside a length prefix".to_owned())?;
+        Ok(bytes[pos..end]
+            .iter()
+            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+    }
+
+    let mut pos = 0usize;
+    let mut pending: u64 = 1; // elements owed across all open collections (the root is one)
+    let mut open: Vec<u64> = Vec::new(); // elements still owed per open collection = depth
+    while pending > 0 {
+        while open.last() == Some(&0) {
+            open.pop();
+        }
+        let marker = *bytes
+            .get(pos)
+            .ok_or_else(|| "ends before the document is complete".to_owned())?;
+        pos += 1;
+        pending -= 1;
+        if let Some(innermost) = open.last_mut() {
+            *innermost -= 1;
+        }
+        // (length-prefix bytes, payload bytes after the prefix, child elements)
+        let (prefix, payload, children): (usize, u64, u64) = match marker {
+            0x00..=0x7f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => (0, 0, 0),
+            0x80..=0x8f => (0, 0, 2 * u64::from(marker & 0x0f)),
+            0x90..=0x9f => (0, 0, u64::from(marker & 0x0f)),
+            0xa0..=0xbf => (0, u64::from(marker & 0x1f), 0),
+            0xc1 => return Err("contains the reserved marker 0xc1".to_owned()),
+            0xc4 | 0xd9 => (1, be(bytes, pos, 1)?, 0),
+            0xc5 | 0xda => (2, be(bytes, pos, 2)?, 0),
+            0xc6 | 0xdb => (4, be(bytes, pos, 4)?, 0),
+            0xc7 => (1, be(bytes, pos, 1)? + 1, 0), // ext: length prefix, then type byte + data
+            0xc8 => (2, be(bytes, pos, 2)? + 1, 0),
+            0xc9 => (4, be(bytes, pos, 4)? + 1, 0),
+            0xca..=0xd3 => (0, 1u64 << (marker & 0x03), 0), // f32/f64/u8..u64/i8..i64: 4,8,1,2,4,8,1,2,4,8
+            0xd4..=0xd8 => (0, 1 + (1u64 << (marker - 0xd4)), 0), // fixext: type byte + 1/2/4/8/16
+            0xdc => (2, 0, be(bytes, pos, 2)?),
+            0xdd => (4, 0, be(bytes, pos, 4)?),
+            0xde => (2, 0, 2 * be(bytes, pos, 2)?),
+            0xdf => (4, 0, 2 * be(bytes, pos, 4)?),
+        };
+        pos += prefix;
+        let remaining = (bytes.len() - pos) as u64;
+        if payload > remaining {
+            return Err("declares more bytes than the input holds".to_owned());
+        }
+        pos += payload as usize; // <= remaining, so it fits usize
+        if children > 0 {
+            if open.len() >= max_depth {
+                return Err(format!("nests deeper than {max_depth} levels"));
+            }
+            open.push(children);
+        }
+        pending += children;
+        if pending > remaining - payload {
+            return Err("declares more elements than the input can back".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Reject a MessagePack document whose headers would make decoding it allocate out of
+/// proportion to its size — see `check_msgpack_structure`. Zero-copy for `bytes` and for
+/// read-only `memoryview`s of `bytes`; raises ValueError naming the violated bound.
+#[pyfunction]
+#[pyo3(name = "check_msgpack_structure")]
+pub fn check_msgpack_structure_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_depth: usize,
+) -> PyResult<()> {
+    let view = bytes_view(py, data)?;
+    check_msgpack_structure(view.as_slice(), max_depth).map_err(|what| {
+        PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
+    })
+}
+
 #[pymethods]
 impl PyByteStorage {
     #[new]
@@ -86,41 +228,10 @@ impl PyByteStorage {
         py: Python,
         envelope_bytes: &Bound<'_, PyAny>,
     ) -> PyResult<(Vec<u8>, String)> {
-        let owned: Vec<u8>;
-        let buf: PyBuffer<u8>;
-        let base_bytes: Option<Bound<'_, PyBytes>>;
-        let data: &[u8] = if let Ok(b) = envelope_bytes.cast::<PyBytes>() {
-            // `bytes` is immutable and kept alive by the Bound for the whole call:
-            // a zero-copy borrow with no data-race exposure.
-            b.as_bytes()
-        } else {
-            buf = PyBuffer::get(envelope_bytes)?;
-            // Borrowing across the GIL release below is only sound when the BACKING
-            // STORAGE is immutable — readonly() describes the view, not the exporter
-            // (memoryview(bytearray).toreadonly() passes it while another thread can
-            // still mutate the bytearray). Attribute trust is not enough either: a
-            // PEP 688 __buffer__ exporter can name a decoy `bytes` in `.obj`. So the
-            // gate is a containment proof (borrowable_offset), and its payoff is that
-            // the borrow becomes expressible as an ORDINARY SLICE of that `bytes` —
-            // bounds-checked by Rust, no `unsafe`, nothing for a stale comment to
-            // misstate. Anything unproven falls back to a copy.
-            base_bytes = envelope_bytes
-                .getattr("obj")
-                .ok()
-                .and_then(|base| base.cast_into::<PyBytes>().ok());
-            let borrowed = base_bytes.as_ref().and_then(|base| {
-                borrowable_offset(&buf, base)
-                    .map(|off| &base.as_bytes()[off..off + buf.item_count()])
-            });
-            match borrowed {
-                Some(slice) => slice,
-                None => {
-                    // Mutable, non-bytes-backed, non-contiguous, or empty exporter.
-                    owned = buf.to_vec(py)?;
-                    &owned
-                }
-            }
-        };
+        // Borrowing across the GIL release below is only sound when the backing storage
+        // is immutable — bytes_view proves that or copies (see its doc).
+        let view = bytes_view(py, envelope_bytes)?;
+        let data = view.as_slice();
         // Detach from the GIL for decompression + checksum (see store()).
         py.detach(|| self.inner.retrieve(data))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
