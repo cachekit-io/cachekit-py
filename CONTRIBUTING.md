@@ -204,7 +204,7 @@ make test-cov
 
 ## Review Guidance
 
-This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (see [LAB-1151](https://github.com/cachekit-io/cachekit-py/issues/linked) for governance details). The guidance below documents which paths benefit from security and maintainer review:
+This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (tracked internally as LAB-1151). The guidance below documents which paths benefit from security and maintainer review:
 
 **Security-sensitive paths** — consider requesting review from maintainers:
 - `/rust/` — memory safety, FFI boundaries, cryptography
