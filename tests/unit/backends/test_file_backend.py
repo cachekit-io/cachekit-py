@@ -1822,3 +1822,173 @@ class TestMmapBuffer:
         monkeypatch.setattr(backend_mod.mmap, "mmap", boom)
         with pytest.raises(BackendError):
             backend.get_buffer("k")
+
+
+@pytest.mark.unit
+class TestShortIO:
+    """POSIX short I/O on the write path, and a file shrinking under a read (LAB-2682).
+
+    A single write(2) may store fewer bytes than asked (Linux caps one call at ~2 GiB), and a
+    file can shrink between fstat and read. Neither is tampering, and neither may reach the
+    envelope's integrity check: for encrypted entries that check deliberately classifies any
+    truncated ciphertext as tamper-class (see rust/src/python_bindings.rs), and under
+    ``encryption_fail_closed`` it retains the entry as evidence forever. The backend is the only
+    layer that can tell truncation apart from tampering, because only it knows how many bytes it
+    meant to write (set) or how many the file claimed to hold (get).
+    """
+
+    def test_set_loops_over_short_writes(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Force every os.write to accept at most 5 bytes: set() must still land the whole value."""
+        real_write = os.write
+        calls: list[int] = []
+
+        def short_write(fd: int, data: bytes) -> int:
+            calls.append(len(data))
+            return real_write(fd, memoryview(data)[:5])
+
+        payload = bytes(range(256)) * 8
+        monkeypatch.setattr(os, "write", short_write)
+        backend.set("short_write_key", payload)
+        monkeypatch.undo()
+
+        assert len(calls) > 2, "short writes were not exercised"
+        assert os.path.getsize(backend._key_to_path("short_write_key")) == HEADER_SIZE + len(payload)
+        assert backend.get("short_write_key") == payload
+
+    def test_set_zero_progress_write_raises_and_leaves_nothing_behind(
+        self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that makes no progress must fail loudly, not spin or report success."""
+        from cachekit.backends.errors import BackendError
+
+        monkeypatch.setattr(os, "write", lambda fd, data: 0)
+        with pytest.raises(BackendError):
+            backend.set("stuck_key", b"payload")
+        monkeypatch.undo()
+
+        assert backend.get("stuck_key") is None
+        assert not list(Path(config.cache_dir).rglob("*.tmp.*")), "temp file left behind"
+
+    async def test_refresh_ttl_loops_over_short_writes(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The in-place 8-byte expiry rewrite shares the write idiom with set()."""
+        real_write = os.write
+        backend.set("ttl_key", b"v", ttl=10)
+        monkeypatch.setattr(os, "write", lambda fd, data: real_write(fd, memoryview(data)[:1]))
+        assert await backend.refresh_ttl("ttl_key", 1000) is True
+        monkeypatch.undo()
+
+        remaining = await backend.get_ttl("ttl_key")
+        assert remaining is not None and remaining > 900
+
+    def test_get_file_shrunk_under_read_is_corruption_not_a_hit(
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Payload shorter than st_size - HEADER_SIZE: unlink and miss, like the sibling corruption branches."""
+        key = "shrunk_key"
+        payload = bytes(range(256)) * 8
+        backend.set(key, payload)
+        file_path = backend._key_to_path(key)
+        real_read = os.read
+
+        def truncating_read(fd: int, n: int) -> bytes:
+            if n > HEADER_SIZE:  # the payload read: shrink the file after fstat, before read
+                os.truncate(file_path, HEADER_SIZE + 3)
+            return real_read(fd, n)
+
+        monkeypatch.setattr(os, "read", truncating_read)
+        assert backend.get(key) is None
+        assert not os.path.exists(file_path)
+
+    def test_get_modified_payload_is_served_not_evicted(self, backend: FileBackend) -> None:
+        """AC4 at the backend layer: a same-length modification is not the backend's call.
+
+        Content integrity belongs to the envelope (xxHash3 checksum / AES-GCM tag), so the
+        bytes are handed back unchanged and the file stays for the fail policy to judge.
+        """
+        key = "tampered_key"
+        payload = bytes(range(256)) * 8
+        backend.set(key, payload)
+        file_path = backend._key_to_path(key)
+
+        with open(file_path, "r+b") as f:
+            f.seek(HEADER_SIZE + 10)
+            f.write(b"\xff")
+        tampered = bytearray(payload)
+        tampered[10] = 0xFF
+
+        assert backend.get(key) == bytes(tampered)
+        assert os.path.exists(file_path)
+
+
+@pytest.mark.unit
+class TestShortIOFailClosed:
+    """End-to-end on a real FileBackend: truncation and tampering stay distinguishable under fail-closed (AC4)."""
+
+    _HEX_KEY = "a" * 64
+
+    def _decorated(self, config: FileBackendConfig) -> tuple[Any, list[int]]:
+        from cachekit import cache
+
+        backend = FileBackend(config)
+        calls: list[int] = []
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            l1_enabled=False,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=self._HEX_KEY,
+            fail_closed=True,
+        )
+        def get_value(x: int) -> dict:
+            calls.append(x)
+            return {"result": x}
+
+        return get_value, calls
+
+    @staticmethod
+    def _only_cache_file(config: FileBackendConfig) -> str:
+        files = [str(p) for p in Path(config.cache_dir).rglob("*") if p.is_file()]
+        assert len(files) == 1, files
+        return files[0]
+
+    def test_tampered_entry_raises_and_is_retained(self, config: FileBackendConfig) -> None:
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        get_value, _ = self._decorated(config)
+        assert get_value(1) == {"result": 1}
+        file_path = self._only_cache_file(config)
+
+        with open(file_path, "r+b") as f:  # flip the last ciphertext byte, length unchanged
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)[0]
+            f.seek(-1, os.SEEK_END)
+            f.write(bytes([last ^ 0xFF]))
+
+        with pytest.raises(DecryptionAuthenticationError):
+            get_value(1)
+        assert os.path.exists(file_path), "tamper evidence must be retained"
+
+    def test_entry_shrunk_under_read_is_a_miss_not_a_tamper_alarm(
+        self, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        get_value, calls = self._decorated(config)
+        assert get_value(1) == {"result": 1}
+        file_path = self._only_cache_file(config)
+        real_read = os.read
+
+        def truncating_read(fd: int, n: int) -> bytes:
+            if n > HEADER_SIZE:  # one shot: shrink the file between fstat and the payload read
+                monkeypatch.setattr(os, "read", real_read)
+                # Drop exactly one ciphertext byte: the envelope frame stays structurally valid,
+                # so without the backend's length check this reaches AES-GCM, which rejects
+                # truncated ciphertext as tamper-class and fail-closed would retain it forever.
+                os.truncate(file_path, os.path.getsize(file_path) - 1)
+            return real_read(fd, n)
+
+        monkeypatch.setattr(os, "read", truncating_read)
+        assert get_value(1) == {"result": 1}  # clean miss: recomputed and rewritten, no raise
+        assert calls == [1, 1]
+        assert get_value(1) == {"result": 1}  # the rewritten entry serves
+        assert calls == [1, 1]
