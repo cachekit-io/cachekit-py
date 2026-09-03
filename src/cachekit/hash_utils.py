@@ -77,24 +77,30 @@ def redact_key_for_log(cache_key: object) -> str:
 
 
 def redact_error_for_log(error: object) -> str:
-    """Render an exception for a log/error message without leaking cache keys.
+    """Render an exception for a log/error message without leaking cache keys (CWE-532).
 
-    ``str(error)`` reaches log interpolation at every cache-error sink, and an
-    arbitrary exception's text has unknown provenance — a backend/serialization
-    error can echo the raw cache key (CWE-532, issue #163). So only ``BackendError``
-    (which formats itself key-free: the message is the exception type name and any
-    key is emitted as a redacted digest — see ``BackendError._format_message``) is
-    logged verbatim; every other exception is reduced to its bare type name, with
-    the full detail left on the exception object for programmatic access.
+    An exception's ``str()`` reaches log interpolation at every cache-error sink and has
+    unknown provenance: it can echo the raw cache key directly (a redis ResponseError
+    naming the key) or transitively (a ``BackendError`` whose free-form ``.message`` was
+    built with the key). So this helper logs **no free-form exception text at all** — it
+    does not trust that ``.message`` is key-free, it structurally cannot include it:
+
+    - ``BackendError`` is rendered from its allow-listed, non-key fields only — the Python
+      type plus the ``BackendErrorType`` classification (``.error_type``, an enum of fixed
+      verbs). Its ``.message`` and raw ``.key`` are never read here; the redacted key digest
+      is already emitted in the separate ``key`` log field, and full detail stays on the
+      exception object for programmatic access.
+    - Every other exception collapses to its bare type name.
 
     Sits beside redact_key_for_log() so both log sinks share one error policy.
-    ``BackendError`` is imported lazily to keep this leaf module free of a
-    back-edge to ``backends.errors`` (which imports this module).
+    ``BackendError`` is imported lazily to keep this leaf module free of a back-edge to
+    ``backends.errors`` (which imports this module).
     """
     from cachekit.backends.errors import BackendError
 
     if isinstance(error, BackendError):
-        return str(error)
+        error_type = getattr(error.error_type, "value", error.error_type)
+        return f"{type(error).__name__}({error_type})"
     return type(error).__name__
 
 
