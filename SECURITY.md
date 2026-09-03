@@ -129,6 +129,20 @@ We use MessagePack (safe binary serialization) with type preservation via schema
 + import msgpack  # Safe binary serialization
 ```
 
+### Bounded Decompression (ByteStorage envelopes)
+
+The default read path is `decrypt → ByteStorage.retrieve (LZ4 + xxHash3) →
+MessagePack decode`. This SDK does **not** implement LZ4 — it delegates to
+cachekit-core's bounded `extract()`, which caps the decompressed output at
+`min(512 MiB, 1000 × compressed_len)` before decompressing rather than trusting
+the envelope's self-declared `original_size`. The xxHash3-64 checksum is
+unkeyed, so it detects corruption and does not gate a forging attacker. See
+[cachekit-core Decompression limits][core-decompress] for the numbers and the
+constrained-runtime caveat.
+
+The MessagePack size caps sit on the already-decompressed bytes, so they are
+downstream of that bound.
+
 ### Zero-Knowledge Encryption
 
 When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the server never sees plaintext:
@@ -310,6 +324,55 @@ Reports are archived in `reports/security/` for compliance and audit trails.
 
 ## Known Limitations
 
+### Arrow IPC Decompression Is Unbounded
+
+> [!WARNING]
+> `ArrowSerializer` (`serializer="arrow"`, requires the `[data]` extra) does not
+> read through cachekit-core's bounded `extract()`. `deserialize()` hands the
+> body to `pa.ipc.open_file(...).read_all()`, which decompresses with no size or
+> ratio limit. Measured: a 2,570-byte envelope expands to 64 MiB (26,112:1), and
+> 8,714 bytes to 256 MiB (30,805:1) — ratios cachekit-core rejects at 1000:1.
+> Tracked in LAB-2730.
+
+Neither existing control covers it:
+
+- **The `[8-byte xxHash3-64][Arrow IPC]` prefix is not authentication.** It is
+  unkeyed, so a backend-write attacker recomputes it — and they need not
+  bother, because `deserialize()` also accepts raw `ARROW1` bodies with no
+  checksum at all (the legacy integrity-off branch).
+- **`max_value_size` is enforced on the write path only** (`cache_handler.py`),
+  so it is a producer-side quota, not a check on bytes coming back off the wire.
+
+**Exposure**: non-secure Arrow caches on a backend an attacker can write to.
+`arrow_compression` defaults to `"zstd"`, so compression is on by default *once
+Arrow is selected*; Arrow itself is opt-in. Secure (`@cache.secure`) caches
+authenticate via AES-256-GCM before the reader sees anything, so they are not
+exposed.
+
+**A sound bound exists, and it costs the compression feature.** Uncompressed
+Arrow IPC allocates in proportion to its own length (measured ratio 1.000), so
+refusing bodies that declare `BodyCompression` on read makes `len(body)` a
+genuine pre-decompression bound. That requires writing `compression="none"` too,
+or every read of our own entries fails — which is a wire-size and L1-footprint
+decision, not a drive-by fix. Keeping compression instead means summing each
+buffer's uncompressed-length prefix before decompressing; `pa.ipc.read_message`
+exposes the first buffer's prefix but not the rest, so that needs a
+bounds-checked walk of the record-batch Flatbuffers metadata. LAB-2730 carries
+both options.
+
+Approaches that do **not** work, so nobody re-derives them: pyarrow exposes no
+read-side size limit and no allocation-limiting memory pool; accumulating
+`batch.nbytes` across `reader.get_batch(i)` is defeated because a forged
+envelope declares one batch (our writer chunks to ~8 MiB, an attacker does not);
+and a `table.nbytes` check after `read_all()` runs after the allocation it is
+meant to prevent.
+
+**Mitigations available now**: use `@cache.secure` for Arrow caches on
+untrusted backends, or run with an enforced process memory limit. Setting
+`compression=None` on the serializer does **not** mitigate — `deserialize()`
+decompresses according to the stored stream's own metadata and never consults
+that setting.
+
 ### Cryptographic Security
 
 > [!NOTE]
@@ -404,6 +467,7 @@ We appreciate responsible disclosure from the security community. Security resea
 [core-security]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md
 [core-supply-chain]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#supply-chain-security
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
+[core-decompress]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#decompression-limits
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
 [cwe-532]: https://cwe.mitre.org/data/definitions/532.html
