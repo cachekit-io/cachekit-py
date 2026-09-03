@@ -191,6 +191,10 @@ See [SSRF Protection](docs/features/ssrf-protection.md) for full details, includ
 
 The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Lock-Id` request header when releasing a lock (`DELETE /v1/cache/{key}/lock`), **never** in the URL query string. Query strings are routinely captured by access logs, proxy/CDN logs, and OpenTelemetry `http.url` spans ([CWE-532][cwe-532]); a leaked token could be replayed to release a lock within its short TTL. The CacheKit SaaS backend dual-reads the header and the legacy `?lock_id=` query during migration, preferring the header (removed in protocol 2.0).
 
+### Cache-Key Path Encoding (CWE-22)
+
+Custom `@cache(key=...)` values are percent-encoded (`quote(key, safe="")`) before they reach the CachekitIO request path, so a key can only ever address `/v1/cache/{key}` and never a different `api.cachekit.io` endpoint. Without encoding, a key containing `../` would be collapsed client-side by httpx's dot-segment normalization ([CWE-22][cwe-22]) — e.g. `default:../../admin` → `GET /admin` — and `?`/`#` would be split into a query/fragment, both escaping the cache namespace with the application's bearer token. The encoding is byte-identical to cachekit-rs (`urlencoding::encode`) and resolves to the same server-side key as cachekit-ts (`encodeURIComponent`) after the SaaS validator's single decode, so cross-SDK cache lookups still coincide.
+
 ---
 
 ## FFI Boundary Security
@@ -399,3 +403,4 @@ We appreciate responsible disclosure from the security community. Security resea
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
 [cwe-532]: https://cwe.mitre.org/data/definitions/532.html
+[cwe-22]: https://cwe.mitre.org/data/definitions/22.html
