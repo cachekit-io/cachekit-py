@@ -193,7 +193,11 @@ The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Loc
 
 ### Cache-Key Path Encoding (CWE-22)
 
-Custom `@cache(key=...)` values are percent-encoded (`quote(key, safe="")`) before they reach the CachekitIO request path, so a key can only ever address `/v1/cache/{key}` and never a different `api.cachekit.io` endpoint. Without encoding, a key containing `../` would be collapsed client-side by httpx's dot-segment normalization ([CWE-22][cwe-22]) — e.g. `default:../../admin` → `GET /admin` — and `?`/`#` would be split into a query/fragment, both escaping the cache namespace with the application's bearer token. The encoding is byte-identical to cachekit-rs (`urlencoding::encode`) and resolves to the same server-side key as cachekit-ts (`encodeURIComponent`) after the SaaS validator's single decode, so cross-SDK cache lookups still coincide.
+Custom `@cache(key=...)` values are percent-encoded before they reach the CachekitIO request path, so a key can only ever address `/v1/cache/{key}` and never a different `api.cachekit.io` endpoint. Without encoding, `?`/`#` would be split into a query/fragment and a `/`-bearing key would introduce extra path segments, both escaping the cache namespace with the application's bearer token; httpx normalizes these client-side *before the request leaves the process* ([CWE-22][cwe-22]), so the SaaS-side key validator never sees them. `quote(key, safe="")` encodes every reserved character (`/` → `%2F`, `?` → `%3F`, `#` → `%23`, `%` → `%25`), collapsing the whole key into one inert path segment.
+
+RFC-3986 marks `.` as *unreserved*, so `quote` (like cachekit-ts `encodeURIComponent` and cachekit-rs `urlencoding::encode`) leaves it raw — but a key of exactly `.` or `..` is still a live dot-segment that httpx collapses: `..` → `GET /v1`, and on the sub-resource routes `../ttl` → `GET /v1/ttl`, `../lock` → `GET /v1/lock`, reaching a *different* route with the bearer token. The encoder special-cases an all-dot segment (`..` → `%2E%2E`) so it can no longer collapse; only a segment that is *entirely* dots is affected (`a:..` is untouched), so canonical keys are unchanged.
+
+Encode-once matches the SaaS validator's single decode, so a canonical key round-trips byte-for-byte. Python's `quote(key, safe="")` is byte-identical to cachekit-rs `urlencoding::encode`, and resolves to the same server-side key as cachekit-ts `encodeURIComponent` after that single decode, so cross-SDK cache lookups still coincide.
 
 ---
 

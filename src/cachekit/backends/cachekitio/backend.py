@@ -230,14 +230,24 @@ class CachekitIOBackend:
 
         ``safe=""`` encodes *every* reserved character — ``/`` ``?`` ``#`` ``%`` and the
         rest — so a caller-controlled key (the ``@cache(key=...)`` escape hatch) can never
-        escape ``/v1/cache/{key}``. Without it, httpx normalises ``..`` dot-segments and
-        splits ``?``/``#`` client-side, turning ``default:../../admin`` into ``GET /admin``
-        carrying the app's bearer token (CWE-22 / CWE-20). The SaaS validator decodes
-        exactly once, so this single encode round-trips byte-for-byte to the original key.
-        Byte-identical to cachekit-rs ``urlencoding::encode``; resolves to the same
-        server-side key as cachekit-ts ``encodeURIComponent`` after that single decode.
+        escape ``/v1/cache/{key}`` via an injected delimiter, query, or fragment
+        (CWE-22 / CWE-20). Encode-once matches the SaaS validator's single decode, so a
+        canonical key round-trips byte-for-byte. See ``SECURITY.md`` for the cross-SDK
+        wire-parity contract (cachekit-rs / cachekit-ts).
+
+        Dot-segment guard: ``quote`` leaves RFC-3986 *unreserved* ``.`` untouched, so a key
+        of exactly ``.`` or ``..`` survives as a live dot-segment that httpx collapses
+        client-side *before the request leaves the process* — ``..`` -> ``/v1``,
+        ``../ttl`` -> ``/v1/ttl``, ``../lock`` -> ``/v1/lock`` — re-opening the endpoint
+        escape on a *different* route carrying the bearer token, never reaching the SaaS
+        key validator. Percent-encode the dots so the segment is inert; the SaaS decodes
+        ``%2E`` -> ``.`` once and rejects ``..`` anyway. Only an all-dot segment collapses
+        (``a:..`` does not), so nothing else is touched and wire-parity is unaffected.
         """
-        return quote(key, safe="")
+        encoded = quote(key, safe="")
+        if encoded in (".", ".."):
+            return encoded.replace(".", "%2E")
+        return encoded
 
     def _request_sync(
         self,

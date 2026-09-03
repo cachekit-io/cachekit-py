@@ -4,28 +4,27 @@ CachekitIO request path (LAB-2846, CWE-22 / CWE-20).
 Before the fix, the raw key was interpolated unquoted into
 ``/v1/cache/{key}``. httpx (pinned ``>=0.28.1``) normalises dot-segments and
 splits ``?``/``#`` *client-side, before the request leaves the process* — so a
-custom ``@cache(key=...)`` value containing ``../`` could escape the
-``/v1/cache/`` prefix and address arbitrary ``api.cachekit.io`` endpoints with
-the application's bearer token:
+custom ``@cache(key=...)`` value could escape the ``/v1/cache/`` prefix and
+address arbitrary ``api.cachekit.io`` endpoints with the application's bearer
+token:
 
-    default:../../admin  ->  GET /admin        (traversal escapes the prefix)
-    k?x=1#f              ->  GET /v1/cache/k?x=1  (query/fragment injection)
+    k?x=1#f  ->  GET /v1/cache/k?x=1  (query/fragment injection)
+    a/b      ->  GET /v1/cache/a/b    (extra path segment)
+    ..       ->  GET /v1              (dot-segment collapse)
+    ../ttl   ->  GET /v1/ttl          (collapse onto a *different* route)
 
-The fix routes every raw-key call site through ``CachekitIOBackend._encode_key``
-(``quote(key, safe="")``). These tests drive the real backend methods through a
-real ``httpx`` client backed by a ``MockTransport`` and assert on
-``request.url.raw_path`` — the actual bytes that would go on the wire, *after*
-httpx's normalisation. Asserting the raw path (not a mocked endpoint string) is
-what proves the traversal is neutralised at the layer that used to defeat it.
+The last case is the nastiest: ``quote(key, safe="")`` leaves RFC-3986 unreserved
+``.`` raw, so a key of exactly ``.`` or ``..`` still collapses even after
+encoding — ``_encode_key`` special-cases an all-dot segment to ``%2E`` so it
+can't. See ``SECURITY.md`` for the full mechanism and the cross-SDK wire-parity
+contract (cachekit-ts ``encodeURIComponent``, cachekit-rs ``urlencoding::encode``,
+SaaS single decode + ``..`` reject).
 
-Cross-SDK contract: cachekit-ts encodes with ``encodeURIComponent`` and
-cachekit-rs with ``urlencoding::encode``; the SaaS validator (``cache-key-validator.ts``)
-decodes exactly once and rejects ``..``. Post-fix Python is byte-identical on the
-wire with cachekit-rs's ``urlencoding::encode``; for cachekit-ts it resolves to
-the same server-side key after that single decode (``quote(safe="")`` and rust
-additionally percent-encode ``! * ' ( )``, which ``decodeURIComponent`` restores —
-canonical ``ns:…:args:…`` keys never contain those chars, so there is no interop
-gap in practice).
+These tests drive the real backend methods through a real ``httpx`` client backed
+by a ``MockTransport`` and assert on ``request.url.raw_path`` — the actual bytes
+that would go on the wire, *after* httpx's normalisation. Asserting the raw path
+(not a mocked endpoint string) is what proves the traversal is neutralised at the
+layer that used to defeat it.
 """
 
 from __future__ import annotations
@@ -46,7 +45,10 @@ _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, n
 # Keys that weaponise httpx's client-side URL normalisation (the vuln vectors),
 # plus the benign shapes that must still round-trip unchanged.
 _TRAVERSAL_KEYS = [
-    "default:../../admin",  # dot-segment traversal → would collapse to /admin
+    "default:../../admin",  # `/`-bearing traversal (every `/` → %2F, so no collapse)
+    "..",  # bare dot-segment: collapses to /v1 (or /v1/ttl on suffix routes) unless encoded
+    ".",  # single dot-segment: collapses to the collection endpoint unless encoded
+    "a:..",  # trailing dots but NOT an all-dot segment → must stay raw dots, must not collapse
     "k?x=1#f",  # query + fragment injection
     "a b",  # space (must not become a raw space / '+' in the path)
     "ns:articles:func:mod.fn:args:" + ("a" * 64) + ":1s",  # canonical 7-seg key (`:` → %3A)
@@ -103,11 +105,14 @@ def _assert_contained(request: httpx.Request, key: str, *, suffix: str = "") -> 
         encoded_key = encoded_key[: -len(suffix)]
 
     # The encoded key segment carries no separator/delimiter that httpx (or the
-    # SaaS router) could act on. With no real ``/`` in the segment, a traversable
-    # ``../`` cannot exist — so bare ``.``/``..`` need NOT be encoded (quote()
-    # leaves them, RFC-3986 unreserved); dot-segment collapse requires a real
-    # ``/`` boundary, and every ``/`` here is ``%2F``. The SaaS validator
-    # additionally rejects ``..`` in the decoded key.
+    # SaaS router) could act on: every ``/`` is ``%2F``, so no *embedded* ``../``
+    # can exist. A segment that is *entirely* dots (``.`` / ``..``) IS still a live
+    # dot-segment even without an embedded ``/`` — httpx collapses it against the
+    # ``/v1/cache/`` prefix (and the ``/ttl`` / ``/lock`` suffix supplies the trailing
+    # boundary), so ``_encode_key`` must encode those dots too. The ``startswith``
+    # check above is what catches a collapse: a bare ``..`` that leaked would show up
+    # as ``/v1`` or ``/v1/ttl``, failing the prefix assertion. The SaaS validator
+    # additionally rejects ``..`` in the decoded key as defence in depth.
     for bad in ("/", "?", "#"):
         assert bad not in encoded_key, f"unencoded {bad!r} survived in key segment: {encoded_key!r}"
 
