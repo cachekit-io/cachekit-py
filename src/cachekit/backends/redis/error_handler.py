@@ -85,6 +85,11 @@ def classify_redis_error(
         - ReadOnlyError, ClusterDownError: TRANSIENT (temporary cluster state)
         - All others: UNKNOWN (log and investigate)
     """
+    # Every branch below puts only type(exc).__name__ in the message, never the raw
+    # exception text: redis-py surfaces the offending key in ResponseError/NoPermission
+    # text ("NOPERM ... keys used as arguments", "WRONGTYPE ... key ..."), and the
+    # message reaches log sinks via str(e) (CWE-532, LAB-304). Full detail stays on
+    # original_exception; the key is on the .key attribute (redacted by _format_message).
     # Import here to avoid circular dependency and handle missing redis
     try:
         from redis.exceptions import (
@@ -104,7 +109,7 @@ def classify_redis_error(
     except ImportError:
         # Redis not installed - treat as unknown error
         return BackendError(
-            f"Redis error (redis-py not installed): {exc!s}",
+            f"Redis error (redis-py not installed): {type(exc).__name__}",
             error_type=BackendErrorType.UNKNOWN,
             original_exception=exc,
             operation=operation,
@@ -114,7 +119,7 @@ def classify_redis_error(
     # AUTHENTICATION: Credential/auth issues (check FIRST - subclass of ConnectionError)
     if isinstance(exc, (AuthenticationError, NoPermissionError)):
         return BackendError(
-            f"Redis authentication error: {exc!s}",
+            f"Redis authentication error: {type(exc).__name__}",
             error_type=BackendErrorType.AUTHENTICATION,
             original_exception=exc,
             operation=operation,
@@ -124,7 +129,7 @@ def classify_redis_error(
     # TIMEOUT: Operation exceeded time limit
     if isinstance(exc, RedisTimeoutError):
         return BackendError(
-            f"Redis timeout: {exc!s}",
+            f"Redis timeout: {type(exc).__name__}",
             error_type=BackendErrorType.TIMEOUT,
             original_exception=exc,
             operation=operation,
@@ -134,7 +139,7 @@ def classify_redis_error(
     # TRANSIENT: Temporary failures, retry with exponential backoff
     if isinstance(exc, (RedisConnectionError, BusyLoadingError, ReadOnlyError)):
         return BackendError(
-            f"Transient Redis error: {exc!s}",
+            f"Transient Redis error: {type(exc).__name__}",
             error_type=BackendErrorType.TRANSIENT,
             original_exception=exc,
             operation=operation,
@@ -144,7 +149,7 @@ def classify_redis_error(
     # PERMANENT: Unfixable errors (data format, protocol errors)
     if isinstance(exc, (ResponseError, DataError)):
         return BackendError(
-            f"Permanent Redis error: {exc!s}",
+            f"Permanent Redis error: {type(exc).__name__}",
             error_type=BackendErrorType.PERMANENT,
             original_exception=exc,
             operation=operation,
@@ -157,7 +162,7 @@ def classify_redis_error(
 
         if isinstance(exc, ClusterDownError):
             return BackendError(
-                f"Redis cluster down: {exc!s}",
+                f"Redis cluster down: {type(exc).__name__}",
                 error_type=BackendErrorType.TRANSIENT,
                 original_exception=exc,
                 operation=operation,
@@ -168,7 +173,7 @@ def classify_redis_error(
 
     # UNKNOWN: Unclassified error - log for investigation
     return BackendError(
-        f"Unknown Redis error: {exc!s}",
+        f"Unknown Redis error: {type(exc).__name__}",
         error_type=BackendErrorType.UNKNOWN,
         original_exception=exc,
         operation=operation,

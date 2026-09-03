@@ -282,3 +282,48 @@ class TestRedactErrorForLog:
         rendered = redact_error_for_log(ValueError(f"bad key: {TENANT_KEY}"))
         assert rendered == "ValueError"
         assert TENANT_KEY not in rendered
+
+
+class TestClassifierMessagesAreKeyFree:
+    """Every backend classifier must build a key-free BackendError.message (CWE-532).
+
+    This is the invariant ``redact_error_for_log`` relies on when it logs a BackendError
+    verbatim: provider exception text (redis ACL/WRONGTYPE, httpx URL, pymemcache) can
+    echo the raw key, so no classifier may interpolate ``str(exc)`` into the message —
+    only ``type(exc).__name__``. Detail stays on ``original_exception``; the key rides
+    the ``.key`` attribute, which ``_format_message`` redacts. Guards against the wrapped
+    path the logger-call architecture test cannot see (a BackendError construction, not a
+    logger call).
+    """
+
+    def test_redis_classifier_does_not_leak_key(self) -> None:
+        redis_exc = pytest.importorskip("redis.exceptions")
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        # redis-py ResponseError text echoes the offending key verbatim (ACL/WRONGTYPE);
+        # ResponseError classifies PERMANENT — a real branch, not the UNKNOWN fallback.
+        exc = redis_exc.ResponseError(f"WRONGTYPE Operation against key {TENANT_KEY}")
+        err = classify_redis_error(exc, operation="get", key=TENANT_KEY)
+        assert TENANT_KEY not in str(err)
+        assert redact_cache_key(TENANT_KEY) in str(err)  # key present only as its digest
+
+    def test_http_classifier_does_not_leak_key(self) -> None:
+        import httpx
+
+        from cachekit.backends.cachekitio.error_handler import classify_http_error
+
+        # httpx exception text carries the request URL, which embeds the raw key in its path.
+        exc = httpx.ConnectError(f"Connection refused to https://api.cachekit.io/v1/cache/{TENANT_KEY}")
+        err = classify_http_error(exc, operation="get", key=TENANT_KEY)
+        assert TENANT_KEY not in str(err)
+        assert redact_cache_key(TENANT_KEY) in str(err)
+
+    def test_memcached_classifier_does_not_leak_key(self) -> None:
+        from cachekit.backends.memcached.error_handler import classify_memcached_error
+
+        # TIMEOUT/TRANSIENT branches previously interpolated raw {exc}. socket.timeout is
+        # an alias of TimeoutError (3.10+), which the TIMEOUT branch matches.
+        exc = TimeoutError(f"timed out serving key {TENANT_KEY}")
+        err = classify_memcached_error(exc, operation="get", key=TENANT_KEY)
+        assert TENANT_KEY not in str(err)
+        assert redact_cache_key(TENANT_KEY) in str(err)

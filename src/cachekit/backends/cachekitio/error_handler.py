@@ -99,29 +99,34 @@ def classify_http_error(
                 key=key,
             )
 
-    # TIMEOUT: Request exceeded time limit
+    # TIMEOUT: Request exceeded time limit.
+    # Only the exception TYPE goes in the message: httpx exception text embeds the
+    # request URL, which carries the raw cache key in its path, and the message reaches
+    # log sinks via str(e) (CWE-532, LAB-304). Detail stays on original_exception.
     if isinstance(exc, httpx.TimeoutException):
         return BackendError(
-            f"Request timeout: {exc}",
+            f"Request timeout: {type(exc).__name__}",
             error_type=BackendErrorType.TIMEOUT,
             original_exception=exc,
             operation=operation,
             key=key,
         )
 
-    # TRANSIENT: Connection failures (retry)
+    # TRANSIENT: Connection failures (retry). Type-only message — httpx text can echo
+    # the request URL (raw key in path), and str(e) reaches log sinks (CWE-532).
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
         return BackendError(
-            f"Connection failed: {exc}",
+            f"Connection failed: {type(exc).__name__}",
             error_type=BackendErrorType.TRANSIENT,
             original_exception=exc,
             operation=operation,
             key=key,
         )
 
-    # UNKNOWN: Unclassified error
+    # UNKNOWN: Unclassified error. Type-only message (CWE-532): arbitrary httpx text
+    # can echo the request URL, which carries the raw key. Detail on original_exception.
     return BackendError(
-        f"Unknown HTTP error: {exc}",
+        f"Unknown HTTP error: {type(exc).__name__}",
         error_type=BackendErrorType.UNKNOWN,
         original_exception=exc,
         operation=operation,

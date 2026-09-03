@@ -1,6 +1,11 @@
-"""Standardized hashing utilities for cachekit.
+"""Standardized hashing and log-redaction utilities for cachekit.
 
 Uses BLAKE3 for hashing (approximately 2-3 GB/s throughput).
+
+This is also the leaf home for the log-redaction policy — ``redact_cache_key``,
+``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532). It lives here, not in
+``cache_handler`` or ``backends.errors``, so backend/L1 modules can share one policy
+without an import cycle (``backends.errors`` imports this module).
 """
 
 import hashlib
