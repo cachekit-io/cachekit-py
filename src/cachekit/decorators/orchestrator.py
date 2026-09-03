@@ -469,5 +469,5 @@ class FeatureOrchestrator:
 
         logger_instance = get_logger_provider().get_logger(__name__)
         logger_instance.warning(
-            f"Cache operation '{operation}' failed for key '{cache_key}': {error!s} ({type(error).__name__})"
+            f"Cache operation '{operation}' failed for key '{redact_key_for_log(cache_key)}': {error!s} ({type(error).__name__})"
         )

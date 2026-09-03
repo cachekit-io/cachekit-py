@@ -17,6 +17,10 @@ def redact_cache_key(cache_key: object) -> str:
     logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
     across the sync and async cache-set failure paths without leaking the key itself.
 
+    Unkeyed by design — cross-process correlation is the point. The digest is as guessable
+    as the key material (function args or a custom key), so it is a correlation id, not a
+    secret (see SECURITY.md, "Digest strength").
+
     Lives in this leaf module so backend/L1 modules can use it without importing
     cache_handler (which imports them).
 
