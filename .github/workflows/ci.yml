@@ -153,15 +153,50 @@ jobs:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
+    # fail_ci_if_error is deliberately split between these two uploads, not
+    # defaulted (LAB-2528 finding 3). coverage.xml is the ONLY input to the
+    # project/patch statuses codecov.yml declares, and every flag there sets
+    # `carryforward: true` — so a silently-dropped upload does not remove the
+    # status, it answers "is this PR's new code 80% covered?" with a previous
+    # run's numbers.
+    #
+    # Scoped to same-repo events rather than a bare `true`, because of what the
+    # action actually does on a fork (read at the pinned SHA, not assumed): its
+    # `Get OIDC token` step is guarded `CC_USE_OIDC == 'true' && CC_FORK != 'true'`,
+    # so on a fork it never attempts OIDC, `CC_TOKEN` stays empty, and the upload
+    # proceeds TOKENLESS — Codecov's rate-limited path. A bare `true` would let a
+    # 429 nobody controls redden an outside contribution, which on a repo with no
+    # branch protection trains maintainers to merge over red CI: the opposite of
+    # what this ticket is hardening. The flag therefore applies exactly where OIDC
+    # really authenticates.
+    #
+    # ACCEPTED RESIDUAL RISK, stated because the scoping creates it: on a fork PR a
+    # dropped tokenless upload is still silent, and carryforward then answers the
+    # patch question with an earlier commit's numbers — a stale green on exactly the
+    # least-trusted contributions. Accepted because a fork PR cannot reach the
+    # self-hosted `cachekit` runner without a maintainer approving the run, so a
+    # human is already in that loop, and no fork PR has run here to date. The real
+    # fix is to stop depending on an external upload for the floor (a local
+    # `--cov-fail-under` on the PR pytest invocation); that is a coverage-policy
+    # change, tracked separately rather than smuggled into this diff.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
       with:
         files: ./coverage.xml
         use_oidc: true
-        fail_ci_if_error: false
+        fail_ci_if_error: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
+    # Stays false, deliberately: junit.xml feeds Codecov Test Analytics
+    # (flaky-test history) only. Nothing gates on it and no status is computed
+    # from it, so a Codecov-side outage here would redden otherwise-passing CI
+    # while hiding nothing.
+    #
+    # `handle_no_reports_found` is left at its default (false) on both uploads on
+    # purpose: it would also swallow "the report was never written", which is the
+    # silent-degradation this ticket exists to remove. A second red step on an
+    # already-red job is noise; a green job that uploaded nothing is a trust bug.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
@@ -196,7 +231,7 @@ jobs:
     - name: Scan Python dependencies for CVEs
       run: |
         # No suppressions: every prior CVE is resolved at source on the py3.10+
-        # resolution. urllib3>=2.7.0 and pip>=26.1.2 are pinned via
+        # resolution. urllib3>=2.7.0 and pip>=26.2 are pinned via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
         # by their py3.10+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.
