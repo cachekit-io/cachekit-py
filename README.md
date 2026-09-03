@@ -294,8 +294,9 @@ def get_patient_data(hospital_id: int):
 `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3 decrypt-only keys)
 while new writes use `CACHEKIT_MASTER_KEY`. Scheduled rotation avoids
 rotation-caused cache misses only when it follows the runbook's three phases;
-a one-deploy key swap is not zero-miss. Entries are selected by exact key
-fingerprint — never trial decryption. See the [key rotation
+a one-deploy key swap is not zero-miss. CK-framed entries are selected by exact
+key fingerprint — never trial decryption; Interop-mode entries carry no CK frame
+and attempt keyring keys sequentially instead. See the [key rotation
 runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 cachekit employs comprehensive security tooling:

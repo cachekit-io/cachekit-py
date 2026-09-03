@@ -152,8 +152,10 @@ The configuration below is the phase-2 state, not a standalone rotation recipe.
 
 ```bash
 # Phase 2 only: the new key is current after the phase-1 fleet rollout.
-export CACHEKIT_MASTER_KEY=new_key                 # encrypts + decrypts
-export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separated, max 3)
+# Pseudocode — replace the placeholders with 64-character hex (32-byte) values,
+# e.g. `$(openssl rand -hex 32)`. Non-hex or short values are rejected at load.
+export CACHEKIT_MASTER_KEY=<new-key-hex>           # encrypts + decrypts
+export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex> # decrypt-only (comma-separated, max 3)
 # After the longest TTL has elapsed from fleet-wide promotion:
 # unset CACHEKIT_PREVIOUS_MASTER_KEYS
 # Never re-promote a retired key; rotate forward to a fresh key instead.
@@ -291,15 +293,19 @@ data_b = get_user_data(123)  # Same user_id, different tenant, different encrypt
 The keyring has one **current** master key
 (`CACHEKIT_MASTER_KEY`, encrypts and decrypts) plus up to **3 decrypt-only**
 previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
-per-key requirements as the master key). Entries carry the fingerprint of
-their HKDF-derived per-tenant encryption key, so reads select the exact
-keyring entry that wrote them — never trial decryption. The keyring alone does
+per-key requirements as the master key). CK-framed entries carry the
+fingerprint of their HKDF-derived per-tenant encryption key, so reads select
+the exact keyring entry that wrote them — never trial decryption. (Interop-mode
+entries carry no CK frame and instead attempt keyring keys sequentially — see
+the Interop-mode note below.) The keyring alone does
 not make a single-deploy swap zero-miss: use the [three-phase key rotation
 runbook](https://docs.cachekit.io/concepts/key-rotation/) for scheduled
 rotation.
 
 ```bash
 # Phase 2 only, after phase 1 deployed the incoming key decrypt-only fleet-wide.
+# Pseudocode — replace the placeholders with 64-character hex (32-byte) values,
+# e.g. `$(openssl rand -hex 32)`. Non-hex or short values are rejected at load.
 export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
 # Old entries still decrypt; new writes use the new key.
