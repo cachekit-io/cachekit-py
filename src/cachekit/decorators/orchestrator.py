@@ -3,7 +3,7 @@ import logging
 import uuid
 from typing import Any, Optional
 
-from ..hash_utils import redact_key_for_log
+from ..hash_utils import redact_error_for_log, redact_key_for_log
 from ..monitoring.correlation_tracking import CorrelationTracker
 from ..monitoring.pool_monitor import OptimizedPoolMonitor
 
@@ -457,17 +457,22 @@ class FeatureOrchestrator:
             operation=f"{operation}_failed",
             key=cache_key,
             namespace=namespace,
-            error=str(error),
+            # Key-free error text (CWE-532): an arbitrary exception's str() may echo
+            # the raw key, so only BackendError (self-sanitising) is logged verbatim.
+            error=redact_error_for_log(error),
             error_type=type(error).__name__,
             duration_ms=duration_ms,
             correlation_id=correlation_id,
             **extra_context,
         )
 
-        # 5. Also log via standard logger for backwards compatibility
+        # 5. Also log via standard logger for backwards compatibility. Redact the key
+        # inline (idempotent: it is already redacted above, but the flow-insensitive
+        # architecture guard requires the wrapper on the logged expression) and keep
+        # the exception text key-free with redact_error_for_log (CWE-532).
         from ..cache_handler import get_logger_provider
 
         logger_instance = get_logger_provider().get_logger(__name__)
         logger_instance.warning(
-            f"Cache operation '{operation}' failed for key '{redact_key_for_log(cache_key)}': {error!s} ({type(error).__name__})"
+            f"Cache operation '{operation}' failed for key '{redact_key_for_log(cache_key)}': {redact_error_for_log(error)}"
         )

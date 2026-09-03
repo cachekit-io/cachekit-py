@@ -71,6 +71,28 @@ def redact_key_for_log(cache_key: object) -> str:
     return redact_cache_key(key_str)
 
 
+def redact_error_for_log(error: object) -> str:
+    """Render an exception for a log/error message without leaking cache keys.
+
+    ``str(error)`` reaches log interpolation at every cache-error sink, and an
+    arbitrary exception's text has unknown provenance — a backend/serialization
+    error can echo the raw cache key (CWE-532, issue #163). So only ``BackendError``
+    (which formats itself key-free: the message is the exception type name and any
+    key is emitted as a redacted digest — see ``BackendError._format_message``) is
+    logged verbatim; every other exception is reduced to its bare type name, with
+    the full detail left on the exception object for programmatic access.
+
+    Sits beside redact_key_for_log() so both log sinks share one error policy.
+    ``BackendError`` is imported lazily to keep this leaf module free of a
+    back-edge to ``backends.errors`` (which imports this module).
+    """
+    from cachekit.backends.errors import BackendError
+
+    if isinstance(error, BackendError):
+        return str(error)
+    return type(error).__name__
+
+
 def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
     """Ultra-fast hash using BLAKE3 - optimized for hot paths.
 

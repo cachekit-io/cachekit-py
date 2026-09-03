@@ -171,14 +171,18 @@ class TestStructuredRedisLogger:
 
     @patch("cachekit.logging.logging.Logger.log")
     def test_redis_operation_failed_override(self, mock_log, logger):
-        """Test redis_operation_failed override."""
+        """redis_operation_failed emits a key-free error representation (CWE-532).
+
+        A non-BackendError's str() has unknown provenance and may echo the raw cache
+        key, so only its type name reaches the log; error_type still carries the type.
+        """
         error = ValueError("Test error")
         logger.redis_operation_failed("get", "test_key", error)
 
         mock_log.assert_called_once()
         extra = mock_log.call_args[1]["extra"]["structured"]
         assert extra["operation"] == "get"
-        assert extra["error"] == "Test error"
+        assert extra["error"] == "ValueError"  # not the raw "Test error" message
         assert extra["error_type"] == "ValueError"
 
     @patch("cachekit.logging.logging.Logger.log")

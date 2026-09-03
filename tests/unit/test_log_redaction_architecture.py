@@ -29,7 +29,10 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[2] / "src" / "cachekit"
 
 LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "critical", "exception", "log"})
-LOGGER_NAME_RE = re.compile(r"logg(?:er|ing)|^warnings$")  # logger, _logger, logger_instance, logging, warnings
+# logger, _logger, logger_instance, logging, warnings — plus bare log / _log receivers.
+# The (?:^|_)log(?:ger|ging)?(?:_|$) arm anchors on a word boundary so key-shaped names
+# that merely contain "log" (catalog, dialog, backlog) are not treated as loggers.
+LOGGER_NAME_RE = re.compile(r"(?:^|_)log(?:ger|ging)?(?:_|$)|^warnings$")
 LOGGER_FACTORIES = frozenset({"get_logger", "logger", "getLogger", "get_structured_logger"})
 REDACTORS = frozenset({"redact_cache_key", "redact_key_for_log"})
 KEY_NAME_RE = re.compile(r"(?:^|_)key$")
@@ -128,6 +131,9 @@ def test_detector_catches_the_shapes_it_claims_to() -> None:
         ("logging.getLogger(__name__).info('%s', kwargs['key'])", True),  # getLogger + subscript
         ("getattr(logger, level.lower())(f'{cache_key}')", True),  # orchestrator.log_structured style
         ("logger_instance.warning(f'{cache_key}')", True),  # any *logger-suffixed receiver
+        ("_log.warning('cache failure: %s', cache_key)", True),  # bare _log receiver
+        ("log.warning(f'{cache_key}')", True),  # bare log receiver
+        ("catalog.get(key)", False),  # 'log' substring is not a logger
         ("logger.info('ok %s', redact_key_for_log(key))", False),  # redacted %-arg
         ("logger.info(f'{redact_cache_key(lock_key)}')", False),  # redacted f-string
         ("logger.debug('%d keys', len(expired_keys))", False),  # plural: not a key

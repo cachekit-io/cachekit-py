@@ -48,20 +48,25 @@ def classify_memcached_error(
         MemcacheUnexpectedCloseError,
     )
 
-    # Timeout — socket.timeout or OSError with ETIMEDOUT
+    # Timeout — socket.timeout or OSError with ETIMEDOUT.
+    # Only the exception TYPE goes in the message: wrapped provider text has
+    # unknown provenance and may echo the raw cache key, and the message reaches
+    # log sinks via str(e) (CWE-532). Full details stay on original_exception.
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return BackendError(
-            message=f"Memcached timeout during {operation}: {exc}",
+            message=f"Memcached timeout during {operation}: {type(exc).__name__}",
             error_type=BackendErrorType.TIMEOUT,
             original_exception=exc,
             operation=operation,
             key=key,
         )
 
-    # Transient — connection closed, server errors (retriable)
+    # Transient — connection closed, server errors (retriable). Type-only message:
+    # pymemcache close/server errors can echo the raw key, and str(e) reaches log
+    # sinks (CWE-532). Detail stays on original_exception.
     if isinstance(exc, (MemcacheUnexpectedCloseError, MemcacheServerError, ConnectionError, OSError)):
         return BackendError(
-            message=f"Memcached transient error during {operation}: {exc}",
+            message=f"Memcached transient error during {operation}: {type(exc).__name__}",
             error_type=BackendErrorType.TRANSIENT,
             original_exception=exc,
             operation=operation,

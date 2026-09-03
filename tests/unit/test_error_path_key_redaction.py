@@ -251,3 +251,34 @@ class TestStructuredLoggerCacheOperationRedaction:
     def test_falsy_key_emits_empty_string(self, caplog: pytest.LogCaptureFixture) -> None:
         """No key means nothing to redact — must not become a digest of ``""``."""
         assert self._emit(caplog, "") == ""
+
+
+class TestRedactErrorForLog:
+    """Pin the two-branch contract of ``redact_error_for_log`` (CWE-532).
+
+    BackendError formats itself key-free (type name + redacted key digest), so it is
+    logged verbatim; any other exception's ``str()`` has unknown provenance and may
+    echo the raw key, so it collapses to the bare type name.
+    """
+
+    def test_backenderror_passes_through_key_free(self) -> None:
+        from cachekit.hash_utils import redact_error_for_log
+
+        err = BackendError(
+            message="Redis timeout during get: TimeoutError",
+            error_type=BackendErrorType.TIMEOUT,
+            operation="get",
+            key=TENANT_KEY,
+        )
+        rendered = redact_error_for_log(err)
+        assert rendered == str(err)
+        assert TENANT_KEY not in rendered
+        assert redact_cache_key(TENANT_KEY) in rendered  # key present only as its digest
+
+    def test_arbitrary_exception_reduced_to_type_name(self) -> None:
+        from cachekit.hash_utils import redact_error_for_log
+
+        # A raw provider exception whose text embeds the key must not leak it.
+        rendered = redact_error_for_log(ValueError(f"bad key: {TENANT_KEY}"))
+        assert rendered == "ValueError"
+        assert TENANT_KEY not in rendered
