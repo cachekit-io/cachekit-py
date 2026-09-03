@@ -150,7 +150,6 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "--strict-markers",
     "--verbose",
-    "--basetemp=/tmp/pytest",
     "--doctest-modules",              # Validate docstring examples
     "--doctest-continue-on-failure",  # Report all doctest failures, not just first
     "--markdown-docs",                # Validate markdown documentation examples
