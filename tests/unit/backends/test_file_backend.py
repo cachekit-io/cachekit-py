@@ -807,6 +807,27 @@ class TestErrorPaths:
         assert result is None
         assert not os.path.exists(file_path)
 
+    def test_get_survives_short_reads(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """read(2) may return fewer bytes than asked (POSIX; Linux caps one call at ~2 GiB).
+
+        Force every os.read to hand back at most 5 bytes, so the 14-byte header and the payload
+        each need several calls. get() must return the full value, not a truncated one that
+        would fail downstream integrity as spurious corruption.
+        """
+        real_read = os.read
+        calls: list[int] = []
+
+        def short_read(fd: int, n: int) -> bytes:
+            calls.append(n)
+            return real_read(fd, min(n, 5))
+
+        payload = bytes(range(256)) * 8
+        backend.set("short_read_key", payload)
+        monkeypatch.setattr(os, "read", short_read)
+
+        assert backend.get("short_read_key") == payload
+        assert len(calls) > 2, "short reads were not exercised"
+
     def test_get_expired_ttl_deletes_file(self, backend: FileBackend, config: FileBackendConfig) -> None:
         """Test get deletes expired files."""
         key = "expired_key"
