@@ -27,7 +27,7 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -339,14 +339,11 @@ class StandardSerializer:
                 msgpack_data = data
 
             # Deserialize MessagePack
-            return msgpack.unpackb(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
-        except (msgpack.exceptions.UnpackException, ValueError, TypeError, BufferError) as e:
-            # BufferError: a non-u8 buffer exporter (e.g. numpy float array) rejected at the
-            # PyO3 boundary. Pre-LAB-770 bytes() coerced these to raw bytes and envelope
-            # validation rejected the garbage as ValueError; same contract, new cause.
+        except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
 

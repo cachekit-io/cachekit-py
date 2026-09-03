@@ -36,9 +36,7 @@ from pathlib import Path, PurePath
 from typing import Any
 from uuid import UUID
 
-import msgpack
-
-from .serializers.base import SerializationError
+from .serializers.base import SerializationError, unpackb_bounded
 
 # Full-string match REQUIRED: re.match with a $ anchor still accepts a
 # trailing newline. Pinned by the reject_trailing_newline error vector.
@@ -440,7 +438,7 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "check that every writer for this key uses @cache(interop=...)."
         )
     try:
-        return msgpack.unpackb(raw, raw=False, strict_map_key=True, object_hook=_revive_sentinels)
+        return unpackb_bounded(raw, raw=False, strict_map_key=True, object_hook=_revive_sentinels)
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 

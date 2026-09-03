@@ -12,12 +12,34 @@ from __future__ import annotations
 
 from uuid import UUID
 
+import msgpack
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from cachekit._rust_serializer import ByteStorage
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import SerializationError
+
+# A well-formed msgpack document whose ndarray marker makes np.frombuffer raise
+# OverflowError (itemsize past C long) — a forged entry that is neither a decode-bound
+# rejection nor a ValueError, so it pins the serializer's exception contract.
+FORGED_NDARRAY = msgpack.packb(
+    {"__ndarray__": True, "dtype": {"names": ["a"], "formats": ["f8"], "itemsize": 2**63}, "shape": [1], "data": b"x" * 8}
+)
+
+
+@pytest.mark.parametrize(
+    "serializer, entry",
+    [
+        (AutoSerializer(enable_integrity_checking=False), FORGED_NDARRAY),
+        (AutoSerializer(), bytes(ByteStorage("msgpack").store(FORGED_NDARRAY, "msgpack"))),
+    ],
+    ids=["plain", "verified-envelope"],
+)
+def test_forged_payload_failure_is_a_serialization_error(serializer: AutoSerializer, entry: bytes) -> None:
+    with pytest.raises(SerializationError):
+        serializer.deserialize(entry)
 
 
 class TestAutoSerializerUUID:

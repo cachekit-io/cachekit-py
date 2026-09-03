@@ -1,10 +1,14 @@
 //! `PyO3` bindings for `cachekit-core`
 //!
 //! This crate provides thin Python wrappers around the cachekit-core library.
-//! All business logic lives in cachekit-core; this crate only handles Python FFI.
+//! Business logic lives in cachekit-core, with one SDK-owned exception: the untrusted
+//! msgpack decode bound in `msgpack_bounds` (LAB-2503), pending a core-shared walk.
 
 // Re-export core types for use in Python bindings
 pub use cachekit_core::{ByteStorage, OperationMetrics, StorageEnvelope};
+
+/// Untrusted msgpack structural bound — pure Rust, not gated on `python`
+pub mod msgpack_bounds;
 
 #[cfg(feature = "encryption")]
 pub use cachekit_core::{
@@ -31,6 +35,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the checksum feature alone; must not vanish when encryption is off)
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::verify_checksum_py, m)?)?;
+
+    // Untrusted-decode structural bound (LAB-2503) — zero-copy header walk that
+    // serializers/base.py::unpackb_bounded runs before every msgpack.unpackb
+    m.add_function(wrap_pyfunction!(
+        python_bindings::check_msgpack_structure_py,
+        m
+    )?)?;
 
     // Add encryption functionality if feature is enabled
     #[cfg(feature = "encryption")]

@@ -8,6 +8,10 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+import msgpack
+
+from cachekit._rust_serializer import check_msgpack_structure
+
 
 @runtime_checkable
 class SerializerProtocol(Protocol):
@@ -320,3 +324,67 @@ class SuspiciousCacheEntryError(SerializationError):
     """
 
     pass
+
+
+# ---------------------------------------------------------------------------
+# Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
+# ---------------------------------------------------------------------------
+
+#: cachekit's own nesting ceiling, enforced by the Rust ``check_msgpack_structure``
+#: walk before msgpack-python ever sees the document. Two constraints pin it: the
+#: protocol requires every SDK's bound to sit in 32..=1024, and it must not exceed
+#: msgpack-python's C unpacker stack (a document at the ceiling has to decode after
+#: passing the walk; tests/unit/protocol/test_decode_bounds.py checks exactly that).
+MSGPACK_MAX_NESTING = 1024
+
+#: Everything a corrupted or forged payload can make a decode raise, for serializers
+#: to turn into ``SerializationError``. msgpack's own errors are ``ValueError``
+#: subclasses; the AutoSerializer object hook and the NumPy/DataFrame/Series
+#: reconstructors add ``TypeError`` / ``OverflowError`` (``np.frombuffer`` on a forged
+#: dtype or itemsize), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
+#: the shape they wrote); ``BufferError`` is a non-u8 buffer exporter rejected at the
+#: PyO3 boundary (LAB-770). Anything else — above all ``RuntimeError`` for a missing
+#: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
+PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError)
+
+
+def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
+    """Decode one untrusted MessagePack document under cachekit-owned bounds.
+
+    Why not plain ``msgpack.unpackb``: a collection header costs 1-5 bytes but may
+    declare up to 2**32-1 elements, and the C unpacker pre-allocates the container
+    (``PyList_New(n)``) *before* decoding the children. Nested headers stack those
+    allocations depth-first, so the library's per-collection default cap
+    (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
+    transient heap — measured 10 KB -> 67 MB.
+
+    The bound is the Rust extension's zero-copy, header-only walk
+    (``check_msgpack_structure``, documented there) run before the decode. It
+    rejects a document that nests deeper than :data:`MSGPACK_MAX_NESTING` or whose
+    open headers declare more elements or bytes than the remaining input can back.
+    Every element that survives is backed by >= 1 input byte, so the real decode's
+    total container pre-allocation is bounded by len(data) rather than by
+    depth x declared length. The explicit ``max_*_len=len(data)`` caps on
+    ``unpackb`` are unreachable once the walk passes; they are defence in depth
+    against a walk regression, not an independent bound.
+
+    Every rejection is a ``ValueError`` (``FormatError``, ``ExtraData``, or the
+    walk's own ``ValueError`` naming the violated bound), which the read paths
+    already turn into a controlled cache miss. Trailing bytes are still rejected
+    by ``unpackb`` itself.
+
+    Examples:
+        >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
+        {'a': [1, 2]}
+        >>> unpackb_bounded(b"\\xdc\\x07\\xd0" * 5000)  # 15 KB nested-header bomb
+        Traceback (most recent call last):
+        ...
+        ValueError: Unpack failed: MessagePack document declares more elements than the input can back
+        >>> unpackb_bounded(b"\\x91" * 1025 + b"\\xc0")  # one level past the ceiling
+        Traceback (most recent call last):
+        ...
+        ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
+    """
+    n = len(data)
+    check_msgpack_structure(data, MSGPACK_MAX_NESTING)
+    return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)
