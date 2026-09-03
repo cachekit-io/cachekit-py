@@ -196,7 +196,7 @@ jobs:
     - name: Scan Python dependencies for CVEs
       run: |
         # No suppressions: every prior CVE is resolved at source on the py3.10+
-        # resolution. urllib3>=2.7.0 and pip>=26.1.2 are pinned via
+        # resolution. urllib3>=2.7.0 and pip>=26.2 are floored via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
         # by their py3.10+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.

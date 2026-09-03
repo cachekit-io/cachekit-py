@@ -247,10 +247,12 @@ constraint-dependencies = [
     "urllib3>=2.7.0",
     "fonttools>=4.60.2",
     "werkzeug>=3.1.4",
-    # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixes
+    # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixed
     # PYSEC-2026-196 (entry-point path traversal), GHSA-58qw-9mgm-455v (tar/zip
-    # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering).
-    "pip>=26.1.2",
+    # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering); 26.2 adds
+    # PYSEC-2026-3721 (doubly-encoded index URLs escaping the target directory —
+    # arbitrary write on install from a malicious index).
+    "pip>=26.2",
     # h2 is a transitive dep (httpx[http2] -> h2). 4.4.1 fixes
     # GHSA-6hr6-w5qg-qmwg (duplicate Host headers forwarded on HTTP/2 ->
     # HTTP/1.1 downgrade — request smuggling primitive).
