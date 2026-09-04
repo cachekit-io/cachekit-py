@@ -705,6 +705,40 @@ class TestMidPublishMemoryOrdering:
             assert session_module._session_id is not None
             assert session_module._session_start_ms is not None
 
+    def test_double_check_accepts_a_complete_publish(self):
+        """A state completed while waiting for the lock does not reinitialize."""
+        from cachekit.decorators import session as session_module
+        from cachekit.decorators.session import get_session_id
+
+        class PublishBeforeEnter:
+            def __enter__(self):
+                session_module._session_start_ms = 1
+                session_module._session_id = "published-under-lock"
+                session_module._session_pid = os.getpid()
+
+            def __exit__(self, *_):
+                return False
+
+        saved = (
+            session_module._session_lock,
+            session_module._session_pid,
+            session_module._session_id,
+            session_module._session_start_ms,
+        )
+        session_module._session_lock = PublishBeforeEnter()
+        session_module._session_pid = None
+        session_module._session_id = None
+        session_module._session_start_ms = None
+        try:
+            assert get_session_id() == "published-under-lock"
+        finally:
+            (
+                session_module._session_lock,
+                session_module._session_pid,
+                session_module._session_id,
+                session_module._session_start_ms,
+            ) = saved
+
     def test_session_headers_present_mid_publish(self):
         with self._mid_publish_state():
             headers = get_session_headers()

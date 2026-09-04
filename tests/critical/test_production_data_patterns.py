@@ -30,9 +30,6 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
-# Requires the [data] extra — absent e.g. in the free-threaded CI lane (LAB-511).
-pd = pytest.importorskip("pandas")
-
 # Import from compatibility wrapper
 from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer  # noqa: E402
 
@@ -621,6 +618,7 @@ class TestProductionDataPatterns:
 
     def test_pandas_dataframe_enterprise_scenarios(self):
         """Test Pandas DataFrames in enterprise contexts"""
+        pd = pytest.importorskip("pandas")
         # Create enterprise-style DataFrame
         df = pd.DataFrame(
             {

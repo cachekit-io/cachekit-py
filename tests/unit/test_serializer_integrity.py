@@ -5,18 +5,24 @@ Tests that OrjsonSerializer and ArrowSerializer detect data corruption via xxHas
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
-# Requires the [data] + [json] extras — absent e.g. in the free-threaded CI
-# lane until pandas/pyarrow/orjson ship free-threaded wheels (LAB-511).
-pd = pytest.importorskip("pandas")
-pytest.importorskip("pyarrow")
-pytest.importorskip("orjson")
+from cachekit.serializers.base import SerializationError
 
-from cachekit.serializers import ArrowSerializer, OrjsonSerializer  # noqa: E402
-from cachekit.serializers.base import SerializationError  # noqa: E402
+_HAS_ORJSON = importlib.util.find_spec("orjson") is not None
+_HAS_ARROW = all(importlib.util.find_spec(package) is not None for package in ("pandas", "pyarrow"))
+
+if _HAS_ORJSON:
+    from cachekit.serializers import OrjsonSerializer
+if _HAS_ARROW:
+    import pandas as pd
+
+    from cachekit.serializers import ArrowSerializer
 
 
+@pytest.mark.skipif(not _HAS_ORJSON, reason="requires the [json] extra")
 class TestOrjsonSerializerIntegrity:
     """Test xxHash3-64 integrity checking for OrjsonSerializer."""
 
@@ -154,6 +160,7 @@ class TestOrjsonSerializerIntegrity:
         assert result == original
 
 
+@pytest.mark.skipif(not _HAS_ARROW, reason="requires the [data] extra")
 class TestArrowSerializerIntegrity:
     """Test xxHash3-64 integrity checking for ArrowSerializer."""
 
@@ -321,6 +328,7 @@ class TestArrowSerializerIntegrity:
 class TestIntegrityPerformance:
     """Test that integrity checking overhead is minimal."""
 
+    @pytest.mark.skipif(not _HAS_ORJSON, reason="requires the [json] extra")
     def test_orjson_checksum_overhead_acceptable(self):
         """xxHash3-64 checksum adds minimal overhead to OrjsonSerializer."""
         serializer = OrjsonSerializer()
@@ -338,6 +346,7 @@ class TestIntegrityPerformance:
 
         assert overhead == 8  # Exactly 8 bytes for xxHash3-64 checksum
 
+    @pytest.mark.skipif(not _HAS_ARROW, reason="requires the [data] extra")
     def test_arrow_checksum_overhead_acceptable(self):
         """xxHash3-64 checksum adds minimal overhead to ArrowSerializer."""
         serializer = ArrowSerializer()

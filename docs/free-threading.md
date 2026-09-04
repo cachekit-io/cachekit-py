@@ -49,7 +49,7 @@ the ticket, plus what the free-threaded CI lane surfaced:
 | Site | Mechanism | Verdict |
 |:-----|:----------|:--------|
 | `decorators/session.py` `_ensure_session_initialized` | Lock-free fast path over three module globals | **Fixed** — fast path and double-check gate on all three fields; regression tests in `tests/unit/test_saas_observability.py::TestMidPublishMemoryOrdering` and `tests/unit/test_free_threading.py` |
-| `reliability/metrics_collection.py` `AsyncMetricsCollector.flush` | Polled `Queue.empty()` | **Fixed** — `empty()` flips when the worker *dequeues*, not when it finishes processing; flush now waits on `unfinished_tasks` (zeroed by `task_done()` after processing). Was a routine flake on the free-threaded lane, invisible under the GIL's coarse scheduling |
+| `reliability/metrics_collection.py` `AsyncMetricsCollector.flush` | Polled `Queue.empty()` | **Fixed** — `empty()` flips when the worker *dequeues*, not when it finishes processing; flush now waits on its own pending-work condition, signaled after `task_done()`. Was a routine flake on the free-threaded lane, invisible under the GIL's coarse scheduling |
 | `decorators/wrapper.py` `_FunctionStats` | `RLock` around every counter mutation and `get_info` | Safe. `l1_enabled` is a plain attribute re-set on re-decoration (under the registry lock) and read without the stats lock; a stale read yields a conservative rate-limit classification header, never corruption |
 | `decorators/wrapper.py` `_function_stats_registry` | Module-level `Lock` around all access | Safe |
 | `os.register_at_fork` handlers (session + stats registry) | Run in the child while single-threaded; replace locks wholesale | Safe — single-threaded by construction at execution time |
