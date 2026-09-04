@@ -49,7 +49,7 @@ the ticket, plus what the free-threaded CI lane surfaced:
 | Site | Mechanism | Verdict |
 |:-----|:----------|:--------|
 | `decorators/session.py` `_ensure_session_initialized` | Lock-free fast path over three module globals | **Fixed** — fast path and double-check gate on all three fields; regression tests in `tests/unit/test_saas_observability.py::TestMidPublishMemoryOrdering` and `tests/unit/test_free_threading.py` |
-| `reliability/metrics_collection.py` `AsyncMetricsCollector.flush` | Polled `Queue.empty()` | **Fixed** — `empty()` flips when the worker *dequeues*, not when it finishes processing; flush now waits on its own pending-work condition, signaled after `task_done()`. Was a routine flake on the free-threaded lane, invisible under the GIL's coarse scheduling |
+| `reliability/metrics_collection.py` `AsyncMetricsCollector.flush` | Polled `Queue.empty()` | **Fixed** — `empty()` flips when the worker *dequeues*, not when it finishes processing; flush now waits on a collector-owned pending-work counter + `Condition` (+1 on enqueue, −1 once the worker has processed or dropped the item, `notify_all()` when it reaches zero). Was a routine flake on the free-threaded lane, invisible under the GIL's coarse scheduling |
 | `decorators/wrapper.py` `_FunctionStats` | `RLock` around every counter mutation and `get_info` | Safe. `l1_enabled` is a plain attribute re-set on re-decoration (under the registry lock) and read without the stats lock; a stale read yields a conservative rate-limit classification header, never corruption |
 | `decorators/wrapper.py` `_function_stats_registry` | Module-level `Lock` around all access | Safe |
 | `os.register_at_fork` handlers (session + stats registry) | Run in the child while single-threaded; replace locks wholesale | Safe — single-threaded by construction at execution time |
@@ -65,11 +65,17 @@ the ticket, plus what the free-threaded CI lane surfaced:
 
 `.github/workflows/ci.yml` job `test-freethreaded`:
 
-1. Installs with `uv sync --python 3.14t --no-default-groups --group test
-   --no-install-package hiredis`. The `test` dependency group is the core
-   test toolchain; the extras that lack free-threaded wheels (orjson, numpy,
-   pandas, pyarrow) live only in the `dev` group and the `[data]`/`[json]`
-   extras, and their tests skip via `pytest.importorskip`.
+1. Installs exactly what the job runs — note the hiredis exclusion, it is
+   load-bearing (see below):
+
+   ```bash
+   uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
+   ```
+
+   The `test` dependency group is the core test toolchain; the extras that
+   lack free-threaded wheels (orjson, numpy, pandas, pyarrow) live only in
+   the `dev` group and the `[data]`/`[json]` extras, and their tests skip
+   via `pytest.importorskip`.
 2. Asserts the interpreter is a free-threaded build **and** that
    `sys._is_gil_enabled()` is still `False` after importing `cachekit`,
    `cachekit._rust_serializer`, and `redis` — a dependency that fails to
