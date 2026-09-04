@@ -36,6 +36,79 @@ data = get_sensitive_data(123)  # Encrypted in Redis
 
 ---
 
+## Which Path: `@cache.secure` vs `@cache.io` + `CACHEKIT_MASTER_KEY`
+
+There are two real, shipped paths to encrypted caching on the cachekit.io SaaS. Both are
+zero-knowledge on the wire **when a master key is present** — the difference is what
+happens when it isn't, and which backend you actually reach.
+
+| | `@cache.secure(backend=CachekitIOBackend())` | `@cache.io()` + `CACHEKIT_MASTER_KEY` env |
+|---|---|---|
+| Encryption | Forced ON in code (`EncryptionConfig.enabled=True`) | Auto-detected from the env var (tri-state `enabled=None`) |
+| **No master key present** | **Fails closed** — raises `ValueError` at decoration time | **Fails open** — silently caches plaintext to the SaaS |
+| Integrity checking | Forced `True`, cannot be overridden | On by preset default |
+| Backend | Env auto-detect — **not pinned to the SaaS**, see footgun below; pass `backend=` explicitly | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
+| Tenant mode | `single_tenant_mode` handled automatically | Handled automatically (auto-detect path) |
+| Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`) |
+
+**`@cache.io()` does not take a `backend=` argument.** The preset always
+constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
+decorator is silently discarded, and `backend=None` flips the wrapper into
+L1-only mode (in-process memory — the SaaS is never contacted, despite the
+`.io` name). Calling `DecoratorConfig.io(backend=...)` directly raises
+`TypeError` (duplicate keyword argument). To target any other backend, use a
+different preset with an explicit `backend=`.
+
+**Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
+explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
+opt-in convenience** → set `CACHEKIT_MASTER_KEY` and let auto-detect do it (this
+applies to every preset, not just `.io`). Compliance arguments — "the SaaS only
+ever stores ciphertext" — should only be hung on the fail-closed path: on the
+auto-detect path, one missing env var quietly puts plaintext on the backend. Even
+on the fail-closed path, client-side encryption may *reduce* HIPAA/PCI DSS scope
+subject to assessment and your surrounding controls — it does not remove regulated
+data from scope on its own (see [Compliance Implications](#compliance-implications)).
+
+> [!WARNING]
+> **`@cache.secure` does NOT pin the SaaS backend.** Backend resolution is the
+> same lookup as every preset: explicit `backend=` → `set_default_backend()` →
+> environment auto-detect at **first call** (`CACHEKIT_API_KEY` → cachekit.io SaaS;
+> `CACHEKIT_REDIS_URL` → Redis; then the Memcached/File selectors; else
+> `REDIS_URL` / localhost Redis fallback). Two consequences: (1) in a 12-factor
+> environment where `REDIS_URL` is set and `CACHEKIT_API_KEY` is not,
+> `@cache.secure` **silently encrypts to Redis instead of the SaaS**; (2) because
+> resolution is lazy, a backend misconfiguration (e.g. two auto-detect selectors
+> set at once) surfaces as a `ConfigurationError` at first call, not at import.
+> When the SaaS is the requirement, pass `backend=CachekitIOBackend()` explicitly
+> — auditable in code and immune to environment drift.
+
+```python notest
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+# Security requirement: fail-closed, auditable, explicitly targets the SaaS
+@cache.secure(backend=CachekitIOBackend(), ttl=3600)
+def get_patient_record(patient_id: str):
+    return fetch_phi(patient_id)  # illustrative
+
+# Fleet-wide convenience: encrypts iff CACHEKIT_MASTER_KEY is set,
+# silently plaintext if it is not
+@cache.io(ttl=300)
+def get_dashboard_stats(org_id: str):
+    return compute_stats(org_id)  # illustrative
+```
+
+> [!IMPORTANT]
+> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
+> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
+> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
+> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
+> key-mismatched entries (miss + recompute) unless you opt in. See
+> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
+
+---
+
 ## What It Does
 
 **Encryption pipeline** (works with ANY serializer):
@@ -121,7 +194,7 @@ def get_user_ssn(user_id):
 
 ### Missing Master Key
 > [!WARNING]
-> `cache.secure` requires a master key. Omitting it raises a `ConfigurationError` at decoration time, not at call time.
+> `cache.secure` requires a master key. Omitting it raises a `ValueError` at decoration time, not at call time — this is the fail-closed guarantee that distinguishes `.secure` from env-var auto-detection (see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key) above).
 
 ```python notest
 # Forget to set master_key parameter
@@ -160,12 +233,14 @@ export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separat
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
 When you turn encryption on over a cache that already holds plaintext entries, those
-entries are **rejected, never read**. The read path fails closed: the entry raises a
-`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
-and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+entries are **rejected, never read**: the entry raises a `SerializationError`
+internally, the caller treats it as a miss, evicts the stale entry, recomputes,
+and re-stores the value encrypted. (This rejection is unconditional — it is not
+governed by the `fail_closed` setting, which applies only to authenticated-decrypt
+failures.) Migration is therefore lazy and self-healing:
 
 ```text
-read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+read plaintext entry → SerializationError (rejected, never deserialized) → evict → recompute → re-store encrypted
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
@@ -255,7 +330,7 @@ def get_patient_records(hospital_id: int):
     )
 
 df = get_patient_records(42)
-# DataFrame encrypted client-side, HIPAA-compliant zero-knowledge storage
+# DataFrame encrypted client-side — zero-knowledge storage
 ```
 
 ### Multi-Tenant Isolation
@@ -381,7 +456,7 @@ path when encryption is configured:
 ```text
 Handler configured with encryption:
   entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
-  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+  entry header claims plaintext  → SerializationError (plaintext never returned; miss + evict, independent of `fail_closed`)
 ```
 
 The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
@@ -622,7 +697,6 @@ export default {
     // NEVER sees plaintext (no decryption key)
     await KV.put(key, value);
 
-    // Compliance: GDPR, HIPAA, PCI-DSS satisfied
     // Backend cannot read user data even if compromised
     return new Response("OK");
   }
@@ -632,7 +706,7 @@ export default {
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
 - ✅ Multi-tenant isolation (per-tenant encryption keys)
-- ✅ GDPR/HIPAA/PCI-DSS compliance out of the box
+- ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
 ---
