@@ -328,7 +328,8 @@ class StandardSerializer:
             >>> result == {"test": 123}
             True
         """
-        data = bytes(data)  # coerce unwrap's zero-copy memoryview; no-op when already bytes (Rust retrieve needs bytes)
+        # No bytes() coercion: Rust retrieve accepts the buffer protocol (LAB-770), so
+        # unwrap's zero-copy memoryview flows through without a full-payload copy.
         try:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
@@ -342,7 +343,10 @@ class StandardSerializer:
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
-        except (msgpack.exceptions.UnpackException, ValueError, TypeError) as e:
+        except (msgpack.exceptions.UnpackException, ValueError, TypeError, BufferError) as e:
+            # BufferError: a non-u8 buffer exporter (e.g. numpy float array) rejected at the
+            # PyO3 boundary. Pre-LAB-770 bytes() coerced these to raw bytes and envelope
+            # validation rejected the garbage as ValueError; same contract, new cause.
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
 

@@ -312,13 +312,14 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
     """END-TO-END read through FileBackend.get() (default serializer, no mmap).
 
     This is the path most cached functions take (anything that isn't a plaintext
-    Arrow DataFrame). Measured cost today: ~5x payload on the Python heap —
-    FileBackend.get's two full-payload copies (os.read + the file_data[14:] slice,
-    the exact copies #169 calls out), StandardSerializer.deserialize's ``bytes(data)``
-    re-coercion of the envelope's zero-copy memoryview (Rust retrieve needs bytes),
-    the decompressed msgpack document, and the unpacked output. The bound pins that:
-    one MORE full-payload copy (~6x) fails. Tightening below 5x means fixing those
-    copies (separate ticket per #169 — this test is the measurement).
+    Arrow DataFrame). Measured cost today: ~3x payload on the Python heap —
+    FileBackend.get's single payload os.read (header read separately, LAB-770),
+    the decompressed msgpack document, and the unpacked output. The two avoidable
+    copies #169 called out are gone: the file_data[14:] slice (header-first read)
+    and deserialize's ``bytes(data)`` coercion (Rust retrieve takes the buffer
+    protocol, so unwrap's zero-copy memoryview flows through). The bound pins
+    that: one full-payload copy creeping back (~4x) fails. ~3x is the floor —
+    decompress + unpack are inherent (retrieve returns owned bytes by construction).
     """
     payload = np.random.default_rng(0).bytes(50 * _MB)  # incompressible: envelope ~= payload size
     backend, operation = _file_read_stack(tmp_path / "cache", "default")
@@ -333,9 +334,10 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
 
     assert hit is not None, "end-to-end File read missed (errors read as miss — check logs)"
     assert hit[1] == payload
-    assert peak / len(payload) < 5.7, (
-        f"File-backend bytes read peak {peak / len(payload):.2f}x payload — an additional full-payload "
-        f"read-side copy crept in (known cost ~5x: os.read + slice + bytes() coercion + decode + output)"
+    assert peak / len(payload) < 3.5, (
+        f"File-backend bytes read peak {peak / len(payload):.2f}x payload — a full-payload read-side "
+        f"copy crept back in (known cost ~3x: payload os.read + decode + output; LAB-770 removed "
+        f"the header slice and the bytes() coercion)"
     )
 
 
