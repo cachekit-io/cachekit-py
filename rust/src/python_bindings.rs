@@ -21,6 +21,29 @@ impl Default for PyByteStorage {
     }
 }
 
+/// Offset into `base` at which `buf`'s memory starts, iff `buf` is a plain, immutable,
+/// C-contiguous window onto that `bytes` object — the shape `SerializationWrapper.unwrap`
+/// produces. `Some(off)` means `&base.as_bytes()[off..off + buf.item_count()]` is exactly
+/// the buffer's bytes, so the caller can borrow it with a safe slice instead of a raw one.
+///
+/// Every conjunct is load-bearing: `readonly` + a `bytes` base rule out a mutable exporter
+/// racing the GIL-released read; `is_c_contiguous` rules out a strided view whose logical
+/// bytes are not the contiguous span; the range check rules out a spoofed `.obj` naming a
+/// decoy `bytes` the memory does not belong to; and `checked_add` keeps that range check
+/// honest against a forged `Py_buffer` length rather than wrapping past it.
+fn borrowable_offset(buf: &PyBuffer<u8>, base: &Bound<'_, PyBytes>) -> Option<usize> {
+    let bytes = base.as_bytes();
+    let start = bytes.as_ptr() as usize;
+    let ptr = buf.buf_ptr() as usize;
+    let end = ptr.checked_add(buf.item_count())?;
+    (buf.readonly()
+        && buf.is_c_contiguous()
+        && buf.item_count() > 0
+        && ptr >= start
+        && end <= start + bytes.len())
+    .then(|| ptr - start)
+}
+
 #[pymethods]
 impl PyByteStorage {
     #[new]
@@ -52,13 +75,54 @@ impl PyByteStorage {
     /// Retrieve and validate stored bytes
     ///
     /// Args:
-    ///     envelope_bytes: Serialized StorageEnvelope bytes
+    ///     envelope_bytes: Serialized StorageEnvelope — any buffer-protocol object
+    ///         (`bytes`, `memoryview`, `bytearray`), so callers holding a zero-copy
+    ///         `memoryview` (SerializationWrapper.unwrap) never re-coerce to `bytes` (LAB-770)
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
-    pub fn retrieve(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
+    pub fn retrieve(
+        &self,
+        py: Python,
+        envelope_bytes: &Bound<'_, PyAny>,
+    ) -> PyResult<(Vec<u8>, String)> {
+        let owned: Vec<u8>;
+        let buf: PyBuffer<u8>;
+        let base_bytes: Option<Bound<'_, PyBytes>>;
+        let data: &[u8] = if let Ok(b) = envelope_bytes.cast::<PyBytes>() {
+            // `bytes` is immutable and kept alive by the Bound for the whole call:
+            // a zero-copy borrow with no data-race exposure.
+            b.as_bytes()
+        } else {
+            buf = PyBuffer::get(envelope_bytes)?;
+            // Borrowing across the GIL release below is only sound when the BACKING
+            // STORAGE is immutable — readonly() describes the view, not the exporter
+            // (memoryview(bytearray).toreadonly() passes it while another thread can
+            // still mutate the bytearray). Attribute trust is not enough either: a
+            // PEP 688 __buffer__ exporter can name a decoy `bytes` in `.obj`. So the
+            // gate is a containment proof (borrowable_offset), and its payoff is that
+            // the borrow becomes expressible as an ORDINARY SLICE of that `bytes` —
+            // bounds-checked by Rust, no `unsafe`, nothing for a stale comment to
+            // misstate. Anything unproven falls back to a copy.
+            base_bytes = envelope_bytes
+                .getattr("obj")
+                .ok()
+                .and_then(|base| base.cast_into::<PyBytes>().ok());
+            let borrowed = base_bytes.as_ref().and_then(|base| {
+                borrowable_offset(&buf, base)
+                    .map(|off| &base.as_bytes()[off..off + buf.item_count()])
+            });
+            match borrowed {
+                Some(slice) => slice,
+                None => {
+                    // Mutable, non-bytes-backed, non-contiguous, or empty exporter.
+                    owned = buf.to_vec(py)?;
+                    &owned
+                }
+            }
+        };
         // Detach from the GIL for decompression + checksum (see store()).
-        py.detach(|| self.inner.retrieve(envelope_bytes))
+        py.detach(|| self.inner.retrieve(data))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
     }
 

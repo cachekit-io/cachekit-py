@@ -56,6 +56,11 @@ Choose how data is stored:
 | [Distributed Locking](features/distributed-locking.md) | Prevent thundering herd |
 | [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) | Client-side AES-256-GCM |
 | [Prometheus Metrics](features/prometheus-metrics.md) | Production observability |
+| [Interop Mode](features/interop-mode.md) | Cross-SDK cache sharing with cachekit-ts/rs |
+| [L1 Invalidation & SWR](features/l1-invalidation.md) | Process-local invalidation, stale-while-revalidate |
+| [Reference Caching](features/reference-caching.md) | `@cache.local()` for non-serializable objects |
+| [Rust Serialization](features/rust-serialization.md) | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
+| [SSRF Protection](features/ssrf-protection.md) | URL allowlisting for the CachekitIO backend |
 
 ## Architecture & Reference
 

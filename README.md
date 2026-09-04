@@ -412,6 +412,11 @@ info = expensive_func.cache_info()
 | [Distributed Locking][distributed-locking-url] | Cache stampede prevention |
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
+| [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Process-local invalidation, stale-while-revalidate |
+| [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
+| [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
+| [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
 
 ---
 
@@ -495,6 +500,11 @@ MIT License - see [LICENSE][license-file-url] for details.
 [distributed-locking-url]: docs/features/distributed-locking.md
 [prometheus-url]: docs/features/prometheus-metrics.md
 [encryption-url]: docs/features/zero-knowledge-encryption.md
+[interop-url]: docs/features/interop-mode.md
+[l1-invalidation-url]: docs/features/l1-invalidation.md
+[reference-caching-url]: docs/features/reference-caching.md
+[rust-serialization-url]: docs/features/rust-serialization.md
+[ssrf-url]: docs/features/ssrf-protection.md
 [contributing-url]: CONTRIBUTING.md
 [license-file-url]: LICENSE
 [github-url]: https://github.com/cachekit-io/cachekit-py
