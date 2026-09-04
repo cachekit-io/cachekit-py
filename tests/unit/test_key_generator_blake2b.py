@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 import pytest
 
 from cachekit.key_generator import CacheKeyGenerator
@@ -93,6 +92,7 @@ class TestBlake2bKeyGeneration:
 
     def test_blake2b_with_numpy_arrays_supported(self):
         """Test that 1D NumPy arrays with supported dtypes generate valid keys."""
+        np = pytest.importorskip("numpy")
 
         def test_func(arr):
             return arr.sum()
@@ -111,6 +111,7 @@ class TestBlake2bKeyGeneration:
 
     def test_blake2b_with_unsupported_numpy_arrays_raises(self):
         """Test that numpy arrays violating constraints raise TypeError."""
+        np = pytest.importorskip("numpy")
 
         def test_func(arr):
             return arr.sum()
