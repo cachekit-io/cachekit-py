@@ -298,14 +298,15 @@ class AsyncMetricsCollector:
 
         Waits for the worker to finish PROCESSING, not merely dequeue.
         """
-        if self._worker_thread and self._worker_thread.is_alive():
-            deadline = time.monotonic() + timeout
-            with self._pending_condition:
-                while self._pending_metrics:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    self._pending_condition.wait(remaining)
+        if not self._worker_thread or not self._worker_thread.is_alive():
+            return  # nothing will ever drain the counter; waiting would only burn the timeout
+        deadline = time.monotonic() + timeout
+        with self._pending_condition:
+            while self._pending_metrics:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._pending_condition.wait(remaining)
 
     def shutdown(self, timeout: float = 2.0):
         """Shutdown the collector gracefully."""

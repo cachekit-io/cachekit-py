@@ -175,11 +175,17 @@ class TestAsyncMetricsCollector:
 
         thread = threading.Thread(target=lambda: (collector.flush(), flushed.set()))
         thread.start()
-        assert not flushed.wait(timeout=0.05)
-        allow_processing.set()
-        assert flushed.wait(timeout=1.0)
-        thread.join()
-        collector.shutdown()
+        try:
+            assert not flushed.wait(timeout=0.05)
+            allow_processing.set()
+            assert flushed.wait(timeout=1.0)
+        finally:
+            # A failed assertion must not leave the daemon worker parked in
+            # process_metric (and the flush thread parked behind it) for the
+            # rest of the test process.
+            allow_processing.set()
+            thread.join(timeout=2.0)
+            collector.shutdown()
 
     def test_graceful_shutdown(self):
         """Test graceful shutdown of collector."""
