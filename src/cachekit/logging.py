@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from cachekit.config import get_settings
+from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 # Configure base logger
 logger = logging.getLogger(__name__)
@@ -251,11 +252,16 @@ class UltraOptimizedStructuredLogger:
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
-        # Mask cache key if needed
-        if self.mask_sensitive and cache_key:
-            display_key = self._mask_sensitive_data(cache_key)
-        else:
-            display_key = cache_key[:50] if cache_key else ""  # Truncate long keys
+        # Always redact: cache keys embed caller-supplied tenant/user identifiers
+        # (CWE-532, LAB-304). PII-pattern masking (SSN/email/...) does not catch
+        # them, and a raw [:50] prefix is exactly the leak — so neither is an
+        # alternative to the digest.
+        #
+        # Same guard the orchestrator sink uses, not a bare redact_cache_key():
+        # callers reach this method with values already redacted upstream, and
+        # re-hashing would emit a second, different digest for one key and break
+        # correlation between the two sinks. Sentinels stay readable too.
+        display_key = redact_key_for_log(cache_key) if cache_key else ""
 
         # Determine log level based on error presence
         level = "ERROR" if "error" in kwargs else "INFO"
@@ -406,16 +412,10 @@ class UltraOptimizedStructuredLogger:
             context["correlation_id"] = self._context.correlation_id
         return context
 
-    def _mask_sensitive_data(self, data: str) -> str:
-        """Mask sensitive data if enabled."""
-        if self.mask_sensitive:
-            return mask_sensitive_patterns(data)
-        return data
-
     # Compatibility methods for tests
     def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure."""
-        self.cache_operation(operation, key, error=str(error), error_type=type(error).__name__, **kwargs)
+        """Log Redis operation failure. Error text is key-free (CWE-532)."""
+        self.cache_operation(operation, key, error=redact_error_for_log(error), error_type=type(error).__name__, **kwargs)
 
     def cache_hit(self, key: str, **kwargs):
         """Log cache hit."""

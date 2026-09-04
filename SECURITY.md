@@ -187,6 +187,22 @@ When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Sid
 
 See [SSRF Protection](docs/features/ssrf-protection.md) for full details, including custom host configuration for development environments.
 
+### Cache Key Redaction in Logs (CWE-532)
+
+Cache keys can embed caller-supplied tenant/user identifiers, so **the SDK's own loggers** (`cachekit.*`) never emit them verbatim ([CWE-532][cwe-532]). Every cachekit log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction. `BackendError` redacts its `key` at construction, so `str(e)` is safe at any log sink; backend error *messages* carry no raw key either — wrapped third-party exception text of unknown provenance (e.g. pymemcache illegal-input errors, which echo the key) is reduced to the exception type name, with the original exception preserved on `original_exception` for programmatic access. An architecture test (`tests/unit/test_log_redaction_architecture.py`) walks every logging call in the package — `logger.*()`, `get_logger().*()`, `getattr(logger, level)()` — and fails CI if a key-shaped value reaches one unredacted in the message, `%s` arguments, or `extra=`, so the guarantee does not depend on the next contributor remembering it. It is flow-insensitive: build log lines inline, not via a pre-formatted variable, or the guard cannot see them.
+
+**Scope — transport logs are not covered.** The CachekitIO backend addresses entries by key in the request path (`GET /v1/cache/{key}`), and `httpx` logs every request line — method, full URL, status — at `INFO` on its own `httpx` logger. An application that enables `INFO` globally (`logging.basicConfig(level=logging.INFO)`) will therefore see raw keys in *httpx's* output on every operation, exactly as it would see any REST resource path. cachekit does not mute a third-party logger on your behalf; if your keys carry identifiers, silence or raise the level of that logger in your logging config:
+
+```python
+import logging
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+```
+
+The same applies to any HTTP-layer capture between the SDK and `api.cachekit.io` — see the lock-token paragraph below for why path/query content is treated as logged.
+
+**Digest strength.** The redaction digest is *unkeyed* blake2b, so it is exactly as hard to reverse as the key material is to guess — and the key material is deterministic from the call: `[ns:{ns}:]func:{mod.fn}:args:{blake2b(args)}` for generated keys, or whatever you return from `@cache(key=...)`. Namespace and function name are static application config, so a cache on `get_user(user_id)` is enumerable from its digest by iterating plausible IDs, whether the key was generated (hash the candidate args) or hand-built (`default:user:1234`). A per-installation secret was considered and rejected for a public library (unset it is theatre; set it breaks cross-process log correlation, the property the digest exists for). Treat the digest as a correlation ID, never as a secret: if a log reader must not be able to confirm *which* user an entry belongs to, do not grant that reader the logs.
+
 ### Lock Token Transport (CWE-532)
 
 The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Lock-Id` request header when releasing a lock (`DELETE /v1/cache/{key}/lock`), **never** in the URL query string. Query strings are routinely captured by access logs, proxy/CDN logs, and OpenTelemetry `http.url` spans ([CWE-532][cwe-532]); a leaked token could be replayed to release a lock within its short TTL. The CacheKit SaaS backend dual-reads the header and the legacy `?lock_id=` query during migration, preferring the header (removed in protocol 2.0).

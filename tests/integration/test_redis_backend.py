@@ -17,6 +17,7 @@ import redis
 
 from cachekit.backends.base import BackendError, BaseBackend
 from cachekit.backends.redis import RedisBackend
+from cachekit.hash_utils import redact_cache_key
 
 from ..utils.redis_test_helpers import RedisIsolationMixin
 
@@ -486,10 +487,11 @@ class TestRedisBackendErrorMessages:
             assert error.operation == "get"
             # Should include key for debugging
             assert error.key == "cache:user:123"
-            # Should include both in formatted message
+            # Formatted message carries the operation and the redacted key digest
             error_msg = str(error)
             assert "operation=get" in error_msg
-            assert "cache:user:123" in error_msg
+            assert redact_cache_key("cache:user:123") in error_msg
+            assert "cache:user:123" not in error_msg
 
 
 # =============================================================================

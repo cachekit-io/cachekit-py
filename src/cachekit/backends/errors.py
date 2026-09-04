@@ -10,6 +10,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
+from ..hash_utils import redact_cache_key
+
 
 class BackendErrorType(str, Enum):
     """Error classification for circuit breaker and retry decisions.
@@ -52,7 +54,9 @@ class BackendError(Exception):
         error_type: Error classification (see BackendErrorType)
         original_exception: The original exception that caused this error (if any)
         operation: The operation that failed (get, set, delete, exists)
-        key: The cache key involved in the operation (optional, for debugging)
+        key: The cache key involved in the operation (optional, for debugging).
+            Kept raw on the attribute for programmatic access; the formatted
+            exception text carries only its redacted digest (CWE-532).
 
     Example:
         >>> from redis import ConnectionError as RedisConnectionError
@@ -99,9 +103,11 @@ class BackendError(Exception):
         if self.operation:
             parts.append(f"operation={self.operation}")
         if self.key:
-            # Truncate key for security/readability
-            key_display = self.key[:50] + "..." if len(self.key) > 50 else self.key
-            parts.append(f"key={key_display}")
+            # Redact, don't truncate: str(e) reaches log interpolation at every
+            # error sink, and cache keys embed caller-supplied tenant/user
+            # identifiers (CWE-532, LAB-304). The fixed-length digest keeps the
+            # message correlatable with the sinks' own redact_cache_key() output.
+            parts.append(f"key={redact_cache_key(self.key)}")
         if self.error_type:
             parts.append(f"type={self.error_type.value}")
         return " | ".join(parts)

@@ -12,6 +12,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from cachekit.hash_utils import redact_key_for_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -182,7 +184,11 @@ class L1Cache:
         # Skip caching if the effective TTL is non-finite (NaN/inf would create an
         # immortal entry that never expires) or too short (would expire immediately).
         if not math.isfinite(expiry) or expiry <= current_time:
-            logger.debug("Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)", key, expiry)
+            logger.debug(
+                "Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)",
+                redact_key_for_log(key),
+                expiry,
+            )
             return
 
         # Estimate size
@@ -199,7 +205,7 @@ class L1Cache:
                     self._remove_entry(key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
-                key,
+                redact_key_for_log(key),
                 size,
                 self.max_memory_bytes,
             )
