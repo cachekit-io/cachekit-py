@@ -32,6 +32,8 @@ class FakeSWRBackend:
     def __init__(self, grant_lock: bool = True) -> None:
         self.store: dict[str, bytes] = {}
         self.stale = False
+        self.fresh_for: int | None = None
+        self.freshness_reads = 0
         self.grant_lock = grant_lock
         self.set_calls: list[tuple[int | None, int | None]] = []
         self.lock_attempts: list[str] = []
@@ -39,9 +41,10 @@ class FakeSWRBackend:
     def get(self, key: str) -> bytes | None:
         return self.store.get(key)
 
-    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
+        self.freshness_reads += 1
         value = self.store.get(key)
-        return None if value is None else (value, self.stale)
+        return None if value is None else (value, self.stale, self.fresh_for)
 
     def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         self.store[key] = value
@@ -377,9 +380,9 @@ class TestSWRForkIsolation:
             def get(self, key: str) -> bytes | None:
                 return self.store.get(key)
 
-            def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+            def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
                 value = self.store.get(key)
-                return None if value is None else (value, self.stale)
+                return None if value is None else (value, self.stale, None)
 
             def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
                 self.store[key] = value
@@ -484,7 +487,7 @@ class TestSWRForkIsolation:
 class TestOperationHandlerFreshnessDegradation:
     """get_cached_value_with_freshness error paths mirror get_cached_value (#159 contract)."""
 
-    def _make_op(self, deserialize_side_effect=None, get_result=(b"bytes", True)):
+    def _make_op(self, deserialize_side_effect=None, get_result=(b"bytes", True, None)):
         from unittest import mock
 
         from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
@@ -506,6 +509,24 @@ class TestOperationHandlerFreshnessDegradation:
 
         op = CacheOperationHandler(CacheSerializationHandler(), CacheKeyGenerator())
         assert op.get_cached_value_with_freshness("k") is None  # RuntimeError -> generic path -> miss
+
+    def test_legacy_two_tuple_backend_degrades_to_no_bound(self) -> None:
+        """LAB-557 compat: a third-party SWR backend still returning the released
+        2-tuple (bytes, is_stale) must read as fresh_for=None (legacy L1 lifetime),
+        NOT raise a strict-unpack ValueError that the broad except swallows into a
+        permanent every-hit-is-a-miss cache bypass (expert-panel finding)."""
+        from unittest import mock
+
+        from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
+
+        serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        serialization.deserialize_data.return_value = {"v": 1}
+        serialization.encryption_fail_closed = False
+        op = CacheOperationHandler(serialization, CacheKeyGenerator())
+        cache_handler = mock.MagicMock()
+        cache_handler.get_with_freshness.return_value = (b"bytes", False)  # 0.5.x 2-tuple
+        op.set_cache_handler(cache_handler)
+        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}), False, None)
 
     def test_backend_error_reads_as_miss(self) -> None:
         op, cache_handler = self._make_op()
@@ -727,10 +748,10 @@ class TestFreshnessFailClosedPropagation:
         serialization.encryption_fail_closed = True  # fail closed: MUST propagate
         op = CacheOperationHandler(serialization, CacheKeyGenerator())
         cache_handler = mock.MagicMock()
-        cache_handler.get_with_freshness.return_value = (b"tampered", True)
+        cache_handler.get_with_freshness.return_value = (b"tampered", True, 0)
 
         async def _gwfa(key: str):
-            return (b"tampered", True)
+            return (b"tampered", True, 0)
 
         cache_handler.get_with_freshness_async.side_effect = _gwfa
         op.set_cache_handler(cache_handler)
@@ -751,3 +772,166 @@ class TestFreshnessFailClosedPropagation:
         with pytest.raises(DecryptionAuthenticationError):
             await op.get_cached_value_with_freshness_async("k")
         cache_handler.delete_async.assert_not_called()  # evidence retained when fail-closed
+
+
+class TestFreshForBoundedL1Backfill:
+    """LAB-557 (spec/saas-api.md#remaining-freshness): L1 backfill from an L2
+    hit is bounded by the server's remaining freshness — an entry read late in
+    its freshness window must not be served fresh from L1 past fresh_until."""
+
+    @staticmethod
+    def _l1_put_spy():
+        """Patch context recording every redis_ttl passed to L1Cache.put."""
+        from unittest import mock
+
+        from cachekit.l1_cache import L1Cache
+
+        seen: list[Any] = []
+        original = L1Cache.put
+
+        def spy(self: Any, key: str, value: bytes, redis_ttl: Any = None, expires_at: Any = None) -> None:
+            seen.append(redis_ttl)
+            return original(self, key, value, redis_ttl=redis_ttl, expires_at=expires_at)
+
+        return seen, mock.patch.object(L1Cache, "put", spy)
+
+    @staticmethod
+    async def _seed_then_clear_l1(compute: Any, backend: FakeSWRBackend) -> None:
+        """First call stores L2 + L1; clear L1 (restoring the L2 bytes) so the
+        next read is an L2 hit that backfills."""
+        assert await compute() == 1
+        l2_snapshot = dict(backend.store)
+        await compute.invalidate_cache()  # type: ignore[attr-defined]
+        backend.store.update(l2_snapshot)
+
+    async def test_backfill_bounded_to_remaining_freshness(self) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, namespace="ff-bound")
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.fresh_for = 2  # the read lands 2s before the server's fresh_until
+
+        seen, patcher = self._l1_put_spy()
+        with patcher:
+            assert await compute() == 1  # L2 hit -> bounded L1 backfill
+        assert seen == [2]  # min(ttl=60, fresh_for=2) — never the decorator-scale 60
+
+    async def test_absent_signal_keeps_legacy_backfill(self) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, namespace="ff-legacy")
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.fresh_for = None  # pre-signal server
+
+        seen, patcher = self._l1_put_spy()
+        with patcher:
+            assert await compute() == 1
+        assert seen == [60]  # legacy: the decorator ttl, unchanged behavior
+
+    async def test_read_at_freshness_end_is_never_served_fresh_from_l1(self) -> None:
+        """The LAB-557 regression: fresh-labelled hit with 0s remaining must not
+        be recorded in L1 — the next read goes back to L2 instead of serving a
+        locally-resurrected 'fresh' value past the server's freshness end."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, namespace="ff-zero")
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.fresh_for = 0
+        reads_before = backend.freshness_reads
+
+        assert await compute() == 1  # fresh hit, 0s remaining -> no L1 record
+        assert await compute() == 1  # MUST reach L2 again (unbounded backfill would serve L1)
+        assert backend.freshness_reads == reads_before + 2
+        assert calls["n"] == 1  # value itself still served from cache, no recompute
+
+    async def test_bound_applies_without_configured_swr(self) -> None:
+        """The unbounded backfill predates SWR: a capable backend bounds the
+        backfill even when the decorator configures no stale window."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, namespace="ff-noswr")  # no stale_ttl
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.fresh_for = 3
+
+        seen, patcher = self._l1_put_spy()
+        with patcher:
+            assert await compute() == 1
+        assert seen == [3]
+
+    async def test_stale_hit_without_configured_swr_serves_but_never_revalidates(self) -> None:
+        """Gate-widening guard: a mixed-reader stale hit on a decorator without
+        a stale window is served (spec: never a blocking miss) but must not
+        schedule a background revalidation it doesn't own — and must not
+        backfill L1."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, namespace="ff-mixed")  # no stale_ttl
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.stale = True
+        backend.fresh_for = 0
+
+        seen, patcher = self._l1_put_spy()
+        with patcher:
+            assert await compute() == 1  # served, not an error, no recompute paid
+        assert seen == []  # stale is never recorded in L1
+        await asyncio.sleep(0.2)  # grace: a scheduled revalidation would recompute
+        assert calls["n"] == 1
+        assert len(backend.set_calls) == 1  # only the seeding write — no revalidation PUT
+
+    async def test_no_ttl_backfill_clamps_to_l1_default_never_extends(self) -> None:
+        """Panel finding (CWE-613): with ttl=None the legacy L1 lifetime is
+        DEFAULT_L1_TTL_SECONDS — a long server remainder must clamp to it, never
+        extend local service toward the 30-day cap (DELETE-as-revocation relies
+        on that ageout). A short remainder still shortens."""
+        from cachekit.l1_cache import DEFAULT_L1_TTL_SECONDS
+
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, namespace="ff-nottl")  # ttl=None
+        async def compute() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        await self._seed_then_clear_l1(compute, backend)
+        backend.fresh_for = 2_592_000  # 30-day remainder from the server
+
+        seen, patcher = self._l1_put_spy()
+        with patcher:
+            assert await compute() == 1
+        assert seen == [DEFAULT_L1_TTL_SECONDS]  # clamped, not extended
+
+        l2_snapshot = dict(backend.store)
+        await compute.invalidate_cache()  # type: ignore[attr-defined]
+        backend.store.update(l2_snapshot)
+        backend.fresh_for = 2  # short remainder still shortens below the default
+
+        seen2, patcher2 = self._l1_put_spy()
+        with patcher2:
+            assert await compute() == 1
+        assert seen2 == [2]

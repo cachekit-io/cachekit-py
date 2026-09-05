@@ -192,6 +192,7 @@ Rules and behavior:
 - A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
+- On the CachekitIO backend, every read (SWR-configured or not) also carries the server's remaining freshness (`X-CacheKit-Fresh-For`, [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#remaining-freshness)): an L2 hit backfilled into L1 lives at most `min(ttl, remaining)` locally, so a value read near the end of its server-side freshness window is never served fresh from L1 past the server's bound. Pre-signal servers omit the header and behavior is unchanged.
 
 ### File Backend Environment Variables
 
