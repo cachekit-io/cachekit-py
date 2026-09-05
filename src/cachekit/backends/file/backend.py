@@ -56,6 +56,26 @@ MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
 
 
+def _read_fully(fd: int, n: int) -> bytes:
+    """Read ``n`` bytes from ``fd``, looping over short reads; stops early only at EOF.
+
+    A single read(2) may return fewer bytes than asked (POSIX permits it; Linux caps one call at
+    ~2 GiB), so a lone ``os.read`` can silently truncate a large payload into a spurious integrity
+    failure. A file shorter than ``n`` still yields a short result, so callers' header/integrity
+    validation sees truncation exactly as before. CPython's single-chunk ``join`` returns the chunk
+    itself, so the one-read case (every payload the kernel serves whole) adds no copy and the
+    LAB-770 read-peak bound holds; only a genuinely short-read payload pays a join copy.
+    """
+    chunks: list[bytes] = []
+    while n > 0:
+        chunk = os.read(fd, n)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        n -= len(chunk)
+    return b"".join(chunks)
+
+
 class _MmapHandle:
     """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
     header). Zero-copy: the view aliases mapped pages, never a heap copy.
@@ -167,11 +187,14 @@ class FileBackend:
                     self._acquire_file_lock(fd, exclusive=False)
 
                     try:
-                        # Read entire file
-                        file_data = os.read(fd, os.fstat(fd).st_size)
+                        # Header-first read (LAB-770): reading the 14-byte header separately,
+                        # then the payload via _read_fully, avoids the full-payload
+                        # file_data[HEADER_SIZE:] slice copy (~1x payload off the read peak).
+                        st_size = os.fstat(fd).st_size
+                        header = _read_fully(fd, HEADER_SIZE)
 
                         # Validate header
-                        if len(file_data) < HEADER_SIZE:
+                        if len(header) < HEADER_SIZE:
                             # Corrupted file, delete it
                             os.close(fd)
                             fd_closed = True
@@ -179,10 +202,10 @@ class FileBackend:
                             return None
 
                         # Parse header
-                        magic = file_data[0:2]
-                        version = file_data[2]
-                        # flags = struct.unpack(">H", file_data[4:6])[0]  # uint16 BE (reserved for future)
-                        expiry_timestamp = struct.unpack(">Q", file_data[6:14])[0]  # uint64 BE
+                        magic = header[0:2]
+                        version = header[2]
+                        # flags = struct.unpack(">H", header[4:6])[0]  # uint16 BE (reserved for future)
+                        expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
 
                         # Validate magic and version
                         if magic != MAGIC or version != FORMAT_VERSION:
@@ -200,9 +223,8 @@ class FileBackend:
                             self._safe_unlink(file_path)
                             return None
 
-                        # Extract payload
-                        payload = file_data[HEADER_SIZE:]
-                        return payload
+                        # Read payload directly — exactly the bytes after the header
+                        return _read_fully(fd, st_size - HEADER_SIZE)
 
                     finally:
                         self._release_file_lock(fd)
@@ -272,8 +294,11 @@ class FileBackend:
                     if st_size < HEADER_SIZE:
                         self._safe_unlink(file_path)
                         return None
-                    header = os.read(fd, HEADER_SIZE)
-                    if header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                    header = _read_fully(fd, HEADER_SIZE)
+                    # Re-check the length: st_size above was sampled before the read, so a
+                    # file truncated in between yields a short header here and header[2]
+                    # would raise IndexError straight past this backend's OSError handling.
+                    if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
                         self._safe_unlink(file_path)
                         return None
                     expiry_timestamp = struct.unpack(">Q", header[6:14])[0]
@@ -537,7 +562,7 @@ class FileBackend:
 
                     try:
                         # Read header only
-                        header_data = os.read(fd, HEADER_SIZE)
+                        header_data = _read_fully(fd, HEADER_SIZE)
 
                         if len(header_data) < HEADER_SIZE:
                             # Corrupted, clean up
@@ -664,7 +689,7 @@ class FileBackend:
                 try:
                     self._acquire_file_lock(fd, exclusive=False)
                     try:
-                        header = os.read(fd, HEADER_SIZE)
+                        header = _read_fully(fd, HEADER_SIZE)
                         if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
                             os.close(fd)
                             fd_closed = True
@@ -723,7 +748,7 @@ class FileBackend:
                 try:
                     self._acquire_file_lock(fd, exclusive=True)
                     try:
-                        header = os.read(fd, HEADER_SIZE)
+                        header = _read_fully(fd, HEADER_SIZE)
                         if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
                             os.close(fd)
                             fd_closed = True
