@@ -88,6 +88,25 @@ hiredis is excluded because it does not declare free-threaded support (no
 `Py_mod_gil` slot); redis-py transparently falls back to its pure-Python
 parser. On a GIL build nothing changes — hiredis remains the default parser.
 
+## Measured performance
+
+A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, CPython 3.14.3 free-threaded build, eight physical cores, pinned with `taskset -c 0-7` on a Ryzen 9 5950X) compared no-GIL and GIL cache throughput:
+
+| threads | no-GIL median s (min–max) | GIL median s (min–max) | GIL / no-GIL |
+| --: | --: | --: | --: |
+| 1 | 3.4422 (2.7822–4.4336) | 3.0566 (2.7979–3.3807) | 0.89x |
+| 2 | 1.9956 (1.8117–2.2210) | 3.6367 (3.2625–3.8376) | 1.82x |
+| 4 | 1.3402 (1.1175–1.9018) | 3.5293 (3.4629–4.8231) | 2.63x |
+| 8 | 1.1550 (0.8962–1.4837) | 3.6749 (3.5853–4.7236) | 3.18x |
+
+**Measurement conditions:** Five isolated repetitions each; 16,000-operation workload; harness built-in warmup; GIL state asserted via `sys._is_gil_enabled()` at runtime. See [verification comment](https://github.com/cachekit-io/cachekit-py/pull/188#issuecomment-5557418229) for full details.
+
+**Key findings:**
+- **Threaded throughput confirmed.** no-GIL reaches 2.57x one→four-thread scaling (64.2% efficiency) and is 2.63x faster than the GIL arm at four threads.
+- **Single-thread cost confirmed.** no-GIL is 12.6% slower at the single-thread median; however, the ranges overlap (GIL max 3.3807 vs no-GIL min 2.7822).
+
+**Cross-library comparison:** The benchmark measures cachekit operations only. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run — these packages do not publish free-threaded (`cp314t`) wheels as of 2026-08. When upstream wheels ship, see [LAB-3038](mention://issue/01a07568-c0fc-778d-bfdb-e1d8aaaa4725) for cross-stack performance.
+
 ## Deferred: declared support + free-threaded wheels
 
 Publishing `cp314t` wheels and declaring official free-threaded support is
