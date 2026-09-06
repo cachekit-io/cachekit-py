@@ -55,7 +55,7 @@ Expanded Rust test suite from 900+ tests to **1100+ tests** by adding critical s
 - `test_subtle_multi_byte_patterns`: XOR, swap, increment, block corruption
 
 **Validation**:
-- xxHash3-64 checksums detect all multi-byte corruption patterns
+- xxHash3-64 checksums detect all tested multi-byte corruption patterns
 - Corruption at any offset (start/middle/end) detected
 - Subtle patterns (swap, increment, aligned blocks) caught
 
