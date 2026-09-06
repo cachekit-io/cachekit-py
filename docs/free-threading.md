@@ -90,7 +90,7 @@ parser. On a GIL build nothing changes — hiredis remains the default parser.
 
 ## Measured performance
 
-A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, CPython 3.14.3 free-threaded build, eight logical CPUs, pinned with `taskset -c 0-7` on a Ryzen 9 5950X) compared no-GIL and GIL cache throughput:
+A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, CPython 3.14.3 free-threaded build, eight logical CPUs, pinned with `taskset -c 0-7` on a Ryzen 9 5950X) compared no-GIL and GIL serializer throughput (`StandardSerializer.serialize`):
 
 | threads | no-GIL median s (min–max) | GIL median s (min–max) | GIL / no-GIL |
 | --: | --: | --: | --: |
@@ -105,7 +105,7 @@ A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, C
 - **Threaded throughput confirmed.** no-GIL reaches 2.57x one→four-thread scaling (64.2% efficiency) and is 2.63x faster than the GIL arm at four threads.
 - **Single-thread cost confirmed.** no-GIL is 12.6% slower at the single-thread median; however, the ranges overlap (GIL max 3.3807 vs no-GIL min 2.7822).
 
-**Cross-library comparison:** The benchmark measures cachekit operations only. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run — these packages do not publish free-threaded (`cp314t`) wheels as of 2026-08. When upstream wheels ship, cross-stack performance will be measured then (tracked internally as LAB-3038).
+**Cross-library comparison:** The benchmark measures the `StandardSerializer.serialize` path only (msgpack + Rust ByteStorage), not cache reads or writes. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run — these packages do not publish free-threaded (`cp314t`) wheels as of 2026-08. When upstream wheels ship, cross-stack performance will be measured then (tracked internally as LAB-3038).
 
 ## Deferred: declared support + free-threaded wheels
 
