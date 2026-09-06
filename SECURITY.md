@@ -251,7 +251,7 @@ Encode-once matches the SaaS validator's single decode, so a canonical key round
 </details>
 
 > [!NOTE]
-> Core dependencies (ring, lz4_flex, blake3) are audited in cachekit-core. See [cachekit-core supply chain docs][core-supply-chain].
+> Core dependencies (`ring` / `aes-gcm` for AES-256-GCM, `lz4_flex`, `xxhash-rust`, `rmp-serde`, `hkdf`, `sha2`) are audited in cachekit-core. See [cachekit-core supply chain docs][core-supply-chain]. `blake3` is not a cachekit-core dependency: it is a cachekit-py (Python) dependency used for cache-key hashing in `src/cachekit/hash_utils.py`, audited in this repo's own Python supply chain below.
 
 ### Python Dependencies
 

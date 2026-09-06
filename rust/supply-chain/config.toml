@@ -167,7 +167,7 @@ criteria = "safe-to-deploy"
 [[exemptions.blake3]]
 version = "1.8.2"
 criteria = "safe-to-deploy"
-notes = "Blake3 cryptographic hash - integrity checking for compressed data. Audit planned Q1 2026."
+notes = "Not a dependency of this crate: absent from Cargo.lock and from `cargo tree -i blake3 --all-features`. ByteStorage integrity is xxHash3-64 (xxhash-rust via cachekit-core), not Blake3. Exemption retained pending cargo-vet cleanup (not this PR)."
 
 [[exemptions.block-buffer]]
 version = "0.10.4"
