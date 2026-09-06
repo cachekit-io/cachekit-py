@@ -510,11 +510,13 @@ class TestOperationHandlerFreshnessDegradation:
         op = CacheOperationHandler(CacheSerializationHandler(), CacheKeyGenerator())
         assert op.get_cached_value_with_freshness("k") is None  # RuntimeError -> generic path -> miss
 
-    def test_legacy_two_tuple_backend_degrades_to_no_bound(self) -> None:
-        """LAB-557 compat: a third-party SWR backend still returning the released
-        2-tuple (bytes, is_stale) must read as fresh_for=None (legacy L1 lifetime),
-        NOT raise a strict-unpack ValueError that the broad except swallows into a
-        permanent every-hit-is-a-miss cache bypass (expert-panel finding)."""
+    def test_legacy_two_tuple_handler_degrades_to_no_bound(self) -> None:
+        """LAB-557 compat: a custom CacheHandlerStrategy built against the v0.18.0
+        2-tuple (bytes, is_stale) signature must read as fresh_for=None (legacy L1
+        lifetime), NOT raise a strict-unpack ValueError that the broad except
+        swallows into a permanent every-hit-is-a-miss cache bypass (expert-panel
+        finding). Third-party 2-tuple BACKENDS are padded upstream by
+        StandardCacheHandler (tests/unit/backends/test_cachekitio_swr_transport.py)."""
         from unittest import mock
 
         from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler

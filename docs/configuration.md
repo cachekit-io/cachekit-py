@@ -187,7 +187,7 @@ def report():
 Rules and behavior:
 
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
-- **CachekitIO only** — other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set.
+- **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
 - A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.

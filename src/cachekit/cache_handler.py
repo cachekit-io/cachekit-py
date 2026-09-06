@@ -269,11 +269,10 @@ def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
-    """Pad a legacy ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
+    """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
 
-    Third-party SWR backends written against the released 0.5.x protocol still
-    return the 2-tuple and pass :func:`supports_swr`, so the handler — not each
-    caller — owns the shape it promises. None (miss) passes through.
+    Third-party SWR backends (0.5.x) and custom CacheHandlerStrategy implementations
+    (0.18.0) built against the 2-tuple signature still return it; None passes through.
     """
     if hit is None:
         return None
@@ -1424,16 +1423,14 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness")
 
-            hit = self._cache_handler.get_with_freshness(cache_key)
+            # Normalised here too: a custom CacheHandlerStrategy built against the
+            # v0.18.0 2-tuple signature must degrade to fresh_for=None, not have a
+            # strict 3-unpack ValueError swallowed below into a permanent
+            # every-hit-is-a-miss cache bypass (expert-panel finding, LAB-557).
+            hit = _normalize_freshness_hit(self._cache_handler.get_with_freshness(cache_key))
             if hit is None:
                 return None
-            # Length-tolerant unpack: a third-party SWR backend built against the
-            # released 2-tuple (bytes, is_stale) signature must degrade to
-            # fresh_for=None (legacy L1 behavior), not have a strict 3-unpack
-            # ValueError swallowed below into a permanent every-hit-is-a-miss
-            # cache bypass (expert-panel finding, LAB-557).
-            cached_data, is_stale, *_rest = hit
-            fresh_for = _rest[0] if _rest else None
+            cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized), is_stale, fresh_for)
@@ -1471,13 +1468,10 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness_async")
 
-            hit = await self._cache_handler.get_with_freshness_async(cache_key)
+            hit = _normalize_freshness_hit(await self._cache_handler.get_with_freshness_async(cache_key))
             if hit is None:
                 return None
-            # Length-tolerant unpack — same 2-tuple compatibility contract as the
-            # sync variant above.
-            cached_data, is_stale, *_rest = hit
-            fresh_for = _rest[0] if _rest else None
+            cached_data, is_stale, fresh_for = hit  # same 2-tuple contract as the sync variant above
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized, cached_data), is_stale, fresh_for)

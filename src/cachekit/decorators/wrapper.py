@@ -674,22 +674,17 @@ def create_cache_wrapper(
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
 
     def _l2_freshness_capable() -> bool:
-        """SWR/freshness capability of the backend as RESOLVED so far — read by the
-        read paths at call time, never snapshotted at decoration time.
-
-        A provider-backed decorator (no backend= argument, e.g. @cache.production
-        with CACHEKIT_API_KEY set) has _backend=None here and resolves it on first
-        call; a decoration-time snapshot would route every such CachekitIO read
-        through the plain get and drop the fresh_for bound (LAB-557). Class-level
-        check: an instance-level hasattr reads Mock/proxy objects as capable.
-        """
+        """Freshness capability of the backend as RESOLVED so far. The read paths
+        call this at call time because provider-backed decorators (no backend=
+        argument, e.g. @cache.production with CACHEKIT_API_KEY set) resolve
+        _backend on first call (LAB-557). Class-level check: an instance-level
+        hasattr reads Mock/proxy objects as capable."""
         return _backend is not None and supports_swr(_backend)
 
-    # Decoration-time snapshot for stale_ttl validation only: configuring a stale
-    # window needs a known-capable backend up front (fail at decoration, as
-    # documented), so provider-backed decorators get the read-side fresh_for
-    # bound above but must pass an explicit CachekitIO backend to enable SWR.
-    _l2_swr_backend_capable = _l2_freshness_capable()
+    # Decoration-time snapshot for SWR activation (explicit stale_ttl validation,
+    # io()'s swr_by_default): a stale window fails at decoration as documented, so
+    # provider-backed decorators get the read-side bound but cannot enable SWR.
+    _l2_swr_capable_at_decoration = _l2_freshness_capable()
     _stale_ttl: int | None = None
     if stale_ttl is not None:
         from ..config.validation import ConfigurationError
@@ -704,10 +699,11 @@ def create_cache_wrapper(
                 raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
             if ttl + stale_ttl > _max_total_ttl:
                 raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
-            if not _l2_swr_backend_capable:
+            if not _l2_swr_capable_at_decoration:
                 raise ConfigurationError(
-                    "stale_ttl requires an SWR-capable backend (CachekitIO). "
-                    "Other backends have no read-side freshness signal — remove stale_ttl or switch to @cache.io."
+                    "stale_ttl requires an SWR-capable backend (CachekitIO) known at decoration time. "
+                    "Other backends have no read-side freshness signal — remove stale_ttl, switch to "
+                    "@cache.io, or pass backend=CachekitIOBackend() explicitly."
                 )
             _stale_ttl = stale_ttl
     elif (
@@ -715,7 +711,7 @@ def create_cache_wrapper(
         and getattr(config, "swr_by_default", False)
         and ttl is not None
         and ttl > 0
-        and _l2_swr_backend_capable
+        and _l2_swr_capable_at_decoration
     ):
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or

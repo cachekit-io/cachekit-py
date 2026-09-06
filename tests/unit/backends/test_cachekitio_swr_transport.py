@@ -253,19 +253,11 @@ class TestHandlerDegradation:
         assert await handler.get_with_freshness_async("missing") is None
 
 
-class _LegacyTupleBackend:
+class _LegacyTupleBackend(_SWRBackend):
     """Third-party SWR backend on the released 0.5.x 2-tuple read protocol."""
 
-    def get(self, key: str) -> bytes:
-        return b"legacy"
-
-    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+    def get_with_freshness(self, key: str):
         return None if key == "missing" else (b"legacy", True)
-
-    def set(self, key: str, value: bytes, ttl=None, stale_ttl=None) -> None: ...
-
-    def delete(self, key: str) -> bool:
-        return False
 
 
 class TestHandlerNormalisesLegacyTuple:
