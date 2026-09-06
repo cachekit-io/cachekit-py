@@ -25,6 +25,7 @@ from cachekit.cache_handler import (
 @pytest.mark.unit
 class TestSupportsMmapRead:
     def test_arrow_pandas_plaintext_is_eligible(self) -> None:
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
         sh = CacheSerializationHandler(serializer_name="arrow")
         assert sh.supports_mmap_read() is True
 
@@ -34,12 +35,14 @@ class TestSupportsMmapRead:
 
     def test_encrypted_arrow_not_eligible(self) -> None:
         """Encrypted values can never mmap — AES-GCM decrypt owns its buffer."""
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
         sh = CacheSerializationHandler(serializer_name="arrow")
         sh.encryption = True
         assert sh.supports_mmap_read() is False
 
     def test_arrow_return_format_not_eligible(self) -> None:
         """A pyarrow.Table aliases the mmap; closing the handle would be a use-after-free. Pandas only."""
+        pytest.importorskip("pyarrow")  # "arrow" handler init requires the [data] extra (LAB-511)
         from cachekit.serializers.arrow_serializer import ArrowSerializer
 
         sh = CacheSerializationHandler(serializer_name="arrow")
