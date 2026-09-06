@@ -19,6 +19,11 @@ from pathlib import Path
 
 import pytest
 
+# docs/conftest.py imports numpy/pandas at module level (its fences use them) —
+# absent e.g. in the free-threaded CI lane (LAB-511).
+pytest.importorskip("numpy")
+pytest.importorskip("pandas")
+
 DOCS_CONFTEST = Path(__file__).resolve().parents[2] / "docs" / "conftest.py"
 
 

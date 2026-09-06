@@ -30,10 +30,8 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
-import pandas as pd
-
 # Import from compatibility wrapper
-from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer
+from tests.critical.cache_serializer_compat import CACHE_SERIALIZER_AVAILABLE, CacheSerializer  # noqa: E402
 
 
 class ProductionDataGenerator:
@@ -620,6 +618,7 @@ class TestProductionDataPatterns:
 
     def test_pandas_dataframe_enterprise_scenarios(self):
         """Test Pandas DataFrames in enterprise contexts"""
+        pd = pytest.importorskip("pandas")
         # Create enterprise-style DataFrame
         df = pd.DataFrame(
             {
