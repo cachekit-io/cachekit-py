@@ -251,3 +251,34 @@ class TestHandlerDegradation:
         handler = StandardCacheHandler(backend)  # type: ignore[arg-type]
         assert await handler.get_with_freshness_async("k") == (b"value", False, None)
         assert await handler.get_with_freshness_async("missing") is None
+
+
+class _LegacyTupleBackend:
+    """Third-party SWR backend on the released 0.5.x 2-tuple read protocol."""
+
+    def get(self, key: str) -> bytes:
+        return b"legacy"
+
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
+        return None if key == "missing" else (b"legacy", True)
+
+    def set(self, key: str, value: bytes, ttl=None, stale_ttl=None) -> None: ...
+
+    def delete(self, key: str) -> bool:
+        return False
+
+
+class TestHandlerNormalisesLegacyTuple:
+    """LAB-557: StandardCacheHandler owns the 3-tuple shape it promises. A legacy
+    2-tuple backend passes supports_swr, so the handler pads it to
+    (bytes, is_stale, None) — callers never see a 2-tuple."""
+
+    def test_sync_pads_legacy_two_tuple(self) -> None:
+        handler = StandardCacheHandler(_LegacyTupleBackend())  # type: ignore[arg-type]
+        assert handler.get_with_freshness("k") == (b"legacy", True, None)
+        assert handler.get_with_freshness("missing") is None
+
+    async def test_async_pads_legacy_two_tuple(self) -> None:
+        handler = StandardCacheHandler(_LegacyTupleBackend())  # type: ignore[arg-type]
+        assert await handler.get_with_freshness_async("k") == (b"legacy", True, None)
+        assert await handler.get_with_freshness_async("missing") is None

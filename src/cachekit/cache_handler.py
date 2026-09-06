@@ -268,6 +268,19 @@ def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
     return callable(getattr(type(backend), "get_with_freshness", None))
 
 
+def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
+    """Pad a legacy ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
+
+    Third-party SWR backends written against the released 0.5.x protocol still
+    return the 2-tuple and pass :func:`supports_swr`, so the handler — not each
+    caller — owns the shape it promises. None (miss) passes through.
+    """
+    if hit is None:
+        return None
+    value, is_stale, *rest = hit
+    return (value, is_stale, rest[0] if rest else None)
+
+
 # Import caching for serializer modules
 #
 # PERFORMANCE OPTIMIZATION: Dynamic imports are expensive (~100μs per import)
@@ -2005,7 +2018,7 @@ class StandardCacheHandler:
             value = self.get(key)
             return (value, False, None) if value is not None else None
         try:
-            return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(self._with_backpressure_and_timeout(self.backend.get_with_freshness, key))
         except BackendError as e:
             get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
@@ -2019,7 +2032,9 @@ class StandardCacheHandler:
             value = await self.get_async(key)
             return (value, False, None) if value is not None else None
         try:
-            return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(
+                await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            )
         except BackendError as e:
             get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None

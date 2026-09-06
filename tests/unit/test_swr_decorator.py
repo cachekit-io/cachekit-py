@@ -859,6 +859,54 @@ class TestFreshForBoundedL1Backfill:
         assert backend.freshness_reads == reads_before + 2
         assert calls["n"] == 1  # value itself still served from cache, no recompute
 
+    async def test_provider_resolved_backend_gets_the_bound(self) -> None:
+        """A provider-backed decorator (no backend= argument, e.g. @cache.production
+        with CACHEKIT_API_KEY set) resolves its CachekitIO backend on first call.
+        Capability must be read then, not snapshotted at decoration — or every
+        such read skips the freshness path and backfills L1 for the full ttl."""
+        from unittest import mock
+
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+        provider = mock.MagicMock()
+        provider.get_backend.return_value = backend
+
+        with mock.patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+
+            @cache(ttl=60, namespace="ff-provider")  # no backend= -> provider-resolved
+            async def compute() -> int:
+                calls["n"] += 1
+                return calls["n"]
+
+            await self._seed_then_clear_l1(compute, backend)
+            backend.fresh_for = 0
+            reads_before = backend.freshness_reads
+
+            assert await compute() == 1  # fresh hit, 0s remaining -> no L1 record
+            assert await compute() == 1  # MUST reach L2 again
+        assert backend.freshness_reads == reads_before + 2
+        assert calls["n"] == 1
+
+    def test_provider_resolved_backend_takes_sync_freshness_read(self) -> None:
+        """Sync twin: the sync hit path has no L1 backfill, but its stale-label
+        detection also depends on the freshness read being taken at all."""
+        from unittest import mock
+
+        backend = FakeSWRBackend()
+        provider = mock.MagicMock()
+        provider.get_backend.return_value = backend
+
+        with mock.patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+
+            @cache(ttl=60, namespace="ff-provider-sync", l1_enabled=False)
+            def compute() -> int:
+                return 1
+
+            assert compute() == 1  # miss -> store
+            reads_before = backend.freshness_reads
+            assert compute() == 1  # L2 hit
+        assert backend.freshness_reads == reads_before + 1
+
     async def test_bound_applies_without_configured_swr(self) -> None:
         """The unbounded backfill predates SWR: a capable backend bounds the
         backfill even when the decorator configures no stale window."""

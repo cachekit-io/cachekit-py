@@ -672,9 +672,24 @@ def create_cache_wrapper(
     # and re-run the wrapped function in the background. Requires an SWR-capable
     # backend (CachekitIO — the server signals freshness on read).
     _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
-    # Class-level capability check (shared with the read-path fallback): an
-    # instance-level hasattr would read Mock/proxy objects as SWR-capable.
-    _l2_swr_backend_capable = _backend is not None and supports_swr(_backend)
+
+    def _l2_freshness_capable() -> bool:
+        """SWR/freshness capability of the backend as RESOLVED so far — read by the
+        read paths at call time, never snapshotted at decoration time.
+
+        A provider-backed decorator (no backend= argument, e.g. @cache.production
+        with CACHEKIT_API_KEY set) has _backend=None here and resolves it on first
+        call; a decoration-time snapshot would route every such CachekitIO read
+        through the plain get and drop the fresh_for bound (LAB-557). Class-level
+        check: an instance-level hasattr reads Mock/proxy objects as capable.
+        """
+        return _backend is not None and supports_swr(_backend)
+
+    # Decoration-time snapshot for stale_ttl validation only: configuring a stale
+    # window needs a known-capable backend up front (fail at decoration, as
+    # documented), so provider-backed decorators get the read-side fresh_for
+    # bound above but must pass an explicit CachekitIO backend to enable SWR.
+    _l2_swr_backend_capable = _l2_freshness_capable()
     _stale_ttl: int | None = None
     if stale_ttl is not None:
         from ..config.validation import ConfigurationError
@@ -762,7 +777,7 @@ def create_cache_wrapper(
         miss/error = (None, False, None), same degradation contract as
         get_cached_value_async.
         """
-        if _l2_swr_backend_capable:
+        if _l2_freshness_capable():
             hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
             return hit if hit is not None else (None, False, None)
         return await operation_handler.get_cached_value_async(cache_key), False, None
@@ -1301,7 +1316,7 @@ def create_cache_wrapper(
             # The sync hit path performs no L1 backfill, so the fresh_for bound
             # (tuple slot 2) has no consumer here.
             _sync_l2_stale = False
-            if _l2_swr_backend_capable:
+            if _l2_freshness_capable():
                 _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
@@ -1681,7 +1696,7 @@ def create_cache_wrapper(
                 # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
-                if _l2_swr_backend_capable:
+                if _l2_freshness_capable():
                     _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
                     cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
