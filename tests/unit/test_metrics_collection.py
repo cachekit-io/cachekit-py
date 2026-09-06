@@ -170,21 +170,24 @@ class TestAsyncMetricsCollector:
             allow_processing.wait()
 
         collector._process_metric = process_metric
-        collector.record_counter("inflight")
-        assert processing_started.wait(timeout=1.0)
-
-        thread = threading.Thread(target=lambda: (collector.flush(), flushed.set()))
-        thread.start()
+        thread: threading.Thread | None = None
         try:
+            collector.record_counter("inflight")
+            assert processing_started.wait(timeout=1.0)
+
+            thread = threading.Thread(target=lambda: (collector.flush(), flushed.set()))
+            thread.start()
             assert not flushed.wait(timeout=0.05)
             allow_processing.set()
             assert flushed.wait(timeout=1.0)
         finally:
-            # A failed assertion must not leave the daemon worker parked in
-            # process_metric (and the flush thread parked behind it) for the
-            # rest of the test process.
+            # Any failed assertion — including the readiness wait — must not
+            # leave the daemon worker parked in process_metric, the flush
+            # thread parked behind it, or the collector running for the rest
+            # of the test process.
             allow_processing.set()
-            thread.join(timeout=2.0)
+            if thread is not None:
+                thread.join(timeout=2.0)
             collector.shutdown()
 
     def test_graceful_shutdown(self):
