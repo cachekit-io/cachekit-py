@@ -298,7 +298,7 @@ trial decryption — and old entries age out via TTL, no cache flush required. S
 
 cachekit employs comprehensive security tooling:
 
-- **Supply Chain Security**: cargo-deny for license compliance + RustSec scanning
+- **Dependency Security**: cargo-deny for license compliance + cargo-audit for RustSec scanning
 - **Formal Verification**: Kani proves correctness of compression, checksums, encryption
 - **Runtime Analysis**: Miri + sanitizers for memory safety
 - **Fuzzing**: Coverage-guided testing with >80% code coverage
