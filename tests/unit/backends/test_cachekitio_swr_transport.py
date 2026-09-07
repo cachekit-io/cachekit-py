@@ -150,10 +150,10 @@ class _SWRBackend:
         self.freshness: bool = False
         self.fresh_for: int | None = None
 
-    def get(self, key: str):
+    def get(self, key: str) -> bytes | None:
         return b"plain-get"
 
-    def get_with_freshness(self, key: str):
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
         return (b"swr-get", self.freshness, self.fresh_for)
 
     def set(self, key: str, value: bytes, ttl=None, stale_ttl=None) -> None:
@@ -167,7 +167,7 @@ class _PlainBackend:
     def __init__(self) -> None:
         self.store: dict[str, bytes] = {}
 
-    def get(self, key: str):
+    def get(self, key: str) -> bytes | None:
         return self.store.get(key)
 
     def set(self, key: str, value: bytes, ttl=None) -> None:
@@ -225,10 +225,10 @@ class _ExplodingBackend(_SWRBackend):
         super().__init__()
         self.exc = exc
 
-    def get_with_freshness(self, key: str):
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
         raise self.exc
 
-    def get(self, key: str):
+    def get(self, key: str) -> bytes | None:
         raise self.exc
 
 
@@ -256,7 +256,7 @@ class TestHandlerDegradation:
 class _LegacyTupleBackend(_SWRBackend):
     """Third-party SWR backend on the released 0.5.x 2-tuple read protocol."""
 
-    def get_with_freshness(self, key: str):
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:  # type: ignore[override]
         return None if key == "missing" else (b"legacy", True)
 
 
