@@ -6,10 +6,12 @@ Tests:
 - Nested complex objects with new types
 - Error detection for unsupported types (Pydantic, ORM, custom classes)
 - Security: _safe_hasattr prevents code execution
+- LAB-2503 exception contract: forged payloads and object-hook diagnostics fail closed as SerializationError
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from uuid import UUID
 
 import msgpack
@@ -21,25 +23,43 @@ from cachekit._rust_serializer import ByteStorage
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import SerializationError
 
-# A well-formed msgpack document whose ndarray marker makes np.frombuffer raise
-# OverflowError (itemsize past C long) — a forged entry that is neither a decode-bound
-# rejection nor a ValueError, so it pins the serializer's exception contract.
-FORGED_NDARRAY = msgpack.packb(
-    {"__ndarray__": True, "dtype": {"names": ["a"], "formats": ["f8"], "itemsize": 2**63}, "shape": [1], "data": b"x" * 8}
-)
+# Well-formed msgpack documents whose ndarray marker makes numpy raise something that is neither
+# a decode-bound rejection nor a ValueError, pinning the serializer's exception contract:
+# OverflowError (dict dtype with itemsize past C long), SyntaxError (numpy's comma-string dtype
+# parser runs ast.literal_eval on the forged shape prefix "(1,f8"), and the M8[0ns] dtype that
+# numpy accepts and pandas then dies on with SIGFPE — refused before any array is built.
+FORGED_NDARRAYS = {
+    "itemsize-past-c-long": msgpack.packb(
+        {"__ndarray__": True, "dtype": {"names": ["a"], "formats": ["f8"], "itemsize": 2**63}, "shape": [1], "data": b"x" * 8}
+    ),
+    "dtype-shape-prefix-unparseable": msgpack.packb({"__ndarray__": True, "dtype": "(1,f8", "shape": [1], "data": b"x" * 8}),
+    "datetime-zero-unit-multiplier": msgpack.packb({"__ndarray__": True, "dtype": "M8[0ns]", "shape": [1], "data": b"x" * 8}),
+}
 
 
+@pytest.mark.parametrize("payload", FORGED_NDARRAYS.values(), ids=list(FORGED_NDARRAYS))
 @pytest.mark.parametrize(
-    "serializer, entry",
+    "serializer, wrap",
     [
-        (AutoSerializer(enable_integrity_checking=False), FORGED_NDARRAY),
-        (AutoSerializer(), bytes(ByteStorage("msgpack").store(FORGED_NDARRAY, "msgpack"))),
+        (AutoSerializer(enable_integrity_checking=False), lambda b: b),
+        (AutoSerializer(), lambda b: bytes(ByteStorage("msgpack").store(b, "msgpack"))),
     ],
     ids=["plain", "verified-envelope"],
 )
-def test_forged_payload_failure_is_a_serialization_error(serializer: AutoSerializer, entry: bytes) -> None:
+def test_forged_payload_failure_is_a_serialization_error(
+    serializer: AutoSerializer, wrap: Callable[[bytes], bytes], payload: bytes
+) -> None:
     with pytest.raises(SerializationError):
-        serializer.deserialize(entry)
+        serializer.deserialize(wrap(payload))
+
+
+def test_hook_diagnostic_propagates_unwrapped_from_the_verified_envelope() -> None:
+    """The object hook's SerializationError sits outside PAYLOAD_DECODE_ERRORS, so it leaves the
+    verified-envelope decode unwrapped — that catch must never widen back to ``Exception``."""
+    entry = bytes(ByteStorage("msgpack").store(msgpack.packb({"__uuid__": True}), "msgpack"))
+    with pytest.raises(SerializationError, match=r"^Invalid UUID format: missing 'value' field") as excinfo:
+        AutoSerializer().deserialize(entry)
+    assert excinfo.value.__cause__ is None
 
 
 class TestAutoSerializerUUID:

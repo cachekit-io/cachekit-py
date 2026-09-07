@@ -35,9 +35,9 @@ from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "decode-bounds.json"
-FIXTURE_SHA256 = "fa8bc750a4911fe3663b9ab68f13438a3e924b6bc742e9f6763ca35ad2407476"  # pragma: allowlist secret
+FIXTURE_SHA256 = "75c1204e6f58f5220581d3e40e75a68f2df605b4e3c817107b0c690cd7da5cd4"  # pragma: allowlist secret
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-EXPECTED_COUNTS = {"reject_vectors": 10, "accept_vectors": 2}
+EXPECTED_COUNTS = {"reject_vectors": 13, "accept_vectors": 2}
 
 # Peak transient heap a rejected decode may cost: a small constant (tracemalloc + unpackb
 # overhead) plus a few multiples of the input. Unguarded, the nested_array32_input_len vector
@@ -53,10 +53,10 @@ def _envelope(payload: bytes) -> bytes:
 CACHE_KEY = "ns:decode:bounds"
 
 
-@functools.lru_cache(maxsize=1)
-def _frame_template() -> tuple[dict[str, Any], str]:
+@functools.lru_cache(maxsize=2)
+def _frame_template(serializer: str = "default") -> tuple[dict[str, Any], str]:
     _, metadata, serializer_name = SerializationWrapper.unwrap(
-        CacheSerializationHandler().serialize_data({"t": 1}, cache_key=CACHE_KEY)
+        CacheSerializationHandler(serializer).serialize_data({"t": 1}, cache_key=CACHE_KEY)
     )
     return metadata, serializer_name
 
@@ -92,6 +92,10 @@ def _peak_of(fn: Callable[..., Any], *args: Any) -> tuple[Any, BaseException | N
 
 def _vector_ids(group: str) -> list[str]:
     return [v["name"] for v in VECTORS[group]]
+
+
+def _reject_vector(name: str) -> bytes:
+    return bytes.fromhex(next(v["input_hex"] for v in VECTORS["reject_vectors"] if v["name"] == name))
 
 
 class TestFixtureIsTheVendoredProtocolFile:
@@ -134,3 +138,24 @@ class TestOwnedBounds:
     def test_trailing_bytes_still_rejected(self) -> None:
         with pytest.raises(msgpack.exceptions.ExtraData):
             unpackb_bounded(b"\xc0\xc0")
+
+    def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self) -> None:
+        # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),
+        # and the walk must have stopped it before the decoder pre-allocated ~8000x the input.
+        serializer = AutoSerializer(enable_integrity_checking=False)
+        assert serializer.validate_data(msgpack.packb({"t": 1})) is True
+        bomb = _reject_vector("nested_array32_input_len_depth_1100")
+        valid, err, peak = _peak_of(serializer.validate_data, bomb)
+        assert (valid, err) == (False, None)
+        assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(bomb), f"validate_data peaked at {peak} bytes"
+
+    @pytest.mark.parametrize("original_type", ["dataframe", "series"])
+    def test_bomb_behind_a_dataframe_or_series_frame_is_a_controlled_miss(self, original_type: str) -> None:
+        # AutoSerializer's metadata routes decode outside the verified-envelope normaliser; the bound's
+        # rejection must still reach the handler as SerializationError (evict + tamper hook), never a
+        # bare ValueError. The message match keeps a "Serializer mismatch" error from faking a pass.
+        metadata, serializer_name = _frame_template("auto")
+        bomb = _reject_vector("nested_array32_input_len_depth_1100")
+        frame = SerializationWrapper.wrap(_envelope(bomb), {**metadata, "original_type": original_type}, serializer_name)
+        with pytest.raises(SerializationError, match=f"failed to decode as {original_type}"):
+            CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)

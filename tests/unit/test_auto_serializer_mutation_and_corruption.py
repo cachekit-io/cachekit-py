@@ -12,23 +12,61 @@ as raw msgpack — losing the corruption diagnostic. A checksum mismatch must su
 DataFrames route through ArrowSerializer when pyarrow is installed, so the columnar msgpack path
 (``_serialize_dataframe`` / the ``"dataframe"`` branch) is exercised by disabling the arrow
 serializer. Series never use arrow, so they hit the columnar path unconditionally.
+
+LAB-2503: ``TestDataFrameSeriesReadRoutes`` pins every DataFrame/Series read route (metadata x
+integrity, and metadata-less via the envelope's format_id); it lives here because this file
+already forces the columnar path.
 """
 
 from __future__ import annotations
 
+import msgpack
 import numpy as np
 import pandas as pd
 import pytest
 
+from cachekit._rust_serializer import ByteStorage
 from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import SerializationError
 
 
-def _no_arrow() -> AutoSerializer:
+def _no_arrow(**kwargs: bool) -> AutoSerializer:
     """An AutoSerializer forced onto the columnar msgpack DataFrame path (pyarrow absent)."""
-    s = AutoSerializer()
+    s = AutoSerializer(**kwargs)
     s._arrow_serializer = None
     return s
+
+
+def _assert_equal(out: pd.DataFrame | pd.Series, expected: pd.DataFrame | pd.Series) -> None:
+    if isinstance(expected, pd.DataFrame):
+        pd.testing.assert_frame_equal(out, expected)
+    else:
+        pd.testing.assert_series_equal(out, expected)
+
+
+FRAME = pd.DataFrame({"x": np.arange(5, dtype=np.float64), "n": np.arange(5, dtype=np.int64)})
+SERIES = pd.Series(np.arange(8, dtype=np.float64), name="v")
+
+
+@pytest.mark.unit
+class TestDataFrameSeriesReadRoutes:
+    """Every route a DataFrame/Series read can take must reconstruct the value: with metadata
+    on both integrity settings, and — the decorator read path may carry none — from the
+    verified envelope's own format_id (LAB-2503 moved that route under the fail-closed guard).
+    """
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    @pytest.mark.parametrize("integrity", [True, False], ids=["integrity-on", "integrity-off"])
+    def test_roundtrip_with_metadata(self, value: pd.DataFrame | pd.Series, integrity: bool) -> None:
+        s = _no_arrow(enable_integrity_checking=integrity)
+        data, meta = s.serialize(value)
+        _assert_equal(s.deserialize(data, meta), value)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_roundtrip_without_metadata_via_envelope_format_id(self, value: pd.DataFrame | pd.Series) -> None:
+        s = _no_arrow()
+        data, _ = s.serialize(value)
+        _assert_equal(s.deserialize(data), value)
 
 
 @pytest.mark.unit
@@ -91,3 +129,24 @@ class TestDataFrameSeriesCorruptionDiagnostic:
         corrupted[len(corrupted) // 2] ^= 0xFF
         with pytest.raises(SerializationError):
             s.deserialize(bytes(corrupted), meta)
+
+
+@pytest.mark.unit
+class TestForgedColumnarDtypeIsRefused:
+    """A forged numeric-column dtype is refused before any array is built. ``M8[0ns]`` passes
+    ``np.frombuffer`` and then kills the process with SIGFPE inside pandas — uncatchable — and the
+    writer only ever emits plain NumPy numeric dtypes, so anything else is a forgery (LAB-2503).
+    """
+
+    @pytest.mark.parametrize("dtype", ["M8[0ns]", "m8[0ns]", "U4"])
+    @pytest.mark.parametrize("kind", ["dataframe", "series"])
+    def test_forged_column_dtype_is_a_serialization_error(self, kind: str, dtype: str) -> None:
+        column = {"type": "numeric", "data": b"\x00" * 8, "dtype": dtype}
+        body = (
+            {"columns": ["x"], "index": None, "data": {"x": column}}
+            if kind == "dataframe"
+            else {"name": None, "index": None, **column}
+        )
+        entry = bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
+        with pytest.raises(SerializationError, match="Forged columnar dtype"):
+            AutoSerializer().deserialize(entry)

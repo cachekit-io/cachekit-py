@@ -157,6 +157,22 @@ def _is_plain_numpy_numeric(dtype: Any) -> bool:
     return HAS_PANDAS and not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
 
 
+def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
+    """``np.dtype(spec)`` for a dtype the cache entry itself supplies, refusing what the writer never emits.
+
+    A forged ``M8[0ns]`` (zero datetime unit multiplier) passes ``np.frombuffer`` and then kills
+    the process with SIGFPE inside pandas — a signal no ``except`` can catch — so it is refused
+    before any array is built. Columnar (DataFrame/Series) entries only ever carry dtypes that
+    pass ``_is_plain_numpy_numeric``, the write-side predicate, so ``numeric_only`` mirrors it.
+    """
+    dtype = np.dtype(spec)
+    if numeric_only and not _is_plain_numpy_numeric(dtype):
+        raise SerializationError(f"Forged columnar dtype {dtype}: the writer only emits plain NumPy numeric columns")
+    if dtype.kind in "Mm" and np.datetime_data(dtype)[1] == 0:
+        raise SerializationError(f"Forged dtype {dtype}: a zero datetime unit multiplier crashes pandas")
+    return dtype
+
+
 def _na_safe_object_list(series: Any) -> list:
     """``series.tolist()`` with scalar pandas NA sentinels (pd.NA/NaT/NaN) mapped to None.
 
@@ -297,7 +313,7 @@ def _auto_object_hook(obj: Any) -> Any:
             if "data" not in obj or "shape" not in obj or "dtype" not in obj:
                 raise SerializationError("Invalid ndarray format: missing required fields in cached data")
             # .copy(): writable result that does not alias the source buffer (the L1-cached bytes on a hit) — #157.
-            return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"]).copy()
+            return np.frombuffer(obj["data"], dtype=_dtype_from_untrusted(obj["dtype"])).reshape(obj["shape"]).copy()
 
     return obj
 
@@ -550,11 +566,9 @@ class AutoSerializer:
                         original_data, _ = self._byte_storage.retrieve(data)
                     except (ValueError, SerializationError) as e:
                         raise SerializationError(f"DataFrame integrity check failed (corrupted cache entry): {e}") from e
-                    unpacked_data = unpackb_bounded(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_dataframe(unpacked_data)
+                    return self._decode_columnar(original_data, detected_format)
                 # Integrity off: data is direct msgpack (no envelope)
-                unpacked_data = unpackb_bounded(data, **self._msgpack_unpack_opts)
-                return self._deserialize_dataframe(unpacked_data)
+                return self._decode_columnar(data, detected_format)
             elif detected_format == "series":
                 if self.enable_integrity_checking and len(data) > 4:
                     # Same fail-closed contract as the DataFrame branch above (#156).
@@ -562,11 +576,9 @@ class AutoSerializer:
                         original_data, _ = self._byte_storage.retrieve(data)
                     except (ValueError, SerializationError) as e:
                         raise SerializationError(f"Series integrity check failed (corrupted cache entry): {e}") from e
-                    unpacked_data = unpackb_bounded(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_series(unpacked_data)
+                    return self._decode_columnar(original_data, detected_format)
                 # Integrity off: data is direct msgpack (no envelope)
-                unpacked_data = unpackb_bounded(data, **self._msgpack_unpack_opts)
-                return self._deserialize_series(unpacked_data)
+                return self._decode_columnar(data, detected_format)
 
         # For Rust-envelope formats, use the Rust layer
         envelope_error: Exception | None = None
@@ -601,8 +613,6 @@ class AutoSerializer:
                             return self._deserialize_dataframe(unpacked_data)
                         return self._deserialize_series(unpacked_data)
                     return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
-                except SerializationError:
-                    raise
                 except PAYLOAD_DECODE_ERRORS as e:
                     raise SerializationError(
                         f"Cache entry payload failed to decode inside a verified envelope (format={detected_format!r}): {e}"
@@ -630,9 +640,6 @@ class AutoSerializer:
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
             return unpackb_bounded(data, **self._msgpack_unpack_opts)
-        except SerializationError:
-            # Re-raise SerializationError (corruption detection) without swallowing
-            raise
         except PAYLOAD_DECODE_ERRORS as msgpack_error:
             # If msgpack fails for other reasons, try NumPy-specific deserialization — and if
             # that fails too, report every reason: the msgpack one is the decode-bound
@@ -738,10 +745,12 @@ class AutoSerializer:
             # not alias the source bytes (the L1-cached buffer on a hit) — see #157. frombuffer alone
             # returns a read-only view aliasing the input.
             raw_bytes = data[offset:]
-            arr = np.frombuffer(raw_bytes, dtype=dtype_str).copy()
+            arr = np.frombuffer(raw_bytes, dtype=_dtype_from_untrusted(dtype_str)).copy()
             return arr.reshape(shape)
-        except (ValueError, TypeError, IndexError) as e:
-            # TypeError: np.frombuffer on a forged dtype string; UnicodeDecodeError is a ValueError.
+        except (ValueError, TypeError, IndexError, SyntaxError) as e:
+            # TypeError: np.frombuffer on a forged dtype string; SyntaxError: numpy's comma-string
+            # dtype parser runs ast.literal_eval on a forged shape prefix such as "(1,f8";
+            # UnicodeDecodeError is a ValueError.
             raise SerializationError(f"Failed to deserialize NumPy array: {e}") from e
 
     def _serialize_dataframe(self, df: pd.DataFrame) -> bytes:
@@ -801,7 +810,7 @@ class AutoSerializer:
         for col, col_info in serialized["data"].items():
             if col_info["type"] == "numeric":
                 # Reconstruct from NumPy bytes; .copy() → writable, non-aliasing column (#157).
-                arr = np.frombuffer(col_info["data"], dtype=col_info["dtype"]).copy()
+                arr = np.frombuffer(col_info["data"], dtype=_dtype_from_untrusted(col_info["dtype"], numeric_only=True)).copy()
                 columns_data[col] = arr
             else:
                 # Use object data directly
@@ -865,7 +874,9 @@ class AutoSerializer:
 
         if serialized["type"] == "numeric":
             # .copy() → writable Series values that do not alias the source buffer (#157).
-            values = np.frombuffer(serialized["data"], dtype=serialized["dtype"]).copy()
+            values = np.frombuffer(
+                serialized["data"], dtype=_dtype_from_untrusted(serialized["dtype"], numeric_only=True)
+            ).copy()
         else:
             values = serialized["data"]
 
@@ -876,6 +887,20 @@ class AutoSerializer:
             series.index = pd.Index(serialized["index"])
 
         return series
+
+    def _decode_columnar(self, payload: bytes | bytearray | memoryview, kind: str) -> pd.DataFrame | pd.Series:
+        """Decode a ``dataframe`` / ``series`` payload, failing closed as ``SerializationError``.
+
+        The metadata routes in ``deserialize`` reach here outside the verified-envelope
+        normaliser, and the read handler treats only ``SerializationError`` as a read error
+        (evict + tamper hook) — a bare ``ValueError`` from the decode bound would be logged as
+        a backend fault and the poisoned entry kept (LAB-2503).
+        """
+        build = self._deserialize_dataframe if kind == "dataframe" else self._deserialize_series
+        try:
+            return build(unpackb_bounded(payload, **self._msgpack_unpack_opts))
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(f"Cache entry payload failed to decode as {kind}: {e}") from e
 
     def _serialize_msgpack(self, obj: Any) -> bytes:
         """Serialize general object with MessagePack."""

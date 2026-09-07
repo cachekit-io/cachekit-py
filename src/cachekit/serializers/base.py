@@ -340,12 +340,14 @@ MSGPACK_MAX_NESTING = 1024
 #: Everything a corrupted or forged payload can make a decode raise, for serializers
 #: to turn into ``SerializationError``. msgpack's own errors are ``ValueError``
 #: subclasses; the AutoSerializer object hook and the NumPy/DataFrame/Series
-#: reconstructors add ``TypeError`` / ``OverflowError`` (``np.frombuffer`` on a forged
-#: dtype or itemsize), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
+#: reconstructors add ``TypeError`` (``np.frombuffer`` on a forged dtype string),
+#: ``OverflowError`` (a forged dict dtype whose itemsize is past C long), ``SyntaxError``
+#: (numpy's comma-string dtype parser runs ``ast.literal_eval`` on a forged shape prefix
+#: such as ``"(1,f8"``), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
 #: the shape they wrote); ``BufferError`` is a non-u8 buffer exporter rejected at the
 #: PyO3 boundary (LAB-770). Anything else — above all ``RuntimeError`` for a missing
 #: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
-PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError)
+PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError, SyntaxError)
 
 
 def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:

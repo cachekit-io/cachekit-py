@@ -174,3 +174,43 @@ class TestAutoSerializerNumpyUnderEncryption:
         result = wrapper.deserialize(data, metadata, cache_key)
 
         np.testing.assert_array_equal(result, original)
+
+
+def _numpy_raw(dtype: bytes, shape: tuple[int, ...], payload: bytes) -> bytes:
+    """A NUMPY_RAW entry laid out exactly as ``_serialize_numpy`` writes it, fields attacker-chosen."""
+    shape_data = b"".join(dim.to_bytes(4, "little") for dim in shape)
+    header = len(dtype).to_bytes(2, "little") + dtype + len(shape_data).to_bytes(2, "little") + shape_data
+    return b"NUMPY_RAW" + header + payload
+
+
+# Each passes the header checks and reaches _deserialize_numpy's own except clause — the dtype
+# decode or numpy raising TypeError / ValueError / SyntaxError (measured on numpy 1.26-2.3).
+FORGED_NUMPY_RAW = {
+    "dtype-not-understood": _numpy_raw(b"not-a-dtype", (1,), b"\x00" * 8),
+    "itemsize-past-c-long": _numpy_raw(b"V9223372036854775808", (1,), b"\x00" * 8),
+    "dtype-not-utf8": _numpy_raw(b"\xff\xfe", (1,), b"\x00" * 8),
+    "shape-does-not-fit": _numpy_raw(b"<f8", (7,), b"\x00" * 8),
+    "shape-prefix-unparseable": _numpy_raw(b"(1,f8", (1,), b"\x00" * 8),  # numpy -> ast.literal_eval -> SyntaxError
+}
+
+
+@pytest.mark.unit
+class TestAutoSerializerNumpyForgedEntries:
+    """A NUMPY_RAW entry is routed to ``_deserialize_numpy`` structurally, with no outer
+    ``PAYLOAD_DECODE_ERRORS`` normalisation, so its own except clause is the whole fail-closed
+    contract for a forged entry (LAB-2503). The checksum is unkeyed and does not help: whoever
+    can write the backend can also write a matching xxHash3-64.
+    """
+
+    @pytest.mark.parametrize("entry", FORGED_NUMPY_RAW.values(), ids=list(FORGED_NUMPY_RAW))
+    @pytest.mark.parametrize("checksummed", [False, True], ids=["raw", "checksummed"])
+    def test_forged_entry_fails_closed_as_serialization_error(self, entry: bytes, checksummed: bool) -> None:
+        if checksummed:
+            entry = xxhash.xxh3_64_digest(entry) + entry
+        with pytest.raises(SerializationError, match="Failed to deserialize NumPy array"):
+            AutoSerializer().deserialize(entry)
+
+    def test_degenerate_datetime_dtype_is_refused_before_any_array_is_built(self) -> None:
+        # M8[0ns] passes np.frombuffer and then kills the process with SIGFPE inside pandas.
+        with pytest.raises(SerializationError, match="zero datetime unit multiplier"):
+            AutoSerializer().deserialize(_numpy_raw(b"M8[0ns]", (1,), b"\x00" * 8))

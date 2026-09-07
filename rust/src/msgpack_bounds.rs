@@ -3,18 +3,20 @@
 //! a core-shared walk usable from py/rs/wasm is the follow-up. Mirrors the opcode table of
 //! cachekit-rs `check_structure` so the two SDKs reject the same documents.
 
-/// Header-only walk over one MessagePack document: str/bin/ext payloads are skipped by
+/// Header-only walk over one `MessagePack` document: str/bin/ext payloads are skipped by
 /// offset, never read, and nothing is allocated beyond one `u64` per open collection.
 ///
-/// Rejects, before any decoder pre-allocates a container:
+/// Trailing bytes after the root element are left to the decoder (`ExtraData`).
+///
+/// # Errors
+///
+/// Names the violated bound, before any decoder pre-allocates a container, for:
 /// - nesting deeper than `max_depth`;
 /// - a header declaring more payload bytes than the input holds;
 /// - more pending elements (across every open collection) than remaining bytes can back —
 ///   every element costs >= 1 byte, so a decoder's total container pre-allocation is then
 ///   bounded by the input length instead of by `depth × declared_len`;
 /// - the reserved marker 0xc1 and input that ends mid-document.
-///
-/// Trailing bytes after the root element are left to the decoder (`ExtraData`).
 pub fn check_msgpack_structure(bytes: &[u8], max_depth: usize) -> Result<(), String> {
     fn be(bytes: &[u8], pos: usize, width: usize) -> Result<u64, String> {
         let end = pos
@@ -66,7 +68,10 @@ pub fn check_msgpack_structure(bytes: &[u8], max_depth: usize) -> Result<(), Str
         if payload > remaining {
             return Err("declares more bytes than the input holds".to_owned());
         }
-        pos += payload as usize; // <= remaining, so it fits usize
+        // <= remaining, so this cannot fail; `try_from` rather than `as usize` satisfies
+        // clippy::cast_possible_truncation, line-for-line with cachekit-rs `check_structure`.
+        pos += usize::try_from(payload)
+            .map_err(|_| "declares more bytes than the input holds".to_owned())?;
         if children > 0 {
             if open.len() >= max_depth {
                 return Err(format!("nests deeper than {max_depth} levels"));
