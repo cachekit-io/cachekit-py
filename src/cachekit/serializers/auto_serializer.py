@@ -173,6 +173,19 @@ def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
     return dtype
 
 
+def _expect(value: Any, kind: type, what: str) -> Any:
+    """Refuse a columnar field whose type the writer never emits.
+
+    The ``__ndarray__`` object hook can substitute an attacker-typed ndarray for any field of a
+    forged DataFrame/Series document; pandas then asserts (``AssertionError``) or indexing raises
+    ``IndexError`` — both outside ``PAYLOAD_DECODE_ERRORS``. The writer emits ``list`` for
+    ``columns`` / ``index`` / object data and ``dict`` for the document and each column.
+    """
+    if not isinstance(value, kind):
+        raise SerializationError(f"Forged columnar payload: {what} is {type(value).__name__}, expected {kind.__name__}")
+    return value
+
+
 def _na_safe_object_list(series: Any) -> list:
     """``series.tolist()`` with scalar pandas NA sentinels (pd.NA/NaT/NaN) mapped to None.
 
@@ -805,22 +818,24 @@ class AutoSerializer:
             # Otherwise unpack msgpack
             serialized = unpackb_bounded(data, **self._msgpack_unpack_opts)
 
+        serialized = _expect(serialized, dict, "document")
         # Reconstruct DataFrame column by column
         columns_data = {}
-        for col, col_info in serialized["data"].items():
-            if col_info["type"] == "numeric":
+        for col, col_info in _expect(serialized["data"], dict, "data").items():
+            info = _expect(col_info, dict, f"column {col!r}")
+            if info["type"] == "numeric":
                 # Reconstruct from NumPy bytes; .copy() → writable, non-aliasing column (#157).
-                arr = np.frombuffer(col_info["data"], dtype=_dtype_from_untrusted(col_info["dtype"], numeric_only=True)).copy()
+                arr = np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
                 columns_data[col] = arr
             else:
                 # Use object data directly
-                columns_data[col] = col_info["data"]
+                columns_data[col] = _expect(info["data"], list, f"column {col!r} data")
 
-        df = pd.DataFrame(columns_data, columns=serialized["columns"])
+        df = pd.DataFrame(columns_data, columns=_expect(serialized["columns"], list, "columns"))
 
         # Restore index if it was serialized
         if serialized["index"] is not None:
-            df.index = pd.Index(serialized["index"])
+            df.index = pd.Index(_expect(serialized["index"], list, "index"))
 
         return df
 
@@ -872,19 +887,20 @@ class AutoSerializer:
             # Otherwise unpack msgpack
             serialized = unpackb_bounded(data, **self._msgpack_unpack_opts)
 
+        serialized = _expect(serialized, dict, "document")
         if serialized["type"] == "numeric":
             # .copy() → writable Series values that do not alias the source buffer (#157).
             values = np.frombuffer(
                 serialized["data"], dtype=_dtype_from_untrusted(serialized["dtype"], numeric_only=True)
             ).copy()
         else:
-            values = serialized["data"]
+            values = _expect(serialized["data"], list, "data")
 
         series = pd.Series(values, name=serialized["name"])
 
         # Restore index if it was serialized
         if serialized["index"] is not None:
-            series.index = pd.Index(serialized["index"])
+            series.index = pd.Index(_expect(serialized["index"], list, "index"))
 
         return series
 

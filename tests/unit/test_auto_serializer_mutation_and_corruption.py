@@ -131,11 +131,19 @@ class TestDataFrameSeriesCorruptionDiagnostic:
             s.deserialize(bytes(corrupted), meta)
 
 
+# A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a
+# forged document can put an array where the writer only ever puts a list or a dict. M8[2s] is a
+# dtype numpy accepts and pandas then asserts on (AssertionError, outside PAYLOAD_DECODE_ERRORS).
+NDARRAY_M8_2S = {"__ndarray__": True, "dtype": "M8[2s]", "shape": [1], "data": b"\x00" * 8}
+F8_COLUMN = {"type": "numeric", "data": b"\x00" * 8, "dtype": "<f8"}
+
+
 @pytest.mark.unit
-class TestForgedColumnarDtypeIsRefused:
-    """A forged numeric-column dtype is refused before any array is built. ``M8[0ns]`` passes
-    ``np.frombuffer`` and then kills the process with SIGFPE inside pandas — uncatchable — and the
-    writer only ever emits plain NumPy numeric dtypes, so anything else is a forgery (LAB-2503).
+class TestForgedColumnarPayloadIsRefused:
+    """Forged DataFrame/Series documents are refused before pandas sees them (LAB-2503): a numeric
+    column dtype the writer never emits (``M8[0ns]`` passes ``np.frombuffer`` and then kills the
+    process with SIGFPE inside pandas — uncatchable), and an ndarray smuggled via the ``__ndarray__``
+    hook into a field the writer only ever fills with a list or a dict.
     """
 
     @pytest.mark.parametrize("dtype", ["M8[0ns]", "m8[0ns]", "U4"])
@@ -149,4 +157,30 @@ class TestForgedColumnarDtypeIsRefused:
         )
         entry = bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
         with pytest.raises(SerializationError, match="Forged columnar dtype"):
+            AutoSerializer().deserialize(entry)
+
+    @pytest.mark.parametrize(
+        "kind, body",
+        [
+            ("dataframe", {"columns": ["x"], "index": None, "data": {"x": NDARRAY_M8_2S}}),
+            ("dataframe", {"columns": ["x"], "index": None, "data": {"x": {"type": "object", "data": NDARRAY_M8_2S}}}),
+            ("dataframe", {"columns": NDARRAY_M8_2S, "index": None, "data": {"x": F8_COLUMN}}),
+            ("dataframe", {"columns": ["x"], "index": NDARRAY_M8_2S, "data": {"x": F8_COLUMN}}),
+            ("dataframe", {"columns": ["x"], "index": None, "data": NDARRAY_M8_2S}),
+            ("series", {"name": None, "index": None, "type": "object", "data": NDARRAY_M8_2S}),
+            ("series", {"name": None, "index": NDARRAY_M8_2S, **F8_COLUMN}),
+        ],
+        ids=[
+            "df-column-is-ndarray",
+            "df-object-data-is-ndarray",
+            "df-columns-is-ndarray",
+            "df-index-is-ndarray",
+            "df-data-is-ndarray",
+            "series-object-data-is-ndarray",
+            "series-index-is-ndarray",
+        ],
+    )
+    def test_ndarray_where_the_writer_emits_a_list_or_dict_is_refused(self, kind: str, body: dict) -> None:
+        entry = bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
+        with pytest.raises(SerializationError, match="Forged columnar payload"):
             AutoSerializer().deserialize(entry)
