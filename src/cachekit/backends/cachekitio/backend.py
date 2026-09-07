@@ -224,6 +224,31 @@ class CachekitIOBackend:
         self._sync_client = get_sync_http_client(self._config)
         self._async_client = get_cached_async_http_client(self._config)
 
+    @staticmethod
+    def _encode_key(key: str) -> str:
+        """Percent-encode a cache key for safe interpolation into the request path.
+
+        ``safe=""`` encodes *every* reserved character — ``/`` ``?`` ``#`` ``%`` and the
+        rest — so a caller-controlled key (the ``@cache(key=...)`` escape hatch) can never
+        escape ``/v1/cache/{key}`` via an injected delimiter, query, or fragment
+        (CWE-22 / CWE-20). Encode-once matches the SaaS validator's single decode, so a
+        canonical key round-trips byte-for-byte. See ``SECURITY.md`` for the cross-SDK
+        wire-parity contract (cachekit-rs / cachekit-ts).
+
+        Dot-segment guard: ``quote`` leaves RFC-3986 *unreserved* ``.`` untouched, so a key
+        of exactly ``.`` or ``..`` survives as a live dot-segment that httpx collapses
+        client-side *before the request leaves the process* — ``..`` -> ``/v1``,
+        ``../ttl`` -> ``/v1/ttl``, ``../lock`` -> ``/v1/lock`` — re-opening the endpoint
+        escape on a *different* route carrying the bearer token, never reaching the SaaS
+        key validator. Percent-encode the dots so the segment is inert; the SaaS decodes
+        ``%2E`` -> ``.`` once and rejects ``..`` anyway. Only an all-dot segment collapses
+        (``a:..`` does not), so nothing else is touched and wire-parity is unaffected.
+        """
+        encoded = quote(key, safe="")
+        if encoded in (".", ".."):
+            return encoded.replace(".", "%2E")
+        return encoded
+
     def _request_sync(
         self,
         method: str,
@@ -340,7 +365,7 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         try:
-            response = self._request_sync("GET", key)
+            response = self._request_sync("GET", self._encode_key(key))
             return response.content
         except BackendError as exc:
             # 404 is not an error (cache miss)
@@ -371,7 +396,7 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         try:
-            response = self._request_sync("GET", key)
+            response = self._request_sync("GET", self._encode_key(key))
             return response.content, self._is_stale(response)
         except BackendError as exc:
             if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
@@ -393,7 +418,7 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        self._request_sync("PUT", key, content=value, headers=self._set_headers(ttl, stale_ttl))
+        self._request_sync("PUT", self._encode_key(key), content=value, headers=self._set_headers(ttl, stale_ttl))
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
@@ -419,7 +444,7 @@ class CachekitIOBackend:
             BackendError: If operation fails
         """
         try:
-            self._request_sync("DELETE", key)
+            self._request_sync("DELETE", self._encode_key(key))
             return True
         except BackendError as exc:
             # 404 means key didn't exist (not an error for delete)
@@ -442,7 +467,7 @@ class CachekitIOBackend:
         """
         try:
             # Use HEAD request (idiomatic HTTP for existence checks)
-            self._request_sync("HEAD", key)
+            self._request_sync("HEAD", self._encode_key(key))
             return True
         except BackendError as exc:
             # 404 means doesn't exist
@@ -502,7 +527,7 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         try:
-            response = await self._request_async("GET", key)
+            response = await self._request_async("GET", self._encode_key(key))
             return response.content
         except BackendError as exc:
             # 404 is not an error (cache miss)
@@ -525,7 +550,7 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        await self._request_async("PUT", key, content=value, headers=self._set_headers(ttl, stale_ttl))
+        await self._request_async("PUT", self._encode_key(key), content=value, headers=self._set_headers(ttl, stale_ttl))
 
     async def delete_async(self, key: str) -> bool:
         """Delete key from cache (async).
@@ -540,7 +565,7 @@ class CachekitIOBackend:
             BackendError: If operation fails
         """
         try:
-            await self._request_async("DELETE", key)
+            await self._request_async("DELETE", self._encode_key(key))
             return True
         except BackendError as exc:
             # 404 means key didn't exist (not an error for delete)
@@ -563,7 +588,7 @@ class CachekitIOBackend:
         """
         try:
             # Use HEAD request (idiomatic HTTP for existence checks)
-            await self._request_async("HEAD", key)
+            await self._request_async("HEAD", self._encode_key(key))
             return True
         except BackendError as exc:
             # 404 means doesn't exist
@@ -633,7 +658,7 @@ class CachekitIOBackend:
         # int(NaN) / int(inf) raise ValueError/OverflowError that aren't BackendError, so
         # they'd escape the wrapper's degrade-to-no-lock branch and crash the @cache.io call.
         timeout_ms = max(1, int(timeout * 1000)) if math.isfinite(timeout) else 1
-        encoded_key = quote(lock_key, safe="")
+        encoded_key = self._encode_key(lock_key)
         try:
             response = await self._request_async(
                 "POST",
@@ -713,7 +738,7 @@ class CachekitIOBackend:
         # capability token and travels in the X-CacheKit-Lock-Id header, NOT the query
         # string (CWE-532): a ?lock_id= query leaks it into access/proxy logs and OTel
         # http.url spans. It is server-issued, so it needs no URL-encoding.
-        encoded_key = quote(lock_key, safe="")
+        encoded_key = self._encode_key(lock_key)
         try:
             await self._request_async("DELETE", f"{encoded_key}/lock", headers={LOCK_ID_HEADER: lock_id})
             return True
@@ -732,7 +757,7 @@ class CachekitIOBackend:
             TTL in seconds, None if key doesn't exist or has no expiry
         """
         try:
-            response = await self._request_async("GET", f"{key}/ttl")
+            response = await self._request_async("GET", f"{self._encode_key(key)}/ttl")
             data = response.json()
             return data.get("ttl")
         except BackendError:
@@ -752,7 +777,7 @@ class CachekitIOBackend:
             payload = json.dumps({"ttl": ttl})
             await self._request_async(
                 "PATCH",
-                f"{key}/ttl",
+                f"{self._encode_key(key)}/ttl",
                 content=payload.encode(),
                 headers={"Content-Type": "application/json"},
             )

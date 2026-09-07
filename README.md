@@ -299,7 +299,7 @@ trial decryption — and old entries age out via TTL, no cache flush required. S
 
 cachekit employs comprehensive security tooling:
 
-- **Supply Chain Security**: cargo-deny for license compliance + RustSec scanning
+- **Dependency Security**: cargo-deny for license compliance + cargo-audit for RustSec scanning
 - **Formal Verification**: Kani proves correctness of compression, checksums, encryption
 - **Runtime Analysis**: Miri + sanitizers for memory safety
 - **Fuzzing**: Coverage-guided testing with >80% code coverage
@@ -358,6 +358,15 @@ exposition setup.
 
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
+
+**Free-threaded CPython (3.14t):** the core suites run green on
+free-threaded 3.14 with the GIL verified disabled (CI job
+`test-freethreaded`), and the Rust extension declares free-threaded safety
+(`gil_used = false`). Free-threaded wheels are **not yet published** and
+free-threaded builds are not officially supported — blocked on upstream
+wheels (orjson, hiredis; numpy/pandas/pyarrow for `[data]`). See
+[measured performance results](docs/free-threading.md#measured-performance) and the
+full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 
 **Per-Function Statistics:**
 - Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
