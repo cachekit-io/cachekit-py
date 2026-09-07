@@ -654,17 +654,15 @@ class AutoSerializer:
         try:
             return unpackb_bounded(data, **self._msgpack_unpack_opts)
         except PAYLOAD_DECODE_ERRORS as msgpack_error:
-            # If msgpack fails for other reasons, try NumPy-specific deserialization — and if
-            # that fails too, report every reason: the msgpack one is the decode-bound
-            # rejection for a forged entry and must not vanish behind the NumPy header error.
-            try:
-                return self._deserialize_numpy(data)
-            except (SerializationError, *PAYLOAD_DECODE_ERRORS) as numpy_error:
-                raise SerializationError(
-                    "Cache entry is not a decodable MessagePack or NumPy payload"
-                    f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
-                    f" (msgpack: {msgpack_error}) (numpy: {numpy_error})"
-                ) from msgpack_error
+            # NUMPY_RAW entries were routed structurally at the top, so nothing reaching here can be
+            # a NumPy payload (and a NumPy attempt would raise RuntimeError without the [data]
+            # extra). Report every reason for the miss: the msgpack one is the decode-bound
+            # rejection for a forged entry and must not vanish behind the envelope error.
+            raise SerializationError(
+                "Cache entry is not a decodable MessagePack payload"
+                f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
+                f" (msgpack: {msgpack_error})"
+            ) from msgpack_error
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
         """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.

@@ -191,6 +191,13 @@ class TestOwnedBounds:
         with pytest.raises(ValueError, match="reserved marker 0xc1"):
             check_msgpack_structure(b"\xc1", MSGPACK_MAX_NESTING)
 
+    def test_plain_path_miss_does_not_depend_on_numpy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Without the [data] extra (the free-threaded CI lane) a forged plain entry must still be a
+        # SerializationError — not the RuntimeError a NumPy fallback raises for a missing numpy.
+        monkeypatch.setattr("cachekit.serializers.auto_serializer.HAS_NUMPY", False)
+        with pytest.raises(SerializationError, match="not a decodable MessagePack payload"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(_reject_vector("bin32_overclaim"))
+
     def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self) -> None:
         # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),
         # and the walk must have stopped it before the decoder pre-allocated ~8000x the input.
