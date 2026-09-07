@@ -20,6 +20,8 @@ already forces the columnar path.
 
 from __future__ import annotations
 
+import functools
+
 import msgpack
 import pytest
 
@@ -139,27 +141,46 @@ class TestDataFrameSeriesCorruptionDiagnostic:
 # dtype numpy accepts and pandas then asserts on (AssertionError, outside PAYLOAD_DECODE_ERRORS).
 NDARRAY_M8_2S = {"__ndarray__": True, "dtype": "M8[2s]", "shape": [1], "data": b"\x00" * 8}
 F8_COLUMN = {"type": "numeric", "data": b"\x00" * 8, "dtype": "<f8"}
+# A marker msgpack decodes (the walk admits 1024 levels) but repr() cannot on 3.10/3.11 (RecursionError).
+DEEP_LIST = functools.reduce(lambda acc, _: [acc], range(1000), [])
+
+
+def _entry(kind: str, body: dict) -> bytes:
+    """A checksummed ``dataframe`` / ``series`` entry carrying ``body``."""
+    return bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
+
+
+def _columnar_entry(kind: str, column: dict) -> bytes:
+    """A checksummed ``dataframe`` / ``series`` entry whose single column is ``column``."""
+    body = (
+        {"columns": ["x"], "index": None, "data": {"x": column}}
+        if kind == "dataframe"
+        else {"name": None, "index": None, **column}
+    )
+    return _entry(kind, body)
 
 
 @pytest.mark.unit
 class TestForgedColumnarPayloadIsRefused:
     """Forged DataFrame/Series documents are refused before pandas sees them (LAB-2503): a numeric
     column dtype the writer never emits (``M8[0ns]`` passes ``np.frombuffer`` and then kills the
-    process with SIGFPE inside pandas — uncatchable), and an ndarray smuggled via the ``__ndarray__``
-    hook into a field the writer only ever fills with a list or a dict.
+    process with SIGFPE inside pandas — uncatchable), a column type marker other than the two the
+    writer emits, and an ndarray smuggled via the ``__ndarray__`` hook into a field the writer only
+    ever fills with a list or a dict.
     """
 
     @pytest.mark.parametrize("dtype", ["M8[0ns]", "m8[0ns]", "U4"])
     @pytest.mark.parametrize("kind", ["dataframe", "series"])
     def test_forged_column_dtype_is_a_serialization_error(self, kind: str, dtype: str) -> None:
-        column = {"type": "numeric", "data": b"\x00" * 8, "dtype": dtype}
-        body = (
-            {"columns": ["x"], "index": None, "data": {"x": column}}
-            if kind == "dataframe"
-            else {"name": None, "index": None, **column}
-        )
-        entry = bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
+        entry = _columnar_entry(kind, {**F8_COLUMN, "dtype": dtype})
         with pytest.raises(SerializationError, match="Forged columnar dtype"):
+            AutoSerializer().deserialize(entry)
+
+    @pytest.mark.parametrize("marker", ["forged", DEEP_LIST], ids=["unknown-string", "list-nested-1000-deep"])
+    @pytest.mark.parametrize("kind", ["dataframe", "series"])
+    def test_unknown_column_type_marker_is_refused(self, kind: str, marker: object) -> None:
+        entry = _columnar_entry(kind, {"type": marker, "data": [1, 2]})
+        with pytest.raises(SerializationError, match="Forged columnar payload: .* type is"):
             AutoSerializer().deserialize(entry)
 
     @pytest.mark.parametrize(
@@ -184,6 +205,5 @@ class TestForgedColumnarPayloadIsRefused:
         ],
     )
     def test_ndarray_where_the_writer_emits_a_list_or_dict_is_refused(self, kind: str, body: dict) -> None:
-        entry = bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
         with pytest.raises(SerializationError, match="Forged columnar payload"):
-            AutoSerializer().deserialize(entry)
+            AutoSerializer().deserialize(_entry(kind, body))

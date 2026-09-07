@@ -186,6 +186,22 @@ def _expect(value: Any, kind: type, what: str) -> Any:
     return value
 
 
+def _column_values(info: dict[str, Any], what: str) -> Any:
+    """Rebuild one column's values from the ``{type, data[, dtype]}`` the writer emits (``dtype`` only for ``"numeric"``).
+
+    ``type`` is an allow-list, not a numeric/else switch: an unknown marker must not be read as object data.
+    """
+    marker = info["type"]
+    if marker == "numeric":
+        # .copy() → writable values that do not alias the source buffer (#157).
+        return np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
+    if marker == "object":
+        return _expect(info["data"], list, f"{what} data")
+    # Attacker-chosen: echo a str capped at 40 chars; never repr() a structure (RecursionError on 3.10/3.11 at depth ~1000).
+    shown = marker if isinstance(marker, str) else type(marker).__name__
+    raise SerializationError(f"Forged columnar payload: {what} type is {shown!r:.40}, expected 'numeric' or 'object'")
+
+
 def _na_safe_object_list(series: Any) -> list:
     """``series.tolist()`` with scalar pandas NA sentinels (pd.NA/NaT/NaN) mapped to None.
 
@@ -805,6 +821,7 @@ class AutoSerializer:
 
         Raises:
             RuntimeError: If pandas not installed
+            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
@@ -817,18 +834,10 @@ class AutoSerializer:
             serialized = unpackb_bounded(data, **self._msgpack_unpack_opts)
 
         serialized = _expect(serialized, dict, "document")
-        # Reconstruct DataFrame column by column
         columns_data = {}
         for col, col_info in _expect(serialized["data"], dict, "data").items():
-            info = _expect(col_info, dict, f"column {col!r}")
-            if info["type"] == "numeric":
-                # Reconstruct from NumPy bytes; .copy() → writable, non-aliasing column (#157).
-                arr = np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
-                columns_data[col] = arr
-            else:
-                # Use object data directly
-                columns_data[col] = _expect(info["data"], list, f"column {col!r} data")
-
+            what = f"column {col!r:.40}"  # col is attacker-chosen: cap the echo
+            columns_data[col] = _column_values(_expect(col_info, dict, what), what)
         df = pd.DataFrame(columns_data, columns=_expect(serialized["columns"], list, "columns"))
 
         # Restore index if it was serialized
@@ -874,6 +883,7 @@ class AutoSerializer:
 
         Raises:
             RuntimeError: If pandas not installed
+            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
@@ -886,15 +896,7 @@ class AutoSerializer:
             serialized = unpackb_bounded(data, **self._msgpack_unpack_opts)
 
         serialized = _expect(serialized, dict, "document")
-        if serialized["type"] == "numeric":
-            # .copy() → writable Series values that do not alias the source buffer (#157).
-            values = np.frombuffer(
-                serialized["data"], dtype=_dtype_from_untrusted(serialized["dtype"], numeric_only=True)
-            ).copy()
-        else:
-            values = _expect(serialized["data"], list, "data")
-
-        series = pd.Series(values, name=serialized["name"])
+        series = pd.Series(_column_values(serialized, "series"), name=serialized["name"])
 
         # Restore index if it was serialized
         if serialized["index"] is not None:
