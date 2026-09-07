@@ -26,7 +26,7 @@ from typing import Any
 import msgpack
 import pytest
 
-from cachekit._rust_serializer import ByteStorage
+from cachekit._rust_serializer import ByteStorage, check_msgpack_structure
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
 from cachekit.serializers.auto_serializer import AutoSerializer
@@ -138,6 +138,58 @@ class TestOwnedBounds:
     def test_trailing_bytes_still_rejected(self) -> None:
         with pytest.raises(msgpack.exceptions.ExtraData):
             unpackb_bounded(b"\xc0\xc0")
+
+    def test_mutable_exporters_are_accepted(self) -> None:
+        # A bytearray (or a memoryview over one) is snapshotted so the walk and the decode see one
+        # immutable document; a memoryview of bytes stays zero-copy. All three must decode.
+        doc = msgpack.packb({"t": 1})
+        assert unpackb_bounded(bytearray(doc), raw=False) == {"t": 1}
+        assert unpackb_bounded(memoryview(bytearray(doc)), raw=False) == {"t": 1}
+        assert unpackb_bounded(memoryview(doc)[0:], raw=False) == {"t": 1}
+
+    # One exact-width document per fixed-width marker family: float32/64, uint8..64, int8..64,
+    # fixext 1/2/4/8/16, ext8/16/32 (2-byte payload), str8/16/32 + fixstr, bin8/16/32.
+    FIXED_WIDTH_DOCS = [
+        b"\xca" + b"\x00" * 4,
+        b"\xcb" + b"\x00" * 8,
+        b"\xcc\x00",
+        b"\xcd\x00\x00",
+        b"\xce" + b"\x00" * 4,
+        b"\xcf" + b"\x00" * 8,
+        b"\xd0\x00",
+        b"\xd1\x00\x00",
+        b"\xd2" + b"\x00" * 4,
+        b"\xd3" + b"\x00" * 8,
+        b"\xd4\x01\x00",
+        b"\xd5\x01\x00\x00",
+        b"\xd6\x01" + b"\x00" * 4,
+        b"\xd7\x01" + b"\x00" * 8,
+        b"\xd8\x01" + b"\x00" * 16,
+        b"\xc7\x02\x01\x00\x00",
+        b"\xc8\x00\x02\x01\x00\x00",
+        b"\xc9\x00\x00\x00\x02\x01\x00\x00",
+        b"\xa1x",
+        b"\xd9\x01x",
+        b"\xda\x00\x01x",
+        b"\xdb\x00\x00\x00\x01x",
+        b"\xc4\x01x",
+        b"\xc5\x00\x01x",
+        b"\xc6\x00\x00\x00\x01x",
+    ]
+
+    @pytest.mark.parametrize("doc", FIXED_WIDTH_DOCS, ids=lambda d: f"0x{d[0]:02x}")
+    def test_every_marker_is_walked_to_its_exact_width(self, doc: bytes) -> None:
+        # Exact length passes the walk; one byte short is a truncation; a trailing byte reaches the
+        # decoder as ExtraData — together they pin that the walk consumed exactly the marker's width.
+        check_msgpack_structure(doc, MSGPACK_MAX_NESTING)
+        with pytest.raises(ValueError, match="Unpack failed"):
+            check_msgpack_structure(doc[:-1], MSGPACK_MAX_NESTING)
+        with pytest.raises(msgpack.exceptions.ExtraData):
+            unpackb_bounded(doc + b"\xc0")
+
+    def test_reserved_marker_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved marker 0xc1"):
+            check_msgpack_structure(b"\xc1", MSGPACK_MAX_NESTING)
 
     def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self) -> None:
         # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),

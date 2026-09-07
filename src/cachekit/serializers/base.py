@@ -387,6 +387,11 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         ...
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
+    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
+        # A mutable exporter (bytearray, a memoryview over one) could change between the walk and
+        # the decode, so both must see one immutable document. bytes and a memoryview of bytes stay
+        # zero-copy — the same containment proof the Rust side's bytes_view uses.
+        data = bytes(data)
     n = len(data)
     check_msgpack_structure(data, MSGPACK_MAX_NESTING)
     return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)
