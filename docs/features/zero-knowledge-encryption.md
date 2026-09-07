@@ -40,7 +40,9 @@ data = get_sensitive_data(123)  # Encrypted in Redis
 
 There are two real, shipped paths to encrypted caching on the cachekit.io SaaS. Both are
 zero-knowledge on the wire **when a master key is present** — the difference is what
-happens when it isn't, and which backend you actually reach.
+happens when it isn't, and which backend you actually reach. "Zero-knowledge" covers cached
+**values**: the cache key and frame header stay cleartext on both paths (see
+[Accepted Exposure](#cleartext-frame-header-fields-accepted-exposure)).
 
 | | `@cache.secure(backend=CachekitIOBackend())` | `@cache.io()` + `CACHEKIT_MASTER_KEY` env |
 |---|---|---|
@@ -482,6 +484,15 @@ Relocating these fields would be a cross-SDK wire-format change owned by the
 [protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
 exposure rather than diverging from the shared frame format.
 
+Beyond the frame header, the **cache key itself is cleartext** — on the CachekitIO backend
+it travels percent-encoded in the URL path (`/v1/cache/{key}`). The key carries the
+namespace and the function's `module.qualname` plus an unkeyed, unsalted blake2b-256 of
+the arguments (`ns:{ns}:func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or known
+argument space the hash is offline-enumerable: a backend operator can learn *which* record
+was accessed, when, and how often, without decrypting anything. Encryption protects
+values, not access patterns — keep secrets out of namespaces and function names, and
+count argument-identifiable access as metadata exposure in your threat model.
+
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
 Three failure classes surface on the decrypt read path, and cachekit distinguishes
@@ -561,6 +572,14 @@ didn't recently disable encryption for that function, investigate.
 ---
 
 ## Compliance Implications
+
+> [!IMPORTANT]
+> The arguments below hold only on the **fail-closed path** (`@cache.secure` + explicit
+> backend). On the env auto-detect path one missing `CACHEKIT_MASTER_KEY` silently puts
+> plaintext on the backend and none of these checkmarks apply. Even fail-closed,
+> client-side encryption may *reduce* HIPAA/PCI DSS scope subject to assessment and your
+> surrounding controls — it does not remove regulated data from scope on its own. See
+> [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key).
 
 ### GDPR
 - ✅ Encryption satisfies "processing security" requirement
