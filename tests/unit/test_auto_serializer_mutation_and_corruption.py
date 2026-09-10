@@ -207,3 +207,36 @@ class TestForgedColumnarPayloadIsRefused:
     def test_ndarray_where_the_writer_emits_a_list_or_dict_is_refused(self, kind: str, body: dict) -> None:
         with pytest.raises(SerializationError, match="Forged columnar payload"):
             AutoSerializer().deserialize(_entry(kind, body))
+
+
+def _numpy_raw(dtype: bytes, shape: bytes) -> bytes:
+    return b"NUMPY_RAW" + len(dtype).to_bytes(2, "little") + dtype + len(shape).to_bytes(2, "little") + shape
+
+
+class TestForgedNumpyMetadataIsRefused:
+    """NUMPY_RAW dtype/shape metadata is untrusted: slicing past the end silently shortens and a
+    partial 4-byte chunk used to parse as a dimension, so a forged 1-byte zero shape chunk built
+    an EMPTY array instead of raising (CodeRabbit on cachekit-py#276)."""
+
+    @pytest.mark.parametrize(
+        ("payload", "why"),
+        [
+            (_numpy_raw(b"<f8", b"\x00"), "1-byte shape chunk parsed as dimension 0 -> empty array"),
+            (_numpy_raw(b"<f8", b"\x01\x00\x00"), "3-byte shape chunk (not 4-aligned)"),
+            (
+                b"NUMPY_RAW" + (3).to_bytes(2, "little") + b"<f8" + (8).to_bytes(2, "little") + b"\x01\x00\x00\x00",
+                "shape shorter than its length prefix",
+            ),
+            (b"NUMPY_RAW" + (9).to_bytes(2, "little") + b"<f8", "dtype shorter than its length prefix"),
+        ],
+    )
+    def test_truncated_or_misaligned_metadata_is_a_serialization_error(self, payload: bytes, why: str) -> None:
+        pytest.importorskip("numpy")
+        with pytest.raises(SerializationError, match="truncated or misaligned"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(payload)
+
+    def test_well_formed_numpy_still_round_trips(self) -> None:
+        np = pytest.importorskip("numpy")
+        arr = np.arange(6, dtype="<f8").reshape(2, 3)
+        s = AutoSerializer(enable_integrity_checking=False)
+        np.testing.assert_array_equal(s.deserialize(s.serialize(arr)[0]), arr)

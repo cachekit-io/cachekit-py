@@ -752,7 +752,7 @@ class AutoSerializer:
             # Read dtype
             dtype_len = int.from_bytes(data[offset : offset + 2], byteorder="little")
             offset += 2
-            dtype_str = data[offset : offset + dtype_len].decode("utf-8")
+            dtype_bytes = data[offset : offset + dtype_len]
             offset += dtype_len
 
             # Read shape
@@ -760,6 +760,13 @@ class AutoSerializer:
             offset += 2
             shape_data = data[offset : offset + shape_len]
             offset += shape_len
+
+            # Slicing past the end silently shortens, and a partial 4-byte chunk would parse as a
+            # dimension (a forged 1-byte zero chunk = shape (0,) = an empty array instead of an
+            # error). Untrusted metadata must be exactly what its length prefix claims.
+            if len(dtype_bytes) != dtype_len or len(shape_data) != shape_len or shape_len % 4:
+                raise SerializationError("Invalid NumPy data format - truncated or misaligned dtype/shape metadata")
+            dtype_str = dtype_bytes.decode("utf-8")
 
             # Reconstruct shape from packed integers
             shape = []

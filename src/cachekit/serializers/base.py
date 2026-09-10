@@ -387,6 +387,12 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         ...
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
+    if isinstance(data, memoryview):
+        # The walk (PyBuffer<u8>) and the decode must see one flat byte string: cast("B") flattens a
+        # multi-dimensional view and retypes any C-contiguous format ("b"/"c"/"H"...) to unsigned bytes
+        # without copying, so len(data) is the byte count the max_*_len caps need; a non-contiguous
+        # view has no flat form and is copied.
+        data = data.cast("B") if data.c_contiguous else bytes(data)
     if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
         # A mutable exporter (bytearray, a memoryview over one) could change between the walk and
         # the decode, so both must see one immutable document. bytes and a memoryview of bytes stay

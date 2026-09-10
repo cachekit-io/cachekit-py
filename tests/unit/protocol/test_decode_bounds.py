@@ -147,6 +147,28 @@ class TestOwnedBounds:
         assert unpackb_bounded(memoryview(bytearray(doc)), raw=False) == {"t": 1}
         assert unpackb_bounded(memoryview(doc)[0:], raw=False) == {"t": 1}
 
+    def test_memoryview_shapes_and_formats_decode_like_bytes(self) -> None:
+        # The Rust walk takes PyBuffer<u8>; msgpack takes any itemsize-1 buffer. Views are normalised
+        # to a flat "B" view first so the two agree, len(data) is the byte count the caps need, and a
+        # legitimate document is never rejected for the shape or format of the view it arrived in.
+        doc = next(
+            d
+            for d in (msgpack.packb({"k": b"x" * m, "l": [1, 2, 3]}, use_bin_type=True) for m in range(1, 9))
+            if len(d) % 8 == 0
+        )
+        expected = msgpack.unpackb(doc, raw=False)
+        views = {
+            "signed char": memoryview(doc).cast("b"),
+            "char": memoryview(doc).cast("c"),
+            "2-D bytes": memoryview(doc).cast("B", shape=[len(doc) // 8, 8]),
+            "uint16": memoryview(doc).cast("H"),
+        }
+        for name, view in views.items():
+            assert unpackb_bounded(view, raw=False) == expected, name
+        # A non-contiguous view has no flat form: it is copied, then decoded like the bytes it selects.
+        interleaved = bytes(b for pair in zip(doc, doc, strict=True) for b in pair)
+        assert unpackb_bounded(memoryview(interleaved)[::2], raw=False) == expected
+
     # One exact-width document per fixed-width marker family: float32/64, uint8..64, int8..64,
     # fixext 1/2/4/8/16, ext8/16/32 (2-byte payload), str8/16/32 + fixstr, bin8/16/32.
     FIXED_WIDTH_DOCS = [
