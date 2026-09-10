@@ -119,8 +119,7 @@ cachekit/
 │   ├── src/
 │   │   ├── lib.rs              # PyO3 FFI boundary
 │   │   └── python_bindings.rs  # Python type wrappers
-│   ├── fuzz/                   # cargo-fuzz targets
-│   └── supply-chain/           # cargo-vet security audits
+│   └── fuzz/                   # cargo-fuzz targets
 │
 ├── src/cachekit/
 │   ├── decorators/             # @cache, @redis_cache
@@ -354,7 +353,7 @@ cd rust && cargo fuzz run byte_storage_decompress
 | Layer | Tools |
 |:------|:------|
 | **Python** | Ruff "S" (68 checks), pip-audit, Atheris, Hypothesis, basedpyright |
-| **Rust** | cargo-fuzz, cargo-deny, cargo-vet, Kani |
+| **Rust** | cargo-fuzz, cargo-deny, cargo-audit, Kani |
 
 > [!NOTE]
 > For comprehensive security documentation, see [SECURITY.md](SECURITY.md).
@@ -518,21 +517,6 @@ S101: Use of `assert` detected
 |:--------|:---------|
 | In tests | Allowed (Ruff config excludes `tests/` from S101) |
 | In source | Use `if not condition: raise` instead |
-
-### cargo-vet Exemptions
-
-```
-error: Package foo@1.0.0 is not audited
-```
-
-**Fix**: Add exemption to `rust/supply-chain/config.toml`:
-
-```toml
-[[exemptions.foo]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-notes = "Used only in tests"
-```
 
 ---
 

@@ -293,6 +293,25 @@ dev = [
 fuzz = [
     { name = "atheris" },
 ]
+test = [
+    { name = "faker" },
+    { name = "fakeredis" },
+    { name = "httpx" },
+    { name = "hypothesis" },
+    { name = "psutil" },
+    { name = "pymemcache" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-benchmark" },
+    { name = "pytest-cov" },
+    { name = "pytest-markdown-docs" },
+    { name = "pytest-redis" },
+    { name = "pytest-xdist" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "time-machine" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -344,6 +363,25 @@ dev = [
     { name = "time-machine", specifier = ">=2.19.0" },
 ]
 fuzz = [{ name = "atheris", specifier = ">=2.3.0" }]
+test = [
+    { name = "faker", specifier = ">=20.0.0" },
+    { name = "fakeredis", specifier = ">=2.21.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "hypothesis", specifier = ">=6.0.0" },
+    { name = "psutil", specifier = ">=5.9.0" },
+    { name = "pymemcache", specifier = ">=4.0.0" },
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.21.0" },
+    { name = "pytest-benchmark", specifier = ">=4.0.0" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "pytest-markdown-docs", specifier = ">=0.6.0" },
+    { name = "pytest-redis", specifier = ">=3.0.0" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "requests", marker = "python_full_version >= '3.10'", specifier = ">=2.33.0" },
+    { name = "time-machine", specifier = ">=2.19.0" },
+]
 
 [[package]]
 name = "cachetools"

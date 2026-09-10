@@ -11,6 +11,7 @@ This module provides:
 """
 
 import os
+import sys
 
 import pytest
 
@@ -31,6 +32,34 @@ try:
     PYTEST_REDIS_AVAILABLE = True
 except ImportError:
     pass
+
+
+# =============================================================================
+# Free-threaded build guard (LAB-511)
+# =============================================================================
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _gil_stays_disabled_on_free_threaded_builds():
+    """On a free-threaded build, fail the session if anything re-enabled the GIL.
+
+    Any C extension without a Py_mod_gil declaration (a conftest import, a
+    plugin, a future dependency bump) re-enables the GIL for the whole
+    process at import time — silently turning the free-threaded CI lane back
+    into a GIL run while it keeps reporting green. Checked at teardown so
+    every lazily-imported module is covered, and autouse at session scope so
+    it runs in EVERY pytest-xdist worker process and in every suite. No-op
+    on GIL builds.
+    """
+    yield
+    import sysconfig
+
+    if sysconfig.get_config_var("Py_GIL_DISABLED") and sys._is_gil_enabled():  # type: ignore[attr-defined]
+        pytest.fail(
+            "The GIL was re-enabled during a free-threaded test session — "
+            "some imported extension module does not declare free-threaded "
+            "support (Py_mod_gil). This worker silently ran under the GIL."
+        )
 
 
 # =============================================================================

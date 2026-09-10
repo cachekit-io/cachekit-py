@@ -200,8 +200,12 @@ exclude_lines = [
 ]
 
 [dependency-groups]
-dev = [
-    # Testing
+# Core test toolchain — everything tests/unit + tests/critical need on ANY
+# interpreter, including free-threaded CPython: the free-threaded CI lane
+# installs ONLY this group (LAB-511). A dep may live here only if it ships
+# free-threaded wheels or builds cleanly from source on 3.14t; deps that
+# don't (orjson, numpy, pandas, pyarrow) stay in dev below.
+test = [
     "fakeredis>=2.21.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -210,6 +214,19 @@ dev = [
     "pytest-markdown-docs>=0.6.0",
     "pytest-redis>=3.0.0",
     "pymemcache>=4.0.0",
+    # Utilities
+    "faker>=20.0.0",
+    "httpx>=0.28.1",
+    "hypothesis>=6.0.0",
+    "requests>=2.33.0; python_version >= '3.10'",
+    "psutil>=5.9.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.3",
+    "pytest-xdist>=3.8.0",
+    "time-machine>=2.19.0",
+]
+dev = [
+    { include-group = "test" },
     # Competitive comparison suite (tests/competitive/ benchmarks cachekit vs these)
     "cachetools>=5.3.0",
     "aiocache>=0.12.0",
@@ -218,14 +235,7 @@ dev = [
     "ruff>=0.6.0",
     # Utilities
     "bashlex>=0.18",
-    "faker>=20.0.0",
-    "httpx>=0.28.1",
-    "hypothesis>=6.0.0",
     "pip-audit>=2.7.0",
-    "requests>=2.33.0; python_version >= '3.10'",
-    "psutil>=5.9.0",
-    "python-dotenv>=1.0.0",
-    "pyyaml>=6.0.3",
     # Data science support (for testing AutoSerializer with numpy/pandas)
     "numpy>=2.0.2",
     "pandas>=1.3.0",
@@ -233,8 +243,6 @@ dev = [
     # OrjsonSerializer support — now the [json] optional extra; kept here so the
     # orjson tests, doctests, and markdown-docs still resolve it in dev/CI.
     "orjson>=3.9.0",
-    "pytest-xdist>=3.8.0",
-    "time-machine>=2.19.0",
 ]
 # Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
 fuzz = [
