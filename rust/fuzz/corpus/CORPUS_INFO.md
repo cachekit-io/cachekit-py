@@ -1,94 +1,64 @@
-# Fuzzing Corpus Information
+# Fuzzing Corpus
 
-## Overview
+Committed seed inputs for the fuzz targets in this crate.
 
-This directory contains the initial fuzzing corpus for cachekit's Rust security layer.
+## Layout: one directory per target
 
-**Generated**: 2025-11-07
-**Total Size**: 6.9MB (under 10MB target)
-**Total Files**: 1,758 samples
-
-## Corpus Organization
-
-### ByteStorage Corpus (`byte_storage/`)
-- **valid_envelopes/** (3 files, 12K): Valid MessagePack envelopes for baseline testing
-- **corrupted_envelopes/** (4 files, 16K): Malformed MessagePack structures
-- **size_edge_cases/** (8 files, 28K): Size boundary testing (0 bytes, 1 byte, u32::MAX, suspicious ratios)
-- **format_strings/** (5 files, 28K): Format identifier injection patterns
-
-**Edge Cases Added**:
-- Empty file (0 bytes)
-- Single byte file
-- 100 null bytes
-- u32::MAX representation
-
-### Encryption Corpus (`encryption/`)
-- **key_material/** (3 files, 12K): Master key samples
-- **tenant_ids/** (10 files, 48K): Tenant identifier patterns (normal, malicious, Unicode)
-- **aad_patterns/** (5 files, 24K): Additional authenticated data samples
-- **ciphertext_samples/** (4 files, 12K): Valid and corrupted ciphertext
-
-**Edge Cases Added**:
-- Unicode mixed (Korean + Japanese)
-- Emoji
-- RTL override character (U+202E)
-- Embedded null bytes
-
-### Integration Corpus (`integration/`)
-- **layered_data/** (2 files, 8K): Combined compression + encryption samples
-
-## Corpus Generation
-
-Corpus was generated from:
-1. **Automated extraction** (`scripts/generate_corpus.sh`):
-   - Production test fixtures from `tests/critical/`
-   - Synthetic edge cases (size boundaries, format injection)
-   - Encryption patterns (tenant IDs, AAD, ciphertext)
-
-2. **Manual additions**:
-   - Empty files
-   - Unicode edge cases
-   - Null byte patterns
-   - Platform-specific edge cases
-
-## Validation
-
-Validated with `scripts/validate_corpus.sh`:
-- Total size under 10MB target
-- Sufficient sample diversity (1,758 files)
-- Proper directory organization
-- 3 empty files (intentional edge cases)
-
-## Usage
-
-### Quick Fuzzing (60s per target)
-```bash
-make fuzz-quick
+```text
+corpus/<target-name>/
 ```
 
-### Deep Fuzzing (8hr per target)
-```bash
-make fuzz-deep
-```
+`<target-name>` is the `[[bin]]` name in `Cargo.toml`, because that is the
+directory `cargo fuzz run <target>` loads (and grows) by default — no corpus
+argument needed, locally or in CI. Any other layout is invisible to the
+fuzzer: an earlier category tree (`byte_storage/`, `encryption/`, …) sat here
+for months without a single target ever reading it (LAB-1149).
 
-### Corpus Maintenance
-```bash
-# Minimize corpus (remove redundancy)
-./scripts/minimize_corpus.sh
+No file counts or sizes are recorded here — a written-down count is stale the
+day someone adds a seed. For live numbers run, from the repository root (the
+scripts resolve their paths relative to `rust/fuzz/`, one level up from this
+file):
 
-# Re-validate after changes
+```bash
+cd rust/fuzz
 ./scripts/validate_corpus.sh
 ```
 
-## Maintenance Notes
+It fails if any `[[bin]]` target lacks seeds or the corpus exceeds the 10MB
+CI budget.
 
-- **Corpus growth**: Fuzzing will discover new inputs and add them to corpus automatically
-- **Minimization**: Run `minimize_corpus.sh` periodically to deduplicate and reduce size
-- **Edge cases**: Add new attack patterns to appropriate subdirectories
-- **Size limit**: Keep total corpus under 10MB for CI efficiency
+## Where seeds come from
 
-## References
+- **Generated**: `scripts/generate_corpus.sh` writes a deterministic seed set
+  per target, shaped to each target's input format (e.g. `32-byte key ++
+  plaintext` for encryption targets). Valid `StorageEnvelope` seeds are
+  byte-exact against cachekit-core's wire format — raw LZ4 block, xxHash3-64
+  big-endian checksum, rmp-serde array-form MessagePack — so they reach
+  `extract()`'s post-decompression branches that random inputs essentially
+  never hit (a matching 64-bit checksum is a 2^-64 event).
+- **Grown**: local fuzz runs write hash-named discoveries into these
+  directories. Commit keepers after `scripts/minimize_corpus.sh`, or discard.
+- **Regressions**: when a crash is found and fixed, commit the minimized
+  reproducer into the crashing target's directory so the input is re-tested
+  on every future run.
 
-- Design document: `.spec-workflow/specs/rust-fuzzing-enhancement/design.md`
-- Fuzzing guide: `rust/fuzz/README.md`
-- Task specification: `.spec-workflow/specs/rust-fuzzing-enhancement/tasks.md`
+## Maintenance
+
+All three below run from the repository root — the `cd rust/fuzz` is part of
+the recipe, since the scripts resolve their paths relative to `rust/fuzz/`:
+
+```bash
+cd rust/fuzz
+
+# Regenerate the deterministic seed set. Byte-identical under the dependency
+# versions pinned at the top of the script; see its header for the caveat.
+./scripts/generate_corpus.sh
+
+# Deduplicate / shrink after growth runs (needs a nightly toolchain)
+./scripts/minimize_corpus.sh
+
+# Check layout and size budget
+./scripts/validate_corpus.sh
+```
+
+Keep the total under 10MB so CI seed loading stays cheap.

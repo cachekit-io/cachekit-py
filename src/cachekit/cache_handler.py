@@ -236,19 +236,41 @@ def supports_streaming_write(backend: BaseBackend) -> TypeGuard[BufferWritableBa
 class SWRCapableBackend(Protocol):
     """Backend with server-signaled stale-while-revalidate reads (LAB-381).
 
-    Reads report whether the entry is in its stale-grace window; writes accept
-    the window length. Currently only CachekitIOBackend (the SaaS signals
-    freshness on read — see protocol spec/saas-api.md#stale-while-revalidate).
+    Reads report whether the entry is in its stale-grace window plus the
+    server's remaining freshness in seconds (LAB-557; None from a pre-signal
+    server); writes accept the window length. Currently only CachekitIOBackend
+    (the SaaS signals freshness on read — see protocol
+    spec/saas-api.md#stale-while-revalidate and #remaining-freshness).
     """
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]: ...
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]: ...
 
     def set(self, key: str, value: bytes, ttl: Optional[int] = None, stale_ttl: Optional[int] = None) -> None: ...
 
 
 def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
-    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381)."""
-    return hasattr(backend, "get_with_freshness")
+    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381).
+
+    Checked on the backend's CLASS, not the instance: protocol methods live on
+    classes, while instance-level hasattr reads dynamic-attribute objects
+    (unittest.mock.Mock, __getattr__ proxies) as SWR-capable and silently
+    reroutes their reads through the freshness path — reachable without any SWR
+    config since the LAB-557 gate widening (the freshness read now runs for
+    every capable backend, not only when stale_ttl is set).
+    """
+    return callable(getattr(type(backend), "get_with_freshness", None))
+
+
+def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
+    """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
+
+    Third-party SWR backends (0.5.x) and custom CacheHandlerStrategy implementations
+    (0.18.0) built against the 2-tuple signature still return it; None passes through.
+    """
+    if hit is None:
+        return None
+    value, is_stale, *rest = hit
+    return (value, is_stale, rest[0] if rest else None)
 
 
 # Import caching for serializer modules
@@ -1378,10 +1400,13 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
-    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool]]:
-        """SWR variant of :meth:`get_cached_value` (LAB-381): also reports staleness.
+    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool, Optional[int]]]:
+        """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
+        staleness and the server's remaining freshness in seconds.
 
-        Returns ``((True, value), is_stale)`` on a hit, None on miss/error. The mmap
+        Returns ``((True, value), is_stale, fresh_for)`` on a hit, None on
+        miss/error. fresh_for is None when no signal exists (pre-signal server,
+        non-SWR backend) — the caller applies legacy L1 TTL behavior. The mmap
         fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
         Error semantics mirror get_cached_value: the LAB-108 policy point raises
         DecryptionAuthenticationError when fail-closed (poisoned entry retained as
@@ -1391,13 +1416,17 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness")
 
-            hit = self._cache_handler.get_with_freshness(cache_key)
+            # Normalised here too: a custom CacheHandlerStrategy built against the
+            # v0.18.0 2-tuple signature must degrade to fresh_for=None, not have a
+            # strict 3-unpack ValueError swallowed below into a permanent
+            # every-hit-is-a-miss cache bypass (expert-panel finding, LAB-557).
+            hit = _normalize_freshness_hit(self._cache_handler.get_with_freshness(cache_key))
             if hit is None:
                 return None
-            cached_data, is_stale = hit
+            cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized), is_stale)
+            return ((True, deserialized), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1415,25 +1444,30 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
             return None
 
-    async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
-        """Async SWR variant (LAB-381): staleness + the raw envelope for L1 backfill.
+    async def get_cached_value_with_freshness_async(
+        self, cache_key: str
+    ) -> Optional[tuple[tuple[bool, Any, bytes], bool, Optional[int]]]:
+        """Async SWR variant (LAB-381/LAB-557): staleness + remaining freshness +
+        the raw envelope for L1 backfill.
 
-        Returns ``((True, value, raw_bytes), is_stale)`` on a hit — the 3-tuple
-        matches :meth:`get_cached_value_async` (LAB-111 routing) so the async
-        decorator backfills L1 without re-serializing. None on miss/error; the
-        LAB-108 fail-closed policy propagates DecryptionAuthenticationError.
+        Returns ``((True, value, raw_bytes), is_stale, fresh_for)`` on a hit —
+        the inner 3-tuple matches :meth:`get_cached_value_async` (LAB-111
+        routing) so the async decorator backfills L1 without re-serializing;
+        fresh_for (seconds, None = no signal) bounds that backfill to the
+        server's remaining freshness. None on miss/error; the LAB-108
+        fail-closed policy propagates DecryptionAuthenticationError.
         """
         try:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness_async")
 
-            hit = await self._cache_handler.get_with_freshness_async(cache_key)
+            hit = _normalize_freshness_hit(await self._cache_handler.get_with_freshness_async(cache_key))
             if hit is None:
                 return None
-            cached_data, is_stale = hit
+            cached_data, is_stale, fresh_for = hit  # same 2-tuple contract as the sync variant above
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized, cached_data), is_stale)
+            return ((True, deserialized, cached_data), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1786,11 +1820,13 @@ class CacheHandlerStrategy(Protocol):
         """Delete key from cache asynchronously."""
         ...
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
-        """Get value plus SWR staleness (LAB-381); (bytes, is_stale) or None."""
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
+        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557);
+        (bytes, is_stale, fresh_for) or None. fresh_for is None from a pre-signal
+        server or a non-SWR backend."""
         ...
 
-    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
         """Async variant of get_with_freshness."""
         ...
 
@@ -1957,18 +1993,19 @@ class StandardCacheHandler:
             get_logger().error(f"Unexpected error mmapping key {redact_cache_key(key)}: {e}")
             return None
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
-        """Get value plus SWR staleness from an SWR-capable backend (LAB-381).
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
+        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557).
 
-        Returns ``(bytes, is_stale)`` on a hit, or None on miss/error (same
-        degradation contract as :meth:`get` — an error reads as a miss and the
-        caller takes the synchronous recompute path).
+        Returns ``(bytes, is_stale, fresh_for)`` on a hit, or None on miss/error
+        (same degradation contract as :meth:`get` — an error reads as a miss and
+        the caller takes the synchronous recompute path). Non-SWR backends read
+        as ``(bytes, False, None)`` — no freshness signal, legacy L1 behavior.
         """
         if not supports_swr(self.backend):
             value = self.get(key)
-            return (value, False) if value is not None else None
+            return (value, False, None) if value is not None else None
         try:
-            return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(self._with_backpressure_and_timeout(self.backend.get_with_freshness, key))
         except BackendError as e:
             get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None
@@ -1976,13 +2013,15 @@ class StandardCacheHandler:
             get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
             return None
 
-    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
         """Async variant of :meth:`get_with_freshness` (sync backend call in the thread pool)."""
         if not supports_swr(self.backend):
             value = await self.get_async(key)
-            return (value, False) if value is not None else None
+            return (value, False, None) if value is not None else None
         try:
-            return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(
+                await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            )
         except BackendError as e:
             get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
             return None

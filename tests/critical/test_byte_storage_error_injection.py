@@ -375,3 +375,177 @@ class TestByteStorageErrorInjection(RedisIsolationMixin):
 
         error_msg = str(exc_info.value).lower()
         assert "exceeds maximum size" in error_msg or "too large" in error_msg
+
+
+class TestByteStorageBufferProtocol:
+    """retrieve() accepts the buffer protocol (LAB-770) — no bytes() coercion needed.
+
+    The zero-copy read path hands retrieve() a memoryview (SerializationWrapper.unwrap
+    slices one past the frame header); the PyO3 boundary must take it directly, plus
+    fall back to a copy for writable or non-contiguous exporters.
+    """
+
+    def test_retrieve_accepts_readonly_memoryview(self):
+        """Zero-copy path: memoryview over bytes round-trips identically to bytes."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"buffer-protocol-roundtrip" * 1000
+        envelope = storage.store(payload, None)
+
+        data, fmt = storage.retrieve(memoryview(envelope))
+        assert data == payload
+        assert fmt == "msgpack"
+
+    def test_retrieve_accepts_offset_memoryview(self):
+        """The exact shape unwrap produces: a view sliced past a frame prefix."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"offset-view" * 500
+        envelope = storage.store(payload, None)
+
+        framed = b"JUNKHDR" + envelope
+        data, _ = storage.retrieve(memoryview(framed)[7:])
+        assert data == payload
+
+    def test_retrieve_accepts_writable_buffer(self):
+        """Copy-fallback path: bytearray (writable exporter) still round-trips."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"writable-exporter" * 500
+        envelope = storage.store(payload, None)
+
+        data, _ = storage.retrieve(bytearray(envelope))
+        assert data == payload
+        data, _ = storage.retrieve(memoryview(bytearray(envelope)))
+        assert data == payload
+
+    def test_retrieve_readonly_view_over_mutable_exporter_round_trips(self):
+        """A readonly VIEW whose backing storage is still mutable must not be borrowed
+        across the GIL release (data race). It takes the copy path — readonly() alone
+        is not the zero-copy gate; the exporter must be immutable bytes.
+
+        Round-trip equality is all this one can assert: the bytearray base fails the
+        `.obj`-is-`bytes` cast before borrowable_offset is consulted, so a weakened
+        range check would not show up here. The spoof test below is what pins that.
+        """
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"readonly-view-mutable-backing" * 500
+        envelope = storage.store(payload, None)
+
+        ro_view = memoryview(bytearray(envelope)).toreadonly()
+        assert ro_view.readonly
+        data, _ = storage.retrieve(ro_view)
+        assert data == payload
+
+    def test_retrieve_spoofed_obj_attribute_round_trips(self):
+        """A PEP 688 exporter with a decoy bytes `.obj` attribute must not trick the
+        zero-copy gate: the containment proof sees its memory is NOT inside the decoy
+        bytes and takes the copy path. Round-trip stays correct.
+
+        This test IS load-bearing for that proof. Because the borrow is a plain slice
+        of the base `bytes`, dropping the range check does not silently misread here:
+        the offset lands outside the decoy and the slice bounds check aborts (verified
+        by deleting the check and re-running — the old raw-pointer borrow passed green
+        under the same sabotage, reading out of bounds). The strided test below pins
+        is_c_contiguous() the same way.
+        """
+        import sys
+
+        if sys.version_info < (3, 12):
+            pytest.skip("__buffer__ protocol requires Python 3.12+")
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"spoofed-exporter" * 500
+        envelope = storage.store(payload, None)
+
+        class Spoof:
+            obj = b"decoy-bytes-not-the-buffer"
+
+            def __init__(self, backing: bytearray) -> None:
+                self.backing = backing
+
+            def __buffer__(self, flags: int) -> memoryview:
+                return memoryview(self.backing).toreadonly()
+
+        data, _ = storage.retrieve(Spoof(bytearray(envelope)))
+        assert data == payload
+
+    def test_retrieve_accepts_non_contiguous_view(self):
+        """Copy-fallback path: a strided view is copied, not misread."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = b"strided-view" * 500
+        envelope = storage.store(payload, None)
+
+        interleaved = bytes(b for byte in envelope for b in (byte, 0xFF))
+        data, _ = storage.retrieve(memoryview(interleaved)[::2])
+        assert data == payload
+
+    def test_retrieve_rejects_corrupt_memoryview(self):
+        """Error semantics are unchanged for buffer-protocol inputs."""
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        with pytest.raises(ValueError):
+            storage.retrieve(memoryview(b"not an envelope"))
+
+    def test_retrieve_memoryview_adds_no_python_copy(self):
+        """No PYTHON-side full-envelope copy on the memoryview path (LAB-770).
+
+        tracemalloc sees only Python-heap allocations: retrieve's output bytes (~1x
+        payload for incompressible input). A bytes(data)-style coercion creeping back
+        in front of retrieve adds another ~1x and fails here. Known blind spot: a
+        Rust-side copy (to_vec) is invisible to tracemalloc (measured: borrow and
+        copy paths both read 1.00x), so the borrow itself is pinned by review of
+        retrieve() in rust/src/python_bindings.rs, not by this suite.
+        """
+        import gc
+        import os
+        import tracemalloc
+
+        from cachekit._rust_serializer import ByteStorage
+
+        storage = ByteStorage("msgpack")
+        payload = os.urandom(8 * 1024 * 1024)  # incompressible: envelope ~= payload
+        envelope = storage.store(payload, None)
+        view = memoryview(envelope)
+
+        gc.collect()
+        tracemalloc.start()
+        data, _ = storage.retrieve(view)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+
+        assert data == payload
+        assert peak / len(payload) < 1.5, (
+            f"retrieve(memoryview) peak {peak / len(payload):.2f}x payload — the zero-copy borrow "
+            f"regressed to a full envelope copy (expected ~1x: just the output bytes)"
+        )
+
+    def test_standard_serializer_deserialize_memoryview(self):
+        """End-to-end: deserialize() takes unwrap's memoryview without re-coercing."""
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        serializer = StandardSerializer()
+        obj = {"key": [1, 2, 3], "blob": b"x" * 4096}
+        data, _ = serializer.serialize(obj)
+
+        assert serializer.deserialize(memoryview(data)) == obj
+
+    def test_standard_serializer_deserialize_non_u8_buffer_raises_serialization_error(self):
+        """A non-u8 exporter (rejected as BufferError at the PyO3 boundary) keeps the
+        documented SerializationError contract — pre-LAB-770 bytes() coerced these to
+        raw bytes and envelope validation rejected them as ValueError."""
+        np = pytest.importorskip("numpy")
+        from cachekit.serializers.base import SerializationError
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        with pytest.raises(SerializationError):
+            StandardSerializer().deserialize(np.zeros(4))

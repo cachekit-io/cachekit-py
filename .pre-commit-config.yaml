@@ -77,8 +77,13 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # v6.0.0  # pragma: allowlist secret
     hooks:
+      # Fuzz corpus seeds are opaque byte strings, not text — "fixing" their
+      # whitespace or final newline silently changes the seed (and breaks
+      # byte-exact StorageEnvelope seeds whose checksum must verify).
       - id: trailing-whitespace
+        exclude: ^rust/fuzz/corpus/
       - id: end-of-file-fixer
+        exclude: ^rust/fuzz/corpus/
       - id: check-yaml
       - id: check-added-large-files
         args: [--maxkb=1000]
