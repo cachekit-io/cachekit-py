@@ -76,6 +76,22 @@ def _read_fully(fd: int, n: int) -> bytes:
     return b"".join(chunks)
 
 
+def _write_fully(fd: int, data: bytes) -> None:
+    """Write all of ``data`` to ``fd``, looping over short writes; the write twin of ``_read_fully``.
+
+    A single write(2) may store fewer bytes than asked (POSIX permits it; Linux caps one call at
+    ~2 GiB) and ``os.write`` only reports the count, so a lone call can silently truncate a large
+    value that is then fsync'd and renamed into place as a "successful" set (see the
+    truncated-payload branch in ``get`` for what that costs). Raises EIO on zero progress.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError(errno.EIO, f"write made no progress with {view.nbytes} bytes remaining")
+        view = view[written:]
+
+
 class _MmapHandle:
     """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
     header). Zero-copy: the view aliases mapped pages, never a heap copy.
@@ -223,11 +239,24 @@ class FileBackend:
                             self._safe_unlink(file_path)
                             return None
 
-                        # Read payload directly — exactly the bytes after the header
-                        return _read_fully(fd, st_size - HEADER_SIZE)
+                        # Read payload directly — exactly the bytes after the header.
+                        payload_size = st_size - HEADER_SIZE
+                        payload = _read_fully(fd, payload_size)
+                        if len(payload) < payload_size:
+                            # The file shrank between fstat and read: truncated underneath us.
+                            # Treat it as corruption like the header branches above (unlink,
+                            # miss) instead of handing a short payload to the envelope, whose
+                            # AES-GCM check would classify it as tampering and, under
+                            # encryption_fail_closed, retain the entry as evidence forever.
+                            os.close(fd)
+                            fd_closed = True
+                            self._safe_unlink(file_path)
+                            return None
+                        return payload
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -379,7 +408,7 @@ class FileBackend:
 
                     try:
                         # Write all data
-                        os.write(fd, file_data)
+                        _write_fully(fd, file_data)
 
                         # fsync to ensure data is on disk
                         os.fsync(fd)
@@ -594,7 +623,8 @@ class FileBackend:
                         return True
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -709,7 +739,8 @@ class FileBackend:
                             return None
                         return int(remaining)  # whole-second granularity, matching Redis TTL
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -768,11 +799,12 @@ class FileBackend:
                         # power loss yields a wrong expiry, never a corrupt payload (magic/version
                         # are untouched), so the entry just expires early/late. No rewrite-rename.
                         os.lseek(fd, 6, os.SEEK_SET)
-                        os.write(fd, struct.pack(">Q", new_expiry))
+                        _write_fully(fd, struct.pack(">Q", new_expiry))
                         os.fsync(fd)
                         return True
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)

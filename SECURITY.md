@@ -11,7 +11,7 @@
 - [Architecture Overview](#architecture-overview)
 - [Python SDK Security Features](#python-sdk-security-features)
 - [FFI Boundary Security](#ffi-boundary-security)
-- [Supply Chain Security](#supply-chain-security)
+- [Dependency Security](#dependency-security)
 - [CI/CD Security](#cicd-security)
 - [Known Limitations](#known-limitations)
 - [Security Roadmap](#security-roadmap)
@@ -191,6 +191,14 @@ See [SSRF Protection](docs/features/ssrf-protection.md) for full details, includ
 
 The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Lock-Id` request header when releasing a lock (`DELETE /v1/cache/{key}/lock`), **never** in the URL query string. Query strings are routinely captured by access logs, proxy/CDN logs, and OpenTelemetry `http.url` spans ([CWE-532][cwe-532]); a leaked token could be replayed to release a lock within its short TTL. The CacheKit SaaS backend dual-reads the header and the legacy `?lock_id=` query during migration, preferring the header (removed in protocol 2.0).
 
+### Cache-Key Path Encoding (CWE-22)
+
+Custom `@cache(key=...)` values are percent-encoded before they reach the CachekitIO request path, so a key can only ever address `/v1/cache/{key}` and never a different `api.cachekit.io` endpoint. Without encoding, `?`/`#` would be split into a query/fragment and a `/`-bearing key would introduce extra path segments, both escaping the cache namespace with the application's bearer token; httpx normalizes these client-side *before the request leaves the process* ([CWE-22][cwe-22]), so the SaaS-side key validator never sees them. `quote(key, safe="")` encodes every reserved character (`/` → `%2F`, `?` → `%3F`, `#` → `%23`, `%` → `%25`), collapsing the whole key into one inert path segment.
+
+RFC-3986 marks `.` as *unreserved*, so `quote` (like cachekit-ts `encodeURIComponent` and cachekit-rs `urlencoding::encode`) leaves it raw — but a key of exactly `.` or `..` is still a live dot-segment that httpx collapses: `..` → `GET /v1`, and on the sub-resource routes `../ttl` → `GET /v1/ttl`, `../lock` → `GET /v1/lock`, reaching a *different* route with the bearer token. The encoder special-cases an all-dot segment (`..` → `%2E%2E`) so it can no longer collapse; only a segment that is *entirely* dots is affected (`a:..` is untouched), so canonical keys are unchanged.
+
+Encode-once matches the SaaS validator's single decode, so a canonical key round-trips byte-for-byte. Python's `quote(key, safe="")` is byte-identical to cachekit-rs `urlencoding::encode`, and resolves to the same server-side key as cachekit-ts `encodeURIComponent` after that single decode, so cross-SDK cache lookups still coincide.
+
 ---
 
 ## FFI Boundary Security
@@ -220,14 +228,14 @@ The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Loc
 
 ---
 
-## Supply Chain Security
+## Dependency Security
 
 ### Rust Dependencies
 
 | Tool | Purpose | Config |
 |:-----|:--------|:-------|
-| **cargo-deny** | License + vulnerability scanning | `rust/deny.toml` |
-| **cargo-vet** | Supply chain auditing | `rust/supply-chain/config.toml` |
+| **cargo-deny** | License + vulnerability scanning | `deny.toml` |
+| **cargo-audit** | CVE scanning against RustSec Advisory Database | `.github/workflows/security-fast.yml` (inline ignore list) |
 
 <details>
 <summary><strong>📋 Policy Details</strong></summary>
@@ -238,12 +246,10 @@ The distributed-lock capability token (`lock_id`) is sent in the `X-CacheKit-Loc
 
 **Vulnerability scanning**: [RustSec Advisory Database][rustsec]
 
-**Audit status**: In progress (Q1 2026 target for full coverage)
-
 </details>
 
 > [!NOTE]
-> Core dependencies (ring, lz4_flex, blake3) are audited in cachekit-core. See [cachekit-core supply chain docs][core-supply-chain].
+> Core dependencies (`ring` / `aes-gcm` for AES-256-GCM, `lz4_flex`, `xxhash-rust`, `rmp-serde`, `hkdf`, `sha2`) are audited in cachekit-core. See [cachekit-core dependency docs][core-deps]. `blake3` is not a cachekit-core dependency: it is a cachekit-py (Python) dependency used for cache-key hashing in `src/cachekit/hash_utils.py`, audited in this repo's own Python dependencies below.
 
 ### Python Dependencies
 
@@ -357,7 +363,6 @@ Security patches are backported to the latest supported version.
 
 | Quarter | Milestone |
 |:--------|:----------|
-| Q1 2026 | Complete cargo-vet audits for all dependencies |
 | Q2 2026 | Add Hypothesis fuzzing for Python layer |
 | Q3 2026 | Third-party security audit (SDK + FFI boundary) |
 | Q4 2026 | SLSA Level 3 compliance |
@@ -394,8 +399,9 @@ We appreciate responsible disclosure from the security community. Security resea
 [gh-repo]: https://github.com/cachekit-io/cachekit-py
 [core-repo]: https://github.com/cachekit-io/cachekit-core
 [core-security]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md
-[core-supply-chain]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#supply-chain-security
+[core-deps]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#dependencies
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
 [cwe-532]: https://cwe.mitre.org/data/definitions/532.html
+[cwe-22]: https://cwe.mitre.org/data/definitions/22.html

@@ -13,13 +13,24 @@ Note: Blake3 is still used in hash_utils.py for cache keys (security-relevant).
 
 from __future__ import annotations
 
-import pandas as pd
+import importlib.util
+
 import pytest
 
-from cachekit.serializers import ArrowSerializer, OrjsonSerializer
 from cachekit.serializers.base import SerializationError
 
+_HAS_ORJSON = importlib.util.find_spec("orjson") is not None
+_HAS_ARROW = all(importlib.util.find_spec(package) is not None for package in ("pandas", "pyarrow"))
 
+if _HAS_ORJSON:
+    from cachekit.serializers import OrjsonSerializer
+if _HAS_ARROW:
+    import pandas as pd
+
+    from cachekit.serializers import ArrowSerializer
+
+
+@pytest.mark.skipif(not _HAS_ORJSON, reason="requires the [json] extra")
 class TestOrjsonSerializerXxhashIntegrity:
     """Test xxHash3-64 integrity checking for OrjsonSerializer."""
 
@@ -114,6 +125,7 @@ class TestOrjsonSerializerXxhashIntegrity:
         assert "Checksum validation failed" in str(exc_info.value)
 
 
+@pytest.mark.skipif(not _HAS_ARROW, reason="requires the [data] extra")
 class TestArrowSerializerXxhashIntegrity:
     """Test xxHash3-64 integrity checking for ArrowSerializer."""
 
@@ -204,6 +216,7 @@ class TestArrowSerializerXxhashIntegrity:
 class TestXxhashPerformanceCharacteristics:
     """Test that xxHash3-64 overhead is minimal and consistent."""
 
+    @pytest.mark.skipif(not _HAS_ORJSON, reason="requires the [json] extra")
     def test_orjson_overhead_percentage(self):
         """xxHash3-64 overhead should be less than 0.1% for large payloads."""
         serializer = OrjsonSerializer()
@@ -214,6 +227,7 @@ class TestXxhashPerformanceCharacteristics:
         overhead_percentage = (8 / len(data)) * 100
         assert overhead_percentage < 0.1, f"Overhead {overhead_percentage:.4f}% exceeds 0.1%"
 
+    @pytest.mark.skipif(not _HAS_ARROW, reason="requires the [data] extra")
     def test_arrow_overhead_percentage(self):
         """xxHash3-64 overhead should be less than 0.1% for large DataFrames."""
         serializer = ArrowSerializer()

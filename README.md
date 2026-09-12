@@ -298,7 +298,7 @@ trial decryption — and old entries age out via TTL, no cache flush required. S
 
 cachekit employs comprehensive security tooling:
 
-- **Supply Chain Security**: cargo-deny for license compliance + RustSec scanning
+- **Dependency Security**: cargo-deny for license compliance + cargo-audit for RustSec scanning
 - **Formal Verification**: Kani proves correctness of compression, checksums, encryption
 - **Runtime Analysis**: Miri + sanitizers for memory safety
 - **Fuzzing**: Coverage-guided testing with >80% code coverage
@@ -358,6 +358,15 @@ exposition setup.
 <details>
 <summary><strong>Thread Safety Details</strong></summary>
 
+**Free-threaded CPython (3.14t):** the core suites run green on
+free-threaded 3.14 with the GIL verified disabled (CI job
+`test-freethreaded`), and the Rust extension declares free-threaded safety
+(`gil_used = false`). Free-threaded wheels are **not yet published** and
+free-threaded builds are not officially supported — blocked on upstream
+wheels (orjson, hiredis; numpy/pandas/pyarrow for `[data]`). See
+[measured performance results](docs/free-threading.md#measured-performance) and the
+full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
+
 **Per-Function Statistics:**
 - Statistics tracked per function identity (`module.qualname`), shared across all calls and across re-decorations of the same function
 - Thread-safe via RLock (all methods safe for concurrent access)
@@ -404,6 +413,11 @@ info = expensive_func.cache_info()
 | [Distributed Locking][distributed-locking-url] | Cache stampede prevention |
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
+| [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Process-local invalidation, stale-while-revalidate |
+| [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
+| [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
+| [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
 
 ---
 
@@ -487,6 +501,11 @@ MIT License - see [LICENSE][license-file-url] for details.
 [distributed-locking-url]: docs/features/distributed-locking.md
 [prometheus-url]: docs/features/prometheus-metrics.md
 [encryption-url]: docs/features/zero-knowledge-encryption.md
+[interop-url]: docs/features/interop-mode.md
+[l1-invalidation-url]: docs/features/l1-invalidation.md
+[reference-caching-url]: docs/features/reference-caching.md
+[rust-serialization-url]: docs/features/rust-serialization.md
+[ssrf-url]: docs/features/ssrf-protection.md
 [contributing-url]: CONTRIBUTING.md
 [license-file-url]: LICENSE
 [github-url]: https://github.com/cachekit-io/cachekit-py
