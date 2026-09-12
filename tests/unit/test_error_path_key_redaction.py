@@ -11,17 +11,27 @@ blake2b digest, never verbatim.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
 
+from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, StandardCacheHandler
+from cachekit.cache_handler import (
+    CacheInvalidator,
+    CacheOperationHandler,
+    CacheSerializationHandler,
+    StandardCacheHandler,
+    _get_cached_serializer_class,
+)
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.hash_utils import _SENTINEL_KEYS, redact_cache_key
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.logging import UltraOptimizedStructuredLogger
+from cachekit.serializers.base import SerializationError
 
 TENANT_KEY = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
 
@@ -65,6 +75,56 @@ class _FailingBackend:
         return True, {"backend_type": "failing"}
 
 
+class _RaisingCacheHandler:
+    """CacheHandlerStrategy stand-in whose async reads raise (see _operation_handler)."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def get_async(self, key: str, refresh_ttl: Optional[int] = None) -> Optional[bytes]:
+        raise self._error
+
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
+        raise self._error
+
+
+class _DictBackend:
+    """Transparent in-memory BaseBackend; ``delete_error`` makes delete raise."""
+
+    key_prefix = ""  # interop compatibility contract (ensure_interop_backend_compatible)
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+        self.delete_error: Optional[Exception] = None
+
+    def get(self, key: str) -> Optional[bytes]:
+        return self.store.get(key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        self.store[key] = bytes(value)
+
+    def delete(self, key: str) -> bool:
+        if self.delete_error is not None:
+            raise self.delete_error
+        return self.store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self.store
+
+    def health_check(self) -> tuple[bool, dict[str, Any]]:
+        return True, {"backend_type": "dict"}
+
+
+class _LockingDictBackend(_DictBackend):
+    """Adds the LockableBackend protocol so the async wrapper takes the stampede-lock branch."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self, key: str, timeout: float = 10.0, blocking_timeout: Optional[float] = None
+    ) -> AsyncIterator[bool]:
+        yield True
+
+
 class _FailingTTLBackend(_FailingBackend):
     """Adds TTL inspection so supports_ttl_inspection() passes; get_ttl raises."""
 
@@ -74,6 +134,14 @@ class _FailingTTLBackend(_FailingBackend):
 
     async def refresh_ttl(self, key: str, ttl: int) -> bool:
         raise self._error
+
+
+def _assert_error_text_redacted(caplog: pytest.LogCaptureFixture, error: Exception) -> None:
+    """The exception renders as its type name only; its free-form text (which may echo a key) never does."""
+    messages = [r.getMessage() for r in caplog.records]
+    assert str(error), "test bug: a blank message would match every record"
+    assert any(type(error).__name__ in m for m in messages), f"expected {type(error).__name__} in logs; got {messages!r}"
+    assert not any(str(error) in m for m in messages), f"exception text leaked into logs: {messages!r}"
 
 
 def _assert_redacted(caplog: pytest.LogCaptureFixture, raw_key: str) -> None:
@@ -108,11 +176,10 @@ class TestStandardCacheHandlerRedaction:
 
     @staticmethod
     def _operation_handler(error: Exception) -> CacheOperationHandler:
-        # Serialization is never reached: the L2 read raises first. The real strategy
-        # over the failing backend is what routes the exception into the L2 read sinks.
-        return CacheOperationHandler(
-            MagicMock(), CacheKeyGenerator(), cache_handler=StandardCacheHandler(backend=_FailingBackend(error))
-        )
+        # StandardCacheHandler swallows backend errors at its OWN sink and returns None, so a
+        # failing backend never reaches the CacheOperationHandler sinks these tests pin. The
+        # exception has to come from the cache handler itself.
+        return CacheOperationHandler(MagicMock(), CacheKeyGenerator(), cache_handler=_RaisingCacheHandler(error))  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     async def test_async_get_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
@@ -362,3 +429,199 @@ class TestClassifierMessagesAreKeyFree:
         err = classify_memcached_error(exc, operation="get", key=TENANT_KEY)
         assert TENANT_KEY not in str(err)
         assert redact_cache_key(TENANT_KEY) in str(err)
+
+
+class TestSerializationSinksRedaction:
+    """cache_handler.py serialization sinks: exception text renders as a type name only."""
+
+    @pytest.mark.parametrize(
+        "import_path",
+        ["cachekit.no_such_module.Nope", "cachekit.cache_handler.NoSuchClass"],
+        ids=["import_error", "attribute_error"],
+    )
+    def test_serializer_import_failure(self, import_path: str, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING), pytest.raises((ImportError, AttributeError)) as exc_info:
+            _get_cached_serializer_class("lab304-bogus", import_path)
+
+        _assert_error_text_redacted(caplog, exc_info.value)
+
+    def test_serialize_failure(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        handler = CacheSerializationHandler(serializer_name="default", encryption=False)
+        error = RuntimeError(f"serializer exploded on {TENANT_KEY}")
+        monkeypatch.setattr(handler._base_serializer, "serialize", MagicMock(side_effect=error))
+
+        with caplog.at_level(logging.ERROR), pytest.raises(SerializationError):
+            handler.serialize_data({"a": 1}, cache_key=TENANT_KEY)
+
+        _assert_error_text_redacted(caplog, error)
+
+    def test_interop_deserialize_failure_redacts_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        handler = CacheSerializationHandler(serializer_name="default", encryption=False, interop_mode=True)
+        error = RuntimeError(f"decoder exploded on {TENANT_KEY}")
+        monkeypatch.setattr(handler._base_serializer, "deserialize", MagicMock(side_effect=error))
+
+        with caplog.at_level(logging.ERROR), pytest.raises(SerializationError):
+            handler.deserialize_data(b"\x81\xa1a\x01", TENANT_KEY)
+
+        _assert_redacted(caplog, TENANT_KEY)
+        _assert_error_text_redacted(caplog, error)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_async_streaming_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        """set_streaming_async: the BackendError sink and the producer-failure sink."""
+        backend = MagicMock()
+        backend.set_streaming.side_effect = error
+        handler = StandardCacheHandler(backend=backend)
+
+        with caplog.at_level(logging.ERROR):
+            assert await handler.set_streaming_async(TENANT_KEY, lambda sink: None) is False
+
+        _assert_redacted(caplog, TENANT_KEY)
+
+
+class TestDecoratorWrapperRedaction:
+    """Direct logger calls in decorators/wrapper.py that bypass the orchestrator sink."""
+
+    @staticmethod
+    def _poison_deserialize(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+        # Class-level patch: the wrapper reaches deserialize_data through the handler instance
+        # it built at decoration time, so an instance patch has nothing to attach to.
+        monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", MagicMock(side_effect=error))
+
+    def test_sync_l1_deserialization_failure_redacts_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _DictBackend()
+
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-sync")
+        def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        assert get_user(1) == {"id": 1}  # populates L1 and L2
+        (cache_key,) = backend.store
+        error = RuntimeError(f"corrupt entry for {cache_key}")
+        self._poison_deserialize(monkeypatch, error)
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            assert get_user(1) == {"id": 1}  # L1 hit fails, L2 fails, function recomputes
+
+        _assert_redacted(caplog, cache_key)
+        _assert_error_text_redacted(caplog, error)
+
+    async def test_async_l1_deserialization_failure_redacts_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _DictBackend()
+
+        @cache(backend=backend, ttl=300, l1_enabled=True, namespace="lab304-l1-async")
+        async def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        assert await get_user(1) == {"id": 1}
+        (cache_key,) = backend.store
+        error = RuntimeError(f"corrupt entry for {cache_key}")
+        self._poison_deserialize(monkeypatch, error)
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            assert await get_user(1) == {"id": 1}
+
+        _assert_redacted(caplog, cache_key)
+        _assert_error_text_redacted(caplog, error)
+
+    async def test_async_double_check_failure_redacts_key(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Post-lock double-check read raises: logged at debug, function still recomputes."""
+        backend = _LockingDictBackend()
+        error = RuntimeError(f"double-check exploded on {TENANT_KEY}")
+        real_get = CacheOperationHandler.get_cached_value_async
+        calls: list[str] = []
+
+        async def second_call_raises(self: CacheOperationHandler, cache_key: str, *args: Any, **kwargs: Any) -> Any:
+            calls.append(cache_key)
+            if len(calls) == 2:  # 1st = pre-lock read (miss), 2nd = post-lock double-check
+                raise error
+            return await real_get(self, cache_key, *args, **kwargs)
+
+        monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", second_call_raises)
+
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab304-dc")
+        async def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            assert await get_user(1) == {"id": 1}
+
+        assert len(calls) == 2
+        _assert_redacted(caplog, calls[1])
+        _assert_error_text_redacted(caplog, error)
+
+    @staticmethod
+    def _failing_provider(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+        provider = MagicMock()
+        provider.get_backend.side_effect = error
+        monkeypatch.setattr("cachekit.decorators.wrapper.get_backend_provider", lambda: provider)
+
+    def test_sync_invalidate_provider_failure(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        @cache(ttl=300, namespace="lab304-inv-sync")
+        def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        error = RuntimeError(f"provider exploded for {TENANT_KEY}")
+        self._failing_provider(monkeypatch, error)
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            get_user.invalidate_cache(1)  # no L2 to clear; must not raise
+
+        _assert_error_text_redacted(caplog, error)
+
+    async def test_async_invalidate_provider_failure(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        @cache(ttl=300, namespace="lab304-inv-async")
+        async def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        error = RuntimeError(f"provider exploded for {TENANT_KEY}")
+        self._failing_provider(monkeypatch, error)
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            await get_user.invalidate_cache(1)
+
+        _assert_error_text_redacted(caplog, error)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    def test_sync_interop_delete_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _DictBackend()
+
+        @cache(backend=backend, l1_enabled=False, interop="get_user", namespace="users")
+        def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        get_user(1)
+        (interop_key,) = backend.store
+        backend.delete_error = error
+
+        with caplog.at_level(logging.ERROR):
+            get_user.invalidate_cache(1)
+
+        _assert_redacted(caplog, interop_key)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_async_interop_delete_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _DictBackend()
+
+        @cache(backend=backend, l1_enabled=False, interop="get_user", namespace="users")
+        async def get_user(user_id: int) -> dict[str, int]:
+            return {"id": user_id}
+
+        await get_user(1)
+        (interop_key,) = backend.store
+        backend.delete_error = error
+
+        with caplog.at_level(logging.ERROR):
+            await get_user.invalidate_cache(1)
+
+        _assert_redacted(caplog, interop_key)

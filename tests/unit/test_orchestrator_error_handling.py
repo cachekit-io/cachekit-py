@@ -367,6 +367,13 @@ class TestCacheKeyRedaction:
             if structured is not None:
                 assert self.TENANT_KEY not in str(structured)
 
+    def test_structured_log_cache_operation_without_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        """No ``key`` kwarg: nothing to redact, the ``unknown`` sentinel stands in."""
+        with caplog.at_level(logging.INFO):
+            self._orchestrator().log_cache_operation(operation="circuit_breaker_open")
+
+        assert any("Cache operation: circuit_breaker_open" in record.getMessage() for record in caplog.records)
+
     def test_backend_error_carrying_raw_key_is_sanitised(self, caplog: pytest.LogCaptureFixture) -> None:
         """BackendError text must not leak its key attribute through {error} interpolation.
 
