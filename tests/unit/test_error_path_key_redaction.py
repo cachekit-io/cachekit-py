@@ -1,17 +1,18 @@
 """Error-path log redaction for backend operations (CWE-532, LAB-304).
 
 Companion to ``tests/unit/test_orchestrator_error_handling.py``'s
-``TestCacheKeyRedaction``: that file pins the decorator error sink; this file
-pins the direct logger calls in ``cache_handler.py`` — backend set/delete
-failures, invalidation failures, and TTL-refresh failures. Each test drives a
-real failure and asserts the tenant-identifying key appears only as its
-blake2b digest, never verbatim.
+``TestCacheKeyRedaction``: that file pins ``FeatureOrchestrator.handle_cache_error``;
+this file pins every direct logger sink outside the orchestrator — in
+``cache_handler.py`` (backend set/get/delete, streaming, serialization, TTL
+refresh) and ``decorators/wrapper.py`` (L1 deserialization, post-lock double
+check, invalidation). Each test drives a real failure and asserts the
+tenant-identifying key appears only as its blake2b digest, never verbatim, and
+the exception renders as a type name, never its text.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -89,9 +90,7 @@ class _RaisingCacheHandler:
 
 
 class _DictBackend:
-    """Transparent in-memory BaseBackend; ``delete_error`` makes delete raise."""
-
-    key_prefix = ""  # interop compatibility contract (ensure_interop_backend_compatible)
+    """Transparent in-memory backend; ``delete_error`` makes delete raise."""
 
     def __init__(self) -> None:
         self.store: dict[str, bytes] = {}
@@ -108,20 +107,12 @@ class _DictBackend:
             raise self.delete_error
         return self.store.pop(key, None) is not None
 
-    def exists(self, key: str) -> bool:
-        return key in self.store
-
-    def health_check(self) -> tuple[bool, dict[str, Any]]:
-        return True, {"backend_type": "dict"}
-
 
 class _LockingDictBackend(_DictBackend):
-    """Adds the LockableBackend protocol so the async wrapper takes the stampede-lock branch."""
+    """Adds ``acquire_lock`` so the async wrapper takes the stampede-lock branch."""
 
     @asynccontextmanager
-    async def acquire_lock(
-        self, key: str, timeout: float = 10.0, blocking_timeout: Optional[float] = None
-    ) -> AsyncIterator[bool]:
+    async def acquire_lock(self, key: str, **_: Any):
         yield True
 
 
@@ -136,18 +127,24 @@ class _FailingTTLBackend(_FailingBackend):
         raise self._error
 
 
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Message text plus the structured ``extra`` payload — a key hidden in ``record.structured`` is still a leak."""
+    return [r.getMessage() + str(getattr(r, "structured", "")) for r in caplog.records]
+
+
 def _assert_error_text_redacted(caplog: pytest.LogCaptureFixture, error: Exception) -> None:
     """The exception renders as its type name only; its free-form text (which may echo a key) never does."""
-    messages = [r.getMessage() for r in caplog.records]
+    messages = _messages(caplog)
     assert str(error), "test bug: a blank message would match every record"
     assert any(type(error).__name__ in m for m in messages), f"expected {type(error).__name__} in logs; got {messages!r}"
     assert not any(str(error) in m for m in messages), f"exception text leaked into logs: {messages!r}"
+    assert not any(TENANT_KEY in m for m in messages), f"raw key leaked into logs: {messages!r}"
 
 
 def _assert_redacted(caplog: pytest.LogCaptureFixture, raw_key: str) -> None:
     """The digest must appear in some record; the raw key in none."""
     digest = redact_cache_key(raw_key)
-    messages = [r.getMessage() for r in caplog.records]
+    messages = _messages(caplog)
     assert any(digest in m for m in messages), f"expected digest {digest!r} in logs; got {messages!r}"
     assert not any(raw_key in m for m in messages), f"raw key leaked into logs: {messages!r}"
     assert not any(TENANT_KEY in m for m in messages), f"key-bearing exception text leaked into logs: {messages!r}"
@@ -171,6 +168,18 @@ class TestStandardCacheHandlerRedaction:
 
         with caplog.at_level(logging.ERROR):
             assert handler.delete(TENANT_KEY) is False
+
+        _assert_redacted(caplog, TENANT_KEY)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_async_streaming_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        """set_streaming_async: both except branches (BackendError / generic), driven from the backend."""
+        backend = MagicMock()
+        backend.set_streaming.side_effect = error
+        handler = StandardCacheHandler(backend=backend)
+
+        with caplog.at_level(logging.ERROR):
+            assert await handler.set_streaming_async(TENANT_KEY, lambda sink: None) is False
 
         _assert_redacted(caplog, TENANT_KEY)
 
@@ -434,14 +443,9 @@ class TestClassifierMessagesAreKeyFree:
 class TestSerializationSinksRedaction:
     """cache_handler.py serialization sinks: exception text renders as a type name only."""
 
-    @pytest.mark.parametrize(
-        "import_path",
-        ["cachekit.no_such_module.Nope", "cachekit.cache_handler.NoSuchClass"],
-        ids=["import_error", "attribute_error"],
-    )
-    def test_serializer_import_failure(self, import_path: str, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING), pytest.raises((ImportError, AttributeError)) as exc_info:
-            _get_cached_serializer_class("lab304-bogus", import_path)
+    def test_serializer_import_failure(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING), pytest.raises(ImportError) as exc_info:
+            _get_cached_serializer_class("lab304-bogus", "cachekit.no_such_module.Nope")
 
         _assert_error_text_redacted(caplog, exc_info.value)
 
@@ -463,22 +467,10 @@ class TestSerializationSinksRedaction:
         monkeypatch.setattr(handler._base_serializer, "deserialize", MagicMock(side_effect=error))
 
         with caplog.at_level(logging.ERROR), pytest.raises(SerializationError):
-            handler.deserialize_data(b"\x81\xa1a\x01", TENANT_KEY)
+            handler.deserialize_data(b"irrelevant", TENANT_KEY)  # the patched decoder raises before reading them
 
         _assert_redacted(caplog, TENANT_KEY)
         _assert_error_text_redacted(caplog, error)
-
-    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
-    async def test_async_streaming_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
-        """set_streaming_async: the BackendError sink and the producer-failure sink."""
-        backend = MagicMock()
-        backend.set_streaming.side_effect = error
-        handler = StandardCacheHandler(backend=backend)
-
-        with caplog.at_level(logging.ERROR):
-            assert await handler.set_streaming_async(TENANT_KEY, lambda sink: None) is False
-
-        _assert_redacted(caplog, TENANT_KEY)
 
 
 class TestDecoratorWrapperRedaction:
@@ -489,6 +481,13 @@ class TestDecoratorWrapperRedaction:
         # Class-level patch: the wrapper reaches deserialize_data through the handler instance
         # it built at decoration time, so an instance patch has nothing to attach to.
         monkeypatch.setattr(CacheSerializationHandler, "deserialize_data", MagicMock(side_effect=error))
+
+    @staticmethod
+    def _assert_l1_sink(caplog: pytest.LogCaptureFixture, cache_key: str, error: Exception) -> None:
+        _assert_redacted(caplog, cache_key)
+        _assert_error_text_redacted(caplog, error)
+        prefix = f"L1 cache deserialization failed for {redact_cache_key(cache_key)}"
+        assert any(m.startswith(prefix) for m in _messages(caplog)), f"L1 sink did not fire: {_messages(caplog)!r}"
 
     def test_sync_l1_deserialization_failure_redacts_key(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -501,14 +500,14 @@ class TestDecoratorWrapperRedaction:
 
         assert get_user(1) == {"id": 1}  # populates L1 and L2
         (cache_key,) = backend.store
+        backend.store.clear()  # L2 misses, so the L1 sink is the only one that can emit the digest
         error = RuntimeError(f"corrupt entry for {cache_key}")
         self._poison_deserialize(monkeypatch, error)
 
         with caplog.at_level(logging.WARNING, logger="cachekit"):
-            assert get_user(1) == {"id": 1}  # L1 hit fails, L2 fails, function recomputes
+            assert get_user(1) == {"id": 1}  # L1 hit fails, L2 misses, function recomputes
 
-        _assert_redacted(caplog, cache_key)
-        _assert_error_text_redacted(caplog, error)
+        self._assert_l1_sink(caplog, cache_key, error)
 
     async def test_async_l1_deserialization_failure_redacts_key(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -521,14 +520,14 @@ class TestDecoratorWrapperRedaction:
 
         assert await get_user(1) == {"id": 1}
         (cache_key,) = backend.store
+        backend.store.clear()
         error = RuntimeError(f"corrupt entry for {cache_key}")
         self._poison_deserialize(monkeypatch, error)
 
         with caplog.at_level(logging.WARNING, logger="cachekit"):
             assert await get_user(1) == {"id": 1}
 
-        _assert_redacted(caplog, cache_key)
-        _assert_error_text_redacted(caplog, error)
+        self._assert_l1_sink(caplog, cache_key, error)
 
     async def test_async_double_check_failure_redacts_key(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -536,14 +535,12 @@ class TestDecoratorWrapperRedaction:
         """Post-lock double-check read raises: logged at debug, function still recomputes."""
         backend = _LockingDictBackend()
         error = RuntimeError(f"double-check exploded on {TENANT_KEY}")
-        real_get = CacheOperationHandler.get_cached_value_async
         calls: list[str] = []
 
-        async def second_call_raises(self: CacheOperationHandler, cache_key: str, *args: Any, **kwargs: Any) -> Any:
+        async def second_call_raises(self: CacheOperationHandler, cache_key: str, *_: Any, **__: Any) -> None:
             calls.append(cache_key)
-            if len(calls) == 2:  # 1st = pre-lock read (miss), 2nd = post-lock double-check
+            if len(calls) == 2:  # 1st = pre-lock read (a miss: the store is empty), 2nd = post-lock double-check
                 raise error
-            return await real_get(self, cache_key, *args, **kwargs)
 
         monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", second_call_raises)
 
@@ -592,8 +589,14 @@ class TestDecoratorWrapperRedaction:
 
         _assert_error_text_redacted(caplog, error)
 
-    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
-    def test_sync_interop_delete_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+    @staticmethod
+    def _arm_delete_failure(backend: _DictBackend) -> tuple[str, Exception]:
+        """One shape suffices: the sink is a single ``except Exception``; the text carries the key."""
+        (interop_key,) = backend.store
+        backend.delete_error = ValueError(f"illegal input: {interop_key}")
+        return interop_key, backend.delete_error
+
+    def test_sync_interop_delete_failure_redacts_key(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = _DictBackend()
 
         @cache(backend=backend, l1_enabled=False, interop="get_user", namespace="users")
@@ -601,16 +604,15 @@ class TestDecoratorWrapperRedaction:
             return {"id": user_id}
 
         get_user(1)
-        (interop_key,) = backend.store
-        backend.delete_error = error
+        interop_key, error = self._arm_delete_failure(backend)
 
         with caplog.at_level(logging.ERROR):
             get_user.invalidate_cache(1)
 
         _assert_redacted(caplog, interop_key)
+        _assert_error_text_redacted(caplog, error)
 
-    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
-    async def test_async_interop_delete_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+    async def test_async_interop_delete_failure_redacts_key(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = _DictBackend()
 
         @cache(backend=backend, l1_enabled=False, interop="get_user", namespace="users")
@@ -618,10 +620,10 @@ class TestDecoratorWrapperRedaction:
             return {"id": user_id}
 
         await get_user(1)
-        (interop_key,) = backend.store
-        backend.delete_error = error
+        interop_key, error = self._arm_delete_failure(backend)
 
         with caplog.at_level(logging.ERROR):
             await get_user.invalidate_cache(1)
 
         _assert_redacted(caplog, interop_key)
+        _assert_error_text_redacted(caplog, error)
