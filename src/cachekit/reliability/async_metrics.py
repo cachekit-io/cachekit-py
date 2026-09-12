@@ -11,6 +11,8 @@ import time
 from collections import defaultdict
 from typing import Any, Optional, Union
 
+from cachekit.hash_utils import redact_error_for_log
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -247,7 +249,7 @@ class AsyncMetricsCollector:
                     last_flush = time.time()
 
             except Exception as e:
-                logger.error(f"Error in metrics worker: {e}")
+                logger.error(f"Error in metrics worker: {redact_error_for_log(e)}")
 
             # Force flush if too much time has passed
             if batch and (time.time() - last_flush) > self.flush_interval:
@@ -296,7 +298,7 @@ class AsyncMetricsCollector:
                     histograms[name].append((metric["value"], labels_key))
 
             except Exception as e:
-                logger.error(f"Error processing metric: {e}")
+                logger.error(f"Error processing metric: {redact_error_for_log(e)}")
             finally:
                 # Return metric data to pool for reuse
                 self._return_to_pool(metric)

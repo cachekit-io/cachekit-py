@@ -23,6 +23,7 @@ import redis
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis.error_handler import classify_redis_error
+from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +388,7 @@ class PerRequestRedisBackend:
                         await asyncio.to_thread(lock.release)
                     except Exception as e:
                         # Lock may have expired - log but don't fail
-                        logger.debug("Error releasing Redis lock (may have expired): %s", e)
+                        logger.debug("Error releasing Redis lock (may have expired): %s", redact_error_for_log(e))
         except Exception as exc:
             raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
 
@@ -498,4 +499,4 @@ class RedisBackendProvider:
             self._pool.disconnect()
         except Exception as e:
             # Best effort cleanup - log but don't raise
-            logger.debug("Error closing Redis connection pool: %s", e)
+            logger.debug("Error closing Redis connection pool: %s", redact_error_for_log(e))

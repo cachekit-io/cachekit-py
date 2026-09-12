@@ -345,3 +345,39 @@ def test_set_default_backend_with_memcached_backend(mock_store):
             assert call_count == 1  # Cache hit
         finally:
             set_default_backend(original)
+
+
+@pytest.mark.critical
+def test_oversized_value_error_never_leaks_raw_key(backend, mock_hash_client):
+    """The oversized-value message must not embed the raw key — str(e) reaches
+    log sinks verbatim (CWE-532, LAB-304); the key= digest segment carries correlation."""
+    tenant_key = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
+    big = b"\x00" * (1024 * 1024 + 1)
+
+    with pytest.raises(BackendError) as exc_info:
+        backend.set(tenant_key, big, ttl=60)
+
+    assert tenant_key not in str(exc_info.value)
+    assert "tenant-42-alice-secret" not in str(exc_info.value)
+    assert exc_info.value.key == tenant_key  # raw on the attribute for programmatic use
+
+
+@pytest.mark.critical
+def test_classified_error_never_leaks_key_from_wrapped_exception_text():
+    """pymemcache embeds the raw key in illegal-input exception text; the classified
+    BackendError message must carry only the exception type (CWE-532)."""
+    from pymemcache.exceptions import MemcacheIllegalInputError
+
+    tenant_key = "ns:tenant-42-alice-secret:" + "x" * 300
+    exc = MemcacheIllegalInputError(f"Key is too long: {tenant_key!r}")
+
+    err = classify_memcached_error(exc, operation="set", key=tenant_key)
+
+    assert err.error_type == BackendErrorType.PERMANENT
+    assert tenant_key not in str(err)
+    assert "tenant-42-alice-secret" not in str(err)
+    assert err.original_exception is exc  # full detail preserved for programmatic access
+
+    # Unknown-fallback branch: arbitrary exception text has unknown provenance
+    err = classify_memcached_error(RuntimeError(f"boom {tenant_key}"), operation="get", key=tenant_key)
+    assert "tenant-42-alice-secret" not in str(err)

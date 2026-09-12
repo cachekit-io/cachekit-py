@@ -19,6 +19,7 @@ from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.hash_utils import redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
@@ -159,7 +160,7 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     except Exception as e:
         # Session header generation failed - continue without session headers
         # This ensures backend requests never fail due to session tracking issues
-        _logger.debug(f"Session header generation failed: {e}")
+        _logger.debug(f"Session header generation failed: {redact_error_for_log(e)}")
         session_headers = {}
 
     # Build metrics headers

@@ -5,6 +5,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from cachekit._rust_serializer import ByteStorage
+from cachekit.hash_utils import redact_error_for_log
 
 from .auto_serializer import AutoSerializer
 from .base import (
@@ -179,7 +180,7 @@ def benchmark_serializers() -> dict[str, Any]:
         try:
             serializers[name] = get_serializer(name)
         except Exception as e:
-            logger.warning(f"Failed to instantiate {name} serializer: {e}")
+            logger.warning(f"Failed to instantiate {name} serializer: {redact_error_for_log(e)}")
     return serializers
 
 

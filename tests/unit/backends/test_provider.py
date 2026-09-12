@@ -25,6 +25,7 @@ from cachekit.backends.provider import (
     LoggerProvider,
     SimpleLogger,
 )
+from cachekit.hash_utils import redact_cache_key  # noqa: I001
 
 
 @pytest.mark.unit
@@ -117,7 +118,7 @@ class TestSimpleLogger:
 
         logger.cache_hit("key:123")
 
-        mock_logger.debug.assert_called_once_with("Redis cache hit for key: key:123")
+        mock_logger.debug.assert_called_once_with(f"Redis cache hit for key: {redact_cache_key('key:123')}")
 
     def test_cache_hit_custom_source(self) -> None:
         """Test cache hit logging with custom source."""
@@ -126,7 +127,7 @@ class TestSimpleLogger:
 
         logger.cache_hit("key:456", source="Memcached")
 
-        mock_logger.debug.assert_called_once_with("Memcached cache hit for key: key:456")
+        mock_logger.debug.assert_called_once_with(f"Memcached cache hit for key: {redact_cache_key('key:456')}")
 
     def test_cache_miss(self) -> None:
         """Test cache miss logging."""
@@ -135,7 +136,7 @@ class TestSimpleLogger:
 
         logger.cache_miss("key:789")
 
-        mock_logger.debug.assert_called_once_with("Cache miss for key: key:789")
+        mock_logger.debug.assert_called_once_with(f"Cache miss for key: {redact_cache_key('key:789')}")
 
     def test_cache_stored_without_ttl(self) -> None:
         """Test cache storage logging without TTL."""
@@ -144,7 +145,7 @@ class TestSimpleLogger:
 
         logger.cache_stored("key:111")
 
-        mock_logger.debug.assert_called_once_with("Cached result for key: key:111")
+        mock_logger.debug.assert_called_once_with(f"Cached result for key: {redact_cache_key('key:111')}")
 
     def test_cache_stored_with_ttl(self) -> None:
         """Test cache storage logging with TTL."""
@@ -153,7 +154,7 @@ class TestSimpleLogger:
 
         logger.cache_stored("key:222", ttl=3600)
 
-        mock_logger.debug.assert_called_once_with("Cached result for key: key:222 with TTL 3600")
+        mock_logger.debug.assert_called_once_with(f"Cached result for key: {redact_cache_key('key:222')} with TTL 3600")
 
     def test_cache_invalidated_default_source(self) -> None:
         """Test cache invalidation logging with default source."""
@@ -162,7 +163,7 @@ class TestSimpleLogger:
 
         logger.cache_invalidated("key:333")
 
-        mock_logger.debug.assert_called_once_with("Invalidated Redis cache for key: key:333")
+        mock_logger.debug.assert_called_once_with(f"Invalidated Redis cache for key: {redact_cache_key('key:333')}")
 
     def test_cache_invalidated_custom_source(self) -> None:
         """Test cache invalidation logging with custom source."""
@@ -171,7 +172,7 @@ class TestSimpleLogger:
 
         logger.cache_invalidated("key:444", source="L1")
 
-        mock_logger.debug.assert_called_once_with("Invalidated L1 cache for key: key:444")
+        mock_logger.debug.assert_called_once_with(f"Invalidated L1 cache for key: {redact_cache_key('key:444')}")
 
 
 @pytest.mark.unit

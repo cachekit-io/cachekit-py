@@ -12,6 +12,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
+from cachekit.hash_utils import redact_error_for_log
+
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
     CacheInvalidator,
@@ -73,7 +75,7 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     try:
         exc = task.exception()
         if exc is not None:
-            _logger.debug("Background TTL refresh failed for %s: %s", redact_cache_key(cache_key), exc)
+            _logger.debug("Background TTL refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
@@ -844,7 +846,7 @@ def create_cache_wrapper(
             else:
                 await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
         finally:
             _l2_swr_end(cache_key)
 
@@ -866,7 +868,7 @@ def create_cache_wrapper(
             )
             _put_l1(cache_key, serialized_data)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), exc)
+            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
         finally:
             _l2_swr_end(cache_key)
 
@@ -887,7 +889,11 @@ def create_cache_wrapper(
             call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
             _l2_swr_end(cache_key)
-            _logger.debug("SWR revalidation skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc)
+            _logger.debug(
+                "SWR revalidation skipped for %s: arguments not deep-copyable: %s",
+                redact_cache_key(cache_key),
+                redact_error_for_log(exc),
+            )
             return
         try:
             if is_async:
@@ -909,7 +915,9 @@ def create_cache_wrapper(
                 ).start()
         except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
             _l2_swr_end(cache_key)
-            _logger.debug("SWR revalidation could not be scheduled for %s: %s", redact_cache_key(cache_key), exc)
+            _logger.debug(
+                "SWR revalidation could not be scheduled for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc)
+            )
 
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
@@ -984,7 +992,9 @@ def create_cache_wrapper(
             _l1_swr_slots.release()
             _object_cache.cancel_refresh(cache_key, version)
             _logger.debug(
-                "L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s", redact_cache_key(cache_key), exc
+                "L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s",
+                redact_cache_key(cache_key),
+                redact_error_for_log(exc),
             )
             return None
 
@@ -1021,7 +1031,9 @@ def create_cache_wrapper(
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
                 _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
-                _logger.debug("L1-only SWR background refresh failed for %s: %s", redact_cache_key(cache_key), exc)
+                _logger.debug(
+                    "L1-only SWR background refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc)
+                )
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -1292,7 +1304,9 @@ def create_cache_wrapper(
                     raise
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
-                    logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                    logger().warning(
+                        f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+                    )
                     _l1_cache.invalidate(cache_key)
 
         # Continue with the rest of the sync wrapper logic...
@@ -1444,7 +1458,7 @@ def create_cache_wrapper(
                 features.handle_cache_error(
                     error=e,
                     operation="cache_set",
-                    cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                    cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
                     duration_ms=set_duration_ms,
                     serializer="rust",
@@ -1457,7 +1471,7 @@ def create_cache_wrapper(
             features.handle_cache_error(
                 error=e,
                 operation="backend_connection",
-                cache_key=cache_key,
+                cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=0.0,
                 correlation_id=correlation_id,
@@ -1648,7 +1662,9 @@ def create_cache_wrapper(
                         raise
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
-                        logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                        logger().warning(
+                            f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+                        )
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)
@@ -1731,7 +1747,7 @@ def create_cache_wrapper(
                                 task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
                         except Exception as e:
                             # TTL refresh is optional, don't fail on error
-                            _logger.debug("TTL refresh failed for %s: %s", cache_key, e)
+                            _logger.debug("TTL refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
                     elif refresh_ttl_on_get and ttl:
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
@@ -1806,11 +1822,17 @@ def create_cache_wrapper(
                                 raise
                             except Exception as e:
                                 # If double-check fails, continue to execute function
-                                _logger.debug("Double-check cache failed after lock acquisition: %s", e)
+                                _logger.debug(
+                                    "Double-check cache failed after lock acquisition for %s: %s",
+                                    redact_cache_key(cache_key),
+                                    redact_error_for_log(e),
+                                )
                         else:
                             # Lock timeout - double-check cache before giving up
                             # Another request may have populated it while we waited
-                            logger().warning(f"Failed to acquire lock for {cache_key} after {blocking_timeout}s, checking cache")
+                            logger().warning(
+                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                            )
                             try:
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
@@ -1828,7 +1850,7 @@ def create_cache_wrapper(
                             except Exception:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
-                                    f"Cache check after lock timeout failed for {cache_key}, executing without lock"
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
                                 )
 
                         # Execute the original function (with or without lock)
@@ -1874,7 +1896,7 @@ def create_cache_wrapper(
                             features.handle_cache_error(
                                 error=e,
                                 operation="cache_set",
-                                cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                                cache_key=cache_key or "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
                                 correlation_id=correlation_id,
@@ -1905,12 +1927,16 @@ def create_cache_wrapper(
                             raise e.original_exception from e
 
                     # Lock operation failed - execute without lock
-                    logger().warning(f"Lock operation failed for {cache_key}, executing without lock: {e}")
+                    logger().warning(
+                        f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
+                    )
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
             if not hasattr(_backend, "acquire_lock"):
-                logger().debug(f"Backend doesn't support locking for {cache_key}, executing without thundering herd protection")
+                logger().debug(
+                    f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
+                )
 
             try:
                 # Execute the original function
@@ -1956,7 +1982,7 @@ def create_cache_wrapper(
                     features.handle_cache_error(
                         error=e,
                         operation="cache_set",
-                        cache_key=redact_cache_key(cache_key) if cache_key else "unknown",
+                        cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
                         correlation_id=correlation_id,
@@ -1985,7 +2011,7 @@ def create_cache_wrapper(
                 _backend = get_backend_provider().get_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
-                _logger.debug("Failed to get backend for invalidation: %s", e)
+                _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
@@ -2003,7 +2029,7 @@ def create_cache_wrapper(
                     try:
                         _backend.delete(key)
                     except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         continue  # keep key tracked for retry
                 _cached_keys.discard(key)
             return
@@ -2030,7 +2056,7 @@ def create_cache_wrapper(
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
             else:
                 invalidator.invalidate_cache(func, args, kwargs, namespace)
 
@@ -2045,7 +2071,7 @@ def create_cache_wrapper(
                 _backend = get_backend_provider().get_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
-                _logger.debug("Failed to get backend for async invalidation: %s", e)
+                _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
@@ -2061,7 +2087,7 @@ def create_cache_wrapper(
                     try:
                         _backend.delete(key)
                     except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", key, e)
+                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         continue
                 _cached_keys.discard(key)
             return
@@ -2089,7 +2115,7 @@ def create_cache_wrapper(
                 try:
                     _backend.delete(cache_key)
                 except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", cache_key, e)
+                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
             else:
                 await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
 

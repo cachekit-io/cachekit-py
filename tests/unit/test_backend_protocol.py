@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from cachekit.backends.base import BackendError, BaseBackend
+from cachekit.hash_utils import redact_cache_key
 
 
 @pytest.mark.unit
@@ -31,21 +32,22 @@ class TestBackendError:
         assert error.operation == "get"
 
     def test_error_with_key(self):
-        """BackendError should include key in formatted message."""
+        """BackendError should include the redacted key digest in the formatted message."""
         error = BackendError("Failed to store", operation="set", key="cache:user:123")
         error_msg = str(error)
         assert "Failed to store" in error_msg
         assert "operation=set" in error_msg
-        assert "key=cache:user:123" in error_msg
-        assert error.key == "cache:user:123"
+        assert f"key={redact_cache_key('cache:user:123')}" in error_msg
+        assert "cache:user:123" not in error_msg  # raw key never in text (CWE-532)
+        assert error.key == "cache:user:123"  # attribute stays raw for programmatic use
 
-    def test_error_with_long_key_truncation(self):
-        """BackendError should truncate long keys for readability."""
+    def test_error_with_long_key_stays_fixed_length(self):
+        """Redaction replaces truncation: long keys become a fixed-length digest."""
         long_key = "cache:" + "x" * 100
         error = BackendError("Failed", operation="get", key=long_key)
         error_msg = str(error)
-        assert "..." in error_msg
-        assert len(error_msg) < len(long_key) + 50  # Truncated
+        assert long_key not in error_msg
+        assert redact_cache_key(long_key) in error_msg
 
     def test_error_serializability(self):
         """BackendError should contain only serializable types."""
@@ -276,7 +278,8 @@ class TestBackendErrorContext:
         assert error.operation == "get"
         assert error.key == "cache:user:123"
         assert "get" in str(error)
-        assert "cache:user:123" in str(error)
+        assert redact_cache_key("cache:user:123") in str(error)
+        assert "cache:user:123" not in str(error)
 
     def test_error_context_for_set_operation(self):
         """BackendError should capture context for set operations."""
