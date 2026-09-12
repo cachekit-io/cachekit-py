@@ -179,9 +179,13 @@ jobs:
     # fix is to stop depending on an external upload for the floor (a local
     # `--cov-fail-under` on the PR pytest invocation); that is a coverage-policy
     # change, tracked separately rather than smuggled into this diff.
+    # Pin floor is v7.0.0 (or the v5.5.5 / v6.0.2 backports): every earlier release
+    # fetches Codecov's signing key from a keybase account Codecov deleted in June
+    # 2026, so CLI signature verification can never pass there — and with
+    # fail_ci_if_error false that failure is silent and an unverified binary runs.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
         files: ./coverage.xml
         use_oidc: true
@@ -199,7 +203,7 @@ jobs:
     # already-red job is noise; a green job that uploaded nothing is a trust bug.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
         files: ./junit.xml
         report_type: test_results
