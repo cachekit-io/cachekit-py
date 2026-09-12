@@ -68,13 +68,14 @@ def _call_args(node: ast.Call) -> list[ast.expr]:
     return [*node.args, *(kw.value for kw in node.keywords)]
 
 
-def _is_logger_receiver(node: ast.AST) -> bool:
-    if isinstance(node, ast.Name):
-        return bool(LOGGER_NAME_RE.search(node.id))
+def _is_logger_receiver(node: ast.AST, direct: dict[str, str] | None = None, aliases: frozenset[str] = frozenset()) -> bool:
+    if isinstance(node, ast.Name):  # logger / self... and ``import logging as lg`` module aliases
+        return bool(LOGGER_NAME_RE.search(node.id)) or node.id in aliases
     if isinstance(node, ast.Attribute):  # self.logger / self._logger
         return bool(LOGGER_NAME_RE.search(node.attr))
-    if isinstance(node, ast.Call):  # get_logger().warning(...) / logging.getLogger(__name__).info(...)
-        return _call_name(node) in LOGGER_FACTORIES
+    if isinstance(node, ast.Call):  # get_logger().warning(...) / getLogger(__name__).info(...), incl. aliased factories
+        name = _call_name(node)
+        return name in LOGGER_FACTORIES or (direct or {}).get(name) == "getLogger"
     return False
 
 
@@ -102,12 +103,15 @@ def _is_logger_call(node: ast.Call, direct: dict[str, str] | None = None, aliase
     func = node.func
     if isinstance(func, ast.Name):  # from logging import warning; warning("%s", key)
         return func.id in (direct or {})
-    if isinstance(func, ast.Attribute):
-        receiver = func.value
-        aliased = isinstance(receiver, ast.Name) and receiver.id in aliases  # import logging as lg; lg.warning(...)
-        return func.attr in LOG_METHODS and (aliased or _is_logger_receiver(receiver))
-    # getattr(logger, level.lower())(message, ...)
-    return isinstance(func, ast.Call) and _call_name(func) == "getattr" and bool(func.args) and _is_logger_receiver(func.args[0])
+    if isinstance(func, ast.Attribute):  # lg.warning(...), get_logger().info(...), gl(__name__).warning(...)
+        return func.attr in LOG_METHODS and _is_logger_receiver(func.value, direct, aliases)
+    # getattr(logger, level.lower())(message, ...) — receiver may be a module alias (getattr(lg, level))
+    return (
+        isinstance(func, ast.Call)
+        and _call_name(func) == "getattr"
+        and bool(func.args)
+        and _is_logger_receiver(func.args[0], direct, aliases)
+    )
 
 
 def _key_identifier(node: ast.AST) -> str | None:
@@ -227,6 +231,11 @@ def test_detector_catches_the_shapes_it_claims_to() -> None:
         ("from warnings import warn\nwarn(f'{cache_key}')", True),  # warnings.warn imported directly
         ("import logging as lg\nlg.warning('%s', cache_key)", True),  # aliased module receiver
         ("from logging import getLogger\ngetLogger(__name__).info('%s', cache_key)", True),  # direct getLogger factory
+        (
+            "from logging import getLogger as gl\ngl(__name__).warning(f'{cache_key}')",
+            True,
+        ),  # aliased getLogger factory receiver
+        ("import logging as lg\ngetattr(lg, 'warning')(f'{cache_key}')", True),  # getattr on an aliased module receiver
         ("from logging import exception\nexception('boom')", True),  # directly imported traceback emitter
         ("def warning(msg): pass\nwarning(f'{cache_key}')", False),  # same name, not imported from logging
         # exception text
