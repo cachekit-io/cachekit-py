@@ -64,7 +64,10 @@ class TestL2DecryptFailureWarning:
 
         assert result is None
         assert any("decrypt/integrity failure" in r.message for r in caplog.records)
-        assert any("GCM tag mismatch" in r.message for r in caplog.records)
+        # The exception is rendered by redact_error_for_log (CWE-532, LAB-304): the log
+        # names the type, never the provider's free-form message text.
+        assert any("EncryptionError" in r.message for r in caplog.records)
+        assert not any("GCM tag mismatch" in r.message for r in caplog.records)
 
     def test_generic_exception_does_not_trigger_decrypt_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         """Non-SerializationError (e.g. ConnectionError) uses the generic warning."""

@@ -1,4 +1,4 @@
-"""Architecture test: no stdlib logger call may receive a raw cache key (CWE-532, LAB-304).
+"""Architecture test: no logging call may receive a raw cache key or raw exception text (CWE-532, LAB-304).
 
 The redaction sweep on PR #264 hand-edited ~30 log lines. Nothing stopped the
 next ``logger.debug(f"... {key}")`` from landing with CI green — this does.
@@ -6,24 +6,37 @@ next ``logger.debug(f"... {key}")`` from landing with CI green — this does.
 For every logging call under ``src/cachekit`` — receiver a logger name
 (``logger``, ``_logger``, ``self._logger``, ``logger_instance``, ``logging``,
 ``warnings``), a logger factory call (``get_logger()``, ``logger()``,
-``logging.getLogger(...)``), or ``getattr(logger, level)(...)`` — any Name,
-Attribute, or ``d["..."]`` subscript whose identifier is key-shaped (``key``,
-``cache_key``, ``lock_key``, ``e.key``, ``kwargs["key"]`` ...) must be wrapped
-in ``redact_cache_key`` / ``redact_key_for_log`` somewhere between it and the
-call: in the message f-string, in ``%s`` arguments, or in ``extra=``.
+``logging.getLogger(...)``), or ``getattr(logger, level)(...)``:
 
-Known blind spot (flow-insensitive): a message pre-built into a variable
-(``msg = f"miss {key}"; logger.debug(msg)``) is not traced. Build log lines
-inline so the guard can see them. Sink-central redaction is not exempted: the
-sinks' own stdlib calls satisfy the rule; callers passing raw keys *into*
-``handle_cache_error`` / ``log_cache_operation`` / ``SimpleLogger.cache_*`` are
-covered by those sinks' contract tests, not here.
+* **Keys.** Any Name, Attribute, or ``d["..."]`` subscript whose identifier is
+  key-shaped (``key``, ``cache_key``, ``lock_key``, ``e.key``, ``kwargs["key"]``)
+  must be wrapped in ``redact_cache_key`` / ``redact_key_for_log`` somewhere
+  between it and the call: in the message f-string, ``%s`` arguments, or ``extra=``.
+* **Exceptions.** An exception's ``str()`` has unknown provenance (a redis
+  ResponseError naming the key, a ``BackendError`` whose free-form message was
+  built with it). Any exception-shaped identifier — every name bound by an
+  ``except ... as <name>`` in the same file, plus the conventional names
+  ``e``/``ex``/``exc``/``err``/``error``/``exception`` and any ``*_err``-style
+  suffix, for parameters such as ``error: Exception`` — or an attribute of one,
+  must be wrapped in ``redact_error_for_log``. ``type(e).__name__`` is allowed.
+* **Tracebacks.** ``logger.exception(...)`` and ``exc_info=`` are flagged
+  outright: the traceback carries the raw exception text whatever the message says.
+
+Known blind spots (flow-insensitive): a message pre-built into a variable
+(``msg = f"miss {key}"; logger.debug(msg)``) is not traced, and an exception
+held in a parameter with an unconventional name (``failure: Exception``) is not
+recognised. Build log lines inline, and bind exceptions with ``except ... as``
+or a conventional name, so the guard can see them. Sink-central redaction is not
+exempted: the sinks' own stdlib calls satisfy the rule; callers passing raw keys
+*into* ``handle_cache_error`` / ``log_cache_operation`` / ``SimpleLogger.cache_*``
+are covered by those sinks' contract tests, not here.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "cachekit"
@@ -34,8 +47,10 @@ LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "critical"
 # that merely contain "log" (catalog, dialog, backlog) are not treated as loggers.
 LOGGER_NAME_RE = re.compile(r"(?:^|_)log(?:ger|ging)?(?:_|$)|^warnings$")
 LOGGER_FACTORIES = frozenset({"get_logger", "logger", "getLogger", "get_structured_logger"})
-REDACTORS = frozenset({"redact_cache_key", "redact_key_for_log"})
+KEY_REDACTORS = frozenset({"redact_cache_key", "redact_key_for_log"})
+ERROR_REDACTORS = frozenset({"redact_error_for_log", "type"})  # type(e).__name__ is key-free
 KEY_NAME_RE = re.compile(r"(?:^|_)key$")
+EXC_NAME_RE = re.compile(r"(?:^|_)(?:e|ex|exc|err|error|exception)$")
 
 
 def _call_name(node: ast.Call) -> str:
@@ -79,50 +94,88 @@ def _key_identifier(node: ast.AST) -> str | None:
     return None
 
 
-def _raw_keys(node: ast.AST) -> list[str]:
-    """Key-shaped identifiers under ``node`` not enclosed by a redactor call."""
-    ident = _key_identifier(node)
-    if ident is not None:
-        return [ident]
+def _exception_identifier(bound: frozenset[str]) -> Callable[[ast.AST], str | None]:
+    """Predicate for exception-shaped roots: names bound by ``except ... as`` in this file, or conventional names."""
+
+    def ident(node: ast.AST) -> str | None:
+        root = node
+        while isinstance(root, (ast.Attribute, ast.Subscript)):  # e.message, e.args[0]
+            root = root.value
+        if isinstance(root, ast.Name) and (root.id in bound or EXC_NAME_RE.search(root.id)):
+            return root.id
+        return None
+
+    return ident
+
+
+def _unredacted(node: ast.AST, ident: Callable[[ast.AST], str | None], redactors: frozenset[str]) -> list[str]:
+    """Identifiers matching ``ident`` under ``node`` that are not enclosed by a call to one of ``redactors``."""
+    found_here = ident(node)
+    if found_here is not None:
+        return [found_here]
     found: list[str] = []
     if isinstance(node, ast.Call):
         # The callee's own name is never a key (``redact_cache_key`` ends in ``_key``);
         # only its receiver chain (``obj.key.method()``) can carry one.
         if isinstance(node.func, ast.Attribute):
-            found.extend(_raw_keys(node.func.value))
-        if _call_name(node) not in REDACTORS:
+            found.extend(_unredacted(node.func.value, ident, redactors))
+        if _call_name(node) not in redactors:
             for child in _call_args(node):
-                found.extend(_raw_keys(child))
+                found.extend(_unredacted(child, ident, redactors))
         return found
     if isinstance(node, ast.IfExp):
         # ``redact(key) if key else "unknown"`` — the test is a truthiness check, it never renders.
-        return _raw_keys(node.body) + _raw_keys(node.orelse)
+        return _unredacted(node.body, ident, redactors) + _unredacted(node.orelse, ident, redactors)
     for child in ast.iter_child_nodes(node):
-        found.extend(_raw_keys(child))
+        found.extend(_unredacted(child, ident, redactors))
     return found
+
+
+def _emits_traceback(node: ast.Call) -> bool:
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "exception":
+        return True
+    return any(kw.arg == "exc_info" for kw in node.keywords)
+
+
+def _except_names(tree: ast.AST) -> frozenset[str]:
+    return frozenset(h.name for h in ast.walk(tree) if isinstance(h, ast.ExceptHandler) and h.name)
+
+
+def _violations_in(tree: ast.AST, where: str) -> list[str]:
+    out: list[str] = []
+    exc_ident = _exception_identifier(_except_names(tree))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _is_logger_call(node):
+            continue
+        loc = f"{where}:{node.lineno}"
+        keys = [k for arg in _call_args(node) for k in _unredacted(arg, _key_identifier, KEY_REDACTORS)]
+        if keys:
+            out.append(f"{loc} logs raw {', '.join(sorted(set(keys)))}")
+        excs = [k for arg in _call_args(node) for k in _unredacted(arg, exc_ident, ERROR_REDACTORS)]
+        if excs:
+            out.append(f"{loc} logs raw exception text {', '.join(sorted(set(excs)))} (wrap in redact_error_for_log)")
+        if _emits_traceback(node):
+            out.append(f"{loc} emits a traceback (logger.exception / exc_info) — raw exception text")
+    return out
 
 
 def _violations(root: Path) -> list[str]:
     out: list[str] = []
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not _is_logger_call(node):
-                continue
-            leaks = [k for arg in _call_args(node) for k in _raw_keys(arg)]
-            if leaks:
-                out.append(f"{path.relative_to(root.parents[1])}:{node.lineno} logs raw {', '.join(sorted(set(leaks)))}")
+        out.extend(_violations_in(tree, str(path.relative_to(root.parents[1]))))
     return out
 
 
-def test_no_raw_cache_key_reaches_a_logger_call() -> None:
+def test_no_raw_key_or_exception_text_reaches_a_logger_call() -> None:
     violations = _violations(SRC)
-    assert not violations, "Raw cache keys reach a logger call (wrap in redact_key_for_log):\n  " + "\n  ".join(violations)
+    assert not violations, "Raw cache keys or exception text reach a logger call:\n  " + "\n  ".join(violations)
 
 
 def test_detector_catches_the_shapes_it_claims_to() -> None:
     """The guard is only as good as its detector — pin the shapes it must flag and must allow."""
     cases = [
+        # keys
         ("logger.debug(f'hit {key}')", True),  # f-string
         ("logger.debug('miss %s', cache_key)", True),  # %-args
         ("self._logger.warning('x', extra={'k': e.key})", True),  # attribute in extra=
@@ -139,9 +192,24 @@ def test_detector_catches_the_shapes_it_claims_to() -> None:
         ("logger.debug('%d keys', len(expired_keys))", False),  # plural: not a key
         ("get_logger().warning(f\"{redact_cache_key(cache_key) if cache_key else 'unknown'}\")", False),  # truthiness test
         ("client.get(key)", False),  # not a logger
+        # exception text
+        ("logger.warning(f'set failed for {redact_cache_key(cache_key)}: {e}')", True),  # f-string {e}
+        ("_logger.debug('TTL refresh failed for %s: %s', redact_cache_key(cache_key), exc)", True),  # %-arg exc
+        ("logger.error(f'decrypt failed: {error!s}')", True),  # !s conversion
+        ("logger.error(f'failed: {e.message}')", True),  # attribute of an exception
+        ("logger.warning(f'evict failed: {del_err}')", True),  # *_err suffix
+        ("logger.debug('x: %s', import_err)", True),  # *_err suffix, %-arg
+        (
+            "try:\n    pass\nexcept ValueError as failure:\n    logger.error(f'{failure}')",
+            True,
+        ),  # except-bound, unconventional name
+        ("logger.error('failed', exc_info=True)", True),  # traceback
+        ("logger.exception('failed')", True),  # traceback
+        ("logger.warning(f'failed: {redact_error_for_log(e)}')", False),  # redacted
+        ("logger.warning('failed: %s', redact_error_for_log(exc))", False),  # redacted %-arg
+        ("logger.warning(f'failed: {type(e).__name__}')", False),  # type name is key-free
+        ("def f(failure):\n    logger.error(f'{failure}')", False),  # unconventional parameter: documented blind spot
     ]
     for src, expected in cases:
-        tree = ast.parse(src)
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_logger_call(n)]
-        flagged = any(_raw_keys(a) for c in calls for a in _call_args(c))
+        flagged = bool(_violations_in(ast.parse(src), "<case>"))
         assert flagged is expected, f"{src!r}: expected flagged={expected}, got {flagged}"

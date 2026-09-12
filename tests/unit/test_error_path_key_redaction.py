@@ -24,6 +24,19 @@ from cachekit.logging import UltraOptimizedStructuredLogger
 
 TENANT_KEY = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
 
+# Every sink is driven with four exception shapes. The first two prove the KEY field is
+# redacted; the last two prove the EXCEPTION TEXT is too — a BackendError whose free-form
+# ``message`` embeds the key (``_format_message`` preserves it verbatim) and a provider
+# exception that echoes it (redis ResponseError style). A sink that interpolates ``{e}``
+# raw passes the first two and fails the last two.
+ERRORS = [
+    BackendError("backend down", error_type=BackendErrorType.TRANSIENT),
+    ValueError("unexpected"),
+    BackendError(f"WRONGTYPE for {TENANT_KEY}", error_type=BackendErrorType.TRANSIENT, operation="get"),
+    ValueError(f"illegal input: {TENANT_KEY}"),
+]
+ERROR_IDS = ["backend_error", "unexpected_error", "backenderror_key_in_message", "provider_key_in_text"]
+
 
 class _FailingBackend:
     """Minimal BaseBackend whose mutating operations raise a configured error."""
@@ -68,16 +81,13 @@ def _assert_redacted(caplog: pytest.LogCaptureFixture, raw_key: str) -> None:
     messages = [r.getMessage() for r in caplog.records]
     assert any(digest in m for m in messages), f"expected digest {digest!r} in logs; got {messages!r}"
     assert not any(raw_key in m for m in messages), f"raw key leaked into logs: {messages!r}"
+    assert not any(TENANT_KEY in m for m in messages), f"key-bearing exception text leaked into logs: {messages!r}"
 
 
 class TestStandardCacheHandlerRedaction:
     """set/delete/TTL-refresh failures log the digest, never the raw key."""
 
-    @pytest.mark.parametrize(
-        "error",
-        [BackendError("backend down", error_type=BackendErrorType.TRANSIENT), ValueError("unexpected")],
-        ids=["backend_error", "unexpected_error"],
-    )
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_set_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
         handler = StandardCacheHandler(backend=_FailingBackend(error))
 
@@ -86,11 +96,7 @@ class TestStandardCacheHandlerRedaction:
 
         _assert_redacted(caplog, TENANT_KEY)
 
-    @pytest.mark.parametrize(
-        "error",
-        [BackendError("backend down", error_type=BackendErrorType.TRANSIENT), ValueError("unexpected")],
-        ids=["backend_error", "unexpected_error"],
-    )
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_delete_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
         handler = StandardCacheHandler(backend=_FailingBackend(error))
 
@@ -99,9 +105,10 @@ class TestStandardCacheHandlerRedaction:
 
         _assert_redacted(caplog, TENANT_KEY)
 
-    async def test_ttl_refresh_failure_redacts_key(self, caplog: pytest.LogCaptureFixture) -> None:
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_ttl_refresh_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
         """get_ttl raising must not fail the operation — and must log only the digest."""
-        handler = StandardCacheHandler(backend=_FailingTTLBackend(ValueError("ttl probe failed")))
+        handler = StandardCacheHandler(backend=_FailingTTLBackend(error))
 
         with caplog.at_level(logging.DEBUG):
             await handler._maybe_refresh_ttl(TENANT_KEY, refresh_ttl=300)
@@ -116,11 +123,7 @@ class TestCacheInvalidatorRedaction:
         backend = _FailingBackend(error)
         return CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend), backend
 
-    @pytest.mark.parametrize(
-        "error",
-        [BackendError("backend down", error_type=BackendErrorType.TRANSIENT), ValueError("unexpected")],
-        ids=["backend_error", "unexpected_error"],
-    )
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_sync_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
         invalidator, backend = self._invalidator(error)
 
@@ -133,11 +136,7 @@ class TestCacheInvalidatorRedaction:
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
 
-    @pytest.mark.parametrize(
-        "error",
-        [BackendError("backend down", error_type=BackendErrorType.TRANSIENT), ValueError("unexpected")],
-        ids=["backend_error", "unexpected_error"],
-    )
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     async def test_async_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
         invalidator, backend = self._invalidator(error)
 

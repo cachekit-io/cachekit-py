@@ -7,6 +7,8 @@ configure hiredis behavior in Python 3.13+ free-threading environments.
 import logging
 import sys
 
+from cachekit.hash_utils import redact_error_for_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +24,7 @@ def _get_disable_hiredis_setting() -> bool:
         redis_config = RedisBackendConfig.from_env()
         return redis_config.disable_hiredis
     except Exception as e:
-        logger.debug(f"Could not load Redis config for hiredis setting: {e}")
+        logger.debug(f"Could not load Redis config for hiredis setting: {redact_error_for_log(e)}")
         return False
 
 
@@ -63,7 +65,7 @@ def configure_hiredis_for_free_threading():
                 )
                 return _disable_hiredis()
         except Exception as e:
-            logger.debug(f"Could not determine GIL status: {e}")
+            logger.debug(f"Could not determine GIL status: {redact_error_for_log(e)}")
             # If we can't determine GIL status, continue with default behavior
 
     return False
@@ -85,7 +87,7 @@ def _disable_hiredis():
         return True
 
     except Exception as e:
-        logger.warning(f"Failed to disable hiredis: {e}. GIL warnings may appear.")
+        logger.warning(f"Failed to disable hiredis: {redact_error_for_log(e)}. GIL warnings may appear.")
         return False
 
 

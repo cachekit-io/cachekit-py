@@ -31,7 +31,7 @@ from cachekit.di import DIContainer
 
 # Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
 # leaf module so backend/L1 modules can redact without importing this module (cycle).
-from cachekit.hash_utils import redact_cache_key
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import (
@@ -166,10 +166,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
     if fail_closed and isinstance(error, DecryptionAuthenticationError):
         get_logger().error(
             f"{tier.upper()} cache decrypt AUTHENTICATION failure for {redact_cache_key(cache_key)}; "
-            f"failing closed (encryption.fail_closed=True): {error}"
+            f"failing closed (encryption.fail_closed=True): {redact_error_for_log(error)}"
         )
         raise error
-    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {error}")
+    get_logger().warning(
+        f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {redact_error_for_log(error)}"
+    )
     return reason
 
 
@@ -333,7 +335,7 @@ def _get_cached_serializer_class(serializer_name: str, import_path: str):
 
             return serializer_class
         except (ImportError, AttributeError) as e:
-            get_logger().warning(f"Failed to import serializer {import_path}: {e}")
+            get_logger().warning(f"Failed to import serializer {import_path}: {redact_error_for_log(e)}")
             raise
 
 
@@ -743,7 +745,7 @@ class CacheSerializationHandler:
             get_logger().info(f"Generated and persisted new deployment UUID: {new_uuid} at {deployment_uuid_file}")
         except Exception as e:
             get_logger().error(
-                f"Failed to persist deployment UUID to {deployment_uuid_file}: {e}. "
+                f"Failed to persist deployment UUID to {deployment_uuid_file}: {redact_error_for_log(e)}. "
                 "UUID will be regenerated on next restart (cache will be invalidated)."
             )
 
@@ -930,7 +932,7 @@ class CacheSerializationHandler:
             raise
         except Exception as e:
             # Don't silently fallback - log error and raise to prevent data loss
-            get_logger().error(f"Serialization failed with {self.serializer_name}: {e}")
+            get_logger().error(f"Serialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
 
         # L2 oversized-entry ceiling (issue #163): every L2 write flows through here,
@@ -1159,7 +1161,7 @@ class CacheSerializationHandler:
             # SerializationError/EncryptionError: let the outer handler log and handle
             raise
         except Exception as e:
-            get_logger().error(f"Deserialization failed with {self.serializer_name}: {e}")
+            get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
             raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {e}") from e
 
     def _deserialize_interop(self, data: str | bytes | memoryview, cache_key: str) -> Any:
@@ -1204,7 +1206,7 @@ class CacheSerializationHandler:
         except (ValueError, SerializationError):
             raise
         except Exception as e:
-            get_logger().error(f"Interop deserialization failed: {e}")
+            get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             raise SerializationError(f"Failed to deserialize interop cache entry: {e}") from e
 
 
@@ -1271,7 +1273,9 @@ class CacheOperationHandler:
         try:
             self.on_deserialize_error(error, cache_key)
         except Exception as hook_err:  # observability must never break the miss path
-            get_logger().warning(f"on_deserialize_error hook failed for {redact_cache_key(cache_key)}: {hook_err}")
+            get_logger().warning(
+                f"on_deserialize_error hook failed for {redact_cache_key(cache_key)}: {redact_error_for_log(hook_err)}"
+            )
 
     def get_cache_key(
         self,
@@ -1331,7 +1335,9 @@ class CacheOperationHandler:
             if self._cache_handler is not None:
                 self._cache_handler.delete(cache_key)
         except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            get_logger().warning(
+                f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {redact_error_for_log(del_err)}"
+            )
         self._notify_deserialize_error(e, cache_key)
 
     async def _handle_l2_read_error_async(self, e: SerializationError, cache_key: str) -> None:
@@ -1341,7 +1347,9 @@ class CacheOperationHandler:
             if self._cache_handler is not None:
                 await self._cache_handler.delete_async(cache_key)
         except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            get_logger().warning(
+                f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {redact_error_for_log(del_err)}"
+            )
         self._notify_deserialize_error(e, cache_key)
 
     def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
@@ -1397,7 +1405,7 @@ class CacheOperationHandler:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
     def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool, Optional[int]]]:
@@ -1441,7 +1449,7 @@ class CacheOperationHandler:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
     async def get_cached_value_with_freshness_async(
@@ -1482,7 +1490,7 @@ class CacheOperationHandler:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
     async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
@@ -1529,7 +1537,7 @@ class CacheOperationHandler:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
     def store_result(
@@ -1604,7 +1612,9 @@ class CacheOperationHandler:
             # silently never cached" (spec-mandated; matches cachekit-ts).
             raise
         except Exception as e:
-            get_logger().warning(f"Failed to store in backend cache: {e}")
+            get_logger().warning(
+                f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
             return None
 
     async def store_result_async(
@@ -1670,7 +1680,9 @@ class CacheOperationHandler:
             # silently never cached" (spec-mandated; matches cachekit-ts).
             raise
         except Exception as e:
-            get_logger().warning(f"Failed to store in backend cache: {e}")
+            get_logger().warning(
+                f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
             return None
 
     def set_cache_handler(self, handler: CacheHandlerStrategy):
@@ -1741,9 +1753,11 @@ class CacheInvalidator:
             self._backend.delete(cache_key)
             get_logger().cache_invalidated(cache_key, "Backend")
         except BackendError as e:
-            get_logger().error(f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {e}")
+            get_logger().error(
+                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
         except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {e}")
+            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
 
     async def invalidate_cache_async(
         self,
@@ -1773,9 +1787,11 @@ class CacheInvalidator:
             self._backend.delete(cache_key)
             get_logger().cache_invalidated(cache_key, "Backend")
         except BackendError as e:
-            get_logger().error(f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {e}")
+            get_logger().error(
+                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
         except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {e}")
+            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
 
 
 @runtime_checkable
@@ -1949,7 +1965,7 @@ class StandardCacheHandler:
                 )
         except Exception as e:
             # Log but don't fail the cache operation
-            get_logger().debug(f"Failed to refresh TTL for {redact_cache_key(key)}: {e}")
+            get_logger().debug(f"Failed to refresh TTL for {redact_cache_key(key)}: {redact_error_for_log(e)}")
 
     def get(self, key: str, refresh_ttl: Optional[int] = None) -> Optional[bytes]:
         """Get value from cache using backend.
@@ -1970,10 +1986,10 @@ class StandardCacheHandler:
 
             return value
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     def get_buffer(self, key: str) -> Optional[BufferHandle]:
@@ -1987,10 +2003,10 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.get_buffer, key)
         except BackendError as e:
-            get_logger().error(f"Backend error mmapping key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error mmapping key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error mmapping key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error mmapping key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
@@ -2007,10 +2023,10 @@ class StandardCacheHandler:
         try:
             return _normalize_freshness_hit(self._with_backpressure_and_timeout(self.backend.get_with_freshness, key))
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
@@ -2023,10 +2039,10 @@ class StandardCacheHandler:
                 await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
             )
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     def set(
@@ -2056,10 +2072,10 @@ class StandardCacheHandler:
                 self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
@@ -2078,12 +2094,12 @@ class StandardCacheHandler:
             self._with_backpressure_and_timeout(self.backend.set_streaming, key, write_payload, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
             # Producer-side failure (serialization error, max_value_size budget): the backend
             # already discarded its partial write; surface the real cause, not a backend error.
-            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def set_streaming_async(
@@ -2097,10 +2113,10 @@ class StandardCacheHandler:
             await self._with_backpressure_and_timeout_async(self.backend.set_streaming, key, write_payload, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     def delete(self, key: str) -> bool:
@@ -2115,10 +2131,10 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.delete, key)
         except BackendError as e:
-            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def _with_backpressure_and_timeout_async(self, operation, *args, **kwargs):
@@ -2152,10 +2168,10 @@ class StandardCacheHandler:
 
             return value
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     async def set_async(
@@ -2179,10 +2195,10 @@ class StandardCacheHandler:
                 await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def delete_async(self, key: str) -> bool:
@@ -2194,8 +2210,8 @@ class StandardCacheHandler:
             # Run sync backend operation in thread pool
             return await self._with_backpressure_and_timeout_async(self.backend.delete, key)
         except BackendError as e:
-            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False

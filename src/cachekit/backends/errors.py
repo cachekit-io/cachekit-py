@@ -103,10 +103,11 @@ class BackendError(Exception):
         if self.operation:
             parts.append(f"operation={self.operation}")
         if self.key:
-            # Redact, don't truncate: str(e) reaches log interpolation at every
-            # error sink, and cache keys embed caller-supplied tenant/user
-            # identifiers (CWE-532, LAB-304). The fixed-length digest keeps the
-            # message correlatable with the sinks' own redact_cache_key() output.
+            # Redact, don't truncate: cachekit's own sinks never render str(e)
+            # (they go through redact_error_for_log), but application code may
+            # log it, and cache keys embed caller-supplied tenant/user identifiers
+            # (CWE-532, LAB-304). The fixed-length digest keeps that text
+            # correlatable with the sinks' own redact_cache_key() output.
             parts.append(f"key={redact_cache_key(self.key)}")
         if self.error_type:
             parts.append(f"type={self.error_type.value}")

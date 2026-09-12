@@ -133,7 +133,7 @@ class AsyncLogWriter(threading.Thread):
                     self._write_batch(entries)
 
             except Exception as e:
-                logger.error(f"Error in async log writer: {e}")
+                logger.error(f"Error in async log writer: {redact_error_for_log(e)}")
 
     def stop(self):
         """Stop the writer thread."""

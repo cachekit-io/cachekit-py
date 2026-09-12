@@ -12,7 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from cachekit.hash_utils import redact_key_for_log
+from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 # Default L1 entry lifetime when the caller supplies no TTL. Shared with the
 # decorator's LAB-557 backfill bound: the server's Fresh-For may only ever
@@ -424,7 +424,7 @@ class L1CacheManager:
                         logger.debug("Background cleanup removed %d expired entries", total_cleaned)
 
                 except Exception as e:
-                    logger.error("Error in background cleanup: %s", e)
+                    logger.error("Error in background cleanup: %s", redact_error_for_log(e))
 
             logger.info("L1 cache background cleanup stopped")
 

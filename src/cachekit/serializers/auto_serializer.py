@@ -59,6 +59,7 @@ except ImportError:
     ArrowSerializer = None  # type: ignore[assignment,misc]
 
 from cachekit._rust_serializer import ByteStorage
+from cachekit.hash_utils import redact_error_for_log
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata
 
@@ -598,7 +599,9 @@ class AutoSerializer:
                 raise
             except Exception as e:
                 # If Rust envelope parsing fails for other reasons, try Python-only deserialization
-                logger.debug(f"Rust envelope parsing failed, falling back to Python-only deserialization: {e}")
+                logger.debug(
+                    f"Rust envelope parsing failed, falling back to Python-only deserialization: {redact_error_for_log(e)}"
+                )
 
         # Check for Arrow IPC format before msgpack fall-through
         # Arrow data may have xxHash3-64 checksum prefix (8 bytes) or be direct Arrow IPC
