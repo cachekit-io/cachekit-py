@@ -6,7 +6,9 @@ next ``logger.debug(f"... {key}")`` from landing with CI green — this does.
 For every logging call under ``src/cachekit`` — receiver a logger name
 (``logger``, ``_logger``, ``self._logger``, ``logger_instance``, ``logging``,
 ``warnings``), a logger factory call (``get_logger()``, ``logger()``,
-``logging.getLogger(...)``), or ``getattr(logger, level)(...)``:
+``logging.getLogger(...)``), a function imported directly from ``logging`` /
+``warnings`` (``from logging import warning``, aliases included), an aliased
+module (``import logging as lg``), or ``getattr(logger, level)(...)``:
 
 * **Keys.** Any Name, Attribute, or ``d["..."]`` subscript whose identifier is
   key-shaped (``key``, ``cache_key``, ``lock_key``, ``e.key``, ``kwargs["key"]``)
@@ -76,10 +78,34 @@ def _is_logger_receiver(node: ast.AST) -> bool:
     return False
 
 
-def _is_logger_call(node: ast.Call) -> bool:
+LOG_MODULES = frozenset({"logging", "warnings"})
+
+
+def _direct_log_names(tree: ast.AST) -> tuple[dict[str, str], frozenset[str]]:
+    """Names bound by importing from the logging modules directly.
+
+    Returns (functions, module_aliases): ``from logging import warning as w`` binds the
+    function ``w`` (mapped back to ``warning``); ``import logging as lg`` binds the module
+    alias ``lg`` — a receiver the name regex would otherwise miss.
+    """
+    funcs: dict[str, str] = {}
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in LOG_MODULES:
+            funcs.update({a.asname or a.name: a.name for a in node.names if a.name in LOG_METHODS | {"getLogger"}})
+        elif isinstance(node, ast.Import):
+            modules.update(a.asname or a.name for a in node.names if a.name in LOG_MODULES)
+    return funcs, frozenset(modules)
+
+
+def _is_logger_call(node: ast.Call, direct: dict[str, str] | None = None, aliases: frozenset[str] = frozenset()) -> bool:
     func = node.func
+    if isinstance(func, ast.Name):  # from logging import warning; warning("%s", key)
+        return func.id in (direct or {})
     if isinstance(func, ast.Attribute):
-        return func.attr in LOG_METHODS and _is_logger_receiver(func.value)
+        receiver = func.value
+        aliased = isinstance(receiver, ast.Name) and receiver.id in aliases  # import logging as lg; lg.warning(...)
+        return func.attr in LOG_METHODS and (aliased or _is_logger_receiver(receiver))
     # getattr(logger, level.lower())(message, ...)
     return isinstance(func, ast.Call) and _call_name(func) == "getattr" and bool(func.args) and _is_logger_receiver(func.args[0])
 
@@ -131,8 +157,11 @@ def _unredacted(node: ast.AST, ident: Callable[[ast.AST], str | None], redactors
     return found
 
 
-def _emits_traceback(node: ast.Call) -> bool:
-    if isinstance(node.func, ast.Attribute) and node.func.attr == "exception":
+def _emits_traceback(node: ast.Call, direct: dict[str, str] | None = None) -> bool:
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "exception":
+        return True
+    if isinstance(func, ast.Name) and (direct or {}).get(func.id) == "exception":  # from logging import exception as x
         return True
     return any(kw.arg == "exc_info" for kw in node.keywords)
 
@@ -144,8 +173,9 @@ def _except_names(tree: ast.AST) -> frozenset[str]:
 def _violations_in(tree: ast.AST, where: str) -> list[str]:
     out: list[str] = []
     exc_ident = _exception_identifier(_except_names(tree))
+    direct, aliases = _direct_log_names(tree)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not _is_logger_call(node):
+        if not isinstance(node, ast.Call) or not _is_logger_call(node, direct, aliases):
             continue
         loc = f"{where}:{node.lineno}"
         keys = [k for arg in _call_args(node) for k in _unredacted(arg, _key_identifier, KEY_REDACTORS)]
@@ -154,7 +184,7 @@ def _violations_in(tree: ast.AST, where: str) -> list[str]:
         excs = [k for arg in _call_args(node) for k in _unredacted(arg, exc_ident, ERROR_REDACTORS)]
         if excs:
             out.append(f"{loc} logs raw exception text {', '.join(sorted(set(excs)))} (wrap in redact_error_for_log)")
-        if _emits_traceback(node):
+        if _emits_traceback(node, direct):
             out.append(f"{loc} emits a traceback (logger.exception / exc_info) — raw exception text")
     return out
 
@@ -192,6 +222,13 @@ def test_detector_catches_the_shapes_it_claims_to() -> None:
         ("logger.debug('%d keys', len(expired_keys))", False),  # plural: not a key
         ("get_logger().warning(f\"{redact_cache_key(cache_key) if cache_key else 'unknown'}\")", False),  # truthiness test
         ("client.get(key)", False),  # not a logger
+        ("from logging import warning\nwarning('%s', cache_key)", True),  # directly imported function
+        ("from logging import error as log_err\nlog_err(f'{cache_key}')", True),  # aliased direct import
+        ("from warnings import warn\nwarn(f'{cache_key}')", True),  # warnings.warn imported directly
+        ("import logging as lg\nlg.warning('%s', cache_key)", True),  # aliased module receiver
+        ("from logging import getLogger\ngetLogger(__name__).info('%s', cache_key)", True),  # direct getLogger factory
+        ("from logging import exception\nexception('boom')", True),  # directly imported traceback emitter
+        ("def warning(msg): pass\nwarning(f'{cache_key}')", False),  # same name, not imported from logging
         # exception text
         ("logger.warning(f'set failed for {redact_cache_key(cache_key)}: {e}')", True),  # f-string {e}
         ("_logger.debug('TTL refresh failed for %s: %s', redact_cache_key(cache_key), exc)", True),  # %-arg exc

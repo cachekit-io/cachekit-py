@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.cache_handler import CacheInvalidator, StandardCacheHandler
+from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, StandardCacheHandler
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.hash_utils import _SENTINEL_KEYS, redact_cache_key
 from cachekit.key_generator import CacheKeyGenerator
@@ -102,6 +103,30 @@ class TestStandardCacheHandlerRedaction:
 
         with caplog.at_level(logging.ERROR):
             assert handler.delete(TENANT_KEY) is False
+
+        _assert_redacted(caplog, TENANT_KEY)
+
+    @staticmethod
+    def _operation_handler(error: Exception) -> CacheOperationHandler:
+        # Serialization is never reached: the L2 read raises first. The real strategy
+        # over the failing backend is what routes the exception into the L2 read sinks.
+        return CacheOperationHandler(
+            MagicMock(), CacheKeyGenerator(), cache_handler=StandardCacheHandler(backend=_FailingBackend(error))
+        )
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_async_get_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        """The async L2 read sink (CacheOperationHandler.get_cached_value_async)."""
+        with caplog.at_level(logging.WARNING):
+            assert await self._operation_handler(error).get_cached_value_async(TENANT_KEY) is None
+
+        _assert_redacted(caplog, TENANT_KEY)
+
+    @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
+    async def test_async_freshness_get_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
+        """The SWR freshness read sink (CacheOperationHandler.get_cached_value_with_freshness_async)."""
+        with caplog.at_level(logging.WARNING):
+            assert await self._operation_handler(error).get_cached_value_with_freshness_async(TENANT_KEY) is None
 
         _assert_redacted(caplog, TENANT_KEY)
 
