@@ -153,8 +153,8 @@ jobs:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
-    # fail_ci_if_error is deliberately split between these two uploads, not
-    # defaulted (LAB-2528 finding 3). coverage.xml is the ONLY input to the
+    # The two uploads below are deliberately treated differently, not defaulted
+    # (LAB-2528 finding 3). coverage.xml is the ONLY input to the
     # project/patch statuses codecov.yml declares, and every flag there sets
     # `carryforward: true` — so a silently-dropped upload does not remove the
     # status, it answers "is this PR's new code 80% covered?" with a previous
@@ -179,10 +179,13 @@ jobs:
     # fix is to stop depending on an external upload for the floor (a local
     # `--cov-fail-under` on the PR pytest invocation); that is a coverage-policy
     # change, tracked separately rather than smuggled into this diff.
-    # Pin floor is v7.0.0 (or the v5.5.5 / v6.0.2 backports): every earlier release
-    # fetches Codecov's signing key from a keybase account Codecov deleted in June
-    # 2026, so CLI signature verification can never pass there — and with
-    # fail_ci_if_error false that failure is silent and an unverified binary runs.
+    #
+    # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
+    # June 2026 keybase migration fetch the CLI signing key from a deleted account,
+    # so `gpg --verify` can never pass. The wrapper stops there only when
+    # fail_ci_if_error is true; otherwise it prints "CLI integrity verified" and runs
+    # the unverified binary. Accepted flip side: a keybase.io outage now fails
+    # same-repo CI closed, not open.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
@@ -192,10 +195,12 @@ jobs:
         fail_ci_if_error: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
-    # Stays false, deliberately: junit.xml feeds Codecov Test Analytics
-    # (flaky-test history) only. Nothing gates on it and no status is computed
-    # from it, so a Codecov-side outage here would redden otherwise-passing CI
-    # while hiding nothing.
+    # fail_ci_if_error is true here too, for a different reason: it is also the
+    # wrapper's signature-enforcement switch (see the pin note above), so false
+    # would let an unverified binary run. The "don't redden CI" intent lives in
+    # continue-on-error instead: junit.xml feeds Codecov Test Analytics (flaky-test
+    # history) only and nothing gates on it, so a Codecov-side outage marks this
+    # step failed-and-continued and the job stays green.
     #
     # `handle_no_reports_found` is left at its default (false) on both uploads on
     # purpose: it would also swallow "the report was never written", which is the
@@ -203,13 +208,14 @@ jobs:
     # already-red job is noise; a green job that uploaded nothing is a trust bug.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
+      continue-on-error: true
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
         files: ./junit.xml
         report_type: test_results
         use_oidc: true
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
-        fail_ci_if_error: false
+        fail_ci_if_error: true
 
   # Version sync + doc tests (push to main only)
   post-merge:
