@@ -11,7 +11,13 @@ import sys
 
 import pytest
 
-from cachekit.serializers import (
+# Lazy loading can only be exercised when the lazily-loaded serializers are
+# actually installed — requires the [data] + [json] extras, absent e.g. in the
+# free-threaded CI lane (LAB-511).
+pytest.importorskip("pyarrow")
+pytest.importorskip("orjson")
+
+from cachekit.serializers import (  # noqa: E402
     SERIALIZER_REGISTRY,
     _get_arrow_serializer,
     _get_orjson_serializer,
@@ -20,9 +26,9 @@ from cachekit.serializers import (
     get_serializer,
     get_serializer_info,
 )
-from cachekit.serializers.arrow_serializer import ArrowSerializer
-from cachekit.serializers.base import SerializerProtocol
-from cachekit.serializers.orjson_serializer import OrjsonSerializer
+from cachekit.serializers.arrow_serializer import ArrowSerializer  # noqa: E402
+from cachekit.serializers.base import SerializerProtocol  # noqa: E402
+from cachekit.serializers.orjson_serializer import OrjsonSerializer  # noqa: E402
 
 
 class TestLazyArrowSerializerLoading:

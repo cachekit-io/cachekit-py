@@ -158,6 +158,38 @@ class TestAsyncMetricsCollector:
 
         collector.shutdown()
 
+    def test_flush_waits_for_inflight_processing(self):
+        """Flush does not return after the worker has only dequeued a metric."""
+        collector = AsyncMetricsCollector()
+        processing_started = threading.Event()
+        allow_processing = threading.Event()
+        flushed = threading.Event()
+
+        def process_metric(_metric):
+            processing_started.set()
+            allow_processing.wait()
+
+        collector._process_metric = process_metric
+        thread: threading.Thread | None = None
+        try:
+            collector.record_counter("inflight")
+            assert processing_started.wait(timeout=1.0)
+
+            thread = threading.Thread(target=lambda: (collector.flush(), flushed.set()))
+            thread.start()
+            assert not flushed.wait(timeout=0.05)
+            allow_processing.set()
+            assert flushed.wait(timeout=1.0)
+        finally:
+            # Any failed assertion — including the readiness wait — must not
+            # leave the daemon worker parked in process_metric, the flush
+            # thread parked behind it, or the collector running for the rest
+            # of the test process.
+            allow_processing.set()
+            if thread is not None:
+                thread.join(timeout=2.0)
+            collector.shutdown()
+
     def test_graceful_shutdown(self):
         """Test graceful shutdown of collector."""
         collector = AsyncMetricsCollector()

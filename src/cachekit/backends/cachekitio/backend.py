@@ -44,9 +44,12 @@ LEGACY_TTL_HEADER = "X-TTL"
 # Stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate).
 # STALE_TTL_HEADER rides PUTs to open a stale-grace window past the fresh TTL;
 # FRESHNESS_HEADER labels every GET/HEAD 200 as fresh|stale. Pre-SWR servers
-# ignore the former and never emit the latter.
+# ignore the former and never emit the latter. FRESH_FOR_HEADER carries the
+# remaining freshness in whole seconds on GET 200s (LAB-557,
+# spec/saas-api.md#remaining-freshness); pre-signal servers omit it.
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
+FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
 
 def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
@@ -385,19 +388,42 @@ class CachekitIOBackend:
         value = response.headers.get(FRESHNESS_HEADER)
         return value is not None and value != "fresh"
 
-    def get_with_freshness(self, key: str) -> tuple[bytes, bool] | None:
-        """Retrieve value plus its SWR freshness (sync).
+    @staticmethod
+    def _fresh_for(response: httpx.Response) -> int | None:
+        """Parse X-CacheKit-Fresh-For (LAB-557, spec/saas-api.md#remaining-freshness).
+
+        Absent = pre-signal server → None (legacy behavior: no bound).
+        Unparseable or negative = drift → 0 (do not extend local service — the
+        conservative action, mirroring the unrecognized-freshness → stale rule).
+        """
+        value = response.headers.get(FRESH_FOR_HEADER)
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            # Drift signal, not a crash: a server/proxy emitting garbage here
+            # disables L1 backfill for affected reads — log so a fleet-wide
+            # latency regression is diagnosable (expert-panel finding).
+            _logger.debug(f"Unparseable {FRESH_FOR_HEADER} header {value!r}; treating as 0 (no L1 backfill)")
+            return 0
+        return parsed if parsed >= 0 else 0
+
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
+        """Retrieve value plus its SWR freshness and remaining-freshness bound (sync).
 
         Returns:
-            ``(value, is_stale)`` on a hit — ``is_stale`` is True only for an
-            entry in its stale-grace window (LAB-381) — or None on a miss.
+            ``(value, is_stale, fresh_for)`` on a hit — ``is_stale`` is True only
+            for an entry in its stale-grace window (LAB-381); ``fresh_for`` is the
+            server's remaining freshness in seconds, or None from a pre-signal
+            server (LAB-557) — or None on a miss.
 
         Raises:
             BackendError: If operation fails (network, auth, etc.)
         """
         try:
             response = self._request_sync("GET", self._encode_key(key))
-            return response.content, self._is_stale(response)
+            return response.content, self._is_stale(response), self._fresh_for(response)
         except BackendError as exc:
             if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
                 if exc.original_exception.response.status_code == 404:

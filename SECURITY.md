@@ -11,7 +11,7 @@
 - [Architecture Overview](#architecture-overview)
 - [Python SDK Security Features](#python-sdk-security-features)
 - [FFI Boundary Security](#ffi-boundary-security)
-- [Supply Chain Security](#supply-chain-security)
+- [Dependency Security](#dependency-security)
 - [CI/CD Security](#cicd-security)
 - [Known Limitations](#known-limitations)
 - [Security Roadmap](#security-roadmap)
@@ -228,14 +228,14 @@ Encode-once matches the SaaS validator's single decode, so a canonical key round
 
 ---
 
-## Supply Chain Security
+## Dependency Security
 
 ### Rust Dependencies
 
 | Tool | Purpose | Config |
 |:-----|:--------|:-------|
-| **cargo-deny** | License + vulnerability scanning | `rust/deny.toml` |
-| **cargo-vet** | Supply chain auditing | `rust/supply-chain/config.toml` |
+| **cargo-deny** | License + vulnerability scanning | `deny.toml` |
+| **cargo-audit** | CVE scanning against RustSec Advisory Database | `.github/workflows/security-fast.yml` (inline ignore list) |
 
 <details>
 <summary><strong>📋 Policy Details</strong></summary>
@@ -246,12 +246,10 @@ Encode-once matches the SaaS validator's single decode, so a canonical key round
 
 **Vulnerability scanning**: [RustSec Advisory Database][rustsec]
 
-**Audit status**: In progress (Q1 2026 target for full coverage)
-
 </details>
 
 > [!NOTE]
-> Core dependencies (ring, lz4_flex, blake3) are audited in cachekit-core. See [cachekit-core supply chain docs][core-supply-chain].
+> Core dependencies (`ring` / `aes-gcm` for AES-256-GCM, `lz4_flex`, `xxhash-rust`, `rmp-serde`, `hkdf`, `sha2`) are audited in cachekit-core. See [cachekit-core dependency docs][core-deps]. `blake3` is not a cachekit-core dependency: it is a cachekit-py (Python) dependency used for cache-key hashing in `src/cachekit/hash_utils.py`, audited in this repo's own Python dependencies below.
 
 ### Python Dependencies
 
@@ -365,7 +363,6 @@ Security patches are backported to the latest supported version.
 
 | Quarter | Milestone |
 |:--------|:----------|
-| Q1 2026 | Complete cargo-vet audits for all dependencies |
 | Q2 2026 | Add Hypothesis fuzzing for Python layer |
 | Q3 2026 | Third-party security audit (SDK + FFI boundary) |
 | Q4 2026 | SLSA Level 3 compliance |
@@ -402,7 +399,7 @@ We appreciate responsible disclosure from the security community. Security resea
 [gh-repo]: https://github.com/cachekit-io/cachekit-py
 [core-repo]: https://github.com/cachekit-io/cachekit-core
 [core-security]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md
-[core-supply-chain]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#supply-chain-security
+[core-deps]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#dependencies
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
