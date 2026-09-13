@@ -143,18 +143,22 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 ### Key Rotation
 
+Keeping a retiring key decrypt-only makes its entries readable; it does **not**
+make a one-deploy key swap zero-miss. For a scheduled rotation, follow the
+[three-phase key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/):
+deploy the incoming key decrypt-only to every reader first, promote it only
+after that rollout completes, then retire the old key after the longest TTL.
+The configuration below is the phase-2 state, not a standalone rotation recipe.
+
 ```bash
-# Changed CACHEKIT_MASTER_KEY without retaining the old key
-# Old encrypted data in Redis → Can't decrypt
-# Error: "Decryption failed: authentication tag verification failed"
-# Solution: keep the retiring key decrypt-only for the rotation window
-export CACHEKIT_MASTER_KEY=new_key                 # encrypts + decrypts
-export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separated, max 3)
-# Restart app → old entries stay readable, new writes use the new key.
-# Old-key entries age out via TTL; drop the old key from the list once the
-# window (≥ longest TTL in use) has passed. Rotation is forward-only: never
-# re-promote a retired key to CACHEKIT_MASTER_KEY — a configuration where the
-# current key also appears in the previous-keys list is rejected at load.
+# Phase 2 only: the new key is current after the phase-1 fleet rollout.
+# Pseudocode — replace the placeholders with 64-character hex (32-byte) values,
+# e.g. `$(openssl rand -hex 32)`. Non-hex or short values are rejected at load.
+export CACHEKIT_MASTER_KEY=<new-key-hex>           # encrypts + decrypts
+export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex> # decrypt-only (comma-separated, max 3)
+# After the longest TTL has elapsed from fleet-wide promotion:
+# unset CACHEKIT_PREVIOUS_MASTER_KEYS
+# Never re-promote a retired key; rotate forward to a fresh key instead.
 ```
 
 ### Enabling Encryption on an Existing (Plaintext) Cache
@@ -286,21 +290,27 @@ data_b = get_user_data(123)  # Same user_id, different tenant, different encrypt
 
 ### Key Rotation Pattern
 
-Zero-downtime rotation via the keyring: one **current** master key
+The keyring has one **current** master key
 (`CACHEKIT_MASTER_KEY`, encrypts and decrypts) plus up to **3 decrypt-only**
 previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
-per-key requirements as the master key). Entries carry the fingerprint of
-their HKDF-derived per-tenant encryption key, so reads select the exact
-keyring entry that wrote them — never trial decryption.
+per-key requirements as the master key). CK-framed entries carry the
+fingerprint of their HKDF-derived per-tenant encryption key, so reads select
+the exact keyring entry that wrote them — never trial decryption. (Interop-mode
+entries carry no CK frame and instead attempt keyring keys sequentially — see
+the Interop-mode note below.) The keyring alone does
+not make a single-deploy swap zero-miss: use the [three-phase key rotation
+runbook](https://docs.cachekit.io/concepts/key-rotation/) for scheduled
+rotation.
 
 ```bash
-# 1. Promote the new key; retain the old key decrypt-only
+# Phase 2 only, after phase 1 deployed the incoming key decrypt-only fleet-wide.
+# Pseudocode — replace the placeholders with 64-character hex (32-byte) values,
+# e.g. `$(openssl rand -hex 32)`. Non-hex or short values are rejected at load.
 export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
-# 2. Old entries still decrypt (selected by key fingerprint); new writes use the new key
-# 3. Old-key entries age out via TTL (or re-encrypt on the next write)
-# 4. After the window (≥ longest TTL in use), drop the old key
-unset CACHEKIT_PREVIOUS_MASTER_KEYS
+# Old entries still decrypt; new writes use the new key.
+# After the longest TTL from fleet-wide promotion:
+# unset CACHEKIT_PREVIOUS_MASTER_KEYS
 ```
 
 Rules enforced at config load — rejected, never truncated or silently fixed:
