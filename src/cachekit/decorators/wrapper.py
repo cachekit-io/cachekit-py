@@ -36,7 +36,7 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
-from ..serializers.base import SerializationError
+from ..serializers.base import SerializationError, bounded_error
 from ..serializers.encryption_wrapper import DecryptionAuthenticationError, KeyringConfigurationError
 
 # Config import removed - using direct DecoratorConfig integration
@@ -1292,7 +1292,7 @@ def create_cache_wrapper(
                     raise
                 except Exception as e:
                     # L1 deserialization failed - invalidate and continue to L2
-                    logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                    logger().warning(f"L1 cache deserialization failed for {cache_key}: {bounded_error(e)}")
                     _l1_cache.invalidate(cache_key)
 
         # Continue with the rest of the sync wrapper logic...
@@ -1648,7 +1648,7 @@ def create_cache_wrapper(
                         raise
                     except Exception as e:
                         # L1 deserialization failed - invalidate and continue to L2
-                        logger().warning(f"L1 cache deserialization failed for {cache_key}: {e}")
+                        logger().warning(f"L1 cache deserialization failed for {cache_key}: {bounded_error(e)}")
                         _l1_cache.invalidate(cache_key)
 
             # Initialize backend only when needed (lazy init for performance)

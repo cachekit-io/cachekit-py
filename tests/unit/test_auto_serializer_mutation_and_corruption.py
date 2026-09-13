@@ -21,13 +21,15 @@ already forces the columnar path.
 from __future__ import annotations
 
 import functools
+import logging
 
 import msgpack
 import pytest
 
 from cachekit._rust_serializer import ByteStorage
+from cachekit.cache_handler import handle_decrypt_failure
 from cachekit.serializers import AutoSerializer
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import ERROR_ECHO_MAX, SerializationError, bounded_error
 
 # Requires the [data] extra — absent e.g. in the free-threaded CI lane until
 # numpy/pandas ship free-threaded wheels (LAB-511).
@@ -208,6 +210,18 @@ class TestForgedColumnarPayloadIsRefused:
         with pytest.raises(SerializationError, match="Forged columnar payload"):
             AutoSerializer().deserialize(_entry(kind, body))
 
+    @pytest.mark.parametrize(
+        "kind, body",
+        [("dataframe", [1, 2]), ("series", 7)],
+        ids=["dataframe-body-is-list", "series-body-is-int"],
+    )
+    def test_non_dict_document_is_refused(self, kind: str, body: object) -> None:
+        # The writer always emits a dict body; a forged non-dict decodes cleanly under the msgpack
+        # bound and now hits the _expect shape gate directly (the dead bytes-preamble that used to
+        # sit ahead of it is gone), so the "document is <type>" guard is reachable in production.
+        with pytest.raises(SerializationError, match="Forged columnar payload: document is"):
+            AutoSerializer().deserialize(_entry(kind, body))  # type: ignore[arg-type]
+
 
 def _numpy_raw(dtype: bytes, shape: bytes) -> bytes:
     return b"NUMPY_RAW" + len(dtype).to_bytes(2, "little") + dtype + len(shape).to_bytes(2, "little") + shape
@@ -240,3 +254,47 @@ class TestForgedNumpyMetadataIsRefused:
         arr = np.arange(6, dtype="<f8").reshape(2, 3)
         s = AutoSerializer(enable_integrity_checking=False)
         np.testing.assert_array_equal(s.deserialize(s.serialize(arr)[0]), arr)
+
+
+def _oversized_forged_error() -> SerializationError:
+    """The SerializationError raised by decoding a poisoned columnar entry that carries a 1 MiB
+    column name and a 4 KB forged dtype — the real error object the read-path log sites echo."""
+    big_name = "n" * (1024 * 1024)  # 1 MiB column name (already capped in the field echo, #276)
+    big_dtype = "z" * 4096  # 4 KB forged dtype — numpy echoes the whole string, uncapped (LAB-3131)
+    body = {
+        "columns": [big_name],
+        "index": None,
+        "data": {big_name: {"type": "numeric", "data": b"", "dtype": big_dtype}},
+    }
+    with pytest.raises(SerializationError) as excinfo:
+        AutoSerializer().deserialize(_entry("dataframe", body))
+    return excinfo.value
+
+
+@pytest.mark.unit
+class TestForgedEntryErrorEchoIsBounded:
+    """LAB-3131 AC1: a poisoned columnar entry of any size logs O(1)-bounded text at every wrap
+    site. #276 capped the per-field marker/column echoes, but ``_dtype_from_untrusted`` still
+    echoed the full forged dtype, so the SerializationError message — and every log line built
+    from it — grew with the payload. The bound is applied once, at each read-path wrap site, via
+    :func:`bounded_error`.
+    """
+
+    def test_bounded_error_clips_and_single_lines(self) -> None:
+        clipped = bounded_error(SerializationError("x" * (1024 * 1024) + "\nsecond line"))
+        assert len(clipped) < ERROR_ECHO_MAX + 64
+        assert "truncated, " in clipped and "\n" not in clipped
+
+    def test_forged_dtype_produces_an_unbounded_message(self) -> None:
+        # Guards the premise: without the bound the echoed text really is huge (the 4 KB dtype is
+        # in there in full), so the assertions below are proving the bound does real work.
+        assert len(str(_oversized_forged_error())) > 4096
+
+    def test_handle_decrypt_failure_warning_line_is_bounded(self, caplog) -> None:
+        # _handle_l2_read_error and the wrapper L1 SerializationError guard both route the poisoned
+        # error here; this is the WARNING line emitted on every poisoned read.
+        err = _oversized_forged_error()
+        with caplog.at_level(logging.WARNING):
+            handle_decrypt_failure(err, tier="l2", cache_key="ns:app:key", fail_closed=False)
+        lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
+        assert lines and all(len(line) < 2048 for line in lines)

@@ -729,7 +729,9 @@ class TestColumnarFallbackExtensionDtypes:
         )
 
         data = ser._serialize_dataframe(df)  # previously raised: msgpack can't pack pd.NA
-        out = ser._deserialize_dataframe(data)
+        # _decode_columnar decodes the msgpack body then hands the document to
+        # _deserialize_dataframe (which now takes a decoded document, not bytes).
+        out = ser._decode_columnar(data, "dataframe")
 
         assert list(out.columns) == ["ints", "floats", "objs", "plain"]
         assert out.shape == (4, 4)
@@ -749,7 +751,7 @@ class TestColumnarFallbackExtensionDtypes:
         df = pd.DataFrame({"x": pd.array([1, 2, 3], dtype="int64[pyarrow]")})
 
         data = ser._serialize_dataframe(df)
-        out = ser._deserialize_dataframe(data)
+        out = ser._decode_columnar(data, "dataframe")
 
         assert out["x"].tolist() == [1, 2, 3]
 
@@ -759,7 +761,7 @@ class TestColumnarFallbackExtensionDtypes:
         s = pd.Series(pd.array([1, 2, None, 4], dtype="Int64"), name="n")
 
         data = ser._serialize_series(s)  # previously raised on the pd.NA sentinel
-        out = ser._deserialize_series(data)
+        out = ser._decode_columnar(data, "series")
 
         assert out.name == "n"
         assert out.iloc[0] == 1 and out.iloc[3] == 4
@@ -771,6 +773,6 @@ class TestColumnarFallbackExtensionDtypes:
         ser = AutoSerializer(enable_integrity_checking=False)
         s = pd.Series(pd.array([1, 2, 3], dtype="int64[pyarrow]"), name="x")
 
-        out = ser._deserialize_series(ser._serialize_series(s))
+        out = ser._decode_columnar(ser._serialize_series(s), "series")
 
         assert out.tolist() == [1, 2, 3]

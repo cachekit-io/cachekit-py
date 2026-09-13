@@ -36,6 +36,7 @@ from cachekit.serializers.base import (
     SerializationFormat,
     SerializationMetadata,
     SuspiciousCacheEntryError,
+    bounded_error,
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
@@ -173,10 +174,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
     if fail_closed and isinstance(error, DecryptionAuthenticationError):
         get_logger().error(
             f"{tier.upper()} cache decrypt AUTHENTICATION failure for {redact_cache_key(cache_key)}; "
-            f"failing closed (encryption.fail_closed=True): {error}"
+            f"failing closed (encryption.fail_closed=True): {bounded_error(error)}"
         )
         raise error
-    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {error}")
+    get_logger().warning(
+        f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {bounded_error(error)}"
+    )
     return reason
 
 
@@ -1166,8 +1169,8 @@ class CacheSerializationHandler:
             # SerializationError/EncryptionError: let the outer handler log and handle
             raise
         except Exception as e:
-            get_logger().error(f"Deserialization failed with {self.serializer_name}: {e}")
-            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {e}") from e
+            get_logger().error(f"Deserialization failed with {self.serializer_name}: {bounded_error(e)}")
+            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {bounded_error(e)}") from e
 
     def _deserialize_interop(self, data: str | bytes | memoryview, cache_key: str) -> Any:
         """Interop/v1 read path: config decides encryption, never the stored bytes.
@@ -1211,8 +1214,8 @@ class CacheSerializationHandler:
         except (ValueError, SerializationError):
             raise
         except Exception as e:
-            get_logger().error(f"Interop deserialization failed: {e}")
-            raise SerializationError(f"Failed to deserialize interop cache entry: {e}") from e
+            get_logger().error(f"Interop deserialization failed: {bounded_error(e)}")
+            raise SerializationError(f"Failed to deserialize interop cache entry: {bounded_error(e)}") from e
 
 
 class CacheOperationHandler:
