@@ -288,15 +288,12 @@ jobs:
   # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
   # deny-list: a deny-list fails open on a new label, `CacheKit` casing,
   # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
-  # Every `runs-on:` and matrix `os:` value must be one of the exact labels in
-  # the allow-list regex below or the literal `${{ matrix.os }}`, written inline
-  # where the guard can read it: no fromJSON matrices, no flow-style
-  # `{runs-on: x}`, no reusable workflows from other repos (their runs-on lives
-  # outside this scan). Exact labels, not a hosted-prefix pattern: a prefix
-  # match would admit any label renamed `ubuntu-<anything>`. This is drift
-  # protection for maintainers, NOT a fork-PR control: a fork PR runs the
-  # fork's copy of this file and can simply delete the guard; the control for
-  # that lives in repository and org runner settings, outside this file.
+  # The program is the heredoc below; its regression fixtures are
+  # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
+  # guard cannot pass anything. This is drift protection for maintainers, NOT
+  # a fork-PR control: a fork PR runs the fork's copy of this file and can
+  # simply delete the guard; the control for that lives in repository and org
+  # runner settings, outside this file.
   runner-drift-guard:
     name: Runner Drift Guard
     runs-on: ubuntu-latest
@@ -304,44 +301,57 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Every runs-on / matrix os value is an allow-listed GitHub-hosted label
+    # The program stays in this workflow file on purpose: GITHUB_TOKEN cannot
+    # write .github/workflows/, so a `contents: write` job (release-please) or
+    # a compromised action could rewrite a script under .github/scripts/ but
+    # not this heredoc. It is written to a temp file so the self-test and the
+    # scan run the same bytes.
+    - name: Write the guard program
       run: |
-        # One awk pass, no shell pipeline: a program error exits non-zero and
-        # fails the step (fail closed) instead of reading as "no match".
-        # Comments are stripped before matching; `- os:` covers matrix include
-        # entries. Same command runs locally: paste it from here.
-        awk -f /dev/stdin .github/workflows/*.y*ml <<'AWK'
+        cat > "$RUNNER_TEMP/runner-drift-guard.awk" <<'AWK'
+          # Allow-list, fail closed: every runs-on value, and every os value
+          # inside a matrix block, must be one of the exact hosted labels in
+          # HOSTED or the matrix.os expression. This is a line scanner, not a
+          # YAML parser: a line that could hide a runner label from it is an
+          # error, never a skip. Exact labels, not a hosted-prefix pattern (a
+          # prefix admits any self-hosted label named ubuntu-<anything>) and not
+          # a copy of GitHub's image table (it rots): adopting another hosted
+          # image is a deliberate edit to HOSTED. Out of scope, deliberately:
+          # YAML obfuscation (explicit `?` keys, escape sequences, tags on keys)
+          # is a deliberate act, not drift; the control for that lives in
+          # repository and org runner settings, outside this file.
+          BEGIN { HOSTED = "^(ubuntu|macos|windows)-latest$" }
           FNR == 1 { matrix_indent = -1 }
           { sub(/#.*/, ""); $0 = tolower($0) }
           /^[[:space:]]*$/ { next }
-          # A runner set where the rule below cannot read it is an error, not
-          # a skip: flow-style `{runs-on: x}` / `{os: [..]}`, a matrix built by
-          # an expression, a job calling a reusable workflow in another repo,
-          # or a YAML anchor/alias/merge key — `matrix: *shared` (or `<<: *shared`)
-          # would place `os:` behind an alias this scanner never resolves, so an
-          # anchored self-hosted value could hide outside any `matrix:` block the
-          # indent tracker below sees (LAB-3500 #288 review finding).
-          /[{,][[:space:]]*["']?(runs-on|os)["']?[[:space:]]*:/ ||
-          /^[[:space:]]*(-[[:space:]]*)?(matrix|include|exclude)[[:space:]]*:[[:space:]]*\$\{\{/ ||
-          /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*\*/ ||
-          /^[[:space:]]*(-[[:space:]]*)?<<[[:space:]]*:/ ||
-          (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
-            printf "::error file=%s,line=%d::runner set where the drift guard cannot read it — write `runs-on: <label>` / `os: [<labels>]` inline, spell matrices out (no fromJSON), call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
-            bad = 1
-          }
-          # Track nesting inside a `matrix:` block by indentation, so a bare
-          # `os:` is validated only there — the same key also names a
-          # workflow_dispatch input or an action's `with:` parameter, and
-          # those aren't runner selection (CodeRabbit, LAB-3500 #288). `matrix:`
-          # only ever appears under `strategy:` in workflow YAML, so tracking
-          # the key alone is enough; `runs-on:` has no such ambiguity and stays
-          # validated unconditionally.
+          # Track the matrix block by indentation: a bare os: is validated only
+          # there, because the same key names a workflow_dispatch input or an
+          # action with: parameter, which select no runner. The tracker arms
+          # only on a bare `matrix:` line — anything else on that line (an
+          # expression, anchor, alias, tag or flow map) leaves the block unread,
+          # so the rule below rejects the line instead of guessing what is on it.
           {
             match($0, /^[[:space:]]*(-[[:space:]]*)?/)
             indent = RLENGTH
             if (matrix_indent >= 0 && indent <= matrix_indent) matrix_indent = -1
           }
           /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*$/ { matrix_indent = indent }
+          # Lines that may hide a runner label: a flow mapping carrying a
+          # runner/strategy/matrix key; strategy: or matrix: with any inline
+          # value, include: with one inside a matrix; a YAML merge key or a bare
+          # alias item; a job calling a reusable workflow in another repo (its
+          # runs-on is outside this scan; ./.github/workflows/ callees are
+          # scanned). Accepted false positives, all fail-closed: an env/with key
+          # named matrix or strategy with an inline value; a flow map with an
+          # os key.
+          /[{,][[:space:]]*["']?(runs-on|os|strategy|matrix|include)["']?[[:space:]]*:/ ||
+          /^[[:space:]]*(-[[:space:]]*)?["']?(strategy|matrix)["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?include["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ && matrix_indent >= 0) ||
+          /^[[:space:]]*(-[[:space:]]*)?(<<[[:space:]]*:|\*[^*[:space:]])/ ||
+          (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
+            printf "::error file=%s,line=%d::line may hide a runner label from the drift guard — write `runs-on: <label>` / `os: [<labels>]` inline; keep `strategy:`, `matrix:`, `include:` as bare keys over a static block (no expressions, anchors, aliases or flow maps); call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
+            bad = 1
+          }
           /^[[:space:]]*(-[[:space:]]*)?["']?runs-on["']?[[:space:]]*:/ ||
           (/^[[:space:]]*(-[[:space:]]*)?["']?os["']?[[:space:]]*:/ && matrix_indent >= 0) {
             v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
@@ -349,15 +359,23 @@ jobs:
             if (v ~ /^\[/ && v !~ /\]$/) v = ""
             gsub(/[][ "']/, "", v)
             n = split(v, items, ",")
-            ok = (n > 0)
-            for (i = 1; i <= n; i++) if (items[i] !~ /^(ubuntu|macos|windows)-latest$/) ok = 0
+            ok = (v != "")
+            for (i = 1; i <= n; i++) if (items[i] !~ HOSTED) ok = 0
             if (!ok) {
-              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners (LAB-3500); adopting a new hosted image means extending the allow-list in this job\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
+              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners (LAB-3500); adopting a new hosted image means extending HOSTED in the runner-drift-guard job of ci.yml\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
               bad = 1
             }
           }
           END { exit bad }
         AWK
+
+    - name: Guard self-test (regression fixtures)
+      run: bash .github/scripts/runner-drift-guard-selftest.sh "$RUNNER_TEMP/runner-drift-guard.awk"
+
+    # One awk pass, no shell pipeline: a program error exits non-zero and fails
+    # the step (fail closed) instead of reading as "no match".
+    - name: Every runs-on / matrix os value is an allow-listed GitHub-hosted label
+      run: awk -f "$RUNNER_TEMP/runner-drift-guard.awk" .github/workflows/*.y*ml
 
   # Summary job (required for branch protection)
   ci-success:
