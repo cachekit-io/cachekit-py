@@ -25,10 +25,19 @@ jobs:
   # Lint, format, type check (runs on all events)
   quick-check:
     name: Format & Lint
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    # `uv sync` builds the Rust extension via maturin into ./target, and clippy
+    # below compiles the same workspace — cache the dependency artifacts and the
+    # cargo registry across runs.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies
       run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
@@ -80,8 +89,8 @@ jobs:
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write  # Required for Codecov OIDC
@@ -98,6 +107,17 @@ jobs:
         docker run -d --name redis -p 6379:6379 \
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+        cache-suffix: py${{ matrix.python-version }}
+
+    # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
+    # leg — legs sharing one key would restore the wrong interpreter's build.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py${{ matrix.python-version }}
 
     - name: Install dependencies
       run: uv sync --python ${{ matrix.python-version }} --group dev
@@ -182,8 +202,8 @@ jobs:
   # transparently falls back to its pure-Python parser.
   test-freethreaded:
     name: Tests (Python 3.14t, GIL disabled)
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -192,6 +212,15 @@ jobs:
         docker run -d --name redis -p 6379:6379 \
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+        cache-suffix: py3.14t
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py3.14t
 
     - name: Install dependencies (test group only)
       run: uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
@@ -219,10 +248,16 @@ jobs:
   post-merge:
     name: Post-Merge Checks
     if: github.event_name == 'push'
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Check Python ↔ Rust version consistency
       run: |
@@ -248,18 +283,52 @@ jobs:
     - name: Run markdown documentation tests
       run: make test-docs-examples
 
+  # LAB-1161 / LAB-3500 option (a): this repo is public and forkable, so every
+  # job runs on GitHub-hosted runners — never on the org's self-hosted ARC pool
+  # (labels `cachekit`, `cachekit-lean`). Fail the workflow if a runs-on or
+  # matrix runner value drifts back. This is drift protection for maintainers,
+  # NOT a fork-PR control: a fork PR runs the fork's copy of this file and can
+  # simply delete the guard. The server-side control is the runner group
+  # (`cachekit-private`, allows_public_repositories=false) — LAB-1161 stage 2.
+  runner-drift-guard:
+    name: Runner Drift Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: No self-hosted runner labels in .github/workflows/
+      run: |
+        # Strip YAML comments first, then match the label only where it can
+        # take effect: `runs-on:` / matrix `os:` / `runner:` keys, bare list
+        # items, and quoted tokens (fromJSON matrices, inline flow sequences).
+        # Bare prose mentions (this comment, `import cachekit`) do not match.
+        label='(cachekit(-lean)?|self-hosted)'
+        rc=0
+        for f in .github/workflows/*.yml; do
+          if sed 's/#.*//' "$f" | grep -nE \
+               -e "^[[:space:]]*(runs-on|os|runner)[[:space:]]*:.*(^|[^-A-Za-z0-9_./])${label}([^-A-Za-z0-9_.]|$)" \
+               -e "^[[:space:]]*-[[:space:]]*['\"]?${label}['\"]?[[:space:]]*$" \
+               -e "['\"]${label}['\"]"; then
+            echo "::error file=$f::self-hosted runner label in a public repo workflow — every job must run on GitHub-hosted runners (LAB-1161)"
+            rc=1
+          fi
+        done
+        exit $rc
+
   # Summary job (required for branch protection)
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [quick-check, test, test-freethreaded]
+    needs: [quick-check, test, test-freethreaded, runner-drift-guard]
     if: always()
     steps:
     - name: Check all jobs succeeded
       run: |
         if [[ "${{ needs.quick-check.result }}" != "success" ]] || \
            [[ "${{ needs.test.result }}" != "success" ]] || \
-           [[ "${{ needs.test-freethreaded.result }}" != "success" ]]; then
+           [[ "${{ needs.test-freethreaded.result }}" != "success" ]] || \
+           [[ "${{ needs.runner-drift-guard.result }}" != "success" ]]; then
           echo "One or more jobs failed"
           exit 1
         fi

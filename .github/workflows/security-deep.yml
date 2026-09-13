@@ -16,24 +16,14 @@ jobs:
   # Deep security analysis (< 2 hours) - nightly scheduled
   kani-verification:
     name: Kani Formal Verification
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Pin rustup/cargo to /tmp (single fs) to avoid EXDEV on toolchain staging,
-      # and so the kani-verifier binary lands in a known, PATH-able location. The
-      # runner's default CARGO_HOME/bin is not on PATH, so cargo-kani exited 127.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Put cargo bin on PATH
-      run: echo "/tmp/cargo/bin" >> "$GITHUB_PATH"
-
     - name: Ensure stable toolchain
       run: |
-        # Runner image ships stable; only install if missing.
-        # Full `toolchain install` can hit EXDEV in containers (rust-lang/rustup#1239).
+        # Hosted image ships stable (and ~/.cargo/bin is on PATH); only install if missing.
         rustup toolchain list | grep -q stable || rustup toolchain install stable
 
     - name: Install Kani
@@ -48,17 +38,12 @@ jobs:
 
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
-    runs-on: cachekit
-    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
-    # no cross-run cache) + ~10 min ASAN builds + 3 x 60 min fuzz time
-    # (-max_total_time is pure fuzz time, excluding builds) + slack.
+    runs-on: ubuntu-latest
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (hosted runner starts
+    # cold; no cross-run cache on this nightly job) + ~10 min ASAN builds
+    # + 3 x 60 min fuzz time (-max_total_time is pure fuzz time, excluding
+    # builds) + slack. Must stay under the 360 min GitHub-hosted hard cap.
     timeout-minutes: 240
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
-      # toolchain across overlay/hostPath boundaries on the ARC runner pod
-      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -72,7 +57,7 @@ jobs:
 
     - name: Install cargo-fuzz
       # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
-      # release immediate code exec on the self-hosted runner. Same pattern as
+      # release immediate code exec on the CI runner. Same pattern as
       # kani-verifier above and fuzz-smoke.yml.
       run: cargo install --locked cargo-fuzz --version 0.13.2
 
@@ -133,16 +118,21 @@ jobs:
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
     # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
-    # interpreter uv builds atheris from sdist, which needs clang + libFuzzer
-    # (find_libfuzzer.sh) — absent on the self-hosted runner, so install fails
-    # before any fuzzing runs. Both uv sync and uv run must pin, or uv run
-    # re-resolves to a different interpreter and re-triggers the source build.
+    # interpreter uv builds atheris from sdist, which needs clang plus a
+    # matching libFuzzer archive (find_libfuzzer.sh) that runner images do not
+    # reliably ship, so install fails before any fuzzing runs. Both uv sync and
+    # uv run must pin, or uv run re-resolves to a different interpreter and
+    # re-triggers the source build.
     - name: Install dependencies
       run: |
         uv sync --group dev --group fuzz --python 3.11
@@ -175,14 +165,8 @@ jobs:
 
   miri-full:
     name: Miri Full Suite
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
-      # toolchain across overlay/hostPath boundaries on the ARC runner pod
-      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -198,14 +182,8 @@ jobs:
 
   sanitizers:
     name: Sanitizers (ASan, TSan, MSan)
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages the nightly
-      # toolchain / rust-src across overlay/hostPath boundaries on the ARC runner
-      # pod (rust-lang/rustup#1239). Same pattern as fuzzing / miri-full jobs.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     strategy:
       fail-fast: false
       matrix:
@@ -252,7 +230,7 @@ jobs:
 
   generate-security-report:
     name: Generate Security Report
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
     steps:
