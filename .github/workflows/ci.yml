@@ -315,7 +315,9 @@ jobs:
         # Comments are stripped before matching; `- os:` covers matrix include
         # entries. Same command runs locally: paste it from here.
         awk -f /dev/stdin .github/workflows/*.y*ml <<'AWK'
+          FNR == 1 { matrix_indent = -1 }
           { sub(/#.*/, ""); $0 = tolower($0) }
+          /^[[:space:]]*$/ { next }
           # A runner set where the rule below cannot read it is an error, not
           # a skip: flow-style `{runs-on: x}` / `{os: [..]}`, a matrix built by
           # an expression, or a job calling a reusable workflow in another repo.
@@ -325,7 +327,21 @@ jobs:
             printf "::error file=%s,line=%d::runner set where the drift guard cannot read it — write `runs-on: <label>` / `os: [<labels>]` inline, spell matrices out (no fromJSON), call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
             bad = 1
           }
-          /^[[:space:]]*(-[[:space:]]*)?["']?(runs-on|os)["']?[[:space:]]*:/ {
+          # Track nesting inside a `matrix:` block by indentation, so a bare
+          # `os:` is validated only there — the same key also names a
+          # workflow_dispatch input or an action's `with:` parameter, and
+          # those aren't runner selection (CodeRabbit, LAB-3500 #288). `matrix:`
+          # only ever appears under `strategy:` in workflow YAML, so tracking
+          # the key alone is enough; `runs-on:` has no such ambiguity and stays
+          # validated unconditionally.
+          {
+            match($0, /^[[:space:]]*(-[[:space:]]*)?/)
+            indent = RLENGTH
+            if (matrix_indent >= 0 && indent <= matrix_indent) matrix_indent = -1
+          }
+          /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*$/ { matrix_indent = indent }
+          /^[[:space:]]*(-[[:space:]]*)?["']?runs-on["']?[[:space:]]*:/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?os["']?[[:space:]]*:/ && matrix_indent >= 0) {
             v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
             if (v ~ /^["']?\$\{\{[[:space:]]*matrix\.os[[:space:]]*\}\}["']?$/) next
             if (v ~ /^\[/ && v !~ /\]$/) v = ""
