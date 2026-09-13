@@ -11,7 +11,7 @@ resolution-markers = [
 constraints = [
     { name = "fonttools", specifier = ">=4.60.2" },
     { name = "h2", specifier = ">=4.4.1" },
-    { name = "pip", specifier = ">=26.1.2" },
+    { name = "pip", specifier = ">=26.2" },
     { name = "urllib3", specifier = ">=2.7.0" },
     { name = "werkzeug", specifier = ">=3.1.4" },
 ]
