@@ -73,6 +73,19 @@ class TestDataFrameSeriesReadRoutes:
         data, _ = s.serialize(value)
         _assert_equal(s.deserialize(data), value)
 
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_roundtrip_cross_config_written_off_read_on(self, value: pd.DataFrame | pd.Series) -> None:
+        """LAB-2736 regression: an entry written with integrity off (no ByteStorage envelope)
+        must still reconstruct through the columnar decoder when read by a reader with
+        integrity on — not fall through to returning the raw wire dict unchecked."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        out = reader.deserialize(data, meta)
+        assert type(out) is type(value)
+        _assert_equal(out, value)
+
 
 @pytest.mark.unit
 class TestDeserializedArraysAreWritable:
@@ -134,6 +147,36 @@ class TestDataFrameSeriesCorruptionDiagnostic:
         corrupted[len(corrupted) // 2] ^= 0xFF
         with pytest.raises(SerializationError):
             s.deserialize(bytes(corrupted), meta)
+
+
+@pytest.mark.unit
+class TestEnvelopeVerificationVsNotAnEnvelope:
+    """LAB-2736: ``retrieve()`` raises a distinct type for a verified-but-corrupt envelope
+    (checksum/decompression/size failure) vs. bytes that were never a ByteStorage envelope
+    at all (e.g. written with integrity checking off). ``deserialize`` must fail closed on
+    the former and keep falling through to the plain-msgpack path only on the latter.
+    """
+
+    def test_corrupted_payload_names_the_integrity_failure(self) -> None:
+        s = AutoSerializer()
+        data, meta = s.serialize({"nums": list(range(2000))})
+
+        corrupted = bytearray(data)
+        corrupted[len(corrupted) // 2] ^= 0xFF
+        with pytest.raises(SerializationError) as exc_info:
+            s.deserialize(bytes(corrupted), meta)
+
+        message = str(exc_info.value)
+        assert "envelope verification" in message
+        assert "not a decodable MessagePack" not in message
+
+    def test_plain_msgpack_written_with_integrity_off_still_falls_through(self) -> None:
+        off = AutoSerializer(enable_integrity_checking=False)
+        payload = {"a": 1, "b": [1, 2, 3]}
+        data, _ = off.serialize(payload)
+
+        on = AutoSerializer(enable_integrity_checking=True)
+        assert on.deserialize(data) == payload
 
 
 # A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a
