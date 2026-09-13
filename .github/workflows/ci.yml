@@ -320,9 +320,15 @@ jobs:
           /^[[:space:]]*$/ { next }
           # A runner set where the rule below cannot read it is an error, not
           # a skip: flow-style `{runs-on: x}` / `{os: [..]}`, a matrix built by
-          # an expression, or a job calling a reusable workflow in another repo.
+          # an expression, a job calling a reusable workflow in another repo,
+          # or a YAML anchor/alias/merge key — `matrix: *shared` (or `<<: *shared`)
+          # would place `os:` behind an alias this scanner never resolves, so an
+          # anchored self-hosted value could hide outside any `matrix:` block the
+          # indent tracker below sees (LAB-3500 #288 security-panel finding).
           /[{,][[:space:]]*["']?(runs-on|os)["']?[[:space:]]*:/ ||
           /^[[:space:]]*(-[[:space:]]*)?(matrix|include|exclude)[[:space:]]*:[[:space:]]*\$\{\{/ ||
+          /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*\*/ ||
+          /^[[:space:]]*(-[[:space:]]*)?<<[[:space:]]*:/ ||
           (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
             printf "::error file=%s,line=%d::runner set where the drift guard cannot read it — write `runs-on: <label>` / `os: [<labels>]` inline, spell matrices out (no fromJSON), call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
             bad = 1
