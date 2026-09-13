@@ -284,23 +284,19 @@ jobs:
     - name: Run markdown documentation tests
       run: make test-docs-examples
 
-  # LAB-1161 / LAB-3500: this repo is public and forkable, so every job runs on
-  # GitHub-hosted runners — never on the org's self-hosted ARC pool (labels
-  # `cachekit`, `cachekit-lean`). Allow-list, not deny-list: a deny-list fails
-  # open on a new pool label, `CacheKit` casing, `${{ vars.X }}` indirection or
-  # the mapping form `runs-on: {group:, labels:}`. Every `runs-on:` and matrix
-  # `os:` value must be one of the exact labels in the allow-list regex below
-  # or the literal `${{ matrix.os }}`, written inline where the guard can read
-  # it: no fromJSON matrices, no flow-style `{runs-on: x}`, no reusable
-  # workflows from other repos (their runs-on lives outside this scan). Exact
-  # labels, not a hosted-prefix pattern: a prefix match would admit a pool
-  # label renamed `ubuntu-<anything>`. This is
-  # drift protection for maintainers, NOT a fork-PR control: a fork PR runs the
-  # fork's copy of this file and can simply delete the guard. The server-side
-  # control is the runner group `cachekit-private` (allows_public_repositories
-  # =false); the pool moves into it in LAB-1161 stage 2, which is staged behind
-  # this change — until stage 2 lands a fork editing its copy can still reach
-  # the pool.
+  # LAB-3500: this repo is public and forkable, so every job runs on
+  # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
+  # deny-list: a deny-list fails open on a new label, `CacheKit` casing,
+  # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
+  # Every `runs-on:` and matrix `os:` value must be one of the exact labels in
+  # the allow-list regex below or the literal `${{ matrix.os }}`, written inline
+  # where the guard can read it: no fromJSON matrices, no flow-style
+  # `{runs-on: x}`, no reusable workflows from other repos (their runs-on lives
+  # outside this scan). Exact labels, not a hosted-prefix pattern: a prefix
+  # match would admit any label renamed `ubuntu-<anything>`. This is drift
+  # protection for maintainers, NOT a fork-PR control: a fork PR runs the
+  # fork's copy of this file and can simply delete the guard; the control for
+  # that lives in repository and org runner settings, outside this file.
   runner-drift-guard:
     name: Runner Drift Guard
     runs-on: ubuntu-latest
@@ -324,7 +320,7 @@ jobs:
           # or a YAML anchor/alias/merge key — `matrix: *shared` (or `<<: *shared`)
           # would place `os:` behind an alias this scanner never resolves, so an
           # anchored self-hosted value could hide outside any `matrix:` block the
-          # indent tracker below sees (LAB-3500 #288 security-panel finding).
+          # indent tracker below sees (LAB-3500 #288 review finding).
           /[{,][[:space:]]*["']?(runs-on|os)["']?[[:space:]]*:/ ||
           /^[[:space:]]*(-[[:space:]]*)?(matrix|include|exclude)[[:space:]]*:[[:space:]]*\$\{\{/ ||
           /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*\*/ ||
@@ -356,7 +352,7 @@ jobs:
             ok = (n > 0)
             for (i = 1; i <= n; i++) if (items[i] !~ /^(ubuntu|macos|windows)-latest$/) ok = 0
             if (!ok) {
-              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo never runs on the self-hosted pool (LAB-1161); adopting a new hosted image means extending the allow-list in this job\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
+              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners (LAB-3500); adopting a new hosted image means extending the allow-list in this job\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
               bad = 1
             }
           }
