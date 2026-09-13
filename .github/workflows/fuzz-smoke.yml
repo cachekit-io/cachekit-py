@@ -26,7 +26,8 @@ jobs:
     # Budget (cold): ~2 min rustup + ~10 min cargo-fuzz install + ~10 min
     # one-shot ASAN build of all targets + ~1 min per fuzz target (count derived
     # from `cargo fuzz list`, ~14 min today) + slack. rust-cache below skips the
-    # install and most of the build on a warm run.
+    # install and most of the build on a warm run — this workflow is PR-only, so
+    # a PR's first push is cold and later pushes to the same PR are warm.
     timeout-minutes: 45
 
     steps:

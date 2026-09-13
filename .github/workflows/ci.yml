@@ -32,7 +32,7 @@ jobs:
 
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        enable-cache: true
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
 
     # `uv sync` builds the Rust extension via maturin into ./target, and clippy
     # below compiles the same workspace — cache the dependency artifacts and the
@@ -110,11 +110,13 @@ jobs:
 
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        enable-cache: true
-        cache-suffix: py${{ matrix.python-version }}
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
 
     # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
-    # leg — legs sharing one key would restore the wrong interpreter's build.
+    # leg — with one shared key the first leg to save wins and every other leg
+    # restores foreign pyo3 artifacts and rebuilds anyway (cargo fingerprints
+    # catch the mismatch), so the cache would thrash instead of hit.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         key: py${{ matrix.python-version }}
@@ -215,12 +217,10 @@ jobs:
 
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        enable-cache: true
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         cache-suffix: py3.14t
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        key: py3.14t
 
     - name: Install dependencies (test group only)
       run: uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
@@ -255,8 +255,9 @@ jobs:
 
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        enable-cache: true
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
 
+    # `uv sync` below builds the Rust extension via maturin — cache its dependencies.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Check Python ↔ Rust version consistency
@@ -283,13 +284,19 @@ jobs:
     - name: Run markdown documentation tests
       run: make test-docs-examples
 
-  # LAB-1161 / LAB-3500 option (a): this repo is public and forkable, so every
-  # job runs on GitHub-hosted runners — never on the org's self-hosted ARC pool
-  # (labels `cachekit`, `cachekit-lean`). Fail the workflow if a runs-on or
-  # matrix runner value drifts back. This is drift protection for maintainers,
-  # NOT a fork-PR control: a fork PR runs the fork's copy of this file and can
-  # simply delete the guard. The server-side control is the runner group
-  # (`cachekit-private`, allows_public_repositories=false) — LAB-1161 stage 2.
+  # LAB-1161 / LAB-3500: this repo is public and forkable, so every job runs on
+  # GitHub-hosted runners — never on the org's self-hosted ARC pool (labels
+  # `cachekit`, `cachekit-lean`). Allow-list, not deny-list: a deny-list fails
+  # open on a new pool label, `CacheKit` casing, `${{ vars.X }}` indirection or
+  # the block form `runs-on: {group:, labels:}`. Every `runs-on:` and matrix
+  # `os:` value must be a hosted label or the literal `${{ matrix.os }}`, so a
+  # runner matrix has to spell its labels out inline (no fromJSON). This is
+  # drift protection for maintainers, NOT a fork-PR control: a fork PR runs the
+  # fork's copy of this file and can simply delete the guard. The server-side
+  # control is the runner group `cachekit-private` (allows_public_repositories
+  # =false); the pool moves into it in LAB-1161 stage 2, which is staged behind
+  # this change — until stage 2 lands a fork editing its copy can still reach
+  # the pool.
   runner-drift-guard:
     name: Runner Drift Guard
     runs-on: ubuntu-latest
@@ -297,24 +304,28 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: No self-hosted runner labels in .github/workflows/
+    - name: Every runs-on / matrix os value is a GitHub-hosted label
       run: |
-        # Strip YAML comments first, then match the label only where it can
-        # take effect: `runs-on:` / matrix `os:` / `runner:` keys, bare list
-        # items, and quoted tokens (fromJSON matrices, inline flow sequences).
-        # Bare prose mentions (this comment, `import cachekit`) do not match.
-        label='(cachekit(-lean)?|self-hosted)'
-        rc=0
-        for f in .github/workflows/*.yml; do
-          if sed 's/#.*//' "$f" | grep -nE \
-               -e "^[[:space:]]*(runs-on|os|runner)[[:space:]]*:.*(^|[^-A-Za-z0-9_./])${label}([^-A-Za-z0-9_.]|$)" \
-               -e "^[[:space:]]*-[[:space:]]*['\"]?${label}['\"]?[[:space:]]*$" \
-               -e "['\"]${label}['\"]"; then
-            echo "::error file=$f::self-hosted runner label in a public repo workflow — every job must run on GitHub-hosted runners (LAB-1161)"
-            rc=1
-          fi
-        done
-        exit $rc
+        # One awk pass, no shell pipeline: a program error exits non-zero and
+        # fails the step (fail closed) instead of reading as "no match".
+        # Comments are stripped before matching; `- os:` covers matrix include
+        # entries. Same command runs locally: paste it from here.
+        awk -f /dev/stdin .github/workflows/*.y*ml <<'AWK'
+          { sub(/#.*/, "") }
+          /^[[:space:]]*(-[[:space:]]*)?(runs-on|os)[[:space:]]*:/ {
+            v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+            if (v ~ /^["']?\$\{\{[[:space:]]*matrix\.os[[:space:]]*\}\}["']?$/) next
+            gsub(/[][ "']/, "", v)
+            n = split(v, items, ",")
+            ok = (n > 0)
+            for (i = 1; i <= n; i++) if (items[i] !~ /^(ubuntu|macos|windows)-[a-z0-9.-]+$/) ok = 0
+            if (!ok) {
+              printf "::error file=%s,line=%d::runner value \"%s\" is not a GitHub-hosted label — this public repo never runs on the self-hosted pool (LAB-1161)\n", FILENAME, FNR, (v == "" ? "<empty / block form>" : v)
+              bad = 1
+            }
+          }
+          END { exit bad }
+        AWK
 
   # Summary job (required for branch protection)
   ci-success:

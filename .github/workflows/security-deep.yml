@@ -13,18 +13,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Deep security analysis (< 2 hours) - nightly scheduled
+  # Deep security analysis - nightly scheduled
   kani-verification:
     name: Kani Formal Verification
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Ensure stable toolchain
-      run: |
-        # Hosted image ships stable (and ~/.cargo/bin is on PATH); only install if missing.
-        rustup toolchain list | grep -q stable || rustup toolchain install stable
 
     - name: Install Kani
       run: |
@@ -39,10 +34,13 @@ jobs:
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
     runs-on: ubuntu-latest
-    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (hosted runner starts
-    # cold; no cross-run cache on this nightly job) + ~10 min ASAN builds
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install + ~10 min ASAN builds
     # + 3 x 60 min fuzz time (-max_total_time is pure fuzz time, excluding
     # builds) + slack. Must stay under the 360 min GitHub-hosted hard cap.
+    # No rust-cache here on purpose: a nightly job's 10 min install is noise
+    # against 180 min of fuzz time, and it would be one more cache competing
+    # for the repo's 10 GB budget (fuzz-smoke.yml caches the same toolchain
+    # where PR latency matters).
     timeout-minutes: 240
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -123,9 +121,13 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    # No uv or Rust cache on this nightly job: the cold `uv sync` (maturin
+    # build included) is noise against 30 min of fuzz time, and an unsuffixed
+    # uv cache would just restore the cp312 wheel set the PR jobs save.
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        enable-cache: true
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        enable-cache: false
 
     # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
     # interpreter uv builds atheris from sdist, which needs clang plus a

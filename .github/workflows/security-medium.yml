@@ -22,9 +22,9 @@ jobs:
   cargo-geiger:
     name: Unsafe Code Tracking
     runs-on: ubuntu-latest
-    # cargo-geiger pulls in the `cargo` crate, so a cold `cargo install` is a
-    # long compile on a hosted runner; rust-cache keeps the binary across runs.
-    timeout-minutes: 30
+    # cargo-geiger pulls in the `cargo` crate; measured ~4 min cold on a hosted
+    # runner, and rust-cache keeps the binary across runs.
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -65,7 +65,7 @@ jobs:
   miri-subset:
     name: Miri UB Detection (Subset)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
