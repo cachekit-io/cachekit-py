@@ -203,6 +203,11 @@ jobs:
     # continue-on-error instead: junit.xml feeds Codecov Test Analytics (flaky-test
     # history) only and nothing gates on it, so a Codecov-side outage marks this
     # step failed-and-continued and the job stays green.
+    # That downgrade is visibility only: the wrapper exits before it chmods or runs
+    # the binary, so a bad signature here still runs no downloaded code. Nor does it hide
+    # an integrity failure on same-repo events: the coverage step above verifies the
+    # same CLI, key and checksum hard-fail first, so a signature that cannot pass
+    # reddens the job there before this step runs.
     #
     # `handle_no_reports_found` is left at its default (false) on both uploads on
     # purpose: it would also swallow "the report was never written", which is the
