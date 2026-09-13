@@ -203,11 +203,13 @@ def _column_values(info: dict[str, Any], what: str) -> Any:
 
 
 def _column_trio(series: Any) -> dict[str, Any]:
-    """Build the ``{type, data[, dtype]}`` marker for one column/Series, the write-side mirror of
-    :func:`_column_values`.
+    """Build one column's/Series' marker — the write-side mirror of :func:`_column_values`.
 
-    One writer for both the DataFrame-column and the bare-Series paths, so the marker set and key
-    order live in a single place and a third marker cannot be added to one side only. Plain NumPy
+    The marker is the 3-key ``{type: "numeric", data, dtype}`` for a plain-numeric column and the
+    2-key ``{type: "object", data}`` otherwise (the ``dtype`` key is numeric-only) — "trio" names
+    the maximal numeric form. One writer for both the DataFrame-column and the bare-Series paths, so
+    the marker set and key order live in a single place and a third marker cannot be added to one
+    side only (the AC3 goal). Plain NumPy
     numeric dtypes take the raw-buffer path; everything else (nullable/extension dtypes) takes the
     NA-safe object path so pd.NA/NaT do not crash msgpack (#160). Wire bytes and key order MUST
     stay byte-identical to the interop fixtures.

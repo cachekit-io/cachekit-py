@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import functools
 import logging
+from unittest import mock
 
 import msgpack
 import pytest
 
 from cachekit._rust_serializer import ByteStorage
-from cachekit.cache_handler import handle_decrypt_failure
+from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, handle_decrypt_failure
+from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import ERROR_ECHO_MAX, SerializationError, bounded_error
 
@@ -280,10 +282,17 @@ class TestForgedEntryErrorEchoIsBounded:
     :func:`bounded_error`.
     """
 
-    def test_bounded_error_clips_and_single_lines(self) -> None:
-        clipped = bounded_error(SerializationError("x" * (1024 * 1024) + "\nsecond line"))
-        assert len(clipped) < ERROR_ECHO_MAX + 64
-        assert "truncated, " in clipped and "\n" not in clipped
+    def test_bounded_error_clips_and_neutralizes_control_chars(self) -> None:
+        # Over-length text is clipped to O(1) with the true length preserved for forensics.
+        clipped = bounded_error(SerializationError("x" * (1024 * 1024)))
+        assert len(clipped) <= ERROR_ECHO_MAX + 64
+        assert "1048576 chars total" in clipped
+        # Every line/terminal-control char is escaped, so the result is one terminal-safe line —
+        # not just \n/\r (ANSI \x1b, vertical tab \x0b, Unicode line-sep U+2028 all handled).
+        raw = "a\nb\rc\x1bd\x0be" + chr(0x2028) + "f"  # newline, CR, ANSI ESC, VT, U+2028 line-sep
+        unsafe = bounded_error(SerializationError(raw))
+        assert not any(ch in unsafe for ch in "\n\r\x1b\x0b" + chr(0x2028))
+        assert "\\x1b" in unsafe
 
     def test_forged_dtype_produces_an_unbounded_message(self) -> None:
         # Guards the premise: without the bound the echoed text really is huge (the 4 KB dtype is
@@ -297,4 +306,24 @@ class TestForgedEntryErrorEchoIsBounded:
         with caplog.at_level(logging.WARNING):
             handle_decrypt_failure(err, tier="l2", cache_key="ns:app:key", fail_closed=False)
         lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
-        assert lines and all(len(line) < 2048 for line in lines)
+        # Line = fixed template + one bounded_error() echo, so it is O(1) in ERROR_ECHO_MAX,
+        # independent of the (multi-MB) forged payload.
+        assert lines and all(len(line) < ERROR_ECHO_MAX + 256 for line in lines)
+
+    def test_end_to_end_l2_read_of_forged_entry_logs_bounded_line(self, caplog) -> None:
+        # The real read plumbing: get_cached_value -> _handle_l2_read_error -> handle_decrypt_failure.
+        # Catches a regression if a future edit logs the poisoned error ahead of the bounded site.
+        err = _oversized_forged_error()
+        serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        serialization.deserialize_data.side_effect = err
+        serialization.encryption_fail_closed = False  # real bool: a MagicMock is truthy -> fail-closed
+        serialization.supports_mmap_read.return_value = False
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator())
+        backend = mock.MagicMock()
+        backend.get.return_value = b"poisoned-entry-bytes"
+        handler.set_cache_handler(backend)
+
+        with caplog.at_level(logging.WARNING):
+            assert handler.get_cached_value("ns:app:key") is None  # fail-open miss
+        lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
+        assert lines and all(len(line) < ERROR_ECHO_MAX + 256 for line in lines)
