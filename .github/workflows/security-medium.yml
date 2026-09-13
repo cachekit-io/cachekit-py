@@ -3,6 +3,7 @@ name: Security Medium
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:  # Manual re-run / pre-merge validation of the workflow itself
 
 permissions:
   contents: read
@@ -17,13 +18,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Medium security checks (< 15 min) - post-merge validation
+  # Medium security checks - post-merge validation
   cargo-geiger:
     name: Unsafe Code Tracking
-    runs-on: cachekit
+    runs-on: ubuntu-latest
+    # cargo-geiger pulls in the `cargo` crate; measured ~4 min cold on a hosted
+    # runner, and rust-cache keeps the binary across runs.
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install cargo-geiger
       run: cargo install --locked cargo-geiger
@@ -59,14 +64,8 @@ jobs:
 
   miri-subset:
     name: Miri UB Detection (Subset)
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
-      # toolchain across overlay/hostPath boundaries on the ARC runner pod
-      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
