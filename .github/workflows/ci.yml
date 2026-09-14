@@ -25,10 +25,19 @@ jobs:
   # Lint, format, type check (runs on all events)
   quick-check:
     name: Format & Lint
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # `uv sync` builds the Rust extension via maturin into ./target, and clippy
+    # below compiles the same workspace — cache the dependency artifacts and the
+    # cargo registry across runs.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies
       run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
@@ -80,8 +89,8 @@ jobs:
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write  # Required for Codecov OIDC
@@ -98,6 +107,19 @@ jobs:
         docker run -d --name redis -p 6379:6379 \
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
+
+    # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
+    # leg — with one shared key the first leg to save wins and every other leg
+    # restores foreign pyo3 artifacts and rebuilds anyway (cargo fingerprints
+    # catch the mismatch), so the cache would thrash instead of hit.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py${{ matrix.python-version }}
 
     - name: Install dependencies
       run: uv sync --python ${{ matrix.python-version }} --group dev
@@ -182,8 +204,8 @@ jobs:
   # transparently falls back to its pure-Python parser.
   test-freethreaded:
     name: Tests (Python 3.14t, GIL disabled)
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -192,6 +214,13 @@ jobs:
         docker run -d --name redis -p 6379:6379 \
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: py3.14t
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies (test group only)
       run: uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
@@ -219,10 +248,17 @@ jobs:
   post-merge:
     name: Post-Merge Checks
     if: github.event_name == 'push'
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # `uv sync` below builds the Rust extension via maturin — cache its dependencies.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Check Python ↔ Rust version consistency
       run: |
@@ -248,18 +284,112 @@ jobs:
     - name: Run markdown documentation tests
       run: make test-docs-examples
 
+  # LAB-3500: this repo is public and forkable, so every job runs on
+  # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
+  # deny-list: a deny-list fails open on a new label, `CacheKit` casing,
+  # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
+  # The program is the heredoc below; its regression fixtures are
+  # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
+  # guard cannot pass anything. This is drift protection for maintainers, NOT
+  # a fork-PR control: a fork PR runs the fork's copy of this file and can
+  # simply delete the guard; the control for that lives in repository and org
+  # runner settings, outside this file.
+  runner-drift-guard:
+    name: Runner Drift Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    # The program stays in this workflow file on purpose: GITHUB_TOKEN cannot
+    # write .github/workflows/, so a `contents: write` job (release-please) or
+    # a compromised action could rewrite a script under .github/scripts/ but
+    # not this heredoc. It is written to a temp file so the self-test and the
+    # scan run the same bytes.
+    - name: Write the guard program
+      run: |
+        cat > "$RUNNER_TEMP/runner-drift-guard.awk" <<'AWK'
+          # Allow-list, fail closed: every runs-on value, and every os value
+          # inside a matrix block, must be one of the exact hosted labels in
+          # HOSTED or the matrix.os expression. This is a line scanner, not a
+          # YAML parser: a line that could hide a runner label from it is an
+          # error, never a skip. Exact labels, not a hosted-prefix pattern (a
+          # prefix admits any self-hosted label named ubuntu-<anything>) and not
+          # a copy of GitHub's image table (it rots): adopting another hosted
+          # image is a deliberate edit to HOSTED. Out of scope, deliberately:
+          # YAML obfuscation (explicit `?` keys, escape sequences, tags on keys)
+          # is a deliberate act, not drift; the control for that lives in
+          # repository and org runner settings, outside this file.
+          BEGIN { HOSTED = "^(ubuntu|macos|windows)-latest$" }
+          FNR == 1 { matrix_indent = -1 }
+          { sub(/#.*/, ""); $0 = tolower($0) }
+          /^[[:space:]]*$/ { next }
+          # Track the matrix block by indentation: a bare os: is validated only
+          # there, because the same key names a workflow_dispatch input or an
+          # action with: parameter, which select no runner. The tracker arms
+          # only on a bare `matrix:` line — anything else on that line (an
+          # expression, anchor, alias, tag or flow map) leaves the block unread,
+          # so the rule below rejects the line instead of guessing what is on it.
+          {
+            match($0, /^[[:space:]]*(-[[:space:]]*)?/)
+            indent = RLENGTH
+            if (matrix_indent >= 0 && indent <= matrix_indent) matrix_indent = -1
+          }
+          /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*$/ { matrix_indent = indent }
+          # Lines that may hide a runner label: a flow mapping carrying a
+          # runner/strategy/matrix key; strategy: or matrix: with any inline
+          # value, include: with one inside a matrix; a YAML merge key or a bare
+          # alias item; a job calling a reusable workflow in another repo (its
+          # runs-on is outside this scan; ./.github/workflows/ callees are
+          # scanned). Accepted false positives, all fail-closed: an env/with key
+          # named matrix or strategy with an inline value; a flow map with an
+          # os key.
+          /[{,][[:space:]]*["']?(runs-on|os|strategy|matrix|include)["']?[[:space:]]*:/ ||
+          /^[[:space:]]*(-[[:space:]]*)?["']?(strategy|matrix)["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?include["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ && matrix_indent >= 0) ||
+          /^[[:space:]]*(-[[:space:]]*)?(<<[[:space:]]*:|\*[^*[:space:]])/ ||
+          (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
+            printf "::error file=%s,line=%d::line may hide a runner label from the drift guard — write `runs-on: <label>` / `os: [<labels>]` inline; keep `strategy:`, `matrix:`, `include:` as bare keys over a static block (no expressions, anchors, aliases or flow maps); call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
+            bad = 1
+          }
+          /^[[:space:]]*(-[[:space:]]*)?["']?runs-on["']?[[:space:]]*:/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?os["']?[[:space:]]*:/ && matrix_indent >= 0) {
+            v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+            if (v ~ /^["']?\$\{\{[[:space:]]*matrix\.os[[:space:]]*\}\}["']?$/) next
+            if (v ~ /^\[/ && v !~ /\]$/) v = ""
+            gsub(/[][ "']/, "", v)
+            n = split(v, items, ",")
+            ok = (v != "")
+            for (i = 1; i <= n; i++) if (items[i] !~ HOSTED) ok = 0
+            if (!ok) {
+              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners (LAB-3500); adopting a new hosted image means extending HOSTED in the runner-drift-guard job of ci.yml\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
+              bad = 1
+            }
+          }
+          END { exit bad }
+        AWK
+
+    - name: Guard self-test (regression fixtures)
+      run: bash .github/scripts/runner-drift-guard-selftest.sh "$RUNNER_TEMP/runner-drift-guard.awk"
+
+    # One awk pass, no shell pipeline: a program error exits non-zero and fails
+    # the step (fail closed) instead of reading as "no match".
+    - name: Every runs-on / matrix os value is an allow-listed GitHub-hosted label
+      run: awk -f "$RUNNER_TEMP/runner-drift-guard.awk" .github/workflows/*.y*ml
+
   # Summary job (required for branch protection)
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [quick-check, test, test-freethreaded]
+    needs: [quick-check, test, test-freethreaded, runner-drift-guard]
     if: always()
     steps:
     - name: Check all jobs succeeded
       run: |
         if [[ "${{ needs.quick-check.result }}" != "success" ]] || \
            [[ "${{ needs.test.result }}" != "success" ]] || \
-           [[ "${{ needs.test-freethreaded.result }}" != "success" ]]; then
+           [[ "${{ needs.test-freethreaded.result }}" != "success" ]] || \
+           [[ "${{ needs.runner-drift-guard.result }}" != "success" ]]; then
           echo "One or more jobs failed"
           exit 1
         fi
