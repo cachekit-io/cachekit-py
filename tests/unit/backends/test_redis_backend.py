@@ -7,15 +7,26 @@ which CI only runs on push-to-main.
 Regression coverage for #154: the shared pools must use decode_responses=False so
 binary payloads (LZ4 / Arrow IPC / AES-256-GCM ciphertext) are never UTF-8 decoded,
 and RedisBackend.get() must return those raw bytes (or None) without coercion.
+
+Regression coverage for the distributed-lock executor stall: ``acquire_lock`` must
+not hold an executor thread while a waiter polls (see
+``TestRedisLockWaitersDoNotPinExecutorThreads``).
 """
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import pytest
+from redis.commands.core import Script
+from redis.connection import Encoder
+from redis.lock import Lock
 
 from cachekit.backends.redis import RedisBackend
+from cachekit.backends.redis.provider import PerRequestRedisBackend
 
 
 @pytest.mark.unit
@@ -250,3 +261,67 @@ class TestRedisBackendGetContract:
         # bytes|None narrowing guard must hold defensively (no str coercion).
         backend = self._backend_returning("unexpected-str")
         assert backend.get("k") is None
+
+
+class _FakeRedis:
+    """Just enough of ``redis.Redis`` for ``redis.lock.Lock``: SET NX PX plus the release script.
+
+    Guarded by a mutex because ``acquire_lock`` runs each attempt on an executor thread.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, bytes] = {}
+        self._mutex = threading.Lock()
+
+    def get_encoder(self) -> Encoder:
+        return Encoder("utf-8", "strict", False)
+
+    def register_script(self, script: str) -> Script:
+        return Script(self, script)
+
+    def set(self, name: str, value: bytes, nx: bool = False, px: int | None = None) -> bool | None:
+        with self._mutex:
+            if nx and name in self._store:
+                return None
+            self._store[name] = value
+            return True
+
+    def evalsha(self, _sha: str, _numkeys: int, name: str, token: bytes) -> int:
+        """The only script ``Lock`` runs here is LUA_RELEASE: delete iff the token still matches."""
+        with self._mutex:
+            if self._store.get(name) != token:
+                return 0
+            del self._store[name]
+            return 1
+
+
+@pytest.mark.unit
+class TestRedisLockWaitersDoNotPinExecutorThreads:
+    """A lock waiter must not hold an executor thread while it waits.
+
+    ``acquire_lock`` used to run redis-py's *blocking* ``Lock.acquire`` inside
+    ``asyncio.to_thread``. With more concurrent misses on one key than the default
+    executor has threads (``min(32, cpu_count + 4)`` — 8 on a 4-vCPU CI host), every
+    thread sat in a polling loop, the holder's own ``get``/``set``/``release`` (also
+    ``to_thread`` calls) queued behind them, every waiter hit ``blocking_timeout`` and
+    recomputed — a stampede from the feature that exists to prevent one. This pins the
+    executor at 2 threads and runs 4 contenders: red on the blocking implementation
+    (two waiters time out), green when the wait happens on the event loop.
+    """
+
+    async def test_all_contenders_acquire_when_executor_is_smaller_than_contention(self, monkeypatch):
+        # Lock caches its Script objects on the class. An earlier test may have registered
+        # them against a MagicMock client, whose "release" would never delete our key.
+        for attr in ("lua_release", "lua_extend", "lua_reacquire"):
+            monkeypatch.setattr(Lock, attr, None)
+
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+        backend = PerRequestRedisBackend(_FakeRedis(), tenant_id="t")
+
+        async def contend() -> bool:
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=2.0) as acquired:
+                await asyncio.sleep(0.05)  # the holder's compute
+                return acquired
+
+        results = await asyncio.gather(*(contend() for _ in range(4)))
+        assert results == [True] * 4, f"waiters starved the executor and timed out: {results}"
