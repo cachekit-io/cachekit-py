@@ -16,6 +16,7 @@ not hold an executor thread while a waiter polls (see
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from unittest.mock import Mock, patch
 import pytest
 from redis.commands.core import Script
 from redis.connection import Encoder
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.lock import Lock
 
 from cachekit.backends.redis import RedisBackend
@@ -282,6 +284,7 @@ class _FakeRedis:
         self.nx_entered: threading.Event | None = None
         self.block_nx: threading.Event | None = None
         self.nx_done: threading.Event | None = None
+        self.nx_error: Exception | None = None  # raised by the NX SET once unblocked, in place of a result
 
     def get_encoder(self) -> Encoder:
         return Encoder("utf-8", "strict", False)
@@ -294,6 +297,8 @@ class _FakeRedis:
             self.nx_entered.set()
         if nx and self.block_nx is not None:
             self.block_nx.wait()
+        if nx and self.nx_error is not None:
+            raise self.nx_error
         with self._mutex:
             if nx:
                 self.nx_attempts.append(time.monotonic())
@@ -313,6 +318,19 @@ class _FakeRedis:
                 return 0
             del self._store[name]
             return 1
+
+
+async def _entered(event: threading.Event, what: str) -> None:
+    """Poll a thread-side event from the loop; ``to_thread(event.wait)`` would take the very executor thread under test."""
+    deadline = time.monotonic() + 2.0
+    while not event.is_set():
+        assert time.monotonic() < deadline, what
+        await asyncio.sleep(0.01)
+
+
+async def _acquire_once(backend: PerRequestRedisBackend) -> None:
+    async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None):
+        pass
 
 
 @pytest.mark.unit
@@ -407,15 +425,8 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
         fake.nx_done = threading.Event()
         backend = PerRequestRedisBackend(fake, tenant_id="t")
 
-        async def acquire() -> None:
-            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None):
-                pass
-
-        task = asyncio.create_task(acquire())
-        deadline = time.monotonic() + 2.0
-        while not fake.nx_entered.is_set():
-            assert time.monotonic() < deadline, "executor thread never entered the SET NX call"
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(_acquire_once(backend))
+        await _entered(fake.nx_entered, "executor thread never entered the SET NX call")
 
         task.cancel()
         fake.block_nx.set()  # let the executor thread finish the SET NX (it wins the lock)
@@ -430,3 +441,116 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         lock_name = backend._scoped_key("k") + ":lock"
         assert lock_name not in fake._store, "lock won after cancellation must still be released"
+
+    async def test_second_cancellation_while_draining_the_attempt_still_releases_the_lock(self):
+        """A cancel landing while the first one waits out the in-flight SET NX must not orphan the key.
+
+        Awaiting the attempt bare once its shield is cancelled hands the *next* ``task.cancel()``
+        straight to the attempt task: its result is lost and the release skipped. Red on that
+        code, green once the attempt is awaited uninterrupted.
+        """
+        fake = _FakeRedis()
+        fake.nx_entered = threading.Event()
+        fake.block_nx = threading.Event()
+        fake.nx_done = threading.Event()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        task = asyncio.create_task(_acquire_once(backend))
+        await _entered(fake.nx_entered, "executor thread never entered the SET NX call")
+
+        task.cancel()
+        await asyncio.sleep(0)  # first cancellation lands; acquire_lock is now waiting out the attempt
+        task.cancel()
+        fake.block_nx.set()  # the executor thread finishes the SET NX and wins the lock
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert fake.nx_done.wait(2.0), "executor thread never finished the SET NX"
+        assert backend._scoped_key("k") + ":lock" not in fake._store, "lock won under repeated cancellation must be released"
+
+    async def test_second_cancellation_while_the_release_is_queued_still_releases_the_lock(self):
+        """A cancel landing while ``lock.release`` still waits for an executor thread must not orphan the key.
+
+        With every executor thread busy — the saturation this class exists for — the release
+        sits in the pool's queue, and a bare ``await to_thread(lock.release)`` lets the next
+        ``task.cancel()`` cancel that queued work item, so the release never runs. Red on that
+        code, green once the release is awaited uninterrupted.
+        """
+        fake = _FakeRedis()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+        pool = ThreadPoolExecutor(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(pool)
+        holding = asyncio.Event()
+
+        async def hold() -> None:
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None) as acquired:
+                assert acquired
+                holding.set()
+                await asyncio.Event().wait()  # hold the lock until cancelled
+
+        task = asyncio.create_task(hold())
+        await holding.wait()
+
+        busy = threading.Event()
+        pool.submit(busy.wait)  # the only executor thread is now taken; the release will queue behind it
+        task.cancel()
+        await asyncio.sleep(0)  # first cancellation lands; the release is queued for the pool
+        task.cancel()
+        busy.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        pool.shutdown(wait=True)  # whatever survived in the queue has run by now
+        assert backend._scoped_key("k") + ":lock" not in fake._store, "lock must be released despite repeated cancellation"
+
+    async def test_attempt_failing_during_cancellation_is_logged_not_raised(self, caplog):
+        """A Redis error from the in-flight attempt must not replace the ``CancelledError``; it is logged instead."""
+        fake = _FakeRedis()
+        fake.nx_entered = threading.Event()
+        fake.block_nx = threading.Event()
+        fake.nx_error = RedisConnectionError("redis went away")
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        task = asyncio.create_task(_acquire_once(backend))
+        await _entered(fake.nx_entered, "executor thread never entered the SET NX call")
+        task.cancel()
+        fake.block_nx.set()  # the executor thread now fails the SET NX
+
+        with pytest.raises(asyncio.CancelledError), caplog.at_level(logging.WARNING, logger="cachekit.backends.redis.provider"):
+            await task
+        assert any(
+            r.levelno == logging.WARNING and r.exc_info and isinstance(r.exc_info[1], RedisConnectionError)
+            for r in caplog.records
+        ), "a failed attempt swallowed by cancellation must be logged with its traceback"
+
+    async def test_cancellation_mid_attempt_that_loses_leaves_the_holders_lock_alone(self, caplog):
+        """A cancelled attempt that loses to an existing holder has nothing to release: no release call, nothing logged."""
+        fake = _FakeRedis()
+        fake.nx_entered = threading.Event()
+        fake.block_nx = threading.Event()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+        lock_name = backend._scoped_key("k") + ":lock"
+        fake._store[lock_name] = b"someone-else"
+
+        task = asyncio.create_task(_acquire_once(backend))
+        await _entered(fake.nx_entered, "executor thread never entered the SET NX call")
+        task.cancel()
+        fake.block_nx.set()  # the executor thread finishes the SET NX and loses
+
+        with pytest.raises(asyncio.CancelledError), caplog.at_level(logging.DEBUG, logger="cachekit.backends.redis.provider"):
+            await task
+        assert fake._store[lock_name] == b"someone-else"
+        assert not caplog.records, "a lost attempt must not try to release (a bare release would log at DEBUG)"
+
+    async def test_release_failing_in_redis_is_logged_and_leaves_the_key_to_its_ttl(self, caplog, monkeypatch):
+        """Redis failing the release is the one gap left: the caller sees no error, the key lives until its TTL."""
+        fake = _FakeRedis()
+        monkeypatch.setattr(fake, "evalsha", Mock(side_effect=RedisConnectionError("redis went away")))
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit.backends.redis.provider"):
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None) as acquired:
+                assert acquired
+
+        assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
+        assert any("releasing" in r.getMessage() and r.levelno == logging.DEBUG for r in caplog.records)

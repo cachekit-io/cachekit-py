@@ -11,11 +11,13 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 from urllib.parse import quote as url_encode
 
 import redis
@@ -28,6 +30,29 @@ logger = logging.getLogger(__name__)
 
 # Module-level ContextVar for async-safe tenant isolation
 tenant_context: ContextVar[Optional[str]] = ContextVar("tenant_context", default=None)
+
+T = TypeVar("T")
+
+
+async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
+    """Await ``fut`` to completion even if the current task is cancelled meanwhile.
+
+    ``asyncio.to_thread`` work is uninterruptible once an executor thread picks it up, and a
+    still-queued work item is dropped if its future is cancelled first — so a cancelled awaiter
+    either loses the outcome of a round-trip that still completes, or loses the round-trip
+    itself. ``asyncio.wait`` never cancels its inputs and never unwraps their result, so keep
+    waiting on ``fut`` until it is really done, absorbing every cancellation, then re-raise the
+    last one: callers read ``fut`` for the real outcome before letting it propagate.
+    """
+    cancelled: Optional[asyncio.CancelledError] = None
+    while not fut.done():
+        try:
+            await asyncio.wait({fut})
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return fut.result()
 
 
 class PerRequestRedisBackend:
@@ -362,10 +387,10 @@ class PerRequestRedisBackend:
             the waiters, every waiter times out, and all of them recompute.
             Sets thread_local=False because attempts and release may run on different
             executor threads.
+            Cancellation is drained, not raced: an in-flight attempt or release round-trip
+            always runs to completion, a lock the attempt wins is released, and only then is
+            the ``CancelledError`` re-raised.
         """
-        import asyncio
-        import uuid
-
         # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
@@ -385,30 +410,34 @@ class PerRequestRedisBackend:
             deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
             token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
 
-            async def _release() -> None:
+            def _release_sync() -> None:
                 try:
-                    await asyncio.to_thread(lock.release)
-                except Exception as e:
+                    lock.release()
+                except redis.RedisError as e:
                     # Lock may have expired - log but don't fail
                     logger.debug("Error releasing Redis lock (may have expired): %s", e)
 
+            async def _release() -> None:
+                # Uninterrupted: with the executor saturated the release sits in the pool's queue,
+                # and a cancellation landing then would drop it and orphan the key for its TTL.
+                await _await_uninterrupted(asyncio.ensure_future(asyncio.to_thread(_release_sync)))
+
             while True:
-                # asyncio.to_thread cannot be interrupted once the executor thread starts the
-                # SET NX round-trip, so a cancellation of the awaiting task doesn't stop it from
-                # winning the lock — only from seeing that it did. Run the attempt as its own task
-                # and await it shielded: on cancellation, wait for the attempt's real result and
-                # release before re-raising, instead of orphaning a won lock for its full TTL.
+                # A cancellation of the awaiting task doesn't stop the executor thread's SET NX
+                # from winning the lock — only the coroutine from seeing that it did. Await the
+                # attempt uninterrupted: on cancellation, recover its real result and release a
+                # won lock before re-raising, instead of orphaning it for its full TTL.
                 attempt = asyncio.ensure_future(asyncio.to_thread(lock.acquire, blocking=False, token=token))
                 try:
-                    acquired = await asyncio.shield(attempt)
+                    acquired = await _await_uninterrupted(attempt)
                 except asyncio.CancelledError:
-                    # Recover the shielded attempt's real result; never let its own failure
-                    # (e.g. a Redis ConnectionError) mask the cancellation — always re-raise.
-                    try:
-                        won = await attempt
-                    except Exception:
-                        won = False
-                    if won:
+                    # The attempt has finished. One that failed (e.g. a Redis ConnectionError) cannot
+                    # have won; log it rather than let it mask the cancellation.
+                    if (err := attempt.exception()) is not None:
+                        logger.warning(
+                            "Redis lock attempt for %s failed while acquire_lock was being cancelled", key, exc_info=err
+                        )
+                    elif attempt.result():
                         await _release()
                     raise
                 # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt

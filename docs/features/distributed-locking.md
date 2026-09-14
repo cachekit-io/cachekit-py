@@ -163,11 +163,12 @@ Three behavioural edges to design around:
 ```
 
 Cancelling the task awaiting `acquire_lock` mid-attempt does not trigger this
-degradation: the in-flight `SET NX` is always awaited to completion, and a lock
-it goes on to win is released before the cancellation propagates, so a
-**single** cancellation never orphans a held lock. A *second* cancellation
-landing during that release is not shielded and re-orphans the key — bounded
-by the same 30 s TTL as the crash case above.
+degradation: the in-flight `SET NX` is awaited to completion — through repeated
+cancellations too — and a lock it goes on to win is released before the
+cancellation propagates. The release round-trip is drained the same way, so a
+cancel landing while it is still queued for an executor thread cannot drop it.
+What remains is Redis itself failing the release, which leaves the key until
+the same 30 s TTL as the crash case above.
 
 ### TTL Shorter Than Compute Time
 ```python
