@@ -395,7 +395,12 @@ class DecoratorConfig:
         Use cases: PII, medical data, financial records, GDPR compliance
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolution is the same as every preset — explicit backend= kwarg, then
+              set_default_backend(), then DefaultBackendProvider env auto-detect at FIRST CALL
+              (CACHEKIT_API_KEY → cachekit.io SaaS; CACHEKIT_REDIS_URL → Redis; then Memcached/File
+              selectors; else REDIS_URL / localhost Redis fallback). .secure does NOT pin the SaaS:
+              with REDIS_URL set and CACHEKIT_API_KEY unset, encrypted values silently go to Redis.
+              When the SaaS is a requirement, pass backend=CachekitIOBackend() explicitly.
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
@@ -552,6 +557,10 @@ class DecoratorConfig:
         Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
         AES-256-GCM encryption — no code changes needed. Auto-detection happens in
         CacheSerializationHandler and applies to ALL presets, not just .io().
+        FAIL-OPEN caveat: if CACHEKIT_MASTER_KEY is absent, the same code silently
+        caches plaintext to the SaaS. When encryption is a security requirement,
+        use @cache.secure(backend=CachekitIOBackend()) instead — it raises at
+        decoration time when no key is present.
 
         Args:
             **kwargs: Overrides (ttl, namespace, etc.)
