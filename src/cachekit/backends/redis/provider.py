@@ -384,8 +384,27 @@ class PerRequestRedisBackend:
             loop = asyncio.get_running_loop()
             deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
             token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
+
+            async def _release() -> None:
+                try:
+                    await asyncio.to_thread(lock.release)
+                except Exception as e:
+                    # Lock may have expired - log but don't fail
+                    logger.debug("Error releasing Redis lock (may have expired): %s", e)
+
             while True:
-                acquired = await asyncio.to_thread(lock.acquire, blocking=False, token=token)
+                # asyncio.to_thread cannot be interrupted once the executor thread starts the
+                # SET NX round-trip, so a cancellation of the awaiting task doesn't stop it from
+                # winning the lock — only from seeing that it did. Run the attempt as its own task
+                # and await it shielded: on cancellation, wait for the attempt's real result and
+                # release before re-raising, instead of orphaning a won lock for its full TTL.
+                attempt = asyncio.ensure_future(asyncio.to_thread(lock.acquire, blocking=False, token=token))
+                try:
+                    acquired = await asyncio.shield(attempt)
+                except asyncio.CancelledError:
+                    if await attempt:
+                        await _release()
+                    raise
                 # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
                 # would land past the deadline. blocking_timeout=None means a single attempt.
                 if acquired or deadline is None or loop.time() + lock.sleep > deadline:
@@ -396,11 +415,7 @@ class PerRequestRedisBackend:
             finally:
                 # Release lock if acquired (also run in thread pool)
                 if acquired:
-                    try:
-                        await asyncio.to_thread(lock.release)
-                    except Exception as e:
-                        # Lock may have expired - log but don't fail
-                        logger.debug("Error releasing Redis lock (may have expired): %s", e)
+                    await _release()
         except Exception as exc:
             raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
 

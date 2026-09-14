@@ -162,6 +162,11 @@ Three behavioural edges to design around:
 # the lock itself self-expires after 30 s (lock_timeout) as the safety net.
 ```
 
+Cancelling the task awaiting `acquire_lock` mid-attempt does not trigger this
+degradation: the in-flight `SET NX` is always awaited to completion, and a lock
+it goes on to win is released before the cancellation propagates, so a
+cancelled waiter never orphans a held lock.
+
 ### TTL Shorter Than Compute Time
 ```python
 @cache(ttl=1)  # 1 second TTL

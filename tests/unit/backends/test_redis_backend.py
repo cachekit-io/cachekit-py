@@ -274,6 +274,14 @@ class _FakeRedis:
         self._store: dict[str, bytes] = {}
         self._mutex = threading.Lock()
         self.nx_attempts: list[float] = []  # monotonic time of every SET NX, i.e. every acquire attempt
+        # Test hooks for the cancellation-mid-attempt race: when set, an NX SET call
+        # signals nx_entered (so the test knows the executor thread is inside the call),
+        # blocks on block_nx until the test releases it, then signals nx_done once the
+        # store write has actually landed — independent of whatever asyncio did with the
+        # coroutine that was awaiting it.
+        self.nx_entered: threading.Event | None = None
+        self.block_nx: threading.Event | None = None
+        self.nx_done: threading.Event | None = None
 
     def get_encoder(self) -> Encoder:
         return Encoder("utf-8", "strict", False)
@@ -282,13 +290,21 @@ class _FakeRedis:
         return Script(self, script)
 
     def set(self, name: str, value: bytes, nx: bool = False, px: int | None = None) -> bool | None:
+        if nx and self.nx_entered is not None:
+            self.nx_entered.set()
+        if nx and self.block_nx is not None:
+            self.block_nx.wait()
         with self._mutex:
             if nx:
                 self.nx_attempts.append(time.monotonic())
             if nx and name in self._store:
-                return None
-            self._store[name] = value
-            return True
+                result = None
+            else:
+                self._store[name] = value
+                result = True
+        if nx and self.nx_done is not None:
+            self.nx_done.set()
+        return result
 
     def evalsha(self, _sha: str, _numkeys: int, name: str, token: bytes) -> int:
         """The only script ``Lock`` runs here is LUA_RELEASE: delete iff the token still matches."""
@@ -375,3 +391,42 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
                 assert contended is False
 
         assert len(fake.nx_attempts) == 2, "blocking_timeout=None must be a single SET NX per acquire_lock"
+
+    async def test_cancellation_mid_attempt_releases_a_lock_it_goes_on_to_win(self):
+        """Cancelling the awaiter while the SET NX round-trip is in flight must not orphan the key.
+
+        ``asyncio.to_thread`` can't be interrupted once the executor thread starts the
+        round-trip, so cancellation only stops the awaiting coroutine from seeing the
+        result — not the thread from winning the lock. Red on the pre-fix code (the
+        `try`/`finally` release block is never reached because the cancellation
+        propagates straight out of the `while True` loop); green with the shield.
+        """
+        fake = _FakeRedis()
+        fake.nx_entered = threading.Event()
+        fake.block_nx = threading.Event()
+        fake.nx_done = threading.Event()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        async def acquire() -> None:
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None):
+                pass
+
+        task = asyncio.create_task(acquire())
+        deadline = time.monotonic() + 2.0
+        while not fake.nx_entered.is_set():
+            assert time.monotonic() < deadline, "executor thread never entered the SET NX call"
+            await asyncio.sleep(0.01)
+
+        task.cancel()
+        fake.block_nx.set()  # let the executor thread finish the SET NX (it wins the lock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The executor thread runs independently of the cancelled coroutine, so wait for
+        # its write to actually land before checking the store — otherwise the assertion
+        # below races the background thread instead of testing the fix.
+        assert fake.nx_done.wait(2.0), "executor thread never finished the SET NX"
+
+        lock_name = backend._scoped_key("k") + ":lock"
+        assert lock_name not in fake._store, "lock won after cancellation must still be released"
