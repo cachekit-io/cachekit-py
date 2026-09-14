@@ -125,6 +125,9 @@ test-quick: setup-logs ## Run fast tests (skip slow tests)
 	fi
 	@echo "$(GREEN)✓ Fast tests completed$(RESET)"
 
+# --cov-fail-under mirrors the PR coverage floor in .github/workflows/ci.yml.
+# This target runs the full suite (>= the PR path's unit+critical coverage), so
+# it clears the floor with margin. Keep the two values in step.
 test-cov: setup-logs ## Run tests with coverage
 	@echo "$(BLUE)Running tests with coverage...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log$(RESET)"
@@ -132,7 +135,7 @@ test-cov: setup-logs ## Run tests with coverage
 		--cov=$(PACKAGE_NAME) \
 		--cov-report=term-missing \
 		--cov-report=html:reports/htmlcov \
-		--cov-fail-under=60 \
+		--cov-fail-under=82 \
 		-q \
 		--tb=short \
 		--basetemp=$(TEST_BASETEMP) 2>&1 | tee $(LOG_TEST_DIR)/cov_$(TIMESTAMP).log; then \
