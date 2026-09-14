@@ -1342,6 +1342,93 @@ class TestSafeUnlinkEdgeCases:
 
 
 @pytest.mark.unit
+class TestSafeUnlinkIfSameInode:
+    """Test _safe_unlink_if_same_inode: LAB-2685, the guard against a path-only unlink
+    racing a concurrent set() that renamed a fresh entry onto the same path."""
+
+    def test_deletes_when_inode_matches(self, backend: FileBackend, config: FileBackendConfig) -> None:
+        """No concurrent rename: fd and path agree, so the stale file is deleted as before."""
+        os.makedirs(config.cache_dir, exist_ok=True)
+        file_path = os.path.join(str(config.cache_dir), "same_inode_target")
+        Path(file_path).write_bytes(b"stale")
+
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            backend._safe_unlink_if_same_inode(fd, file_path)
+        finally:
+            os.close(fd)
+
+        assert not os.path.exists(file_path)
+
+    def test_skips_when_path_was_replaced(self, backend: FileBackend, config: FileBackendConfig) -> None:
+        """A concurrent rename onto the path after the fd was opened must survive."""
+        os.makedirs(config.cache_dir, exist_ok=True)
+        file_path = os.path.join(str(config.cache_dir), "raced_target")
+        Path(file_path).write_bytes(b"stale")
+
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            # Simulate a concurrent set() swapping in a fresh entry between the fd-based
+            # decision and the unlink: same path, different (st_dev, st_ino).
+            fresh_path = file_path + ".fresh"
+            Path(fresh_path).write_bytes(b"fresh")
+            os.rename(fresh_path, file_path)
+
+            backend._safe_unlink_if_same_inode(fd, file_path)
+        finally:
+            os.close(fd)
+
+        assert os.path.exists(file_path)
+        assert Path(file_path).read_bytes() == b"fresh"
+
+    def test_expired_get_does_not_delete_entry_renamed_in_by_concurrent_set(
+        self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for LAB-2685.
+
+        get()'s expiry branch decides "expired" from the header read off a held fd, then must
+        evict only the file that fd actually read. Racing a concurrent set() in right after
+        that fd is opened (well before get() reaches its eviction decision) simulates the
+        real-world case: a reader opens an expired file, a writer's set() renames a fresh entry
+        onto the same path, and the reader must not delete the writer's fresh entry. The race is
+        injected at the first `os.fstat(fd)` in `get()` -- present both before and after the
+        LAB-2685 fix -- so this fails identically against the pre-fix path-only
+        `_safe_unlink(file_path)` and passes only once eviction is inode-guarded.
+        """
+        key = "race_key"
+        file_path = backend._key_to_path(key)
+
+        with time_machine.travel(0, tick=False) as traveller:
+            backend.set(key, b"stale_value", ttl=1)
+            traveller.shift(timedelta(seconds=10))  # now expired
+
+            real_fstat = os.fstat
+            raced = False
+
+            def racing_fstat(fd: int, *args: Any, **kwargs: Any) -> os.stat_result:
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    # Concurrent set() wins the race: rename a fresh entry over file_path right
+                    # after the reader's fd was opened, before it decides to evict anything.
+                    fresh_data = backend._build_header(0) + b"fresh_value"
+                    fresh_path = file_path + ".racer"
+                    Path(fresh_path).write_bytes(fresh_data)
+                    os.rename(fresh_path, file_path)
+                return real_fstat(fd, *args, **kwargs)
+
+            monkeypatch.setattr(os, "fstat", racing_fstat)
+
+            result = backend.get(key)
+
+        # Reader still (correctly) treats the key it looked up as expired/missing...
+        assert result is None
+        # ...but must not delete the fresh entry a concurrent set() renamed into its path.
+        assert os.path.exists(file_path)
+        assert Path(file_path).read_bytes()[HEADER_SIZE:] == b"fresh_value"
+
+
+@pytest.mark.unit
 class TestCalculateCacheSizeEdgeCases:
     """Test _calculate_cache_size error handling."""
 

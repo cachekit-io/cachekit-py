@@ -21,13 +21,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast security checks (< 3 min) - parallel execution
+  # Fast security checks - parallel execution. Hosted runners start cold, so
+  # each tool's first `cargo install` compiles from source; rust-cache keeps
+  # ~/.cargo/bin across runs so later runs skip it (cargo-machete installs in
+  # under a minute cold, so it goes without). Timeouts cover the cold path.
   cargo-audit:
     name: Vulnerability Scan
-    runs-on: cachekit
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    # audit-check runs `cargo install cargo-audit` when the binary is absent;
+    # caching ~/.cargo/bin makes that a one-off.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
       with:
@@ -38,10 +45,12 @@ jobs:
 
   cargo-deny:
     name: License & Supply Chain
-    runs-on: cachekit
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install cargo-deny
       run: cargo install --locked cargo-deny
@@ -51,10 +60,13 @@ jobs:
 
   clippy-security:
     name: Security Lints
-    runs-on: cachekit
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    # Caches target/ and the registry for the clippy build (nothing installed here).
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Run Clippy security lints
       run: |
@@ -64,7 +76,7 @@ jobs:
 
   cargo-machete:
     name: Unused Dependencies
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -79,10 +91,17 @@ jobs:
 
   pip-audit:
     name: Python Dependency CVEs
-    runs-on: cachekit
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # `uv sync` builds the Rust extension via maturin — cache its dependencies.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies
       run: |

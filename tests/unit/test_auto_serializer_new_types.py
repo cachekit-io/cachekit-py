@@ -6,18 +6,60 @@ Tests:
 - Nested complex objects with new types
 - Error detection for unsupported types (Pydantic, ORM, custom classes)
 - Security: _safe_hasattr prevents code execution
+- LAB-2503 exception contract: forged payloads and object-hook diagnostics fail closed as SerializationError
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from uuid import UUID
 
+import msgpack
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from cachekit._rust_serializer import ByteStorage
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import SerializationError
+
+# Well-formed msgpack documents whose ndarray marker makes numpy raise something that is neither
+# a decode-bound rejection nor a ValueError, pinning the serializer's exception contract:
+# OverflowError (dict dtype with itemsize past C long), SyntaxError (numpy's comma-string dtype
+# parser runs ast.literal_eval on the forged shape prefix "(1,f8"), and the M8[0ns] dtype that
+# numpy accepts and pandas then dies on with SIGFPE — refused before any array is built.
+FORGED_NDARRAYS = {
+    "itemsize-past-c-long": msgpack.packb(
+        {"__ndarray__": True, "dtype": {"names": ["a"], "formats": ["f8"], "itemsize": 2**63}, "shape": [1], "data": b"x" * 8}
+    ),
+    "dtype-shape-prefix-unparseable": msgpack.packb({"__ndarray__": True, "dtype": "(1,f8", "shape": [1], "data": b"x" * 8}),
+    "datetime-zero-unit-multiplier": msgpack.packb({"__ndarray__": True, "dtype": "M8[0ns]", "shape": [1], "data": b"x" * 8}),
+}
+
+
+@pytest.mark.parametrize("payload", FORGED_NDARRAYS.values(), ids=list(FORGED_NDARRAYS))
+@pytest.mark.parametrize(
+    "serializer, wrap",
+    [
+        (AutoSerializer(enable_integrity_checking=False), lambda b: b),
+        (AutoSerializer(), lambda b: bytes(ByteStorage("msgpack").store(b, "msgpack"))),
+    ],
+    ids=["plain", "verified-envelope"],
+)
+def test_forged_payload_failure_is_a_serialization_error(
+    serializer: AutoSerializer, wrap: Callable[[bytes], bytes], payload: bytes
+) -> None:
+    with pytest.raises(SerializationError):
+        serializer.deserialize(wrap(payload))
+
+
+def test_hook_diagnostic_propagates_unwrapped_from_the_verified_envelope() -> None:
+    """The object hook's SerializationError sits outside PAYLOAD_DECODE_ERRORS, so it leaves the
+    verified-envelope decode unwrapped — that catch must never widen back to ``Exception``."""
+    entry = bytes(ByteStorage("msgpack").store(msgpack.packb({"__uuid__": True}), "msgpack"))
+    with pytest.raises(SerializationError, match=r"^Invalid UUID format: missing 'value' field") as excinfo:
+        AutoSerializer().deserialize(entry)
+    assert excinfo.value.__cause__ is None
 
 
 class TestAutoSerializerUUID:
@@ -687,7 +729,9 @@ class TestColumnarFallbackExtensionDtypes:
         )
 
         data = ser._serialize_dataframe(df)  # previously raised: msgpack can't pack pd.NA
-        out = ser._deserialize_dataframe(data)
+        # _decode_columnar decodes the msgpack body then hands the document to
+        # _deserialize_dataframe (which now takes a decoded document, not bytes).
+        out = ser._decode_columnar(data, "dataframe")
 
         assert list(out.columns) == ["ints", "floats", "objs", "plain"]
         assert out.shape == (4, 4)
@@ -707,7 +751,7 @@ class TestColumnarFallbackExtensionDtypes:
         df = pd.DataFrame({"x": pd.array([1, 2, 3], dtype="int64[pyarrow]")})
 
         data = ser._serialize_dataframe(df)
-        out = ser._deserialize_dataframe(data)
+        out = ser._decode_columnar(data, "dataframe")
 
         assert out["x"].tolist() == [1, 2, 3]
 
@@ -717,7 +761,7 @@ class TestColumnarFallbackExtensionDtypes:
         s = pd.Series(pd.array([1, 2, None, 4], dtype="Int64"), name="n")
 
         data = ser._serialize_series(s)  # previously raised on the pd.NA sentinel
-        out = ser._deserialize_series(data)
+        out = ser._decode_columnar(data, "series")
 
         assert out.name == "n"
         assert out.iloc[0] == 1 and out.iloc[3] == 4
@@ -729,6 +773,6 @@ class TestColumnarFallbackExtensionDtypes:
         ser = AutoSerializer(enable_integrity_checking=False)
         s = pd.Series(pd.array([1, 2, 3], dtype="int64[pyarrow]"), name="x")
 
-        out = ser._deserialize_series(ser._serialize_series(s))
+        out = ser._decode_columnar(ser._serialize_series(s), "series")
 
         assert out.tolist() == [1, 2, 3]
