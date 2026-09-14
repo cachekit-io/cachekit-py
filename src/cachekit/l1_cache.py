@@ -12,6 +12,11 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
+# Default L1 entry lifetime when the caller supplies no TTL. Shared with the
+# decorator's LAB-557 backfill bound: the server's Fresh-For may only ever
+# SHORTEN the L1 lifetime relative to this default, never extend it.
+DEFAULT_L1_TTL_SECONDS = 300
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,8 +181,7 @@ class L1Cache:
         elif redis_ttl is not None:
             expiry = current_time + redis_ttl - self.ttl_buffer_seconds
         else:
-            # Default 5 minute TTL if not specified
-            expiry = current_time + 300 - self.ttl_buffer_seconds
+            expiry = current_time + DEFAULT_L1_TTL_SECONDS - self.ttl_buffer_seconds
 
         # Skip caching if the effective TTL is non-finite (NaN/inf would create an
         # immortal entry that never expires) or too short (would expire immediately).

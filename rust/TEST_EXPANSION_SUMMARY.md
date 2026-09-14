@@ -55,7 +55,7 @@ Expanded Rust test suite from 900+ tests to **1100+ tests** by adding critical s
 - `test_subtle_multi_byte_patterns`: XOR, swap, increment, block corruption
 
 **Validation**:
-- Blake3 checksums detect all multi-byte corruption patterns
+- xxHash3-64 checksums detect all tested multi-byte corruption patterns
 - Corruption at any offset (start/middle/end) detected
 - Subtle patterns (swap, increment, aligned blocks) caught
 
@@ -234,7 +234,7 @@ cargo test --tests --features compression,encryption
 
 1. **Nonce Generation**: Counter-based approach ([random_iv(8)][counter(4)]) is provably collision-free up to 2^32 operations per instance
 2. **Atomicity**: AtomicU64 with SeqCst ordering ensures thread safety across PyO3 boundary
-3. **Corruption Detection**: Blake3 checksums detect all tested corruption patterns (single/multi-byte, any offset, subtle patterns)
+3. **Corruption Detection**: xxHash3-64 checksums detect all tested corruption patterns (single/multi-byte, any offset, subtle patterns)
 4. **Truncation Handling**: All truncation scenarios properly rejected with clear error messages
 5. **Large Payload Efficiency**: System handles 50MB+ payloads without OOM, with good compression ratios
 6. **Concurrent Safety**: No race conditions or corruption detected in stress tests with 100+ threads

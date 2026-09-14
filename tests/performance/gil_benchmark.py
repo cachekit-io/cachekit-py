@@ -6,11 +6,11 @@ Runs an identical CPU-bound serialize workload across 1, 2, 4, 8 threads under t
 runs GIL-free; under a free-threaded build it shows the parallel ceiling.
 
 Free-threaded comparison is interpreter-driven, not code-driven: run this same script
-under a free-threaded interpreter and compare the efficiency column. Today that is
-blocked for cachekit — PyO3 < 3.14 has no free-threaded support, and orjson /
-numpy / pandas / pyarrow lack free-threaded wheels — so the no-GIL arm is reported as
-unavailable. Once a free-threaded cachekit installs, no change here is needed: the
-same run produces the no-GIL numbers.
+under a free-threaded interpreter and compare the efficiency column. The core
+StandardSerializer path (msgpack + Rust ByteStorage) now runs free-threaded; cross-library
+serializer comparisons (orjson / numpy / pandas / pyarrow) remain unavailable because
+those libraries still ship no cp314t free-threaded wheels. Run this script under a
+free-threaded interpreter to see the no-GIL numbers for the core path.
 
 Run:  uv run python tests/performance/gil_benchmark.py
 """
@@ -84,8 +84,9 @@ def main() -> None:
 
     if gil:
         print("\n  No-GIL arm: run this under a free-threaded interpreter to compare the")
-        print("  efficiency column. Blocked today for cachekit (PyO3 < 3.14; orjson /")
-        print("  numpy / pandas / pyarrow lack free-threaded wheels).")
+        print("  efficiency column. The core StandardSerializer path now runs free-threaded;")
+        print("  cross-library comparisons remain unavailable (orjson / numpy / pandas / pyarrow")
+        print("  lack cp314t free-threaded wheels).")
 
 
 if __name__ == "__main__":

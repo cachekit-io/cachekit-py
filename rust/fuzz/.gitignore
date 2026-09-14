@@ -1,7 +1,8 @@
-# Fuzz corpus and artifacts
-# Corpus growth: allow initial seeds, ignore generated
-corpus/*/
-!corpus/*/.gitkeep
+# corpus/ is deliberately NOT ignored: seeds are committed per target
+# (corpus/<target>/, the layout cargo-fuzz loads by default). Local fuzz runs
+# grow these directories with hash-named discoveries — triage them, then
+# commit keepers (after minimize_corpus.sh) or discard with git clean.
+# The old `corpus/*/` pattern here silently excluded every seed: LAB-1149.
 
 # Artifacts: crashes, hangs, slow inputs
 artifacts/

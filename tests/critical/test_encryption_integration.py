@@ -354,7 +354,7 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         2. A DataFrame survives encrypt -> store-in-Redis -> retrieve -> decrypt unchanged.
         3. The raw bytes in Redis are ciphertext (no plaintext column values).
         """
-        import pandas as pd
+        pd = pytest.importorskip("pandas")  # requires the [data] extra (LAB-511)
 
         from cachekit.cache_handler import CacheSerializationHandler
         from cachekit.config.nested import EncryptionConfig, L1CacheConfig

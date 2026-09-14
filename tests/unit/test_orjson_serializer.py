@@ -10,8 +10,12 @@ from uuid import UUID
 
 import pytest
 
-from cachekit.serializers import OrjsonSerializer
-from cachekit.serializers.base import SerializationError, SerializationFormat
+# OrjsonSerializer requires the [json] extra — absent e.g. in the free-threaded
+# CI lane until orjson ships free-threaded wheels (LAB-511).
+pytest.importorskip("orjson")
+
+from cachekit.serializers import OrjsonSerializer  # noqa: E402
+from cachekit.serializers.base import SerializationError, SerializationFormat  # noqa: E402
 
 
 class TestOrjsonSerializerBasics:

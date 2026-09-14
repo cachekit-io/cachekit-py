@@ -177,7 +177,7 @@ class TestCachetoolsComparison:
         """
         CLAIM: cachekit has Rust-powered serialization and compression.
 
-        This is TRUE. LZ4 compression + Blake3 checksums + MessagePack.
+        This is TRUE. LZ4 compression + xxHash3-64 checksums + MessagePack.
         """
 
         @cache(ttl=300)

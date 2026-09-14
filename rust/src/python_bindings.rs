@@ -1,8 +1,10 @@
 //! Python bindings for cachekit-core
 //!
-//! This module provides thin PyO3 wrappers around cachekit-core functionality.
-//! All business logic is delegated to cachekit-core.
+//! This module provides thin PyO3 wrappers around cachekit-core functionality, plus the
+//! buffer-borrow helper they share. Business logic lives in cachekit-core, except the
+//! SDK-owned msgpack decode bound in `crate::msgpack_bounds`.
 
+use crate::msgpack_bounds::check_msgpack_structure;
 use cachekit_core::ByteStorage;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
@@ -19,6 +21,90 @@ impl Default for PyByteStorage {
     fn default() -> Self {
         Self::new(None)
     }
+}
+
+/// Offset into `base` at which `buf`'s memory starts, iff `buf` is a plain, immutable,
+/// C-contiguous window onto that `bytes` object — the shape `SerializationWrapper.unwrap`
+/// produces. `Some(off)` means `&base.as_bytes()[off..off + buf.item_count()]` is exactly
+/// the buffer's bytes, so the caller can borrow it with a safe slice instead of a raw one.
+///
+/// Every conjunct is load-bearing: `readonly` + a `bytes` base rule out a mutable exporter
+/// racing the GIL-released read; `is_c_contiguous` rules out a strided view whose logical
+/// bytes are not the contiguous span; the range check rules out a spoofed `.obj` naming a
+/// decoy `bytes` the memory does not belong to; and `checked_add` keeps that range check
+/// honest against a forged `Py_buffer` length rather than wrapping past it.
+fn borrowable_offset(buf: &PyBuffer<u8>, base: &Bound<'_, PyBytes>) -> Option<usize> {
+    let bytes = base.as_bytes();
+    let start = bytes.as_ptr() as usize;
+    let ptr = buf.buf_ptr() as usize;
+    let end = ptr.checked_add(buf.item_count())?;
+    (buf.readonly()
+        && buf.is_c_contiguous()
+        && buf.item_count() > 0
+        && ptr >= start
+        && end <= start + bytes.len())
+    .then(|| ptr - start)
+}
+
+/// A read-only view of a Python buffer-protocol object's bytes, borrowed without a copy
+/// whenever that is provably sound and copied otherwise. Holds whatever keeps the memory
+/// alive (the `bytes` object, or the owned copy) so `as_slice` needs no `unsafe`.
+enum BytesView<'py> {
+    /// `(base, offset, len)`: a window onto an immutable `bytes` object kept alive by the
+    /// Bound — the whole object, or the read-only C-contiguous `memoryview` of it that
+    /// `SerializationWrapper.unwrap` produces, proven by `borrowable_offset`. Zero-copy.
+    Borrowed(Bound<'py, PyBytes>, usize, usize),
+    /// Mutable, non-`bytes`-backed, strided, or empty exporter: the only safe answer is a copy.
+    Owned(Vec<u8>),
+}
+
+impl BytesView<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            BytesView::Borrowed(base, off, len) => &base.as_bytes()[*off..*off + *len],
+            BytesView::Owned(v) => v,
+        }
+    }
+}
+
+/// Borrow `obj`'s bytes zero-copy when the BACKING STORAGE is provably immutable, else copy.
+///
+/// `readonly()` describes the view, not the exporter (`memoryview(bytearray).toreadonly()`
+/// passes it while another thread can still mutate the bytearray), and a PEP 688
+/// `__buffer__` exporter can name a decoy `bytes` in `.obj` — so the gate is the containment
+/// proof in `borrowable_offset`, whose payoff is that the borrow is an ORDINARY SLICE of that
+/// `bytes`: bounds-checked by Rust, no `unsafe`, nothing for a stale comment to misstate.
+fn bytes_view<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<BytesView<'py>> {
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(BytesView::Borrowed(b.clone(), 0, b.len()?));
+    }
+    let buf = PyBuffer::<u8>::get(obj)?;
+    let base = obj
+        .getattr("obj")
+        .ok()
+        .and_then(|base| base.cast_into::<PyBytes>().ok());
+    if let Some(base) = base {
+        if let Some(off) = borrowable_offset(&buf, &base) {
+            return Ok(BytesView::Borrowed(base, off, buf.item_count()));
+        }
+    }
+    Ok(BytesView::Owned(buf.to_vec(py)?))
+}
+
+/// Reject a MessagePack document whose headers would make decoding it allocate out of
+/// proportion to its size — see `check_msgpack_structure`. Zero-copy for `bytes` and for
+/// read-only `memoryview`s of `bytes`; raises ValueError naming the violated bound.
+#[pyfunction]
+#[pyo3(name = "check_msgpack_structure")]
+pub fn check_msgpack_structure_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    max_depth: usize,
+) -> PyResult<()> {
+    let view = bytes_view(py, data)?;
+    check_msgpack_structure(view.as_slice(), max_depth).map_err(|what| {
+        PyValueError::new_err(format!("Unpack failed: MessagePack document {what}"))
+    })
 }
 
 #[pymethods]
@@ -52,13 +138,23 @@ impl PyByteStorage {
     /// Retrieve and validate stored bytes
     ///
     /// Args:
-    ///     envelope_bytes: Serialized StorageEnvelope bytes
+    ///     envelope_bytes: Serialized StorageEnvelope — any buffer-protocol object
+    ///         (`bytes`, `memoryview`, `bytearray`), so callers holding a zero-copy
+    ///         `memoryview` (SerializationWrapper.unwrap) never re-coerce to `bytes` (LAB-770)
     ///
     /// Returns:
     ///     Tuple[bytes, str]: (original_data, format_identifier)
-    pub fn retrieve(&self, py: Python, envelope_bytes: &[u8]) -> PyResult<(Vec<u8>, String)> {
+    pub fn retrieve(
+        &self,
+        py: Python,
+        envelope_bytes: &Bound<'_, PyAny>,
+    ) -> PyResult<(Vec<u8>, String)> {
+        // Borrowing across the GIL release below is only sound when the backing storage
+        // is immutable — bytes_view proves that or copies (see its doc).
+        let view = bytes_view(py, envelope_bytes)?;
+        let data = view.as_slice();
         // Detach from the GIL for decompression + checksum (see store()).
-        py.detach(|| self.inner.retrieve(envelope_bytes))
+        py.detach(|| self.inner.retrieve(data))
             .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
     }
 

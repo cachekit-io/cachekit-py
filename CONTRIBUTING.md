@@ -194,6 +194,11 @@ make test-cov
 - Aim for >85% coverage for new code
 - All public APIs must have tests
 - Edge cases and error conditions must be tested
+- CI enforces a **total-coverage floor** inside pytest on every PR
+  (`--cov-fail-under`, value in `.github/workflows/ci.yml`), independent of the
+  Codecov upload — a PR whose combined coverage falls below it fails the `Tests`
+  job. `make test-cov` enforces the same floor locally. Codecov still reports the
+  finer-grained new-code (patch) coverage on top of this.
 
 **Rust Test Coverage**:
 - ByteStorage module: 82% coverage (measured via LLVM source-based coverage)
@@ -201,6 +206,18 @@ make test-cov
 - All Rust functionality validated via Python integration tests in `tests/critical/`
 - PyO3's cdylib architecture prevents LLVM coverage tracking across module boundaries
 - This is a known limitation, not a code quality issue
+
+## Review Guidance
+
+This project uses documentation-only code ownership routing. GitHub's `.github/CODEOWNERS` file is not enforced in this repository (tracked internally as LAB-1151). The guidance below documents which paths benefit from security and maintainer review:
+
+**Security-sensitive paths** — consider requesting review from maintainers:
+- `/rust/` — memory safety, FFI boundaries, cryptography
+- `/src/cachekit/serializers/` and `/src/cachekit/reliability/` — serialization and fault tolerance
+- `/.github/workflows/`, `/pyproject.toml`, `/rust/Cargo.toml`, `/.pre-commit-config.yaml` — supply chain configuration
+- `/tests/security/`, `/tests/fuzz/`, `/SECURITY.md` — security documentation and testing
+
+This is a **single-maintainer org** using documentation instead of enforcement. GitHub's review rulesets on this repo require zero code-owner approvals, so the path guidance above is a routing suggestion for pull requests, not a GitHub-enforced gate.
 
 ## Pull Request Process
 

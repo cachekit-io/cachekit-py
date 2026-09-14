@@ -807,6 +807,27 @@ class TestErrorPaths:
         assert result is None
         assert not os.path.exists(file_path)
 
+    def test_get_survives_short_reads(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """read(2) may return fewer bytes than asked (POSIX; Linux caps one call at ~2 GiB).
+
+        Force every os.read to hand back at most 5 bytes, so the 14-byte header and the payload
+        each need several calls. get() must return the full value, not a truncated one that
+        would fail downstream integrity as spurious corruption.
+        """
+        real_read = os.read
+        calls: list[int] = []
+
+        def short_read(fd: int, n: int) -> bytes:
+            calls.append(n)
+            return real_read(fd, min(n, 5))
+
+        payload = bytes(range(256)) * 8
+        backend.set("short_read_key", payload)
+        monkeypatch.setattr(os, "read", short_read)
+
+        assert backend.get("short_read_key") == payload
+        assert len(calls) > 2, "short reads were not exercised"
+
     def test_get_expired_ttl_deletes_file(self, backend: FileBackend, config: FileBackendConfig) -> None:
         """Test get deletes expired files."""
         key = "expired_key"
@@ -1321,6 +1342,93 @@ class TestSafeUnlinkEdgeCases:
 
 
 @pytest.mark.unit
+class TestSafeUnlinkIfSameInode:
+    """Test _safe_unlink_if_same_inode: LAB-2685, the guard against a path-only unlink
+    racing a concurrent set() that renamed a fresh entry onto the same path."""
+
+    def test_deletes_when_inode_matches(self, backend: FileBackend, config: FileBackendConfig) -> None:
+        """No concurrent rename: fd and path agree, so the stale file is deleted as before."""
+        os.makedirs(config.cache_dir, exist_ok=True)
+        file_path = os.path.join(str(config.cache_dir), "same_inode_target")
+        Path(file_path).write_bytes(b"stale")
+
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            backend._safe_unlink_if_same_inode(fd, file_path)
+        finally:
+            os.close(fd)
+
+        assert not os.path.exists(file_path)
+
+    def test_skips_when_path_was_replaced(self, backend: FileBackend, config: FileBackendConfig) -> None:
+        """A concurrent rename onto the path after the fd was opened must survive."""
+        os.makedirs(config.cache_dir, exist_ok=True)
+        file_path = os.path.join(str(config.cache_dir), "raced_target")
+        Path(file_path).write_bytes(b"stale")
+
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            # Simulate a concurrent set() swapping in a fresh entry between the fd-based
+            # decision and the unlink: same path, different (st_dev, st_ino).
+            fresh_path = file_path + ".fresh"
+            Path(fresh_path).write_bytes(b"fresh")
+            os.rename(fresh_path, file_path)
+
+            backend._safe_unlink_if_same_inode(fd, file_path)
+        finally:
+            os.close(fd)
+
+        assert os.path.exists(file_path)
+        assert Path(file_path).read_bytes() == b"fresh"
+
+    def test_expired_get_does_not_delete_entry_renamed_in_by_concurrent_set(
+        self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for LAB-2685.
+
+        get()'s expiry branch decides "expired" from the header read off a held fd, then must
+        evict only the file that fd actually read. Racing a concurrent set() in right after
+        that fd is opened (well before get() reaches its eviction decision) simulates the
+        real-world case: a reader opens an expired file, a writer's set() renames a fresh entry
+        onto the same path, and the reader must not delete the writer's fresh entry. The race is
+        injected at the first `os.fstat(fd)` in `get()` -- present both before and after the
+        LAB-2685 fix -- so this fails identically against the pre-fix path-only
+        `_safe_unlink(file_path)` and passes only once eviction is inode-guarded.
+        """
+        key = "race_key"
+        file_path = backend._key_to_path(key)
+
+        with time_machine.travel(0, tick=False) as traveller:
+            backend.set(key, b"stale_value", ttl=1)
+            traveller.shift(timedelta(seconds=10))  # now expired
+
+            real_fstat = os.fstat
+            raced = False
+
+            def racing_fstat(fd: int, *args: Any, **kwargs: Any) -> os.stat_result:
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    # Concurrent set() wins the race: rename a fresh entry over file_path right
+                    # after the reader's fd was opened, before it decides to evict anything.
+                    fresh_data = backend._build_header(0) + b"fresh_value"
+                    fresh_path = file_path + ".racer"
+                    Path(fresh_path).write_bytes(fresh_data)
+                    os.rename(fresh_path, file_path)
+                return real_fstat(fd, *args, **kwargs)
+
+            monkeypatch.setattr(os, "fstat", racing_fstat)
+
+            result = backend.get(key)
+
+        # Reader still (correctly) treats the key it looked up as expired/missing...
+        assert result is None
+        # ...but must not delete the fresh entry a concurrent set() renamed into its path.
+        assert os.path.exists(file_path)
+        assert Path(file_path).read_bytes()[HEADER_SIZE:] == b"fresh_value"
+
+
+@pytest.mark.unit
 class TestCalculateCacheSizeEdgeCases:
     """Test _calculate_cache_size error handling."""
 
@@ -1801,3 +1909,156 @@ class TestMmapBuffer:
         monkeypatch.setattr(backend_mod.mmap, "mmap", boom)
         with pytest.raises(BackendError):
             backend.get_buffer("k")
+
+
+@pytest.mark.unit
+class TestShortIO:
+    """POSIX short I/O on the write path, and a file shrinking under a read (LAB-2682).
+
+    Neither is tampering; see the truncated-payload branch in ``FileBackend.get`` for why the
+    backend, not the envelope, must be the layer that says so.
+    """
+
+    def test_set_loops_over_short_writes(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Force every os.write to accept at most 5 bytes: set() must still land the whole value."""
+        real_write = os.write
+        calls: list[int] = []
+
+        def short_write(fd: int, data: bytes) -> int:
+            calls.append(len(data))
+            return real_write(fd, memoryview(data)[:5])
+
+        payload = bytes(range(256)) * 8
+        monkeypatch.setattr(os, "write", short_write)
+        backend.set("short_write_key", payload)
+        monkeypatch.undo()
+
+        assert len(calls) > 2, "short writes were not exercised"
+        assert os.path.getsize(backend._key_to_path("short_write_key")) == HEADER_SIZE + len(payload)
+        assert backend.get("short_write_key") == payload
+
+    def test_set_zero_progress_write_raises_and_leaves_nothing_behind(
+        self, backend: FileBackend, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that makes no progress must fail loudly, not spin or report success."""
+        from cachekit.backends.errors import BackendError
+
+        monkeypatch.setattr(os, "write", lambda fd, data: 0)
+        with pytest.raises(BackendError):
+            backend.set("stuck_key", b"payload")
+        monkeypatch.undo()
+
+        assert backend.get("stuck_key") is None
+        assert not list(Path(config.cache_dir).rglob("*.tmp.*")), "temp file left behind"
+
+    def test_get_file_shrunk_under_read_is_corruption_not_a_hit(
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Payload shorter than st_size - HEADER_SIZE: unlink and miss, like the sibling corruption branches."""
+        key = "shrunk_key"
+        payload = bytes(range(256)) * 8
+        backend.set(key, payload)
+        file_path = backend._key_to_path(key)
+        real_read = os.read
+
+        def truncating_read(fd: int, n: int) -> bytes:
+            if n > HEADER_SIZE:  # the payload read: shrink the file after fstat, before read
+                os.truncate(file_path, HEADER_SIZE + 3)
+            return real_read(fd, n)
+
+        monkeypatch.setattr(os, "read", truncating_read)
+        assert backend.get(key) is None
+        assert not os.path.exists(file_path)
+
+    def test_get_modified_payload_is_served_not_evicted(self, backend: FileBackend) -> None:
+        """AC4 at the backend layer: a same-length modification is not the backend's call.
+
+        Content integrity belongs to the envelope (xxHash3 checksum / AES-GCM tag), so the
+        bytes are handed back unchanged and the file stays for the fail policy to judge.
+        """
+        key = "tampered_key"
+        payload = bytes(range(256)) * 8
+        backend.set(key, payload)
+        file_path = backend._key_to_path(key)
+
+        with open(file_path, "r+b") as f:
+            f.seek(HEADER_SIZE + 10)
+            f.write(b"\xff")
+        tampered = bytearray(payload)
+        tampered[10] = 0xFF
+
+        assert backend.get(key) == bytes(tampered)
+        assert os.path.exists(file_path)
+
+
+@pytest.mark.unit
+class TestShortIOFailClosed:
+    """End-to-end on a real FileBackend: truncation and tampering stay distinguishable under fail-closed (AC4)."""
+
+    _HEX_KEY = "a" * 64
+
+    def _decorated(self, config: FileBackendConfig) -> tuple[Any, list[int]]:
+        from cachekit import cache
+
+        backend = FileBackend(config)
+        calls: list[int] = []
+
+        @cache(
+            backend=backend,
+            ttl=300,
+            l1_enabled=False,
+            encryption=True,
+            single_tenant_mode=True,
+            master_key=self._HEX_KEY,
+            fail_closed=True,
+        )
+        def get_value(x: int) -> dict:
+            calls.append(x)
+            return {"result": x}
+
+        return get_value, calls
+
+    @staticmethod
+    def _only_cache_file(config: FileBackendConfig) -> str:
+        files = [str(p) for p in Path(config.cache_dir).rglob("*") if p.is_file()]
+        assert len(files) == 1, files
+        return files[0]
+
+    def test_tampered_entry_raises_and_is_retained(self, config: FileBackendConfig) -> None:
+        from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+
+        get_value, _ = self._decorated(config)
+        assert get_value(1) == {"result": 1}
+        file_path = self._only_cache_file(config)
+
+        with open(file_path, "r+b") as f:  # flip the last ciphertext byte, length unchanged
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)[0]
+            f.seek(-1, os.SEEK_END)
+            f.write(bytes([last ^ 0xFF]))
+
+        with pytest.raises(DecryptionAuthenticationError):
+            get_value(1)
+        assert os.path.exists(file_path), "tamper evidence must be retained"
+
+    def test_entry_shrunk_under_read_is_a_miss_not_a_tamper_alarm(
+        self, config: FileBackendConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        get_value, calls = self._decorated(config)
+        assert get_value(1) == {"result": 1}
+        file_path = self._only_cache_file(config)
+        real_read = os.read
+
+        def truncating_read(fd: int, n: int) -> bytes:
+            if n > HEADER_SIZE:  # one shot: shrink the file between fstat and the payload read
+                monkeypatch.setattr(os, "read", real_read)
+                # Drop exactly one ciphertext byte so the frame stays structurally valid and the
+                # short ciphertext would reach AES-GCM (tamper-class) without the backend's check.
+                os.truncate(file_path, os.path.getsize(file_path) - 1)
+            return real_read(fd, n)
+
+        monkeypatch.setattr(os, "read", truncating_read)
+        assert get_value(1) == {"result": 1}  # clean miss: recomputed and rewritten, no raise
+        assert calls == [1, 1]
+        assert get_value(1) == {"result": 1}  # the rewritten entry serves
+        assert calls == [1, 1]

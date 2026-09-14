@@ -146,7 +146,7 @@ class OrjsonSerializer:
 
             metadata = SerializationMetadata(
                 serialization_format=SerializationFormat.ORJSON,
-                compressed=False,  # No compression (handled by Rust layer if enabled)
+                compressed=False,  # OrjsonSerializer never uses ByteStorage; output is never compressed
                 encrypted=False,  # Encryption is EncryptionWrapper's responsibility
                 original_type="orjson",
             )

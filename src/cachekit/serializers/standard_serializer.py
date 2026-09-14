@@ -27,7 +27,7 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -328,7 +328,8 @@ class StandardSerializer:
             >>> result == {"test": 123}
             True
         """
-        data = bytes(data)  # coerce unwrap's zero-copy memoryview; no-op when already bytes (Rust retrieve needs bytes)
+        # No bytes() coercion: Rust retrieve accepts the buffer protocol (LAB-770), so
+        # unwrap's zero-copy memoryview flows through without a full-payload copy.
         try:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
@@ -338,11 +339,11 @@ class StandardSerializer:
                 msgpack_data = data
 
             # Deserialize MessagePack
-            return msgpack.unpackb(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
-        except (msgpack.exceptions.UnpackException, ValueError, TypeError) as e:
+        except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
 

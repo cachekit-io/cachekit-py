@@ -140,6 +140,8 @@ class AsyncMetricsCollector:
         import queue
 
         self._metric_queue = queue.Queue(maxsize=max_queue_size)
+        self._pending_metrics = 0
+        self._pending_condition = threading.Condition()
 
         # Worker thread management
         self._shutdown_event = threading.Event()
@@ -166,15 +168,20 @@ class AsyncMetricsCollector:
                 # Wait for metric with timeout to allow shutdown checks
                 metric_data = self._metric_queue.get(timeout=self.worker_timeout)
 
-                # Process the metric
-                self._process_metric(metric_data)
+                try:
+                    # Process the metric
+                    self._process_metric(metric_data)
 
-                # Update statistics
-                with self._stats_lock:
-                    self._stats["processed_count"] += 1
-                    self._stats["queue_size"] = self._metric_queue.qsize()
-
-                self._metric_queue.task_done()
+                    # Update statistics
+                    with self._stats_lock:
+                        self._stats["processed_count"] += 1
+                        self._stats["queue_size"] = self._metric_queue.qsize()
+                finally:
+                    self._metric_queue.task_done()
+                    with self._pending_condition:
+                        self._pending_metrics -= 1
+                        if not self._pending_metrics:
+                            self._pending_condition.notify_all()
 
             except queue.Empty:
                 # Timeout - continue to check shutdown
@@ -182,10 +189,6 @@ class AsyncMetricsCollector:
             except Exception as e:
                 # Log error but keep worker running
                 logger.error(f"Error processing metric in worker thread: {e}")
-                try:
-                    self._metric_queue.task_done()
-                except ValueError:
-                    pass  # task_done() called more times than get()
 
     def _process_metric(self, metric_data: dict):
         """Process a single metric."""
@@ -237,15 +240,18 @@ class AsyncMetricsCollector:
         """Add metric to processing queue."""
         import queue
 
-        try:
-            self._metric_queue.put_nowait(metric_data)
-            with self._stats_lock:
-                self._stats["queue_size"] = self._metric_queue.qsize()
-        except queue.Full:
-            # Queue is full - drop the metric
-            with self._stats_lock:
-                self._stats["dropped_count"] += 1
-            logger.warning(f"Metrics queue full, dropped metric: {metric_data.get('name', 'unknown')}")
+        with self._pending_condition:
+            self._pending_metrics += 1
+            try:
+                self._metric_queue.put_nowait(metric_data)
+            except queue.Full:
+                self._pending_metrics -= 1
+                with self._stats_lock:
+                    self._stats["dropped_count"] += 1
+                logger.warning(f"Metrics queue full, dropped metric: {metric_data.get('name', 'unknown')}")
+            else:
+                with self._stats_lock:
+                    self._stats["queue_size"] = self._metric_queue.qsize()
 
     def record_counter(self, name: str, labels: Optional[dict[str, str]] = None, value: float = 1.0):
         """Record a counter metric."""
@@ -288,12 +294,19 @@ class AsyncMetricsCollector:
             self._stats["dropped_count"] = 0
 
     def flush(self, timeout: float = 2.0):
-        """Flush all pending metrics with timeout."""
-        if self._worker_thread and self._worker_thread.is_alive():
-            # Wait for queue to be processed
-            start_time = time.time()
-            while not self._metric_queue.empty() and (time.time() - start_time) < timeout:
-                time.sleep(0.01)
+        """Flush all pending metrics with timeout.
+
+        Waits for the worker to finish PROCESSING, not merely dequeue.
+        """
+        if not self._worker_thread or not self._worker_thread.is_alive():
+            return  # nothing will ever drain the counter; waiting would only burn the timeout
+        deadline = time.monotonic() + timeout
+        with self._pending_condition:
+            while self._pending_metrics:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._pending_condition.wait(remaining)
 
     def shutdown(self, timeout: float = 2.0):
         """Shutdown the collector gracefully."""

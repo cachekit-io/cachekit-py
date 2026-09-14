@@ -56,6 +56,42 @@ MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
 
 
+def _read_fully(fd: int, n: int) -> bytes:
+    """Read ``n`` bytes from ``fd``, looping over short reads; stops early only at EOF.
+
+    A single read(2) may return fewer bytes than asked (POSIX permits it; Linux caps one call at
+    ~2 GiB), so a lone ``os.read`` can silently truncate a large payload into a spurious integrity
+    failure. A file shorter than ``n`` still yields a short result, so callers' header/integrity
+    validation sees truncation exactly as before. CPython's single-chunk ``join`` returns the chunk
+    itself, so the one-read case (every payload the kernel serves whole) adds no copy and the
+    LAB-770 read-peak bound holds; only a genuinely short-read payload pays a join copy.
+    """
+    chunks: list[bytes] = []
+    while n > 0:
+        chunk = os.read(fd, n)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        n -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_fully(fd: int, data: bytes) -> None:
+    """Write all of ``data`` to ``fd``, looping over short writes; the write twin of ``_read_fully``.
+
+    A single write(2) may store fewer bytes than asked (POSIX permits it; Linux caps one call at
+    ~2 GiB) and ``os.write`` only reports the count, so a lone call can silently truncate a large
+    value that is then fsync'd and renamed into place as a "successful" set (see the
+    truncated-payload branch in ``get`` for what that costs). Raises EIO on zero progress.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError(errno.EIO, f"write made no progress with {view.nbytes} bytes remaining")
+        view = view[written:]
+
+
 class _MmapHandle:
     """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
     header). Zero-copy: the view aliases mapped pages, never a heap copy.
@@ -167,45 +203,60 @@ class FileBackend:
                     self._acquire_file_lock(fd, exclusive=False)
 
                     try:
-                        # Read entire file
-                        file_data = os.read(fd, os.fstat(fd).st_size)
+                        # Header-first read (LAB-770): reading the 14-byte header separately,
+                        # then the payload via _read_fully, avoids the full-payload
+                        # file_data[HEADER_SIZE:] slice copy (~1x payload off the read peak).
+                        st_size = os.fstat(fd).st_size
+                        header = _read_fully(fd, HEADER_SIZE)
 
                         # Validate header
-                        if len(file_data) < HEADER_SIZE:
+                        if len(header) < HEADER_SIZE:
                             # Corrupted file, delete it
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return None
 
                         # Parse header
-                        magic = file_data[0:2]
-                        version = file_data[2]
-                        # flags = struct.unpack(">H", file_data[4:6])[0]  # uint16 BE (reserved for future)
-                        expiry_timestamp = struct.unpack(">Q", file_data[6:14])[0]  # uint64 BE
+                        magic = header[0:2]
+                        version = header[2]
+                        # flags = struct.unpack(">H", header[4:6])[0]  # uint16 BE (reserved for future)
+                        expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
 
                         # Validate magic and version
                         if magic != MAGIC or version != FORMAT_VERSION:
                             # Corrupted or wrong version, delete it
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return None
 
                         # Check expiration (0 means never expire)
                         if expiry_timestamp > 0 and time.time() > expiry_timestamp:
                             # Expired, delete it
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return None
 
-                        # Extract payload
-                        payload = file_data[HEADER_SIZE:]
+                        # Read payload directly — exactly the bytes after the header.
+                        payload_size = st_size - HEADER_SIZE
+                        payload = _read_fully(fd, payload_size)
+                        if len(payload) < payload_size:
+                            # The file shrank between fstat and read: truncated underneath us.
+                            # Treat it as corruption like the header branches above (unlink,
+                            # miss) instead of handing a short payload to the envelope, whose
+                            # AES-GCM check would classify it as tampering and, under
+                            # encryption_fail_closed, retain the entry as evidence forever.
+                            self._safe_unlink_if_same_inode(fd, file_path)
+                            os.close(fd)
+                            fd_closed = True
+                            return None
                         return payload
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -268,17 +319,22 @@ class FileBackend:
                 try:
                     st_size = os.fstat(fd).st_size
 
-                    # Validate-then-map: never map a file we're about to delete.
+                    # Validate-then-map: never map a file we're about to delete. fd stays open
+                    # for this whole function (closed in the outer finally below), so the
+                    # inode-guard precondition holds trivially at all three sites in this method.
                     if st_size < HEADER_SIZE:
-                        self._safe_unlink(file_path)
+                        self._safe_unlink_if_same_inode(fd, file_path)
                         return None
-                    header = os.read(fd, HEADER_SIZE)
-                    if header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
-                        self._safe_unlink(file_path)
+                    header = _read_fully(fd, HEADER_SIZE)
+                    # Re-check the length: st_size above was sampled before the read, so a
+                    # file truncated in between yields a short header here and header[2]
+                    # would raise IndexError straight past this backend's OSError handling.
+                    if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                        self._safe_unlink_if_same_inode(fd, file_path)
                         return None
                     expiry_timestamp = struct.unpack(">Q", header[6:14])[0]
                     if expiry_timestamp > 0 and time.time() > expiry_timestamp:
-                        self._safe_unlink(file_path)
+                        self._safe_unlink_if_same_inode(fd, file_path)
                         return None
 
                     # Empty payload (header only): nothing to map (mmap rejects length 0 anyway).
@@ -354,7 +410,7 @@ class FileBackend:
 
                     try:
                         # Write all data
-                        os.write(fd, file_data)
+                        _write_fully(fd, file_data)
 
                         # fsync to ensure data is on disk
                         os.fsync(fd)
@@ -537,13 +593,13 @@ class FileBackend:
 
                     try:
                         # Read header only
-                        header_data = os.read(fd, HEADER_SIZE)
+                        header_data = _read_fully(fd, HEADER_SIZE)
 
                         if len(header_data) < HEADER_SIZE:
                             # Corrupted, clean up
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return False
 
                         # Parse expiry timestamp
@@ -553,23 +609,24 @@ class FileBackend:
 
                         # Validate magic and version
                         if magic != MAGIC or version != FORMAT_VERSION:
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return False
 
                         # Check expiration
                         if expiry_timestamp > 0 and time.time() > expiry_timestamp:
                             # Expired, clean up
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return False
 
                         return True
 
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -664,11 +721,11 @@ class FileBackend:
                 try:
                     self._acquire_file_lock(fd, exclusive=False)
                     try:
-                        header = os.read(fd, HEADER_SIZE)
+                        header = _read_fully(fd, HEADER_SIZE)
                         if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return None
 
                         expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
@@ -678,13 +735,14 @@ class FileBackend:
                         remaining = expiry_timestamp - time.time()
                         if remaining <= 0:
                             # Expired: unlink and report absent (same as get/exists).
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return None
                         return int(remaining)  # whole-second granularity, matching Redis TTL
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -723,19 +781,19 @@ class FileBackend:
                 try:
                     self._acquire_file_lock(fd, exclusive=True)
                     try:
-                        header = os.read(fd, HEADER_SIZE)
+                        header = _read_fully(fd, HEADER_SIZE)
                         if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return False
 
                         current_expiry = struct.unpack(">Q", header[6:14])[0]
                         if current_expiry > 0 and time.time() > current_expiry:
                             # Already expired: treat as absent (mirror get/exists) and unlink.
+                            self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
                             fd_closed = True
-                            self._safe_unlink(file_path)
                             return False
 
                         # Overwrite ONLY the expiry field. ponytail: an 8-byte in-place write to
@@ -743,11 +801,12 @@ class FileBackend:
                         # power loss yields a wrong expiry, never a corrupt payload (magic/version
                         # are untouched), so the entry just expires early/late. No rewrite-rename.
                         os.lseek(fd, 6, os.SEEK_SET)
-                        os.write(fd, struct.pack(">Q", new_expiry))
+                        _write_fully(fd, struct.pack(">Q", new_expiry))
                         os.fsync(fd)
                         return True
                     finally:
-                        self._release_file_lock(fd)
+                        if not fd_closed:  # close already dropped the flock; a reused fd number is a stranger's
+                            self._release_file_lock(fd)
                 finally:
                     if not fd_closed:
                         os.close(fd)
@@ -851,6 +910,31 @@ class FileBackend:
             pass
         except OSError:
             pass  # Best-effort cleanup
+
+    def _safe_unlink_if_same_inode(self, fd: int, path: str) -> None:
+        """Unlink ``path`` only if it still resolves to the same inode as the open ``fd``.
+
+        Every corruption/expiry/truncation branch above decides on a held fd (header read,
+        magic/version check, expiry check, short-payload check) but a path-only unlink races: if
+        another process's ``set()`` renames a fresh entry onto ``path`` between that decision and
+        the unlink, the fresh entry gets deleted instead of the stale one the fd actually read.
+        Comparing ``(st_dev, st_ino)`` from the fd against a fresh ``lstat`` of the path narrows
+        that window to the two syscalls in this function (mirrors cachekit-rs's
+        ``unlink_if_same_inode``, backend/file.rs) — POSIX has no atomic "unlink iff inode
+        matches", so a rename landing between this ``lstat`` and the ``unlink`` below is still
+        possible in principle; it just shrinks a function-body-wide race to a two-syscall one.
+
+        Must be called before ``fd`` is closed: calling it after does not raise (EBADF is
+        swallowed like any other race below), it silently skips the unlink, so eviction is
+        skipped with no signal.
+        """
+        try:
+            fd_stat = os.fstat(fd)
+            path_stat = os.lstat(path)
+        except OSError:
+            return
+        if (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino):
+            self._safe_unlink(path)
 
     def _cleanup_temp_files(self) -> None:
         """Delete orphaned temp files older than 60 seconds on startup."""
