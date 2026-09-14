@@ -202,6 +202,23 @@ def _column_values(info: dict[str, Any], what: str) -> Any:
     raise SerializationError(f"Forged columnar payload: {what} type is {shown!r:.40}, expected 'numeric' or 'object'")
 
 
+def _column_trio(series: Any) -> dict[str, Any]:
+    """Build one column's/Series' marker — the write-side mirror of :func:`_column_values`.
+
+    The marker is the 3-key ``{type: "numeric", data, dtype}`` for a plain-numeric column and the
+    2-key ``{type: "object", data}`` otherwise (the ``dtype`` key is numeric-only) — "trio" names
+    the maximal numeric form. One writer for both the DataFrame-column and the bare-Series paths, so
+    the marker set and key order live in a single place and a third marker cannot be added to one
+    side only (the AC3 goal). Plain NumPy
+    numeric dtypes take the raw-buffer path; everything else (nullable/extension dtypes) takes the
+    NA-safe object path so pd.NA/NaT do not crash msgpack (#160). Wire bytes and key order MUST
+    stay byte-identical to the interop fixtures.
+    """
+    if _is_plain_numpy_numeric(series.dtype):
+        return {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
+    return {"type": "object", "data": _na_safe_object_list(series)}
+
+
 def _na_safe_object_list(series: Any) -> list:
     """``series.tolist()`` with scalar pandas NA sentinels (pd.NA/NaT/NaN) mapped to None.
 
@@ -806,15 +823,10 @@ class AutoSerializer:
             "data": {},
         }
 
-        # Serialize each column separately
+        # Serialize each column separately — _column_trio is the single writer shared with
+        # _serialize_series and mirrored by the _column_values decoder.
         for col in df.columns:
-            series = df[col]
-            # Fast raw-buffer path only for plain NumPy numeric dtypes; nullable/extension
-            # dtypes fall through to the NA-safe object path (see helper docstrings).
-            if _is_plain_numpy_numeric(series.dtype):
-                serialized["data"][col] = {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
-            else:
-                serialized["data"][col] = {"type": "object", "data": _na_safe_object_list(series)}
+            serialized["data"][col] = _column_trio(df[col])
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
@@ -823,8 +835,13 @@ class AutoSerializer:
         else:
             return msgpack_data  # type: ignore[return-value]
 
-    def _deserialize_dataframe(self, data: dict) -> pd.DataFrame:
-        """Deserialize DataFrame from an already-unpacked column-wise document.
+    def _deserialize_dataframe(self, document) -> pd.DataFrame:
+        """Rebuild a DataFrame from the already-decoded columnar ``document``.
+
+        ``document`` is the msgpack-decoded body — every production caller (the verified-envelope
+        route in :meth:`deserialize` and :meth:`_decode_columnar`) decodes under
+        ``unpackb_bounded`` first, so this method never touches the wire bytes and never re-runs
+        the decode bound. A forged non-dict body is refused by the ``_expect`` shape gate.
 
         Requires: pandas installed (HAS_PANDAS=True)
 
@@ -835,7 +852,7 @@ class AutoSerializer:
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
 
-        serialized = _expect(data, dict, "document")
+        serialized = _expect(document, dict, "document")
         columns_data = {}
         for col, col_info in _expect(serialized["data"], dict, "data").items():
             what = f"column {col!r:.40}"  # col is attacker-chosen: cap the echo
@@ -863,13 +880,9 @@ class AutoSerializer:
             "index": series.index.tolist() if series.index.name or not series.index.equals(pd.RangeIndex(len(series))) else None,
         }
 
-        # Same dtype handling as _serialize_dataframe: plain NumPy numeric uses the raw
-        # buffer; nullable/extension dtypes take the NA-safe object path so pd.NA/NaT
-        # do not crash msgpack (#160).
-        if _is_plain_numpy_numeric(series.dtype):
-            serialized.update({"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)})  # type: ignore[union-attr]
-        else:
-            serialized.update({"type": "object", "data": _na_safe_object_list(series)})
+        # Same {type, data[, dtype]} trio as each DataFrame column, appended after name/index
+        # so the on-wire key order is {name, index, type, data[, dtype]} (byte-compatible).
+        serialized.update(_column_trio(series))
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
@@ -878,8 +891,12 @@ class AutoSerializer:
         else:
             return msgpack_data  # type: ignore[return-value]
 
-    def _deserialize_series(self, data: dict) -> pd.Series:
-        """Deserialize Pandas Series from an already-unpacked document.
+    def _deserialize_series(self, document) -> pd.Series:
+        """Rebuild a Series from the already-decoded columnar ``document``.
+
+        ``document`` is the msgpack-decoded body; the same decoded-only contract as
+        :meth:`_deserialize_dataframe` (its callers run ``unpackb_bounded`` first). A forged
+        non-dict body is refused by the ``_expect`` shape gate.
 
         Requires: pandas installed (HAS_PANDAS=True)
 
@@ -890,7 +907,7 @@ class AutoSerializer:
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
 
-        serialized = _expect(data, dict, "document")
+        serialized = _expect(document, dict, "document")
         series = pd.Series(_column_values(serialized, "series"), name=serialized["name"])
 
         # Restore index if it was serialized

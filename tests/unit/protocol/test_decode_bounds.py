@@ -131,7 +131,15 @@ class TestOwnedBounds:
         # The walk rejects one level past MSGPACK_MAX_NESTING; a document AT the ceiling
         # must still decode, so the constant may not exceed msgpack-python's C stack.
         at_bound = b"\x91" * MSGPACK_MAX_NESTING + b"\xc0"
-        assert unpackb_bounded(at_bound) == json.loads("[" * MSGPACK_MAX_NESTING + "null" + "]" * MSGPACK_MAX_NESTING)
+        # Walked iteratively, not compared with `==`: nested-list equality recurses in CPython
+        # too, and would blow the same recursion limit this test is bounding.
+        value: object = unpackb_bounded(at_bound)
+        depth = 0
+        while isinstance(value, list):
+            assert len(value) == 1
+            depth, value = depth + 1, value[0]
+        assert depth == MSGPACK_MAX_NESTING
+        assert value is None
         with pytest.raises(ValueError, match=f"nests deeper than {MSGPACK_MAX_NESTING} levels"):
             unpackb_bounded(b"\x91" * (MSGPACK_MAX_NESTING + 1) + b"\xc0")
 
