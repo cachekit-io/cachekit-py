@@ -26,6 +26,7 @@ import pytest
 from redis.commands.core import Script
 from redis.connection import Encoder
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
 from cachekit.backends.redis import RedisBackend
@@ -417,7 +418,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
         round-trip, so cancellation only stops the awaiting coroutine from seeing the
         result — not the thread from winning the lock. Red on the pre-fix code (the
         `try`/`finally` release block is never reached because the cancellation
-        propagates straight out of the `while True` loop); green with the shield.
+        propagates straight out of the `while True` loop); green once the attempt is awaited uninterrupted.
         """
         fake = _FakeRedis()
         fake.nx_entered = threading.Event()
@@ -445,9 +446,8 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
     async def test_second_cancellation_while_draining_the_attempt_still_releases_the_lock(self):
         """A cancel landing while the first one waits out the in-flight SET NX must not orphan the key.
 
-        Awaiting the attempt bare once its shield is cancelled hands the *next* ``task.cancel()``
-        straight to the attempt task: its result is lost and the release skipped. Red on that
-        code, green once the attempt is awaited uninterrupted.
+        A plain ``asyncio.shield`` hands the *next* ``task.cancel()`` straight to the attempt
+        itself: its result is lost and the release skipped.
         """
         fake = _FakeRedis()
         fake.nx_entered = threading.Event()
@@ -468,13 +468,37 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
         assert fake.nx_done.wait(2.0), "executor thread never finished the SET NX"
         assert backend._scoped_key("k") + ":lock" not in fake._store, "lock won under repeated cancellation must be released"
 
+    async def test_all_tasks_sweep_mid_attempt_still_releases_the_lock(self):
+        """``asyncio.run()`` teardown cancels everything in ``all_tasks()``: a round-trip run as a Task dies under the drain.
+
+        A plain executor future is invisible to that sweep, so the win is still read and released.
+        """
+        fake = _FakeRedis()
+        fake.nx_entered = threading.Event()
+        fake.block_nx = threading.Event()
+        fake.nx_done = threading.Event()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        task = asyncio.create_task(_acquire_once(backend))
+        await _entered(fake.nx_entered, "executor thread never entered the SET NX call")
+
+        me = asyncio.current_task()
+        for t in asyncio.all_tasks():  # what asyncio.run()'s _cancel_all_tasks does
+            if t is not me:
+                t.cancel()
+        fake.block_nx.set()  # the executor thread finishes the SET NX and wins the lock
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert fake.nx_done.wait(2.0), "executor thread never finished the SET NX"
+        assert backend._scoped_key("k") + ":lock" not in fake._store, "lock won during a shutdown sweep must be released"
+
     async def test_second_cancellation_while_the_release_is_queued_still_releases_the_lock(self):
         """A cancel landing while ``lock.release`` still waits for an executor thread must not orphan the key.
 
         With every executor thread busy — the saturation this class exists for — the release
         sits in the pool's queue, and a bare ``await to_thread(lock.release)`` lets the next
-        ``task.cancel()`` cancel that queued work item, so the release never runs. Red on that
-        code, green once the release is awaited uninterrupted.
+        ``task.cancel()`` cancel that queued work item, so the release never runs.
         """
         fake = _FakeRedis()
         backend = PerRequestRedisBackend(fake, tenant_id="t")
@@ -489,7 +513,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
                 await asyncio.Event().wait()  # hold the lock until cancelled
 
         task = asyncio.create_task(hold())
-        await holding.wait()
+        await asyncio.wait_for(holding.wait(), 2.0)
 
         busy = threading.Event()
         pool.submit(busy.wait)  # the only executor thread is now taken; the release will queue behind it
@@ -539,13 +563,19 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         with pytest.raises(asyncio.CancelledError), caplog.at_level(logging.DEBUG, logger="cachekit.backends.redis.provider"):
             await task
-        assert fake._store[lock_name] == b"someone-else"
-        assert not caplog.records, "a lost attempt must not try to release (a bare release would log at DEBUG)"
+        assert not caplog.records, "a lost attempt must not try to release (a release without a token logs)"
 
-    async def test_release_failing_in_redis_is_logged_and_leaves_the_key_to_its_ttl(self, caplog, monkeypatch):
+    @pytest.mark.parametrize(
+        ("error", "level"),
+        [
+            (RedisConnectionError("redis went away"), logging.WARNING),  # key orphaned until its TTL: worth a warning
+            (LockNotOwnedError("expired"), logging.DEBUG),  # already gone or taken over: nothing to orphan
+        ],
+    )
+    async def test_release_failing_in_redis_is_logged_not_raised(self, caplog, monkeypatch, error, level):
         """Redis failing the release is the one gap left: the caller sees no error, the key lives until its TTL."""
         fake = _FakeRedis()
-        monkeypatch.setattr(fake, "evalsha", Mock(side_effect=RedisConnectionError("redis went away")))
+        monkeypatch.setattr(fake, "evalsha", Mock(side_effect=error))
         backend = PerRequestRedisBackend(fake, tenant_id="t")
 
         with caplog.at_level(logging.DEBUG, logger="cachekit.backends.redis.provider"):
@@ -553,4 +583,4 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
                 assert acquired
 
         assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
-        assert any("releasing" in r.getMessage() and r.levelno == logging.DEBUG for r in caplog.records)
+        assert [r.levelno for r in caplog.records if "release" in r.getMessage()] == [level]

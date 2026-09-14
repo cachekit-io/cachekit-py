@@ -12,6 +12,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -21,6 +22,7 @@ from typing import Any, Optional, TypeVar
 from urllib.parse import quote as url_encode
 
 import redis
+from redis.exceptions import LockNotOwnedError
 
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError
@@ -43,6 +45,9 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
     itself. ``asyncio.wait`` never cancels its inputs and never unwraps their result, so keep
     waiting on ``fut`` until it is really done, absorbing every cancellation, then re-raise the
     last one: callers read ``fut`` for the real outcome before letting it propagate.
+
+    Pass a plain future (``loop.run_in_executor``), never a Task: ``all_tasks()`` sweeps such as
+    ``asyncio.run`` teardown cancel Tasks out from under the drain, and the outcome is lost again.
     """
     cancelled: Optional[asyncio.CancelledError] = None
     while not fut.done():
@@ -396,6 +401,8 @@ class PerRequestRedisBackend:
         # deployments — the lock identity didn't change, only the protocol boundary
         # (the wrapper no longer pollutes the cache_key passed in).
         scoped_key = f"{self._scoped_key(key)}:lock"
+        from cachekit.cache_handler import redact_cache_key  # local: cache_handler imports the backends package
+
         try:
             from redis.lock import Lock
 
@@ -411,23 +418,25 @@ class PerRequestRedisBackend:
             token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
 
             def _release_sync() -> None:
+                # Catch inside the executor callable, not around _release(): once a cancellation has
+                # landed, _await_uninterrupted re-raises it and an error left on the future would only
+                # surface as asyncio's "exception was never retrieved" at GC.
                 try:
                     lock.release()
+                except LockNotOwnedError as e:
+                    logger.debug("Redis lock already expired or taken over before release: %s", e)  # nothing to orphan
                 except redis.RedisError as e:
-                    # Lock may have expired - log but don't fail
-                    logger.debug("Error releasing Redis lock (may have expired): %s", e)
+                    logger.warning(
+                        "Redis lock release for %s failed; the key lives until its TTL", redact_cache_key(key), exc_info=e
+                    )
 
             async def _release() -> None:
-                # Uninterrupted: with the executor saturated the release sits in the pool's queue,
-                # and a cancellation landing then would drop it and orphan the key for its TTL.
-                await _await_uninterrupted(asyncio.ensure_future(asyncio.to_thread(_release_sync)))
+                # Drained: a cancel landing while this still queues for a thread must not drop the release.
+                await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
 
             while True:
-                # A cancellation of the awaiting task doesn't stop the executor thread's SET NX
-                # from winning the lock — only the coroutine from seeing that it did. Await the
-                # attempt uninterrupted: on cancellation, recover its real result and release a
-                # won lock before re-raising, instead of orphaning it for its full TTL.
-                attempt = asyncio.ensure_future(asyncio.to_thread(lock.acquire, blocking=False, token=token))
+                # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
+                attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
                 try:
                     acquired = await _await_uninterrupted(attempt)
                 except asyncio.CancelledError:
@@ -435,7 +444,9 @@ class PerRequestRedisBackend:
                     # have won; log it rather than let it mask the cancellation.
                     if (err := attempt.exception()) is not None:
                         logger.warning(
-                            "Redis lock attempt for %s failed while acquire_lock was being cancelled", key, exc_info=err
+                            "Redis lock attempt for %s failed while acquire_lock was being cancelled",
+                            redact_cache_key(key),
+                            exc_info=err,
                         )
                     elif attempt.result():
                         await _release()
