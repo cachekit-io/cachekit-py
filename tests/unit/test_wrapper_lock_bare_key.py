@@ -283,7 +283,7 @@ class TestRedisBackendOwnsLockSuffixOnWire:
                 """Record the lock name (the on-wire key) used to construct the lock."""
                 captured_lock_names.append(name)
 
-            def acquire(self, blocking: bool = True) -> bool:
+            def acquire(self, blocking: bool = True, token: Any = None) -> bool:
                 """Pretend acquisition always succeeds (no real Redis round-trip)."""
                 return True
 

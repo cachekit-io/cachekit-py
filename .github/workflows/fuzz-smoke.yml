@@ -14,10 +14,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Avoid EXDEV "cross-device link" errors on ephemeral runners where
-  # hostPath cache and overlay are on different filesystems
-  RUSTUP_HOME: /tmp/rustup
-  CARGO_HOME: /tmp/cargo
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,11 +22,12 @@ concurrency:
 jobs:
   fuzz-smoke:
     name: Fuzz Smoke Test (60s per target)
-    runs-on: cachekit
-    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
-    # so no cross-run cache) + ~10 min one-shot ASAN build of all targets
-    # + ~1 min per fuzz target (count derived from `cargo fuzz list`, ~14 min
-    # today) + slack.
+    runs-on: ubuntu-latest
+    # Budget (cold): ~2 min rustup + ~10 min cargo-fuzz install + ~10 min
+    # one-shot ASAN build of all targets + ~1 min per fuzz target (count derived
+    # from `cargo fuzz list`, ~14 min today) + slack. rust-cache below skips the
+    # install and most of the build on a warm run — this workflow is PR-only, so
+    # a PR's first push is cold and later pushes to the same PR are warm.
     timeout-minutes: 45
 
     steps:
@@ -59,9 +56,16 @@ jobs:
         rustup toolchain install nightly-2026-04-27
         rustup default nightly-2026-04-27
 
+    # After the toolchain step so the cache key hashes the pinned nightly, not
+    # the image's stable. Caches ~/.cargo/bin (cargo-fuzz) and the fuzz crate's
+    # dependency artifacts; the fuzz targets themselves always rebuild.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        workspaces: rust/fuzz
+
     - name: Install cargo-fuzz
       # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
-      # release immediate code exec on the self-hosted runner.
+      # release immediate code exec on the CI runner.
       run: cargo install --locked cargo-fuzz --version 0.13.2
 
     - name: Verify fuzz lockfile is current
@@ -69,9 +73,9 @@ jobs:
         cd rust/fuzz
         # `cargo fuzz build/run` have no --locked passthrough, so the committed
         # Cargo.lock is advisory to them: on any manifest/lock drift cargo would
-        # silently re-resolve every transitive to newest-on-crates.io, on a
-        # self-hosted runner. This is the only step that enforces the lock —
-        # it fails loudly on drift, and warms the empty CARGO_HOME besides.
+        # silently re-resolve every transitive to newest-on-crates.io. This is
+        # the only step that enforces the lock — it fails loudly on drift, and
+        # warms the registry cache besides.
         cargo +nightly-2026-04-27 fetch --locked
 
     - name: Build all fuzz targets

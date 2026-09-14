@@ -349,6 +349,44 @@ MSGPACK_MAX_NESTING = 1024
 #: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
 PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError, SyntaxError)
 
+#: Character cap for any untrusted-payload-derived error text that a read path logs or folds into
+#: an outer message. A forged/corrupt cache entry controls the exception text — numpy echoes a
+#: whole forged dtype string, an inner ``{e}`` wrap carries it up — so it is unbounded. Measured
+#: on the pre-#276 code, an 8.3 KB envelope carrying a 1 MiB column name produced a 4.19 MB log
+#: line (505x); post-#276 the marker/column echoes are capped but ``_dtype_from_untrusted`` still
+#: echoes the full dtype (a 1 MiB forged dtype still floods). ``repr`` escapes newlines but the
+#: read paths log ``str(e)``, so :func:`bounded_error` also collapses them — one poisoned read is
+#: always exactly one bounded log line (LAB-3131).
+ERROR_ECHO_MAX = 512
+
+#: Every char that could split a log record into extra lines or spoof a terminal, escaped so an
+#: attacker-controlled error message is always ONE terminal-safe line: all C0 controls (incl.
+#: ``\n``/``\r``/``\x0b``/``\x0c``), DEL, the C1 range (incl. NEL ``\x85``), and the Unicode
+#: line/paragraph separators ``U+2028``/``U+2029``. Applied by :func:`bounded_error` after the
+#: length clip, so the escape expansion works on a bounded string, never the raw payload.
+_LOG_UNSAFE_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7F, *range(0x80, 0xA0))}
+_LOG_UNSAFE_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+def bounded_error(exc: BaseException) -> str:
+    """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
+    logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
+
+    Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
+    wraps in ``cache_handler``) rather than per field: the bound then holds for
+    every attacker-inflatable field — marker, column name, dtype — including ones a future field
+    would add. Over-length text is truncated with the true length appended so the message still
+    says "this was huge", then every line/terminal-control char is escaped
+    (:data:`_LOG_UNSAFE_ESCAPES`) so one poisoned read is always exactly one line with no injected
+    ANSI or newlines. Clipping before escaping keeps output O(1) (escape expansion applies to at
+    most ``ERROR_ECHO_MAX`` chars). Log sinks do not use this: they render exceptions via
+    ``cachekit.hash_utils.redact_error_for_log``, which echoes no exception text at all.
+    """
+    text = str(exc)
+    if len(text) > ERROR_ECHO_MAX:
+        text = f"{text[:ERROR_ECHO_MAX]}… [truncated, {len(text)} chars total]"
+    return text.translate(_LOG_UNSAFE_ESCAPES)
+
 
 def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
     """Decode one untrusted MessagePack document under cachekit-owned bounds.

@@ -39,6 +39,7 @@ from cachekit.serializers.base import (
     SerializationFormat,
     SerializationMetadata,
     SuspiciousCacheEntryError,
+    bounded_error,
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
@@ -1162,7 +1163,7 @@ class CacheSerializationHandler:
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
-            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {e}") from e
+            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {bounded_error(e)}") from e
 
     def _deserialize_interop(self, data: str | bytes | memoryview, cache_key: str) -> Any:
         """Interop/v1 read path: config decides encryption, never the stored bytes.
@@ -1207,7 +1208,7 @@ class CacheSerializationHandler:
             raise
         except Exception as e:
             get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
-            raise SerializationError(f"Failed to deserialize interop cache entry: {e}") from e
+            raise SerializationError(f"Failed to deserialize interop cache entry: {bounded_error(e)}") from e
 
 
 class CacheOperationHandler:
