@@ -165,7 +165,9 @@ Three behavioural edges to design around:
 Cancelling the task awaiting `acquire_lock` mid-attempt does not trigger this
 degradation: the in-flight `SET NX` is always awaited to completion, and a lock
 it goes on to win is released before the cancellation propagates, so a
-cancelled waiter never orphans a held lock.
+**single** cancellation never orphans a held lock. A *second* cancellation
+landing during that release is not shielded and re-orphans the key — bounded
+by the same 30 s TTL as the crash case above.
 
 ### TTL Shorter Than Compute Time
 ```python

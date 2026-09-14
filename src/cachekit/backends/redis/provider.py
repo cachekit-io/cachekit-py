@@ -402,7 +402,13 @@ class PerRequestRedisBackend:
                 try:
                     acquired = await asyncio.shield(attempt)
                 except asyncio.CancelledError:
-                    if await attempt:
+                    # Recover the shielded attempt's real result; never let its own failure
+                    # (e.g. a Redis ConnectionError) mask the cancellation — always re-raise.
+                    try:
+                        won = await attempt
+                    except Exception:
+                        won = False
+                    if won:
                         await _release()
                     raise
                 # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
