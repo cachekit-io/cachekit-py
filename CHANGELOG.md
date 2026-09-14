@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.19.0](https://github.com/cachekit-io/cachekit-py/compare/v0.18.0...v0.19.0) (2026-09-14)
+
+
+### Features
+
+* **backend:** bound L1 backfill by the server's remaining freshness (LAB-557) ([#268](https://github.com/cachekit-io/cachekit-py/issues/268)) ([7bd5abf](https://github.com/cachekit-io/cachekit-py/commit/7bd5abf4ba838600b7ae333715a3575dc587143e))
+* **concurrency:** free-threaded CPython support — memory-ordering fixes, gil_used=false, CI lane (LAB-511) ([#265](https://github.com/cachekit-io/cachekit-py/issues/265)) ([bda770b](https://github.com/cachekit-io/cachekit-py/commit/bda770bce822d9a6eff98e555c5f6fd92e509a9c))
+
+
+### Bug Fixes
+
+* **ci:** fail loudly on attestation lookup failure; decide the codecov pair (LAB-2528) ([#270](https://github.com/cachekit-io/cachekit-py/issues/270)) ([2a8b941](https://github.com/cachekit-io/cachekit-py/commit/2a8b941043e8bc3d9a143428495e13226aed4901))
+* **file:** guard eviction unlink against a concurrent rename (LAB-2685) ([#285](https://github.com/cachekit-io/cachekit-py/issues/285)) ([e917a57](https://github.com/cachekit-io/cachekit-py/commit/e917a57c4e6065eb161da8011a26d6805d49c327))
+* **file:** write every byte or fail; evict a payload that shrank under read (LAB-2682) ([#272](https://github.com/cachekit-io/cachekit-py/issues/272)) ([068adb2](https://github.com/cachekit-io/cachekit-py/commit/068adb276c2b1f552b527e4ba91fc2904cd75be5))
+* **redis:** stop lock waiters pinning executor threads (LAB-3596) ([#290](https://github.com/cachekit-io/cachekit-py/issues/290)) ([ddbeb91](https://github.com/cachekit-io/cachekit-py/commit/ddbeb910a9de7932ed93ebbcad4c8435278831e2))
+* **serializers:** bound forged-entry error echoes; retire columnar dead code (LAB-3131) ([#289](https://github.com/cachekit-io/cachekit-py/issues/289)) ([10a1049](https://github.com/cachekit-io/cachekit-py/commit/10a10498d406bce7b4fd8dff6cb2e88e80f9b0a2))
+* **serializers:** bound untrusted msgpack decode depth and header allocation (LAB-2503) ([#276](https://github.com/cachekit-io/cachekit-py/issues/276)) ([f7c087d](https://github.com/cachekit-io/cachekit-py/commit/f7c087dfbd7972bd711f32054949c1b739e00146))
+
 ## [0.18.0](https://github.com/cachekit-io/cachekit-py/compare/v0.17.1...v0.18.0) (2026-09-03)
 
 
