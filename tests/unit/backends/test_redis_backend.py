@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
@@ -272,6 +273,7 @@ class _FakeRedis:
     def __init__(self) -> None:
         self._store: dict[str, bytes] = {}
         self._mutex = threading.Lock()
+        self.nx_attempts: list[float] = []  # monotonic time of every SET NX, i.e. every acquire attempt
 
     def get_encoder(self) -> Encoder:
         return Encoder("utf-8", "strict", False)
@@ -281,6 +283,8 @@ class _FakeRedis:
 
     def set(self, name: str, value: bytes, nx: bool = False, px: int | None = None) -> bool | None:
         with self._mutex:
+            if nx:
+                self.nx_attempts.append(time.monotonic())
             if nx and name in self._store:
                 return None
             self._store[name] = value
@@ -301,7 +305,7 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
     ``acquire_lock`` used to run redis-py's *blocking* ``Lock.acquire`` inside
     ``asyncio.to_thread``. With more concurrent misses on one key than the default
-    executor has threads (``min(32, cpu_count + 4)`` — 8 on a 4-vCPU CI host), every
+    executor has threads (``min(32, cpu_count + 4)``, 8 when ``cpu_count`` is 4), every
     thread sat in a polling loop, the holder's own ``get``/``set``/``release`` (also
     ``to_thread`` calls) queued behind them, every waiter hit ``blocking_timeout`` and
     recomputed — a stampede from the feature that exists to prevent one. This pins the
@@ -309,12 +313,14 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
     (two waiters time out), green when the wait happens on the event loop.
     """
 
-    async def test_all_contenders_acquire_when_executor_is_smaller_than_contention(self, monkeypatch):
-        # Lock caches its Script objects on the class. An earlier test may have registered
-        # them against a MagicMock client, whose "release" would never delete our key.
-        for attr in ("lua_release", "lua_extend", "lua_reacquire"):
-            monkeypatch.setattr(Lock, attr, None)
+    @pytest.fixture(autouse=True)
+    def _fresh_release_script(self, monkeypatch):
+        # Lock caches its Script objects class-wide. An earlier test may have registered
+        # lua_release against a MagicMock client, whose "release" never deletes our key;
+        # reset it so register_scripts() binds it to this test's fake.
+        monkeypatch.setattr(Lock, "lua_release", None)
 
+    async def test_all_contenders_acquire_when_executor_is_smaller_than_contention(self):
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
         backend = PerRequestRedisBackend(_FakeRedis(), tenant_id="t")
 
@@ -325,3 +331,47 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         results = await asyncio.gather(*(contend() for _ in range(4)))
         assert results == [True] * 4, f"waiters starved the executor and timed out: {results}"
+
+    async def test_waiter_gives_up_with_false_when_lock_is_held_past_its_window(self):
+        fake = _FakeRedis()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+        holder_acquired = asyncio.Event()
+        holder_released = asyncio.Event()
+        blocking_timeout = 0.45
+
+        async def hold() -> None:
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None) as acquired:
+                assert acquired is True
+                holder_acquired.set()
+                await asyncio.sleep(0.8)  # longer than the waiter's window
+            holder_released.set()
+
+        async def wait() -> tuple[bool, bool, float]:
+            await holder_acquired.wait()
+            started = time.monotonic()
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=blocking_timeout) as acquired:
+                return acquired, holder_released.is_set(), started
+
+        holder = asyncio.create_task(hold())
+        acquired, holder_had_released, started = await wait()
+        await holder
+
+        assert acquired is False
+        assert holder_had_released is False, "waiter must give up on its own deadline, not wait for the release"
+        waiter_attempts = [t - started for t in fake.nx_attempts if t >= started]
+        assert len(waiter_attempts) >= 2, f"a blocking waiter must retry before giving up: {waiter_attempts}"
+        # Contract: no attempt lands past the deadline. Scheduling jitter only ever delays an
+        # attempt, so the tolerance can hide a slightly late legitimate attempt but never an
+        # extra one — that would land a full lock.sleep (0.1 s) later.
+        assert max(waiter_attempts) <= blocking_timeout + 0.03, f"attempt past the deadline: {waiter_attempts}"
+
+    async def test_non_blocking_acquire_makes_exactly_one_attempt(self):
+        fake = _FakeRedis()
+        backend = PerRequestRedisBackend(fake, tenant_id="t")
+
+        async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None) as held:
+            assert held is True
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=None) as contended:
+                assert contended is False
+
+        assert len(fake.nx_attempts) == 2, "blocking_timeout=None must be a single SET NX per acquire_lock"

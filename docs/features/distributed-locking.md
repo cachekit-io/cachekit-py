@@ -259,6 +259,7 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 3. If SET fails → lock held, retry every 0.1 s for up to blocking_timeout.
    Each retry is one non-blocking SET NX; the wait between retries is an
    asyncio.sleep on the event loop, so a waiter never holds an executor thread
+   while waiting between attempts
 4. On context exit: DEL lock key (only if still holder)
    Lock auto-expires via Redis TTL if holder crashes
 ```

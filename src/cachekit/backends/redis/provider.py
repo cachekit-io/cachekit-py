@@ -357,8 +357,8 @@ class PerRequestRedisBackend:
             the event loop, never a sleep inside an executor thread. A blocking
             ``Lock.acquire`` run via ``to_thread`` would pin one executor thread per waiter for
             up to ``blocking_timeout``. The default executor has only ``min(32, cpu_count + 4)``
-            threads (8 on a 4-vCPU host), so once concurrent misses on one key reach that size the
-            holder's own ``get``/``set``/``release`` — also ``to_thread`` calls — queue behind
+            threads (8 when ``cpu_count`` is 4), so once concurrent misses on one key reach that size
+            the holder's own ``get``/``set``/``release`` — also ``to_thread`` calls — queue behind
             the waiters, every waiter times out, and all of them recompute.
             Sets thread_local=False because attempts and release may run on different
             executor threads.
