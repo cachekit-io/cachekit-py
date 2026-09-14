@@ -136,11 +136,18 @@ jobs:
           --cov-report=term \
           --junitxml=junit-unit.xml \
           -o junit_family=legacy
+        # --cov-fail-under evaluates the *combined* unit+critical total (the
+        # --cov-append accumulation), so it gates this final invocation only, and
+        # reddens the job in pytest independent of the Codecov upload (rationale:
+        # residual-risk note below). 82 = lowest same-repo PR cumulative TOTAL
+        # across the PR matrix minus codecov.yml's declared 2% tolerance, floored;
+        # keep it in step with the Makefile test-cov floor.
         uv run pytest tests/critical/ -m "not slow" \
           --cov=src/cachekit \
           --cov-append \
           --cov-report=xml \
           --cov-report=term \
+          --cov-fail-under=82 \
           --junitxml=junit.xml \
           -o junit_family=legacy
 
@@ -192,17 +199,22 @@ jobs:
     # what this ticket is hardening. The flag therefore applies exactly where OIDC
     # really authenticates.
     #
-    # ACCEPTED RESIDUAL RISK, stated because the scoping creates it: on a fork PR a
-    # dropped tokenless upload is still silent, and carryforward then answers the
-    # patch question with an earlier commit's numbers — a stale green on exactly the
-    # least-trusted contributions. The wrapper's CLI signature check is likewise
+    # RESIDUAL, now narrowed to the PATCH status: the TOTAL-coverage floor no
+    # longer depends on the upload — the final PR pytest run enforces it with
+    # `--cov-fail-under` (above), so a dropped or degraded upload can no longer
+    # answer the total-coverage question with an earlier commit's carryforward;
+    # the job reddens inside pytest first, on same-repo and fork PRs alike. What
+    # Codecov still solely owns is the new-code PATCH status: it is diff-level,
+    # stays `carryforward: true`, and is not enforced locally, so on a fork PR
+    # whose tokenless upload is silently dropped it can still answer "is this
+    # PR's new code 80% covered?" with a previous run's numbers. Accepted: that
+    # status is a reporting signal, not a merge floor, and the local total floor
+    # already catches a gross coverage regression on the same run.
+    # The wrapper's CLI signature check is likewise
     # unenforced there (fail_ci_if_error is its switch; see the pin note below).
     # Accepted because a fork PR cannot reach the self-hosted `cachekit` runner
     # without a maintainer approving the run, no fork PR has run here to date, and
-    # a tampered binary reaches same-repo runs first, where it fails closed. The real
-    # fix is to stop depending on an external upload for the floor (a local
-    # `--cov-fail-under` on the PR pytest invocation); that is a coverage-policy
-    # change, tracked separately rather than smuggled into this diff.
+    # a tampered binary reaches same-repo runs first, where it fails closed.
     #
     # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
     # June 2026 keybase migration fetch the CLI signing key from a deleted account,

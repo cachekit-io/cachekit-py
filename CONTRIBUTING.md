@@ -194,6 +194,11 @@ make test-cov
 - Aim for >85% coverage for new code
 - All public APIs must have tests
 - Edge cases and error conditions must be tested
+- CI enforces a **total-coverage floor** inside pytest on every PR
+  (`--cov-fail-under`, value in `.github/workflows/ci.yml`), independent of the
+  Codecov upload — a PR whose combined coverage falls below it fails the `Tests`
+  job. `make test-cov` enforces the same floor locally. Codecov still reports the
+  finer-grained new-code (patch) coverage on top of this.
 
 **Rust Test Coverage**:
 - ByteStorage module: 82% coverage (measured via LLVM source-based coverage)
