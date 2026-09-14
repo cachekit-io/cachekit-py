@@ -383,13 +383,15 @@ class PerRequestRedisBackend:
 
         Note:
             Each acquisition attempt is one non-blocking ``SET NX`` round-trip run via
-            ``asyncio.to_thread()``; the wait between attempts is an ``asyncio.sleep`` on
-            the event loop, never a sleep inside an executor thread. A blocking
-            ``Lock.acquire`` run via ``to_thread`` would pin one executor thread per waiter for
-            up to ``blocking_timeout``. The default executor has only ``min(32, cpu_count + 4)``
-            threads (8 when ``cpu_count`` is 4), so once concurrent misses on one key reach that size
-            the holder's own ``get``/``set``/``release`` — also ``to_thread`` calls — queue behind
-            the waiters, every waiter times out, and all of them recompute.
+            ``loop.run_in_executor()`` and drained through ``_await_uninterrupted`` (so a
+            cancellation cannot drop a round-trip that still completes); the wait between
+            attempts is an ``asyncio.sleep`` on the event loop, never a sleep inside an
+            executor thread. A blocking ``Lock.acquire`` run in the executor would pin one
+            executor thread per waiter for up to ``blocking_timeout``. The default executor
+            has only ``min(32, cpu_count + 4)`` threads (8 when ``cpu_count`` is 4), so once
+            concurrent misses on one key reach that size the holder's own
+            ``get``/``set``/``release`` — also executor calls — queue behind the waiters,
+            every waiter times out, and all of them recompute.
             Sets thread_local=False because attempts and release may run on different
             executor threads.
             Cancellation is drained, not raced: an in-flight attempt or release round-trip
