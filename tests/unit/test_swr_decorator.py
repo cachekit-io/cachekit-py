@@ -528,7 +528,7 @@ class TestOperationHandlerFreshnessDegradation:
         cache_handler = mock.MagicMock()
         cache_handler.get_with_freshness.return_value = (b"bytes", False)  # 0.5.x 2-tuple
         op.set_cache_handler(cache_handler)
-        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}, b"bytes"), False, None)
+        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}, b"bytes", 5), False, None)
 
     def test_backend_error_reads_as_miss(self) -> None:
         op, cache_handler = self._make_op()

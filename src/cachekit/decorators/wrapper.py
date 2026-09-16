@@ -784,17 +784,18 @@ def create_cache_wrapper(
         recorded (spec: local caches MUST NOT record stale as fresh), and a
         fresh hit's local lifetime is bounded by _l1_backfill_ttl.
 
-        Best-effort: the hit is already decoded, so a refused put (L1Cache.put
-        rejects a non-bytes envelope from an out-of-contract backend) is logged
-        and swallowed — every caller sits inside an `except Exception` that would
-        otherwise demote the served hit into a recompute on each call (LAB-348).
+        Best-effort: the hit is already decoded, so the one refusal L1Cache.put
+        documents — TypeError on a non-bytes envelope from an out-of-contract
+        backend — is logged and skipped; every caller sits inside an `except
+        Exception` that would otherwise demote the served hit into a recompute on
+        each call (LAB-348). Anything else is an L1 bug and propagates.
         """
         if not (_l1_cache and cache_key and cached_data and not is_stale):
             return
         cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
         try:
             _l1_cache.put(cache_key, cached_bytes, redis_ttl=_l1_backfill_ttl(fresh_for))
-        except Exception as exc:  # noqa: BLE001 — a best-effort backfill must never surface to callers
+        except TypeError as exc:
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {bounded_error(exc)}")
             return
         _cached_keys.add(cache_key)
@@ -1333,8 +1334,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cache hit: (True, value, raw envelope for L1 backfill — None on the mmap fast path)
-                _found, result, cached_data = cached_result
+                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
+                _found, result, cached_data, size_bytes = cached_result
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1367,7 +1368,7 @@ def create_cache_wrapper(
                         serializer="rust",
                         success=True,
                         duration_ms=duration * 1000,
-                        size_bytes=len(cached_data) if cached_data else 0,
+                        size_bytes=size_bytes,
                         hit=True,
                     )
 
@@ -1718,8 +1719,8 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill)
-                    _found, result, cached_data = cached_result
+                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
+                    _found, result, cached_data, size_bytes = cached_result
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1733,7 +1734,7 @@ def create_cache_wrapper(
                             serializer="rust",
                             success=True,
                             duration_ms=get_duration_ms,
-                            size_bytes=len(cached_data) if cached_data else 0,
+                            size_bytes=size_bytes,
                             hit=True,
                         )
 
@@ -1816,7 +1817,7 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data = cached_result
+                                    _found, result, cached_data, _size_bytes = cached_result
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1837,7 +1838,7 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data = cached_result
+                                    _found, result, cached_data, _size_bytes = cached_result
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
