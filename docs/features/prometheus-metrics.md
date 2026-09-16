@@ -13,8 +13,8 @@ register a `/metrics` route. Wire up `prometheus_client` exposition in your app 
 metrics show up on your existing scrape endpoint.
 
 ```prometheus
-cache_operations_total{operation="get",namespace="users",success="True",serializer="default"} 9847
-redis_cache_operations_total{operation="get",status="hit",serializer="default",namespace="users"} 9847
+cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"} 31022
+cache_operations_total{operation="get",namespace="users",success="True",serializer="rust"} 9847
 ```
 
 ---
@@ -70,16 +70,22 @@ scrape_configs:
 cachekit emits the following metrics on the default `prometheus_client` registry. The names
 below are the **actual** series names — none carry a `cachekit_` prefix.
 
+> The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
+> preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
+> emitted without the label (an instrumentation gap, not a tier).
+
 ### Counters (always increasing)
 
 ```prometheus
 # Cache operations from the async/sync metrics path.
 # Labels: operation, namespace, success, serializer
-cache_operations_total{operation="get",namespace="users",success="True",serializer="default"}
+cache_operations_total{operation="get",namespace="users",success="True",serializer="rust"}
+cache_operations_total{operation="get",namespace="users",success="True",serializer="l1_memory"}
 
-# Cache operations from the backpressure/load-control path.
+# Backpressure rejections from the load-control path. Emitted only when the request
+# queue is full; serializer and namespace are always "" on this series.
 # Labels: operation, status, serializer, namespace
-redis_cache_operations_total{operation="get",status="hit",serializer="default",namespace="users"}
+redis_cache_operations_total{operation="backpressure",status="rejected",serializer="",namespace=""}
 
 # Decrypt/integrity failures on the read path, split by failure class.
 # Labels: reason — "auth_tamper" (AES-GCM auth failure, tenant mismatch, or
@@ -97,20 +103,20 @@ cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 cachekit_config_drift_reads_total{reason="encryption_disabled"}
 ```
 
-> Hits and misses are not separate series. Compute them from labels — the `success` label
-> on `cache_operations_total` and the `status` label on `redis_cache_operations_total`
-> distinguish hits from misses.
+> Hits and misses are not separate series; derive them from the labels on
+> `cache_operations_total`. `redis_cache_operations_total` carries no hit/miss status — it
+> counts backpressure rejections only.
 
 ### Histograms (latency and size)
 
 ```prometheus
 # Cache operation duration in milliseconds.
 # Labels: operation, namespace, serializer
-cache_operation_duration_ms{operation="get",namespace="users",serializer="default"}
+cache_operation_duration_ms{operation="get",namespace="users",serializer="rust"}
 
 # Cache operation payload size in bytes.
 # Labels: operation, namespace, serializer
-cache_operation_size_bytes{operation="get",namespace="users",serializer="default"}
+cache_operation_size_bytes{operation="get",namespace="users",serializer="l1_memory"}
 ```
 
 ### Gauges (current state)
@@ -131,12 +137,6 @@ circuit_breaker_state{namespace="users",state="open"}
 # Hit rate (percentage) using the success label on cache_operations_total
 100 * sum(rate(cache_operations_total{success="True"}[5m]))
     / sum(rate(cache_operations_total[5m]))
-```
-
-```promql
-# Hit rate from the load-control path using the status label
-100 * sum(rate(redis_cache_operations_total{status="hit"}[5m]))
-    / sum(rate(redis_cache_operations_total[5m]))
 ```
 
 ### Cache Latency (P99)
@@ -276,7 +276,7 @@ created lazily on first use.
 
 **Q: Hit rate always 0**
 A: Check that the function is actually being called and that L1/L2 caching is working.
-Remember hit/miss is derived from labels (`success` / `status`), not from separate series.
+Remember hit/miss is derived from labels on `cache_operations_total`, not from separate series.
 
 **Q: Metrics growing unbounded**
 A: Prometheus retention is configurable (default 15 days). Keep label cardinality bounded —

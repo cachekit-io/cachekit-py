@@ -318,8 +318,8 @@ async def fetch_sensitive(x):
 
 Lock waiters that time out log a `Failed to acquire lock for {key} after 5.0s`
 warning; lock backend errors log a `Lock operation failed … executing without
-lock` warning. For miss-rate monitoring (stampede detection), use the `status`
-label on `redis_cache_operations_total` — see
+lock` warning. For miss-rate monitoring (stampede detection), watch `operation="set"` on
+`cache_operations_total` — every miss writes back — see
 [Prometheus Metrics](prometheus-metrics.md).
 
 ---
@@ -335,7 +335,7 @@ A: Two things to check:
 2. The backend must implement `LockableBackend` (`RedisBackend`, `CachekitIOBackend`). Check with `from cachekit.backends.base import LockableBackend; isinstance(backend, LockableBackend)`.
 
 **Q: How do I know if stampedes are happening?**
-A: Check Prometheus: a spike in `rate(redis_cache_operations_total{status="miss"}[1m])` = stampede risk. See [Prometheus Metrics](prometheus-metrics.md).
+A: Check Prometheus: a spike in `rate(cache_operations_total{operation="set"}[1m])` (misses write back) = stampede risk. See [Prometheus Metrics](prometheus-metrics.md).
 
 ---
 

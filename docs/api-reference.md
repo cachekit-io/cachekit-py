@@ -838,10 +838,15 @@ HTTP server or register a `/metrics` route; wire up `prometheus_client` expositi
 names carry no `cachekit_` prefix:
 
 - `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
-- `redis_cache_operations_total` - Load-control operation counter. Labels: `operation`, `status`, `serializer`, `namespace`
+- `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
 - `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
 - `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
 - `circuit_breaker_state` - Circuit breaker state gauge (0=CLOSED, 1=OPEN, 2=HALF_OPEN). Labels: `namespace`, `state`
+
+The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
+preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
+emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
+rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
 See the [Prometheus Metrics guide](features/prometheus-metrics.md) for exposition setup,
 query examples, and alerting rules.
