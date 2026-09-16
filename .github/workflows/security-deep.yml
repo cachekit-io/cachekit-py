@@ -126,7 +126,7 @@ jobs:
     # uv cache would just restore the cp312 wheel set the PR jobs save.
     - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.13"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         enable-cache: false
 
     # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
