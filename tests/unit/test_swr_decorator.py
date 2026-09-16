@@ -528,7 +528,7 @@ class TestOperationHandlerFreshnessDegradation:
         cache_handler = mock.MagicMock()
         cache_handler.get_with_freshness.return_value = (b"bytes", False)  # 0.5.x 2-tuple
         op.set_cache_handler(cache_handler)
-        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}), False, None)
+        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}, b"bytes"), False, None)
 
     def test_backend_error_reads_as_miss(self) -> None:
         op, cache_handler = self._make_op()
@@ -572,6 +572,42 @@ class TestOperationHandlerFreshnessDegradation:
         backend.stale = False
         assert compute() == 2  # revalidation refreshed L1 with fresh bytes
         assert calls["n"] == 2
+
+    def test_sync_freshness_hit_backfills_l1_unless_stale_or_expired(self) -> None:
+        """LAB-348 parity: the sync freshness read backfills L1 exactly as the
+        async read does — a fresh hit is recorded (next read is L1, no second
+        freshness read), a stale-labelled hit never is, and fresh_for=0 makes
+        the backfill a no-op (the remaining-freshness bound reaches the sync
+        path). No stale_ttl: a stale hit is served with no revalidation, so
+        nothing races the second read."""
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=60, namespace="swr-l1-sync-backfill")
+        def compute() -> int:
+            return 1
+
+        assert compute() == 1
+        l2_snapshot = dict(backend.store)
+
+        def force_l2() -> None:
+            compute.invalidate_cache()  # type: ignore[attr-defined]
+            backend.store.update(l2_snapshot)
+            backend.freshness_reads = 0
+
+        force_l2()
+        assert compute() == 1 and compute() == 1
+        assert backend.freshness_reads == 1  # fresh hit backfilled -> second read served by L1
+
+        force_l2()
+        backend.stale = True
+        assert compute() == 1 and compute() == 1
+        assert backend.freshness_reads == 2  # stale hit never recorded in L1
+
+        force_l2()
+        backend.stale = False
+        backend.fresh_for = 0
+        assert compute() == 1 and compute() == 1
+        assert backend.freshness_reads == 2  # nothing fresh remains -> L1Cache.put skips the entry
 
 
 class TestSWRSchedulingHardening:

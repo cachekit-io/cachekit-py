@@ -104,7 +104,7 @@ class TestGetCachedValueMmapBranch:
 
         result = self._handler(sh, ch).get_cached_value("k")
 
-        assert result == (True, sentinel)
+        assert result == (True, sentinel, None)  # no envelope: the mmap view never reaches L1 (blocker C)
         ch.get_buffer.assert_called_once_with("k")
         ch.get.assert_not_called()  # normal read path NOT used on the mmap hit
         sh.deserialize_data.assert_called_once_with(handle.view, "k")
@@ -133,7 +133,7 @@ class TestGetCachedValueMmapBranch:
 
         ch.get_buffer.assert_called_once()
         ch.get.assert_called_once()  # fell through
-        assert result == (True, "val")
+        assert result == (True, "val", b"frame")  # os.read fallback carries the envelope for L1
 
 
 @pytest.mark.unit
@@ -165,8 +165,9 @@ class TestMmapReadEndToEnd:
             hit = oh.get_cached_value("k")
 
         assert hit is not None
-        found, value = hit
+        found, value, envelope = hit
         assert found is True
+        assert envelope is None  # mmap hit: nothing to backfill into L1
         pd.testing.assert_frame_equal(value, df)
         gb.assert_called_once()  # the real mmap path was taken
         g.assert_not_called()  # not the os.read fallback

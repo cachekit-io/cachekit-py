@@ -1362,7 +1362,11 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
+            raw_bytes is the serialized envelope so the decorator can backfill L1
+            without re-serializing (re-encrypting) — same shape as the async variant
+            (LAB-348). It is None on the mmap fast path: the mapped view is confined
+            to this frame and must never reach L1 (#171 blocker C).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1381,7 +1385,7 @@ class CacheOperationHandler:
                 if handle is not None:
                     try:
                         get_logger().cache_hit(cache_key, "Backend(mmap)")
-                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
+                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key), None)
                     finally:
                         handle.close()
 
@@ -1390,8 +1394,8 @@ class CacheOperationHandler:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
+                return (True, deserialized, cached_data)
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
@@ -1410,12 +1414,14 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
             return None
 
-    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool, Optional[int]]]:
+    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, bytes], bool, Optional[int]]]:
         """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
         staleness and the server's remaining freshness in seconds.
 
-        Returns ``((True, value), is_stale, fresh_for)`` on a hit, None on
-        miss/error. fresh_for is None when no signal exists (pre-signal server,
+        Returns ``((True, value, raw_bytes), is_stale, fresh_for)`` on a hit —
+        the inner 3-tuple matches the async variant so the sync decorator
+        backfills L1 without re-serializing (LAB-348) — None on miss/error.
+        fresh_for is None when no signal exists (pre-signal server,
         non-SWR backend) — the caller applies legacy L1 TTL behavior. The mmap
         fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
         Error semantics mirror get_cached_value: the LAB-108 policy point raises
@@ -1436,7 +1442,7 @@ class CacheOperationHandler:
             cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized), is_stale, fresh_for)
+            return ((True, deserialized, cached_data), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1504,8 +1510,8 @@ class CacheOperationHandler:
 
         Returns:
             Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
-            Unlike the sync variant, the raw serialized envelope is included so the
-            async decorator can backfill L1 without re-serializing (re-encrypting).
+            The raw serialized envelope is included so the decorator can backfill L1
+            without re-serializing (re-encrypting); same shape as the sync variant.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
