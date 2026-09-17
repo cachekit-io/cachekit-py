@@ -372,13 +372,15 @@ def bounded_error(exc: BaseException) -> str:
     """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
     logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
 
-    Applied once at each trust-boundary wrap site (the read-path log/re-raise points in
-    ``cache_handler``/``decorators.wrapper``) rather than per field: the bound then holds for
+    Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
+    wraps in ``cache_handler``) rather than per field: the bound then holds for
     every attacker-inflatable field — marker, column name, dtype — including ones a future field
-    would add. Over-length text is truncated with the true length appended so the log still says
-    "this was huge", then every line/terminal-control char is escaped (:data:`_LOG_UNSAFE_ESCAPES`)
-    so one poisoned read is always exactly one log line with no injected ANSI or newlines. Clipping
-    before escaping keeps output O(1) (escape expansion applies to at most ``ERROR_ECHO_MAX`` chars).
+    would add. Over-length text is truncated with the true length appended so the message still
+    says "this was huge", then every line/terminal-control char is escaped
+    (:data:`_LOG_UNSAFE_ESCAPES`) so one poisoned read is always exactly one line with no injected
+    ANSI or newlines. Clipping before escaping keeps output O(1) (escape expansion applies to at
+    most ``ERROR_ECHO_MAX`` chars). Log sinks do not use this: they render exceptions via
+    ``cachekit.hash_utils.redact_error_for_log``, which echoes no exception text at all.
     """
     text = str(exc)
     if len(text) > ERROR_ECHO_MAX:

@@ -21,6 +21,7 @@ from redis.exceptions import (
 from cachekit.backends.errors import BackendError, BackendErrorType, CapabilityNotAvailableError
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.backends.redis.provider import PerRequestRedisBackend
+from cachekit.hash_utils import redact_cache_key
 
 
 @pytest.mark.integration
@@ -99,7 +100,7 @@ class TestBackendErrorRepresentation:
         assert "transient" in repr_str
 
     def test_error_formatted_message(self):
-        """Test formatted message includes operation and key context."""
+        """Formatted message includes operation context and the redacted key digest."""
         error = BackendError(
             "Get failed",
             error_type=BackendErrorType.TRANSIENT,
@@ -109,21 +110,23 @@ class TestBackendErrorRepresentation:
         msg = str(error)
         assert "Get failed" in msg
         assert "operation=get" in msg
-        assert "key=user:123" in msg
+        assert f"key={redact_cache_key('user:123')}" in msg
         assert "type=transient" in msg
 
-    def test_error_key_truncation(self):
-        """Test long keys are truncated in error messages."""
-        long_key = "x" * 100
+    def test_error_key_redacted_not_leaked(self):
+        """The raw key never appears in the exception text — only its fixed-length
+        digest (CWE-532, LAB-304). The attribute keeps the raw key for programmatic use."""
+        tenant_key = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
         error = BackendError(
             "Error",
             error_type=BackendErrorType.TRANSIENT,
-            key=long_key,
+            key=tenant_key,
         )
         msg = str(error)
-        assert "..." in msg
-        assert long_key not in msg
-        assert len(msg) < len(long_key)
+        assert tenant_key not in msg
+        assert "tenant-42-alice-secret" not in msg
+        assert redact_cache_key(tenant_key) in msg
+        assert error.key == tenant_key
 
 
 @pytest.mark.integration
@@ -272,5 +275,6 @@ class TestErrorClassificationConsistency:
         msg = str(error)
         assert "Operation failed" in msg
         assert "get" in msg
-        assert "cache:user:123" in msg
+        assert f"key={redact_cache_key('cache:user:123')}" in msg
+        assert "cache:user:123" not in msg
         assert "transient" in msg
