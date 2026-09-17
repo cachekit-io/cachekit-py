@@ -82,4 +82,9 @@ async def test_async_get_hit_records_sync_labels(recorded: list[dict[str, Any]],
     gets = [c for c in recorded if c["operation"] == "get"]
     assert len(gets) == 1
     assert (gets[0].get("serializer"), gets[0].get("hit")) == (tier, True)  # what the sync hit sites pass
-    assert gets[0].get("size_bytes", 0) > 0
+    # Exact served size, not just positive: both hit sites record the raw serialized
+    # envelope's length — the L1 backfill stores the same bytes L2 returned, so the
+    # single L2 store value is the ground truth for either tier. A `> 0` assertion
+    # would pass on a wrong constant (e.g. size_bytes=1); this pins the real value.
+    expected_size = len(next(iter(backend.store.values())))
+    assert gets[0].get("size_bytes") == expected_size
