@@ -1713,14 +1713,17 @@ def create_cache_wrapper(
                     features.record_success()
 
                     if features.collect_stats:
-                        # size_bytes: raw envelope, matching the L1 site's len(l1_bytes).
+                        # size_bytes: the encoded envelope, matching the bytes _l1_backfill_from_l2
+                        # stores and the L1 site's len(l1_bytes). A str envelope is UTF-8 encoded
+                        # first, so non-ASCII payloads report byte length, not character count.
+                        _l2_envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                         features.record_cache_operation(
                             operation="get",
                             namespace=namespace or "default",
                             serializer="rust",
                             success=True,
                             duration_ms=get_duration_ms,
-                            size_bytes=len(cached_data),
+                            size_bytes=len(_l2_envelope),
                             hit=True,
                         )
 
