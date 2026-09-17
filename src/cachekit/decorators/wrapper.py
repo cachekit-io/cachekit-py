@@ -1615,8 +1615,11 @@ def create_cache_wrapper(
                             features.record_cache_operation(
                                 operation="get",
                                 namespace=namespace or "default",
+                                serializer="l1_memory",
                                 success=True,
                                 duration_ms=0.001,  # Sub-microsecond
+                                size_bytes=len(l1_bytes),
+                                hit=True,
                             )
 
                         # Record L1 hit for cache_info()
@@ -1710,11 +1713,16 @@ def create_cache_wrapper(
                     features.record_success()
 
                     if features.collect_stats:
+                        # size_bytes is the raw L2 envelope actually served (and backfilled
+                        # into L1 below), so L1 and L2 hits on one entry report the same size.
                         features.record_cache_operation(
                             operation="get",
                             namespace=namespace or "default",
+                            serializer="rust",
                             success=True,
                             duration_ms=get_duration_ms,
+                            size_bytes=len(cached_data) if cached_data else 0,
+                            hit=True,
                         )
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
