@@ -271,7 +271,7 @@ class FeatureOrchestrator:
         """Set attributes on a span (no-op)."""
         pass
 
-    def log_cache_operation(self, **kwargs):
+    def log_cache_operation(self, **kwargs: Any) -> None:
         """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532)."""
         if self._enable_structured_logging and kwargs:
             operation = kwargs.get("operation", "unknown")
