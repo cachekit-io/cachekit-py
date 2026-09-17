@@ -1713,15 +1713,15 @@ def create_cache_wrapper(
                     features.record_success()
 
                     if features.collect_stats:
-                        # size_bytes is the raw L2 envelope actually served (and backfilled
-                        # into L1 below), so L1 and L2 hits on one entry report the same size.
+                        # size_bytes: raw envelope, matching the L1 site's len(l1_bytes); the sync L2
+                        # site has no envelope in hand and estimates from str(value) instead.
                         features.record_cache_operation(
                             operation="get",
                             namespace=namespace or "default",
                             serializer="rust",
                             success=True,
                             duration_ms=get_duration_ms,
-                            size_bytes=len(cached_data) if cached_data else 0,
+                            size_bytes=len(cached_data),
                             hit=True,
                         )
 

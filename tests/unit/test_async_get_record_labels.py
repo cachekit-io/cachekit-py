@@ -1,12 +1,10 @@
 """Async hit-record stats parity (LAB-3765).
 
-The sync wrapper records an L1 hit as ``operation="get", serializer="l1_memory",
-hit=True`` and an L2 hit as ``serializer="rust", hit=True``, both with the served
-payload size. The async wrapper's two hit sites recorded ``get`` with none of
-those, so on a hit-heavy async workload most ``get`` traffic filed under
-``serializer="unknown"``. Both async tiers are pinned here through the real
-decorator stack: a miss primes L2 (and L1 via backfill); clearing L1 before the
-second call forces it past L1 to the L2 site.
+The sync wrapper records an L1 hit as ``serializer="l1_memory", hit=True`` and an L2
+hit as ``serializer="rust", hit=True``, both with the served size; the async L1 and
+uncontended L2 hit sites recorded none of those, so async hits filed under
+``serializer="unknown"``. A miss primes L2 (and L1 via the miss-store); clearing L1
+before the second call forces it past L1 to the L2 site.
 """
 
 from __future__ import annotations
@@ -45,12 +43,9 @@ class _ByteStore:
 
 @pytest.fixture(autouse=True)
 def setup_di_for_redis_isolation() -> Iterator[None]:
-    """Override the root conftest's Redis isolation: the backend is injected, no Redis needed.
-
-    Keep L1 clear between cases — both share a cache key, and a leaked L1 entry would
-    turn the L2 case's priming miss into an L1 hit.
-    """
-    get_l1_cache_manager().clear_all()
+    """L1 hygiene between the two cases: tests/unit/conftest.py's no-op override of the root
+    fixture dropped its clear_all(), and a leaked entry would turn the L2 case's priming
+    miss into an L1 hit."""
     yield
     get_l1_cache_manager().clear_all()
 
