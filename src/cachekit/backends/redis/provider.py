@@ -27,6 +27,7 @@ from redis.exceptions import LockNotOwnedError
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis.error_handler import classify_redis_error
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -403,8 +404,6 @@ class PerRequestRedisBackend:
         # deployments — the lock identity didn't change, only the protocol boundary
         # (the wrapper no longer pollutes the cache_key passed in).
         scoped_key = f"{self._scoped_key(key)}:lock"
-        from cachekit.cache_handler import redact_cache_key  # local: cache_handler imports the backends package
-
         try:
             from redis.lock import Lock
 
@@ -426,10 +425,14 @@ class PerRequestRedisBackend:
                 try:
                     lock.release()
                 except LockNotOwnedError as e:
-                    logger.debug("Redis lock already expired or taken over before release: %s", e)  # nothing to orphan
+                    logger.debug(
+                        "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
+                    )  # nothing to orphan
                 except redis.RedisError as e:
                     logger.warning(
-                        "Redis lock release for %s failed; the key lives until its TTL", redact_cache_key(key), exc_info=e
+                        "Redis lock release for %s failed (%s); the key lives until its TTL",
+                        redact_cache_key(key),
+                        redact_error_for_log(e),
                     )
 
             async def _release() -> None:
@@ -446,9 +449,9 @@ class PerRequestRedisBackend:
                     # have won; log it rather than let it mask the cancellation.
                     if (err := attempt.exception()) is not None:
                         logger.warning(
-                            "Redis lock attempt for %s failed while acquire_lock was being cancelled",
+                            "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
                             redact_cache_key(key),
-                            exc_info=err,
+                            redact_error_for_log(err),
                         )
                     elif attempt.result():
                         await _release()
@@ -574,4 +577,4 @@ class RedisBackendProvider:
             self._pool.disconnect()
         except Exception as e:
             # Best effort cleanup - log but don't raise
-            logger.debug("Error closing Redis connection pool: %s", e)
+            logger.debug("Error closing Redis connection pool: %s", redact_error_for_log(e))

@@ -542,10 +542,14 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         with pytest.raises(asyncio.CancelledError), caplog.at_level(logging.WARNING, logger="cachekit.backends.redis.provider"):
             await task
+        # LAB-304: the log names the error by type only — never its text, never a traceback.
         assert any(
-            r.levelno == logging.WARNING and r.exc_info and isinstance(r.exc_info[1], RedisConnectionError)
+            r.levelno == logging.WARNING
+            and RedisConnectionError.__name__ in r.getMessage()
+            and "redis went away" not in r.getMessage()
+            and r.exc_info is None
             for r in caplog.records
-        ), "a failed attempt swallowed by cancellation must be logged with its traceback"
+        ), "a failed attempt swallowed by cancellation must be logged, by type"
 
     async def test_cancellation_mid_attempt_that_loses_leaves_the_holders_lock_alone(self, caplog):
         """A cancelled attempt that loses to an existing holder has nothing to release: no release call, nothing logged."""

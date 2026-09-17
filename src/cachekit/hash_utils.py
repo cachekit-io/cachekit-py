@@ -1,11 +1,107 @@
-"""Standardized hashing utilities for cachekit.
+"""Standardized hashing and log-redaction utilities for cachekit.
 
 Uses BLAKE3 for hashing (approximately 2-3 GB/s throughput).
+
+This is also the leaf home for the log-redaction policy — ``redact_cache_key``,
+``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532). It lives here, not in
+``cache_handler`` or ``backends.errors``, so backend/L1 modules can share one policy
+without an import cycle (``backends.errors`` imports this module).
 """
 
+import hashlib
+import re
 from typing import Union
 
 import blake3
+
+
+def redact_cache_key(cache_key: object) -> str:
+    """Redact a cache key for log/error messages.
+
+    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
+    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
+    across the sync and async cache-set failure paths without leaking the key itself.
+
+    Unkeyed by design — cross-process correlation is the point. The digest is as guessable
+    as the key material (function args or a custom key), so it is a correlation id, not a
+    secret (see SECURITY.md, "Digest strength").
+
+    Lives in this leaf module so backend/L1 modules can use it without importing
+    cache_handler (which imports them).
+
+    The exact output format (``<redacted:{16 hex}>``) is pinned by
+    ``_REDACTED_KEY_RE`` below and by ``test_pass_through_is_strict_allow_list``
+    — change them together.
+    """
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
+
+
+#: Placeholders that occupy the cache_key field but are not keys and carry no
+#: caller data, so they stay readable. ``system`` is the label health.py logs its
+#: checks under; hashing it turned a readable operator-facing field into an
+#: opaque digest and silently broke any dashboard filtering on it. None of these
+#: is a well-formed cache key (real keys are ``ns:...``), so nothing caller-supplied
+#: can impersonate one.
+_SENTINEL_KEYS = frozenset({"unknown", "<generation_failed>", "system"})
+
+#: Matches exactly what redact_cache_key() emits — keep the two in step.
+_REDACTED_KEY_RE = re.compile(r"<redacted:[0-9a-f]{16}>\Z")
+
+
+def redact_key_for_log(cache_key: object) -> str:
+    """Redact a cache key for logging unless it is a known sentinel or already redacted.
+
+    Cache keys embed caller-supplied tenant/user identifiers and must never reach
+    logs verbatim (CWE-532, issue #163). Real keys are canonical ``ns:...`` strings;
+    sentinels (``unknown``, ``<generation_failed>``) and redact_cache_key() output
+    (``<redacted:{16 hex}>``) carry no caller data and stay readable as-is.
+
+    Matching the strict generated format makes redaction idempotent, so one key can
+    cross several sinks — ``handle_cache_error`` into ``log_cache_operation``, or a
+    caller handing an already-redacted value to ``SimpleLogger`` — and still emit a
+    single digest that correlates across all of them. Re-hashing would mint a fresh
+    digest per hop and break that correlation, without opening a pass-through for
+    arbitrary angle-bracketed strings.
+
+    Prefer this over :func:`redact_cache_key` at any *sink*. Reach for the bare
+    function only where the input is known-raw and cannot already be redacted.
+
+    Lives beside redact_cache_key() in this leaf module so the decorator
+    orchestrator, ``cachekit.logging`` and the backend loggers share one policy
+    without importing each other.
+    """
+    key_str = str(cache_key)
+    if key_str in _SENTINEL_KEYS or _REDACTED_KEY_RE.fullmatch(key_str):
+        return key_str
+    return redact_cache_key(key_str)
+
+
+def redact_error_for_log(error: object) -> str:
+    """Render an exception for a log/error message without leaking cache keys (CWE-532).
+
+    An exception's ``str()`` reaches log interpolation at every cache-error sink and has
+    unknown provenance: it can echo the raw cache key directly (a redis ResponseError
+    naming the key) or transitively (a ``BackendError`` whose free-form ``.message`` was
+    built with the key). So this helper logs **no free-form exception text at all** — it
+    does not trust that ``.message`` is key-free, it structurally cannot include it:
+
+    - ``BackendError`` is rendered from its allow-listed, non-key fields only — the Python
+      type plus the ``BackendErrorType`` classification (``.error_type``, an enum of fixed
+      verbs). Its ``.message`` and raw ``.key`` are never read here; the redacted key digest
+      is already emitted in the separate ``key`` log field, and full detail stays on the
+      exception object for programmatic access.
+    - Every other exception collapses to its bare type name.
+
+    Sits beside redact_key_for_log() so both log sinks share one error policy.
+    ``BackendError`` is imported lazily to keep this leaf module free of a back-edge to
+    ``backends.errors`` (which imports this module).
+    """
+    from cachekit.backends.errors import BackendError
+
+    if isinstance(error, BackendError):
+        error_type = getattr(error.error_type, "value", error.error_type)
+        return f"{type(error).__name__}({error_type})"
+    return type(error).__name__
 
 
 def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:

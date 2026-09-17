@@ -113,7 +113,7 @@ class RedisBackend:
             return self._client_provider.get_sync_client()
         except Exception as e:
             raise BackendError(
-                message=f"Failed to create Redis client: {e}",
+                message=f"Failed to create Redis client: {type(e).__name__}",
                 operation="get_client",
             ) from e
 
@@ -139,7 +139,7 @@ class RedisBackend:
             return value if isinstance(value, bytes) else None
         except Exception as e:
             raise BackendError(
-                message=f"Redis GET failed: {e}",
+                message=f"Redis GET failed: {type(e).__name__}",
                 operation="get",
                 key=key,
             ) from e
@@ -165,7 +165,7 @@ class RedisBackend:
                 client.set(key, value)
         except Exception as e:
             raise BackendError(
-                message=f"Redis SET failed: {e}",
+                message=f"Redis SET failed: {type(e).__name__}",
                 operation="set",
                 key=key,
             ) from e
@@ -195,7 +195,7 @@ class RedisBackend:
             return result > 0
         except Exception as e:
             raise BackendError(
-                message=f"Redis DELETE failed: {e}",
+                message=f"Redis DELETE failed: {type(e).__name__}",
                 operation="delete",
                 key=key,
             ) from e
@@ -225,7 +225,7 @@ class RedisBackend:
             return result > 0
         except Exception as e:
             raise BackendError(
-                message=f"Redis EXISTS failed: {e}",
+                message=f"Redis EXISTS failed: {type(e).__name__}",
                 operation="exists",
                 key=key,
             ) from e

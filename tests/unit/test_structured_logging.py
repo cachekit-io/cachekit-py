@@ -106,15 +106,19 @@ class TestStructuredRedisLogger:
         context = logger._get_context()
         assert context["trace_id"] == trace_id
 
-    def test_mask_sensitive_data(self, logger, logger_no_mask):
-        """Test sensitive data masking."""
-        sensitive = "email@test.com"
+    def test_cache_key_always_redacted(self, logger, logger_no_mask):
+        """cache_operation redacts the key regardless of mask_sensitive (CWE-532, LAB-304)."""
+        from unittest.mock import patch as _patch
 
-        # With masking enabled
-        assert logger._mask_sensitive_data(sensitive) == "XXX@XXX.XXX"
+        from cachekit.hash_utils import redact_cache_key
 
-        # With masking disabled
-        assert logger_no_mask._mask_sensitive_data(sensitive) == sensitive
+        sensitive = "ns:tenant-42:func:app.f:args:email@test.com:v1"
+        for lg in (logger, logger_no_mask):
+            with _patch("cachekit.logging.logging.Logger.log") as mock_log:
+                lg.cache_operation("get", sensitive, hit=True)
+            extra = mock_log.call_args[1]["extra"]["structured"]
+            assert extra["cache_key"] == redact_cache_key(sensitive)
+            assert sensitive not in str(extra)
 
     @patch("cachekit.logging.logging.Logger.log")
     def test_cache_operation_logging(self, mock_log, logger):
@@ -140,7 +144,9 @@ class TestStructuredRedisLogger:
         # Check structured context
         extra = call_args[1]["extra"]["structured"]
         assert extra["operation"] == "get"
-        assert extra["cache_key"] == "user:XXX@XXX.XXX"  # Masked
+        from cachekit.hash_utils import redact_cache_key
+
+        assert extra["cache_key"] == redact_cache_key("user:email@test.com")  # Redacted digest (CWE-532)
         assert extra["namespace"] == "users"
         assert extra["serializer"] == "orjson"
         assert extra["duration_ms"] == 1.5
@@ -165,14 +171,18 @@ class TestStructuredRedisLogger:
 
     @patch("cachekit.logging.logging.Logger.log")
     def test_redis_operation_failed_override(self, mock_log, logger):
-        """Test redis_operation_failed override."""
+        """redis_operation_failed emits a key-free error representation (CWE-532).
+
+        A non-BackendError's str() has unknown provenance and may echo the raw cache
+        key, so only its type name reaches the log; error_type still carries the type.
+        """
         error = ValueError("Test error")
         logger.redis_operation_failed("get", "test_key", error)
 
         mock_log.assert_called_once()
         extra = mock_log.call_args[1]["extra"]["structured"]
         assert extra["operation"] == "get"
-        assert extra["error"] == "Test error"
+        assert extra["error"] == "ValueError"  # not the raw "Test error" message
         assert extra["error_type"] == "ValueError"
 
     @patch("cachekit.logging.logging.Logger.log")
