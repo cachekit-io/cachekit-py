@@ -103,9 +103,12 @@ cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 cachekit_config_drift_reads_total{reason="encryption_disabled"}
 ```
 
-> Hits and misses are not separate series; derive them from the labels on
-> `cache_operations_total`. `redis_cache_operations_total` carries no hit/miss status — it
-> counts backpressure rejections only.
+> Hit/miss is not exposed as a series or a label. `cache_operations_total` carries
+> `operation`, `namespace`, `success`, and `serializer` — `success` is operation success
+> across reads, writes, and other operations, **not** a cache hit, and there is no `hit`
+> label. `redis_cache_operations_total` carries no hit/miss status either — it counts
+> backpressure rejections only. For a miss signal, use `operation="set"` as a cache-write
+> proxy (see [Query Examples](#query-examples)), not a hit/miss series.
 
 ### Histograms (latency and size)
 
@@ -131,12 +134,24 @@ circuit_breaker_state{namespace="users",state="open"}
 
 ## Query Examples
 
-### Cache Hit Rate
+### Operation Success Rate
+
+`cache_operations_total` has no hit/miss label — `success` covers reads, writes, and
+other operations, so this is an operation-success rate, not a hit rate.
 
 ```promql
-# Hit rate (percentage) using the success label on cache_operations_total
+# Operation success rate (percentage) using the success label on cache_operations_total
 100 * sum(rate(cache_operations_total{success="True"}[5m]))
     / sum(rate(cache_operations_total[5m]))
+```
+
+For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
+writes back, but it is a write proxy — it can double-count when stats collection is on
+and records nothing for a failed write — so treat it as a proxy, not an exact miss count.
+
+```promql
+# Cache-write rate as a miss-rate proxy (see caveats above)
+sum(rate(cache_operations_total{operation="set"}[5m]))
 ```
 
 ### Cache Latency (P99)
@@ -168,16 +183,16 @@ circuit_breaker_state
 
 ## Alerting Examples
 
-### Alert: Low Cache Hit Rate
+### Alert: Low Operation Success Rate
 
 ```yaml
-- alert: LowCacheHitRate
+- alert: LowCacheOperationSuccessRate
   expr: |
     100 * sum(rate(cache_operations_total{success="True"}[5m]))
         / sum(rate(cache_operations_total[5m]))
-    < 50  # Hit rate below 50%
+    < 50  # Operation success below 50% (this is not a hit rate)
   annotations:
-    summary: "Cache hit rate is low (< 50%)"
+    summary: "Cache operation success rate is low (< 50%)"
 ```
 
 ### Alert: Circuit Breaker Open
@@ -274,9 +289,10 @@ A: cachekit does not expose metrics for you. Confirm your app starts
 the **default** registry, and that at least one decorated function has run — series are
 created lazily on first use.
 
-**Q: Hit rate always 0**
-A: Check that the function is actually being called and that L1/L2 caching is working.
-Remember hit/miss is derived from labels on `cache_operations_total`, not from separate series.
+**Q: Where is the hit rate?**
+A: There is no hit/miss series or label. `cache_operations_total` exposes operation
+success (`success`), not hits. Use `operation="set"` as a cache-write proxy for misses
+(see [Query Examples](#query-examples)) — it is a proxy, not an exact count.
 
 **Q: Metrics growing unbounded**
 A: Prometheus retention is configurable (default 15 days). Keep label cardinality bounded —
