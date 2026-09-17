@@ -332,7 +332,7 @@ class TestGetCachedValueFailPolicy:
         """Regression: the happy path is untouched by the policy plumbing."""
         handler, strategy, serialization = _make_operation_handler(fail_closed=True)
         strategy.store["key:a"] = serialization.serialize_data({"v": 7}, cache_key="key:a")
-        assert handler.get_cached_value("key:a") == (True, {"v": 7})
+        assert handler.get_cached_value("key:a") == (True, {"v": 7}, len(strategy.store["key:a"]))
 
 
 class TestConfigDriftRead:

@@ -1322,7 +1322,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cached result is a tuple (True, actual_value)
+                # Cached result is a tuple (True, value, size_bytes): size_bytes is the served L2
+                # envelope length, the same quantity the L1 and async hit sites record (LAB-3768).
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1337,7 +1338,6 @@ def create_cache_wrapper(
                     )
 
                 # Record cache hit with structured logging
-                size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                 features.log_cache_operation(
                     operation="get",
                     key=cache_key,
@@ -1350,14 +1350,13 @@ def create_cache_wrapper(
 
                 # Also record statistics if enabled
                 if features.collect_stats:
-                    size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                     features.record_cache_operation(
                         operation="get",
                         namespace=namespace or "default",
                         serializer="rust",
                         success=True,
                         duration_ms=duration * 1000,
-                        size_bytes=size_bytes,
+                        size_bytes=cached_result[2],
                         hit=True,
                     )
 
