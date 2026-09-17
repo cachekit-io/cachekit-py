@@ -158,7 +158,7 @@ class UltraOptimizedStructuredLogger:
     - Lock-free ring buffer
     - Sampling (10% default)
     - Async batch writes
-    - Smart PII masking
+    - PII key-name masking (password/token/secret/key/auth kwargs)
     - Near-zero overhead when not sampled
     """
 
