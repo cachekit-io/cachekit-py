@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.logging import (
     JsonFormatter,
     StructuredRedisLogger,
@@ -169,21 +170,29 @@ class TestStructuredRedisLogger:
         assert extra["error"] == "Connection timeout"
         assert extra["error_type"] == "TimeoutError"
 
+    @pytest.mark.parametrize(
+        ("error", "rendered", "error_type"),
+        [
+            (ValueError("Test error"), "ValueError", "ValueError"),
+            (BackendError("Redis timeout", error_type=BackendErrorType.TIMEOUT), "BackendError(timeout)", "BackendError"),
+        ],
+        ids=["provider_exception", "backend_error"],
+    )
     @patch("cachekit.logging.logging.Logger.log")
-    def test_redis_operation_failed_override(self, mock_log, logger):
+    def test_redis_operation_failed_override(self, mock_log, logger, error, rendered, error_type):
         """redis_operation_failed emits a key-free error representation (CWE-532).
 
         A non-BackendError's str() has unknown provenance and may echo the raw cache
-        key, so only its type name reaches the log; error_type still carries the type.
+        key, so only its type name reaches the log; a BackendError renders as
+        ``TypeName(error_type)``. error_type still carries the Python type.
         """
-        error = ValueError("Test error")
         logger.redis_operation_failed("get", "test_key", error)
 
         mock_log.assert_called_once()
         extra = mock_log.call_args[1]["extra"]["structured"]
         assert extra["operation"] == "get"
-        assert extra["error"] == "ValueError"  # not the raw "Test error" message
-        assert extra["error_type"] == "ValueError"
+        assert extra["error"] == rendered  # never the raw message
+        assert extra["error_type"] == error_type
 
     @patch("cachekit.logging.logging.Logger.log")
     def test_cache_hit_override(self, mock_log, logger):

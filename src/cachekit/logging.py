@@ -263,6 +263,10 @@ class UltraOptimizedStructuredLogger:
         # correlation between the two sinks. Sentinels stay readable too.
         display_key = redact_key_for_log(cache_key) if cache_key else ""
 
+        # CWE-532 at the sink: render an exception key-free; a str is already rendered (re-sanitising one emits "str").
+        if isinstance(kwargs.get("error"), BaseException):
+            kwargs["error"] = redact_error_for_log(kwargs["error"])
+
         # Determine log level based on error presence
         level = "ERROR" if "error" in kwargs else "INFO"
 
@@ -414,8 +418,8 @@ class UltraOptimizedStructuredLogger:
 
     # Compatibility methods for tests
     def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure. Error text is key-free (CWE-532)."""
-        self.cache_operation(operation, key, error=redact_error_for_log(error), error_type=type(error).__name__, **kwargs)
+        """Log Redis operation failure. ``cache_operation`` renders the error key-free (CWE-532)."""
+        self.cache_operation(operation, key, error=error, error_type=type(error).__name__, **kwargs)
 
     def cache_hit(self, key: str, **kwargs):
         """Log cache hit."""
