@@ -1363,11 +1363,10 @@ class CacheOperationHandler:
 
         Returns:
             Tuple (True, value, size_bytes) if cache hit, None if cache miss or error.
-            size_bytes is the length of the L2 envelope actually served, so the decorator's
-            hit metric measures the same quantity as the L1 and async hit sites (LAB-3768).
-            It is a length rather than the envelope itself: the sync path does no L1 backfill
-            (#164) and the mmap fast path's view dangles once its handle closes (#171). The
-            async variant carries the raw bytes instead because it does backfill L1.
+            size_bytes is the length of the L2 envelope actually served, the same quantity
+            the L1 hit site records via len(l1_bytes) (LAB-3768). It is a length rather than
+            the envelope itself: the sync path does no L1 backfill (#164) and the mmap fast
+            path's view dangles once its handle closes (#171).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.

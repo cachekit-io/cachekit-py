@@ -1322,8 +1322,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cached result is a tuple (True, value, size_bytes): size_bytes is the served L2
-                # envelope length, the same quantity the L1 and async hit sites record (LAB-3768).
+                # (True, value, size_bytes): served L2 envelope length, see get_cached_value.
+                _found, result, size_bytes = cached_result
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1356,7 +1356,7 @@ def create_cache_wrapper(
                         serializer="rust",
                         success=True,
                         duration_ms=duration * 1000,
-                        size_bytes=cached_result[2],
+                        size_bytes=size_bytes,
                         hit=True,
                     )
 
@@ -1373,7 +1373,7 @@ def create_cache_wrapper(
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
-                return cached_result[1]
+                return result
         except DecryptionAuthenticationError:
             # Fail-closed tamper failure propagated from get_cached_value — it only
             # raises when encryption.fail_closed=True (the metric and error log were
