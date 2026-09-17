@@ -1713,8 +1713,7 @@ def create_cache_wrapper(
                     features.record_success()
 
                     if features.collect_stats:
-                        # size_bytes: raw envelope, matching the L1 site's len(l1_bytes); the sync L2
-                        # site has no envelope in hand and estimates from str(value) instead.
+                        # size_bytes: raw envelope, matching the L1 site's len(l1_bytes).
                         features.record_cache_operation(
                             operation="get",
                             namespace=namespace or "default",
