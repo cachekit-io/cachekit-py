@@ -59,6 +59,7 @@ except ImportError:
     ArrowSerializer = None  # type: ignore[assignment,misc]
 
 from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
+from cachekit.hash_utils import redact_error_for_log
 
 from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
@@ -635,7 +636,9 @@ class AutoSerializer:
                 # fall through to the Python-only paths below, keeping the reason for the
                 # final error.
                 envelope_error = e
-                logger.debug(f"Rust envelope parsing failed, falling back to Python-only deserialization: {e}")
+                logger.debug(
+                    f"Rust envelope parsing failed, falling back to Python-only deserialization: {redact_error_for_log(e)}"
+                )
             else:
                 # The envelope verified (checksum matched), so its payload is exactly what was
                 # stored; a payload that then fails to decode is corruption or a forged entry
