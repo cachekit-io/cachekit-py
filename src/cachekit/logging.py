@@ -42,7 +42,6 @@ FLUSH_INTERVAL = _logging_config["flush_interval"]
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
-LONG_TOKEN_LENGTH_THRESHOLD = 30  # Minimum length to abbreviate tokens
 
 
 @dataclass
@@ -159,13 +158,12 @@ class UltraOptimizedStructuredLogger:
     - Lock-free ring buffer
     - Sampling (10% default)
     - Async batch writes
-    - Smart PII masking
+    - PII key-name masking (password/token/secret/key/auth kwargs)
     - Near-zero overhead when not sampled
     """
 
-    def __init__(self, name: str, mask_sensitive: bool = True):
+    def __init__(self, name: str):
         self.name = name
-        self.mask_sensitive = mask_sensitive
         self.buffer = LockFreeRingBuffer()
         self.writer = AsyncLogWriter(self.buffer)
         self.writer.start()
@@ -481,29 +479,25 @@ _logger_instances: dict[str, UltraOptimizedStructuredLogger] = {}
 _logger_lock = threading.Lock()
 
 
-def get_structured_logger(name: str, mask_sensitive: bool = True) -> UltraOptimizedStructuredLogger:
+def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
     """Get or create a structured logger instance.
 
     Args:
         name: Logger name (usually __name__)
-        mask_sensitive: Whether to mask sensitive data
 
     Returns:
         Ultra-optimized structured logger instance
     """
-    # Create cache key including mask_sensitive setting
-    cache_key = f"{name}:{mask_sensitive}"
-
     # Fast path - check if already exists
-    if cache_key in _logger_instances:
-        return _logger_instances[cache_key]
+    if name in _logger_instances:
+        return _logger_instances[name]
 
     # Slow path - create new instance
     with _logger_lock:
         # Double-check pattern
-        if cache_key not in _logger_instances:
-            _logger_instances[cache_key] = UltraOptimizedStructuredLogger(name, mask_sensitive)
-        return _logger_instances[cache_key]
+        if name not in _logger_instances:
+            _logger_instances[name] = UltraOptimizedStructuredLogger(name)
+        return _logger_instances[name]
 
 
 # Alias
@@ -534,38 +528,3 @@ class JsonFormatter(logging.Formatter):
             log_data["exception"] = "".join(traceback.format_exception(*record.exc_info))
 
         return json.dumps(log_data, separators=(",", ":"))
-
-
-# Additional compatibility functions
-def mask_sensitive_patterns(data: str) -> str:
-    """Mask sensitive patterns in data."""
-    if data is None:
-        return None
-
-    import re
-
-    # SSN patterns
-    data = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "XXX-XX-XXXX", data)
-    data = re.sub(r"\b\d{9}\b", "XXXXXXXXX", data)
-
-    # Credit card patterns
-    data = re.sub(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b", "XXXX-XXXX-XXXX-XXXX", data)
-
-    # Email addresses
-    data = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "XXX@XXX.XXX", data)
-
-    # Phone numbers
-    data = re.sub(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", "XXX-XXX-XXXX", data)
-    data = re.sub(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}\b", "(XXX) XXX-XXXX", data)
-
-    # JWT tokens (must be done before general API keys)
-    data = re.sub(r"\b[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\b", "XXX.XXX.XXX", data)
-
-    # API keys and tokens (20+ chars)
-    data = re.sub(
-        r"\b[A-Za-z0-9_-]{20,}\b",
-        lambda m: "XXXXX...XXXXX" if len(m.group()) > LONG_TOKEN_LENGTH_THRESHOLD else "XXX",
-        data,
-    )
-
-    return data
