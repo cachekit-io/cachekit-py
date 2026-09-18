@@ -1353,7 +1353,7 @@ class CacheOperationHandler:
             )
         self._notify_deserialize_error(e, cache_key)
 
-    def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
+    def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[tuple[bool, Any, int]]:
         """Get value from cache if it exists.
 
         Args:
@@ -1361,7 +1361,11 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, size_bytes) if cache hit, None if cache miss or error.
+            size_bytes is the length of the L2 envelope actually served, the same quantity
+            the L1 hit site records via len(l1_bytes) (LAB-3768). It is a length rather than
+            the envelope itself: the sync path does no L1 backfill (#164) and the mmap fast
+            path's view dangles once its handle closes (#171).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1380,7 +1384,9 @@ class CacheOperationHandler:
                 if handle is not None:
                     try:
                         get_logger().cache_hit(cache_key, "Backend(mmap)")
-                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
+                        value = self.serialization_handler.deserialize_data(handle.view, cache_key)
+                        # Size is read before close(); the view itself must never leave this frame (#171).
+                        return (True, value, handle.view.nbytes)
                     finally:
                         handle.close()
 
@@ -1389,8 +1395,8 @@ class CacheOperationHandler:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; the served envelope size rides along
+                return (True, deserialized, len(cached_data))
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
@@ -1409,11 +1415,11 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool, Optional[int]]]:
+    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, int], bool, Optional[int]]]:
         """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
         staleness and the server's remaining freshness in seconds.
 
-        Returns ``((True, value), is_stale, fresh_for)`` on a hit, None on
+        Returns ``((True, value, size_bytes), is_stale, fresh_for)`` on a hit, None on
         miss/error. fresh_for is None when no signal exists (pre-signal server,
         non-SWR backend) — the caller applies legacy L1 TTL behavior. The mmap
         fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
@@ -1435,7 +1441,7 @@ class CacheOperationHandler:
             cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized), is_stale, fresh_for)
+            return ((True, deserialized, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad

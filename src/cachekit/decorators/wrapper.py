@@ -1336,7 +1336,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cached result is a tuple (True, actual_value)
+                # (True, value, size_bytes): served L2 envelope length, see get_cached_value.
+                _found, result, size_bytes = cached_result
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1351,7 +1352,6 @@ def create_cache_wrapper(
                     )
 
                 # Record cache hit with structured logging
-                size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                 features.log_cache_operation(
                     operation="get",
                     key=cache_key,
@@ -1364,7 +1364,6 @@ def create_cache_wrapper(
 
                 # Also record statistics if enabled
                 if features.collect_stats:
-                    size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                     features.record_cache_operation(
                         operation="get",
                         namespace=namespace or "default",
@@ -1388,7 +1387,7 @@ def create_cache_wrapper(
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
-                return cached_result[1]
+                return result
         except DecryptionAuthenticationError:
             # Fail-closed tamper failure propagated from get_cached_value — it only
             # raises when encryption.fail_closed=True (the metric and error log were
