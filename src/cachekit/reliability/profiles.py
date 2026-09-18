@@ -67,15 +67,11 @@ class ProfileConfig:
     metrics_batch_size: int = 100
     metrics_flush_interval: float = 0.1
 
-    # Security features
-    mask_sensitive_data: bool = True
-
     # Backpressure settings
     backpressure_read_operations: bool = False  # Skip backpressure for reads
     backpressure_timeout: float = 0.1  # Shorter timeout for cache ops
 
     # Logging optimization
-    lazy_pii_masking: bool = True
     log_level_threshold: str = "INFO"
 
 
@@ -94,10 +90,7 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
         health_cache_duration=1.0,  # Cache longer for performance
         # Performance optimized
         max_concurrent_requests=1000,  # Higher limit
-        # Security still enabled
-        mask_sensitive_data=True,
         # Minimal logging
-        lazy_pii_masking=True,
         log_level_threshold="WARNING",  # Only log warnings and errors
     ),
     ReliabilityProfile.BALANCED: ProfileConfig(
@@ -115,13 +108,10 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
         max_concurrent_requests=100,
         metrics_batch_size=100,
         metrics_flush_interval=0.1,
-        # Security enabled
-        mask_sensitive_data=True,
         # Optimized backpressure
         backpressure_read_operations=False,  # Skip reads
         backpressure_timeout=0.1,
         # Optimized logging
-        lazy_pii_masking=True,
         log_level_threshold="INFO",
     ),
     ReliabilityProfile.FULL: ProfileConfig(
@@ -139,13 +129,10 @@ PROFILE_CONFIGS: dict[ReliabilityProfile, ProfileConfig] = {
         max_concurrent_requests=50,
         metrics_batch_size=50,  # Smaller batches for lower latency
         metrics_flush_interval=0.05,  # More frequent flushes
-        # Full security
-        mask_sensitive_data=True,
         # Full backpressure (including reads)
         backpressure_read_operations=True,
         backpressure_timeout=0.5,  # Longer timeout for reliability
         # Full logging
-        lazy_pii_masking=True,
         log_level_threshold="DEBUG",
     ),
 }
@@ -234,7 +221,6 @@ def create_optimized_decorator_config(profile: ReliabilityProfile = ReliabilityP
         "_use_async_metrics": config.async_metrics,
         "_use_lightweight_health": True,
         "_health_check_level": config.health_check_level.value,
-        "_lazy_pii_masking": config.lazy_pii_masking,
         "_backpressure_read_ops": config.backpressure_read_operations,
         "_metrics_batch_size": config.metrics_batch_size,
         "_metrics_flush_interval": config.metrics_flush_interval,
