@@ -790,6 +790,36 @@ def create_cache_wrapper(
             _l1_cache.put(cache_key, cached_bytes, redis_ttl=_l1_backfill_ttl(fresh_for))
             _cached_keys.add(cache_key)
 
+    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> Any:
+        """Record the telemetry for an async L2 hit — the uncontended read and
+        both post-lock double-check hits (LAB-3769) share this so a
+        thundering-herd hit is never invisible to cache_operations_total /
+        cache_info() just because it arrived via the lock's double-check.
+
+        Returns the UTF-8-encoded envelope when collect_stats computed one
+        (else the original cached_data unchanged), so callers can pass it
+        straight to _l1_backfill_from_l2 instead of re-encoding a str payload
+        a second time."""
+        features.set_operation_context("get", duration_ms=get_duration_ms)
+        features.record_success()
+        envelope = cached_data
+        if features.collect_stats:
+            # size_bytes: the encoded envelope, matching the bytes _l1_backfill_from_l2
+            # stores. A str envelope is UTF-8 encoded first, so non-ASCII payloads
+            # report byte length, not character count.
+            envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+            features.record_cache_operation(
+                operation="get",
+                namespace=namespace or "default",
+                serializer="rust",
+                success=True,
+                duration_ms=get_duration_ms,
+                size_bytes=len(envelope),
+                hit=True,
+            )
+        _stats.record_l2_hit(get_duration_ms)
+        return envelope
+
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
 
@@ -1725,23 +1755,7 @@ def create_cache_wrapper(
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.set_operation_context("get", duration_ms=get_duration_ms)
-                    features.record_success()
-
-                    if features.collect_stats:
-                        # size_bytes: the encoded envelope, matching the bytes _l1_backfill_from_l2
-                        # stores and the L1 site's len(l1_bytes). A str envelope is UTF-8 encoded
-                        # first, so non-ASCII payloads report byte length, not character count.
-                        _l2_envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                        features.record_cache_operation(
-                            operation="get",
-                            namespace=namespace or "default",
-                            serializer="rust",
-                            success=True,
-                            duration_ms=get_duration_ms,
-                            size_bytes=len(_l2_envelope),
-                            hit=True,
-                        )
+                    cached_data = _record_l2_hit_async(cached_data, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1762,9 +1776,6 @@ def create_cache_wrapper(
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
                         warn_ttl_refresh_unsupported(_backend)
-
-                    # Record L2 hit with latency for cache_info()
-                    _stats.record_l2_hit(get_duration_ms)
 
                     # SWR: stale hit — value already in hand; revalidate in the
                     # background so no request pays the recompute at a TTL boundary.
@@ -1819,10 +1830,13 @@ def create_cache_wrapper(
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
                                     _found, result, cached_data = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    cached_data = _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1846,10 +1860,13 @@ def create_cache_wrapper(
                             try:
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
                                     _found, result, cached_data = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    cached_data = _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
