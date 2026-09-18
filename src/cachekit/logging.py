@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from cachekit.config import get_settings
+from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
 # Configure base logger
 logger = logging.getLogger(__name__)
@@ -41,7 +42,6 @@ FLUSH_INTERVAL = _logging_config["flush_interval"]
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
-LONG_TOKEN_LENGTH_THRESHOLD = 30  # Minimum length to abbreviate tokens
 
 
 @dataclass
@@ -132,7 +132,7 @@ class AsyncLogWriter(threading.Thread):
                     self._write_batch(entries)
 
             except Exception as e:
-                logger.error(f"Error in async log writer: {e}")
+                logger.error(f"Error in async log writer: {redact_error_for_log(e)}")
 
     def stop(self):
         """Stop the writer thread."""
@@ -158,13 +158,12 @@ class UltraOptimizedStructuredLogger:
     - Lock-free ring buffer
     - Sampling (10% default)
     - Async batch writes
-    - Smart PII masking
+    - PII key-name masking (password/token/secret/key/auth kwargs)
     - Near-zero overhead when not sampled
     """
 
-    def __init__(self, name: str, mask_sensitive: bool = True):
+    def __init__(self, name: str):
         self.name = name
-        self.mask_sensitive = mask_sensitive
         self.buffer = LockFreeRingBuffer()
         self.writer = AsyncLogWriter(self.buffer)
         self.writer.start()
@@ -251,11 +250,20 @@ class UltraOptimizedStructuredLogger:
 
     def cache_operation(self, operation: str, cache_key: str, **kwargs):
         """Log cache operation with standard fields."""
-        # Mask cache key if needed
-        if self.mask_sensitive and cache_key:
-            display_key = self._mask_sensitive_data(cache_key)
-        else:
-            display_key = cache_key[:50] if cache_key else ""  # Truncate long keys
+        # Always redact: cache keys embed caller-supplied tenant/user identifiers
+        # (CWE-532, LAB-304). PII-pattern masking (SSN/email/...) does not catch
+        # them, and a raw [:50] prefix is exactly the leak — so neither is an
+        # alternative to the digest.
+        #
+        # Same guard the orchestrator sink uses, not a bare redact_cache_key():
+        # callers reach this method with values already redacted upstream, and
+        # re-hashing would emit a second, different digest for one key and break
+        # correlation between the two sinks. Sentinels stay readable too.
+        display_key = redact_key_for_log(cache_key) if cache_key else ""
+
+        # CWE-532 at the sink: render an exception key-free; a str is already rendered (re-sanitising one emits "str").
+        if isinstance(kwargs.get("error"), BaseException):
+            kwargs["error"] = redact_error_for_log(kwargs["error"])
 
         # Determine log level based on error presence
         level = "ERROR" if "error" in kwargs else "INFO"
@@ -406,16 +414,10 @@ class UltraOptimizedStructuredLogger:
             context["correlation_id"] = self._context.correlation_id
         return context
 
-    def _mask_sensitive_data(self, data: str) -> str:
-        """Mask sensitive data if enabled."""
-        if self.mask_sensitive:
-            return mask_sensitive_patterns(data)
-        return data
-
     # Compatibility methods for tests
     def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure."""
-        self.cache_operation(operation, key, error=str(error), error_type=type(error).__name__, **kwargs)
+        """Log Redis operation failure. ``cache_operation`` renders the error key-free (CWE-532)."""
+        self.cache_operation(operation, key, error=error, error_type=type(error).__name__, **kwargs)
 
     def cache_hit(self, key: str, **kwargs):
         """Log cache hit."""
@@ -481,29 +483,25 @@ _logger_instances: dict[str, UltraOptimizedStructuredLogger] = {}
 _logger_lock = threading.Lock()
 
 
-def get_structured_logger(name: str, mask_sensitive: bool = True) -> UltraOptimizedStructuredLogger:
+def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
     """Get or create a structured logger instance.
 
     Args:
         name: Logger name (usually __name__)
-        mask_sensitive: Whether to mask sensitive data
 
     Returns:
         Ultra-optimized structured logger instance
     """
-    # Create cache key including mask_sensitive setting
-    cache_key = f"{name}:{mask_sensitive}"
-
     # Fast path - check if already exists
-    if cache_key in _logger_instances:
-        return _logger_instances[cache_key]
+    if name in _logger_instances:
+        return _logger_instances[name]
 
     # Slow path - create new instance
     with _logger_lock:
         # Double-check pattern
-        if cache_key not in _logger_instances:
-            _logger_instances[cache_key] = UltraOptimizedStructuredLogger(name, mask_sensitive)
-        return _logger_instances[cache_key]
+        if name not in _logger_instances:
+            _logger_instances[name] = UltraOptimizedStructuredLogger(name)
+        return _logger_instances[name]
 
 
 # Alias
@@ -534,38 +532,3 @@ class JsonFormatter(logging.Formatter):
             log_data["exception"] = "".join(traceback.format_exception(*record.exc_info))
 
         return json.dumps(log_data, separators=(",", ":"))
-
-
-# Additional compatibility functions
-def mask_sensitive_patterns(data: str) -> str:
-    """Mask sensitive patterns in data."""
-    if data is None:
-        return None
-
-    import re
-
-    # SSN patterns
-    data = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "XXX-XX-XXXX", data)
-    data = re.sub(r"\b\d{9}\b", "XXXXXXXXX", data)
-
-    # Credit card patterns
-    data = re.sub(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b", "XXXX-XXXX-XXXX-XXXX", data)
-
-    # Email addresses
-    data = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "XXX@XXX.XXX", data)
-
-    # Phone numbers
-    data = re.sub(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", "XXX-XXX-XXXX", data)
-    data = re.sub(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}\b", "(XXX) XXX-XXXX", data)
-
-    # JWT tokens (must be done before general API keys)
-    data = re.sub(r"\b[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\b", "XXX.XXX.XXX", data)
-
-    # API keys and tokens (20+ chars)
-    data = re.sub(
-        r"\b[A-Za-z0-9_-]{20,}\b",
-        lambda m: "XXXXX...XXXXX" if len(m.group()) > LONG_TOKEN_LENGTH_THRESHOLD else "XXX",
-        data,
-    )
-
-    return data

@@ -127,7 +127,10 @@ class MemcachedBackend:
         if max_size and len(value) > max_size:
             raise BackendError(
                 message=(
-                    f"Value for key {key!r} is {len(value)} bytes, which exceeds the Memcached "
+                    # No raw key in the message — it reaches log sinks via str(e)
+                    # (CWE-532); the key= segment _format_message appends carries
+                    # the redacted digest for correlation.
+                    f"Value is {len(value)} bytes, which exceeds the Memcached "
                     f"max item size of {max_size} bytes. Memcached cannot store it. Enable "
                     f"compression, use a larger-payload backend (Redis/SaaS/File), or raise both "
                     f"the server's -I limit and CACHEKIT_MEMCACHED_MAX_ITEM_SIZE_BYTES."
