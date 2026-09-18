@@ -12,54 +12,7 @@ from cachekit.logging import (
     JsonFormatter,
     StructuredRedisLogger,
     get_structured_logger,
-    mask_sensitive_patterns,
 )
-
-
-class TestSensitiveDataMasking:
-    """Test PII masking functionality."""
-
-    def test_mask_ssn_patterns(self):
-        """Test SSN masking."""
-        assert mask_sensitive_patterns("My SSN is 123-45-6789") == "My SSN is XXX-XX-XXXX"
-        assert mask_sensitive_patterns("SSN: 123456789") == "SSN: XXXXXXXXX"
-
-    def test_mask_credit_card_patterns(self):
-        """Test credit card masking."""
-        assert mask_sensitive_patterns("Card: 1234-5678-9012-3456") == "Card: XXXX-XXXX-XXXX-XXXX"
-        assert mask_sensitive_patterns("Card: 1234567890123456") == "Card: XXXX-XXXX-XXXX-XXXX"
-
-    def test_mask_email_addresses(self):
-        """Test email masking."""
-        assert mask_sensitive_patterns("Email: user@example.com") == "Email: XXX@XXX.XXX"
-        assert mask_sensitive_patterns("Contact: john.doe+tag@company.co.uk") == "Contact: XXX@XXX.XXX"
-
-    def test_mask_phone_numbers(self):
-        """Test phone number masking."""
-        assert mask_sensitive_patterns("Call: 123-456-7890") == "Call: XXX-XXX-XXXX"
-        assert mask_sensitive_patterns("Phone: (123) 456-7890") == "Phone: (XXX) XXX-XXXX"
-        assert mask_sensitive_patterns("Tel: 123.456.7890") == "Tel: XXX-XXX-XXXX"
-
-    def test_mask_api_keys(self):
-        """Test API key masking."""
-        long_key = "sk_test_4eC39HqLyjWDarjtT1zdp7dc"
-        assert mask_sensitive_patterns(f"API Key: {long_key}") == "API Key: XXXXX...XXXXX"
-
-    def test_mask_jwt_tokens(self):
-        """Test JWT token masking."""
-        jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-        assert mask_sensitive_patterns(f"Token: {jwt}") == "Token: XXX.XXX.XXX"
-
-    def test_mask_multiple_patterns(self):
-        """Test masking multiple patterns in one string."""
-        text = "User email@test.com with SSN 123-45-6789 called from 555-123-4567"
-        expected = "User XXX@XXX.XXX with SSN XXX-XX-XXXX called from XXX-XXX-XXXX"
-        assert mask_sensitive_patterns(text) == expected
-
-    def test_empty_string(self):
-        """Test masking empty string."""
-        assert mask_sensitive_patterns("") == ""
-        assert mask_sensitive_patterns(None) is None
 
 
 class TestStructuredRedisLogger:
@@ -68,16 +21,10 @@ class TestStructuredRedisLogger:
     @pytest.fixture
     def logger(self):
         """Create a test logger instance."""
-        return StructuredRedisLogger("test_logger", mask_sensitive=True)
-
-    @pytest.fixture
-    def logger_no_mask(self):
-        """Create a test logger without masking."""
-        return StructuredRedisLogger("test_logger_no_mask", mask_sensitive=False)
+        return StructuredRedisLogger("test_logger")
 
     def test_logger_initialization(self, logger):
         """Test logger initialization."""
-        assert logger.mask_sensitive is True
         assert hasattr(logger, "_context")
         assert isinstance(logger._context, threading.local)
 
@@ -106,19 +53,18 @@ class TestStructuredRedisLogger:
         context = logger._get_context()
         assert context["trace_id"] == trace_id
 
-    def test_cache_key_always_redacted(self, logger, logger_no_mask):
-        """cache_operation redacts the key regardless of mask_sensitive (CWE-532, LAB-304)."""
+    def test_cache_key_always_redacted(self, logger):
+        """cache_operation always redacts the key via digest (CWE-532, LAB-304)."""
         from unittest.mock import patch as _patch
 
         from cachekit.hash_utils import redact_cache_key
 
         sensitive = "ns:tenant-42:func:app.f:args:email@test.com:v1"
-        for lg in (logger, logger_no_mask):
-            with _patch("cachekit.logging.logging.Logger.log") as mock_log:
-                lg.cache_operation("get", sensitive, hit=True)
-            extra = mock_log.call_args[1]["extra"]["structured"]
-            assert extra["cache_key"] == redact_cache_key(sensitive)
-            assert sensitive not in str(extra)
+        with _patch("cachekit.logging.logging.Logger.log") as mock_log:
+            logger.cache_operation("get", sensitive, hit=True)
+        extra = mock_log.call_args[1]["extra"]["structured"]
+        assert extra["cache_key"] == redact_cache_key(sensitive)
+        assert sensitive not in str(extra)
 
     @patch("cachekit.logging.logging.Logger.log")
     def test_cache_operation_logging(self, mock_log, logger):
@@ -322,11 +268,9 @@ class TestFactoryFunction:
     """Test factory function."""
 
     def test_get_structured_logger(self):
-        """Test get_structured_logger factory."""
+        """Test get_structured_logger factory returns one cached instance per name."""
         logger1 = get_structured_logger("test1")
         assert isinstance(logger1, StructuredRedisLogger)
-        assert logger1.mask_sensitive is True
 
-        logger2 = get_structured_logger("test2", mask_sensitive=False)
-        assert isinstance(logger2, StructuredRedisLogger)
-        assert logger2.mask_sensitive is False
+        logger1_again = get_structured_logger("test1")
+        assert logger1_again is logger1
