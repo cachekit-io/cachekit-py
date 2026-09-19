@@ -8,8 +8,10 @@ L2 stats. That is exactly the traffic the lock exists to absorb.
 
 Reproduces contention by patching the backend's ``get`` to miss once (forcing the
 wrapper past the pre-lock check into the lock path) then hit on the next call —
-the double-check read inside the held lock, standing in for "another request
-filled the cache while we waited".
+the double-check read standing in for "another request filled the cache while we
+waited". Parametrised over the lock outcome so both hit returns are covered: the
+lock-acquired branch and the lock-timeout branch, which record via the same
+``_record_l2_hit_async`` helper but are reached by different control flow.
 
 ``_LockableByteStore`` is defined locally rather than imported from
 tests/unit/test_async_set_record_labels.py (cachekit-py#295): that file does not
@@ -29,10 +31,15 @@ from cachekit.decorators.orchestrator import FeatureOrchestrator
 
 
 class _LockableByteStore:
-    """In-memory byte store implementing LockableBackend — lock always granted."""
+    """In-memory byte store implementing LockableBackend.
 
-    def __init__(self) -> None:
+    ``lock_acquired`` selects which double-check hit return is exercised: True
+    takes the lock-acquired branch, False the lock-timeout branch.
+    """
+
+    def __init__(self, *, lock_acquired: bool = True) -> None:
         self.store: dict[str, bytes] = {}
+        self._lock_acquired = lock_acquired
 
     def get(self, key: str) -> bytes | None:
         return self.store.get(key)
@@ -51,7 +58,7 @@ class _LockableByteStore:
 
     @asynccontextmanager
     async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
-        yield True
+        yield self._lock_acquired
 
 
 @pytest.fixture
@@ -68,8 +75,9 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 
 @pytest.mark.unit
-async def test_async_l2_double_check_hit_records_get(recorded: list[dict[str, Any]]) -> None:
-    backend = _LockableByteStore()
+@pytest.mark.parametrize("lock_acquired", [True, False], ids=["lock-acquired", "lock-timeout"])
+async def test_async_l2_double_check_hit_records_get(recorded: list[dict[str, Any]], lock_acquired: bool) -> None:
+    backend = _LockableByteStore(lock_acquired=lock_acquired)
 
     @cache(backend=backend, ttl=60, namespace="async-dc-labels", l1_enabled=False)
     async def compute() -> dict[str, int]:
@@ -100,3 +108,7 @@ async def test_async_l2_double_check_hit_records_get(recorded: list[dict[str, An
     assert len(gets) == 1
     assert (gets[0].get("serializer"), gets[0].get("hit")) == ("rust", True)
     assert gets[0].get("size_bytes") == expected_size
+    # The double-check read is timed on its own window, so a duration is always
+    # recorded — a regression that drops it would still pass the label asserts.
+    assert isinstance(gets[0].get("duration_ms"), float)
+    assert gets[0]["duration_ms"] >= 0.0
