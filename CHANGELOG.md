@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.19.0](https://github.com/cachekit-io/cachekit-py/compare/v0.18.0...v0.19.0) (2026-09-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **logging:** UltraOptimizedStructuredLogger.__init__ no longer accepts mask_sensitive; get_structured_logger() no longer accepts mask_sensitive and now keys _logger_instances on name alone; mask_sensitive_patterns is removed; ProfileConfig.mask_sensitive_data and ProfileConfig.lazy_pii_masking are removed. All were read by nothing and toggled no behavior. Constructors/callers passing them now raise TypeError instead of silently no-op'ing. Same removal shape as L1CacheConfig.namespace_index in v0.18.0 and L1CacheConfig.invalidation_enabled in v0.16.0 (LAB-520).
+
+### Features
+
+* **backend:** bound L1 backfill by the server's remaining freshness (LAB-557) ([#268](https://github.com/cachekit-io/cachekit-py/issues/268)) ([7bd5abf](https://github.com/cachekit-io/cachekit-py/commit/7bd5abf4ba838600b7ae333715a3575dc587143e))
+* **concurrency:** free-threaded CPython support — memory-ordering fixes, gil_used=false, CI lane (LAB-511) ([#265](https://github.com/cachekit-io/cachekit-py/issues/265)) ([bda770b](https://github.com/cachekit-io/cachekit-py/commit/bda770bce822d9a6eff98e555c5f6fd92e509a9c))
+
+
+### Bug Fixes
+
+* **ci:** fail loudly on attestation lookup failure; decide the codecov pair (LAB-2528) ([#270](https://github.com/cachekit-io/cachekit-py/issues/270)) ([2a8b941](https://github.com/cachekit-io/cachekit-py/commit/2a8b941043e8bc3d9a143428495e13226aed4901))
+* **ci:** make the Atheris fuzz job capable of failing + repair its dead targets (LAB-1140) ([#269](https://github.com/cachekit-io/cachekit-py/issues/269)) ([6ab0c28](https://github.com/cachekit-io/cachekit-py/commit/6ab0c289f8fe1e8891c30b94faed7a3501809e16))
+* **decorators:** async get hits record serializer/size/hit like the sync path (LAB-3765) ([#297](https://github.com/cachekit-io/cachekit-py/issues/297)) ([9b96fd2](https://github.com/cachekit-io/cachekit-py/commit/9b96fd2b90364bd36ef3268bca6ff4df2daafe40))
+* **decorators:** async lock double-check L2 hits record get telemetry (LAB-3769) ([#303](https://github.com/cachekit-io/cachekit-py/issues/303)) ([683b1c7](https://github.com/cachekit-io/cachekit-py/commit/683b1c7cc178948c922683551ae41e6c77beef24))
+* **file:** guard eviction unlink against a concurrent rename (LAB-2685) ([#285](https://github.com/cachekit-io/cachekit-py/issues/285)) ([e917a57](https://github.com/cachekit-io/cachekit-py/commit/e917a57c4e6065eb161da8011a26d6805d49c327))
+* **file:** write every byte or fail; evict a payload that shrank under read (LAB-2682) ([#272](https://github.com/cachekit-io/cachekit-py/issues/272)) ([068adb2](https://github.com/cachekit-io/cachekit-py/commit/068adb276c2b1f552b527e4ba91fc2904cd75be5))
+* **logging:** redact raw cache keys on all log paths (LAB-304) ([#264](https://github.com/cachekit-io/cachekit-py/issues/264)) ([81f97fb](https://github.com/cachekit-io/cachekit-py/commit/81f97fb76245e3924bf91b61996e1b4e7639f702))
+* **logging:** sanitise error kwarg at the structured cache-operation sinks (LAB-3666) ([#301](https://github.com/cachekit-io/cachekit-py/issues/301)) ([d27ec29](https://github.com/cachekit-io/cachekit-py/commit/d27ec29e0dbdfdf64e253a6fb5665b4d30639869))
+* **redis:** stop lock waiters pinning executor threads (LAB-3596) ([#290](https://github.com/cachekit-io/cachekit-py/issues/290)) ([ddbeb91](https://github.com/cachekit-io/cachekit-py/commit/ddbeb910a9de7932ed93ebbcad4c8435278831e2))
+* **serializers:** bound forged-entry error echoes; retire columnar dead code (LAB-3131) ([#289](https://github.com/cachekit-io/cachekit-py/issues/289)) ([10a1049](https://github.com/cachekit-io/cachekit-py/commit/10a10498d406bce7b4fd8dff6cb2e88e80f9b0a2))
+* **serializers:** bound untrusted msgpack decode depth and header allocation (LAB-2503) ([#276](https://github.com/cachekit-io/cachekit-py/issues/276)) ([f7c087d](https://github.com/cachekit-io/cachekit-py/commit/f7c087dfbd7972bd711f32054949c1b739e00146))
+* **serializers:** type ByteStorage.retrieve failures and collapse duplicated columnar decode (LAB-2736) ([#287](https://github.com/cachekit-io/cachekit-py/issues/287)) ([0aa78ca](https://github.com/cachekit-io/cachekit-py/commit/0aa78ca8dc0749492e6078cdcfe2330743bb202f))
+
+
+### Performance Improvements
+
+* **decorators:** backfill L1 on sync L2 hits; size stats by envelope length (LAB-348) ([#294](https://github.com/cachekit-io/cachekit-py/issues/294)) ([c019b26](https://github.com/cachekit-io/cachekit-py/commit/c019b2659eb964408facb6d7191b85a26177342a))
+
+
+### Code Refactoring
+
+* **logging:** remove dead PII-masking knobs (LAB-3797) ([#300](https://github.com/cachekit-io/cachekit-py/issues/300)) ([705640b](https://github.com/cachekit-io/cachekit-py/commit/705640bde14b73c249ed6d8b30733eb46752a9a2))
+
 ## [0.18.0](https://github.com/cachekit-io/cachekit-py/compare/v0.17.1...v0.18.0) (2026-09-03)
 
 
