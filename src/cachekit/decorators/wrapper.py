@@ -817,6 +817,15 @@ def create_cache_wrapper(
         a recompute, so a throwing metrics collector would silently turn a hit
         already in hand into a full recompute — under exactly the stampede the
         lock exists to absorb. Telemetry never costs a served hit.
+
+        The two clauses are deliberately split rather than narrowed to the
+        collector's own error types. Narrowing does NOT fail fast here: an
+        unexpected raise would land in the caller's `except Exception`, which
+        logs at DEBUG under "Double-check cache failed after lock acquisition"
+        and recomputes — quieter than this, misattributed, and a recompute per
+        contended hit. So the unexpected case is caught too, and made loud
+        instead: ERROR with the exception type named, which is the signal a
+        narrow clause was meant to produce.
         """
         try:
             features.set_operation_context("get", duration_ms=get_duration_ms)
@@ -835,8 +844,15 @@ def create_cache_wrapper(
                     hit=True,
                 )
             _stats.record_l2_hit(get_duration_ms)
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
+            # The collector's documented refusals: duplicated timeseries, a label set
+            # that disagrees with the registered metric, a non-numeric observation.
             logger().warning(f"L2 hit telemetry skipped: {redact_error_for_log(exc)}")
+        except Exception as exc:
+            # Not a collector refusal — a bug in the telemetry stack. Still must not
+            # cost the served hit, so surface it at ERROR with its type rather than
+            # letting the caller demote this hit into a recompute.
+            logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.

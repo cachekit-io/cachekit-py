@@ -112,3 +112,53 @@ async def test_async_l2_double_check_hit_records_get(recorded: list[dict[str, An
     # recorded — a regression that drops it would still pass the label asserts.
     assert isinstance(gets[0].get("duration_ms"), float)
     assert gets[0]["duration_ms"] >= 0.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "raised",
+    [ValueError("duplicated timeseries"), AttributeError("collector refactored away")],
+    ids=["collector-refusal", "unexpected-bug"],
+)
+async def test_throwing_collector_does_not_cost_the_served_hit(monkeypatch: pytest.MonkeyPatch, raised: Exception) -> None:
+    """A throwing metrics collector must never demote a contended hit into a recompute.
+
+    Both double-check returns sit inside an `except Exception` that falls through to
+    executing the function again, so an unguarded telemetry call would turn the hit
+    this lock exists to protect into exactly the recompute it exists to prevent —
+    once per contender. Parametrised over both handler clauses in
+    `_record_l2_hit_async`: the collector's own refusal types, and an unexpected
+    error that is caught too (narrowing there would not fail fast, it would just
+    hand the raise to the caller's DEBUG-level handler and recompute anyway).
+    """
+    backend = _LockableByteStore()
+    calls = 0
+
+    @cache(backend=backend, ttl=60, namespace="async-dc-throw", l1_enabled=False)
+    async def compute() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {"answer": 42}
+
+    assert await compute() == {"answer": 42}
+    assert calls == 1
+
+    real_get = backend.get
+    gets = 0
+
+    def patched_get(key: str) -> bytes | None:
+        nonlocal gets
+        gets += 1
+        return None if gets == 1 else real_get(key)
+
+    backend.get = patched_get  # type: ignore[method-assign]
+
+    def boom(self: Any, **kw: Any) -> None:
+        raise raised
+
+    monkeypatch.setattr(FeatureOrchestrator, "record_cache_operation", boom)
+
+    # The hit is still served from the double-check read, and the function body
+    # never runs a second time.
+    assert await compute() == {"answer": 42}
+    assert calls == 1
