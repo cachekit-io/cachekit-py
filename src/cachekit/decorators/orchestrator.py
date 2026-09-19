@@ -271,13 +271,16 @@ class FeatureOrchestrator:
         """Set attributes on a span (no-op)."""
         pass
 
-    def log_cache_operation(self, **kwargs):
-        """Log cache operation with structured logging. Redacts ``key`` (CWE-532)."""
+    def log_cache_operation(self, **kwargs: Any) -> None:
+        """Log cache operation with structured logging. Redacts ``key``, sanitises ``error`` (CWE-532)."""
         if self._enable_structured_logging and kwargs:
             operation = kwargs.get("operation", "unknown")
             # Redact in kwargs itself — it is splatted into the structured payload below.
             if "key" in kwargs:
                 kwargs["key"] = redact_key_for_log(kwargs["key"])
+            # CWE-532 at the sink: render an exception key-free; a str is already rendered (re-sanitising one emits "str").
+            if isinstance(kwargs.get("error"), BaseException):
+                kwargs["error"] = redact_error_for_log(kwargs["error"])
             key = kwargs.get("key", "unknown")
             self.log_structured("info", f"Cache operation: {operation}", cache_key=key, **kwargs)
 
@@ -457,8 +460,8 @@ class FeatureOrchestrator:
             operation=f"{operation}_failed",
             key=cache_key,
             namespace=namespace,
-            # Key-free error text (CWE-532): an arbitrary exception's str() may echo
-            # the raw key, so only BackendError (self-sanitising) is logged verbatim.
+            # Key-free error text (CWE-532): type name only, or BackendError(error_type) —
+            # no exception's str() is trusted. The sink renders a raw object the same way.
             error=redact_error_for_log(error),
             error_type=type(error).__name__,
             duration_ms=duration_ms,

@@ -395,6 +395,53 @@ class TestRedactErrorForLog:
         assert TENANT_KEY not in rendered
 
 
+ERROR_KWARGS = [
+    pytest.param(ValueError(f"WRONGTYPE for {TENANT_KEY}"), "ValueError", id="provider_exception"),
+    pytest.param(
+        BackendError(f"provider failure for {TENANT_KEY}", error_type=BackendErrorType.TIMEOUT, key=TENANT_KEY),
+        "BackendError(timeout)",
+        id="backenderror_key_in_message",
+    ),
+    pytest.param("Connection timeout", "Connection timeout", id="str_passes_through"),
+]
+
+
+class TestErrorKwargSanitisedAtSink:
+    """An ``error`` kwarg is sanitised once, at each structured sink (CWE-532, defence in depth).
+
+    Three in-tree callers, three shapes: ``handle_cache_error`` pre-renders to a str,
+    ``redis_operation_failed`` passes the exception object, and the circuit-breaker path
+    in ``wrapper.py`` passes a str literal. The sink must emit all three key-free, and a
+    str must pass through untouched (re-sanitising one would emit the literal ``"str"``).
+    The assertion runs over the whole payload, not the ``error`` field alone.
+    """
+
+    @pytest.mark.parametrize(("error", "rendered"), ERROR_KWARGS)
+    def test_logging_sink(self, error: object, rendered: str, caplog: pytest.LogCaptureFixture) -> None:
+        logger = UltraOptimizedStructuredLogger("test.error_kwarg")
+
+        with caplog.at_level(logging.INFO, logger="test.error_kwarg"):
+            logger.cache_operation("set", TENANT_KEY, error=error)
+
+        assert not any(TENANT_KEY in m for m in _messages(caplog))
+        assert caplog.records[-1].structured["error"] == rendered
+
+    @pytest.mark.parametrize(("error", "rendered"), ERROR_KWARGS)
+    def test_orchestrator_sink(self, error: object, rendered: str, caplog: pytest.LogCaptureFixture) -> None:
+        orchestrator = FeatureOrchestrator(
+            namespace="test",
+            circuit_breaker_enabled=False,
+            backpressure_enabled=False,
+            enable_structured_logging=True,
+        )
+
+        with caplog.at_level(logging.INFO):
+            orchestrator.log_cache_operation(operation="set_failed", key=TENANT_KEY, error=error)
+
+        assert not any(TENANT_KEY in m for m in _messages(caplog))
+        assert caplog.records[-1].structured["error"] == rendered
+
+
 class TestClassifierMessagesAreKeyFree:
     """Every backend classifier must build a key-free BackendError.message (CWE-532).
 

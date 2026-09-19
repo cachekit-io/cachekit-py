@@ -29,9 +29,10 @@ Known blind spots (flow-insensitive): a message pre-built into a variable
 held in a parameter with an unconventional name (``failure: Exception``) is not
 recognised. Build log lines inline, and bind exceptions with ``except ... as``
 or a conventional name, so the guard can see them. Sink-central redaction is not
-exempted: the sinks' own stdlib calls satisfy the rule; callers passing raw keys
-*into* ``handle_cache_error`` / ``log_cache_operation`` / ``SimpleLogger.cache_*``
-are covered by those sinks' contract tests, not here.
+exempted: the sinks' own stdlib calls satisfy the rule; callers passing raw keys or
+exceptions *into* ``handle_cache_error`` / ``log_cache_operation`` /
+``cache_operation`` / ``SimpleLogger.cache_*`` are covered by those sinks' contract
+tests, not here.
 """
 
 from __future__ import annotations

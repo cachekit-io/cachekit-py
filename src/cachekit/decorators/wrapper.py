@@ -784,11 +784,81 @@ def create_cache_wrapper(
         """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
         invariants at every call site in lockstep: a stale-labelled hit is never
         recorded (spec: local caches MUST NOT record stale as fresh), and a
-        fresh hit's local lifetime is bounded by _l1_backfill_ttl."""
-        if _l1_cache and cache_key and cached_data and not is_stale:
-            cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+        fresh hit's local lifetime is bounded by _l1_backfill_ttl.
+
+        Best-effort: the hit is already decoded, so the one refusal L1Cache.put
+        documents — TypeError on a non-bytes envelope from an out-of-contract
+        backend — is logged and skipped; every caller sits inside an `except
+        Exception` that would otherwise demote the served hit into a recompute on
+        each call (LAB-348). Anything else is an L1 bug and propagates.
+        """
+        if not (_l1_cache and cache_key and cached_data and not is_stale):
+            return
+        cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+        try:
             _l1_cache.put(cache_key, cached_bytes, redis_ttl=_l1_backfill_ttl(fresh_for))
-            _cached_keys.add(cache_key)
+        except TypeError as exc:
+            logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
+            return
+        _cached_keys.add(cache_key)
+
+    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+        """Record the telemetry for an async L2 hit — the uncontended read and
+        both post-lock double-check hits (LAB-3769) share this so a
+        thundering-herd hit is never invisible to cache_operations_total /
+        cache_info() just because it arrived via the lock's double-check.
+
+        size_bytes is computed here rather than read from the handler's
+        size_bytes tuple slot (LAB-348), so this label never depends on the
+        handler's tuple shape; the two agree on every in-contract async hit.
+
+        Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
+        every call site sits inside an `except Exception` that falls through to
+        a recompute, so a throwing metrics collector would silently turn a hit
+        already in hand into a full recompute — under exactly the stampede the
+        lock exists to absorb. Telemetry never costs a served hit.
+
+        The two clauses are deliberately split rather than narrowed to the
+        collector's own error types. Narrowing does NOT fail fast here: an
+        unexpected raise would land in the caller's `except Exception`, which
+        logs at DEBUG under "Double-check cache failed after lock acquisition"
+        and recomputes — quieter than this, misattributed, and a recompute per
+        contended hit. So the unexpected case is caught too, and made loud
+        instead: ERROR with the exception type named, which is the signal a
+        narrow clause was meant to produce.
+        """
+        try:
+            # Local stat first, external collector second: this is pure arithmetic
+            # under a lock and cannot realistically refuse, whereas the collector can
+            # — and once the hit is served anyway, a collector refusal must not leave
+            # cache_info() omitting a hit the caller was handed. Losing the counter to
+            # someone else's registry error is the same invisibility this helper exists
+            # to remove.
+            _stats.record_l2_hit(get_duration_ms)
+            features.set_operation_context("get", duration_ms=get_duration_ms)
+            features.record_success()
+            if features.collect_stats:
+                # Defensive encode for an out-of-contract backend: both async readers
+                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
+                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+                features.record_cache_operation(
+                    operation="get",
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    success=True,
+                    duration_ms=get_duration_ms,
+                    size_bytes=len(envelope),
+                    hit=True,
+                )
+        except (ValueError, TypeError) as exc:
+            # The collector's documented refusals: duplicated timeseries, a label set
+            # that disagrees with the registered metric, a non-numeric observation.
+            logger().warning(f"L2 hit telemetry skipped: {redact_error_for_log(exc)}")
+        except Exception as exc:
+            # Not a collector refusal — a bug in the telemetry stack. Still must not
+            # cost the served hit, so surface it at ERROR with its type rather than
+            # letting the caller demote this hit into a recompute.
+            logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
@@ -1323,20 +1393,21 @@ def create_cache_wrapper(
             # thread below. The freshness path drops refresh_ttl, which is a
             # documented no-op on the sync path anyway (StandardCacheHandler.get),
             # and skips the mmap fast path (CachekitIO is not buffer-readable).
-            # The sync hit path performs no L1 backfill, so the fresh_for bound
-            # (tuple slot 2) has no consumer here.
             _sync_l2_stale = False
+            _sync_l2_fresh_for: int | None = None
             if _l2_freshness_capable():
                 _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
             else:
                 cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
 
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cached result is a tuple (True, actual_value)
+                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
+                _found, result, cached_data, size_bytes = cached_result
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1351,7 +1422,6 @@ def create_cache_wrapper(
                     )
 
                 # Record cache hit with structured logging
-                size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                 features.log_cache_operation(
                     operation="get",
                     key=cache_key,
@@ -1364,7 +1434,6 @@ def create_cache_wrapper(
 
                 # Also record statistics if enabled
                 if features.collect_stats:
-                    size_bytes = len(str(cached_result[1]).encode("utf-8")) if cached_result[1] is not None else 0
                     features.record_cache_operation(
                         operation="get",
                         namespace=namespace or "default",
@@ -1374,6 +1443,10 @@ def create_cache_wrapper(
                         size_bytes=size_bytes,
                         hit=True,
                     )
+
+                # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
+                # + remaining-freshness bound (LAB-557), as on the async path (LAB-348).
+                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for)
 
                 # Record L2 hit with latency for cache_info()
                 duration_ms = duration * 1000
@@ -1388,7 +1461,7 @@ def create_cache_wrapper(
                 # WHY: L2 cache hit returns from try block that lacks finally cleanup
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
-                return cached_result[1]
+                return result
         except DecryptionAuthenticationError:
             # Fail-closed tamper failure propagated from get_cached_value — it only
             # raises when encryption.fail_closed=True (the metric and error log were
@@ -1624,13 +1697,16 @@ def create_cache_wrapper(
                         features.set_operation_context("l1_get", duration_ms=0.001)
                         features.record_success()
 
-                        # Record L1 cache hit metrics
+                        # Record L1 cache hit metrics (same labels as the sync L1 hit)
                         if features.collect_stats:
                             features.record_cache_operation(
                                 operation="get",
                                 namespace=namespace or "default",
+                                serializer="l1_memory",
                                 success=True,
                                 duration_ms=0.001,  # Sub-microsecond
+                                size_bytes=len(l1_bytes),
+                                hit=True,
                             )
 
                         # Record L1 hit for cache_info()
@@ -1717,21 +1793,12 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill)
-                    _found, result, cached_data = cached_result
+                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
+                    _found, result, cached_data, _size_bytes = cached_result
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.set_operation_context("get", duration_ms=get_duration_ms)
-                    features.record_success()
-
-                    if features.collect_stats:
-                        features.record_cache_operation(
-                            operation="get",
-                            namespace=namespace or "default",
-                            success=True,
-                            duration_ms=get_duration_ms,
-                        )
+                    _record_l2_hit_async(cached_data, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1752,9 +1819,6 @@ def create_cache_wrapper(
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
                         warn_ttl_refresh_unsupported(_backend)
-
-                    # Record L2 hit with latency for cache_info()
-                    _stats.record_l2_hit(get_duration_ms)
 
                     # SWR: stale hit — value already in hand; revalidate in the
                     # background so no request pays the recompute at a TTL boundary.
@@ -1809,10 +1873,13 @@ def create_cache_wrapper(
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data = cached_result
+                                    _found, result, cached_data, _size_bytes = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1836,10 +1903,13 @@ def create_cache_wrapper(
                             try:
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data = cached_result
+                                    _found, result, cached_data, _size_bytes = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
