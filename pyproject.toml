@@ -263,4 +263,9 @@ constraint-dependencies = [
     # GHSA-6hr6-w5qg-qmwg (duplicate Host headers forwarded on HTTP/2 ->
     # HTTP/1.1 downgrade — request smuggling primitive).
     "h2>=4.4.1",
+    # anyio is a transitive dep (httpx[http2] -> httpx -> anyio), so it reaches
+    # users through the cachekit[http2] extra, not just dev. 4.14.2 fixes
+    # GHSA-82r6-8w77-94w6 (IDNA-normalised hostname confusion in TLS
+    # verification) and GHSA-5p39-cfhj-2xmp (process-pool stderr deadlock).
+    "anyio>=4.14.2",
 ]
