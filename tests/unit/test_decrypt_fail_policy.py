@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from cachekit.cache_handler import (
+    CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
     handle_decrypt_failure,
@@ -332,7 +333,7 @@ class TestGetCachedValueFailPolicy:
         """Regression: the happy path is untouched by the policy plumbing."""
         handler, strategy, serialization = _make_operation_handler(fail_closed=True)
         strategy.store["key:a"] = serialization.serialize_data({"v": 7}, cache_key="key:a")
-        assert handler.get_cached_value("key:a") == (True, {"v": 7}, strategy.store["key:a"], len(strategy.store["key:a"]))
+        assert handler.get_cached_value("key:a") == CacheHit({"v": 7}, strategy.store["key:a"], len(strategy.store["key:a"]))
 
 
 class TestConfigDriftRead:
