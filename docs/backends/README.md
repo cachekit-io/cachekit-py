@@ -199,14 +199,17 @@ CACHEKIT_REDIS_URL=redis://prod.example.com:6379
 
 # Fallback: REDIS_URL
 REDIS_URL=redis://localhost:6379
+
+# Managed SaaS (takes precedence over the Redis selectors)
+CACHEKIT_API_KEY=ck_live_...
 ```
 
-If no explicit backend and no module-level default, cachekit creates a RedisBackend from environment variables.
+If no explicit backend and no module-level default, cachekit auto-detects a backend from the environment at the function's **first call**.
 
 **Resolution order**:
-1. Check for explicit `backend` parameter in `@cache(backend=...)`
-2. Check for module-level default via `set_default_backend()`
-3. Create RedisBackend from environment variables (CACHEKIT_REDIS_URL > REDIS_URL)
+1. Explicit `backend` parameter in `@cache(backend=...)` — the only order-independent tier
+2. Module-level default via `set_default_backend()` — read once, **at decoration time**; a default set after the decorated module is imported is ignored
+3. Environment auto-detection at first call: `CACHEKIT_API_KEY` → CachekitIO, `CACHEKIT_REDIS_URL` → Redis, `CACHEKIT_MEMCACHED_SERVERS` → Memcached, `CACHEKIT_FILE_CACHE_DIR` → File; more than one of these set at once is a `ConfigurationError`; none set → Redis from `REDIS_URL` (localhost default). A provider error here is **logged and the function runs uncached** — it does not raise.
 
 ## Performance Considerations
 

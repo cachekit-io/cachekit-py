@@ -395,8 +395,17 @@ class DecoratorConfig:
         Use cases: PII, medical data, financial records, GDPR compliance
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
-        Note: integrity_checking is forced to True (non-negotiable for security)
+        Note: Backend resolution is the same as every preset — explicit backend= kwarg (the only
+              order-independent tier), then set_default_backend() as read AT DECORATION TIME, then
+              DefaultBackendProvider env auto-detect at FIRST CALL (CACHEKIT_API_KEY → cachekit.io SaaS;
+              CACHEKIT_REDIS_URL → Redis; then Memcached/File selectors; else REDIS_URL / localhost
+              Redis fallback). A provider error at first call is logged and the function runs
+              uncached — it does not raise. .secure does NOT pin the SaaS: with REDIS_URL set and
+              CACHEKIT_API_KEY unset, encrypted values silently go to Redis. When the SaaS is a
+              requirement, pass backend=CachekitIOBackend() explicitly.
+        Note: integrity_checking is forced to True on this preset path (the kwarg is discarded).
+              An override applied via @cache(config=DecoratorConfig.secure(...), integrity_checking=False)
+              is NOT re-forced.
 
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
@@ -552,6 +561,12 @@ class DecoratorConfig:
         Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
         AES-256-GCM encryption — no code changes needed. Auto-detection happens in
         CacheSerializationHandler and applies to ALL presets, not just .io().
+        FAIL-OPEN caveat: CACHEKIT_MASTER_KEY is read when the decorator is applied
+        (import time). If it is absent then — including a key loaded later by dotenv
+        in main() or a vault startup hook — the same code silently caches plaintext to
+        the SaaS on every call. When encryption is a security requirement, use
+        @cache.secure(backend=CachekitIOBackend()) instead — it raises at decoration
+        time when no key is present.
 
         Args:
             **kwargs: Overrides (ttl, namespace, etc.)
