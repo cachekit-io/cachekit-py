@@ -6,12 +6,12 @@
 
 ## TL;DR
 
-Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. Redis never sees plaintext. Perfect for sensitive data (PII, credentials, health info).
+Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. The backend never sees plaintext values. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
 @cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM encryption
 def get_user_ssn(user_id):
-    return db.get_ssn(user_id)  # Encrypted in Redis, decrypted in-app (illustrative)
+    return db.get_ssn(user_id)  # stored encrypted; L1-only here (backend=None) — pass backend= for Redis/SaaS
 ```
 
 ---
@@ -31,7 +31,7 @@ os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes
 def get_sensitive_data(user_id):
     return db.query(SensitiveData).filter_by(id=user_id).first()  # illustrative - db not defined
 
-data = get_sensitive_data(123)  # Encrypted in Redis
+data = get_sensitive_data(123)  # stored encrypted (L1-only — backend=None)
 ```
 
 ---
@@ -47,42 +47,51 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | | `@cache.secure(backend=CachekitIOBackend())` | `@cache.io()` + `CACHEKIT_MASTER_KEY` env |
 |---|---|---|
 | Encryption | Forced ON in code (`EncryptionConfig.enabled=True`) | Auto-detected from the env var (tri-state `enabled=None`) |
-| **No master key present** | **Fails closed** — raises `ValueError` at decoration time | **Fails open** — silently caches plaintext to the SaaS |
-| Integrity checking | Forced `True`, cannot be overridden | On by preset default |
-| Backend | Env auto-detect — **not pinned to the SaaS**, see footgun below; pass `backend=` explicitly | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
-| Tenant mode | `single_tenant_mode` handled automatically | Handled automatically (auto-detect path) |
-| Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`) |
+| **No master key present** | **Fails closed** — raises `ValueError` at decoration time (the `CACHEKIT_MASTER_KEY` fallback is read then, at import) | **Fails open** — silently caches plaintext to the SaaS. The key is read **at decoration time**: one loaded later (dotenv in `main()`, a startup vault hook) is never seen, and every call ships plaintext |
+| Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
+| Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
+| Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
+| Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`); the refresh runs the function on a background thread after the response has been served, so it must not depend on request-scoped resources (a per-request DB session). `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
 constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
 decorator is silently discarded, and `backend=None` flips the wrapper into
 L1-only mode (in-process memory — the SaaS is never contacted, despite the
-`.io` name). Calling `DecoratorConfig.io(backend=...)` directly raises
-`TypeError` (duplicate keyword argument). To target any other backend, use a
-different preset with an explicit `backend=`.
+`.io` name). To target any other backend, use a different preset with an
+explicit `backend=`.
 
 **Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
 explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
 opt-in convenience** → set `CACHEKIT_MASTER_KEY` and let auto-detect do it (this
-applies to every preset, not just `.io`). Compliance arguments — "the SaaS only
-ever stores ciphertext" — should only be hung on the fail-closed path: on the
-auto-detect path, one missing env var quietly puts plaintext on the backend. Even
-on the fail-closed path, client-side encryption may *reduce* HIPAA/PCI DSS scope
-subject to assessment and your surrounding controls — it does not remove regulated
-data from scope on its own (see [Compliance Implications](#compliance-implications)).
+applies to every preset, not just `.io`). Compliance arguments belong on the
+fail-closed path only, and even there they are scope-*reduction* arguments, not
+guarantees — see [Compliance Implications](#compliance-implications) for the one
+canonical statement.
 
 > [!WARNING]
 > **`@cache.secure` does NOT pin the SaaS backend.** Backend resolution is the
-> same lookup as every preset: explicit `backend=` → `set_default_backend()` →
-> environment auto-detect at **first call** (`CACHEKIT_API_KEY` → cachekit.io SaaS;
-> `CACHEKIT_REDIS_URL` → Redis; then the Memcached/File selectors; else
-> `REDIS_URL` / localhost Redis fallback). Two consequences: (1) in a 12-factor
-> environment where `REDIS_URL` is set and `CACHEKIT_API_KEY` is not,
-> `@cache.secure` **silently encrypts to Redis instead of the SaaS**; (2) because
-> resolution is lazy, a backend misconfiguration (e.g. two auto-detect selectors
-> set at once) surfaces as a `ConfigurationError` at first call, not at import.
-> When the SaaS is the requirement, pass `backend=CachekitIOBackend()` explicitly
-> — auditable in code and immune to environment drift.
+> same lookup as every preset: explicit `backend=` → `set_default_backend()` **as
+> read at decoration time** → environment auto-detect at **first call**
+> (`CACHEKIT_API_KEY` → cachekit.io SaaS; `CACHEKIT_REDIS_URL` → Redis; then the
+> Memcached/File selectors; else `REDIS_URL` / localhost Redis fallback). Only an
+> explicit `backend=` is order-independent: a `set_default_backend()` that runs
+> after the decorated module has been imported is silently ignored. Consequences:
+> (1) in a 12-factor environment where `REDIS_URL` is set and `CACHEKIT_API_KEY`
+> is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
+> (2) a backend misconfiguration at first call (e.g. two auto-detect selectors set
+> at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
+> `client_creation` failure and the function runs **uncached on every call**.
+> Alert on `client_creation` failures. When the SaaS is the requirement, pass
+> `backend=CachekitIOBackend()` explicitly — auditable in code and immune to
+> environment drift.
+>
+> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
+> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
+> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
+> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
+> key-mismatched entries (miss + recompute) unless you opt in. See
+> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ```python notest
 from cachekit import cache
@@ -99,15 +108,6 @@ def get_patient_record(patient_id: str):
 def get_dashboard_stats(org_id: str):
     return compute_stats(org_id)  # illustrative
 ```
-
-> [!IMPORTANT]
-> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
-> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
-> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
-> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
-> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
-> key-mismatched entries (miss + recompute) unless you opt in. See
-> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ---
 
@@ -249,7 +249,7 @@ There is deliberately **no opt-in flag** to let an encryption-enabled reader acc
 plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
 an attacker with backend write access is indistinguishable from a legacy one — any
 "accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
-fail-closed read path exists to prevent. If you need to read plaintext entries, use a
+downgrade-protected read path exists to prevent. If you need to read plaintext entries, use a
 handler with `encryption=False` (which never had keys to protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
@@ -294,7 +294,7 @@ def get_user_profile(user_id):
     return db.get_profile(user_id)  # illustrative - db not defined
 
 profile = get_user_profile(123)
-# Data encrypted in Redis, decrypted in-app
+# stored encrypted, decrypted in-app (L1-only here — backend=None; pass backend= for Redis/SaaS)
 ```
 
 ### Encrypted JSON (Zero-Knowledge API Caching)
@@ -441,7 +441,7 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
            Prevents nonce reuse even across reboots
 ```
 
-### Fail-Closed Read Path (Encryption Downgrade Protection)
+### Encryption Downgrade Protection (Read Path)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext and is **not** covered by the AES-GCM
@@ -489,7 +489,10 @@ it travels percent-encoded in the URL path (`/v1/cache/{key}`). The key carries 
 namespace and the function's `module.qualname` plus an unkeyed, unsalted blake2b-256 of
 the arguments (`ns:{ns}:func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or known
 argument space the hash is offline-enumerable: a backend operator can learn *which* record
-was accessed, when, and how often, without decrypting anything. Encryption protects
+was accessed, when, and how often, without decrypting anything. Because the key
+travels in the URL path it also lands in every access log on the request path — load
+balancer, CDN, TLS terminator — and persists for those retention windows, long after
+the cache TTL; ciphertext length leaks approximate plaintext size too. Encryption protects
 values, not access patterns — keep secrets out of namespaces and function names, and
 count argument-identifiable access as metadata exposure in your threat model.
 

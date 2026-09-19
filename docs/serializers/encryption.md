@@ -80,10 +80,9 @@ def get_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}
 
 # Backend receives encrypted blob, never sees plaintext
-# GDPR/HIPAA/PCI-DSS compliant out of the box
 ```
 
-When using `EncryptionWrapper` with a remote backend (e.g., cachekit.io), the SaaS backend stores only opaque ciphertext. It has no access to keys and cannot decrypt data. This makes the backend out-of-scope for HIPAA/PCI-DSS compliance requirements.
+When using `EncryptionWrapper` with a remote backend (e.g., cachekit.io), the SaaS backend stores only opaque ciphertext. It has no access to keys and cannot decrypt data. This supports a HIPAA/PCI DSS scope-*reduction* argument, subject to assessment and your surrounding controls — it does not take regulated data out of scope on its own (see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)).
 
 ## Performance
 

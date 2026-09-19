@@ -184,11 +184,10 @@ def get_user_profile(user_id: str) -> dict:
 
 **Why this matters**:
 - `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
-- Per-tenant key derivation via HKDF — cryptographic isolation between namespaces
+- Per-tenant key derivation via HKDF keyed on the tenant id — namespaces within a tenant share one derived key; cross-namespace separation comes from the AAD cache-key binding, not from key derivation
 - The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
-- With `@cache.secure` + explicit backend: the SaaS holds only ciphertext — this supports a
-  HIPAA/PCI DSS scope-*reduction* argument, subject to assessment and your surrounding
-  controls; it does not take regulated data out of scope on its own (see below)
+- With `@cache.secure` + explicit backend: the SaaS holds only ciphertext — a scope-*reduction*
+  argument, not a guarantee; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
 - Without `@cache.secure`: SaaS stores plaintext, may be in compliance scope
 
 **Requirements**:
@@ -210,15 +209,15 @@ zero-knowledge bytes on the wire — **but the failure mode is inverted**:
   forced on in code; a missing master key (param or `CACHEKIT_MASTER_KEY`) raises
   `ValueError` at decoration time. No plaintext **values** can ever reach the
   backend (cache keys and the frame header stay plaintext by design).
-- `@cache.io()` + `CACHEKIT_MASTER_KEY` — **fails open.** If the env var is absent,
-  the same code silently caches **plaintext** to the SaaS.
+- `@cache.io()` + `CACHEKIT_MASTER_KEY` — **fails open.** If the env var is absent
+  **at decoration time**, the same code silently caches **plaintext** to the SaaS —
+  and a key loaded later (dotenv in `main()`, a vault startup hook) is never seen.
 
 Use `.secure` + explicit backend when encryption is a security requirement (PII,
-PHI, compliance arguments — a HIPAA/PCI DSS scope-*reduction* argument can only be
-made on this path, and even then is subject to assessment and your surrounding
-controls; encryption alone does not remove regulated data from scope). Use `.io()`
-+ env when encryption is a fleet-wide opt-in convenience and plaintext caching is
-an acceptable state.
+PHI, any compliance argument — see
+[Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
+for the canonical statement). Use `.io()` + env when encryption is a fleet-wide
+opt-in convenience and plaintext caching is an acceptable state.
 
 Two caveats, covered in depth in
 [Which Path](../features/zero-knowledge-encryption.md#which-path-cachesecure-vs-cacheio--cachekit_master_key):

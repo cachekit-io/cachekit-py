@@ -139,7 +139,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 | Server visibility | Opaque ciphertext only |
 | Key derivation | HKDF with per-tenant salts |
 | Authentication | GCM tags prevent tampering |
-| Compliance | GDPR/HIPAA/PCI-DSS ready |
+| Compliance | May *reduce* GDPR/HIPAA/PCI DSS scope, subject to assessment — not a compliance guarantee ([details](docs/features/zero-knowledge-encryption.md#compliance-implications)) |
 
 <details>
 <summary><strong>🔐 Master Key Security</strong></summary>
