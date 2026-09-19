@@ -9,9 +9,7 @@ resolution-markers = [
 
 [manifest]
 constraints = [
-    { name = "anyio", specifier = ">=4.14.2" },
     { name = "fonttools", specifier = ">=4.60.2" },
-    { name = "h2", specifier = ">=4.4.1" },
     { name = "pip", specifier = ">=26.2" },
     { name = "urllib3", specifier = ">=2.7.0" },
     { name = "werkzeug", specifier = ">=3.1.4" },
@@ -254,7 +252,10 @@ name = "cachekit"
 version = "0.18.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio", version = "4.14.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "anyio", version = "4.15.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "blake3" },
+    { name = "h2" },
     { name = "httpx", extra = ["http2"] },
     { name = "msgpack" },
     { name = "prometheus-client" },
@@ -335,7 +336,9 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.14.2" },
     { name = "blake3", specifier = ">=1.0.5" },
+    { name = "h2", specifier = ">=4.4.1" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "msgpack", specifier = ">=1.2.1" },
     { name = "numpy", marker = "extra == 'data'", specifier = ">=2.0.2" },

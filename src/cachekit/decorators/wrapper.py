@@ -802,41 +802,41 @@ def create_cache_wrapper(
             return
         _cached_keys.add(cache_key)
 
-    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> Any:
+    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
-        size_bytes is derived from the envelope, NOT from the handler's
-        size_bytes tuple slot (LAB-348): the handler reports len() of whatever
-        the backend returned, which is a CHARACTER count for a str envelope,
-        and this label stays byte-denominated at every hit site (LAB-3765).
+        size_bytes is computed here rather than read from the handler's
+        size_bytes tuple slot (LAB-348), so this label never depends on the
+        handler's tuple shape; the two agree on every in-contract async hit.
 
-        Returns the UTF-8-encoded envelope when collect_stats computed one
-        (else cached_data unchanged), so callers hand it straight to
-        _l1_backfill_from_l2 rather than encoding the same str payload twice
-        per hit. _l1_backfill_from_l2 encodes defensively itself (LAB-348), so
-        passing the original back is correct, only wasteful.
+        Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
+        every call site sits inside an `except Exception` that falls through to
+        a recompute, so a throwing metrics collector would silently turn a hit
+        already in hand into a full recompute — under exactly the stampede the
+        lock exists to absorb. Telemetry never costs a served hit.
         """
-        features.set_operation_context("get", duration_ms=get_duration_ms)
-        features.record_success()
-        envelope = cached_data
-        if features.collect_stats:
-            # A str envelope is UTF-8 encoded first, so non-ASCII payloads report
-            # byte length, matching the bytes _l1_backfill_from_l2 stores.
-            envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-            features.record_cache_operation(
-                operation="get",
-                namespace=namespace or "default",
-                serializer="rust",
-                success=True,
-                duration_ms=get_duration_ms,
-                size_bytes=len(envelope),
-                hit=True,
-            )
-        _stats.record_l2_hit(get_duration_ms)
-        return envelope
+        try:
+            features.set_operation_context("get", duration_ms=get_duration_ms)
+            features.record_success()
+            if features.collect_stats:
+                # Defensive encode for an out-of-contract backend: both async readers
+                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
+                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+                features.record_cache_operation(
+                    operation="get",
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    success=True,
+                    duration_ms=get_duration_ms,
+                    size_bytes=len(envelope),
+                    hit=True,
+                )
+            _stats.record_l2_hit(get_duration_ms)
+        except Exception as exc:
+            logger().warning(f"L2 hit telemetry skipped: {redact_error_for_log(exc)}")
 
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
@@ -1776,7 +1776,7 @@ def create_cache_wrapper(
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    cached_data = _record_l2_hit_async(cached_data, get_duration_ms)
+                    _record_l2_hit_async(cached_data, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1857,7 +1857,7 @@ def create_cache_wrapper(
                                     # Another request filled the cache while we waited
                                     _found, result, cached_data, _size_bytes = cached_result
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    cached_data = _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1887,7 +1887,7 @@ def create_cache_wrapper(
                                     # Cache was populated while waiting - use it
                                     _found, result, cached_data, _size_bytes = cached_result
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    cached_data = _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
