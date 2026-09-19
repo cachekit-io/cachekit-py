@@ -158,7 +158,18 @@ async def test_throwing_collector_does_not_cost_the_served_hit(monkeypatch: pyte
 
     monkeypatch.setattr(FeatureOrchestrator, "record_cache_operation", boom)
 
+    # Counters are keyed by module.qualname and shared across decorator
+    # applications (see cache_info's docstring), so both parametrised runs share
+    # one set — assert the delta, not an absolute.
+    l2_hits_before = compute.cache_info().l2_hits
+
     # The hit is still served from the double-check read, and the function body
     # never runs a second time.
     assert await compute() == {"answer": 42}
     assert calls == 1
+
+    # ...and cache_info() still counts it. A refusal from the external collector
+    # must not cost the local L2 stat, or a served hit goes missing from
+    # cache_info().l2_hits and the average L2 latency — the same invisibility
+    # this helper exists to remove, just moved to a different sink.
+    assert compute.cache_info().l2_hits == l2_hits_before + 1

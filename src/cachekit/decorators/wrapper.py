@@ -828,6 +828,13 @@ def create_cache_wrapper(
         narrow clause was meant to produce.
         """
         try:
+            # Local stat first, external collector second: this is pure arithmetic
+            # under a lock and cannot realistically refuse, whereas the collector can
+            # — and once the hit is served anyway, a collector refusal must not leave
+            # cache_info() omitting a hit the caller was handed. Losing the counter to
+            # someone else's registry error is the same invisibility this helper exists
+            # to remove.
+            _stats.record_l2_hit(get_duration_ms)
             features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
@@ -843,7 +850,6 @@ def create_cache_wrapper(
                     size_bytes=len(envelope),
                     hit=True,
                 )
-            _stats.record_l2_hit(get_duration_ms)
         except (ValueError, TypeError) as exc:
             # The collector's documented refusals: duplicated timeseries, a label set
             # that disagrees with the registered metric, a non-numeric observation.
