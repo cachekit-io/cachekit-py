@@ -1955,6 +1955,8 @@ def create_cache_wrapper(
                                     namespace=namespace or "default",
                                     success=True,
                                     duration_ms=set_duration_ms,
+                                    serializer="rust",
+                                    hit=False,  # Was a miss
                                 )
 
                         except InteropError:
@@ -2041,6 +2043,8 @@ def create_cache_wrapper(
                             namespace=namespace or "default",
                             success=True,
                             duration_ms=set_duration_ms,
+                            serializer="rust",
+                            hit=False,  # Was a miss
                         )
 
                 except InteropError:
