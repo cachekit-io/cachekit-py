@@ -802,6 +802,64 @@ def create_cache_wrapper(
             return
         _cached_keys.add(cache_key)
 
+    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+        """Record the telemetry for an async L2 hit — the uncontended read and
+        both post-lock double-check hits (LAB-3769) share this so a
+        thundering-herd hit is never invisible to cache_operations_total /
+        cache_info() just because it arrived via the lock's double-check.
+
+        size_bytes is computed here rather than read from the handler's
+        size_bytes tuple slot (LAB-348), so this label never depends on the
+        handler's tuple shape; the two agree on every in-contract async hit.
+
+        Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
+        every call site sits inside an `except Exception` that falls through to
+        a recompute, so a throwing metrics collector would silently turn a hit
+        already in hand into a full recompute — under exactly the stampede the
+        lock exists to absorb. Telemetry never costs a served hit.
+
+        The two clauses are deliberately split rather than narrowed to the
+        collector's own error types. Narrowing does NOT fail fast here: an
+        unexpected raise would land in the caller's `except Exception`, which
+        logs at DEBUG under "Double-check cache failed after lock acquisition"
+        and recomputes — quieter than this, misattributed, and a recompute per
+        contended hit. So the unexpected case is caught too, and made loud
+        instead: ERROR with the exception type named, which is the signal a
+        narrow clause was meant to produce.
+        """
+        try:
+            # Local stat first, external collector second: this is pure arithmetic
+            # under a lock and cannot realistically refuse, whereas the collector can
+            # — and once the hit is served anyway, a collector refusal must not leave
+            # cache_info() omitting a hit the caller was handed. Losing the counter to
+            # someone else's registry error is the same invisibility this helper exists
+            # to remove.
+            _stats.record_l2_hit(get_duration_ms)
+            features.set_operation_context("get", duration_ms=get_duration_ms)
+            features.record_success()
+            if features.collect_stats:
+                # Defensive encode for an out-of-contract backend: both async readers
+                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
+                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
+                features.record_cache_operation(
+                    operation="get",
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    success=True,
+                    duration_ms=get_duration_ms,
+                    size_bytes=len(envelope),
+                    hit=True,
+                )
+        except (ValueError, TypeError) as exc:
+            # The collector's documented refusals: duplicated timeseries, a label set
+            # that disagrees with the registered metric, a non-numeric observation.
+            logger().warning(f"L2 hit telemetry skipped: {redact_error_for_log(exc)}")
+        except Exception as exc:
+            # Not a collector refusal — a bug in the telemetry stack. Still must not
+            # cost the served hit, so surface it at ERROR with its type rather than
+            # letting the caller demote this hit into a recompute.
+            logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
+
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
 
@@ -1740,23 +1798,7 @@ def create_cache_wrapper(
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.set_operation_context("get", duration_ms=get_duration_ms)
-                    features.record_success()
-
-                    if features.collect_stats:
-                        # size_bytes: the encoded envelope, matching the bytes _l1_backfill_from_l2
-                        # stores and the L1 site's len(l1_bytes). A str envelope is UTF-8 encoded
-                        # first, so non-ASCII payloads report byte length, not character count.
-                        _l2_envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
-                        features.record_cache_operation(
-                            operation="get",
-                            namespace=namespace or "default",
-                            serializer="rust",
-                            success=True,
-                            duration_ms=get_duration_ms,
-                            size_bytes=len(_l2_envelope),
-                            hit=True,
-                        )
+                    _record_l2_hit_async(cached_data, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1777,9 +1819,6 @@ def create_cache_wrapper(
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
                         warn_ttl_refresh_unsupported(_backend)
-
-                    # Record L2 hit with latency for cache_info()
-                    _stats.record_l2_hit(get_duration_ms)
 
                     # SWR: stale hit — value already in hand; revalidate in the
                     # background so no request pays the recompute at a TTL boundary.
@@ -1834,10 +1873,13 @@ def create_cache_wrapper(
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
                                     _found, result, cached_data, _size_bytes = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1861,10 +1903,13 @@ def create_cache_wrapper(
                             try:
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
                                     _found, result, cached_data, _size_bytes = cached_result
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
