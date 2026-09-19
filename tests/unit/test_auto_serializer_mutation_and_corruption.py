@@ -95,6 +95,20 @@ class TestDataFrameSeriesReadRoutes:
             reader.deserialize(data, meta)
 
     @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_cross_config_written_on_read_off_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """The other direction: an enveloped entry (metadata.compressed=True) read by a reader
+        with integrity off must raise explicitly. Before the gate this only failed by luck —
+        the envelope happens to msgpack-decode as a list, not the dict the columnar decoder
+        expects — and surfaced as a misleading "forged columnar payload" error."""
+        writer = _no_arrow(enable_integrity_checking=True)
+        reader = _no_arrow(enable_integrity_checking=False)
+        data, meta = writer.serialize(value)
+        assert meta.compressed is True
+
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
     def test_corrupted_integrity_off_entry_read_on_fails_closed_not_silently_wrong(
         self, value: pd.DataFrame | pd.Series
     ) -> None:
@@ -223,6 +237,19 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         truncated = data[: len(data) // 4]
         with pytest.raises(SerializationError, match="envelope verification"):
             s.deserialize(truncated, meta)
+
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
+        """Writer on, reader off, generic msgpack: retrieve() never runs, so nothing sets
+        envelope_error and the compressed=True gate below it never fires. Before the gate
+        the read fell through to unpackb on the ENVELOPE bytes and silently returned its
+        positional fields — ``[payload, checksum, size, format]`` — as the cached value."""
+        on = AutoSerializer(enable_integrity_checking=True)
+        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        off = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            off.deserialize(data, meta)
 
 
 # A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a

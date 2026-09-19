@@ -328,7 +328,7 @@ def get_data():
 
 ### E021: Deserialization failed
 
-**Message**: `Cache entry failed envelope verification (corrupted cache entry): ...` or `Cache entry is not a decodable MessagePack payload ...`
+**Message**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, or `Cache entry is not a decodable MessagePack payload ...`
 
 **Error Code**: `SerializationError` (same class as E020 — there is no separate `DeserializationError` class)
 

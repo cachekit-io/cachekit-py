@@ -459,6 +459,18 @@ class TestStandardSerializerIntegrityChecking:
         deserialized = serializer.deserialize(serialized)
         assert deserialized == data
 
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
+        """Writer on, reader off: the ByteStorage envelope cannot be verified or unwrapped
+        without ByteStorage. Before the gate unpackb ran on the envelope bytes and silently
+        returned its positional fields — ``[payload, checksum, size, format]`` — as the value."""
+        on = StandardSerializer(enable_integrity_checking=True)
+        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        off = StandardSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            off.deserialize(data, meta)
+
     def test_metadata_format_msgpack(self) -> None:
         """Test that metadata always reports SerializationFormat.MSGPACK."""
         serializer = StandardSerializer()

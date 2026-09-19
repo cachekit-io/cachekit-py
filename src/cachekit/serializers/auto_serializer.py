@@ -600,6 +600,12 @@ class AutoSerializer:
                 says true but whose envelope failed to parse at all raises instead —
                 that combination is corruption wearing the not-an-envelope path's
                 clothes, not a legitimate cross-config read.
+
+                A reader with integrity checking OFF additionally raises on any
+                dataframe/series/msgpack entry whose ``metadata.compressed`` says the writer
+                enveloped it: this reader has no ByteStorage to verify — or even unwrap — the
+                envelope, and decoding its bytes as plain msgpack would hand back the
+                envelope's positional fields as the cached value.
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
@@ -627,7 +633,15 @@ class AutoSerializer:
                         "Cannot deserialize Arrow format: ArrowSerializer not available. "
                         "Install with: pip install 'cachekit[data]'"
                     )
-            elif detected_format in ("dataframe", "series"):
+            # From here down (dataframe, series, generic msgpack) metadata.compressed records whether
+            # the writer enveloped the entry — numpy/arrow routed out above, their flag means codec.
+            # An integrity-off reader cannot verify or unwrap it: fail closed (see Raises: above).
+            if getattr(metadata, "compressed", False) and not self.enable_integrity_checking:
+                raise SerializationError(
+                    "Cache entry was written with integrity checking on but this reader has "
+                    f"integrity checking disabled (format={detected_format!r})"
+                )
+            if detected_format in ("dataframe", "series"):
                 if not (self.enable_integrity_checking and len(data) > 4):
                     # Integrity off: data is direct msgpack (no envelope)
                     return self._decode_columnar(data, detected_format)
@@ -679,8 +693,9 @@ class AutoSerializer:
                         f"Cache entry payload failed to decode inside a verified envelope (format={detected_format!r}): {e}"
                     ) from e
 
-        # Reached when self.enable_integrity_checking is True and retrieve() raised the
-        # "not an envelope" ValueError (envelope_error is set). The writer's OWN record of
+        # Reached with integrity on when retrieve() raised the "not an envelope" ValueError
+        # (envelope_error is set), or with integrity off (envelope_error is None; a
+        # compressed=true entry was already rejected above). The writer's OWN record of
         # whether this entry should be a checksummed envelope gates what happens next, not
         # the reader's config: `metadata.compressed` is set at write time to the writer's
         # enable_integrity_checking. A writer that legitimately recorded "no envelope"
