@@ -89,6 +89,22 @@ def fn(): return {1, 2, 3}
 def fn(): return {1, 2, 3}
 ```
 
+## Cross-Config Reads (integrity_checking Mismatch)
+
+`integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) must match between the writer and the reader of a given entry. If it doesn't, AutoSerializer fails closed rather than returning wrong data:
+
+| Written with | Read with | Generic value (dict, list, etc.) | DataFrame / Series |
+|---|---|---|---|
+| `integrity_checking=True` | `integrity_checking=False` | Raises `SerializationError` (E021) | Raises `SerializationError` (E021) |
+| `integrity_checking=False` | `integrity_checking=True` | Decodes normally — there's no envelope to verify | Raises `SerializationError` (E021) |
+
+DataFrame/Series always fail closed on a mismatch, in both directions — a same-shaped DataFrame with silently wrong values is far more dangerous than an explicit error. A generic value written with integrity checking off has no envelope at all, so a reader with it on just decodes the plain MessagePack.
+
+> [!NOTE]
+> This mismatch isn't reachable through `@cache`: `integrity_checking` is part of the cache key, so a reader configured differently from the writer misses the entry and recomputes it, rather than reading it under the wrong config. The table above only applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata.
+
+See [E021](../error-codes.md#e021-deserialization-failed) for the exact error message.
+
 ## Unsupported Types
 
 AutoSerializer explicitly rejects types it can't handle safely:
