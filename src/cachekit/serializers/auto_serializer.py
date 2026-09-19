@@ -579,10 +579,27 @@ class AutoSerializer:
         Raises:
             SerializationError: A ByteStorage envelope was present but failed verification
                 (checksum mismatch, decompression bomb/failure, size mismatch) — genuine
-                corruption or tampering, or a payload that failed to decode inside a
-                verified envelope. Bytes that were never a ByteStorage envelope (e.g. written
-                with integrity checking off) are not an error here: they fall through to the
-                plain-msgpack/NumPy decode paths and only raise if none of those decode either.
+                corruption or tampering — or a payload that failed to decode inside a
+                verified envelope.
+
+                DataFrame/Series entries additionally raise on ANY envelope-parse failure,
+                including "not an envelope at all": unlike the generic msgpack path below,
+                a DataFrame/Series read never reconstructs from unauthenticated bytes,
+                because a wrong-valued-but-same-shaped DataFrame is a far more dangerous
+                silent failure than the wrong-shaped value a generic-format fall-through
+                can produce (matches :class:`StandardSerializer`'s stricter, no-fall-through
+                contract).
+
+                For the generic msgpack path, bytes that were never meant to be a
+                ByteStorage envelope — ``metadata`` is absent (e.g. a caller invoking
+                ``deserialize`` directly with no metadata) or ``metadata.compressed`` is
+                false (the writer's own record of having written it with integrity
+                checking off) — are not an error here: they fall through to the plain
+                msgpack decode, whose own type-marker/structural validation is what
+                catches a genuinely forged entry. An entry whose ``metadata.compressed``
+                says true but whose envelope failed to parse at all raises instead —
+                that combination is corruption wearing the not-an-envelope path's
+                clothes, not a legitimate cross-config read.
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
@@ -614,9 +631,13 @@ class AutoSerializer:
                 if not (self.enable_integrity_checking and len(data) > 4):
                     # Integrity off: data is direct msgpack (no envelope)
                     return self._decode_columnar(data, detected_format)
-                # Integrity on: fall through to the shared Rust-envelope retrieve below, which
-                # re-derives this same detected_format from metadata (#156, LAB-2736 collapse —
-                # one retrieve+decode path instead of a second copy here).
+                # Integrity on: a DataFrame/Series MUST come from a verified envelope —
+                # see the Raises: section above for why this never falls through.
+                try:
+                    original_data, _ = self._byte_storage.retrieve(data)
+                except ValueError as e:
+                    raise self._envelope_failure(e, detected_format) from e
+                return self._decode_columnar(original_data, detected_format)
 
         # For Rust-envelope formats, use the Rust layer
         envelope_error: Exception | None = None
@@ -630,7 +651,7 @@ class AutoSerializer:
                 # fall through to a re-parse as plain msgpack/NumPy (that would either raise a
                 # confusing "not decodable" error or, worse, decode envelope bytes as if they
                 # were the payload).
-                raise SerializationError(f"Cache entry failed envelope verification (corrupted cache entry): {e}") from e
+                raise self._envelope_failure(e) from e
             except Exception as e:
                 # Not a ByteStorage envelope at all (e.g. written with integrity checking off):
                 # fall through to the Python-only paths below, keeping the reason for the
@@ -658,6 +679,21 @@ class AutoSerializer:
                         f"Cache entry payload failed to decode inside a verified envelope (format={detected_format!r}): {e}"
                     ) from e
 
+        # Reached when self.enable_integrity_checking is True and retrieve() raised the
+        # "not an envelope" ValueError (envelope_error is set). The writer's OWN record of
+        # whether this entry should be a checksummed envelope gates what happens next, not
+        # the reader's config: `metadata.compressed` is set at write time to the writer's
+        # enable_integrity_checking. A writer that legitimately recorded "no envelope"
+        # (compressed is false, or metadata is absent entirely — e.g. a hand-built payload
+        # with no metadata, which every non-dataframe/series decode test in this suite
+        # exercises) still falls through to the plain-msgpack decode below; that decode's
+        # own type-marker/structural validation is what catches a genuinely forged entry.
+        # Only a writer that claimed compressed=true, whose envelope then failed to parse
+        # at all, fails closed here — that combination is corruption wearing the
+        # not-an-envelope path's clothes, not a legitimate cross-config read.
+        if envelope_error is not None and metadata is not None and getattr(metadata, "compressed", False):
+            raise self._envelope_failure(envelope_error) from envelope_error
+
         # Check for Arrow IPC format before msgpack fall-through
         # Arrow data may have xxHash3-64 checksum prefix (8 bytes) or be direct Arrow IPC
         if len(data) >= 14 and data[8:14] == b"ARROW1":
@@ -676,17 +712,6 @@ class AutoSerializer:
                 raise SerializationError(
                     "Cannot deserialize Arrow format: ArrowSerializer not available. Install with: pip install 'cachekit[data]'"
                 )
-
-        # Metadata says dataframe/series but the envelope attempt above either wasn't
-        # taken (integrity off) or failed as "not an envelope" (envelope_error set,
-        # e.g. cross-config read of an entry written with integrity off): the bytes
-        # are direct columnar msgpack, not a bare object, and MUST still reconstruct
-        # through _decode_columnar — falling through to the generic branch below would
-        # return the raw wire dict instead of a DataFrame/Series (LAB-2736 regression
-        # caught by expert-panel review: silently wrong-typed data, not merely a
-        # confusing error).
-        if metadata and hasattr(metadata, "original_type") and metadata.original_type in ("dataframe", "series"):
-            return self._decode_columnar(data, metadata.original_type)
 
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
@@ -918,6 +943,13 @@ class AutoSerializer:
             series.index = pd.Index(_expect(serialized["index"], list, "index"))
 
         return series
+
+    @staticmethod
+    def _envelope_failure(cause: Exception, detected_format: str | None = None) -> SerializationError:
+        """One canonical ``SerializationError`` for every envelope-verification failure in
+        ``deserialize`` — see its ``Raises:`` section for the fail-closed contract this backs."""
+        suffix = f" (format={detected_format!r})" if detected_format else ""
+        return SerializationError(f"Cache entry failed envelope verification (corrupted cache entry){suffix}: {cause}")
 
     def _decode_columnar(self, payload: bytes | bytearray | memoryview, kind: str) -> pd.DataFrame | pd.Series:
         """Decode a ``dataframe`` / ``series`` payload, failing closed as ``SerializationError``.

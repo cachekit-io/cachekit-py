@@ -78,17 +78,44 @@ class TestDataFrameSeriesReadRoutes:
         _assert_equal(s.deserialize(data), value)
 
     @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
-    def test_roundtrip_cross_config_written_off_read_on(self, value: pd.DataFrame | pd.Series) -> None:
-        """LAB-2736 regression: an entry written with integrity off (no ByteStorage envelope)
-        must still reconstruct through the columnar decoder when read by a reader with
-        integrity on — not fall through to returning the raw wire dict unchecked."""
+    def test_cross_config_written_off_read_on_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """LAB-2736 follow-up: an entry written with integrity off (no ByteStorage envelope,
+        no checksum ever computed) must raise, not reconstruct, when read by a reader with
+        integrity on — a same-shaped DataFrame/Series with silently wrong values is far more
+        dangerous than a raw-dict/TypeError, so this path never falls through like the
+        generic msgpack path does. Confirmed exploitable before this test existed: 6427/7208
+        single-bit flips on such an entry decoded to a different-valued DataFrame with no
+        error at all, and even the UNCORRUPTED entry decoded successfully despite never
+        having been checksummed. Matches StandardSerializer's stricter contract."""
         writer = _no_arrow(enable_integrity_checking=False)
         reader = _no_arrow(enable_integrity_checking=True)
         data, meta = writer.serialize(value)
 
-        out = reader.deserialize(data, meta)
-        assert type(out) is type(value)
-        _assert_equal(out, value)
+        with pytest.raises(SerializationError, match="envelope verification"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_corrupted_integrity_off_entry_read_on_fails_closed_not_silently_wrong(
+        self, value: pd.DataFrame | pd.Series
+    ) -> None:
+        """The actual exploited shape: bit-flip an entry that was written with integrity
+        off, then read it with integrity on. Every flip must raise SerializationError —
+        none may silently return a DataFrame/Series with different values than what was
+        written. A sample across the byte range (not exhaustive, for CI speed) is enough
+        to pin the contract; the exhaustive proof (7208/7208 raised, 0 silent-wrong) was
+        run by hand before this fix landed."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        for byte_idx in range(0, len(data), max(1, len(data) // 40)):
+            corrupted = bytearray(data)
+            corrupted[byte_idx] ^= 0xFF
+            try:
+                out = reader.deserialize(bytes(corrupted), meta)
+            except SerializationError:
+                continue
+            pytest.fail(f"byte {byte_idx} flip silently returned {out!r} instead of raising")
 
 
 @pytest.mark.unit
@@ -181,6 +208,21 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         on = AutoSerializer(enable_integrity_checking=True)
         assert on.deserialize(data) == payload
+
+    def test_structurally_corrupt_envelope_on_generic_path_fails_closed(self) -> None:
+        """LAB-2736 follow-up: metadata.compressed=True (the writer's own record that this
+        entry should be a verified envelope) plus a structural parse failure — not just a
+        checksum mismatch — must still raise, not fall through to unpackb_bounded on the
+        still-enveloped bytes. Truncation forces DeserializationFailed (structural), the
+        other branch of retrieve()'s failure taxonomy from the checksum-mismatch case
+        ``test_corrupted_payload_names_the_integrity_failure`` already covers above."""
+        s = AutoSerializer(enable_integrity_checking=True)
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        truncated = data[: len(data) // 4]
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(truncated, meta)
 
 
 # A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a
