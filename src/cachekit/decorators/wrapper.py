@@ -803,15 +803,16 @@ def create_cache_wrapper(
             return
         _cached_keys.add(cache_key)
 
-    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
-        size_bytes is computed here rather than read from the handler's
-        size_bytes tuple slot (LAB-348), so this label never depends on the
-        handler's tuple shape; the two agree on every in-contract async hit.
+        size_bytes is the length CacheHit already measured (LAB-3757), not a
+        recompute from the envelope. CacheHit.size_bytes is set on every hit
+        including the mmap fast path, where envelope is None and there are no
+        bytes to measure -- so this label never depends on holding the bytes.
 
         Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
         every call site sits inside an `except Exception` that falls through to
@@ -839,16 +840,13 @@ def create_cache_wrapper(
             features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
-                # Defensive encode for an out-of-contract backend: both async readers
-                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
-                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                 features.record_cache_operation(
                     operation="get",
                     namespace=namespace or "default",
                     serializer="rust",
                     success=True,
                     duration_ms=get_duration_ms,
-                    size_bytes=len(envelope),
+                    size_bytes=size_bytes,
                     hit=True,
                 )
         except (ValueError, TypeError) as exc:
@@ -1799,7 +1797,7 @@ def create_cache_wrapper(
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    _record_l2_hit_async(cached_data, get_duration_ms)
+                    _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1880,7 +1878,7 @@ def create_cache_wrapper(
                                     # Another request filled the cache while we waited
                                     result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1910,7 +1908,7 @@ def create_cache_wrapper(
                                     # Cache was populated while waiting - use it
                                     result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
