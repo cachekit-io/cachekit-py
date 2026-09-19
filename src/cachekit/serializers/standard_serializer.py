@@ -313,13 +313,18 @@ class StandardSerializer:
 
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
-            metadata: Optional metadata (ignored - MessagePack is self-describing)
+            metadata: Optional metadata. Only ``compressed`` is read: with integrity checking
+                off, an entry the writer enveloped (``compressed=True``) is rejected rather
+                than decoded as plain MessagePack (see Raises).
 
         Returns:
             Deserialized Python object
 
         Raises:
-            SerializationError: If data is malformed, not valid MessagePack, or integrity check fails
+            SerializationError: If data is malformed, not valid MessagePack, or integrity check
+                fails; also, with integrity checking off, if ``metadata.compressed`` says the
+                writer enveloped the entry — this reader has no ByteStorage to verify or unwrap
+                it, and unpackb on the envelope bytes would return its fields as the value.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -335,7 +340,11 @@ class StandardSerializer:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
             else:
-                # No ByteStorage - data is pure MessagePack
+                # No ByteStorage — an enveloped entry cannot be verified or unwrapped here (see Raises).
+                if metadata is not None and metadata.compressed:
+                    raise SerializationError(
+                        "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
+                    )
                 msgpack_data = data
 
             # Deserialize MessagePack
