@@ -5,11 +5,48 @@
 //! SDK-owned msgpack decode bound in `crate::msgpack_bounds`.
 
 use crate::msgpack_bounds::check_msgpack_structure;
+use cachekit_core::byte_storage::ByteStorageError;
 use cachekit_core::ByteStorage;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+
+pyo3::create_exception!(
+    _rust_serializer,
+    EnvelopeIntegrityError,
+    PyValueError,
+    "A ByteStorage envelope parsed but failed verification: checksum mismatch, decompression\n\
+     bomb/failure, or a decoded size mismatch against the envelope header.\n\
+     \n\
+     Distinguishes a verified-but-corrupt envelope (this exception) from bytes that were never\n\
+     a ByteStorage envelope at all (`DeserializationFailed`, e.g. written with integrity\n\
+     checking off) — the latter stays a plain `ValueError` so callers keep falling through to\n\
+     the plain-msgpack/NumPy decode paths for it, while this one must fail closed.\n\
+     \n\
+     Subclasses ValueError so existing `pytest.raises(ValueError)` assertions on `retrieve()`\n\
+     failures stay valid. `AutoSerializer.deserialize` catches this specifically and re-raises\n\
+     it as `SerializationError` without falling through."
+);
+
+/// Map a cachekit-core `retrieve()` failure onto the Python exception taxonomy.
+///
+/// `DeserializationFailed` means `envelope_bytes` never parsed as a `StorageEnvelope` — not
+/// corruption, just "not an envelope" — so it stays a plain `ValueError`, the fall-through
+/// signal `AutoSerializer.deserialize` depends on. Every other variant is mapped to
+/// `EnvelopeIntegrityError` and must fail closed: the post-parse checks (checksum, decompressed
+/// size, decompression itself, the compression-ratio bomb guard) are genuine corruption or
+/// tampering, and `InputTooLarge` — raised on the raw `envelope_bytes` length before parsing is
+/// even attempted — is deliberately bucketed the same way rather than treated as "not an
+/// envelope": falling through would hand an oversized blob to the plain-msgpack decode path
+/// instead of rejecting it outright, trading one size guard for a weaker one.
+fn retrieve_error_to_py(err: ByteStorageError) -> PyErr {
+    let message = format!("Retrieval failed: {}", err);
+    match err {
+        ByteStorageError::DeserializationFailed(_) => PyValueError::new_err(message),
+        _ => EnvelopeIntegrityError::new_err(message),
+    }
+}
 
 /// Python wrapper for ByteStorage
 #[pyclass(name = "ByteStorage")]
@@ -155,7 +192,7 @@ impl PyByteStorage {
         let data = view.as_slice();
         // Detach from the GIL for decompression + checksum (see store()).
         py.detach(|| self.inner.retrieve(data))
-            .map_err(|e| PyValueError::new_err(format!("Retrieval failed: {}", e)))
+            .map_err(retrieve_error_to_py)
     }
 
     /// Get compression ratio for given data

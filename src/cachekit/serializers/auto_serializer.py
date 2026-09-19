@@ -58,7 +58,7 @@ except ImportError:
     HAS_ARROW_SERIALIZER = False
     ArrowSerializer = None  # type: ignore[assignment,misc]
 
-from cachekit._rust_serializer import ByteStorage
+from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
 from cachekit.hash_utils import redact_error_for_log
 
 from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
@@ -575,6 +575,14 @@ class AutoSerializer:
 
         Returns:
             Any: Deserialized Python object
+
+        Raises:
+            SerializationError: A ByteStorage envelope was present but failed verification
+                (checksum mismatch, decompression bomb/failure, size mismatch) — genuine
+                corruption or tampering, or a payload that failed to decode inside a
+                verified envelope. Bytes that were never a ByteStorage envelope (e.g. written
+                with integrity checking off) are not an error here: they fall through to the
+                plain-msgpack/NumPy decode paths and only raise if none of those decode either.
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
@@ -602,30 +610,13 @@ class AutoSerializer:
                         "Cannot deserialize Arrow format: ArrowSerializer not available. "
                         "Install with: pip install 'cachekit[data]'"
                     )
-            elif detected_format == "dataframe":
-                if self.enable_integrity_checking and len(data) > 4:
-                    # Unwrap the ByteStorage envelope. A checksum mismatch (raised by retrieve) fails
-                    # closed with a clear corruption error instead of being swallowed and re-parsed as
-                    # raw msgpack, which lost the diagnostic and produced a confusing error (#156).
-                    # The unpack/build sits OUTSIDE this guard so a genuine post-retrieve error surfaces
-                    # as itself rather than being mistaken for corruption.
-                    try:
-                        original_data, _ = self._byte_storage.retrieve(data)
-                    except (ValueError, SerializationError) as e:
-                        raise SerializationError(f"DataFrame integrity check failed (corrupted cache entry): {e}") from e
-                    return self._decode_columnar(original_data, detected_format)
-                # Integrity off: data is direct msgpack (no envelope)
-                return self._decode_columnar(data, detected_format)
-            elif detected_format == "series":
-                if self.enable_integrity_checking and len(data) > 4:
-                    # Same fail-closed contract as the DataFrame branch above (#156).
-                    try:
-                        original_data, _ = self._byte_storage.retrieve(data)
-                    except (ValueError, SerializationError) as e:
-                        raise SerializationError(f"Series integrity check failed (corrupted cache entry): {e}") from e
-                    return self._decode_columnar(original_data, detected_format)
-                # Integrity off: data is direct msgpack (no envelope)
-                return self._decode_columnar(data, detected_format)
+            elif detected_format in ("dataframe", "series"):
+                if not (self.enable_integrity_checking and len(data) > 4):
+                    # Integrity off: data is direct msgpack (no envelope)
+                    return self._decode_columnar(data, detected_format)
+                # Integrity on: fall through to the shared Rust-envelope retrieve below, which
+                # re-derives this same detected_format from metadata (#156, LAB-2736 collapse —
+                # one retrieve+decode path instead of a second copy here).
 
         # For Rust-envelope formats, use the Rust layer
         envelope_error: Exception | None = None
@@ -633,14 +624,17 @@ class AutoSerializer:
             try:
                 # Use Rust layer for decompression and validation
                 original_data, format_id = self._byte_storage.retrieve(data)
-            except SerializationError:
-                # Re-raise SerializationError (corruption detection) without swallowing
-                raise
+            except EnvelopeIntegrityError as e:
+                # The envelope parsed but failed verification (checksum, decompression bomb,
+                # size mismatch) — genuine corruption or tampering. Must fail closed, never
+                # fall through to a re-parse as plain msgpack/NumPy (that would either raise a
+                # confusing "not decodable" error or, worse, decode envelope bytes as if they
+                # were the payload).
+                raise SerializationError(f"Cache entry failed envelope verification (corrupted cache entry): {e}") from e
             except Exception as e:
-                # Not a ByteStorage envelope (e.g. written with integrity checking off):
+                # Not a ByteStorage envelope at all (e.g. written with integrity checking off):
                 # fall through to the Python-only paths below, keeping the reason for the
-                # final error (a checksum mismatch also lands here — retrieve raises a plain
-                # ValueError for both; distinguishing them is a Rust-extension follow-up).
+                # final error.
                 envelope_error = e
                 logger.debug(
                     f"Rust envelope parsing failed, falling back to Python-only deserialization: {redact_error_for_log(e)}"
@@ -657,10 +651,7 @@ class AutoSerializer:
                     if detected_format == "numpy":
                         return self._deserialize_numpy(original_data)
                     if detected_format in ("dataframe", "series"):
-                        unpacked_data = unpackb_bounded(original_data, **self._msgpack_unpack_opts)
-                        if detected_format == "dataframe":
-                            return self._deserialize_dataframe(unpacked_data)
-                        return self._deserialize_series(unpacked_data)
+                        return self._decode_columnar(original_data, detected_format)
                     return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
                 except PAYLOAD_DECODE_ERRORS as e:
                     raise SerializationError(
@@ -685,6 +676,17 @@ class AutoSerializer:
                 raise SerializationError(
                     "Cannot deserialize Arrow format: ArrowSerializer not available. Install with: pip install 'cachekit[data]'"
                 )
+
+        # Metadata says dataframe/series but the envelope attempt above either wasn't
+        # taken (integrity off) or failed as "not an envelope" (envelope_error set,
+        # e.g. cross-config read of an entry written with integrity off): the bytes
+        # are direct columnar msgpack, not a bare object, and MUST still reconstruct
+        # through _decode_columnar — falling through to the generic branch below would
+        # return the raw wire dict instead of a DataFrame/Series (LAB-2736 regression
+        # caught by expert-panel review: silently wrong-typed data, not merely a
+        # confusing error).
+        if metadata and hasattr(metadata, "original_type") and metadata.original_type in ("dataframe", "series"):
+            return self._decode_columnar(data, metadata.original_type)
 
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
