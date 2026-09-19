@@ -16,6 +16,7 @@ from cachekit.hash_utils import redact_error_for_log
 
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
+    CacheHit,
     CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -762,7 +763,7 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[Any, bool, int | None]:
+    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -1406,8 +1407,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
-                _found, result, cached_data, size_bytes = cached_result
+                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1793,8 +1794,8 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
-                    _found, result, cached_data, _size_bytes = cached_result
+                    # Cache hit: envelope is the raw serialized bytes for L1 backfill
+                    result, cached_data = cached_result.value, cached_result.envelope
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1877,7 +1878,7 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                     _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
@@ -1907,7 +1908,7 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                     _record_l2_hit_async(cached_data, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)

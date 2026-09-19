@@ -10,7 +10,7 @@ import asyncio
 import threading
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, BinaryIO, Optional, Protocol, TypeGuard, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
 from cachekit.backends.base import (
     BackendError,
@@ -1211,6 +1211,23 @@ class CacheSerializationHandler:
             raise SerializationError(f"Failed to deserialize interop cache entry: {bounded_error(e)}") from e
 
 
+class CacheHit(NamedTuple):
+    """A successful L2 read from :class:`CacheOperationHandler`.
+
+    envelope is the serialized bytes so the decorator can backfill L1 without
+    re-serializing (re-encrypting) — None on the mmap fast path, where the
+    mapped view is confined to its frame and must never reach L1 (#171
+    blocker C). size_bytes is the envelope's byte length on every hit, mmap
+    included, so payload-size stats never depend on holding the bytes.
+    A hit is distinguished from "no cache entry" by getting a CacheHit at
+    all vs. None — there is no boolean slot (LAB-3757).
+    """
+
+    value: Any
+    envelope: Optional[bytes]
+    size_bytes: int
+
+
 class CacheOperationHandler:
     """Handles core cache operations - Single Responsibility.
 
@@ -1353,9 +1370,7 @@ class CacheOperationHandler:
             )
         self._notify_deserialize_error(e, cache_key)
 
-    def get_cached_value(
-        self, cache_key: str, refresh_ttl: Optional[int] = None
-    ) -> Optional[tuple[bool, Any, Optional[bytes], int]]:
+    def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[CacheHit]:
         """Get value from cache if it exists.
 
         Args:
@@ -1363,13 +1378,8 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value, raw_bytes, size_bytes) if cache hit, None if cache
-            miss or error. raw_bytes is the serialized envelope so the decorator can
-            backfill L1 without re-serializing (re-encrypting) — same shape as the
-            async variant (LAB-348). It is None on the mmap fast path: the mapped view
-            is confined to this frame and must never reach L1 (#171 blocker C).
-            size_bytes is the envelope's byte length on every hit, mmap included, so
-            payload-size stats never depend on holding the bytes.
+            A :class:`CacheHit` on a cache hit, None on cache miss or error. See
+            :class:`CacheHit` for the field semantics (mmap fast path, size_bytes).
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1389,7 +1399,7 @@ class CacheOperationHandler:
                     try:
                         get_logger().cache_hit(cache_key, "Backend(mmap)")
                         size_bytes = handle.view.nbytes  # payload length; the view is released in `finally`
-                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key), None, size_bytes)
+                        return CacheHit(self.serialization_handler.deserialize_data(handle.view, cache_key), None, size_bytes)
                     finally:
                         handle.close()
 
@@ -1398,8 +1408,7 @@ class CacheOperationHandler:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
-                return (True, deserialized, cached_data, len(cached_data))
+                return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
@@ -1418,19 +1427,17 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    def get_cached_value_with_freshness(
-        self, cache_key: str
-    ) -> Optional[tuple[tuple[bool, Any, bytes, int], bool, Optional[int]]]:
+    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
         """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
         staleness and the server's remaining freshness in seconds.
 
-        Returns ``((True, value, raw_bytes, size_bytes), is_stale, fresh_for)`` on
-        a hit — the inner tuple matches the async variant so the sync decorator
-        backfills L1 without re-serializing (LAB-348) — None on miss/error.
-        fresh_for is None when no signal exists (pre-signal server,
-        non-SWR backend) — the caller applies legacy L1 TTL behavior. The mmap
-        fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
-        Error semantics mirror get_cached_value: the LAB-108 policy point raises
+        Returns ``(CacheHit, is_stale, fresh_for)`` on a hit — the CacheHit
+        matches the async variant so the sync decorator backfills L1 without
+        re-serializing (LAB-348) — None on miss/error. fresh_for is None when
+        no signal exists (pre-signal server, non-SWR backend) — the caller
+        applies legacy L1 TTL behavior. The mmap fast path is skipped — SWR is
+        CachekitIO-only, which is not buffer-readable. Error semantics mirror
+        get_cached_value: the LAB-108 policy point raises
         DecryptionAuthenticationError when fail-closed (poisoned entry retained as
         evidence); fail-open evicts and reads as a miss so the caller recomputes.
         """
@@ -1448,7 +1455,7 @@ class CacheOperationHandler:
             cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
+            return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1466,18 +1473,16 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_with_freshness_async(
-        self, cache_key: str
-    ) -> Optional[tuple[tuple[bool, Any, bytes, int], bool, Optional[int]]]:
+    async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
         """Async SWR variant (LAB-381/LAB-557): staleness + remaining freshness +
         the raw envelope for L1 backfill.
 
-        Returns ``((True, value, raw_bytes, size_bytes), is_stale, fresh_for)`` on
-        a hit — the inner tuple matches :meth:`get_cached_value_async` (LAB-111
-        routing) so the async decorator backfills L1 without re-serializing;
-        fresh_for (seconds, None = no signal) bounds that backfill to the
-        server's remaining freshness. None on miss/error; the LAB-108
-        fail-closed policy propagates DecryptionAuthenticationError.
+        Returns ``(CacheHit, is_stale, fresh_for)`` on a hit — the CacheHit
+        matches :meth:`get_cached_value_async` (LAB-111 routing) so the async
+        decorator backfills L1 without re-serializing; fresh_for (seconds,
+        None = no signal) bounds that backfill to the server's remaining
+        freshness. None on miss/error; the LAB-108 fail-closed policy
+        propagates DecryptionAuthenticationError.
         """
         try:
             if self._cache_handler is None:
@@ -1489,7 +1494,7 @@ class CacheOperationHandler:
             cached_data, is_stale, fresh_for = hit  # same 2-tuple contract as the sync variant above
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
+            return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1507,9 +1512,7 @@ class CacheOperationHandler:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_async(
-        self, cache_key: str, refresh_ttl: Optional[int] = None
-    ) -> Optional[tuple[bool, Any, bytes, int]]:
+    async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[CacheHit]:
         """Get value from cache if it exists (async version).
 
         Args:
@@ -1517,10 +1520,8 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value, raw_bytes, size_bytes) if cache hit, None if cache miss
-            or error. The raw serialized envelope is included so the decorator can
-            backfill L1 without re-serializing (re-encrypting); same shape as the sync
-            variant, and size_bytes is its byte length.
+            A :class:`CacheHit` on a cache hit, None on cache miss or error. Same
+            shape as the sync variant; see :class:`CacheHit`.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1537,8 +1538,7 @@ class CacheOperationHandler:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
-                return (True, deserialized, cached_data, len(cached_data))
+                return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
