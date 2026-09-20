@@ -91,6 +91,8 @@ def fn(): return {1, 2, 3}
 
 ## Cross-Config Reads (integrity_checking Mismatch)
 
+**When this applies.** With the default key derivation a mismatch isn't reachable through `@cache`: `integrity_checking` is part of the generated cache key, so a reader configured differently from the writer misses the entry and recomputes it. That segregation does **not** hold when the key is built with `key=` or `fast_mode` — those keys omit the flag, so two `@cache` sites differing only in `integrity_checking` share an entry and everything below applies. It also applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata. Omitting the metadata is not a way around a mismatch raise: an integrity-off reader given an enveloped entry and no metadata returns the envelope's internal fields as a list instead of your value.
+
 What happens when the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's depends on which path the value takes, not on the direction of the mismatch:
 
 | Value | Path | Mismatch in either direction |
@@ -107,9 +109,6 @@ What happens when the reader's `integrity_checking` (see [API Reference](../api-
 **NumPy arrays** are the exception to watch. The checksum is a prefix the *writer* adds when its flag is on; the reader verifies it if present and otherwise decodes the raw buffer. An array written with `integrity_checking=False` is therefore never verified — a flipped byte decodes into wrong values even for a reader with the flag on. The reader's setting buys it nothing here; protection depends entirely on the writer's.
 
 In every case the checksum is unkeyed xxHash3-64: it detects corruption, not tampering. Anyone who can write to the backend can recompute it — see [E003](../error-codes.md#e003-decryption-failed---authentication-tag-mismatch) for the encrypted path that does resist tampering.
-
-> [!NOTE]
-> With the default key derivation this mismatch isn't reachable through `@cache`: `integrity_checking` is part of the generated cache key, so a reader configured differently from the writer misses the entry and recomputes it. That segregation does **not** apply when the key is built another way — `key=`, `fast_mode`, or `interop` — because those keys don't include the flag, so two `@cache` sites differing only in `integrity_checking` share an entry and the table above applies. It also applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata.
 
 See [E021](../error-codes.md#e021-deserialization-failed) for the exact error messages.
 

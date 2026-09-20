@@ -338,31 +338,33 @@ class TestAutoSerializerDataFrameIsAlwaysChecksummed:
     what ``docs/serializers/auto.md`` documents; pin it so the two cannot drift apart.
     """
 
-    DF = pd.DataFrame({"x": [1.0, 2.0, 3.0], "n": [1, 2, 3]})
+    @pytest.fixture
+    def df(self):
+        return pd.DataFrame({"x": [1.0, 2.0, 3.0], "n": [1, 2, 3]})
 
-    def test_writer_flag_does_not_reach_arrow_bytes(self):
+    def test_writer_flag_does_not_reach_arrow_bytes(self, df):
         """The invariant itself: an integrity-off AutoSerializer still delegates to a
         checksumming ArrowSerializer, and the flag leaves the stored bytes untouched."""
         off = AutoSerializer(enable_integrity_checking=False)
         assert off._arrow_serializer is not None
-        data_off, meta_off = off.serialize(self.DF)
-        data_on, _ = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+        data_off, meta_off = off.serialize(df)
+        data_on, _ = AutoSerializer(enable_integrity_checking=True).serialize(df)
         assert meta_off.original_type == "arrow"  # delegated, not columnar msgpack
         assert data_off == data_on
 
-    def test_cross_config_read_decodes(self):
-        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+    def test_cross_config_read_decodes(self, df):
+        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(df)
         reader = AutoSerializer(enable_integrity_checking=False)
-        pd.testing.assert_frame_equal(reader.deserialize(data, metadata), self.DF)
+        pd.testing.assert_frame_equal(reader.deserialize(data, metadata), df)
 
     # 0 = checksum prefix, 10 = inside the ARROW1 magic that both serializers use to
     # discriminate an Arrow stream from msgpack (the only branch that could sidestep the
     # checksum), -1 = payload tail.
     @pytest.mark.parametrize("byte_idx", [0, 10, -1], ids=["checksum", "arrow-magic", "payload"])
-    def test_corruption_still_raises_for_integrity_off_reader(self, byte_idx: int):
+    def test_corruption_still_raises_for_integrity_off_reader(self, df, byte_idx: int):
         """Decoding across the mismatch is safe only because the checksum is still verified:
         a byte flip must raise, never return a same-shaped frame with wrong values."""
-        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(df)
         assert data[8:14] == b"ARROW1"
         corrupted = bytearray(data)
         corrupted[byte_idx] ^= 0xFF
