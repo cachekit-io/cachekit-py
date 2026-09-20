@@ -10,7 +10,9 @@ failure, corrupt data), the decorator must:
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 from unittest import mock
 
@@ -21,6 +23,7 @@ from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHand
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import EncryptionError
+from cachekit.serializers.wrapper import _PREFIX_LEN
 
 
 @pytest.mark.unit
@@ -315,3 +318,92 @@ class TestDecoratorPoisonEviction:
         assert key in backend.deleted
         assert backend._store.get(key) not in (None, poison)
         assert any("cache_get_deserialize" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+class TestCorruptFrameHeaderEvicts:
+    """A corrupt CK frame *header* must evict like a corrupt payload (LAB-4075).
+
+    Drives a REAL CacheSerializationHandler (no deserialize mock) so the exception class
+    under test is the one the code actually raises, not one a mock was told to raise.
+    """
+
+    KEY = "hdr:key"
+
+    @pytest.fixture
+    def plain_handler(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[CacheSerializationHandler]:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        yield CacheSerializationHandler(serializer_name="default")
+
+    @pytest.fixture
+    def enc_handler(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[CacheSerializationHandler]:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        yield CacheSerializationHandler(
+            serializer_name="default",
+            encryption=True,
+            single_tenant_mode=True,
+            deployment_uuid="00000000-0000-0000-0000-000000000001",
+        )
+
+    @staticmethod
+    def _corrupt_header(blob: bytes, variant: str) -> bytes:
+        """Mutate only the header region of a valid CK v3 frame; the payload is untouched."""
+        hdr_len = int.from_bytes(blob[3:_PREFIX_LEN], "big")
+        payload = blob[_PREFIX_LEN + hdr_len :]
+        if variant == "truncated":
+            return blob[: _PREFIX_LEN - 2]
+        if variant == "bad_version":
+            return blob[:2] + b"\x09" + blob[3:]
+        if variant == "bad_header_len":
+            return blob[:3] + (0xFFFFFFFF).to_bytes(4, "big") + blob[_PREFIX_LEN:]
+        if variant == "undecodable_header":
+            return blob[:_PREFIX_LEN] + b"\xff" * hdr_len + payload
+        if variant == "non_json_header":
+            return blob[:_PREFIX_LEN] + b"{" * hdr_len + payload
+        if variant == "unknown_format_enum":
+            doc = json.loads(blob[_PREFIX_LEN : _PREFIX_LEN + hdr_len])
+            doc["m"]["format"] = "not-a-format"
+            new_header = json.dumps(doc).encode()
+            return blob[:3] + len(new_header).to_bytes(4, "big") + new_header + payload
+        raise AssertionError(variant)
+
+    VARIANTS = ["truncated", "bad_version", "bad_header_len", "undecodable_header", "non_json_header", "unknown_format_enum"]
+
+    @pytest.mark.parametrize("variant", VARIANTS)
+    def test_header_corruption_raises_serialization_error(self, plain_handler: CacheSerializationHandler, variant: str) -> None:
+        blob = plain_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+        assert plain_handler.deserialize_data(blob, cache_key=self.KEY) == {"k": "v"}  # baseline is valid
+
+        with pytest.raises(SerializationError):  # not a bare ValueError subclass
+            plain_handler.deserialize_data(self._corrupt_header(blob, variant), cache_key=self.KEY)
+
+    def test_header_corruption_evicts_and_notifies(self, plain_handler: CacheSerializationHandler) -> None:
+        """Sync get_cached_value: corrupt header -> miss, backend delete, on_deserialize_error hook."""
+        blob = plain_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+        handler = CacheOperationHandler(plain_handler, CacheKeyGenerator())
+        mock_ch = mock.MagicMock()
+        mock_ch.get.return_value = self._corrupt_header(blob, "truncated")
+        handler.set_cache_handler(mock_ch)
+        calls: list[tuple[Exception, str]] = []
+        handler.on_deserialize_error = lambda error, key: calls.append((error, key))
+
+        assert handler.get_cached_value(self.KEY) is None
+        mock_ch.delete.assert_called_once_with(self.KEY)
+        assert len(calls) == 1 and isinstance(calls[0][0], SerializationError)
+
+    def test_missing_cache_key_on_encrypted_entry_still_fails_closed_without_evicting(
+        self, enc_handler: CacheSerializationHandler
+    ) -> None:
+        """Guard: the wrap must not swallow the deliberate ValueError for a missing cache_key."""
+        blob = enc_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+
+        with pytest.raises(ValueError, match="cache_key is required"):
+            enc_handler.deserialize_data(blob, cache_key="")
+
+        handler = CacheOperationHandler(enc_handler, CacheKeyGenerator())
+        mock_ch = mock.MagicMock()
+        mock_ch.get.return_value = blob
+        handler.set_cache_handler(mock_ch)
+
+        assert handler.get_cached_value("") is None
+        mock_ch.delete.assert_not_called()  # a caller bug, not a poisoned entry
