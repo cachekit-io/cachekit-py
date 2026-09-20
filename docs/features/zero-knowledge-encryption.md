@@ -69,7 +69,7 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | **No master key present** | **Fails closed** — raises `ValueError` at decoration time (the `CACHEKIT_MASTER_KEY` fallback is read then, at import) | **Fails open** — silently caches plaintext to the SaaS. The key is read **at decoration time**: one loaded later (dotenv in `main()`, a startup vault hook) is never seen, and every call ships plaintext |
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
 | Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
-| Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
+| Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF derivation exists but is **not a tenancy boundary** — see Multi-Tenant Isolation | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
 | Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources. Arguments are deep-copied before scheduling, so a session passed *as an argument* is never shared — but a non-copyable argument silently skips the refresh entirely (logged at DEBUG) — on an instance method `self` is that argument, so a service class holding a lock, a client or an open connection disables SWR permanently and quietly. The sharing route that does bite is a `ContextVar`-bound session, which the context snapshot deliberately carries into the refresh. `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
@@ -165,7 +165,7 @@ Python object (plaintext, in-app only)
 - **AES-256-GCM**: Authenticated encryption, 256-bit key
 - **Client-side**: Encryption happens in Python, before Redis
 - **Master key**: CACHEKIT_MASTER_KEY environment variable
-- **Per-tenant isolation**: Optional key derivation for multi-tenant
+- **Per-tenant key derivation**: Optional, and *not* a tenancy boundary on its own (see Multi-Tenant Isolation)
 - **Nonce uniqueness**: Counter-based, prevents nonce reuse
 - **Authentication**: GCM mode prevents tampering
 
@@ -368,31 +368,29 @@ df = get_patient_records(42)
 ```
 
 ### Multi-Tenant Isolation
-```python notest
-import os
-from cachekit import cache
-from contextvars import ContextVar
 
-tenant_context = ContextVar("tenant_id")
-
-@cache.secure(
-    ttl=3600,
-    master_key=os.environ["CACHEKIT_MASTER_KEY"],
-    tenant_extractor=lambda user_id: tenant_context.get(),
-    backend=None
-)
-def get_user_data(user_id):
-    tenant_id = tenant_context.get()
-    return db.get_user_data(tenant_id, user_id)  # illustrative - db not defined
-
-# Each tenant gets separate encryption key
-# Tenant A can't decrypt Tenant B's data
-tenant_context.set("tenant_1")
-data_a = get_user_data(123)
-
-tenant_context.set("tenant_2")
-data_b = get_user_data(123)  # Same user_id, different tenant, different encryption
-```
+> [!CAUTION]
+> **The per-tenant example previously shown here did not isolate tenants, and has
+> been removed rather than corrected.** Run against this version, the documented
+> form returned tenant A's cached value to tenant B. Two causes, and the first is
+> enough on its own:
+>
+> - it passed `backend=None`, so nothing was serialized, no key was derived and no
+>   encryption ran at all (see the warning at the top of this page); and
+> - the cache key carries **no tenant component** — the key is
+>   `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so both tenants address the same
+>   entry, and separation depends entirely on the decrypt step failing.
+>
+> Supplying a real backend is **not** by itself a sufficient correction: with a
+> backend and the supported `ContextVarExtractor`, the same call still returned the
+> first tenant's value in our check. Until that is root-caused, this page will not
+> show a pattern it cannot demonstrate. `tenant_extractor` also requires an object
+> implementing `.extract(args, kwargs)` — a bare `lambda` raises `AttributeError` —
+> and tenant ids must be valid UUIDs.
+>
+> **Do not rely on `tenant_extractor` as a tenancy boundary.** Give each tenant its
+> own `namespace`, or its own deployment, and treat per-tenant key derivation as
+> defence in depth rather than the control that separates them.
 
 ### Key Rotation Pattern
 
@@ -457,11 +455,15 @@ Tenant ID: tenant_context.get()
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
 
-Properties:
+Properties of the derivation itself:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
-- Tenant A can't decrypt Tenant B's data
-- Enables secure multi-tenant with single master key
+
+What that does NOT give you: the cache key carries no tenant component, so both
+tenants address the same entry and separation rests entirely on the decrypt step
+rejecting the other tenant's ciphertext. That is a fail-closed behaviour, not an
+isolation boundary, and it does not hold at all when nothing is encrypted
+(backend=None). See Multi-Tenant Isolation above before relying on this.
 ```
 
 ### Nonce Generation (Uniqueness)
