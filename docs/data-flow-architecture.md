@@ -725,14 +725,9 @@ def deserialize(data: bytes, metadata) -> Any:
 
 **Checksum Validation:**
 - xxHash3-64 hash verification
-- Detects data corruption in the **payload bytes** — that is the whole of what the checksum
-  covers. The envelope's own `format` and `original_size` fields sit outside it, as does the
-  plaintext CK header (`metadata.original_type`, `metadata.compressed`). `AutoSerializer`
-  therefore treats the envelope's `format` and the header's `original_type` as two
-  unauthenticated copies of the same fact: it decodes only when they agree and raises when
-  they disagree, rather than electing one to override the other. This is corruption and
-  bit-rot containment, not tamper detection — anyone with backend write access can rewrite
-  both consistently and recompute the unkeyed checksum. Tamper detection requires encryption.
+- Detects data corruption in the **payload bytes** only. The envelope's own `format` and
+  `original_size` fields sit outside it, as does the plaintext CK header — see E021 in
+  [error-codes.md](error-codes.md) for how the decode path handles that.
 
 **Test Coverage:**
 - ByteStorage module: 82% LLVM coverage (all production paths tested)

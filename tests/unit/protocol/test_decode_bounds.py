@@ -254,14 +254,13 @@ class TestOwnedBounds:
         with pytest.raises(SerializationError, match=f"failed to decode as {original_type}"):
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
 
-    @pytest.mark.parametrize("original_type", ["dataframe", "series"])
-    def test_envelope_format_disagreeing_with_the_header_is_a_controlled_miss(self, original_type: str) -> None:
-        # Neither the envelope's `format` record nor the header's original_type is covered by the
-        # xxHash3-64, so neither may override the other: a disagreement is corruption and must reach
-        # the handler as SerializationError (evict + tamper hook), never as a decoded value.
+    def test_envelope_format_disagreeing_with_the_header_is_a_controlled_miss(self) -> None:
+        # A format disagreement must reach the handler as SerializationError (evict + tamper hook),
+        # never as a decoded value. One columnar case: the check is a string inequality, not a branch
+        # on which type — tests/unit/test_auto_serializer_mutation_and_corruption.py covers the shapes.
         metadata, serializer_name = _frame_template("auto")
         frame = SerializationWrapper.wrap(
-            _envelope(msgpack.packb({"t": 1})), {**metadata, "original_type": original_type}, serializer_name
+            _envelope(msgpack.packb({"t": 1})), {**metadata, "original_type": "dataframe"}, serializer_name
         )
         with pytest.raises(SerializationError, match="disagrees with header format"):
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)

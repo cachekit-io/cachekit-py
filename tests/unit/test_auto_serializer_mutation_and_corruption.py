@@ -268,19 +268,15 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
     @pytest.mark.parametrize(
         ("stored", "lying_header"),
         [
-            (pd.Series([1.0, 2.0], name="v"), "dataframe"),
-            (pd.Series([1.0, 2.0], name="v"), "msgpack"),
-            ({"a": 1}, "dataframe"),
-            ({"a": 1}, "series"),
+            ({"a": 1}, "dataframe"),  # was type confusion: a dict came back as a DataFrame
+            (pd.Series([1.0, 2.0], name="v"), "dataframe"),  # was a decode error on healthy data
+            (pd.Series([1.0, 2.0], name="v"), "seriez"),  # header rot to a non-whitelisted value
         ],
     )
     def test_a_lying_header_format_fails_closed_rather_than_steering_the_decode(self, stored: object, lying_header: str) -> None:
-        """A LYING header, not merely an absent one — absence is the weak case, a wrong value
-        is the interesting one. The header used to route the columnar decode outright, so a
-        msgpack dict under a rotted ``"dataframe"`` header came back as a DataFrame (type
-        confusion) and an intact DataFrame under a rotted ``"series"`` header raised a decode
-        error on healthy data. Neither field is checksum-covered, so a disagreement between
-        them is corruption: raise, never decode as either."""
+        """A LYING header, not merely an absent one — absence is the weak case. The third case
+        pins the symmetry: rot in the header must fail closed exactly like rot in the envelope,
+        so the check cannot be narrowed to header values that happen to be decodable formats."""
         s = _no_arrow()  # columnar msgpack path, not Arrow IPC
         data, meta = s.serialize(stored)
         assert meta.original_type != lying_header
@@ -290,10 +286,8 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
             s.deserialize(data, meta)
 
     def test_an_unknown_envelope_format_fails_closed_rather_than_decoding_as_msgpack(self) -> None:
-        """The envelope's ``format`` record sits outside the xxHash3-64 (which covers the
-        payload bytes only), so bit rot reaches it on a checksum-verified entry. Rotted to an
-        unknown value it used to miss every branch and fall to ``unpackb_bounded``, handing
-        back a dict for a verified Series. Only formats this writer can emit are decodable."""
+        """Rotted to an unknown value the envelope's format used to miss every branch and fall
+        to ``unpackb_bounded``, handing back a dict for a checksum-verified Series."""
         s = _no_arrow()
         data, meta = s.serialize(pd.Series([1.0, 2.0], name="v"))
         envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]
@@ -304,9 +298,8 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
             s.deserialize(msgpack.packb(envelope), meta)
 
     def test_a_flipped_envelope_format_cannot_silently_change_the_returned_type(self) -> None:
-        """The mirror of the lying-header case: rewrite the envelope's own record instead.
-        Series -> ``"msgpack"`` is whitelisted, so the whitelist alone still returns a dict
-        for a checksum-verified Series; the header's surviving claim is what catches it."""
+        """The mirror of the lying-header case. Series -> ``"msgpack"`` is a format this writer
+        can emit, so the whitelist alone still returns a dict; the header's claim is what catches it."""
         s = _no_arrow()
         series = pd.Series([10.0, 20.0], name="v")
         data, meta = s.serialize(series)
@@ -317,21 +310,48 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="disagrees with header format"):
             s.deserialize(msgpack.packb(envelope), meta)
 
-    def test_an_arrow_entry_with_a_degraded_header_still_decodes_via_its_own_checksum(self) -> None:
-        """Arrow IPC never parses as a ByteStorage envelope, so an Arrow read that carries
-        metadata always has ``envelope_error`` set. When the metadata fail-closed gate sat
-        ABOVE the structural ARROW1 checks it swallowed those reads: an Arrow entry whose
-        header lost ``original_type`` raised instead of reaching ArrowSerializer, which
-        verifies its own xxHash3-64 and would have caught real corruption itself."""
+    @pytest.mark.parametrize("integrity", [True, False])
+    def test_an_arrow_entry_with_a_degraded_header_still_decodes_via_its_own_checksum(self, integrity: bool) -> None:
+        """Arrow IPC never parses as a ByteStorage envelope, so an Arrow read carrying metadata
+        always has ``envelope_error`` set — and its ``compressed`` flag means its own codec, not
+        an envelope. Both fail-closed gates therefore used to swallow an Arrow entry that had
+        merely lost ``original_type``, on the integrity-ON and integrity-OFF reader alike, even
+        though ArrowSerializer verifies its own xxHash3-64. Structural detection runs first."""
         pytest.importorskip("pyarrow")
-        s = AutoSerializer()
         frame = pd.DataFrame({"a": [1, 2, 3]})
-        data, meta = s.serialize(frame)
+        data, meta = AutoSerializer().serialize(frame)
         assert meta.original_type == "arrow", "this test needs the ArrowSerializer path"
         meta.original_type = None
-        meta.compressed = False
 
-        _assert_equal(s.deserialize(data, meta), frame)
+        _assert_equal(AutoSerializer(enable_integrity_checking=integrity).deserialize(data, meta), frame)
+
+    def test_a_lying_header_over_arrow_bytes_does_not_decode_as_arrow(self) -> None:
+        """Recovering the degraded-header Arrow read must not become "structure beats the
+        header": a header naming a DIFFERENT format contradicts the bytes, and decoding it as
+        Arrow anyway would reinstate the single-rotted-field-decides-the-type class this whole
+        contract exists to close. Only an absent (or agreeing) header licenses the recovery."""
+        pytest.importorskip("pyarrow")
+        data, meta = AutoSerializer().serialize(pd.DataFrame({"a": [1, 2, 3]}))
+        assert meta.original_type == "arrow"
+        meta.original_type = "msgpack"
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            AutoSerializer().deserialize(data, meta)
+
+    def test_the_echoed_envelope_format_is_length_bounded(self) -> None:
+        """``format`` is attacker-written and was echoed raw into the exception: a 200 KB field
+        produced a 200,092-char message. The read path re-raises SerializationError unwrapped,
+        so ``bounded_error`` never clips it — the cap has to be at the echo site, as
+        ``_column_values`` already does for its own untrusted marker."""
+        s = _no_arrow()
+        data, meta = s.serialize({"a": 1})
+        meta.original_type = None
+        envelope = msgpack.unpackb(data)
+        envelope[3] = "A" * 200_000
+
+        with pytest.raises(SerializationError) as exc_info:
+            s.deserialize(msgpack.packb(envelope), meta)
+        assert len(str(exc_info.value)) < 200, f"echo not bounded: {len(str(exc_info.value))} chars"
 
     def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
         """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
