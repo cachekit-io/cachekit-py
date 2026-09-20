@@ -337,7 +337,7 @@ class TestCorruptFrameHeaderEvicts:
 
     @pytest.fixture
     def enc_handler(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[CacheSerializationHandler]:
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)  # test-only placeholder, not a secret
         yield CacheSerializationHandler(
             serializer_name="default",
             encryption=True,

@@ -1080,7 +1080,7 @@ class CacheSerializationHandler:
             try:
                 serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
                 metadata = SerializationMetadata.from_dict(metadata_dict)
-            except Exception as e:
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
                 raise SerializationError(f"Corrupt cache envelope: {bounded_error(e)}") from e
 
             # Get base serializer
