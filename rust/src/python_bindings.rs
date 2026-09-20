@@ -21,8 +21,9 @@ pyo3::create_exception!(
      \n\
      Distinguishes a verified-but-corrupt envelope (this exception) from bytes that were never\n\
      a ByteStorage envelope at all (`DeserializationFailed`, e.g. written with integrity\n\
-     checking off) — the latter stays a plain `ValueError` so callers keep falling through to\n\
-     the plain-msgpack/NumPy decode paths for it, while this one must fail closed.\n\
+     checking off) — the latter stays a plain `ValueError`. Whether a caller may fall through\n\
+     on that `ValueError` is the caller's contract (`AutoSerializer.deserialize` does so only\n\
+     for a metadata-less direct call); this exception must always fail closed.\n\
      \n\
      Subclasses ValueError so existing `pytest.raises(ValueError)` assertions on `retrieve()`\n\
      failures stay valid. `AutoSerializer.deserialize` catches this specifically and re-raises\n\
