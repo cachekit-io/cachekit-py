@@ -23,7 +23,7 @@ from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHand
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import EncryptionError
-from cachekit.serializers.wrapper import _PREFIX_LEN
+from cachekit.serializers.wrapper import _PREFIX_LEN, SerializationWrapper
 
 
 @pytest.mark.unit
@@ -390,6 +390,28 @@ class TestCorruptFrameHeaderEvicts:
         assert handler.get_cached_value(self.KEY) is None
         mock_ch.delete.assert_called_once_with(self.KEY)
         assert len(calls) == 1 and isinstance(calls[0][0], SerializationError)
+
+    def test_parser_fault_outside_the_narrowed_catch_still_evicts(self, plain_handler: CacheSerializationHandler) -> None:
+        """The inner catch lists only (AttributeError, KeyError, TypeError, ValueError).
+
+        Anything else a parser raises must still reach SerializationError via the outer arm,
+        or narrowing that tuple would silently restore the no-eviction bug this ticket fixes.
+        Raised through a patched parser rather than crafted bytes on purpose: no header the
+        CPython JSON scanner accepts produces a non-ValueError on 3.12-3.14, so bytes cannot
+        pin this invariant without depending on interpreter internals.
+        """
+        blob = plain_handler.serialize_data({"k": "v"}, cache_key=self.KEY)
+        handler = CacheOperationHandler(plain_handler, CacheKeyGenerator())
+        mock_ch = mock.MagicMock()
+        mock_ch.get.return_value = blob
+        handler.set_cache_handler(mock_ch)
+
+        with mock.patch.object(SerializationWrapper, "unwrap", side_effect=RecursionError("parser blew the stack")):
+            with pytest.raises(SerializationError):
+                plain_handler.deserialize_data(blob, cache_key=self.KEY)
+            assert handler.get_cached_value(self.KEY) is None
+
+        mock_ch.delete.assert_called_once_with(self.KEY)
 
     def test_missing_cache_key_on_encrypted_entry_still_fails_closed_without_evicting(
         self, enc_handler: CacheSerializationHandler
