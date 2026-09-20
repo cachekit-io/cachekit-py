@@ -198,6 +198,14 @@ Set **exactly one** of the prefixed selectors below. Two or more produces a
 raised, so the symptom is a function that silently never caches. There is no precedence
 between them. Only the bare `REDIS_URL` fallback may coexist with a prefixed selector.
 
+That log line is the only signal you get, so watch for it at `WARNING` on the
+`cachekit.decorators.orchestrator` logger — it repeats on every call, and the
+misconfiguration never self-heals:
+
+```text
+Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
+```
+
 ```bash
 # Pick ONE prefixed selector:
 CACHEKIT_REDIS_URL=redis://prod.example.com:6379   # Redis
