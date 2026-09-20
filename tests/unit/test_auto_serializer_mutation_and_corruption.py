@@ -371,6 +371,38 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
+    @pytest.mark.parametrize("header", [None, "arrow"], ids=["no-metadata", "header-arrow"])
+    def test_integrity_off_reader_never_returns_a_healthy_envelope_as_the_value(self, header: str | None) -> None:
+        """An integrity-OFF reader builds no ByteStorage, so the whole retrieve() block is skipped
+        and ``envelope_error`` stays None. Gating the shape check on ``envelope_error`` alone
+        therefore never ran it for that reader, and a HEALTHY, uncorrupted envelope — no rot, no
+        forgery — came back as its four fields, payload in plaintext at slot 0. Two entrances:
+        no metadata at all, and a header claiming ``"arrow"`` (which a since-reverted exemption
+        let skip the only raise on the metadata path). Both must raise."""
+        import copy
+
+        writer = AutoSerializer(enable_integrity_checking=True)
+        reader = AutoSerializer(enable_integrity_checking=False)
+        data, meta = writer.serialize({"token": "secret"})
+        if header is None:
+            metadata = None
+        else:
+            metadata = copy.copy(meta)
+            metadata.original_type = header
+
+        with pytest.raises(SerializationError):
+            reader.deserialize(data, metadata)
+
+    def test_forged_numpy_dtype_echo_is_bounded(self) -> None:
+        """The numpy decode's own re-raise quotes the forged dtype verbatim; every other read-path
+        wrap was bounded while this sibling echoed 65 KB. Bare route, no checksum, integrity-off
+        reader — the shortest path to the raise."""
+        raw = b"NUMPY_RAW" + (65_000).to_bytes(2, "little") + b"z" * 65_000 + (0).to_bytes(2, "little")
+
+        with pytest.raises(SerializationError) as exc_info:
+            AutoSerializer(enable_integrity_checking=False).deserialize(raw)
+        assert len(str(exc_info.value)) < ERROR_ECHO_MAX + 200, f"numpy dtype echo not bounded: {len(str(exc_info.value))}"
+
     @pytest.mark.parametrize("slot, bad", [(0, "notbytes"), (1, "AAAA"), (2, "x"), (3, 42), (3, "seriez"), (3, ["a"])])
     def test_metadata_absent_read_of_a_rotted_envelope_never_returns_the_envelope_itself(self, slot: int, bad: object) -> None:
         """``deserialize(data)`` with no metadata on an envelope whose checksum / size / format slot

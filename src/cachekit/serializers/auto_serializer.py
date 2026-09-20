@@ -644,7 +644,10 @@ class AutoSerializer:
                 ``docs/error-codes.md``.
 
                 With integrity checking OFF the reader builds no ByteStorage, so no envelope is
-                verified — that is what ``@cache.minimal`` chooses. It is not a blanket "nothing
+                verified — that is what ``@cache.minimal`` chooses — and the envelope-shape
+                rejection above applies to its metadata-less reads too, because "nobody ran
+                retrieve()" vouches for a decode no more than "retrieve() failed" does; without
+                it a HEALTHY envelope came back as its four fields. It is not a blanket "nothing
                 is verified": :class:`ArrowSerializer` is constructed regardless of this flag and
                 always writes and checks its own checksum, which is why an intact Arrow entry
                 whose header lost ``original_type`` still decodes on an integrity-off reader
@@ -690,10 +693,11 @@ class AutoSerializer:
             # From here down (dataframe, series, generic msgpack) metadata.compressed records whether
             # the writer enveloped the entry — numpy/arrow routed out above, their flag means codec.
             # An integrity-off reader cannot verify or unwrap it: fail closed (see Raises: above).
-            # Arrow is excluded: ArrowSerializer checksums unconditionally, so a corrupt Arrow entry
-            # was never "written with integrity checking on" in any sense this reader can act on,
-            # and this message would route an operator to flip a setting that cannot fix it.
-            if metadata.compressed and not self.enable_integrity_checking and header_format != "arrow":
+            # No exemption for header "arrow": excluding it skipped the ONLY raise on this path and an
+            # integrity-off reader then handed back an envelope's fields as the value. A corrupt Arrow
+            # entry reaching here reports this config message rather than its own checksum failure —
+            # that imprecision is the accepted cost of not adding a variation to this gate.
+            if metadata.compressed and not self.enable_integrity_checking:
                 raise SerializationError(
                     "Cache entry was written with integrity checking on but this reader has "
                     f"integrity checking disabled (format={header_format!r:.40})"
@@ -774,8 +778,13 @@ class AutoSerializer:
         # one (a rotted checksum or size slot) and no metadata forced the fail-closed gate above,
         # this decode succeeds and would hand back those four slots — compressed payload in
         # slot 0 — as the cached value. That shape is an envelope, not a value: reject it.
-        if envelope_error is not None and self._looks_like_envelope(value):
-            raise self._envelope_failure(envelope_error) from envelope_error
+        # With integrity checking OFF the block above is skipped and envelope_error is always
+        # None, so gating on it alone let an integrity-off reader hand back a HEALTHY envelope's
+        # four fields — payload in plaintext at slot 0 — for a metadata-less read. The condition
+        # is "no verification vouched for this decode": retrieve() failed, or nobody ran it.
+        if (envelope_error is not None or metadata is None) and self._looks_like_envelope(value):
+            cause = envelope_error if envelope_error is not None else "decoded to an envelope that no reader verified"
+            raise self._envelope_failure(cause) from envelope_error
         return value
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
@@ -882,7 +891,7 @@ class AutoSerializer:
             # TypeError: np.frombuffer on a forged dtype string; SyntaxError: numpy's comma-string
             # dtype parser runs ast.literal_eval on a forged shape prefix such as "(1,f8";
             # UnicodeDecodeError is a ValueError.
-            raise SerializationError(f"Failed to deserialize NumPy array: {e}") from e
+            raise SerializationError(f"Failed to deserialize NumPy array: {bounded_error(e)}") from e
 
     def _serialize_dataframe(self, df: pd.DataFrame) -> bytes:
         """Serialize DataFrame with column-wise optimization.
