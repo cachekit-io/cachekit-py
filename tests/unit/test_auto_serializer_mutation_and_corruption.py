@@ -466,16 +466,47 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         ],
         ids=["3of4-label", "4of4-png-series", "3of4-unknown-format", "4of4-minimal-msgpack"],
     )
-    def test_a_value_shaped_exactly_like_an_envelope_still_decodes(self, value: list) -> None:
-        """The other half of the entrance fix, and the reason it is a parse and not a threshold.
-        Two of these score a perfect 4/4 on ``_looks_like_envelope`` — by shape they ARE
-        envelopes — so no score, at any threshold, separates them from a real one. They differ
-        only in that no checksum vouches for them, which is exactly what ``retrieve()`` asks.
-        If someone later replaces the parse with a cleverer score, these rows fail."""
+    def test_a_value_shaped_exactly_like_an_envelope_is_deliberately_refused(self, value: list) -> None:
+        """**This refusal is a chosen cost, not a bug — do not "fix" it without reading Raises:.**
+
+        Two of these score a perfect 4/4 on ``_looks_like_envelope``; by shape they ARE envelopes.
+        A parse does not rescue them either: a legitimate 4/4 list parses as a ``StorageEnvelope``
+        and then fails the checksum, byte-indistinguishable from a rotted one. So the read either
+        refuses these or returns rotted envelopes, and the trilemma table in ``deserialize``'s
+        Raises: records that both alternatives were measured at all three corners.
+
+        This corner was taken because the refusal is a deterministic miss that recomputes the right
+        answer, while the alternative hands the caller a corrupted envelope's compressed payload as
+        their object. An earlier round asserted the opposite here — ``== value`` — which pinned a
+        94% rot-escape rate as intent. If this test starts failing, the rot leak is back."""
         s = _no_arrow(enable_integrity_checking=False)
         data, meta = s.serialize(value)
-        assert s.deserialize(data, meta) == value
-        assert s.deserialize(data, None) == value
+        for metadata in (meta, None):
+            with pytest.raises(SerializationError, match="envelope verification"):
+                s.deserialize(data, metadata)
+
+    def test_no_single_byte_rot_of_an_envelope_is_ever_returned_to_an_integrity_off_reader(self) -> None:
+        """A sweep, because the parametrised rows above cannot show a RATE. Every single-byte
+        substitution of a healthy envelope, read by the integrity-off reader with no metadata:
+        none may come back as a value. A round that gated the rejection behind a re-parse scored
+        271 of 391 here — the parse fails on exactly the corruption it was meant to catch — and
+        the suite stayed green because nothing swept this arm."""
+        s = AutoSerializer(enable_integrity_checking=False)
+        data, _ = AutoSerializer().serialize({"admin": False, "user": "alice", "n": 12345})
+
+        returned = []
+        for i in range(len(data)):
+            for byte in (0x00, 0x01, 0x41, 0x7F, 0x80, 0xC0, 0xDA, 0xFF):
+                if data[i] == byte:
+                    continue
+                mutant = bytearray(data)
+                mutant[i] = byte
+                try:
+                    s.deserialize(bytes(mutant), None)
+                except Exception:
+                    continue
+                returned.append((i, byte))
+        assert not returned, f"{len(returned)} single-byte rots returned a value, e.g. {returned[:3]}"
 
     def test_forged_numpy_dtype_echo_is_bounded(self) -> None:
         """The numpy decode's own re-raise quotes the forged dtype verbatim; every other read-path
@@ -487,8 +518,11 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
             AutoSerializer(enable_integrity_checking=False).deserialize(raw)
         assert len(str(exc_info.value)) < ERROR_ECHO_MAX + 200, f"numpy dtype echo not bounded: {len(str(exc_info.value))}"
 
+    @pytest.mark.parametrize("reader_integrity", [True, False], ids=["reader-on", "reader-off"])
     @pytest.mark.parametrize("slot, bad", [(0, "notbytes"), (1, "AAAA"), (2, "x"), (3, 42), (3, "seriez"), (3, ["a"])])
-    def test_metadata_absent_read_of_a_rotted_envelope_never_returns_the_envelope_itself(self, slot: int, bad: object) -> None:
+    def test_metadata_absent_read_of_a_rotted_envelope_never_returns_the_envelope_itself(
+        self, slot: int, bad: object, reader_integrity: bool
+    ) -> None:
         """``deserialize(data)`` with no metadata on an envelope whose checksum / size / format slot
         rotted: ``retrieve()`` cannot parse it, and — because an envelope is itself valid msgpack —
         the plain-msgpack fall-through then returned ``[compressed_payload, checksum, size, fmt]``
@@ -496,13 +530,13 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         verified-envelope branch was written to close. Every slot, because a shape test keyed on
         the format alone waved ``42`` through and one keyed on the checksum waved ``"AAAA"``
         through: the envelope is recognised by whichever invariant slot survived."""
-        s = AutoSerializer()
-        data, _ = s.serialize({"field": "value"})
+        data, _ = AutoSerializer().serialize({"field": "value"})
         envelope = list(msgpack.unpackb(data))
         envelope[slot] = bad
+        reader = AutoSerializer(enable_integrity_checking=reader_integrity)
 
         with pytest.raises(SerializationError, match="envelope verification"):
-            s.deserialize(msgpack.packb(envelope))
+            reader.deserialize(msgpack.packb(envelope))
 
     @pytest.mark.parametrize("claim", ["msgpack", "arrow"])  # measured: every non-numpy claim takes one branch
     @pytest.mark.parametrize("writer_integrity", [True, False], ids=["checksummed", "bare"])

@@ -494,9 +494,8 @@ class AutoSerializer:
         self.default_format = default_format
         self.enable_integrity_checking = enable_integrity_checking
 
-        # Unconditional: writes still gate on enable_integrity_checking, but an integrity-OFF
-        # READER needs it to ask whether its decode parses as an envelope (_parses_as_envelope).
-        self._byte_storage = ByteStorage(default_format)
+        if self.enable_integrity_checking:
+            self._byte_storage = ByteStorage(default_format)
 
         # Initialize ArrowSerializer for fast DataFrame serialization (if available)
         if HAS_ARROW_SERIALIZER:
@@ -631,14 +630,29 @@ class AutoSerializer:
                 verification happens.
 
                 An integrity-OFF reader runs no ``retrieve()`` at all, so nothing vouched for its
-                decode — **with metadata or without**; saying the metadata-less call was the only
-                remaining fall-through described 0.01% of the traffic through this door. A
-                ByteStorage envelope is itself valid msgpack (``[bytes, [8 ints], int, format]``),
-                so that reader handed a HEALTHY envelope decodes it to those four slots, plaintext
-                payload in slot 0, and would return them as the value. Both entrances close the
-                same way: re-parse the bytes through ``ByteStorage`` and raise if they VERIFY
-                (:meth:`_parses_as_envelope`). Shape cannot make that call — values a caller
-                legitimately cached score a perfect 4/4 — so it only pre-filters; the parse decides.
+                decode — **with metadata or without**, not only on the metadata-less call. Both
+                entrances close on :meth:`_looks_like_envelope`.
+
+                **That is a deliberately chosen corner, not a solved problem.** Every rule trades,
+                measured at each corner:
+
+                ==========================  ========  ========  ============  ==================
+                rule                        healthy   rot       map-encoded   legitimate 3/4-4/4
+                ==========================  ========  ========  ============  ==================
+                shape (this)                reject    reject    **returned**  **refused**
+                shape AND parse             reject    **ret.**  **returned**  accepted
+                parse, rot treated as a hit reject    reject    reject        **refused**
+                ==========================  ========  ========  ============  ==================
+
+                Returning a rotted envelope hands the caller its compressed payload as their
+                object — silent wrong data; refusing an unusual 4-element list is a deterministic
+                miss that recomputes the right answer. A clean failure beats a quiet one, so the
+                permanent refusal is the cost taken. A parse is no escape: a legitimate 4/4 list
+                parses as a ``StorageEnvelope`` and then fails the checksum, byte-indistinguishable
+                from a rotted one. Map-encoded envelopes (``to_vec_named`` or a foreign writer,
+                never this one and never rot) score 0/4 and are returned — this corner's residual.
+                Closing all four needs the writer to mark an envelope AS one: a wire change
+                (LAB-4304), not a read-path rule.
 
                 **Metadata-free reads assume the writer's configuration.** A read with no metadata
                 cannot identify the writer, so it is defined only when reader and writer agree on
@@ -822,19 +836,14 @@ class AutoSerializer:
             ) from msgpack_error
         # A ByteStorage envelope IS valid msgpack — rmp_serde writes StorageEnvelope as
         # [compressed_data, checksum, original_size, format] — so a decode reaching here may be an
-        # envelope rather than a value, and returning it hands back the compressed payload as
-        # slot 0. Measured escapes: 463,095 of 498,015 arrive WITH metadata (integrity-off reader,
-        # `compressed` false or absent) against 49 without, so the metadata-less call is 0.01% of
-        # this door. The arms split on the only thing that differs: whether a parse is possible.
-        if envelope_error is not None:
-            # retrieve() already failed to parse these bytes; the decoded shape is all that is left.
-            if self._looks_like_envelope(value):
-                raise self._envelope_failure(envelope_error) from envelope_error
-        elif self._looks_like_envelope(value) and self._parses_as_envelope(data):
-            # Nothing verified this decode. The parse decides (see _parses_as_envelope); shape may
-            # pre-filter because it is a NECESSARY condition, and does because a bare parse on
-            # every read cost +82% here (1.75 -> 3.18 us/op) — @cache.minimal's whole point.
-            raise self._envelope_failure("decoded to an envelope that no reader verified")
+        # envelope rather than a value, and returning it hands back the compressed payload as slot
+        # 0. Nothing verified this decode: retrieve() failed, or (integrity-off) nobody ran it. One
+        # rule for both, and it is shape, because shape is all that is available on EITHER arm — a
+        # rotted envelope is exactly what a re-parse cannot confirm. See Raises: for which corner
+        # of the trilemma that picks and what it costs.
+        if self._looks_like_envelope(value):
+            cause = envelope_error if envelope_error is not None else "decoded to an envelope that no reader verified"
+            raise self._envelope_failure(cause) from envelope_error
         return value
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
@@ -1065,46 +1074,11 @@ class AutoSerializer:
         end = 8 + len(magic)
         return len(data) > end and data[8:end] == magic and xxhash.xxh3_64_digest(memoryview(data)[8:]) == data[:8]
 
-    def _parses_as_envelope(self, data: bytes) -> bool:
-        """True when ``data`` really is a ByteStorage envelope — it parses AND verifies.
-
-        This is what :meth:`_looks_like_envelope` can only approximate, and the approximation
-        cannot be repaired by moving the threshold. Measured, written integrity-off:
-        ``[b"\x89PNG", [255,0,0,255,0,255,0,255], 4096, "series"]`` and ``[b"x", [1]*8, 0,
-        "msgpack"]`` both score a perfect 4/4 — by shape they ARE envelopes — while a parse
-        rejects both and accepts the healthy envelope. Scoring asks what the bytes look like; the
-        question is whether a checksum vouches for them, and only ``retrieve()`` answers that.
-
-        Any failure means "not an envelope", so the catch is deliberately broad, and a narrower
-        one is a guess at a boundary that does not answer. ``EnvelopeIntegrityError`` subclasses
-        ``ValueError``, so the obvious ``(KeyError, ValueError, TimeoutError)`` narrowing does
-        cover the expected failure — but ``_byte_storage`` is a PyO3 type whose ``retrieve``
-        raises a bare ``TypeError`` for a non-bytes argument, which is not a
-        ``SerializationError`` and escapes ``deserialize`` past every caller's ``except``: the
-        exact shape this predicate replaced. Broad is not total either — PyO3 maps a Rust panic
-        to ``PanicException``, which derives from ``BaseException`` and is not caught here.
-        """
-        try:
-            self._byte_storage.retrieve(data)
-        except Exception as e:
-            # Logged, not swallowed: False here RETURNS the value, so this is the permissive
-            # answer and otherwise the only gate in the decode path that declines without a
-            # record. _looks_like_envelope does NOT make it rare — it accepts 3-of-4, and the
-            # values it says score 4/4 are ones a caller legitimately cached, so a single such
-            # entry logs on EVERY read. Hence isEnabledFor: the argument is evaluated eagerly
-            # whichever formatting style is used, and redact_error_for_log costs 0.34 us against
-            # the 1.75 us/op this path exists to protect. Guarded, 0.06 us.
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Envelope re-parse declined %d bytes: %s", len(data), redact_error_for_log(e))
-            return False
-        return True
-
     @staticmethod
     def _looks_like_envelope(value: object) -> bool:
         """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
-        slot rotted. It DECIDES only on the rot branch, where ``retrieve()`` already failed to
-        parse ``data`` so no parse can speak; on the unverified branch it merely pre-filters for
-        :meth:`_parses_as_envelope`, which decides there. Where it decides, whichever slot broke
+        slot rotted. It decides the whole fall-through, both arms — see ``deserialize``'s Raises:
+        for why a parse cannot help here even though it looks like it should. Whichever slot broke
         the parse is exactly the one that may now look wrong; the other
         THREE identify the envelope, and three is exactly what one rot leaves — so requiring all
         four let a single rotted slot through by construction, not by bad luck. Accepting any ONE
