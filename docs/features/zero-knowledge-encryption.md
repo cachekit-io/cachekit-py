@@ -341,7 +341,7 @@ from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 # A real backend is required — backend=None never serializes, so it never encrypts.
 @cache(
     serializer=EncryptionWrapper(serializer=OrjsonSerializer()),
-    backend=RedisBackend(os.environ.get("REDIS_URL", "redis://localhost:6379")),
+    backend=RedisBackend(os.environ["REDIS_URL"]),
 )
 def get_api_keys(tenant_id: str):
     return {
@@ -368,7 +368,7 @@ from cachekit.serializers import EncryptionWrapper, ArrowSerializer
 # A real backend is required — backend=None never serializes, so it never encrypts.
 @cache(
     serializer=EncryptionWrapper(serializer=ArrowSerializer()),
-    backend=RedisBackend(os.environ.get("REDIS_URL", "redis://localhost:6379")),
+    backend=RedisBackend(os.environ["REDIS_URL"]),
 )
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined

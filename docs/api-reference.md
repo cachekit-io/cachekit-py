@@ -20,8 +20,6 @@
 The `@cache` decorator provides intelligent configuration selection based on function analysis or explicit intent.
 
 ```python notest
-import os
-
 from cachekit import cache
 from cachekit.backends.redis import RedisBackend
 
@@ -36,7 +34,8 @@ def expensive_function():
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
 # Security-critical: PII, medical, financial. Encryption REQUIRES a real backend —
 # backend=None is L1-only mode, which stores live plaintext objects and never encrypts.
-@cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
+# The key is read from CACHEKIT_MASTER_KEY; absent it, decoration raises ValueError.
+@cache.secure(backend=RedisBackend("redis://localhost:6379"))
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)

@@ -42,8 +42,9 @@ def get_api_keys(tenant_id: str):
         "tenant_id": tenant_id
     }
 
-# Encrypted MessagePack (default - use @cache.secure preset)
-@cache.secure(master_key=bytes.fromhex(os.environ["CACHEKIT_MASTER_KEY"]), backend=RedisBackend("redis://localhost:6379"))
+# Encrypted MessagePack (default - use @cache.secure preset).
+# Note the asymmetry: @cache.secure takes the hex STRING, EncryptionWrapper takes raw bytes.
+@cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
