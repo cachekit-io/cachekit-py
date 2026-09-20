@@ -9,9 +9,10 @@
 Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. The backend never sees plaintext values. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
+import os
 from cachekit.backends.redis import RedisBackend
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # AES-256-GCM before it leaves the process
 ```
@@ -38,12 +39,14 @@ Enable encryption with single decorator:
 from cachekit import cache
 from cachekit.backends.redis import RedisBackend
 
-# Set master key (hex-encoded)
 import os
-os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes
+
+# The key comes from the environment, never from source.
+# Generate once and store it in your secret manager:
+#   export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 # A backend is required for encryption — see the warning above on backend=None
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_sensitive_data(user_id):
     return db.query(SensitiveData).filter_by(id=user_id).first()  # illustrative - db not defined
 
@@ -203,11 +206,13 @@ Python object (plaintext, in-app only)
 
 **Mitigation**: Use standard @cache for non-sensitive data:
 ```python notest
+from cachekit.backends.redis import RedisBackend
+import os
 @cache(ttl=300, backend=None)  # No encryption, faster
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))  # Encryption, slower
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))  # Encryption, slower
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # illustrative - db not defined
 ```
@@ -290,7 +295,9 @@ redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
 ### L1 Cache Conflict
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
+from cachekit.backends.redis import RedisBackend
+import os
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_sensitive_data():
     # WITH a backend, L1 stores encrypted bytes (~50ns hits vs 2-7ms Redis)
     # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
@@ -310,10 +317,11 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
 ```python notest
+import os
 from cachekit import cache
 from cachekit.backends.redis import RedisBackend
 
-@cache.secure(ttl=3600, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
+@cache.secure(ttl=3600, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_user_profile(user_id):
     return db.get_profile(user_id)  # illustrative - db not defined
 
@@ -361,6 +369,7 @@ df = get_patient_records(42)
 
 ### Multi-Tenant Isolation
 ```python notest
+import os
 from cachekit import cache
 from contextvars import ContextVar
 
@@ -368,7 +377,7 @@ tenant_context = ContextVar("tenant_id")
 
 @cache.secure(
     ttl=3600,
-    master_key="a" * 64,
+    master_key=os.environ["CACHEKIT_MASTER_KEY"],
     tenant_extractor=lambda user_id: tenant_context.get(),
     backend=None
 )
@@ -561,13 +570,14 @@ export CACHEKIT_ENCRYPTION_FAIL_CLOSED=1
 ```
 
 ```python notest
+import os
 # Per-function (overrides the env setting in either direction)
-@cache.secure(master_key="a" * 64, fail_closed=True)
+@cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], fail_closed=True)
 def get_payment_token(user_id: int): ...
 
 # Or via explicit EncryptionConfig
 from cachekit.config.nested import EncryptionConfig
-config = EncryptionConfig(enabled=True, master_key="a" * 64,
+config = EncryptionConfig(enabled=True, master_key=os.environ["CACHEKIT_MASTER_KEY"],
                           single_tenant_mode=True, fail_closed=True)
 ```
 
@@ -676,7 +686,9 @@ Cached after first use: No additional overhead
 
 **Encryption + Circuit Breaker**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))  # Both enabled
+from cachekit.backends.redis import RedisBackend
+import os
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))  # Both enabled
 def get_data():
     # Decryption error → Circuit breaker catches
     # Encryption happens before circuit breaker (at write time)
@@ -685,7 +697,9 @@ def get_data():
 
 **Encryption + L1 Cache**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
+from cachekit.backends.redis import RedisBackend
+import os
+@cache.secure(ttl=300, master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
     # No plaintext at rest in L1 or L2 — decryption only at read time (< 1ms exposure).

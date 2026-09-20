@@ -593,9 +593,14 @@ def create_cache_wrapper(
 
     validate_encryption_config(encryption, master_key=master_key)
 
-    # Note: L1 cache + encryption is supported.
-    # L1 stores encrypted bytes (not plaintext), decryption happens at read time only.
-    # This maintains security while enabling sub-microsecond cache hits.
+    # Note: L1 cache + encryption is supported WHEN A BACKEND IS CONFIGURED.
+    # L1 then stores encrypted bytes (not plaintext), decryption happens at read time
+    # only, which maintains security while enabling sub-microsecond cache hits.
+    # NOT so under _l1_only_mode (backend=None): that path stores raw Python object
+    # references via ObjectCache and never serializes, so the encryption layer is never
+    # reached and master_key goes unused. Documented in
+    # docs/features/zero-knowledge-encryption.md; a decoration-time guard is tracked
+    # separately (compare the interop guard above, which rejects the same combination).
 
     # Initialize feature orchestrator using EXISTING reliability/monitoring modules
     # Convert CircuitBreakerConfig to dict if provided
