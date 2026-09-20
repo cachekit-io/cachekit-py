@@ -251,11 +251,11 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="integrity checking disabled"):
             off.deserialize(data, meta)
 
-    def test_verified_envelope_format_comes_from_the_envelope_not_the_header(self) -> None:
-        """``metadata.original_type`` is a plaintext-header field. With it None (one flipped
-        header byte), the former ``hasattr(...) else format_id`` never reached ``format_id``
-        and a checksum-verified Series envelope decoded as a dict — an unauthenticated field
-        silently overriding the authenticated one. The envelope's own format record wins."""
+    def test_absent_header_format_leaves_the_envelope_record_in_charge(self) -> None:
+        """With ``metadata.original_type`` None (one flipped header byte), the former
+        ``hasattr(...) else format_id`` never reached ``format_id`` and a checksum-verified
+        Series envelope decoded as a dict. An absent header claim is not a disagreement, so
+        the envelope's own record still decides and the Series comes back."""
         s = AutoSerializer()
         series = pd.Series([1.0, 2.0, 3.0], name="v")
         data, meta = s.serialize(series)
@@ -265,11 +265,80 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         assert isinstance(out, pd.Series)
         pd.testing.assert_series_equal(out, series)
 
+    @pytest.mark.parametrize(
+        ("stored", "lying_header"),
+        [
+            (pd.Series([1.0, 2.0], name="v"), "dataframe"),
+            (pd.Series([1.0, 2.0], name="v"), "msgpack"),
+            ({"a": 1}, "dataframe"),
+            ({"a": 1}, "series"),
+        ],
+    )
+    def test_a_lying_header_format_fails_closed_rather_than_steering_the_decode(self, stored: object, lying_header: str) -> None:
+        """A LYING header, not merely an absent one — absence is the weak case, a wrong value
+        is the interesting one. The header used to route the columnar decode outright, so a
+        msgpack dict under a rotted ``"dataframe"`` header came back as a DataFrame (type
+        confusion) and an intact DataFrame under a rotted ``"series"`` header raised a decode
+        error on healthy data. Neither field is checksum-covered, so a disagreement between
+        them is corruption: raise, never decode as either."""
+        s = _no_arrow()  # columnar msgpack path, not Arrow IPC
+        data, meta = s.serialize(stored)
+        assert meta.original_type != lying_header
+        meta.original_type = lying_header
+
+        with pytest.raises(SerializationError, match="disagrees with header format"):
+            s.deserialize(data, meta)
+
+    def test_an_unknown_envelope_format_fails_closed_rather_than_decoding_as_msgpack(self) -> None:
+        """The envelope's ``format`` record sits outside the xxHash3-64 (which covers the
+        payload bytes only), so bit rot reaches it on a checksum-verified entry. Rotted to an
+        unknown value it used to miss every branch and fall to ``unpackb_bounded``, handing
+        back a dict for a verified Series. Only formats this writer can emit are decodable."""
+        s = _no_arrow()
+        data, meta = s.serialize(pd.Series([1.0, 2.0], name="v"))
+        envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]
+        envelope[3] = "seriez"
+        meta.original_type = None  # no header claim left to catch it
+
+        with pytest.raises(SerializationError, match="unknown envelope format"):
+            s.deserialize(msgpack.packb(envelope), meta)
+
+    def test_a_flipped_envelope_format_cannot_silently_change_the_returned_type(self) -> None:
+        """The mirror of the lying-header case: rewrite the envelope's own record instead.
+        Series -> ``"msgpack"`` is whitelisted, so the whitelist alone still returns a dict
+        for a checksum-verified Series; the header's surviving claim is what catches it."""
+        s = _no_arrow()
+        series = pd.Series([10.0, 20.0], name="v")
+        data, meta = s.serialize(series)
+        assert meta.original_type == "series"
+        envelope = msgpack.unpackb(data)
+        envelope[3] = "msgpack"
+
+        with pytest.raises(SerializationError, match="disagrees with header format"):
+            s.deserialize(msgpack.packb(envelope), meta)
+
+    def test_an_arrow_entry_with_a_degraded_header_still_decodes_via_its_own_checksum(self) -> None:
+        """Arrow IPC never parses as a ByteStorage envelope, so an Arrow read that carries
+        metadata always has ``envelope_error`` set. When the metadata fail-closed gate sat
+        ABOVE the structural ARROW1 checks it swallowed those reads: an Arrow entry whose
+        header lost ``original_type`` raised instead of reaching ArrowSerializer, which
+        verifies its own xxHash3-64 and would have caught real corruption itself."""
+        pytest.importorskip("pyarrow")
+        s = AutoSerializer()
+        frame = pd.DataFrame({"a": [1, 2, 3]})
+        data, meta = s.serialize(frame)
+        assert meta.original_type == "arrow", "this test needs the ArrowSerializer path"
+        meta.original_type = None
+        meta.compressed = False
+
+        _assert_equal(s.deserialize(data, meta), frame)
+
     def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
         """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
-        CK-header byte outside any authentication tag. Flipping it False on a structurally
-        corrupt integrity-on envelope let the generic path decode the envelope itself and
-        return its four positional fields as the cached value. The gate must not consult it."""
+        CK-header field. Flipping it False on a structurally corrupt integrity-on envelope
+        let the generic path decode the envelope itself and return its four positional fields
+        as the cached value. The gate must not consult it: an unauthenticated field may gate a
+        raise, never a decode."""
         s = AutoSerializer()
         data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
         envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]

@@ -334,6 +334,8 @@ def get_data():
 
 **Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see E003 above.
 
+One specific cause worth naming: `... envelope format 'X' disagrees with header format 'Y'` or `... unknown envelope format 'X'`. The stored format is recorded twice — once inside the ByteStorage envelope, once in the plaintext CK header — and the checksum covers neither (it covers the payload bytes only). Rather than letting either copy override the other, `AutoSerializer` decodes only a format it could have written and only when both copies agree; a disagreement is read as corruption and the entry is evicted and recomputed. Bit rot in a single field therefore produces a clean miss instead of a silently wrong Python type.
+
 **What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see E003 above.)
 
 **Solution**:

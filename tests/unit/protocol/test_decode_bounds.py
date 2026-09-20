@@ -46,8 +46,8 @@ PEAK_BUDGET = 2 * 1024 * 1024
 PEAK_PER_INPUT_BYTE = 4
 
 
-def _envelope(payload: bytes) -> bytes:
-    return bytes(ByteStorage("msgpack").store(payload, "msgpack"))
+def _envelope(payload: bytes, format_id: str = "msgpack") -> bytes:
+    return bytes(ByteStorage("msgpack").store(payload, format_id))
 
 
 CACHE_KEY = "ns:decode:bounds"
@@ -245,6 +245,23 @@ class TestOwnedBounds:
         # bare ValueError. The message match keeps a "Serializer mismatch" error from faking a pass.
         metadata, serializer_name = _frame_template("auto")
         bomb = _reject_vector("nested_array32_input_len_depth_1100")
-        frame = SerializationWrapper.wrap(_envelope(bomb), {**metadata, "original_type": original_type}, serializer_name)
+        # The envelope carries the SAME format as the header: this test is about the decode bound,
+        # not about format disagreement (which fails closed earlier — see the test below). Tagging
+        # the envelope "msgpack" under a columnar header made this an accidental disagreement case.
+        frame = SerializationWrapper.wrap(
+            _envelope(bomb, original_type), {**metadata, "original_type": original_type}, serializer_name
+        )
         with pytest.raises(SerializationError, match=f"failed to decode as {original_type}"):
+            CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
+
+    @pytest.mark.parametrize("original_type", ["dataframe", "series"])
+    def test_envelope_format_disagreeing_with_the_header_is_a_controlled_miss(self, original_type: str) -> None:
+        # Neither the envelope's `format` record nor the header's original_type is covered by the
+        # xxHash3-64, so neither may override the other: a disagreement is corruption and must reach
+        # the handler as SerializationError (evict + tamper hook), never as a decoded value.
+        metadata, serializer_name = _frame_template("auto")
+        frame = SerializationWrapper.wrap(
+            _envelope(msgpack.packb({"t": 1})), {**metadata, "original_type": original_type}, serializer_name
+        )
+        with pytest.raises(SerializationError, match="disagrees with header format"):
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
