@@ -993,7 +993,7 @@ class AutoSerializer:
         return len(data) > end and data[8:end] == magic and xxhash.xxh3_64_digest(memoryview(data)[8:]) == data[:8]
 
     @staticmethod
-    def _looks_like_envelope(value: Any) -> bool:
+    def _looks_like_envelope(value: object) -> bool:
         """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
         slot rotted. Only consulted after ``retrieve()`` already failed to parse ``data``, so
         whichever slot broke the parse is exactly the one that may now look wrong; the envelope

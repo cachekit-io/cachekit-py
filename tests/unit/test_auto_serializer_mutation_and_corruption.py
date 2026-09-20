@@ -381,7 +381,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         the format alone waved ``42`` through and one keyed on the checksum waved ``"AAAA"``
         through: the envelope is recognised by whichever invariant slot survived."""
         s = AutoSerializer()
-        data, _ = s.serialize({"token": "secret"})
+        data, _ = s.serialize({"field": "value"})
         envelope = list(msgpack.unpackb(data))
         envelope[slot] = bad
 
