@@ -50,11 +50,17 @@ def get_settings() -> CachekitConfig:
     instance = _settings_instance
     if instance is not None:
         # Self-heal the keyless-then-key-set ordering trap (#195): if the config was first built
-        # before CACHEKIT_MASTER_KEY entered the environment (e.g. an import-time cache decorator
-        # evaluated before the app loaded its secrets), it froze master_key=None — encryption would
-        # then silently never activate. Re-read once the key appears, so it turns on without an
-        # explicit reset_settings(). Idempotent: after the rebuild master_key is set, so this never
-        # fires again (no per-call churn once a key is present).
+        # before CACHEKIT_MASTER_KEY entered the environment, it froze master_key=None. Re-read
+        # once the key appears, so a LATER settings consumer sees it without an explicit
+        # reset_settings(). Idempotent: after the rebuild master_key is set, so this never fires
+        # again (no per-call churn once a key is present).
+        #
+        # SCOPE: this heals the settings singleton, NOT an already-decorated function. A cache
+        # decorator evaluated at import time builds its CacheSerializationHandler there, and that
+        # handler freezes encryption=False once (cache_handler.py, the `if encryption is None`
+        # auto-detect); no later settings re-read flips it. A key loaded after import (dotenv in
+        # main(), a vault startup hook) therefore leaves those functions caching PLAINTEXT — see
+        # docs/features/zero-knowledge-encryption.md, "Which Path".
         if instance.master_key is None and os.environ.get("CACHEKIT_MASTER_KEY"):
             with _settings_lock:
                 # Re-read the global under the lock: a peer may have rebuilt it (key now set) or

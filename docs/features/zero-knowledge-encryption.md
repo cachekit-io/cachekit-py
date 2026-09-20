@@ -51,7 +51,7 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
 | Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
 | Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
-| Backend SWR (`stale_ttl`) | Off unless requested (L1 SWR on in both) | On by default (`stale_ttl` sized from `ttl`); the refresh runs the function on a background thread after the response has been served, so it must not depend on request-scoped resources (a per-request DB session). `stale_ttl=0` opts out |
+| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function after the response has been served — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not depend on request-scoped resources (a per-request DB session). `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
 constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
@@ -80,18 +80,11 @@ canonical statement.
 > is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
 > (2) a backend misconfiguration at first call (e.g. two auto-detect selectors set
 > at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
-> `client_creation` failure and the function runs **uncached on every call**.
+> `client_creation` failure and the function runs **uncached on every call**,
+> L1 included — that early return sits upstream of the L1 lookup.
 > Alert on `client_creation` failures. When the SaaS is the requirement, pass
 > `backend=CachekitIOBackend()` explicitly — auditable in code and immune to
 > environment drift.
->
-> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
-> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
-> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
-> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
-> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
-> key-mismatched entries (miss + recompute) unless you opt in. See
-> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ```python notest
 from cachekit import cache
@@ -108,6 +101,15 @@ def get_patient_record(patient_id: str):
 def get_dashboard_stats(org_id: str):
     return compute_stats(org_id)  # illustrative
 ```
+
+> [!IMPORTANT]
+> **Two separate fail-closed guarantees — don't conflate them.** `.secure` is
+> fail-closed on a *missing key* (decoration-time `ValueError`). But `fail_closed`
+> on a *decrypt failure* (e.g. an AES-GCM auth-tag mismatch at read time) is a
+> separate tri-state setting that defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which **defaults to `False`** — so even `.secure` fails *open* on tampered or
+> key-mismatched entries (miss + recompute) unless you opt in. See
+> [Corruption vs Tamper: Telemetry and Fail-Closed Mode](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ---
 
@@ -728,7 +730,7 @@ export default {
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
 - ✅ Multi-tenant isolation (per-tenant encryption keys)
-- ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key))
+- ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
 ---

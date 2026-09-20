@@ -193,15 +193,19 @@ Call `set_default_backend(None)` to clear the default. Works with any backend (R
 
 ### 3. Environment Variable Auto-Detection (Lowest Priority)
 
+Set **exactly one** of the prefixed selectors below — two or more is a
+`ConfigurationError`, not a precedence order. Only the bare `REDIS_URL` fallback
+may coexist with a prefixed selector.
+
 ```bash
-# Primary: CACHEKIT_REDIS_URL
-CACHEKIT_REDIS_URL=redis://prod.example.com:6379
+# Pick ONE prefixed selector:
+CACHEKIT_REDIS_URL=redis://prod.example.com:6379   # Redis
+# CACHEKIT_API_KEY=ck_live_...                     # managed SaaS (CachekitIO)
+# CACHEKIT_MEMCACHED_SERVERS=cache.example.com:11211
+# CACHEKIT_FILE_CACHE_DIR=/var/cache/cachekit
 
-# Fallback: REDIS_URL
+# Fallback when no prefixed selector is set — never conflicts:
 REDIS_URL=redis://localhost:6379
-
-# Managed SaaS (takes precedence over the Redis selectors)
-CACHEKIT_API_KEY=ck_live_...
 ```
 
 If no explicit backend and no module-level default, cachekit auto-detects a backend from the environment at the function's **first call**.
