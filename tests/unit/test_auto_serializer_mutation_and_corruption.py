@@ -20,6 +20,7 @@ already forces the columnar path.
 
 from __future__ import annotations
 
+import copy
 import functools
 import logging
 from unittest import mock
@@ -32,7 +33,12 @@ from cachekit._rust_serializer import ByteStorage
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, handle_decrypt_failure
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers import AutoSerializer
-from cachekit.serializers.base import ERROR_ECHO_MAX, SerializationError, bounded_error
+from cachekit.serializers.base import (
+    ERROR_ECHO_MAX,
+    SerializationError,
+    SerializationMetadata,
+    bounded_error,
+)
 
 # Requires the [data] extra — absent e.g. in the free-threaded CI lane until
 # numpy/pandas ship free-threaded wheels (LAB-511).
@@ -45,6 +51,14 @@ def _no_arrow(**kwargs: bool) -> AutoSerializer:
     s = AutoSerializer(**kwargs)
     s._arrow_serializer = None
     return s
+
+
+def _meta(base: SerializationMetadata, **overrides: object) -> SerializationMetadata:
+    """A copy of a writer's metadata with fields overridden — a reader's view of the CK header."""
+    clone = copy.copy(base)
+    for key, value in overrides.items():
+        setattr(clone, key, value)
+    return clone
 
 
 def _assert_equal(out: pd.DataFrame | pd.Series, expected: pd.DataFrame | pd.Series) -> None:
@@ -371,27 +385,54 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
-    @pytest.mark.parametrize("header", [None, "arrow"], ids=["no-metadata", "header-arrow"])
-    def test_integrity_off_reader_never_returns_a_healthy_envelope_as_the_value(self, header: str | None) -> None:
+    @pytest.mark.parametrize(
+        "make_metadata",
+        [
+            lambda meta: None,
+            lambda meta: _meta(meta, original_type="arrow"),
+            lambda meta: _meta(meta, compressed=False),
+            lambda meta: SerializationMetadata.from_dict({"format": "msgpack", "original_type": "msgpack"}),
+        ],
+        ids=["no-metadata", "header-arrow", "compressed-false", "compressed-key-absent"],
+    )
+    def test_integrity_off_reader_never_returns_a_healthy_envelope_as_the_value(self, make_metadata) -> None:
         """An integrity-OFF reader builds no ByteStorage, so the whole retrieve() block is skipped
         and ``envelope_error`` stays None. Gating the shape check on ``envelope_error`` alone
         therefore never ran it for that reader, and a HEALTHY, uncorrupted envelope — no rot, no
         forgery — came back as its four fields, payload in plaintext at slot 0. Two entrances:
         no metadata at all, and a header claiming ``"arrow"`` (which a since-reverted exemption
-        let skip the only raise on the metadata path). Both must raise."""
-        import copy
-
+        let skip the only raise on the metadata path). The last two are the dominant entrance:
+        an integrity-off reader that DOES carry metadata, whose ``compressed`` is false or simply
+        absent. The old parametrisation was ``[None, "arrow"]`` and both of those carry
+        ``compressed=True``, so the cross-config gate fired first and this door was never driven —
+        93% of the escapes went through the case the test did not have."""
         writer = AutoSerializer(enable_integrity_checking=True)
         reader = AutoSerializer(enable_integrity_checking=False)
         data, meta = writer.serialize({"token": "secret"})
-        if header is None:
-            metadata = None
-        else:
-            metadata = copy.copy(meta)
-            metadata.original_type = header
 
         with pytest.raises(SerializationError):
-            reader.deserialize(data, metadata)
+            reader.deserialize(data, make_metadata(meta))
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [b"blob", list(range(1, 9)), 42, "label"],
+            [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"],
+            [b"payload", [10] * 8, 7, "not-a-format"],
+            [b"x", [1] * 8, 0, "msgpack"],
+        ],
+        ids=["3of4-label", "4of4-png-series", "3of4-unknown-format", "4of4-minimal-msgpack"],
+    )
+    def test_a_value_shaped_exactly_like_an_envelope_still_decodes(self, value: list) -> None:
+        """The other half of the entrance fix, and the reason it is a parse and not a threshold.
+        Two of these score a perfect 4/4 on ``_looks_like_envelope`` — by shape they ARE
+        envelopes — so no score, at any threshold, separates them from a real one. They differ
+        only in that no checksum vouches for them, which is exactly what ``retrieve()`` asks.
+        If someone later replaces the parse with a cleverer score, these rows fail."""
+        s = _no_arrow(enable_integrity_checking=False)
+        data, meta = s.serialize(value)
+        assert s.deserialize(data, meta) == value
+        assert s.deserialize(data, None) == value
 
     def test_forged_numpy_dtype_echo_is_bounded(self) -> None:
         """The numpy decode's own re-raise quotes the forged dtype verbatim; every other read-path
@@ -681,6 +722,27 @@ class TestForgedEntryErrorEchoIsBounded:
         # it while every other site was bounded. The bound belongs to the read path, not to one
         # function. (That the raw dtype text is huge is proven by bounded_error's own test above.)
         assert len(str(_oversized_forged_error())) < ERROR_ECHO_MAX + 200
+
+    def test_forged_uuid_value_echo_is_bounded(self) -> None:
+        # The object hook's UUID re-raise quoted the cached value verbatim: 200,036 chars from a
+        # 200 KB field. Named by variable, not by the `{e}`/`{cause}` shape an earlier sweep
+        # grepped for, which is how it survived four rounds of "the echo class is now complete".
+        s = _no_arrow(enable_integrity_checking=False)
+        with pytest.raises(SerializationError) as exc:
+            s.deserialize(msgpack.packb({"__uuid__": True, "value": "A" * 200_000}))
+        assert len(str(exc.value)) < ERROR_ECHO_MAX + 200, f"{len(str(exc.value))} chars"
+
+    def test_forged_columnar_dtype_echo_is_bounded_at_the_raise(self) -> None:
+        # Sibling of the same miss, in `_dtype_from_untrusted`. numpy's str() of a forged
+        # structured dtype spec runs ~2x the spec's own size, so the echo grows without limit
+        # with the entry: a 9 KB spec reached 19,373 chars before this bound.
+        from cachekit.serializers.auto_serializer import _dtype_from_untrusted
+
+        spec = [(f"f{i}", [(f"g{j}", "i4") for j in range(10)]) for i in range(10)]
+        for numeric_only in (True, False):
+            with pytest.raises(SerializationError) as exc:
+                _dtype_from_untrusted(spec if numeric_only else "M8[0s]", numeric_only=numeric_only)
+            assert len(str(exc.value)) < ERROR_ECHO_MAX + 200, f"{len(str(exc.value))} chars"
 
     def test_handle_decrypt_failure_warning_line_is_bounded(self, caplog) -> None:
         # _handle_l2_read_error and the wrapper L1 SerializationError guard both route the poisoned

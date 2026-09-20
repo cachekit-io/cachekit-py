@@ -180,9 +180,11 @@ def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
     """
     dtype = np.dtype(spec)
     if numeric_only and not _is_plain_numpy_numeric(dtype):
-        raise SerializationError(f"Forged columnar dtype {dtype}: the writer only emits plain NumPy numeric columns")
+        raise SerializationError(
+            f"Forged columnar dtype {bounded_error(str(dtype))}: the writer only emits plain NumPy numeric columns"
+        )
     if dtype.kind in "Mm" and np.datetime_data(dtype)[1] == 0:
-        raise SerializationError(f"Forged dtype {dtype}: a zero datetime unit multiplier crashes pandas")
+        raise SerializationError(f"Forged dtype {bounded_error(str(dtype))}: a zero datetime unit multiplier crashes pandas")
     return dtype
 
 
@@ -344,7 +346,7 @@ def _auto_object_hook(obj: Any) -> Any:
             try:
                 return UUID(value)
             except (ValueError, TypeError) as e:
-                raise SerializationError(f"Invalid UUID format in cached data: {value}") from e
+                raise SerializationError(f"Invalid UUID format in cached data: {bounded_error(str(value))}") from e
 
         if obj.get("__tuple__") is True:
             if "value" not in obj:
@@ -492,8 +494,9 @@ class AutoSerializer:
         self.default_format = default_format
         self.enable_integrity_checking = enable_integrity_checking
 
-        if self.enable_integrity_checking:
-            self._byte_storage = ByteStorage(default_format)
+        # Unconditional: writes still gate on enable_integrity_checking, but an integrity-OFF
+        # READER needs it to ask whether its decode parses as an envelope (_parses_as_envelope).
+        self._byte_storage = ByteStorage(default_format)
 
         # Initialize ArrowSerializer for fast DataFrame serialization (if available)
         if HAS_ARROW_SERIALIZER:
@@ -623,13 +626,19 @@ class AutoSerializer:
                 metadata must come from a verified envelope: a ``retrieve()`` failure of any
                 kind, including "not an envelope at all", raises rather than reconstructing
                 from bytes nothing verified (matching :class:`StandardSerializer`). Apart from
-                the three routes above, no field of ``metadata`` re-opens that fall-through — the CK header is plaintext, so one flipped byte there must not
-                decide whether verification happens. The only other fall-through is a call with
-                NO metadata (``deserialize(data)``, the direct-API contract). A ByteStorage
-                envelope is itself valid msgpack — ``[bytes, [8 ints], int, format]`` — so the
-                plain decode cannot tell a corrupt envelope from a value by structure alone; a
-                decode that still shows an envelope's invariant slots (``_looks_like_envelope``)
-                is rejected as an envelope that failed to verify, never returned as the value.
+                the three routes above, no field of ``metadata`` re-opens that fall-through —
+                the CK header is plaintext, so one flipped byte there must not decide whether
+                verification happens.
+
+                An integrity-OFF reader runs no ``retrieve()`` at all, so nothing vouched for its
+                decode — **with metadata or without**; saying the metadata-less call was the only
+                remaining fall-through described 0.01% of the traffic through this door. A
+                ByteStorage envelope is itself valid msgpack (``[bytes, [8 ints], int, format]``),
+                so that reader handed a HEALTHY envelope decodes it to those four slots, plaintext
+                payload in slot 0, and would return them as the value. Both entrances close the
+                same way: re-parse the bytes through ``ByteStorage`` and raise if they VERIFY
+                (:meth:`_parses_as_envelope`). Shape cannot make that call — values a caller
+                legitimately cached score a perfect 4/4 — so it only pre-filters; the parse decides.
 
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
@@ -773,18 +782,21 @@ class AutoSerializer:
                 f"{f' (envelope: {bounded_error(envelope_error)})' if envelope_error else ''}"
                 f" (msgpack: {bounded_error(msgpack_error)})"
             ) from msgpack_error
-        # A ByteStorage envelope IS valid msgpack: rmp_serde writes StorageEnvelope as the array
-        # [compressed_data, checksum, original_size, format]. So when retrieve() could not parse
-        # one (a rotted checksum or size slot) and no metadata forced the fail-closed gate above,
-        # this decode succeeds and would hand back those four slots — compressed payload in
-        # slot 0 — as the cached value. That shape is an envelope, not a value: reject it.
-        # With integrity checking OFF the block above is skipped and envelope_error is always
-        # None, so gating on it alone let an integrity-off reader hand back a HEALTHY envelope's
-        # four fields — payload in plaintext at slot 0 — for a metadata-less read. The condition
-        # is "no verification vouched for this decode": retrieve() failed, or nobody ran it.
-        if (envelope_error is not None or metadata is None) and self._looks_like_envelope(value):
-            cause = envelope_error if envelope_error is not None else "decoded to an envelope that no reader verified"
-            raise self._envelope_failure(cause) from envelope_error
+        # A ByteStorage envelope IS valid msgpack — rmp_serde writes StorageEnvelope as
+        # [compressed_data, checksum, original_size, format] — so a decode reaching here may be an
+        # envelope rather than a value, and returning it hands back the compressed payload as
+        # slot 0. Measured escapes: 463,095 of 498,015 arrive WITH metadata (integrity-off reader,
+        # `compressed` false or absent) against 49 without, so the metadata-less call is 0.01% of
+        # this door. The arms split on the only thing that differs: whether a parse is possible.
+        if envelope_error is not None:
+            # retrieve() already failed to parse these bytes; the decoded shape is all that is left.
+            if self._looks_like_envelope(value):
+                raise self._envelope_failure(envelope_error) from envelope_error
+        elif self._looks_like_envelope(value) and self._parses_as_envelope(data):
+            # Nothing verified this decode. The parse decides (see _parses_as_envelope); shape may
+            # pre-filter because it is a NECESSARY condition, and does because a bare parse on
+            # every read cost +82% here (1.75 -> 3.18 us/op) — @cache.minimal's whole point.
+            raise self._envelope_failure("decoded to an envelope that no reader verified")
         return value
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
@@ -1015,11 +1027,34 @@ class AutoSerializer:
         end = 8 + len(magic)
         return len(data) > end and data[8:end] == magic and xxhash.xxh3_64_digest(memoryview(data)[8:]) == data[:8]
 
+    def _parses_as_envelope(self, data: bytes) -> bool:
+        """True when ``data`` really is a ByteStorage envelope — it parses AND verifies.
+
+        This is what :meth:`_looks_like_envelope` can only approximate, and the approximation
+        cannot be repaired by moving the threshold. Measured, written integrity-off:
+        ``[b"\x89PNG", [255,0,0,255,0,255,0,255], 4096, "series"]`` and ``[b"x", [1]*8, 0,
+        "msgpack"]`` both score a perfect 4/4 — by shape they ARE envelopes — while a parse
+        rejects both and accepts the healthy envelope. Scoring asks what the bytes look like; the
+        question is whether a checksum vouches for them, and only ``retrieve()`` answers that.
+
+        Any failure means "not an envelope", so the catch is deliberately broad: a narrower one
+        lets an unanticipated exception type escape ``deserialize`` past every
+        ``except SerializationError`` a caller wrote, which is the shape of the ``TypeError``
+        escape this predicate replaced.
+        """
+        try:
+            self._byte_storage.retrieve(data)
+        except Exception:
+            return False
+        return True
+
     @staticmethod
     def _looks_like_envelope(value: object) -> bool:
         """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
-        slot rotted. Only consulted after ``retrieve()`` already failed to parse ``data``, so
-        whichever slot broke the parse is exactly the one that may now look wrong; the other
+        slot rotted. It DECIDES only on the rot branch, where ``retrieve()`` already failed to
+        parse ``data`` so no parse can speak; on the unverified branch it merely pre-filters for
+        :meth:`_parses_as_envelope`, which decides there. Where it decides, whichever slot broke
+        the parse is exactly the one that may now look wrong; the other
         THREE identify the envelope, and three is exactly what one rot leaves — so requiring all
         four let a single rotted slot through by construction, not by bad luck. Accepting any ONE
         instead false-rejects values a caller legitimately cached: an integrity-off writer's
@@ -1031,12 +1066,13 @@ class AutoSerializer:
         that escaped ``deserialize`` uncaught, past every ``except SerializationError`` a caller
         wrote, wherever ``checksum_ok`` did not short-circuit it away first.
 
-        Residual: TWO rotted slots can leave fewer than three intact and decode as the value. The
-        old rule caught some of those incidentally — whichever of checksum/format survived — at
-        the price of the false miss above. Two independent corruptions are the case no in-band
-        check on an unverified envelope closes (LAB-2736), and a crafted entry is out of scope by
-        the same argument: backend write access returns arbitrary values through the plain path
-        with no gate involved.
+        Residual, and it is NOT "two independent corruptions" as this paragraph used to claim:
+        ONE byte is enough. A msgpack marker byte re-partitions the slot boundaries after it, so a
+        single substitution damages two slots at once — measured, 1 of 391 single-byte
+        substitutions on a 49-byte envelope escaped (offset 3, returned a ``dict``). No in-band
+        check on an envelope nothing verified closes that (LAB-2736, LAB-4304), and a crafted
+        entry is out of scope by the same argument: backend write access returns arbitrary values
+        through the plain path with no gate involved.
         """
         if not (isinstance(value, list) and len(value) == 4):
             return False
