@@ -582,24 +582,22 @@ class AutoSerializer:
                 corruption or tampering — or a payload that failed to decode inside a
                 verified envelope.
 
-                DataFrame/Series entries additionally raise on ANY envelope-parse failure,
-                including "not an envelope at all": unlike the generic msgpack path below,
-                a DataFrame/Series read never reconstructs from unauthenticated bytes,
-                because a wrong-valued-but-same-shaped DataFrame is a far more dangerous
-                silent failure than the wrong-shaped value a generic-format fall-through
-                can produce (matches :class:`StandardSerializer`'s stricter, no-fall-through
-                contract).
+                With integrity checking ON, any entry that arrives WITH metadata — DataFrame,
+                Series, or generic msgpack alike — must come from a verified envelope: a
+                ``retrieve()`` failure of any kind, including "not an envelope at all",
+                raises rather than reconstructing from bytes nothing verified (matches
+                :class:`StandardSerializer`'s no-fall-through contract). No field of
+                ``metadata`` steers that decision: the CK header it comes from is plaintext,
+                so a single flipped byte there must not be able to open the fall-through.
+                Inside a verified envelope, the format is taken from the envelope's own
+                record, never from the header.
 
-                For the generic msgpack path, bytes that were never meant to be a
-                ByteStorage envelope — ``metadata`` is absent (e.g. a caller invoking
-                ``deserialize`` directly with no metadata) or ``metadata.compressed`` is
-                false (the writer's own record of having written it with integrity
-                checking off) — are not an error here: they fall through to the plain
-                msgpack decode, whose own type-marker/structural validation is what
-                catches a genuinely forged entry. An entry whose ``metadata.compressed``
-                says true but whose envelope failed to parse at all raises instead —
-                that combination is corruption wearing the not-an-envelope path's
-                clothes, not a legitimate cross-config read.
+                The one fall-through that remains is a call with NO metadata at all
+                (``deserialize(data)`` — the direct-API contract the type-marker corruption
+                tests exercise): bytes that never parse as an envelope are decoded as plain
+                msgpack, and that decode's own structural validation is what catches a forged
+                entry. With integrity checking OFF the reader has no ByteStorage at all, so
+                nothing on this path is verified — that is what ``@cache.minimal`` chooses.
 
                 A reader with integrity checking OFF additionally raises on any
                 dataframe/series/msgpack entry whose ``metadata.compressed`` says the writer
@@ -642,7 +640,7 @@ class AutoSerializer:
                     f"integrity checking disabled (format={detected_format!r})"
                 )
             if detected_format in ("dataframe", "series"):
-                if not (self.enable_integrity_checking and len(data) > 4):
+                if not self.enable_integrity_checking:
                     # Integrity off: data is direct msgpack (no envelope)
                     return self._decode_columnar(data, detected_format)
                 # Integrity on: a DataFrame/Series MUST come from a verified envelope —
@@ -680,8 +678,11 @@ class AutoSerializer:
                 # (LAB-2503 decode bomb) and MUST fail closed. Falling through here used to
                 # re-decode the ENVELOPE bytes as plain MessagePack and return its positional
                 # fields as the cached value — wrong data, silently.
-                # Use metadata if available, otherwise fall back to format_id from envelope
-                detected_format = metadata.original_type if metadata and hasattr(metadata, "original_type") else format_id
+                # The format comes from INSIDE the verified envelope. metadata.original_type is a
+                # plaintext-header field: with it None (one flipped header byte) the former
+                # `hasattr(...) else format_id` never reached format_id, and a checksum-verified
+                # Series came back as a dict.
+                detected_format = format_id
                 try:
                     if detected_format == "numpy":
                         return self._deserialize_numpy(original_data)
@@ -695,18 +696,12 @@ class AutoSerializer:
 
         # Reached with integrity on when retrieve() raised the "not an envelope" ValueError
         # (envelope_error is set), or with integrity off (envelope_error is None; a
-        # compressed=true entry was already rejected above). The writer's OWN record of
-        # whether this entry should be a checksummed envelope gates what happens next, not
-        # the reader's config: `metadata.compressed` is set at write time to the writer's
-        # enable_integrity_checking. A writer that legitimately recorded "no envelope"
-        # (compressed is false, or metadata is absent entirely — e.g. a hand-built payload
-        # with no metadata, which every non-dataframe/series decode test in this suite
-        # exercises) still falls through to the plain-msgpack decode below; that decode's
-        # own type-marker/structural validation is what catches a genuinely forged entry.
-        # Only a writer that claimed compressed=true, whose envelope then failed to parse
-        # at all, fails closed here — that combination is corruption wearing the
-        # not-an-envelope path's clothes, not a legitimate cross-config read.
-        if envelope_error is not None and metadata is not None and getattr(metadata, "compressed", False):
+        # compressed=true entry was already rejected above). With integrity on, a call that
+        # carries metadata fails closed here — see Raises:. This must NOT consult
+        # metadata.compressed: that field lives in the plaintext CK header, so gating on it
+        # let one flipped byte reopen the fall-through and return the envelope's positional
+        # fields as the cached value. Only the metadata-absent direct-API call falls through.
+        if envelope_error is not None and metadata is not None:
             raise self._envelope_failure(envelope_error) from envelope_error
 
         # Check for Arrow IPC format before msgpack fall-through

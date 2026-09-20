@@ -332,7 +332,7 @@ def get_data():
 
 **Error Code**: `SerializationError` (same class as E020 — there is no separate `DeserializationError` class)
 
-**Cause**: Cached data is corrupted, tampered with, or was written by an incompatible serializer/config
+**Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see E003 above.
 
 **What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see E003 above.)
 

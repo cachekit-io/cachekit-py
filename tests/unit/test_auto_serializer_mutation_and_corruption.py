@@ -251,6 +251,36 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="integrity checking disabled"):
             off.deserialize(data, meta)
 
+    def test_verified_envelope_format_comes_from_the_envelope_not_the_header(self) -> None:
+        """``metadata.original_type`` is a plaintext-header field. With it None (one flipped
+        header byte), the former ``hasattr(...) else format_id`` never reached ``format_id``
+        and a checksum-verified Series envelope decoded as a dict — an unauthenticated field
+        silently overriding the authenticated one. The envelope's own format record wins."""
+        s = AutoSerializer()
+        series = pd.Series([1.0, 2.0, 3.0], name="v")
+        data, meta = s.serialize(series)
+        meta.original_type = None
+
+        out = s.deserialize(data, meta)
+        assert isinstance(out, pd.Series)
+        pd.testing.assert_series_equal(out, series)
+
+    def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
+        """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
+        CK-header byte outside any authentication tag. Flipping it False on a structurally
+        corrupt integrity-on envelope let the generic path decode the envelope itself and
+        return its four positional fields as the cached value. The gate must not consult it."""
+        s = AutoSerializer()
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]
+        envelope[1] = list(envelope[1])
+        envelope[1][0] = "x"  # non-u8 checksum element: the envelope fails to PARSE, not to verify
+        corrupted = msgpack.packb(envelope)
+        meta.compressed = False
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(corrupted, meta)
+
 
 # A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a
 # forged document can put an array where the writer only ever puts a list or a dict. M8[2s] is a
