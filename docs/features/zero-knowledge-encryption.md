@@ -51,7 +51,7 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
 | Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
 | Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
-| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function after the response has been served — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not depend on request-scoped resources (a per-request DB session). `stale_ttl=0` opts out |
+| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources: a per-request DB session shared with the still-running request is the common trap, and it corrupts quietly rather than raising. `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
 constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
@@ -71,17 +71,20 @@ canonical statement.
 > [!WARNING]
 > **`@cache.secure` does NOT pin the SaaS backend.** Backend resolution is the
 > same lookup as every preset: explicit `backend=` → `set_default_backend()` **as
-> read at decoration time** → environment auto-detect at **first call**
-> (`CACHEKIT_API_KEY` → cachekit.io SaaS; `CACHEKIT_REDIS_URL` → Redis; then the
-> Memcached/File selectors; else `REDIS_URL` / localhost Redis fallback). Only an
+> read at decoration time** → environment auto-detect at **first call**. Auto-detect
+> picks whichever **single** prefixed selector is set (`CACHEKIT_API_KEY` → cachekit.io
+> SaaS, `CACHEKIT_REDIS_URL` → Redis, `CACHEKIT_MEMCACHED_SERVERS`, `CACHEKIT_FILE_CACHE_DIR`)
+> — two or more set at once raises `ConfigurationError`, there is no fallthrough between
+> them; none set → `REDIS_URL` / localhost Redis. Only an
 > explicit `backend=` is order-independent: a `set_default_backend()` that runs
 > after the decorated module has been imported is silently ignored. Consequences:
 > (1) in a 12-factor environment where `REDIS_URL` is set and `CACHEKIT_API_KEY`
 > is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
 > (2) a backend misconfiguration at first call (e.g. two auto-detect selectors set
 > at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
-> `client_creation` failure and the function runs **uncached on every call**,
-> L1 included — that early return sits upstream of the L1 lookup.
+> `client_creation` failure and the function runs **uncached on every call**, with
+> **L1 never populated** — so a cold cache stays cold (an async function with an
+> already-warm L1 can still serve those hits until they expire).
 > Alert on `client_creation` failures. When the SaaS is the requirement, pass
 > `backend=CachekitIOBackend()` explicitly — auditable in code and immune to
 > environment drift.
@@ -587,17 +590,17 @@ didn't recently disable encryption for that function, investigate.
 > [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key).
 
 ### GDPR
-- ✅ Encryption satisfies "processing security" requirement
-- ✅ Client-side encryption satisfies "technical measures"
+- ✅ Encryption supports the "processing security" requirement
+- ✅ Client-side encryption supports the "technical measures" requirement
 - ⚠️  Key management still required (rotation, access control)
 
 ### HIPAA
-- ✅ AES-256-GCM satisfies encryption requirement
+- ✅ AES-256-GCM supports the encryption requirement
 - ⚠️  Audit logging required (access to decrypted data)
 - ⚠️  Key management plan required
 
 ### PCI-DSS
-- ✅ Encryption satisfies "encryption at rest" requirement
+- ✅ Encryption supports the "encryption at rest" requirement
 - ⚠️  Key management plan required
 - ⚠️  Regular key rotation required
 

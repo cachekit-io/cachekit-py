@@ -392,17 +392,17 @@ class DecoratorConfig:
     def secure(cls, master_key: str, tenant_extractor: Callable[..., str] | None = None, **kwargs: Any) -> DecoratorConfig:
         """Security profile: Encryption REQUIRED, encrypted-at-rest everywhere, full audit trail, integrity NON-NEGOTIABLE.
 
-        Use cases: PII, medical data, financial records, GDPR compliance
+        Use cases: PII, medical data, financial records, and regulated-data caching where
+                   encryption may reduce compliance scope (see docs/features/zero-knowledge-encryption.md)
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolution is the same as every preset — explicit backend= kwarg (the only
-              order-independent tier), then set_default_backend() as read AT DECORATION TIME, then
-              DefaultBackendProvider env auto-detect at FIRST CALL (CACHEKIT_API_KEY → cachekit.io SaaS;
-              CACHEKIT_REDIS_URL → Redis; then Memcached/File selectors; else REDIS_URL / localhost
-              Redis fallback). A provider error at first call is logged and the function runs
-              uncached — it does not raise. .secure does NOT pin the SaaS: with REDIS_URL set and
-              CACHEKIT_API_KEY unset, encrypted values silently go to Redis. When the SaaS is a
-              requirement, pass backend=CachekitIOBackend() explicitly.
+        Note: .secure does NOT pin the SaaS. Backend resolution is the same as every preset:
+              explicit backend= kwarg (the only order-independent tier), then set_default_backend()
+              as read AT DECORATION TIME, then environment auto-detect at FIRST CALL. So with
+              REDIS_URL set and CACHEKIT_API_KEY unset, encrypted values silently go to Redis, and
+              a provider error at first call is logged, not raised — the function then runs uncached.
+              When the SaaS is a requirement, pass backend=CachekitIOBackend() explicitly.
+              Full selector rules (set exactly one): docs/backends/README.md.
         Note: integrity_checking is forced to True on this preset path (the kwarg is discarded).
               An override applied via @cache(config=DecoratorConfig.secure(...), integrity_checking=False)
               is NOT re-forced.

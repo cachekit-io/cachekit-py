@@ -154,12 +154,15 @@ class PooledClientProvider(CacheClientProvider):
 class DefaultBackendProvider(BackendProviderInterface):
     """Default backend provider with env-based auto-detection.
 
-    Selection is by a single, unambiguous environment signal. Priority order:
-        1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL          → RedisBackend
-        3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
-        4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
-        5. REDIS_URL, or nothing set   → RedisBackend (12-factor / localhost default)
+    Selection is by a single, unambiguous environment signal. These are mutually
+    exclusive selectors, NOT a precedence chain — set exactly one:
+        - CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
+        - CACHEKIT_REDIS_URL          → RedisBackend
+        - CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
+        - CACHEKIT_FILE_CACHE_DIR     → FileBackend
+    Setting two or more raises ConfigurationError (see below); it does not fall through
+    to the next one. With none of them set: REDIS_URL, or nothing → RedisBackend
+    (12-factor / localhost default).
 
     Setting more than one of the four prefixed selectors (1-4) raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
