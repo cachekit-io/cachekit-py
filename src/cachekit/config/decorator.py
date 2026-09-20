@@ -394,7 +394,10 @@ class DecoratorConfig:
 
         Use cases: PII, medical data, financial records, and regulated-data caching where
                    encryption may reduce compliance scope (see docs/features/zero-knowledge-encryption.md)
-        Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
+        Architecture: With a backend configured, both L1 and L2 store encrypted bytes
+                      (encrypt-at-rest everywhere). NOT so with backend=None: L1-only mode
+                      stores raw Python objects and never serializes, so nothing is encrypted
+                      and master_key is unused. Encryption requires a backend.
 
         Note: .secure does NOT pin the SaaS. Backend resolution is the same as every preset:
               explicit backend= kwarg (the only order-independent tier), then set_default_backend()

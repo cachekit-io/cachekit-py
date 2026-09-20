@@ -9,10 +9,24 @@
 Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. The backend never sees plaintext values. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM encryption
+from cachekit.backends.redis import RedisBackend
+
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
 def get_user_ssn(user_id):
-    return db.get_ssn(user_id)  # stored encrypted; L1-only here (backend=None) — pass backend= for Redis/SaaS
+    return db.get_ssn(user_id)  # AES-256-GCM before it leaves the process
 ```
+
+> [!WARNING]
+> **Encryption requires a backend. `backend=None` does not encrypt anything.**
+> `backend=None` selects L1-only mode, which stores **live Python object
+> references** in process memory — it never serializes, so the encryption layer is
+> never reached and the master key is accepted, validated, and then never used.
+> `@cache.secure(master_key=..., backend=None)` raises nothing and encrypts nothing:
+> the values stay readable in a heap or core dump. The same object is also handed to
+> every caller, so mutating a returned value corrupts the cached entry for everyone
+> else. Use L1-only mode for non-sensitive data; for encrypted caching pass a real
+> backend (`RedisBackend`, `CachekitIOBackend`, …), where L1 then holds ciphertext
+> like L2 does.
 
 ---
 
@@ -22,16 +36,18 @@ Enable encryption with single decorator:
 
 ```python notest
 from cachekit import cache
+from cachekit.backends.redis import RedisBackend
 
 # Set master key (hex-encoded)
 import os
 os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM enabled
+# A backend is required for encryption — see the warning above on backend=None
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
 def get_sensitive_data(user_id):
     return db.query(SensitiveData).filter_by(id=user_id).first()  # illustrative - db not defined
 
-data = get_sensitive_data(123)  # stored encrypted (L1-only — backend=None)
+data = get_sensitive_data(123)  # stored encrypted in both L1 and L2
 ```
 
 ---
@@ -51,7 +67,7 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
 | Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
 | Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
-| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources. Arguments are deep-copied before scheduling, so a session passed *as an argument* is never shared — but a non-copyable argument silently skips the refresh entirely (logged at DEBUG). The sharing route that does bite is a `ContextVar`-bound session, which the context snapshot deliberately carries into the refresh. `stale_ttl=0` opts out |
+| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources. Arguments are deep-copied before scheduling, so a session passed *as an argument* is never shared — but a non-copyable argument silently skips the refresh entirely (logged at DEBUG) — on an instance method `self` is that argument, so a service class holding a lock, a client or an open connection disables SWR permanently and quietly. The sharing route that does bite is a `ContextVar`-bound session, which the context snapshot deliberately carries into the refresh. `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
 constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
@@ -80,8 +96,10 @@ canonical statement.
 > after the decorated module has been imported is silently ignored. Consequences:
 > (1) in a 12-factor environment where `REDIS_URL` is set and `CACHEKIT_API_KEY`
 > is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
-> (2) a backend misconfiguration at first call (e.g. two auto-detect selectors set
-> at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
+> (2) for a provider-resolved decorator — `.secure` without `backend=`, `.production`,
+> `.minimal`, bare `@cache`; **never `.io`**, which constructs its own backend at
+> decoration and never consults the provider — a backend misconfiguration at first
+> call (e.g. two auto-detect selectors set at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
 > `client_creation` failure and the function runs **uncached on every call**, with
 > **L1 never populated** — so a cold cache stays cold.
 > Alert on `client_creation_failed`. When the SaaS is the requirement, pass
@@ -189,7 +207,7 @@ Python object (plaintext, in-app only)
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption, slower, for sensitive data
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))  # Encryption, slower
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # illustrative - db not defined
 ```
@@ -272,11 +290,12 @@ redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
 ### L1 Cache Conflict
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption + L1 cache (stores encrypted bytes)
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
 def get_sensitive_data():
-    # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
+    # WITH a backend, L1 stores encrypted bytes (~50ns hits vs 2-7ms Redis)
     # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
+    # With backend=None instead, NONE of the above holds — see the warning at the top
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
 
@@ -292,13 +311,14 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 ```python notest
 from cachekit import cache
+from cachekit.backends.redis import RedisBackend
 
-@cache.secure(ttl=3600, master_key="a" * 64, backend=None)  # AES-256-GCM with MessagePack
+@cache.secure(ttl=3600, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
 def get_user_profile(user_id):
     return db.get_profile(user_id)  # illustrative - db not defined
 
 profile = get_user_profile(123)
-# stored encrypted, decrypted in-app (L1-only here — backend=None; pass backend= for Redis/SaaS)
+# stored encrypted, decrypted in-app
 ```
 
 ### Encrypted JSON (Zero-Knowledge API Caching)
@@ -656,7 +676,7 @@ Cached after first use: No additional overhead
 
 **Encryption + Circuit Breaker**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Both enabled
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))  # Both enabled
 def get_data():
     # Decryption error → Circuit breaker catches
     # Encryption happens before circuit breaker (at write time)
@@ -665,11 +685,11 @@ def get_data():
 
 **Encryption + L1 Cache**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)
+@cache.secure(ttl=300, master_key="a" * 64, backend=RedisBackend("redis://localhost:6379"))
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
-    # No plaintext in memory: encryption at rest in both L1 and L2
-    # Decryption only at read time (< 1ms exposure)
+    # No plaintext at rest in L1 or L2 — decryption only at read time (< 1ms exposure).
+    # This holds only because a backend is configured; backend=None stores raw objects.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
 
