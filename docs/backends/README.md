@@ -202,7 +202,7 @@ between them. Only the bare `REDIS_URL` fallback may coexist with a prefixed sel
 # Pick ONE prefixed selector:
 CACHEKIT_REDIS_URL=redis://prod.example.com:6379   # Redis
 # CACHEKIT_API_KEY=ck_live_...                     # managed SaaS (CachekitIO)
-# CACHEKIT_MEMCACHED_SERVERS=["cache.example.com:11211"]   # JSON array, not a bare string
+# CACHEKIT_MEMCACHED_SERVERS='["cache.example.com:11211"]'   # JSON array; keep the outer single quotes
 # CACHEKIT_FILE_CACHE_DIR=/var/cache/cachekit
 
 # Fallback, used only when no prefixed selector above is set — never conflicts:

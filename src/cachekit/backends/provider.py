@@ -160,14 +160,11 @@ class DefaultBackendProvider(BackendProviderInterface):
         - CACHEKIT_REDIS_URL          → RedisBackend
         - CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         - CACHEKIT_FILE_CACHE_DIR     → FileBackend
-    Setting two or more raises ConfigurationError (see below); it does not fall through
-    to the next one. With none of them set: REDIS_URL, or nothing → RedisBackend
-    (12-factor / localhost default).
-
-    Setting more than one of the four prefixed selectors (1-4) raises
-    ``ConfigurationError`` — auto-detection must be unambiguous; pass
-    ``backend=`` explicitly to override. The non-prefixed ``REDIS_URL`` is only a
-    fallback and never counts as a conflict (12-factor convention).
+    Setting two or more of them raises ``ConfigurationError`` — auto-detection must be
+    unambiguous — rather than falling through to the next; pass ``backend=`` explicitly to
+    override. With none of them set: ``REDIS_URL``, or nothing → RedisBackend (12-factor /
+    localhost default). The non-prefixed ``REDIS_URL`` is only a fallback and never counts
+    as a conflict (12-factor convention).
 
     CachekitIO/Memcached/File backends are stateless singletons (cached). Redis
     backends are per-request tenant-scoped wrappers (not cached —
@@ -175,8 +172,9 @@ class DefaultBackendProvider(BackendProviderInterface):
     single-tenant deployments (default), tenant_context is set to "default".
     """
 
-    # Prefixed selectors in priority order. REDIS_URL is the implicit fallback
-    # and intentionally excluded so it never triggers a conflict.
+    # Prefixed selectors. Tuple order is NOT precedence — setting two or more raises,
+    # and exactly one returns that one, so order affects nothing. REDIS_URL is the implicit
+    # fallback and intentionally excluded so it never triggers a conflict.
     _SELECTORS = (
         ("CACHEKIT_API_KEY", "cachekitio"),
         ("CACHEKIT_REDIS_URL", "redis"),

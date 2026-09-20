@@ -51,7 +51,7 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
 | Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
 | Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF keys available | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
-| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources: a per-request DB session shared with the still-running request is the common trap, and it corrupts quietly rather than raising. `stale_ttl=0` opts out |
+| Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources. Arguments are deep-copied before scheduling, so a session passed *as an argument* is never shared — but a non-copyable argument silently skips the refresh entirely (logged at DEBUG). The sharing route that does bite is a `ContextVar`-bound session, which the context snapshot deliberately carries into the refresh. `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
 constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
@@ -83,9 +83,8 @@ canonical statement.
 > (2) a backend misconfiguration at first call (e.g. two auto-detect selectors set
 > at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
 > `client_creation` failure and the function runs **uncached on every call**, with
-> **L1 never populated** — so a cold cache stays cold (an async function with an
-> already-warm L1 can still serve those hits until they expire).
-> Alert on `client_creation` failures. When the SaaS is the requirement, pass
+> **L1 never populated** — so a cold cache stays cold.
+> Alert on `client_creation_failed`. When the SaaS is the requirement, pass
 > `backend=CachekitIOBackend()` explicitly — auditable in code and immune to
 > environment drift.
 
@@ -588,6 +587,13 @@ didn't recently disable encryption for that function, investigate.
 > client-side encryption may *reduce* HIPAA/PCI DSS scope subject to assessment and your
 > surrounding controls — it does not remove regulated data from scope on its own. See
 > [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key).
+>
+> ⚠️ Encryption covers cached **values** only. The cache key travels cleartext in the
+> request URL and lands in backend access logs — and it carries the function's
+> `module.qualname` plus an enumerable hash of its arguments, so a key like
+> `get_patient_record(patient_id)` leaks who was looked up and when, on the log's
+> retention window rather than the cache TTL. Assess that alongside the ciphertext.
+> See [Accepted Exposure](#cleartext-frame-header-fields-accepted-exposure).
 
 ### GDPR
 - ✅ Encryption supports the "processing security" requirement
