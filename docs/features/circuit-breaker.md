@@ -283,7 +283,16 @@ def fetch(key):
 
 **Circuit Breaker + Encryption**:
 ```python notest
-@cache.secure(master_key="a" * 64, ttl=300, backend=None)  # Both features enabled
+import os
+
+from cachekit.backends.redis import RedisBackend
+
+# Encryption requires a real backend — backend=None is L1-only and encrypts nothing.
+@cache.secure(
+    master_key=os.environ["CACHEKIT_MASTER_KEY"],
+    ttl=300,
+    backend=RedisBackend("redis://localhost:6379"),
+)  # Both features enabled
 def fetch_sensitive(key):
     # Encryption happens before L2 write
     # If L2 fails → Circuit opens

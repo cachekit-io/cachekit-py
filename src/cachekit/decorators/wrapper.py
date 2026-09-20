@@ -464,7 +464,12 @@ def create_cache_wrapper(
     Security Note:
         When encryption=True and tenant_extractor is provided, tenant ID extraction
         uses FAIL CLOSED security policy. If extraction fails, ValueError propagates to caller
-        (no fallback to shared encryption key). This ensures cryptographic tenant isolation.
+        (no fallback to shared encryption key). That is the whole of the guarantee: a
+        missing or unparseable tenant never silently shares one tenant's key. It is NOT
+        a tenancy boundary — cache keys carry no tenant component, so two tenants calling
+        with identical arguments address the same entry, and separation rests entirely on
+        the decrypt step failing. Do not rely on this for cross-tenant isolation; use
+        separate namespaces. See docs/features/zero-knowledge-encryption.md.
     """
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values

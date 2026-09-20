@@ -311,7 +311,10 @@ async def load_dashboard():
 Use intent presets to configure L1 and other features for different use cases:
 
 ```python notest
+import os
+
 from cachekit import cache
+from cachekit.backends.redis import RedisBackend
 
 # Zero overhead - all features disabled
 @cache.minimal(backend=None)
@@ -333,8 +336,9 @@ def prod_function():
 def test_function():
     pass
 
-# Secure - encryption + all features
-@cache.secure(master_key="a" * 64, backend=None)
+# Secure - encryption + all features. Needs a real backend: backend=None is
+# L1-only mode, which never serializes and therefore never encrypts.
+@cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def secure_function():
     pass
 

@@ -319,7 +319,10 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ### Usage Examples
 
 ```python notest
+import os
+
 from cachekit import cache
+from cachekit.backends.redis import RedisBackend
 from cachekit.config.nested import CircuitBreakerConfig
 
 # Zero-config intelligent caching (90% of use cases, L1+L2 enabled)
@@ -336,7 +339,9 @@ def get_price(symbol: str):
 def process_payment(amount):
     return payment_gateway.charge(amount)  # illustrative - not defined
 
-@cache.secure(master_key="a" * 64, backend=None)    # Security-critical: client-side encryption
+# Security-critical: client-side encryption. Requires a real backend — with
+# backend=None nothing is serialized, so nothing is encrypted.
+@cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def get_user_data(user_id: int):
     return db.fetch_user(user_id)  # illustrative - not defined
 

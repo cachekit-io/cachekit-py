@@ -2,7 +2,20 @@
 
 # L1-Only Mode (`backend=None`)
 
-Use `backend=None` to run cachekit as a pure in-memory cache — no Redis, no Memcached, no external services. This is cachekit's equivalent of `functools.lru_cache`, but with all the decorator features (TTL, namespacing, metrics, encryption).
+Use `backend=None` to run cachekit as a pure in-memory cache — no Redis, no Memcached, no external services. This is cachekit's equivalent of `functools.lru_cache`, but with the decorator
+features that do not need a backend (TTL, namespacing, metrics).
+
+> [!WARNING]
+> **Encryption is not one of them. `backend=None` does not encrypt anything.**
+> L1-only mode stores **live Python object references** in process memory and never
+> serializes, so the encryption layer is never reached: a `master_key` is validated
+> at decoration time and then discarded. `@cache.secure(master_key=..., backend=None)`
+> raises nothing and encrypts nothing — the values stay readable in a heap or core
+> dump. The same object is handed to every caller, so mutating a returned value
+> corrupts the cached entry for everyone else. Use L1-only mode for non-sensitive
+> data; for encrypted caching pass a real backend (`RedisBackend`,
+> `CachekitIOBackend`, …), where L1 then holds ciphertext like L2 does. See
+> [Zero-Knowledge Encryption](../features/zero-knowledge-encryption.md).
 
 ## Basic Usage
 
@@ -50,7 +63,9 @@ No network calls. No serialization to bytes. No backend initialization.
 
 ## With Intent Presets
 
-All presets work with `backend=None`:
+All presets accept `backend=None`, but a preset's backend-dependent behaviour does
+not survive it — `@cache.secure` in particular accepts the key and encrypts nothing
+(see the warning above):
 
 ```python notest
 from cachekit import cache
@@ -60,10 +75,14 @@ from cachekit import cache
 def fast_lookup(key: str) -> dict:
     return fetch_data(key)
 
-# With encryption, no backend (L1 stores ciphertext)
-@cache.secure(backend=None, ttl=3600)
-def sensitive_data(user_id: int) -> dict:
-    return get_pii(user_id)
+# Reliability features, no backend
+@cache.production(backend=None, ttl=300)
+def resilient_lookup(key: str) -> dict:
+    return fetch_data(key)
+
+# NOT supported: @cache.secure(backend=None) stores plaintext objects, not ciphertext.
+# For encrypted caching, pass a real backend:
+#     @cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend(...))
 ```
 
 ## Upgrade Path

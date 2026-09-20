@@ -331,11 +331,18 @@ profile = get_user_profile(123)
 
 ### Encrypted JSON (Zero-Knowledge API Caching)
 ```python notest
+import os
+
 from cachekit import cache
+from cachekit.backends.redis import RedisBackend
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
-# Encrypt JSON API responses (webhooks, sessions, API keys)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()), backend=None)
+# Encrypt JSON API responses (webhooks, sessions, API keys).
+# A real backend is required — backend=None never serializes, so it never encrypts.
+@cache(
+    serializer=EncryptionWrapper(serializer=OrjsonSerializer()),
+    backend=RedisBackend(os.environ.get("REDIS_URL", "redis://localhost:6379")),
+)
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_abcdef123456",
@@ -349,12 +356,20 @@ keys = get_api_keys("customer-123")
 
 ### Encrypted DataFrames (Zero-Knowledge ML Caching)
 ```python notest
-from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+import os
+
 import pandas as pd
 
-# Encrypt DataFrames with patient data, ML features, analytics
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()), backend=None)
+from cachekit import cache
+from cachekit.backends.redis import RedisBackend
+from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+
+# Encrypt DataFrames with patient data, ML features, analytics.
+# A real backend is required — backend=None never serializes, so it never encrypts.
+@cache(
+    serializer=EncryptionWrapper(serializer=ArrowSerializer()),
+    backend=RedisBackend(os.environ.get("REDIS_URL", "redis://localhost:6379")),
+)
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined
     return pd.read_sql(
@@ -774,7 +789,10 @@ export default {
 
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
-- ✅ Multi-tenant isolation (per-tenant encryption keys)
+- ✅ Per-tenant key derivation with fail-closed extraction — a tenant's ciphertext is
+  not readable under another tenant's key, and a failed extraction raises rather than
+  falling back to a shared key. This is **not** a tenancy boundary on its own: cache
+  keys carry no tenant component (see [Multi-Tenant Isolation](#multi-tenant-isolation))
 - ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
@@ -784,7 +802,7 @@ export default {
 
 - [Comparison Guide](../comparison.md) - Only cachekit has zero-knowledge encryption
 - [Security Policy](../../SECURITY.md)
-- [Multi-Tenant Encryption](../getting-started.md#multi-tenant)
+- [Multi-Tenant Isolation](#multi-tenant-isolation) - why per-tenant keys are not a tenancy boundary
 - [Serializer Guide](../serializers/README.md) - Encryption with custom serializers
 - [Performance Benchmarks](../../tests/performance/test_encryption_overhead.py) - Evidence-based overhead measurements
 

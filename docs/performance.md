@@ -153,7 +153,8 @@ This is what users experience on cache hits. Overhead breakdown:
 **Security benefit:**
 - Client-side encryption (no plaintext PII in cache)
 - L1 stores encrypted bytes only
-- Tenant isolation (per-tenant encryption keys)
+- Per-tenant key derivation (fail-closed: no fallback to a shared key). Not a tenancy
+  boundary on its own — see [Multi-Tenant Isolation](features/zero-knowledge-encryption.md#multi-tenant-isolation)
 
 See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for details.
 
