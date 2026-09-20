@@ -91,7 +91,7 @@ def fn(): return {1, 2, 3}
 
 ## Cross-Config Reads (integrity_checking Mismatch)
 
-`integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) must match between the writer and the reader of a given entry. If it doesn't, AutoSerializer fails closed rather than returning wrong data:
+When the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's, the outcome depends on the direction and the value type. DataFrame/Series always fail closed; a generic value fails closed only when it was written with checking on and read with it off:
 
 | Written with | Read with | Generic value (dict, list, etc.) | DataFrame / Series |
 |---|---|---|---|
