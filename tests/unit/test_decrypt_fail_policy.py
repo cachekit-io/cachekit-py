@@ -35,6 +35,7 @@ from cachekit.serializers.encryption_wrapper import (
     EncryptionError,
     EncryptionWrapper,
 )
+from cachekit.serializers.wrapper import SerializationWrapper
 
 _HEX_KEY = "a" * 64
 _KEY_BYTES = b"\xaa" * 32
@@ -63,6 +64,21 @@ class TestExceptionTaxonomy:
         tampered[len(tampered) // 2] ^= 0xFF
         with pytest.raises(DecryptionAuthenticationError, match="Decryption failed"):
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
+
+    def test_non_string_original_type_is_corruption_not_tamper(self):
+        """LAB-4350: the header is an AAD *input*, not authenticated content.
+
+        A rotted ``original_type`` (e.g. a list) breaks AAD construction before
+        any tag check runs. That is corruption of the plaintext header, not
+        tamper — it must surface as a plain SerializationError so the read
+        path evicts and recomputes instead of retaining the entry under
+        fail-closed forever."""
+        wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
+        enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
+        meta.original_type = ["rotted"]
+        with pytest.raises(SerializationError, match="original_type") as exc_info:
+            wrapper.deserialize(enc, meta, cache_key="key:a")
+        assert not isinstance(exc_info.value, DecryptionAuthenticationError)
 
     def test_post_decrypt_deserialize_failure_is_not_auth_error(self):
         """A failure AFTER successful authentication is corruption-class, not tamper."""
@@ -327,6 +343,19 @@ class TestGetCachedValueFailPolicy:
         strategy.store["key:c"] = plaintext_writer.serialize_data({"v": 1}, cache_key="key:c")
         assert handler.get_cached_value("key:c") is None
         assert strategy.deleted == ["key:c"]
+
+    @pytest.mark.parametrize("rotted", [["json"], {"t": "json"}, 7, True])
+    def test_fail_closed_rotted_original_type_header_is_miss_and_evicted(self, rotted):
+        """LAB-4350: a non-string ``original_type`` in the stored plaintext header
+        is corruption-class — evicted and recomputed even under fail_closed=True,
+        unlike the tamper-class substitution case above which retains evidence."""
+        handler, strategy, serialization = _make_operation_handler(fail_closed=True)
+        entry = serialization.serialize_data({"v": 1}, cache_key="key:d")
+        payload, metadata_dict, serializer_name = SerializationWrapper.unwrap(entry)
+        metadata_dict["original_type"] = rotted
+        strategy.store["key:d"] = SerializationWrapper.wrap(bytes(payload), metadata_dict, serializer_name)
+        assert handler.get_cached_value("key:d") is None  # miss, not raise
+        assert strategy.deleted == ["key:d"]  # self-heals
 
     def test_fail_open_valid_entry_roundtrips(self):
         """Regression: the happy path is untouched by the policy plumbing."""

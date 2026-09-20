@@ -422,7 +422,11 @@ them (cachekit-py#170):
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
-  serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
+  serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
+  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
+  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
+  AAD construction before any tag check runs — it is corruption, not tamper, and the
+  entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter

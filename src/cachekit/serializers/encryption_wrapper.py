@@ -518,9 +518,14 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        try:
-            aad = self._create_aad(raw_metadata, cache_key)
+        # Build the AAD OUTSIDE the tag-verification try below: the plaintext header
+        # is an AAD *input*, not authenticated content, so a failure here (LAB-4350:
+        # a rotted `original_type`) is header corruption, not tamper. It must reach the
+        # caller as a plain SerializationError (evict + recompute), never be relabelled
+        # DecryptionAuthenticationError and retained forever under fail_closed.
+        aad = self._create_aad(raw_metadata, cache_key)
 
+        try:
             # Decrypt using tenant keys (keys remain in Rust memory, never copied to Python)
             # NOTE: If cache_key doesn't match the one used during encryption,
             # the AAD will be different and AES-GCM authentication will fail.
@@ -620,8 +625,10 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
+        # AAD build stays outside the try — header corruption is not tamper (see deserialize).
+        aad = self._create_aad(raw_metadata, cache_key)
+
         try:
-            aad = self._create_aad(raw_metadata, cache_key)
             if len(self._keyring_fingerprints) == 1:
                 # Single-entry keyring: "sequential" is exactly the current key.
                 # Use the cached derived tenant keys so the no-rotation interop
@@ -707,6 +714,14 @@ class EncryptionWrapper:
         ]
 
         if metadata.original_type:
+            # `original_type` arrives untyped from the plaintext CK header (json.loads →
+            # SerializationMetadata.from_dict passes it straight through). The header is
+            # an AAD INPUT, not AEAD-authenticated content, so a non-string here is bit
+            # rot / corruption — a SerializationError the read path evicts — not tamper.
+            if not isinstance(metadata.original_type, str):
+                raise SerializationError(
+                    f"Corrupt frame header: original_type must be a string, got {type(metadata.original_type).__name__}"
+                )
             components.append(metadata.original_type.encode("utf-8"))
 
         # Version byte 0x03 + length-prefixed encoding
