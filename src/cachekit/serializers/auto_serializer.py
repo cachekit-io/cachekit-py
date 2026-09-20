@@ -61,7 +61,14 @@ except ImportError:
 from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
 from cachekit.hash_utils import redact_error_for_log
 
-from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
+from .base import (
+    PAYLOAD_DECODE_ERRORS,
+    SerializationError,
+    SerializationFormat,
+    SerializationMetadata,
+    bounded_error,
+    unpackb_bounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -587,15 +594,25 @@ class AutoSerializer:
                 payload failed to decode, or the entry's two records of its own format
                 disagree.
 
-                **Verification.** With integrity checking ON, any entry that arrives WITH
+                **Verification.** Arrow and ``NUMPY_RAW`` never travel inside a ByteStorage
+                envelope, so three routes decide a decode with no ``retrieve()`` behind them.
+                Listed by route, not by direction, because the way this contract keeps going
+                wrong is a sweeping claim true of every path its author enumerated:
+
+                * ``[xxh3][ARROW1]`` — routed only when that prefix authenticates, so a value
+                  whose own bytes contain the magic stays on the envelope path.
+                * ``NUMPY_RAW`` — the ``[xxh3]`` prefix is verified when present; bare, it
+                  verifies NOTHING. Legacy bare ``[ARROW1]`` likewise.
+                * a header claiming ``"numpy"`` — reaches the numpy decode on the header's word.
+
+                For every other format, with integrity checking ON, an entry that arrives WITH
                 metadata must come from a verified envelope: a ``retrieve()`` failure of any
                 kind, including "not an envelope at all", raises rather than reconstructing
-                from bytes nothing verified (matching :class:`StandardSerializer`). No field of
-                ``metadata`` can re-open that fall-through — the CK header is plaintext, so one
-                flipped byte there must not decide whether verification happens. The only
-                fall-through left is a call with NO metadata (``deserialize(data)``, the
-                direct-API contract), where the plain-msgpack decode's own structural
-                validation is what catches a forged entry.
+                from bytes nothing verified (matching :class:`StandardSerializer`). Apart from
+                the three routes above, no field of ``metadata`` re-opens that fall-through — the CK header is plaintext, so one flipped byte there must not
+                decide whether verification happens. The only other fall-through is a call with
+                NO metadata (``deserialize(data)``, the direct-API contract), where the
+                plain-msgpack decode's own structural validation is what catches a forged entry.
 
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
@@ -609,8 +626,12 @@ class AutoSerializer:
                 recompute it. Tamper detection needs encryption (E003). See ``E021`` in
                 ``docs/error-codes.md``.
 
-                With integrity checking OFF the reader has no ByteStorage at all, so nothing
-                on this path is verified — that is what ``@cache.minimal`` chooses.
+                With integrity checking OFF the reader builds no ByteStorage, so no envelope is
+                verified — that is what ``@cache.minimal`` chooses. It is not a blanket "nothing
+                is verified": :class:`ArrowSerializer` is constructed regardless of this flag and
+                always writes and checks its own checksum, which is why an intact Arrow entry
+                whose header lost ``original_type`` still decodes on an integrity-off reader
+                rather than failing closed.
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
@@ -631,7 +652,13 @@ class AutoSerializer:
         # original_type is recoverable here rather than failing closed as an unparseable envelope.
         # A header naming a different format contradicts these bytes, so it is left to the
         # fail-closed gate below instead of being decoded on the strength of either one.
-        if header_format in (None, "arrow") and (data[:6] == b"ARROW1" or data[8:14] == b"ARROW1"):
+        # The checksummed arm AUTHENTICATES, it does not sniff: LZ4 emits literals verbatim, so a
+        # value that merely contains b"ARROW1" lands it at envelope offset 8, and a bare marker
+        # test then hands a checksum-intact ByteStorage entry to the Arrow decoder, which calls it
+        # corrupt. The bare arm needs no guard — an envelope is an rmp_serde array, never "A" at 0.
+        if header_format in (None, "arrow") and (
+            data[:6] == b"ARROW1" or (data[8:14] == b"ARROW1" and xxhash.xxh3_64_digest(data[8:]) == data[:8])
+        ):
             if self._arrow_serializer is None:
                 raise SerializationError(
                     "Cannot deserialize Arrow format: ArrowSerializer not available. Install with: pip install 'cachekit[data]'"
@@ -945,8 +972,13 @@ class AutoSerializer:
         Takes a plain string for the format checks, whose "cause" is the comparison itself and
         not an exception; constructing a throwaway ``ValueError`` only to stringify it made the
         two call sites read as if something were being wrapped.
+
+        Every cause echoed here is attacker-inflatable, so the bound goes HERE, not per field:
+        ``rmp_serde``'s ``DeserializationFailed`` text quotes the envelope slot it choked on, so
+        200 KB in the fixed-width ``checksum`` slot walked past three ``!r:.40`` field caps at
+        200,162 chars.
         """
-        return SerializationError(f"Cache entry failed envelope verification (corrupted cache entry): {cause}")
+        return SerializationError(f"Cache entry failed envelope verification (corrupted cache entry): {bounded_error(cause)}")
 
     def _decode_columnar(self, payload: bytes | bytearray | memoryview, kind: str) -> pd.DataFrame | pd.Series:
         """Decode a ``dataframe`` / ``series`` payload, failing closed as ``SerializationError``.

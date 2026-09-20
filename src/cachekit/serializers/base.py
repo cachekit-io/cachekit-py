@@ -368,9 +368,12 @@ _LOG_UNSAFE_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7F, *range(0x8
 _LOG_UNSAFE_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
 
 
-def bounded_error(exc: BaseException) -> str:
+def bounded_error(exc: BaseException | str) -> str:
     """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
     logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
+
+    Accepts a bare ``str`` so a boundary whose "cause" is a comparison rather than a raised error
+    (``AutoSerializer._envelope_failure``) bounds through this same helper.
 
     Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
     wraps in ``cache_handler``) rather than per field: the bound then holds for

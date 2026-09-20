@@ -26,6 +26,7 @@ from unittest import mock
 
 import msgpack
 import pytest
+import xxhash
 
 from cachekit._rust_serializer import ByteStorage
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, handle_decrypt_failure
@@ -338,20 +339,38 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="envelope verification"):
             AutoSerializer().deserialize(data, meta)
 
-    def test_the_echoed_envelope_format_is_length_bounded(self) -> None:
-        """``format`` is attacker-written and was echoed raw into the exception: a 200 KB field
-        produced a 200,092-char message. The read path re-raises SerializationError unwrapped,
-        so ``bounded_error`` never clips it — the cap has to be at the echo site, as
-        ``_column_values`` already does for its own untrusted marker."""
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    def test_an_envelope_whose_bytes_contain_arrow_magic_is_not_hijacked(self, metadata_present: bool) -> None:
+        """The structural Arrow route must authenticate, not sniff. LZ4 emits literals verbatim, so
+        caching ``b"xxARROW1..."`` lands the magic at envelope offset 8 of a valid, checksum-intact
+        entry, and a bare ``data[8:14] == b"ARROW1"`` test handed that healthy entry to the Arrow
+        decoder, which called it corrupt — a false miss on every read, deterministic on recompute,
+        so it never self-heals. No pyarrow needed: the collision is in the ByteStorage writer."""
+        s = AutoSerializer()
+        value = b"xxARROW1" + b"z" * 20
+        data, meta = s.serialize(value)
+        assert data[8:14] == b"ARROW1", "this test needs the magic collision it guards against"
+        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "...and those bytes must not be a real Arrow checksum"
+        meta.original_type = None
+
+        assert s.deserialize(data, meta if metadata_present else None) == value
+
+    @pytest.mark.parametrize("slot, field", [(0, "data"), (1, "checksum"), (2, "original_size"), (3, "format")])
+    def test_the_echoed_envelope_failure_is_length_bounded(self, slot: int, field: str) -> None:
+        """Every envelope slot is attacker-written, and clipping the ones somebody thought to clip
+        is not a bound: three ``!r:.40`` caps held ``format`` to 130 chars while 200 KB in the
+        fixed-width ``checksum`` slot escaped at 200,162, because rmp_serde's own text quotes the
+        slot it choked on and never passes through a cap. Parametrised over the whole envelope so
+        a fourth slot cannot reopen it."""
         s = _no_arrow()
         data, meta = s.serialize({"a": 1})
         meta.original_type = None
-        envelope = msgpack.unpackb(data)
-        envelope[3] = "A" * 200_000
+        envelope = list(msgpack.unpackb(data))
+        envelope[slot] = "A" * 200_000
 
         with pytest.raises(SerializationError) as exc_info:
             s.deserialize(msgpack.packb(envelope), meta)
-        assert len(str(exc_info.value)) < 200, f"echo not bounded: {len(str(exc_info.value))} chars"
+        assert len(str(exc_info.value)) < ERROR_ECHO_MAX + 200, f"{field} echo not bounded: {len(str(exc_info.value))} chars"
 
     def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
         """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
