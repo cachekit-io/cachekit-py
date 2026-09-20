@@ -18,6 +18,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -66,13 +67,8 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
 
     def test_non_string_original_type_is_corruption_not_tamper(self):
-        """LAB-4350: the header is an AAD *input*, not authenticated content.
-
-        A rotted ``original_type`` (e.g. a list) breaks AAD construction before
-        any tag check runs. That is corruption of the plaintext header, not
-        tamper — it must surface as a plain SerializationError so the read
-        path evicts and recomputes instead of retaining the entry under
-        fail-closed forever."""
+        """LAB-4350: the header is an AAD *input*, not authenticated content —
+        a rotted ``original_type`` is corruption, not tamper."""
         wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
         enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
         meta.original_type = ["rotted"]
@@ -344,16 +340,20 @@ class TestGetCachedValueFailPolicy:
         assert handler.get_cached_value("key:c") is None
         assert strategy.deleted == ["key:c"]
 
-    @pytest.mark.parametrize("rotted", [["json"], {"t": "json"}, 7, True])
+    @pytest.mark.parametrize("rotted", [["json"], {"t": "json"}, 7, True, 0, False, [], {}, "\ud800"])
     def test_fail_closed_rotted_original_type_header_is_miss_and_evicted(self, rotted):
-        """LAB-4350: a non-string ``original_type`` in the stored plaintext header
-        is corruption-class — evicted and recomputed even under fail_closed=True,
-        unlike the tamper-class substitution case above which retains evidence."""
+        """LAB-4350: a non-string or non-encodable ``original_type`` in the stored
+        plaintext header is corruption-class — evicted and recomputed even under
+        fail_closed=True, unlike the tamper-class substitution case above which
+        retains evidence. Falsy values and a lone surrogate must not slip past."""
         handler, strategy, serialization = _make_operation_handler(fail_closed=True)
         entry = serialization.serialize_data({"v": 1}, cache_key="key:d")
         payload, metadata_dict, serializer_name = SerializationWrapper.unwrap(entry)
         metadata_dict["original_type"] = rotted
-        strategy.store["key:d"] = SerializationWrapper.wrap(bytes(payload), metadata_dict, serializer_name)
+        # Plant the frame bytes directly, as a backend writer would: `wrap` itself refuses
+        # a lone surrogate, but `json.loads` on the read side accepts the "\\ud800" escape.
+        header = json.dumps({"s": serializer_name, "m": metadata_dict, "v": "2.0"}).encode()
+        strategy.store["key:d"] = b"CK\x03" + len(header).to_bytes(4, "big") + header + bytes(payload)
         assert handler.get_cached_value("key:d") is None  # miss, not raise
         assert strategy.deleted == ["key:d"]  # self-heals
 

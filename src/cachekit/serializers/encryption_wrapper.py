@@ -401,6 +401,8 @@ class EncryptionWrapper:
                 (``metadata.encrypted=False`` — this wrapper never returns
                 unauthenticated bytes), the tenant mismatches, or AES-GCM
                 authentication fails
+            SerializationError: Corrupt plaintext header (non-string or non-encodable
+                original_type) — corruption-class (evict + recompute), not tamper
             EncryptionError: If deserialization fails after authenticated decryption
 
         Examples:
@@ -518,11 +520,8 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # Build the AAD OUTSIDE the tag-verification try below: the plaintext header
-        # is an AAD *input*, not authenticated content, so a failure here (LAB-4350:
-        # a rotted `original_type`) is header corruption, not tamper. It must reach the
-        # caller as a plain SerializationError (evict + recompute), never be relabelled
-        # DecryptionAuthenticationError and retained forever under fail_closed.
+        # AAD build sits OUTSIDE the tag-verification try: a header-rot failure here is
+        # corruption (evict), never tamper (retained under fail_closed) — see _create_aad.
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -589,6 +588,8 @@ class EncryptionWrapper:
         Raises:
             TypeError: If cache_key is not a string
             ValueError: If cache_key is empty
+            SerializationError: Corrupt plaintext header (non-string or
+                non-encodable original_type) — corruption-class, not tamper
             DecryptionAuthenticationError: When no keyring entry authenticates
                 the ciphertext
             EncryptionError: If deserialization fails after authenticated
@@ -713,16 +714,19 @@ class EncryptionWrapper:
             str(metadata.compressed).encode("utf-8"),
         ]
 
-        if metadata.original_type:
-            # `original_type` arrives untyped from the plaintext CK header (json.loads →
-            # SerializationMetadata.from_dict passes it straight through). The header is
-            # an AAD INPUT, not AEAD-authenticated content, so a non-string here is bit
-            # rot / corruption — a SerializationError the read path evicts — not tamper.
-            if not isinstance(metadata.original_type, str):
-                raise SerializationError(
-                    f"Corrupt frame header: original_type must be a string, got {type(metadata.original_type).__name__}"
-                )
-            components.append(metadata.original_type.encode("utf-8"))
+        # `original_type` arrives untyped from the plaintext CK header (json.loads →
+        # SerializationMetadata.from_dict passes it straight through). The header is an
+        # AAD INPUT, not AEAD-authenticated content, so a non-string or non-encodable
+        # value here is header rot — corruption-class, evicted by the read path — not
+        # tamper. Gate on presence, not truthiness: 0 / False / [] / {} are rot too.
+        original_type = metadata.original_type
+        if original_type is not None and not isinstance(original_type, str):
+            raise SerializationError(f"Corrupt frame header: original_type must be a string, got {type(original_type).__name__}")
+        if original_type:
+            try:
+                components.append(original_type.encode("utf-8"))
+            except UnicodeEncodeError as e:
+                raise SerializationError("Corrupt frame header: original_type is not UTF-8 encodable") from e
 
         # Version byte 0x03 + length-prefixed encoding
         aad = bytes([0x03])  # Version 0x03: includes cache_key binding
