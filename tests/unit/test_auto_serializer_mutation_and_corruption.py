@@ -388,7 +388,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="envelope verification"):
             s.deserialize(msgpack.packb(envelope))
 
-    @pytest.mark.parametrize("claim", ["msgpack", "dataframe", "series", "arrow"])
+    @pytest.mark.parametrize("claim", ["msgpack", "arrow"])  # measured: every non-numpy claim takes one branch
     @pytest.mark.parametrize("writer_integrity", [True, False], ids=["checksummed", "bare"])
     @pytest.mark.parametrize("reader_integrity", [True, False], ids=["reader-on", "reader-off"])
     def test_numpy_bytes_are_refused_when_the_header_names_another_format(
@@ -398,13 +398,8 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         the format-agreement rule this file exists to establish never fired on it — ``"msgpack"``
         over NUMPY_RAW bytes still produced an array, on both readers and both prefix forms.
 
-        NumPy RAISES where Arrow merely skips its gate, because the two are not symmetric:
-        ``serialize`` pins NumPy metadata to ``compressed=False`` (#166 — it feeds the AAD), so
-        the cross-config gate that closes Arrow's skipped case on an integrity-off reader can
-        never fire for NumPy. Skipping would leave the refusal to ``unpackb_bounded`` choking on
-        a digest-prefixed payload: measured closed over 4,000 sampled arrays, but by the msgpack
-        decoder's luck rather than by the rule, and naming the wrong cause. Disagreement is
-        corruption — say so, on the route that saw it."""
+        Both readers and both prefix forms, because the route runs before either is consulted.
+        Why it raises rather than skipping lives in ``deserialize``'s ``Raises:``, once."""
         writer = AutoSerializer(enable_integrity_checking=writer_integrity)
         data, meta = writer.serialize(np.arange(6, dtype=np.int32))
         assert meta.original_type == "numpy"

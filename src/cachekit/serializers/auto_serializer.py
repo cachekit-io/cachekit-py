@@ -609,9 +609,14 @@ class AutoSerializer:
                   likewise. Neither can be an envelope (an envelope is an rmp_serde array whose
                   lead byte is never ``N`` or ``A``), so no collision guard is needed.
                 * both ``NUMPY_RAW`` routes additionally require the header to AGREE (absent or
-                  ``"numpy"``), and raise on a disagreement where the Arrow gate only skips: numpy
-                  metadata is pinned ``compressed=False`` (#166), so the cross-config gate that
-                  closes Arrow's skipped case on an integrity-off reader never fires for numpy.
+                  ``"numpy"``) and RAISE on a disagreement, where the Arrow gate below only skips.
+                  Skipping also fails closed — on the envelope gate for an integrity-on reader, on
+                  ``unpackb_bounded`` refusing the payload for an integrity-off one — but each
+                  names a cause that is not the disagreement, and the cross-config gate cannot
+                  rescue the second: it reads ``metadata.compressed``, which is ``False`` for
+                  every numpy entry (#166, it feeds the AAD) and for an Arrow entry too whenever
+                  ``arrow_compression`` is off. ``compressed=False``, not numpy-vs-Arrow, is the
+                  discriminant.
                 * a header claiming ``"numpy"`` — reaches the numpy decode on the header's word.
 
                 For every other format, with integrity checking ON, an entry that arrives WITH
@@ -658,13 +663,9 @@ class AutoSerializer:
         # b"xxNUMPY_RAW" to the numpy decoder, which read the envelope's first 8 bytes as a
         # digest, failed it, and raised on every read — a permanent miss on a healthy key.
         if data.startswith(b"NUMPY_RAW") or self._checksummed_prefix(data, b"NUMPY_RAW"):
-            # Agreement, same rule as the envelope below — the route had none, so a "msgpack"
-            # header over these bytes still returned an ndarray. It RAISES where the Arrow gate
-            # below merely skips, because the two are not symmetric: serialize() pins numpy
-            # metadata to compressed=False (#166, it feeds the AAD), so the cross-config gate
-            # that catches Arrow's skipped case on an integrity-off reader can never fire here.
-            # Skipping would leave the refusal to unpackb_bounded choking on a digest-prefixed
-            # payload — measured closed, but by the decoder's luck, naming the wrong cause.
+            # Agreement, same rule as the envelope below — this route had none, so a "msgpack"
+            # header over these bytes still returned an ndarray. Why it raises where the Arrow
+            # gate skips: see Raises:, which is the one place that contract is stated.
             if header_format not in (None, "numpy"):
                 raise SerializationError(f"NumPy payload disagrees with header format {header_format!r:.40}")
             return self._deserialize_numpy(data)
@@ -1010,17 +1011,23 @@ class AutoSerializer:
         """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
         slot rotted. Only consulted after ``retrieve()`` already failed to parse ``data``, so
         whichever slot broke the parse is exactly the one that may now look wrong; the other
-        THREE identify the envelope. Requiring all four let a single rotted slot through, and
-        accepting any ONE false-rejects values a caller legitimately cached — an integrity-off
-        writer's ``[1, 2, 3, "msgpack"]`` matched on the format slot alone, a miss that recompute
-        reproduces forever (LAB-4312). Three-of-four still rejects all 175 single-slot rots that
-        reach here, the same set the old rule did: both numbers measured, not reasoned.
+        THREE identify the envelope, and three is exactly what one rot leaves — so requiring all
+        four let a single rotted slot through by construction, not by bad luck. Accepting any ONE
+        instead false-rejects values a caller legitimately cached: an integrity-off writer's
+        ``[1, 2, 3, "msgpack"]`` matched on the format slot alone, a miss recompute reproduces
+        forever (LAB-4312).
 
-        Every slot is matched on the TYPE a real envelope always carries, never on its value
-        alone: ``value[3] in _ENVELOPE_FORMATS`` RAISES ``TypeError`` on an unhashable slot
-        instead of returning False, and that escaped ``deserialize`` uncaught — past every
-        ``except SerializationError`` a caller wrote — wherever ``checksum_ok`` did not
-        short-circuit it away first.
+        Every slot is TYPE-checked before its value is read, so ``in _ENVELOPE_FORMATS`` never
+        sees an unhashable slot — there it RAISES ``TypeError`` rather than returning False, and
+        that escaped ``deserialize`` uncaught, past every ``except SerializationError`` a caller
+        wrote, wherever ``checksum_ok`` did not short-circuit it away first.
+
+        Residual: TWO rotted slots can leave fewer than three intact and decode as the value. The
+        old rule caught some of those incidentally — whichever of checksum/format survived — at
+        the price of the false miss above. Two independent corruptions are the case no in-band
+        check on an unverified envelope closes (LAB-2736), and a crafted entry is out of scope by
+        the same argument: backend write access returns arbitrary values through the plain path
+        with no gate involved.
         """
         if not (isinstance(value, list) and len(value) == 4):
             return False
