@@ -91,19 +91,25 @@ def fn(): return {1, 2, 3}
 
 ## Cross-Config Reads (integrity_checking Mismatch)
 
-When the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's, every path fails closed except DataFrames handled by pyarrow:
+What happens when the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's depends on which path the value takes, not on the direction of the mismatch:
 
-| Written with | Read with | Generic value, Series, or DataFrame without pyarrow | DataFrame with pyarrow |
-|---|---|---|---|
-| `integrity_checking=True` | `integrity_checking=False` | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
-| `integrity_checking=False` | `integrity_checking=True` | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
+| Value | Path | Mismatch in either direction |
+|---|---|---|
+| dict, list, str, set, datetime, … | MessagePack (+ envelope when integrity checking is on) | Raises `SerializationError` (E021) |
+| `pandas.Series`; `pandas.DataFrame` without pyarrow | Columnar MessagePack (+ envelope when on) | Raises `SerializationError` (E021) |
+| `pandas.DataFrame` with pyarrow | [ArrowSerializer](arrow.md) — always checksummed | Decodes; corruption always detected |
+| `numpy.ndarray` | Raw buffer, checksummed only when the **writer** had it on | Decodes; corruption detected only if the writer had it on |
 
-**MessagePack paths** — generic values, Series, and DataFrames only when pyarrow is absent — fail closed in both directions. A reader with integrity checking off has no way to verify or unwrap an envelope, and a reader with it on treats bytes that fail envelope verification as corruption rather than guessing they might be plain MessagePack. (Only when no metadata is passed at all does an integrity-on reader fall back to decoding plain MessagePack.)
+**MessagePack paths** fail closed. A reader with integrity checking off has no way to verify or unwrap an envelope, and a reader with it on treats bytes that fail envelope verification as corruption rather than guessing they might be plain MessagePack. (Only when no metadata is passed at all does an integrity-on reader fall back to decoding plain MessagePack.)
 
-**DataFrames with pyarrow installed** (`pip install 'cachekit[data]'`) have no mismatch to fail on. AutoSerializer hands every DataFrame to [ArrowSerializer](arrow.md), which always writes and validates an 8-byte xxHash3-64 checksum regardless of `integrity_checking` — the setting changes neither the stored bytes nor the verification, so either reader decodes the entry, and both still raise on genuine corruption. What is *not* interchangeable on this path is pyarrow itself: a DataFrame written with pyarrow installed raises `SerializationError` when read by an install without it.
+**DataFrames with pyarrow installed** (`pip install 'cachekit[data]'`) have no mismatch to fail on: ArrowSerializer always writes and validates an 8-byte xxHash3-64 checksum regardless of `integrity_checking`, so either reader decodes the entry and both still raise on corruption. What is *not* interchangeable on this path is pyarrow itself: a DataFrame written with pyarrow installed raises `SerializationError` when read by an install without it.
+
+**NumPy arrays** are the exception to watch. The checksum is a prefix the *writer* adds when its flag is on; the reader verifies it if present and otherwise decodes the raw buffer. An array written with `integrity_checking=False` is therefore never verified — a flipped byte decodes into wrong values even for a reader with the flag on. The reader's setting buys it nothing here; protection depends entirely on the writer's.
+
+In every case the checksum is unkeyed xxHash3-64: it detects corruption, not tampering. Anyone who can write to the backend can recompute it — see [E003](../error-codes.md#e003-decryption-failed---authentication-tag-mismatch) for the encrypted path that does resist tampering.
 
 > [!NOTE]
-> This mismatch isn't reachable through `@cache`: `integrity_checking` is part of the cache key, so a reader configured differently from the writer misses the entry and recomputes it, rather than reading it under the wrong config. The table above only applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata.
+> With the default key derivation this mismatch isn't reachable through `@cache`: `integrity_checking` is part of the generated cache key, so a reader configured differently from the writer misses the entry and recomputes it. That segregation does **not** apply when the key is built another way — `key=`, `fast_mode`, or `interop` — because those keys don't include the flag, so two `@cache` sites differing only in `integrity_checking` share an entry and the table above applies. It also applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata.
 
 See [E021](../error-codes.md#e021-deserialization-failed) for the exact error messages.
 

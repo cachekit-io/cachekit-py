@@ -338,31 +338,36 @@ class TestAutoSerializerDataFrameIsAlwaysChecksummed:
     what ``docs/serializers/auto.md`` documents; pin it so the two cannot drift apart.
     """
 
-    @pytest.mark.parametrize("writer_on", [True, False], ids=["written-on", "written-off"])
-    def test_cross_config_read_decodes(self, writer_on: bool):
-        """Either mismatch direction decodes — there is no envelope whose presence differs."""
-        df = pd.DataFrame({"x": [1.0, 2.0, 3.0], "n": [1, 2, 3]})
-        writer = AutoSerializer(enable_integrity_checking=writer_on)
-        reader = AutoSerializer(enable_integrity_checking=not writer_on)
+    DF = pd.DataFrame({"x": [1.0, 2.0, 3.0], "n": [1, 2, 3]})
 
-        data, metadata = writer.serialize(df)
-        assert metadata.original_type == "arrow"  # delegated, not columnar msgpack
+    def test_writer_flag_does_not_reach_arrow_bytes(self):
+        """The invariant itself: an integrity-off AutoSerializer still delegates to a
+        checksumming ArrowSerializer, and the flag leaves the stored bytes untouched."""
+        off = AutoSerializer(enable_integrity_checking=False)
+        assert off._arrow_serializer is not None
+        data_off, meta_off = off.serialize(self.DF)
+        data_on, _ = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+        assert meta_off.original_type == "arrow"  # delegated, not columnar msgpack
+        assert data_off == data_on
 
-        pd.testing.assert_frame_equal(reader.deserialize(data, metadata), df)
+    def test_cross_config_read_decodes(self):
+        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+        reader = AutoSerializer(enable_integrity_checking=False)
+        pd.testing.assert_frame_equal(reader.deserialize(data, metadata), self.DF)
 
-    @pytest.mark.parametrize("reader_on", [True, False], ids=["reader-on", "reader-off"])
-    def test_corruption_still_raises_under_either_reader(self, reader_on: bool):
+    # 0 = checksum prefix, 10 = inside the ARROW1 magic that both serializers use to
+    # discriminate an Arrow stream from msgpack (the only branch that could sidestep the
+    # checksum), -1 = payload tail.
+    @pytest.mark.parametrize("byte_idx", [0, 10, -1], ids=["checksum", "arrow-magic", "payload"])
+    def test_corruption_still_raises_for_integrity_off_reader(self, byte_idx: int):
         """Decoding across the mismatch is safe only because the checksum is still verified:
-        every byte flip must raise, never return a same-shaped frame with wrong values."""
-        df = pd.DataFrame({"x": [1.0, 2.0, 3.0], "n": [1, 2, 3]})
-        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(df)
-        reader = AutoSerializer(enable_integrity_checking=reader_on)
-
-        for byte_idx in range(0, len(data), max(1, len(data) // 20)):
-            corrupted = bytearray(data)
-            corrupted[byte_idx] ^= 0xFF
-            with pytest.raises(SerializationError):
-                reader.deserialize(bytes(corrupted), metadata)
+        a byte flip must raise, never return a same-shaped frame with wrong values."""
+        data, metadata = AutoSerializer(enable_integrity_checking=True).serialize(self.DF)
+        assert data[8:14] == b"ARROW1"
+        corrupted = bytearray(data)
+        corrupted[byte_idx] ^= 0xFF
+        with pytest.raises(SerializationError):
+            AutoSerializer(enable_integrity_checking=False).deserialize(bytes(corrupted), metadata)
 
 
 class TestIntegrityPerformance:
