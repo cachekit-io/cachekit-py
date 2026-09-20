@@ -371,7 +371,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
-    @pytest.mark.parametrize("slot, bad", [(0, "notbytes"), (1, "AAAA"), (2, "x"), (3, 42), (3, "seriez")])
+    @pytest.mark.parametrize("slot, bad", [(0, "notbytes"), (1, "AAAA"), (2, "x"), (3, 42), (3, "seriez"), (3, ["a"])])
     def test_metadata_absent_read_of_a_rotted_envelope_never_returns_the_envelope_itself(self, slot: int, bad: object) -> None:
         """``deserialize(data)`` with no metadata on an envelope whose checksum / size / format slot
         rotted: ``retrieve()`` cannot parse it, and — because an envelope is itself valid msgpack —
@@ -387,6 +387,74 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         with pytest.raises(SerializationError, match="envelope verification"):
             s.deserialize(msgpack.packb(envelope))
+
+    @pytest.mark.parametrize("claim", ["msgpack", "dataframe", "series", "arrow"])
+    @pytest.mark.parametrize("writer_integrity", [True, False], ids=["checksummed", "bare"])
+    @pytest.mark.parametrize("reader_integrity", [True, False], ids=["reader-on", "reader-off"])
+    def test_numpy_bytes_are_refused_when_the_header_names_another_format(
+        self, claim: str, writer_integrity: bool, reader_integrity: bool
+    ) -> None:
+        """LAB-4312: the structural NumPy route returned an ndarray whatever the header said, so
+        the format-agreement rule this file exists to establish never fired on it — ``"msgpack"``
+        over NUMPY_RAW bytes still produced an array, on both readers and both prefix forms.
+
+        NumPy RAISES where Arrow merely skips its gate, because the two are not symmetric:
+        ``serialize`` pins NumPy metadata to ``compressed=False`` (#166 — it feeds the AAD), so
+        the cross-config gate that closes Arrow's skipped case on an integrity-off reader can
+        never fire for NumPy. Skipping would leave the refusal to ``unpackb_bounded`` choking on
+        a digest-prefixed payload: measured closed over 4,000 sampled arrays, but by the msgpack
+        decoder's luck rather than by the rule, and naming the wrong cause. Disagreement is
+        corruption — say so, on the route that saw it."""
+        writer = AutoSerializer(enable_integrity_checking=writer_integrity)
+        data, meta = writer.serialize(np.arange(6, dtype=np.int32))
+        assert meta.original_type == "numpy"
+        assert (data[:9] == b"NUMPY_RAW") is not writer_integrity, "this test needs both prefix forms"
+        meta.original_type = claim
+
+        with pytest.raises(SerializationError, match="disagrees with header format"):
+            AutoSerializer(enable_integrity_checking=reader_integrity).deserialize(data, meta)
+
+    @pytest.mark.parametrize("claim", ["numpy", None], ids=["agrees", "absent"])
+    @pytest.mark.parametrize("writer_integrity", [True, False], ids=["checksummed", "bare"])
+    def test_numpy_bytes_still_decode_when_the_header_agrees_or_is_absent(
+        self, claim: str | None, writer_integrity: bool
+    ) -> None:
+        """The other half of the gate above. ``None`` is the case it decides: a header that merely
+        LOST ``original_type`` must still reach the numpy decode, exactly as the Arrow gate keeps
+        a degraded-header Arrow entry readable, or the gate trades one false miss for another."""
+        writer = AutoSerializer(enable_integrity_checking=writer_integrity)
+        expected = np.arange(6, dtype=np.int32)
+        data, meta = writer.serialize(expected)
+        meta.original_type = claim
+
+        np.testing.assert_array_equal(AutoSerializer().deserialize(data, meta), expected)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [1, 2, 3, "msgpack"],
+            [1, 2, 3, "dataframe"],
+            ["a", "b", "c", "series"],
+            [None, None, None, "series"],
+            [1, 2, 3, ["a"]],
+            [1, 2, 3, {"k": 1}],
+        ],
+        ids=["ints-msgpack", "ints-dataframe", "strs-series", "nones-series", "unhashable-list", "unhashable-dict"],
+    )
+    def test_a_legitimate_four_element_list_is_not_mistaken_for_an_envelope(self, value: list) -> None:
+        """LAB-4312: the shape test accepted the format slot ALONE as proof, so an integrity-off
+        writer's plain-msgpack ``[1, 2, 3, "msgpack"]``, read back by an integrity-on serializer
+        with no metadata, decoded fine and was then rejected as a corrupt envelope. Recompute is
+        deterministic, so that miss never self-heals — the offset-8 magic collision's class,
+        through the other door.
+
+        The last two rows are its unfiled sibling: ``value[3] in _ENVELOPE_FORMATS`` on an
+        unhashable slot does not evaluate False, it raises ``TypeError`` — straight out of
+        ``deserialize``, past every ``except SerializationError`` a caller wrote. It only stayed
+        hidden because ``checksum_ok or ...`` short-circuited whenever slot 1 survived."""
+        data, _ = AutoSerializer(enable_integrity_checking=False).serialize(value)
+
+        assert AutoSerializer(enable_integrity_checking=True).deserialize(data) == value
 
     @pytest.mark.parametrize("metadata_present", [True, False], ids=["with-metadata", "no-metadata"])
     @pytest.mark.parametrize("slot, field", [(0, "data"), (1, "checksum"), (2, "original_size"), (3, "format")])

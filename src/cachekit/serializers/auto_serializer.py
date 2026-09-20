@@ -608,6 +608,10 @@ class AutoSerializer:
                 * bare ``NUMPY_RAW`` at offset 0 — verifies NOTHING. Legacy bare ``[ARROW1]``
                   likewise. Neither can be an envelope (an envelope is an rmp_serde array whose
                   lead byte is never ``N`` or ``A``), so no collision guard is needed.
+                * both ``NUMPY_RAW`` routes additionally require the header to AGREE (absent or
+                  ``"numpy"``), and raise on a disagreement where the Arrow gate only skips: numpy
+                  metadata is pinned ``compressed=False`` (#166), so the cross-config gate that
+                  closes Arrow's skipped case on an integrity-off reader never fires for numpy.
                 * a header claiming ``"numpy"`` — reaches the numpy decode on the header's word.
 
                 For every other format, with integrity checking ON, an entry that arrives WITH
@@ -654,6 +658,15 @@ class AutoSerializer:
         # b"xxNUMPY_RAW" to the numpy decoder, which read the envelope's first 8 bytes as a
         # digest, failed it, and raised on every read — a permanent miss on a healthy key.
         if data.startswith(b"NUMPY_RAW") or self._checksummed_prefix(data, b"NUMPY_RAW"):
+            # Agreement, same rule as the envelope below — the route had none, so a "msgpack"
+            # header over these bytes still returned an ndarray. It RAISES where the Arrow gate
+            # below merely skips, because the two are not symmetric: serialize() pins numpy
+            # metadata to compressed=False (#166, it feeds the AAD), so the cross-config gate
+            # that catches Arrow's skipped case on an integrity-off reader can never fire here.
+            # Skipping would leave the refusal to unpackb_bounded choking on a digest-prefixed
+            # payload — measured closed, but by the decoder's luck, naming the wrong cause.
+            if header_format not in (None, "numpy"):
+                raise SerializationError(f"NumPy payload disagrees with header format {header_format!r:.40}")
             return self._deserialize_numpy(data)
 
         # Arrow IPC — [8-byte xxHash3-64][ARROW1...] or bare [ARROW1...]. Detected by structure
@@ -996,15 +1009,28 @@ class AutoSerializer:
     def _looks_like_envelope(value: object) -> bool:
         """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
         slot rotted. Only consulted after ``retrieve()`` already failed to parse ``data``, so
-        whichever slot broke the parse is exactly the one that may now look wrong; the envelope
-        is recognised by the OTHER slots, any one of which the writer never varies and a value
-        cannot plausibly imitate by accident. Requiring all of them, or only the format, each
-        let a single rotted slot through — measured, not reasoned.
+        whichever slot broke the parse is exactly the one that may now look wrong; the other
+        THREE identify the envelope. Requiring all four let a single rotted slot through, and
+        accepting any ONE false-rejects values a caller legitimately cached — an integrity-off
+        writer's ``[1, 2, 3, "msgpack"]`` matched on the format slot alone, a miss that recompute
+        reproduces forever (LAB-4312). Three-of-four still rejects all 175 single-slot rots that
+        reach here, the same set the old rule did: both numbers measured, not reasoned.
+
+        Every slot is matched on the TYPE a real envelope always carries, never on its value
+        alone: ``value[3] in _ENVELOPE_FORMATS`` RAISES ``TypeError`` on an unhashable slot
+        instead of returning False, and that escaped ``deserialize`` uncaught — past every
+        ``except SerializationError`` a caller wrote — wherever ``checksum_ok`` did not
+        short-circuit it away first.
         """
         if not (isinstance(value, list) and len(value) == 4):
             return False
-        checksum_ok = isinstance(value[1], list) and len(value[1]) == 8 and all(isinstance(b, int) for b in value[1])
-        return checksum_ok or value[3] in _ENVELOPE_FORMATS
+        payload_ok = isinstance(value[0], bytes)
+        checksum_ok = (
+            isinstance(value[1], list) and len(value[1]) == 8 and all(type(b) is int and 0 <= b <= 255 for b in value[1])
+        )
+        size_ok = type(value[2]) is int and value[2] >= 0
+        format_ok = isinstance(value[3], str) and value[3] in _ENVELOPE_FORMATS
+        return sum((payload_ok, checksum_ok, size_ok, format_ok)) >= 3
 
     @staticmethod
     def _envelope_failure(cause: Exception | str) -> SerializationError:
