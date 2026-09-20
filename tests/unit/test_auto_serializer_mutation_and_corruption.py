@@ -355,13 +355,49 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    def test_an_envelope_whose_bytes_contain_numpy_magic_is_not_hijacked(self, metadata_present: bool) -> None:
+        """The NUMPY_RAW twin of the Arrow case above, and strictly worse before the fix: the numpy
+        arm had no digest gate at all, so ``b"xxNUMPY_RAW..."`` — a checksum-intact envelope, header
+        ``"msgpack"`` and correct — was handed to the numpy decoder on every read, which took the
+        envelope's first 8 bytes for a digest, failed it, and raised. A permanent miss on a healthy
+        key, with a backend write per call. Both magics now go through one ``_checksummed_prefix``."""
+        s = AutoSerializer()
+        value = b"xxNUMPY_RAW" + b"z" * 20
+        data, meta = s.serialize(value)
+        assert data[8:17] == b"NUMPY_RAW", "this test needs the magic collision it guards against"
+        assert xxhash.xxh3_64_digest(data[8:]) != data[:8], "...and those bytes must not be a real NumPy checksum"
+        assert meta.original_type == "msgpack"
+
+        assert s.deserialize(data, meta if metadata_present else None) == value
+
+    @pytest.mark.parametrize("slot, bad", [(0, "notbytes"), (1, "AAAA"), (2, "x"), (3, 42), (3, "seriez")])
+    def test_metadata_absent_read_of_a_rotted_envelope_never_returns_the_envelope_itself(self, slot: int, bad: object) -> None:
+        """``deserialize(data)`` with no metadata on an envelope whose checksum / size / format slot
+        rotted: ``retrieve()`` cannot parse it, and — because an envelope is itself valid msgpack —
+        the plain-msgpack fall-through then returned ``[compressed_payload, checksum, size, fmt]``
+        as the cached value. Silent wrong data on the public direct API, the exact shape the
+        verified-envelope branch was written to close. Every slot, because a shape test keyed on
+        the format alone waved ``42`` through and one keyed on the checksum waved ``"AAAA"``
+        through: the envelope is recognised by whichever invariant slot survived."""
+        s = AutoSerializer()
+        data, _ = s.serialize({"token": "secret"})
+        envelope = list(msgpack.unpackb(data))
+        envelope[slot] = bad
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(msgpack.packb(envelope))
+
+    @pytest.mark.parametrize("metadata_present", [True, False], ids=["with-metadata", "no-metadata"])
     @pytest.mark.parametrize("slot, field", [(0, "data"), (1, "checksum"), (2, "original_size"), (3, "format")])
-    def test_the_echoed_envelope_failure_is_length_bounded(self, slot: int, field: str) -> None:
+    def test_the_echoed_envelope_failure_is_length_bounded(self, slot: int, field: str, metadata_present: bool) -> None:
         """Every envelope slot is attacker-written, and clipping the ones somebody thought to clip
         is not a bound: three ``!r:.40`` caps held ``format`` to 130 chars while 200 KB in the
         fixed-width ``checksum`` slot escaped at 200,162, because rmp_serde's own text quotes the
         slot it choked on and never passes through a cap. Parametrised over the whole envelope so
-        a fourth slot cannot reopen it."""
+        a fourth slot cannot reopen it — and over both metadata states, because bounding one
+        raise site (``_envelope_failure``) left the metadata-absent tail at 200,201: the bound is
+        a property of the read path, so every re-raise that quotes an untrusted cause carries it."""
         s = _no_arrow()
         data, meta = s.serialize({"a": 1})
         meta.original_type = None
@@ -369,7 +405,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         envelope[slot] = "A" * 200_000
 
         with pytest.raises(SerializationError) as exc_info:
-            s.deserialize(msgpack.packb(envelope), meta)
+            s.deserialize(msgpack.packb(envelope) + b"\xc1", meta if metadata_present else None)
         assert len(str(exc_info.value)) < ERROR_ECHO_MAX + 200, f"{field} echo not bounded: {len(str(exc_info.value))} chars"
 
     def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
@@ -544,10 +580,12 @@ class TestForgedEntryErrorEchoIsBounded:
         assert not any(ch in unsafe for ch in "\n\r\x1b\x0b" + chr(0x2028))
         assert "\\x1b" in unsafe
 
-    def test_forged_dtype_produces_an_unbounded_message(self) -> None:
-        # Guards the premise: without the bound the echoed text really is huge (the 4 KB dtype is
-        # in there in full), so the assertions below are proving the bound does real work.
-        assert len(str(_oversized_forged_error())) > 4096
+    def test_forged_dtype_error_is_bounded_at_the_columnar_wrap(self) -> None:
+        # The columnar wrap is itself a re-raise site that interpolates an untrusted cause: a
+        # forged 200 KB dtype inside a checksum-VALID envelope came out at 200,078 chars through
+        # it while every other site was bounded. The bound belongs to the read path, not to one
+        # function. (That the raw dtype text is huge is proven by bounded_error's own test above.)
+        assert len(str(_oversized_forged_error())) < ERROR_ECHO_MAX + 200
 
     def test_handle_decrypt_failure_warning_line_is_bounded(self, caplog) -> None:
         # _handle_l2_read_error and the wrapper L1 SerializationError guard both route the poisoned

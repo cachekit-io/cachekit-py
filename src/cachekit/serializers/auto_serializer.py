@@ -595,14 +595,19 @@ class AutoSerializer:
                 disagree.
 
                 **Verification.** Arrow and ``NUMPY_RAW`` never travel inside a ByteStorage
-                envelope, so three routes decide a decode with no ``retrieve()`` behind them.
+                envelope, so with integrity checking ON, three routes decide a decode with no
+                ``retrieve()`` behind them (with it OFF there are more — see the last paragraph).
                 Listed by route, not by direction, because the way this contract keeps going
                 wrong is a sweeping claim true of every path its author enumerated:
 
-                * ``[xxh3][ARROW1]`` — routed only when that prefix authenticates, so a value
-                  whose own bytes contain the magic stays on the envelope path.
-                * ``NUMPY_RAW`` — the ``[xxh3]`` prefix is verified when present; bare, it
-                  verifies NOTHING. Legacy bare ``[ARROW1]`` likewise.
+                * ``[xxh3][ARROW1]`` and ``[xxh3][NUMPY_RAW]`` — routed only when that prefix
+                  matches the body's digest (``_checksummed_prefix``). LZ4 emits literals
+                  verbatim, so a value that merely CONTAINS either magic lands it at envelope
+                  offset 8; the digest check disambiguates a real prefix from that collision.
+                  It is not authentication — the digest is unkeyed.
+                * bare ``NUMPY_RAW`` at offset 0 — verifies NOTHING. Legacy bare ``[ARROW1]``
+                  likewise. Neither can be an envelope (an envelope is an rmp_serde array whose
+                  lead byte is never ``N`` or ``A``), so no collision guard is needed.
                 * a header claiming ``"numpy"`` — reaches the numpy decode on the header's word.
 
                 For every other format, with integrity checking ON, an entry that arrives WITH
@@ -611,8 +616,11 @@ class AutoSerializer:
                 from bytes nothing verified (matching :class:`StandardSerializer`). Apart from
                 the three routes above, no field of ``metadata`` re-opens that fall-through — the CK header is plaintext, so one flipped byte there must not
                 decide whether verification happens. The only other fall-through is a call with
-                NO metadata (``deserialize(data)``, the direct-API contract), where the
-                plain-msgpack decode's own structural validation is what catches a forged entry.
+                NO metadata (``deserialize(data)``, the direct-API contract). A ByteStorage
+                envelope is itself valid msgpack — ``[bytes, [8 ints], int, format]`` — so the
+                plain decode cannot tell a corrupt envelope from a value by structure alone; a
+                decode that still shows an envelope's invariant slots (``_looks_like_envelope``)
+                is rejected as an envelope that failed to verify, never returned as the value.
 
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
@@ -639,11 +647,13 @@ class AutoSerializer:
         # is how a header-sourced value reached a variable holding the envelope's format before.
         header_format = getattr(metadata, "original_type", None)
 
-        # Custom NumPy format — raw [NUMPY_RAW...] or checksummed [8-byte xxHash3-64][NUMPY_RAW...].
-        # Detect by structure (like ArrowSerializer) so it is caught here, before the lossy
-        # retrieve()/msgpack fallback below — _deserialize_numpy strips + verifies the optional
-        # checksum and fails closed on mismatch (#155), even when no metadata is supplied.
-        if data.startswith(b"NUMPY_RAW") or (len(data) >= 17 and data[8:17] == b"NUMPY_RAW"):
+        # Custom NumPy format — bare [NUMPY_RAW...] or checksummed [8-byte xxHash3-64][NUMPY_RAW...].
+        # Detected by structure BEFORE the envelope path, even with no metadata. The checksummed
+        # arm goes through _checksummed_prefix, the same gate as Arrow below: a bare offset-8
+        # magic test handed a checksum-intact ByteStorage entry whose VALUE merely began
+        # b"xxNUMPY_RAW" to the numpy decoder, which read the envelope's first 8 bytes as a
+        # digest, failed it, and raised on every read — a permanent miss on a healthy key.
+        if data.startswith(b"NUMPY_RAW") or self._checksummed_prefix(data, b"NUMPY_RAW"):
             return self._deserialize_numpy(data)
 
         # Arrow IPC — [8-byte xxHash3-64][ARROW1...] or bare [ARROW1...]. Detected by structure
@@ -652,13 +662,7 @@ class AutoSerializer:
         # original_type is recoverable here rather than failing closed as an unparseable envelope.
         # A header naming a different format contradicts these bytes, so it is left to the
         # fail-closed gate below instead of being decoded on the strength of either one.
-        # The checksummed arm AUTHENTICATES, it does not sniff: LZ4 emits literals verbatim, so a
-        # value that merely contains b"ARROW1" lands it at envelope offset 8, and a bare marker
-        # test then hands a checksum-intact ByteStorage entry to the Arrow decoder, which calls it
-        # corrupt. The bare arm needs no guard — an envelope is an rmp_serde array, never "A" at 0.
-        if header_format in (None, "arrow") and (
-            data[:6] == b"ARROW1" or (data[8:14] == b"ARROW1" and xxhash.xxh3_64_digest(data[8:]) == data[:8])
-        ):
+        if header_format in (None, "arrow") and (data[:6] == b"ARROW1" or self._checksummed_prefix(data, b"ARROW1")):
             if self._arrow_serializer is None:
                 raise SerializationError(
                     "Cannot deserialize Arrow format: ArrowSerializer not available. Install with: pip install 'cachekit[data]'"
@@ -672,7 +676,10 @@ class AutoSerializer:
             # From here down (dataframe, series, generic msgpack) metadata.compressed records whether
             # the writer enveloped the entry — numpy/arrow routed out above, their flag means codec.
             # An integrity-off reader cannot verify or unwrap it: fail closed (see Raises: above).
-            if metadata.compressed and not self.enable_integrity_checking:
+            # Arrow is excluded: ArrowSerializer checksums unconditionally, so a corrupt Arrow entry
+            # was never "written with integrity checking on" in any sense this reader can act on,
+            # and this message would route an operator to flip a setting that cannot fix it.
+            if metadata.compressed and not self.enable_integrity_checking and header_format != "arrow":
                 raise SerializationError(
                     "Cache entry was written with integrity checking on but this reader has "
                     f"integrity checking disabled (format={header_format!r:.40})"
@@ -723,7 +730,8 @@ class AutoSerializer:
                     return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
                 except PAYLOAD_DECODE_ERRORS as e:
                     raise SerializationError(
-                        f"Cache entry payload failed to decode inside a verified envelope (format={format_id!r:.40}): {e}"
+                        f"Cache entry payload failed to decode inside a verified envelope (format={format_id!r:.40}): "
+                        f"{bounded_error(e)}"
                     ) from e
 
         # Reached with integrity on when retrieve() raised the "not an envelope" ValueError
@@ -735,17 +743,26 @@ class AutoSerializer:
 
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
-            return unpackb_bounded(data, **self._msgpack_unpack_opts)
+            value = unpackb_bounded(data, **self._msgpack_unpack_opts)
         except PAYLOAD_DECODE_ERRORS as msgpack_error:
             # NUMPY_RAW entries were routed structurally at the top, so nothing reaching here can be
             # a NumPy payload (and a NumPy attempt would raise RuntimeError without the [data]
             # extra). Report every reason for the miss: the msgpack one is the decode-bound
-            # rejection for a forged entry and must not vanish behind the envelope error.
+            # rejection for a forged entry and must not vanish behind the envelope error. Both
+            # causes quote untrusted bytes, so both are bounded here.
             raise SerializationError(
                 "Cache entry is not a decodable MessagePack payload"
-                f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
-                f" (msgpack: {msgpack_error})"
+                f"{f' (envelope: {bounded_error(envelope_error)})' if envelope_error else ''}"
+                f" (msgpack: {bounded_error(msgpack_error)})"
             ) from msgpack_error
+        # A ByteStorage envelope IS valid msgpack: rmp_serde writes StorageEnvelope as the array
+        # [compressed_data, checksum, original_size, format]. So when retrieve() could not parse
+        # one (a rotted checksum or size slot) and no metadata forced the fail-closed gate above,
+        # this decode succeeds and would hand back those four slots — compressed payload in
+        # slot 0 — as the cached value. That shape is an envelope, not a value: reject it.
+        if envelope_error is not None and self._looks_like_envelope(value):
+            raise self._envelope_failure(envelope_error) from envelope_error
+        return value
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
         """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.
@@ -805,10 +822,9 @@ class AutoSerializer:
         # [8-byte checksum][NUMPY_RAW...]; a raw entry (integrity-off / legacy) is [NUMPY_RAW...].
         # A mismatch fails closed (#155) — never reconstructs the corrupted array.
         if not data.startswith(b"NUMPY_RAW") and len(data) >= 17 and data[8:17] == b"NUMPY_RAW":
-            body = data[8:]
-            if xxhash.xxh3_64_digest(body) != data[:8]:
+            if xxhash.xxh3_64_digest(memoryview(data)[8:]) != data[:8]:
                 raise SerializationError("NumPy integrity check failed: xxHash3-64 checksum mismatch (corrupted cache entry)")
-            data = body
+            data = data[8:]
 
         if not data.startswith(b"NUMPY_RAW"):
             raise SerializationError("Invalid NumPy data format - expected NUMPY_RAW header")
@@ -965,6 +981,32 @@ class AutoSerializer:
         return series
 
     @staticmethod
+    def _checksummed_prefix(data: bytes, magic: bytes) -> bool:
+        """True iff ``data`` is ``[8-byte xxHash3-64][magic...]`` and the digest matches the body.
+
+        One gate for both self-checksummed formats (Arrow, NumPy). It disambiguates a real
+        prefix from an LZ4 literal collision — a value that merely CONTAINS ``magic`` lands it at
+        envelope offset 8 — and is not authentication: the digest is unkeyed. ``memoryview``
+        avoids the full-body copy ``data[8:]`` would make on every read of a large frame.
+        """
+        end = 8 + len(magic)
+        return len(data) > end and data[8:end] == magic and xxhash.xxh3_64_digest(memoryview(data)[8:]) == data[:8]
+
+    @staticmethod
+    def _looks_like_envelope(value: Any) -> bool:
+        """A decoded ``StorageEnvelope`` — ``[bytes, [8 ints], int, format]`` — with at most one
+        slot rotted. Only consulted after ``retrieve()`` already failed to parse ``data``, so
+        whichever slot broke the parse is exactly the one that may now look wrong; the envelope
+        is recognised by the OTHER slots, any one of which the writer never varies and a value
+        cannot plausibly imitate by accident. Requiring all of them, or only the format, each
+        let a single rotted slot through — measured, not reasoned.
+        """
+        if not (isinstance(value, list) and len(value) == 4):
+            return False
+        checksum_ok = isinstance(value[1], list) and len(value[1]) == 8 and all(isinstance(b, int) for b in value[1])
+        return checksum_ok or value[3] in _ENVELOPE_FORMATS
+
+    @staticmethod
     def _envelope_failure(cause: Exception | str) -> SerializationError:
         """One canonical ``SerializationError`` for every envelope-verification failure in
         ``deserialize`` — see its ``Raises:`` section for the fail-closed contract this backs.
@@ -992,7 +1034,7 @@ class AutoSerializer:
         try:
             return build(unpackb_bounded(payload, **self._msgpack_unpack_opts))
         except PAYLOAD_DECODE_ERRORS as e:
-            raise SerializationError(f"Cache entry payload failed to decode as {kind}: {e}") from e
+            raise SerializationError(f"Cache entry payload failed to decode as {kind}: {bounded_error(e)}") from e
 
     def _serialize_msgpack(self, obj: Any) -> bytes:
         """Serialize general object with MessagePack."""
