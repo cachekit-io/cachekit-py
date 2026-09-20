@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import functools
 import logging
+from collections.abc import Callable
 from unittest import mock
 
 import msgpack
@@ -300,6 +301,46 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError, match="disagrees with header format"):
             s.deserialize(data, meta)
 
+    @pytest.mark.parametrize(
+        "claim",
+        [["a"], {"a": 1}, 7, True, b"msgpack"],
+        ids=["list", "dict", "int", "bool", "bytes"],
+    )
+    def test_a_header_format_that_is_not_a_string_is_refused_before_anything_reads_it(self, claim: object) -> None:
+        """``original_type`` is not typed anywhere it is filled: the CK header is plaintext JSON
+        and ``SerializationMetadata.from_dict`` hands ``data.get("original_type")`` straight
+        through, so this slot arrives holding whatever decoded. Pinned on the NUMPY route, which
+        reaches the claim before any envelope work. The message must name the TYPE and never the
+        claim — the sites that echo one run ``repr`` before ``:.40`` truncates, so an oversized
+        claim is rendered whole to emit 40 characters and a nested one raises ``RecursionError``,
+        which is not a ``SerializationError`` and escapes every caller's ``except``."""
+        s = AutoSerializer()
+        data, meta = s.serialize(np.arange(4))
+        assert meta.original_type == "numpy"
+        meta.original_type = claim
+
+        with pytest.raises(SerializationError, match="not a string") as caught:
+            s.deserialize(data, meta)
+        assert type(claim).__name__ in str(caught.value)
+        assert repr(claim) not in str(caught.value), "the claim itself must never be rendered"
+
+    def test_a_header_rotted_to_a_non_string_no_longer_returns_the_envelope_body_as_the_value(self) -> None:
+        """Why the type check is not tidying-up. A non-str matches NO branch: it is not
+        ``"numpy"``, not in ``(None, "arrow")``, not in ``("dataframe", "series")`` — so an
+        integrity-off ``series`` entry whose header rotted to a dict skipped the columnar
+        decode, skipped every gate (no envelope is built with integrity off), decoded the
+        columnar body as plain msgpack, and returned it. A ``Series`` came back as a ``dict``,
+        no error raised — the silent-wrong-type class this whole file exists to prevent. The
+        equality chain could never have caught it: ``x in (tuple)`` compares and never hashes,
+        so a non-str disagrees with every format without being read as wrong."""
+        s = _no_arrow(enable_integrity_checking=False)
+        data, meta = s.serialize(pd.Series([10.0, 20.0, 30.0], name="prices"))
+        assert meta.original_type == "series"
+        meta.original_type = {"rot": 1}
+
+        with pytest.raises(SerializationError, match="not a string"):
+            s.deserialize(data, meta)
+
     def test_an_unknown_envelope_format_fails_closed_rather_than_decoding_as_msgpack(self) -> None:
         """Rotted to an unknown value the envelope's format used to miss every branch and fall
         to ``unpackb_bounded``, handing back a dict for a checksum-verified Series."""
@@ -395,7 +436,9 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         ],
         ids=["no-metadata", "header-arrow", "compressed-false", "compressed-key-absent"],
     )
-    def test_integrity_off_reader_never_returns_a_healthy_envelope_as_the_value(self, make_metadata) -> None:
+    def test_integrity_off_reader_never_returns_a_healthy_envelope_as_the_value(
+        self, make_metadata: Callable[[SerializationMetadata], SerializationMetadata | None]
+    ) -> None:
         """An integrity-OFF reader builds no ByteStorage, so the whole retrieve() block is skipped
         and ``envelope_error`` stays None. Gating the shape check on ``envelope_error`` alone
         therefore never ran it for that reader, and a HEALTHY, uncorrupted envelope — no rot, no
@@ -408,7 +451,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         93% of the escapes went through the case the test did not have."""
         writer = AutoSerializer(enable_integrity_checking=True)
         reader = AutoSerializer(enable_integrity_checking=False)
-        data, meta = writer.serialize({"token": "secret"})
+        data, meta = writer.serialize({"field": "value"})
 
         with pytest.raises(SerializationError):
             reader.deserialize(data, make_metadata(meta))

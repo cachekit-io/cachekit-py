@@ -640,12 +640,45 @@ class AutoSerializer:
                 (:meth:`_parses_as_envelope`). Shape cannot make that call — values a caller
                 legitimately cached score a perfect 4/4 — so it only pre-filters; the parse decides.
 
+                **Metadata-free reads assume the writer's configuration.** A read with no metadata
+                cannot identify the writer, so it is defined only when reader and writer agree on
+                ``enable_integrity_checking``. Nothing has to enforce that on the normal path:
+                :meth:`CacheKeyGenerator.generate_key` puts that flag in the key suffix, so a
+                reconfigured reader misses rather than crossing. It is the
+                direct serializer API and a hand-reused raw key that can cross, and there one arm
+                has no parse to appeal to — when ``retrieve()`` already failed, a re-parse fails the
+                same way, so shape DECIDES and a value shaped >=3/4 like an envelope is refused.
+                That residual is the price of not adding a wire discriminator to tell an envelope
+                from a list, which would be a format change (LAB-2736), not a read-path fix.
+
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
                 payload bytes ONLY, so NEITHER copy is verified. Electing either to override
                 the other just moves the hole to the other field, so instead: ``format_id``
                 must be one :meth:`serialize` can write, and a header claim that is present
                 must equal it. A disagreement is corruption -> raise -> evict and recompute.
+
+                A present claim must also BE a string, checked once where this method reads it.
+                The header is plaintext JSON and ``SerializationMetadata.from_dict`` does not type
+                this slot, so it arrives holding whatever decoded — and a non-str was NOT merely
+                an untidy fail-closed. It matches no branch, so an integrity-off ``series`` entry
+                whose header rotted to a dict skipped the columnar decode, skipped every gate,
+                and returned the envelope body: a ``Series`` came back as a ``dict``, no error
+                (measured). Nothing downstream could catch it, because ``x in (tuple)`` compares
+                and never hashes — a non-str disagrees with every format without ever being read
+                as wrong.
+
+                The message names the TYPE, never the claim: the sites that echo it run ``repr``
+                BEFORE ``:.40`` truncates, so an oversized claim is rendered whole to emit 40
+                chars, and a deeply nested one raises ``RecursionError`` — not a
+                ``SerializationError``, so it escapes past every ``except SerializationError`` a
+                direct caller wrote. Typing the slot closes the nesting half outright (only a
+                non-str nests) and leaves the size half open to a huge ``str``, which needs the
+                backend write access already out of scope above. What keeps the nesting case
+                away from a stored entry is that ``json.loads`` in ``SerializationWrapper.unwrap``
+                gives out first — but that ordering is one shared C stack, it moves between
+                processes of the same interpreter, and for a list the margin is a single frame.
+                No number for it is reproducible; the check is here so the ordering need not hold.
 
                 This is corruption and bit-rot containment, NOT an anti-tamper control: the
                 checksum is unkeyed, so anyone who can rewrite one field can rewrite both and
@@ -666,7 +699,12 @@ class AutoSerializer:
         data = bytes(data)
         # The header's claim about the stored format. Read once: binding it twice under two names
         # is how a header-sourced value reached a variable holding the envelope's format before.
+        # Typed once too, here rather than at each of the three sites that compare or echo it —
+        # see Raises:. A non-str is not a format claim; without this it merely disagreed with
+        # every format by accident, since `in (tuple)` compares and never hashes.
         header_format = getattr(metadata, "original_type", None)
+        if header_format is not None and not isinstance(header_format, str):
+            raise SerializationError(f"Cache entry header claims a {type(header_format).__name__} format, not a string")
 
         # Custom NumPy format — bare [NUMPY_RAW...] or checksummed [8-byte xxHash3-64][NUMPY_RAW...].
         # Detected by structure BEFORE the envelope path, even with no metadata. The checksummed
@@ -1037,14 +1075,27 @@ class AutoSerializer:
         rejects both and accepts the healthy envelope. Scoring asks what the bytes look like; the
         question is whether a checksum vouches for them, and only ``retrieve()`` answers that.
 
-        Any failure means "not an envelope", so the catch is deliberately broad: a narrower one
-        lets an unanticipated exception type escape ``deserialize`` past every
-        ``except SerializationError`` a caller wrote, which is the shape of the ``TypeError``
-        escape this predicate replaced.
+        Any failure means "not an envelope", so the catch is deliberately broad, and a narrower
+        one is a guess at a boundary that does not answer. ``EnvelopeIntegrityError`` subclasses
+        ``ValueError``, so the obvious ``(KeyError, ValueError, TimeoutError)`` narrowing does
+        cover the expected failure — but ``_byte_storage`` is a PyO3 type whose ``retrieve``
+        raises a bare ``TypeError`` for a non-bytes argument, which is not a
+        ``SerializationError`` and escapes ``deserialize`` past every caller's ``except``: the
+        exact shape this predicate replaced. Broad is not total either — PyO3 maps a Rust panic
+        to ``PanicException``, which derives from ``BaseException`` and is not caught here.
         """
         try:
             self._byte_storage.retrieve(data)
-        except Exception:
+        except Exception as e:
+            # Logged, not swallowed: False here RETURNS the value, so this is the permissive
+            # answer and otherwise the only gate in the decode path that declines without a
+            # record. _looks_like_envelope does NOT make it rare — it accepts 3-of-4, and the
+            # values it says score 4/4 are ones a caller legitimately cached, so a single such
+            # entry logs on EVERY read. Hence isEnabledFor: the argument is evaluated eagerly
+            # whichever formatting style is used, and redact_error_for_log costs 0.34 us against
+            # the 1.75 us/op this path exists to protect. Guarded, 0.06 us.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Envelope re-parse declined %d bytes: %s", len(data), redact_error_for_log(e))
             return False
         return True
 
