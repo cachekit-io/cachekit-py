@@ -89,7 +89,7 @@ def your_function(args):
 - **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
-- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Outside of `@cache` (which key-segregates it automatically), a writer/reader mismatch raises E021 except for a generic value written with it off and read with it on, which decodes normally — see [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
+- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Outside of `@cache` (which key-segregates it automatically), a writer/reader mismatch raises E021 for a Series, and for a generic value written with it on; a generic value written with it off decodes normally, as does a DataFrame when pyarrow is installed (those are always checksum-verified, whatever this flag says) — see [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
 - **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
 
 #### Performance Parameters
