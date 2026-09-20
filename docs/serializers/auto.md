@@ -91,23 +91,21 @@ def fn(): return {1, 2, 3}
 
 ## Cross-Config Reads (integrity_checking Mismatch)
 
-When the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's, the outcome depends on the direction, the value type, and — for DataFrames — whether pyarrow is installed:
+When the reader's `integrity_checking` (see [API Reference](../api-reference.md#core-parameters)) differs from the writer's, every path fails closed except DataFrames handled by pyarrow:
 
-| Written with | Read with | Generic value (dict, list, etc.) | Series, or DataFrame without pyarrow | DataFrame with pyarrow |
-|---|---|---|---|---|
-| `integrity_checking=True` | `integrity_checking=False` | Raises `SerializationError` (E021) | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
-| `integrity_checking=False` | `integrity_checking=True` | Decodes normally — there's no envelope to verify | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
+| Written with | Read with | Generic value, Series, or DataFrame without pyarrow | DataFrame with pyarrow |
+|---|---|---|---|
+| `integrity_checking=True` | `integrity_checking=False` | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
+| `integrity_checking=False` | `integrity_checking=True` | Raises `SerializationError` (E021) | Decodes normally — always checksum-verified |
 
-**Columnar MessagePack** — Series, and DataFrames only when pyarrow is absent — fails closed in both directions: a same-shaped object with silently wrong values is far more dangerous than an explicit error.
-
-**Generic values** written with integrity checking off have no envelope at all, so a reader with it on just decodes the plain MessagePack.
+**MessagePack paths** — generic values, Series, and DataFrames only when pyarrow is absent — fail closed in both directions. A reader with integrity checking off has no way to verify or unwrap an envelope, and a reader with it on treats bytes that fail envelope verification as corruption rather than guessing they might be plain MessagePack. (Only when no metadata is passed at all does an integrity-on reader fall back to decoding plain MessagePack.)
 
 **DataFrames with pyarrow installed** (`pip install 'cachekit[data]'`) have no mismatch to fail on. AutoSerializer hands every DataFrame to [ArrowSerializer](arrow.md), which always writes and validates an 8-byte xxHash3-64 checksum regardless of `integrity_checking` — the setting changes neither the stored bytes nor the verification, so either reader decodes the entry, and both still raise on genuine corruption. What is *not* interchangeable on this path is pyarrow itself: a DataFrame written with pyarrow installed raises `SerializationError` when read by an install without it.
 
 > [!NOTE]
 > This mismatch isn't reachable through `@cache`: `integrity_checking` is part of the cache key, so a reader configured differently from the writer misses the entry and recomputes it, rather than reading it under the wrong config. The table above only applies to direct `AutoSerializer.serialize()` / `.deserialize()` calls with hand-passed metadata.
 
-See [E021](../error-codes.md#e021-deserialization-failed) for the exact error message.
+See [E021](../error-codes.md#e021-deserialization-failed) for the exact error messages.
 
 ## Unsupported Types
 
