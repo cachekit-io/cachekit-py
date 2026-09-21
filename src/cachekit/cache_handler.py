@@ -59,7 +59,9 @@ CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 # Serializer-name aliases collapsed to one canonical frame tag so interchangeable names stay
 # cache-compatible: an entry written as 'auto' must read back under 'pythonic' (its documented
 # alias) and vice-versa, instead of a serializer-mismatch that recomputes on every read (#167).
-_SERIALIZER_NAME_ALIASES = {"std": "default", "standard": "default", "pythonic": "auto"}
+# Owned by CacheKeyGenerator so the frame tag and the cache key's serializer code resolve
+# through ONE map — two maps would drift and the write path would stop matching invalidation.
+_SERIALIZER_NAME_ALIASES = CacheKeyGenerator.SERIALIZER_NAME_ALIASES
 
 # Global DI container instance with default registrations
 container = DIContainer()
@@ -585,6 +587,18 @@ class CacheSerializationHandler:
             # Protocol instance - use class name for metadata
             self._serializer_string_name = type(serializer_name).__name__
 
+        # Cache-key identity. Deliberately NOT the frame tag: the frame tag is a wire-format
+        # value and must stay the class name for instances, but a class name is attacker-
+        # choosable, and one literally named `auto` would otherwise take AutoSerializer's key
+        # code AND pass the deserialize-time guard (it compares this same string) — reading
+        # another decorator's bytes through the wrong serializer. Every instance resolves to
+        # one reserved identity no class name can equal, so their keyspaces stay separate.
+        self._serializer_key_name = (
+            self._serializer_string_name
+            if isinstance(serializer_name, str)
+            else CacheKeyGenerator.CUSTOM_SERIALIZER_PREFIX + self._serializer_string_name
+        )
+
         # MEDIUM-02: Validate single-tenant mode configuration
         if self.encryption:
             # Require explicit tenant mode (either extractor OR single_tenant_mode)
@@ -656,6 +670,11 @@ class CacheSerializationHandler:
         self._encryption_wrapper_cache: OrderedDict[str, Any] = OrderedDict()  # tenant_id -> EncryptionWrapper
         self._encryption_cache_lock = threading.RLock()
         self._encryption_cache_maxsize = 256
+
+    @property
+    def serializer_key_name(self) -> str:
+        """Serializer identity for the cache key, as CacheKeyGenerator.SERIALIZER_CODES keys it."""
+        return self._serializer_key_name
 
     def _get_deterministic_deployment_uuid(self, provided_uuid: Optional[str]) -> str:
         """Get deployment UUID with determinism guarantee (MEDIUM-02, Criterion 2).
@@ -1322,7 +1341,14 @@ class CacheOperationHandler:
             True
         """
         filtered_kwargs = {k: v for k, v in kwargs.items() if k != "_bypass_cache"}
-        return self.key_generator.generate_key(func, args, filtered_kwargs, namespace, integrity_checking)
+        return self.key_generator.generate_key(
+            func,
+            args,
+            filtered_kwargs,
+            namespace,
+            integrity_checking,
+            serializer_type=self.serialization_handler.serializer_key_name,
+        )
 
     def _handle_l2_read_error(self, e: SerializationError, cache_key: str) -> None:
         """Shared decrypt/integrity failure tail for sync L2 reads (LAB-108/#159).
@@ -1724,6 +1750,8 @@ class CacheInvalidator:
         key_generator: CacheKeyGenerator,
         backend: Optional[BaseBackend] = None,
         integrity_checking: bool = True,
+        *,
+        serializer_type: str,
     ):
         """Initialize with key generator and optional backend.
 
@@ -1731,10 +1759,15 @@ class CacheInvalidator:
             key_generator: Key generator instance
             backend: Optional backend instance (can be set later via set_backend)
             integrity_checking: Whether integrity checking is enabled (affects cache key generation)
+            serializer_type: Serializer name of the decorator this invalidator serves. MUST be
+                the same value CacheOperationHandler.get_cache_key derives (i.e. the serialization
+                handler's ``serializer_type``) - it is half of the key's metadata suffix, so a
+                mismatch would delete a key nothing ever wrote.
         """
         self.key_generator = key_generator
         self._backend = backend
         self.integrity_checking = integrity_checking
+        self.serializer_type = serializer_type
 
     def set_backend(self, backend: BaseBackend):
         """Set the backend instance.
@@ -1764,7 +1797,9 @@ class CacheInvalidator:
         """
         if self._backend is None:
             raise RuntimeError("Backend must be set before calling invalidate_cache")
-        cache_key = self.key_generator.generate_key(func, args, kwargs, namespace, self.integrity_checking)
+        cache_key = self.key_generator.generate_key(
+            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
+        )
 
         try:
             self._backend.delete(cache_key)
@@ -1796,7 +1831,9 @@ class CacheInvalidator:
         """
         if self._backend is None:
             raise RuntimeError("Backend must be set before calling invalidate_cache_async")
-        cache_key = self.key_generator.generate_key(func, args, kwargs, namespace, self.integrity_checking)
+        cache_key = self.key_generator.generate_key(
+            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
+        )
 
         try:
             # Note: BaseBackend methods are sync (not async)

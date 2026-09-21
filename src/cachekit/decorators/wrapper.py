@@ -585,7 +585,13 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    invalidator = CacheInvalidator(key_generator, integrity_checking=integrity_checking)
+    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
+    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
+    invalidator = CacheInvalidator(
+        key_generator,
+        integrity_checking=integrity_checking,
+        serializer_type=serialization_handler.serializer_key_name,
+    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
