@@ -35,6 +35,8 @@ def get_user_ssn(user_id):
 
 Enable encryption with single decorator:
 
+> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there rather than at the first decorated call.
+
 ```python notest
 from cachekit import cache
 from cachekit.backends.redis import RedisBackend
