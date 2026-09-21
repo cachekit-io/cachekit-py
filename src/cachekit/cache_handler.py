@@ -18,6 +18,7 @@ from cachekit.backends.base import (
     BufferHandle,
     BufferReadableBackend,
     BufferWritableBackend,
+    LockableBackend,
     TTLInspectableBackend,
 )
 from cachekit.backends.provider import (
@@ -190,6 +191,28 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
+    """Type guard: backend provides distributed locking (stampede prevention).
+
+    Takes ``object``, not ``BaseBackend`` like its siblings, because the
+    decorator probes the lazily-resolved ``_backend`` cell, which is ``None``
+    until first call and may already be narrowed by another capability guard.
+
+    Checked on the INSTANCE, deliberately — unlike ``supports_swr`` below, which
+    is class-level to keep ``__getattr__`` proxies and mocks off the freshness
+    read path. The asymmetry is the failure direction: a false positive here
+    raises inside the ``async with`` and fails open with a warning, while a
+    false negative silently drops stampede protection on a hot key.
+
+    Equally deliberate: not ``isinstance(backend, LockableBackend)``. Since
+    CPython 3.12 a ``runtime_checkable`` Protocol check resolves members with
+    ``inspect.getattr_static``, which does not consult ``__getattr__`` — so a
+    delegating backend proxy locks on 3.10/3.11 and silently stops locking on
+    3.12+. ``hasattr`` is stable across every supported interpreter.
+    """
+    return hasattr(backend, "acquire_lock")
 
 
 # Backend type names already warned about, so refresh_ttl_on_get degradation warns at most

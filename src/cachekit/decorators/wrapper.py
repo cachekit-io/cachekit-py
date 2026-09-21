@@ -10,11 +10,10 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.base import LockableBackend
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
     CacheInvalidator,
@@ -25,7 +24,9 @@ from ..cache_handler import (
     get_logger,
     handle_decrypt_failure,
     redact_cache_key,
+    supports_locking,
     supports_swr,
+    supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
 from ..interop import (
@@ -47,7 +48,7 @@ from .orchestrator import FeatureOrchestrator
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
-    from ..backends.base import BaseBackend, TTLInspectableBackend
+    from ..backends.base import BaseBackend
     from ..serializers.base import SerializerProtocol
 
 
@@ -923,7 +924,7 @@ def create_cache_wrapper(
         the caller already got the stale value; the entry hard-expires at evict_at and
         the next request takes the ordinary synchronous miss path (spec degradation)."""
         try:
-            if isinstance(_backend, LockableBackend):
+            if supports_locking(_backend):
                 async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
@@ -1820,13 +1821,12 @@ def create_cache_wrapper(
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
                     # Handle TTL refresh if configured and threshold met
-                    if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
-                        _ttl_backend = cast("TTLInspectableBackend", _backend)
+                    if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
                         try:
-                            remaining_ttl = await _ttl_backend.get_ttl(cache_key)
+                            remaining_ttl = await _backend.get_ttl(cache_key)
                             if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
                                 # Refresh TTL in background with error callback
-                                task = asyncio.create_task(_ttl_backend.refresh_ttl(cache_key, ttl))
+                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
                                 task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
                         except Exception as e:
                             # TTL refresh is optional, don't fail on error
@@ -1875,7 +1875,7 @@ def create_cache_wrapper(
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
             # Check if backend supports distributed locking
-            if isinstance(_backend, LockableBackend):
+            if supports_locking(_backend):
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
@@ -2019,7 +2019,7 @@ def create_cache_wrapper(
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
-            if not hasattr(_backend, "acquire_lock"):
+            if not supports_locking(_backend):
                 logger().debug(
                     f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
                 )

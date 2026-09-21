@@ -270,8 +270,11 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: RedisBackend, CachekitIOBackend (SaaS ``POST /v1/cache/{key}/lock``)
-    - Not supported: FileBackend, L1-only (in-memory)
+    - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and
+      therefore the env-resolved Redis path hand out — and ``CachekitIOBackend``
+      (SaaS ``POST /v1/cache/{key}/lock``).
+    - Not supported: ``RedisBackend`` constructed directly and passed as
+      ``backend=``, ``FileBackend``, L1-only (in-memory).
 
     Contract — bare cache key:
         ``acquire_lock`` receives the **bare cache key**, identical to what
@@ -313,9 +316,8 @@ class LockableBackend(Protocol):
         Returns:
             An async context manager yielding True if the lock was acquired,
             False if the wait timed out. Implementations are ``async``
-            generators wrapped in ``@asynccontextmanager``; the protocol
-            declares the *decorated* shape so callers can narrow to
-            ``LockableBackend`` and still type-check ``async with``.
+            generators wrapped in ``@asynccontextmanager``, so this protocol
+            declares the *decorated* shape.
 
         Raises:
             BackendError: If backend operation fails

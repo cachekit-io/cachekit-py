@@ -26,6 +26,7 @@ does not regress the on-wire Redis lock name — the Redis backend now owns the
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -359,3 +360,58 @@ class TestLockFailureWarningRedactsKey:
         assert lock_warnings, "lock failure must be logged"
         assert not any(raw_key in m for m in lock_warnings), f"raw cache key leaked into lock warning: {lock_warnings!r}"
         assert any(redact_cache_key(raw_key) in m for m in lock_warnings), "digest must keep the failure correlatable"
+
+
+class _DelegatingBackendProxy:
+    """Backend wrapper that exposes every capability through ``__getattr__``.
+
+    The shape an instrumentation / tenant-routing / retry wrapper takes in user
+    code, and the shape ``tests/backends/fixtures.py`` builds internally. It has
+    no ``acquire_lock`` attribute of its own — only the delegated one.
+    """
+
+    def __init__(self, wrapped: Any) -> None:
+        """Store the wrapped backend; every attribute access delegates to it."""
+        self._wrapped = wrapped
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any attribute the proxy does not define to the wrapped backend."""
+        return getattr(self._wrapped, name)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestLockCapabilityProbeSeesDelegatingProxies:
+    """The lock-capability probe must stay ``hasattr``-shaped across interpreters.
+
+    ``isinstance(backend, LockableBackend)`` looks equivalent and is not: since
+    CPython 3.12, ``runtime_checkable`` protocol checks resolve members with
+    ``inspect.getattr_static``, which does not consult ``__getattr__``. Swapping
+    the probe for ``isinstance`` therefore keeps locking on 3.10/3.11 and
+    silently drops it on 3.12+ for any delegating backend — a stampede on a hot
+    key with no log line saying protection was lost. This test fails on 3.12+
+    the moment that swap is made again.
+    """
+
+    async def test_proxied_backend_still_takes_the_lock(self) -> None:
+        """A ``__getattr__``-delegated ``acquire_lock`` must still be called."""
+        inner = _RecordingLockableBackend()
+        proxy = _DelegatingBackendProxy(inner)
+
+        # Guard the premise: the proxy is exactly the case the two probes disagree on.
+        from cachekit.backends.base import LockableBackend as _Proto
+
+        assert hasattr(proxy, "acquire_lock")
+        assert not isinstance(proxy, _Proto) or sys.version_info < (3, 12)
+
+        @cache(backend=proxy, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> int:
+            """Trivial cached coroutine used to drive one cache miss through the lock path."""
+            return x * 2
+
+        assert await my_func(7) == 14
+        assert len(inner.lock_keys) == 1, (
+            f"delegating proxy lost stampede protection — acquire_lock was not called "
+            f"(python {sys.version_info.major}.{sys.version_info.minor}); "
+            f"the capability probe must be hasattr-shaped, not isinstance-shaped"
+        )
