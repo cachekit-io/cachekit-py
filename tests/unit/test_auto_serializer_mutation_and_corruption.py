@@ -513,13 +513,20 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         not closable by threshold (``>= 2`` re-refuses LAB-4312's value). So this test pins the
         residual as RECORDED: the guard neutered fails it with hundreds of escapes; a threshold
         change fails it with zero; and the wire-format fix (LAB-4304) that legitimately empties
-        the set must update this record on its way through."""
+        the set must update this record on its way through.
+
+        The sweep also pins the *refusals*, not just the escapes: every one of the ~12.4k mutants
+        that does not escape must raise ``SerializationError``. A bare ``except Exception`` here
+        would let an ``AttributeError`` out of a decode path and still read green, because a crash
+        and a clean refusal are both "did not return a value" to a sweep that only counts escapes.
+        Anything else is collected with its offset and byte so the whole set surfaces at once."""
         s = AutoSerializer(enable_integrity_checking=False)
         data, _ = AutoSerializer().serialize({"admin": False, "user": "alice", "n": 12345})
         assert len(data) == 49, "the known set below is specific to this exact payload"
         known = {(2, 0x2B)} | {(off, b) for off in (33, 34, 35, 36) for b in (0xCB, 0xCF, 0xD3)}
 
         returned: dict[tuple[int, int], object] = {}
+        unwrapped: list[tuple[int, int, str]] = []
         for i in range(len(data)):
             for byte in range(256):
                 if data[i] == byte:
@@ -528,8 +535,11 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
                 mutant[i] = byte
                 try:
                     returned[(i, byte)] = s.deserialize(bytes(mutant), None)
-                except Exception:
+                except SerializationError:
                     continue
+                except Exception as exc:  # recorded, not swallowed: an unwrapped leak is the failure this arm exists to name
+                    unwrapped.append((i, byte, repr(exc)))
+        assert not unwrapped, f"corrupt input leaked a non-SerializationError to the caller: {unwrapped[:5]}"
         assert set(returned) == known, (
             f"escape set moved: +{sorted(set(returned) - known)[:5]} -{sorted(known - set(returned))[:5]}"
         )
