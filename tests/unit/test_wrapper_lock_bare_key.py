@@ -415,3 +415,55 @@ class TestLockCapabilityProbeSeesDelegatingProxies:
             f"(python {sys.version_info.major}.{sys.version_info.minor}); "
             f"the capability probe must be hasattr-shaped, not isinstance-shaped"
         )
+
+
+class _NonCallableLockBackend(_RecordingLockableBackend):
+    """Backend that HAS an ``acquire_lock`` attribute which is not callable.
+
+    The shape a feature-flagged or partially-initialised backend takes when it
+    declares the capability slot and leaves it unset. ``hasattr`` cannot tell it
+    apart from a genuinely lockable backend — ``callable`` can.
+    """
+
+    acquire_lock = None  # type: ignore[assignment]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestNonCallableLockAttributeFallsBackToLockless:
+    """A non-callable ``acquire_lock`` must degrade to lockless, never crash the call.
+
+    Under the previous ``hasattr`` probe this backend passed the capability
+    check, the wrapper then called ``None(...)``, and the resulting
+    ``TypeError`` escaped: the wrapper's handler degrades to lockless execution
+    only for a ``BackendError`` and re-raises everything else. So a backend that
+    merely declared the attribute broke every decorated call it was supposed to
+    protect (CodeRabbit PR #313).
+    """
+
+    async def test_non_callable_acquire_lock_does_not_break_the_call(self) -> None:
+        """The decorated function must still return, having taken the lockless path."""
+        backend = _NonCallableLockBackend()
+
+        # Guard the premise: hasattr cannot distinguish this from a lockable backend.
+        assert hasattr(backend, "acquire_lock")
+        assert not callable(getattr(backend, "acquire_lock", None))
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> int:
+            """Trivial cached coroutine used to drive one cache miss."""
+            return x * 3
+
+        # Previously raised TypeError: 'NoneType' object is not callable.
+        assert await my_func(5) == 15
+
+        # And it genuinely took the lockless branch rather than a swallowed lock.
+        assert backend.lock_keys == [], "no lock should have been taken on a non-lockable backend"
+
+    async def test_capability_probe_rejects_non_callable_attribute(self) -> None:
+        """``supports_locking`` is the single place the callable requirement lives."""
+        from cachekit.cache_handler import supports_locking
+
+        assert supports_locking(_RecordingLockableBackend()) is True
+        assert supports_locking(_NonCallableLockBackend()) is False
+        assert supports_locking(object()) is False
