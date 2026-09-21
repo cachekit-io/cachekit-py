@@ -56,13 +56,6 @@ if TYPE_CHECKING:
 # Python-specific type tags that no other-language SDK can decode.
 CROSS_SDK_SERIALIZER_NAMES = ("default", "std", "standard", "orjson", "arrow")
 
-# Serializer-name aliases collapsed to one canonical frame tag so interchangeable names stay
-# cache-compatible: an entry written as 'auto' must read back under 'pythonic' (its documented
-# alias) and vice-versa, instead of a serializer-mismatch that recomputes on every read (#167).
-# Owned by CacheKeyGenerator so the frame tag and the cache key's serializer code resolve
-# through ONE map — two maps would drift and the write path would stop matching invalidation.
-_SERIALIZER_NAME_ALIASES = CacheKeyGenerator.SERIALIZER_NAME_ALIASES
-
 # Global DI container instance with default registrations
 container = DIContainer()
 container.register(LoggerProvider, DefaultLoggerProvider)
@@ -367,12 +360,23 @@ def _get_cached_serializer_instance(
 
     Raises:
         ValueError: If serializer_name not in SERIALIZER_REGISTRY
-        TypeError: If serializer is not a string or SerializerProtocol instance
+        TypeError: If serializer is not a string or SerializerProtocol instance, or is a
+            serializer class rather than an instance of one
     """
     # If already a protocol instance, validate and return directly
     if not isinstance(serializer, str):
         from cachekit.serializers.base import SerializerProtocol
 
+        # A class passes the runtime_checkable protocol check (the class object has the
+        # methods), but its identity would be its METACLASS name — 'type' — so every class
+        # passed this way would share one frame tag and one key code, the shared bucket the
+        # serializer code exists to prevent; and serialize() would be an unbound call that
+        # fails on every write. Almost always a missing "()".
+        if isinstance(serializer, type):
+            raise TypeError(
+                f"serializer must be an instance, not the class {serializer.__name__}: "
+                f"pass {serializer.__name__}(), not {serializer.__name__}"
+            )
         if not isinstance(serializer, SerializerProtocol):
             raise TypeError(
                 f"serializer must be a string name or SerializerProtocol instance, got {type(serializer).__name__}. "
@@ -531,7 +535,10 @@ class CacheSerializationHandler:
                     "a per-call tenant. Use single-tenant encryption with an explicitly shared "
                     "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
                 )
-            if isinstance(serializer_name, str) and _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name) != "default":
+            if (
+                isinstance(serializer_name, str)
+                and CacheKeyGenerator.SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name) != "default"
+            ):
                 raise ConfigurationError(
                     f"interop mode requires the default (MessagePack) serializer, got '{serializer_name}': "
                     f"interop/v1 values are plain MessagePack by specification."
@@ -581,8 +588,11 @@ class CacheSerializationHandler:
 
         # Extract string name for metadata storage (for protocol instances, use class name)
         if isinstance(serializer_name, str):
-            # Canonicalize aliases to prevent envelope mismatch on deserialize
-            self._serializer_string_name = _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name)
+            # Canonicalize aliases so 'pythonic' is written and read back as 'auto' (and
+            # 'std'/'standard' as 'default'): either spelling reads the other's entries instead
+            # of a serializer mismatch on every read (#167). Resolved through the key generator's
+            # map so the frame tag and the key's serializer code cannot drift apart.
+            self._serializer_string_name = CacheKeyGenerator.SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name)
         else:
             # Protocol instance - use class name for metadata
             self._serializer_string_name = type(serializer_name).__name__

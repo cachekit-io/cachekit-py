@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
+from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
 
 
@@ -113,6 +113,18 @@ class TestSerializerCodeReachesTheKey:
         )
         assert backend.store == {}
 
+    def test_invalidator_without_a_serializer_identity_deletes_nothing(self):
+        """A missing identity must fail loud, not compute a key nothing wrote and 'succeed'."""
+        backend = _RecordingBackend()
+
+        def fn(x: int) -> int:
+            return x
+
+        invalidator = CacheInvalidator(CacheKeyGenerator(), backend, serializer_type="")
+        with pytest.raises(ValueError, match="serializer_type"):
+            invalidator.invalidate_cache(fn, (1,), {}, None)
+        assert backend.deleted == []
+
     def test_integrity_flag_still_independent_of_serializer_code(self):
         """The ic half of the suffix was correct before this fix and must stay so."""
         backend = _RecordingBackend()
@@ -142,6 +154,31 @@ class TestSerializerCodeTable:
         assert key("std") == key("default")
         assert key("pythonic") == key("auto")
         assert key("default") != key("auto")
+
+    @pytest.mark.parametrize("bad", [None, ["auto"]], ids=lambda v: type(v).__name__)
+    def test_non_string_identity_is_rejected(self, bad: object):
+        """Before the dict lookup — the unhashable case proves the guard runs first."""
+        with pytest.raises(TypeError, match="serializer_type"):
+            CacheKeyGenerator.serializer_code(bad)  # type: ignore[arg-type]
+
+    def test_serializer_class_is_rejected_not_bucketed(self):
+        """A class (missing "()") identifies as its metaclass, 'type' — one shared code for all."""
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        with pytest.raises(TypeError, match="not the class StandardSerializer"):
+            CacheSerializationHandler(StandardSerializer)  # type: ignore[arg-type]
+
+    def test_empty_identity_is_rejected(self):
+        """Not `or "default"`: a fallback code is a shared bucket, the bug this module exists to pin."""
+        with pytest.raises(ValueError, match="serializer_type"):
+            CacheKeyGenerator.serializer_code("")
+
+    def test_code_tables_are_read_only(self):
+        """A mutation here would silently re-key every entry process-wide."""
+        with pytest.raises(TypeError):
+            CacheKeyGenerator.SERIALIZER_CODES["evil"] = "s"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            CacheKeyGenerator.SERIALIZER_NAME_ALIASES["evil"] = "default"  # type: ignore[index]
 
     def test_every_registered_serializer_has_a_code(self):
         """A name users can pass must never fall into the custom bucket by omission."""

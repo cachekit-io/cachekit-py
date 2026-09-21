@@ -41,20 +41,47 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 ## Migration Guide
 
+### Breaking change in v0.19.0: the key carries the real serializer
+
+Before v0.19.0 the serializer half of the key suffix was a constant: **every key ended `:1s`
+whatever serializer was configured** (`:0s` with `integrity_checking=False`). From v0.19.0 the
+code reflects the serializer in use — the "Before v0.19.0" column in the table below — so keys
+change identity on upgrade, with no change on your side, for:
+
+- `serializer="auto"` / `"pythonic"`, `"orjson"`, `"arrow"` → now `:1a`, `:1o`, `:1w`;
+- any serializer passed as an **instance**, built-in or custom → now `:1x` + 4 hex.
+
+Not affected: the default serializer (no `serializer=`, `"std"`, `"default"`, `"standard"` —
+`:1s` before and after), `@cache.local()` (always `:0l`), a custom `key=` function (no
+suffix), and `interop_mode=True` (separate key format).
+
+Each affected function on a shared backend gets a one-time cold cache at cut-over, and its
+pre-upgrade entries are never read again. Two decorators over one function that differed only
+in serializer used to evict each other on every call through the `Serializer mismatch` path;
+they now coexist.
+
+**Before you deploy:** pre-upgrade entries are unreachable from the upgraded code, so
+`invalidate_cache()` cannot delete them. If you cache personal data, or rely on invalidation
+reaching entries written before the upgrade, follow the retention warning
+[below](#changing-serializers-separate-keyspaces) — **after the last v0.18 replica is
+retired**, not at the start of a rolling deploy, or replicas still on the old release keep
+writing `:1s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
+orphans the old keyspace rather than deleting it; the retention step still applies.
+
 ### Changing Serializers: Separate Keyspaces
 
 The serializer is part of the cache key. The key's trailing metadata suffix is
 `{integrity_flag}{serializer_code}` — `1`/`0` for integrity checking, then one character
 for the serializer:
 
-| Configured as | Code | Example suffix |
-| :--- | :---: | :--- |
-| `serializer="std"` / `"default"` (the default) | `s` | `:1s` |
-| `serializer="auto"` / `"pythonic"` | `a` | `:1a` |
-| `serializer="orjson"` | `o` | `:1o` |
-| `serializer="arrow"` | `w` | `:1w` |
-| `@cache.local()` reference caching | `l` | `:0l` |
-| **any serializer instance**, built-in or custom | `x` + 4 hex | `:1x4874` |
+| Configured as | Code | Suffix | Before v0.19.0 |
+| :--- | :---: | :--- | :--- |
+| `serializer="std"` / `"default"` / `"standard"` (the default) | `s` | `:1s` | `:1s` |
+| `serializer="auto"` / `"pythonic"` | `a` | `:1a` | `:1s` |
+| `serializer="orjson"` | `o` | `:1o` | `:1s` |
+| `serializer="arrow"` | `w` | `:1w` | `:1s` |
+| `@cache.local()` reference caching | `l` | `:0l` | `:0l` |
+| **any serializer instance**, built-in or custom | `x` + 4 hex | `:1x4874` | `:1s` |
 
 That last row is not a typo: `serializer="arrow"` and `serializer=ArrowSerializer()` are
 *different* cache identities. The cached envelope records the serializer by name — `"arrow"`
@@ -109,7 +136,13 @@ def get_data():
 > — a deletion for erasure, consent withdrawal or permission revocation will report success
 > while the previous entry survives until its TTL expires, or indefinitely if no TTL is set.
 > If you cache personal data, **flush the affected namespace** when you change a serializer
-> or upgrade across a release that re-keys it, rather than relying on expiry.
+> or upgrade across a release that re-keys it, rather than relying on expiry. The SDK has no
+> bulk delete — `cache_clear()` only knows the keys the current process wrote — so flush on
+> the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
+> matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
+> is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
+> there retire only by TTL. During a rolling deploy, flush **after the last replica still
+> writing the old keys is gone** — anything written behind the flush is orphaned.
 
 **The serializer-mismatch guard still exists**, and still raises
 `SerializationError: Serializer mismatch: cached data uses 'X', but decorator configured with 'Y'`.

@@ -9,6 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import UUID
 
@@ -37,19 +38,23 @@ class CacheKeyGenerator:
 
     # Canonical serializer name -> 1-char code for the compact metadata suffix.
     # CANONICAL NAMES ONLY; alias spellings resolve through SERIALIZER_NAME_ALIASES.
-    SERIALIZER_CODES = {
-        "default": "s",  # StandardSerializer (multi-language MessagePack)
-        "auto": "a",  # AutoSerializer (Python-specific, NumPy/pandas)
-        "orjson": "o",  # OrjsonSerializer (JSON-based)
-        "arrow": "w",  # ArrowSerializer (columnar format, w=arroW)
-        "local": "l",  # Reference caching (no serialization)
-    }
+    # Read-only: a mutation here would silently re-key every entry process-wide.
+    SERIALIZER_CODES = MappingProxyType(
+        {
+            "default": "s",  # StandardSerializer (multi-language MessagePack)
+            "auto": "a",  # AutoSerializer (Python-specific, NumPy/pandas)
+            "orjson": "o",  # OrjsonSerializer (JSON-based)
+            "arrow": "w",  # ArrowSerializer (columnar format, w=arroW)
+            "local": "l",  # Reference caching (no serialization)
+        }
+    )
 
     # Alias spelling -> canonical name. Single source of truth: CacheSerializationHandler
-    # imports this to canonicalize the serializer name it writes into the frame header, so
+    # reads this to canonicalize the serializer name it writes into the frame header, so
     # the key's serializer code and the stored envelope's serializer tag are derived from
-    # one map and cannot drift apart (#167, LAB-4351).
-    SERIALIZER_NAME_ALIASES = {"std": "default", "standard": "default", "pythonic": "auto"}
+    # one map and cannot drift apart (#167, LAB-4351). Read-only for the same reason as
+    # SERIALIZER_CODES: mutating it would desync the key from the frame tag.
+    SERIALIZER_NAME_ALIASES = MappingProxyType({"std": "default", "standard": "default", "pythonic": "auto"})
 
     # Prefix applied to a user-supplied SerializerProtocol instance's identity before the
     # code lookup. Angle brackets are not legal in a Python identifier, so a class name can
@@ -155,7 +160,20 @@ class CacheKeyGenerator:
         One character for the serializers in SERIALIZER_CODES (alias spellings resolve
         first); otherwise UNKNOWN_SERIALIZER_CODE plus 4 hex digits derived from the
         identity, which keeps every unrecognised serializer in its own keyspace.
+
+        Raises:
+            TypeError: If ``serializer_type`` is not a str.
+            ValueError: If ``serializer_type`` is empty. A missing identity must fail here,
+                not fall back to a default code: a fallback is a shared bucket, and a key
+                computed from it is one nothing wrote — an invalidator holding it would
+                report a successful delete of an entry that is still there.
         """
+        # Guard here, not per caller: every key (write path, CacheInvalidator, direct
+        # generate_key users) passes through this one function.
+        if not isinstance(serializer_type, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"serializer_type must be str, got {type(serializer_type).__name__}")
+        if not serializer_type:
+            raise ValueError("serializer_type must not be empty")
         canonical = cls.SERIALIZER_NAME_ALIASES.get(serializer_type, serializer_type)
         code = cls.SERIALIZER_CODES.get(canonical)
         if code is not None:

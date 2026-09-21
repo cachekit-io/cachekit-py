@@ -566,6 +566,9 @@ def get_data():
 
 See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces)
 for the code table, the cold-cache warning, and the data-retention caveat on orphaned entries.
+Upgrading from v0.18 or earlier? Keys for non-default serializers change identity without any
+change on your side — see
+[Breaking change in v0.19.0](serializers/README.md#breaking-change-in-v0190-the-key-carries-the-real-serializer).
 
 **Best Practice**: Use namespace versioning for zero-downtime migrations:
 
