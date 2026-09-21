@@ -35,6 +35,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cachekit import cache
+from cachekit.backends.base import LockableBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.hash_utils import redact_cache_key
 
@@ -370,7 +371,7 @@ class _DelegatingBackendProxy:
     no ``acquire_lock`` attribute of its own — only the delegated one.
     """
 
-    def __init__(self, wrapped: Any) -> None:
+    def __init__(self, wrapped: LockableBackend) -> None:
         """Store the wrapped backend; every attribute access delegates to it."""
         self._wrapped = wrapped
 
