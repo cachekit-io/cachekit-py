@@ -238,15 +238,19 @@ def cheap_lookup(x):
 The `LockableBackend` protocol defines how backends provide distributed locking:
 
 ```python notest
-async def acquire_lock(
+def acquire_lock(
     self,
     key: str,              # Bare cache key (same key as get/set); backend derives lock namespace
     timeout: float,        # How long to hold the lock (seconds)
     blocking_timeout: Optional[float] = None,  # Max wait to acquire (None = non-blocking)
-) -> AsyncIterator[bool]:
-    # Yields True if lock acquired, False if timeout waiting
+) -> AbstractAsyncContextManager[bool]:
+    # Entering the context yields True if the lock was acquired, False if the wait timed out
     ...
 ```
+
+Implementations are `async` generators wrapped in `@asynccontextmanager`, so the
+protocol declares the *decorated* shape. That is what lets a caller narrow with
+`isinstance(backend, LockableBackend)` and still type-check the `async with`.
 
 The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 `blocking_timeout=5.0` (max wait to acquire) — see

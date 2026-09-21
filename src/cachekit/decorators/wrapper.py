@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union, cast
 
 from cachekit.hash_utils import redact_error_for_log
 
+from ..backends.base import LockableBackend
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
     CacheInvalidator,
@@ -922,9 +923,8 @@ def create_cache_wrapper(
         the caller already got the stale value; the entry hard-expires at evict_at and
         the next request takes the ordinary synchronous miss path (spec degradation)."""
         try:
-            _acquire_lock = getattr(_backend, "acquire_lock", None)
-            if _acquire_lock is not None:
-                async with _acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
+            if isinstance(_backend, LockableBackend):
+                async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
                     await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
@@ -1875,11 +1875,10 @@ def create_cache_wrapper(
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
             # Check if backend supports distributed locking
-            _acquire_lock = getattr(_backend, "acquire_lock", None)
-            if _acquire_lock is not None:
+            if isinstance(_backend, LockableBackend):
                 try:
                     # Use backend's async lock protocol
-                    async with _acquire_lock(
+                    async with _backend.acquire_lock(
                         cache_key,
                         timeout=lock_timeout,
                         blocking_timeout=blocking_timeout,
