@@ -70,7 +70,7 @@ class TestInvalidateCustomKey:
         backend = RecordingBackend()
         calls = 0
 
-        @_decorate(backend, f"lab4387_sync_{next(iter(mode))}", **mode)
+        @_decorate(backend, "lab4387", **mode)
         def get_user(user_id: int) -> int:
             nonlocal calls
             calls += 1
@@ -92,7 +92,7 @@ class TestInvalidateCustomKey:
         backend = RecordingBackend()
         calls = 0
 
-        @_decorate(backend, f"lab4387_async_{next(iter(mode))}", **mode)
+        @_decorate(backend, "lab4387", **mode)
         async def get_user(user_id: int) -> int:
             nonlocal calls
             calls += 1
