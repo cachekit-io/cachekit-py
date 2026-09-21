@@ -197,7 +197,8 @@ set_default_backend(None)  # clear the default
 
 Call `set_default_backend(None)` to clear the default. Works with any backend (Redis, File, CachekitIO, custom).
 
-**Call order does not matter for backend selection.** A decorator applied
+**Import order does not matter, but configuration must happen before a decorated
+function's first call.** A decorator applied
 without `backend=` pins the default when it is first seen — at decoration if
 already set, otherwise at first call — so the usual layout (business modules
 imported at the top of the file, `set_default_backend()` in `main()`) works.

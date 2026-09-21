@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union, cast
 
 from cachekit.hash_utils import redact_error_for_log
 
@@ -46,10 +46,11 @@ from .orchestrator import FeatureOrchestrator
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
+    from ..backends.base import BaseBackend, TTLInspectableBackend
     from ..serializers.base import SerializerProtocol
 
 
-def _resolve_lazy_backend() -> Any:
+def _resolve_lazy_backend() -> BaseBackend:
     """Backend for a decorator that was applied without ``backend=``.
 
     Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
@@ -1820,11 +1821,12 @@ def create_cache_wrapper(
 
                     # Handle TTL refresh if configured and threshold met
                     if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
+                        _ttl_backend = cast("TTLInspectableBackend", _backend)
                         try:
-                            remaining_ttl = await _backend.get_ttl(cache_key)
+                            remaining_ttl = await _ttl_backend.get_ttl(cache_key)
                             if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
                                 # Refresh TTL in background with error callback
-                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
+                                task = asyncio.create_task(_ttl_backend.refresh_ttl(cache_key, ttl))
                                 task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
                         except Exception as e:
                             # TTL refresh is optional, don't fail on error
@@ -1873,10 +1875,11 @@ def create_cache_wrapper(
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
             # Check if backend supports distributed locking
-            if hasattr(_backend, "acquire_lock"):
+            _acquire_lock = getattr(_backend, "acquire_lock", None)
+            if _acquire_lock is not None:
                 try:
                     # Use backend's async lock protocol
-                    async with _backend.acquire_lock(
+                    async with _acquire_lock(
                         cache_key,
                         timeout=lock_timeout,
                         blocking_timeout=blocking_timeout,
