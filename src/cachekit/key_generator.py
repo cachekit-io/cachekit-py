@@ -159,7 +159,10 @@ class CacheKeyGenerator:
 
         One character for the serializers in SERIALIZER_CODES (alias spellings resolve
         first); otherwise UNKNOWN_SERIALIZER_CODE plus 4 hex digits derived from the
-        identity, which keeps every unrecognised serializer in its own keyspace.
+        identity, which separates unrecognised serializers into their own keyspaces up to
+        the two-byte digest's 65,536 codes. A collision there is possible, not impossible:
+        two identities sharing a code share a key, and the reader's serializer-name check
+        against the envelope — not this code — is what stops a mis-deserialization.
 
         Raises:
             TypeError: If ``serializer_type`` is not a str.

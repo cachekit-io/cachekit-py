@@ -90,9 +90,12 @@ the key carried the code. The key follows the envelope, because a key that claim
 configurations were the same when the envelope says otherwise is exactly what this suffix
 exists to prevent. Prefer the string names; they are the documented, stable identities.
 
-Each instance-configured serializer gets its **own** code, derived from its class name, so
-two of them over the same function stay in separate keyspaces rather than evicting each
-other on every read.
+The code is derived from the serializer's **class** name, so two *different* classes over
+the same function stay in separate keyspaces rather than evicting each other on every read.
+Two instances of the *same* class share one code — see the caution below. The four hex
+digits are a two-byte digest, so two different class names can collide (65,536 codes); the
+envelope's serializer name still stops a mis-deserialization, but the colliding pair shares
+a key and misses on each other's entries.
 
 > [!CAUTION]
 > **Two instances of the same class with different constructor arguments are not

@@ -67,7 +67,12 @@ There is no global registration required — serializer instances are passed per
 > **Your serializer gets its own cache-key code, derived from its class name.** The built-ins
 > named as strings use a single character (`s`, `a`, `o`, `w`, `l`); every serializer passed
 > as an *instance* — yours and the built-ins alike — encodes as `x` followed by four hex
-> digits of its class name, so distinct classes never share a keyspace.
+> digits derived from its class name, which separates distinct classes in all but the rare
+> case that two class names hash to the same four digits. Those four digits are a two-byte
+> digest, so there are 65,536 codes and a collision is possible rather than impossible. It
+> cannot mis-deserialize: the envelope records the serializer name and the mismatch guard
+> rejects the entry. It does cost the isolation — two colliding classes share a key and miss
+> on each other's entries. Give either one a distinct `namespace=` if you hit it.
 >
 > **Two instances of the same class do share one**, constructor arguments included. A
 > `PydanticSerializer(model=User)` and a `PydanticSerializer(model=Order)` over the same

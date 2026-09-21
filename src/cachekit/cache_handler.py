@@ -1762,7 +1762,7 @@ class CacheInvalidator:
         integrity_checking: bool = True,
         *,
         serializer_type: str,
-    ):
+    ) -> None:
         """Initialize with key generator and optional backend.
 
         Args:
