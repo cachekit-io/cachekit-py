@@ -326,6 +326,24 @@ class SuspiciousCacheEntryError(SerializationError):
     pass
 
 
+class EnvelopeShapeError(SerializationError):
+    """An entry nothing verified decoded to the SHAPE of a ByteStorage envelope —
+    ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused.
+
+    Two populations reach this and the read path cannot tell them apart (LAB-2736): a
+    rotted integrity-on envelope whose checksum can no longer be checked, and a legitimate
+    top-level 4-element list a caller cached that merely looks like one. Refusing both is
+    the chosen corner — returning a rotted envelope hands the caller its compressed payload
+    as their object. Callers treat it as a miss (evict → recompute), but for the second
+    population recompute re-produces the same bytes and the refusal repeats on every read,
+    so telemetry counts it under its own ``envelope_shape`` reason rather than
+    ``corruption``: a steady rate on one key is that value, not storage rot, and must not
+    read as a corruption spike.
+    """
+
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------

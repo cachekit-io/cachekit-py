@@ -36,6 +36,7 @@ from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers import AutoSerializer
 from cachekit.serializers.base import (
     ERROR_ECHO_MAX,
+    EnvelopeShapeError,
     SerializationError,
     SerializationMetadata,
     bounded_error,
@@ -463,8 +464,17 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
             [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"],
             [b"payload", [10] * 8, 7, "not-a-format"],
             [b"x", [1] * 8, 0, "msgpack"],
+            [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"],
+            ["s", [1, 2, 3, 4, 5, 6, 7, 8], 5, "msgpack"],
         ],
-        ids=["3of4-label", "4of4-png-series", "3of4-unknown-format", "4of4-minimal-msgpack"],
+        ids=[
+            "3of4-label",
+            "4of4-png-series",
+            "3of4-unknown-format",
+            "4of4-minimal-msgpack",
+            "3of4-format-slot-irrelevant",
+            "3of4-bytes-slot-irrelevant",
+        ],
     )
     def test_a_value_shaped_exactly_like_an_envelope_is_deliberately_refused(self, value: list) -> None:
         """**This refusal is a chosen cost, not a bug — do not "fix" it without reading Raises:.**
@@ -478,35 +488,52 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         This corner was taken because the refusal is a deterministic miss that recomputes the right
         answer, while the alternative hands the caller a corrupted envelope's compressed payload as
         their object. An earlier round asserted the opposite here — ``== value`` — which pinned a
-        94% rot-escape rate as intent. If this test starts failing, the rot leak is back."""
+        94% rot-escape rate as intent. If this test starts failing, the rot leak is back.
+
+        The last two rows are the two 3/4 doors: neither the bytes slot nor the format slot is
+        required, so "envelope-shaped" is wider than an envelope-looking value. The type is
+        asserted, not just the class: it carries its own telemetry reason, so this permanent
+        benign refusal never counts as ``corruption``."""
         s = _no_arrow(enable_integrity_checking=False)
         data, meta = s.serialize(value)
         for metadata in (meta, None):
-            with pytest.raises(SerializationError, match="envelope verification"):
+            with pytest.raises(EnvelopeShapeError, match="envelope verification"):
                 s.deserialize(data, metadata)
 
-    def test_no_single_byte_rot_of_an_envelope_is_ever_returned_to_an_integrity_off_reader(self) -> None:
-        """A sweep, because the parametrised rows above cannot show a RATE. Every single-byte
-        substitution of a healthy envelope, read by the integrity-off reader with no metadata:
-        none may come back as a value. A round that gated the rejection behind a re-parse scored
-        271 of 391 here — the parse fails on exactly the corruption it was meant to catch — and
-        the suite stayed green because nothing swept this arm."""
+    def test_single_byte_rot_sweep_on_an_integrity_off_reader_escapes_exactly_the_known_marker_set(self) -> None:
+        """A full sweep — ALL 255 substitutions per byte — because a parametrised row list cannot
+        show a rate, and an 8-value probe set cannot see the bytes that matter: an earlier version
+        probed 8 values, found 0, and was named "no single-byte rot is ever returned" while 13
+        escaped through bytes it never tried. The suite was green and the claim was false.
+
+        This asserts the KNOWN escape set, not zero. The 13 are ``0xcb``/``0xcf``/``0xd3`` (the
+        float64/uint64/int64 markers) at offsets 33-36, and ``0x2b`` at offset 2: a marker byte
+        re-partitions every slot after it, two slots rot at once, the score drops to 2, and the
+        ``>= 3`` guard passes it. That residual is documented in ``_looks_like_envelope`` and is
+        not closable by threshold (``>= 2`` re-refuses LAB-4312's value). So this test pins the
+        residual as RECORDED: the guard neutered fails it with hundreds of escapes; a threshold
+        change fails it with zero; and the wire-format fix (LAB-4304) that legitimately empties
+        the set must update this record on its way through."""
         s = AutoSerializer(enable_integrity_checking=False)
         data, _ = AutoSerializer().serialize({"admin": False, "user": "alice", "n": 12345})
+        assert len(data) == 49, "the known set below is specific to this exact payload"
+        known = {(2, 0x2B)} | {(off, b) for off in (33, 34, 35, 36) for b in (0xCB, 0xCF, 0xD3)}
 
-        returned = []
+        returned: dict[tuple[int, int], object] = {}
         for i in range(len(data)):
-            for byte in (0x00, 0x01, 0x41, 0x7F, 0x80, 0xC0, 0xDA, 0xFF):
+            for byte in range(256):
                 if data[i] == byte:
                     continue
                 mutant = bytearray(data)
                 mutant[i] = byte
                 try:
-                    s.deserialize(bytes(mutant), None)
+                    returned[(i, byte)] = s.deserialize(bytes(mutant), None)
                 except Exception:
                     continue
-                returned.append((i, byte))
-        assert not returned, f"{len(returned)} single-byte rots returned a value, e.g. {returned[:3]}"
+        assert set(returned) == known, (
+            f"escape set moved: +{sorted(set(returned) - known)[:5]} -{sorted(known - set(returned))[:5]}"
+        )
+        assert all(isinstance(v, list) for v in returned.values()), "every escape is a re-partitioned list"
 
     def test_forged_numpy_dtype_echo_is_bounded(self) -> None:
         """The numpy decode's own re-raise quotes the forged dtype verbatim; every other read-path

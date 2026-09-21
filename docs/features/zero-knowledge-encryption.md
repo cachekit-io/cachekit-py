@@ -409,7 +409,7 @@ exposure rather than diverging from the shared frame format.
 
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
-Three failure classes surface on the decrypt read path, and cachekit distinguishes
+Four failure classes surface on the decrypt read path, and cachekit distinguishes
 them (cachekit-py#170):
 
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
@@ -421,6 +421,12 @@ them (cachekit-py#170):
   CWE-757 downgrade guard) or a missing `tenant_id`. Benign during a lazy
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
+- **`envelope_shape`** — an entry nothing verified decoded to the *shape* of a ByteStorage
+  envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
+  4-element list that merely looks like one; the read path cannot tell them apart, so this
+  is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
+  A steady rate on one key is the second case — that value recomputes on every read (see
+  E021 in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
   Storage rot and bugs, not evidence of tampering.
@@ -428,7 +434,8 @@ them (cachekit-py#170):
 All are counted on the Prometheus counter
 `cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
 `reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
-noise. Baseline `suspicious_envelope` around migration windows.
+noise. Baseline `suspicious_envelope` around migration windows; a flat, steady
+`envelope_shape` rate is one cached value the shape rule refuses on every read, not rot.
 
 **Default (fail open):** a decrypt failure of any class logs a warning, evicts the
 poisoned entry, and recomputes the value. Availability-first — a tampered cache entry

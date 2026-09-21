@@ -63,6 +63,7 @@ from cachekit.hash_utils import redact_error_for_log
 
 from .base import (
     PAYLOAD_DECODE_ERRORS,
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -636,23 +637,38 @@ class AutoSerializer:
                 **That is a deliberately chosen corner, not a solved problem.** Every rule trades,
                 measured at each corner:
 
-                ==========================  ========  ========  ============  ==================
-                rule                        healthy   rot       map-encoded   legitimate 3/4-4/4
-                ==========================  ========  ========  ============  ==================
-                shape (this)                reject    reject    **returned**  **refused**
-                shape AND parse             reject    **ret.**  **returned**  accepted
-                parse, rot treated as a hit reject    reject    reject        **refused**
-                ==========================  ========  ========  ============  ==================
+                ==========================  ========  =========  ============  ===============
+                rule                        healthy   rot        map-encoded   envelope-shaped
+                ==========================  ========  =========  ============  ===============
+                shape (this)                reject    reject \\*  **returned**  **refused**
+                shape AND parse             reject    **ret.**   **returned**  accepted
+                parse, rot treated as a hit reject    reject     reject        **refused**
+                ==========================  ========  =========  ============  ===============
+
+                \\* minus a marker-byte residual, 13 of 12,495 single-byte rots on a 49-byte
+                envelope, measured in :meth:`_looks_like_envelope`.
+
+                "Envelope-shaped" is the predicate, not a picture: a top-level 4-element ``list``
+                of which any THREE of ``bytes`` / eight small ints / non-negative int / known
+                format string hold. Neither the bytes slot nor the format slot is required, so
+                ``[b"\x89PNG", [255,0,0,255,0,255,0,255], 4096, "rgb"]`` and
+                ``["s", [1,2,3,4,5,6,7,8], 5, "msgpack"]`` are both refused. Only that: a
+                ``tuple``, a nested or 3-/5-element list, and every :class:`StandardSerializer`
+                read round-trip untouched.
 
                 Returning a rotted envelope hands the caller its compressed payload as their
-                object — silent wrong data; refusing an unusual 4-element list is a deterministic
+                object — silent wrong data; refusing an envelope-shaped value is a deterministic
                 miss that recomputes the right answer. A clean failure beats a quiet one, so the
-                permanent refusal is the cost taken. A parse is no escape: a legitimate 4/4 list
-                parses as a ``StorageEnvelope`` and then fails the checksum, byte-indistinguishable
-                from a rotted one. Map-encoded envelopes (``to_vec_named`` or a foreign writer,
-                never this one and never rot) score 0/4 and are returned — this corner's residual.
-                Closing all four needs the writer to mark an envelope AS one: a wire change
-                (LAB-4304), not a read-path rule.
+                refusal is the cost taken — priced in full: recompute re-produces the same bytes,
+                so for that value EVERY read misses, forever, and each raises
+                :class:`EnvelopeShapeError`, counted under its own ``envelope_shape`` telemetry
+                reason precisely so a permanent benign refusal cannot read as a corruption spike.
+                A parse is no escape: a legitimate 4/4 list parses as a ``StorageEnvelope`` and
+                then fails the checksum, byte-indistinguishable from a rotted one. Map-encoded
+                envelopes (``to_vec_named`` or a foreign writer, never this one and never rot)
+                score 0/4 and are returned — this corner's other residual. Closing every cell
+                needs the writer to mark an envelope AS one: a wire change (LAB-4304), not a
+                read-path rule.
 
                 **Metadata-free reads assume the writer's configuration.** A read with no metadata
                 cannot identify the writer, so it is defined only when reader and writer agree on
@@ -842,8 +858,17 @@ class AutoSerializer:
         # rotted envelope is exactly what a re-parse cannot confirm. See Raises: for which corner
         # of the trilemma that picks and what it costs.
         if self._looks_like_envelope(value):
-            cause = envelope_error if envelope_error is not None else "decoded to an envelope that no reader verified"
-            raise self._envelope_failure(cause) from envelope_error
+            # Its own type and telemetry label: this read cannot tell a rotted envelope from a
+            # legitimate 4-element list, so it must not be counted as corruption it cannot prove.
+            if envelope_error is not None:
+                raise EnvelopeShapeError(
+                    "Cache entry failed envelope verification: decoded to a ByteStorage envelope shape after "
+                    f"the envelope itself was rejected ({bounded_error(envelope_error)})"
+                ) from envelope_error
+            raise EnvelopeShapeError(
+                "Cache entry failed envelope verification: decoded to a ByteStorage envelope shape that no reader "
+                "verified — a rotted envelope, or a value shaped like one; this read cannot tell which (E021)"
+            )
         return value
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
@@ -1091,13 +1116,19 @@ class AutoSerializer:
         that escaped ``deserialize`` uncaught, past every ``except SerializationError`` a caller
         wrote, wherever ``checksum_ok`` did not short-circuit it away first.
 
-        Residual, and it is NOT "two independent corruptions" as this paragraph used to claim:
-        ONE byte is enough. A msgpack marker byte re-partitions the slot boundaries after it, so a
-        single substitution damages two slots at once — measured, 1 of 391 single-byte
-        substitutions on a 49-byte envelope escaped (offset 3, returned a ``dict``). No in-band
-        check on an envelope nothing verified closes that (LAB-2736, LAB-4304), and a crafted
-        entry is out of scope by the same argument: backend write access returns arbitrary values
-        through the plain path with no gate involved.
+        Residual, measured at this head — and NOT the "1 of 391, offset 3, a ``dict``" an
+        earlier version claimed, which was an integrity-ON reader's number written into a
+        paragraph about the integrity-OFF one. Over ALL 255 substitutions per byte of a
+        49-byte envelope, integrity-off reader, no metadata: 13 of 12,495 escape — offset 2
+        with ``0x2b``, and offsets 33-36 with ``0xcb``/``0xcf``/``0xd3``, the float64/uint64/
+        int64 markers. A marker byte re-partitions every slot after it, so ONE substitution
+        damages two slots, the score drops to 2, and ``>= 3`` says "not an envelope". Every
+        escape is a ``list``; 12 of the 13 carry the healthy compressed payload byte-identical
+        at slot 0. Metadata-present reads: 0 of 12,495, the cross-config gate raises first.
+        ``>= 2`` would close all 13 and re-refuse LAB-4312's ``[1, 2, 3, "msgpack"]``, which also
+        scores 2 — byte-indistinguishable, so no threshold fixes it (LAB-2736, LAB-4304). A
+        crafted entry is out of scope by the same argument: backend write access returns
+        arbitrary values through the plain path with no gate involved.
         """
         if not (isinstance(value, list) and len(value) == 4):
             return False

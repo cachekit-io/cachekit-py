@@ -10,6 +10,7 @@ from cachekit.hash_utils import redact_error_for_log
 from .auto_serializer import AutoSerializer
 from .base import (
     CrossSDKSerializerProtocol,
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -243,6 +244,7 @@ __all__ = [
     "StandardSerializer",
     # Base types
     "CrossSDKSerializerProtocol",
+    "EnvelopeShapeError",
     "SerializationError",
     "SerializationFormat",
     "SerializationMetadata",

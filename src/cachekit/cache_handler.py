@@ -35,6 +35,7 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import (
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -133,6 +134,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
       encryption, missing tenant_id). Benign during lazy plaintext→encrypted
       migration, so it ALWAYS fails open (miss + evict, LAB-241) — but spikes
       outside a migration window warrant investigation.
+    - ``envelope_shape``: EnvelopeShapeError — an entry nothing verified decoded to
+      the shape of a ByteStorage envelope and was refused (LAB-2736). Either a rotted
+      integrity-on envelope or a legitimate top-level 4-element list; the read path
+      cannot tell them apart, so this is NOT reliable corruption evidence and is kept
+      out of ``corruption``. Always fails open. A steady rate on one key is the second
+      case: that value recomputes on every read, forever.
     - ``corruption``: any other SerializationError — checksum mismatch, malformed
       frame, serializer mismatch, deserialize failure on authenticated
       plaintext. Not tamper evidence; always fails open.
@@ -159,6 +166,8 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
         reason = "auth_tamper"
     elif isinstance(error, SuspiciousCacheEntryError):
         reason = "suspicious_envelope"
+    elif isinstance(error, EnvelopeShapeError):
+        reason = "envelope_shape"
     else:
         reason = "corruption"
 

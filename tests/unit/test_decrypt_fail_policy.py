@@ -29,7 +29,7 @@ from cachekit.cache_handler import (
     handle_decrypt_failure,
 )
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import EnvelopeShapeError, SerializationError, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
@@ -174,6 +174,12 @@ class TestHandleDecryptFailure:
         err = SuspiciousCacheEntryError("x")
         assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "suspicious_envelope"
 
+    def test_classifies_envelope_shape(self):
+        # Kept out of "corruption": the read path cannot prove it is corrupt, and for a legitimate
+        # envelope-shaped value it fires on every read forever (LAB-2736).
+        err = EnvelopeShapeError("x")
+        assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "envelope_shape"
+
     def test_classifies_corruption(self):
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=False) == "corruption"
         assert handle_decrypt_failure(EncryptionError("x"), tier="l1", cache_key="k", fail_closed=False) == "corruption"
@@ -187,6 +193,7 @@ class TestHandleDecryptFailure:
             == "suspicious_envelope"
         )
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=True) == "corruption"
+        assert handle_decrypt_failure(EnvelopeShapeError("x"), tier="l2", cache_key="k", fail_closed=True) == "envelope_shape"
 
     def test_records_counter_with_reason_and_tier_labels(self, monkeypatch):
         recorded: list[tuple[str, dict[str, Any]]] = []

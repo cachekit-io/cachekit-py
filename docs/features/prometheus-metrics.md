@@ -86,8 +86,11 @@ redis_cache_operations_total{operation="get",status="hit",serializer="default",n
 #         key-fingerprint mismatch under fail-closed: possible tampering or wrong key),
 #         "suspicious_envelope" (unauthenticated envelope inconsistent with config:
 #         plaintext claim under encryption / missing tenant_id — benign during lazy
-#         migration, suspect otherwise), "corruption" (checksum/format failure —
-#         storage rot or bugs); tier ("l1" or "l2").
+#         migration, suspect otherwise), "envelope_shape" (an unverified entry decoded
+#         to the shape of a ByteStorage envelope — a rotted envelope or a legitimate
+#         4-element list, indistinguishable; a steady rate on ONE key is the latter,
+#         recomputing on every read — see E021), "corruption" (checksum/format
+#         failure — storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 
