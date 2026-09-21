@@ -48,6 +48,20 @@ from .tenant_context import TenantContextExtractor
 if TYPE_CHECKING:
     from ..serializers.base import SerializerProtocol
 
+
+def _resolve_lazy_backend() -> Any:
+    """Backend for a decorator that was applied without ``backend=``.
+
+    Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
+    takes effect regardless of whether it ran before or after the module holding
+    the decorated function was imported (LAB-4457).
+    """
+    from ..config.decorator import get_default_backend
+
+    default = get_default_backend()
+    return default if default is not None else get_backend_provider().get_backend()
+
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 _logger = logging.getLogger(__name__)
@@ -1263,7 +1277,7 @@ def create_cache_wrapper(
 
                 nonlocal _backend
                 if _backend is None:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1672,7 +1686,7 @@ def create_cache_wrapper(
             if interop is not None:
                 if _backend is None:
                     try:
-                        _backend = get_backend_provider().get_backend()
+                        _backend = _resolve_lazy_backend()
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1746,7 +1760,7 @@ def create_cache_wrapper(
             # Initialize backend only when needed (lazy init for performance)
             if _backend is None:
                 try:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -2078,7 +2092,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
@@ -2138,7 +2152,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
