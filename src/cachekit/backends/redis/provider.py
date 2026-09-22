@@ -23,6 +23,7 @@ import redis
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis.error_handler import classify_redis_error
+from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -352,32 +353,45 @@ class PerRequestRedisBackend:
             BackendError: If Redis operation fails
 
         Note:
-            Uses asyncio.to_thread() to run sync Redis lock operations without blocking event loop.
-            Sets thread_local=False to avoid thread-local token issues with thread pool.
+            Each acquisition attempt is one non-blocking ``SET NX`` round-trip run via
+            ``asyncio.to_thread()``; the wait between attempts is an ``asyncio.sleep`` on
+            the event loop, never a sleep inside an executor thread. A blocking
+            ``Lock.acquire`` run via ``to_thread`` would pin one executor thread per waiter for
+            up to ``blocking_timeout``. The default executor has only ``min(32, cpu_count + 4)``
+            threads (8 when ``cpu_count`` is 4), so once concurrent misses on one key reach that size
+            the holder's own ``get``/``set``/``release`` — also ``to_thread`` calls — queue behind
+            the waiters, every waiter times out, and all of them recompute.
+            Sets thread_local=False because attempts and release may run on different
+            executor threads.
         """
         import asyncio
+        import uuid
 
         # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
         # (the wrapper no longer pollutes the cache_key passed in).
         scoped_key = f"{self._scoped_key(key)}:lock"
-        lock = None
         try:
             from redis.lock import Lock
 
-            # Create Redis lock with tenant-scoped key
-            # CRITICAL: thread_local=False allows lock to work across thread pool
             lock = Lock(
                 self._client,
                 name=scoped_key,
                 timeout=timeout,
-                blocking_timeout=blocking_timeout if blocking_timeout is not None else 0,
-                thread_local=False,  # Disable thread-local storage for async/thread pool compatibility
+                thread_local=False,  # attempts and release may land on different executor threads
             )
 
-            # Run sync lock.acquire() in thread pool to avoid blocking event loop
-            acquired = await asyncio.to_thread(lock.acquire, blocking=blocking_timeout is not None)
+            loop = asyncio.get_running_loop()
+            deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
+            token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
+            while True:
+                acquired = await asyncio.to_thread(lock.acquire, blocking=False, token=token)
+                # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
+                # would land past the deadline. blocking_timeout=None means a single attempt.
+                if acquired or deadline is None or loop.time() + lock.sleep > deadline:
+                    break
+                await asyncio.sleep(lock.sleep)
             try:
                 yield acquired
             finally:
@@ -387,7 +401,7 @@ class PerRequestRedisBackend:
                         await asyncio.to_thread(lock.release)
                     except Exception as e:
                         # Lock may have expired - log but don't fail
-                        logger.debug("Error releasing Redis lock (may have expired): %s", e)
+                        logger.debug("Error releasing Redis lock (may have expired): %s", redact_error_for_log(e))
         except Exception as exc:
             raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
 
@@ -498,4 +512,4 @@ class RedisBackendProvider:
             self._pool.disconnect()
         except Exception as e:
             # Best effort cleanup - log but don't raise
-            logger.debug("Error closing Redis connection pool: %s", e)
+            logger.debug("Error closing Redis connection pool: %s", redact_error_for_log(e))

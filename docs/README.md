@@ -70,6 +70,7 @@ Choose how data is stored:
 | [Performance](performance.md) | Benchmarks and optimization |
 | [Comparison](comparison.md) | vs. lru\_cache, aiocache, cachetools |
 | [Error Codes](error-codes.md) | Error reference |
+| [Free-Threaded CPython](free-threading.md) | Support status, concurrency audit, CI safety net |
 
 ---
 

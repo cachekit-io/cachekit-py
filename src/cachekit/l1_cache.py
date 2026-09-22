@@ -12,6 +12,13 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
+
+# Default L1 entry lifetime when the caller supplies no TTL. Shared with the
+# decorator's LAB-557 backfill bound: the server's Fresh-For may only ever
+# SHORTEN the L1 lifetime relative to this default, never extend it.
+DEFAULT_L1_TTL_SECONDS = 300
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,13 +183,16 @@ class L1Cache:
         elif redis_ttl is not None:
             expiry = current_time + redis_ttl - self.ttl_buffer_seconds
         else:
-            # Default 5 minute TTL if not specified
-            expiry = current_time + 300 - self.ttl_buffer_seconds
+            expiry = current_time + DEFAULT_L1_TTL_SECONDS - self.ttl_buffer_seconds
 
         # Skip caching if the effective TTL is non-finite (NaN/inf would create an
         # immortal entry that never expires) or too short (would expire immediately).
         if not math.isfinite(expiry) or expiry <= current_time:
-            logger.debug("Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)", key, expiry)
+            logger.debug(
+                "Skipping L1 cache for key %s - non-finite or too-short TTL (effective expiry: %r)",
+                redact_key_for_log(key),
+                expiry,
+            )
             return
 
         # Estimate size
@@ -199,7 +209,7 @@ class L1Cache:
                     self._remove_entry(key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
-                key,
+                redact_key_for_log(key),
                 size,
                 self.max_memory_bytes,
             )
@@ -414,7 +424,7 @@ class L1CacheManager:
                         logger.debug("Background cleanup removed %d expired entries", total_cleaned)
 
                 except Exception as e:
-                    logger.error("Error in background cleanup: %s", e)
+                    logger.error("Error in background cleanup: %s", redact_error_for_log(e))
 
             logger.info("L1 cache background cleanup stopped")
 

@@ -7,7 +7,6 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import threading
 import warnings
 from collections.abc import Callable
@@ -19,6 +18,7 @@ from cachekit.backends.base import (
     BufferHandle,
     BufferReadableBackend,
     BufferWritableBackend,
+    LockableBackend,
     TTLInspectableBackend,
 )
 from cachekit.backends.provider import (
@@ -29,6 +29,10 @@ from cachekit.backends.provider import (
 )
 from cachekit.config import ConfigurationError, get_settings
 from cachekit.di import DIContainer
+
+# Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
+# leaf module so backend/L1 modules can redact without importing this module (cycle).
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import (
@@ -36,6 +40,7 @@ from cachekit.serializers.base import (
     SerializationFormat,
     SerializationMetadata,
     SuspiciousCacheEntryError,
+    bounded_error,
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
@@ -74,16 +79,6 @@ def get_logger_provider():
 def get_backend_provider():
     """Get the current BackendProviderInterface from DI container."""
     return container.get(BackendProviderInterface)
-
-
-def redact_cache_key(cache_key: object) -> str:
-    """Redact a cache key for log/error messages.
-
-    Cache keys can embed caller-supplied tenant/user identifiers, so they must never reach
-    logs verbatim (issue #163). A fixed-length blake2b digest keeps messages correlatable
-    across the sync and async cache-set failure paths without leaking the key itself.
-    """
-    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
 
 
 # Lazy logger initialization to avoid import-time container access
@@ -173,10 +168,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
     if fail_closed and isinstance(error, DecryptionAuthenticationError):
         get_logger().error(
             f"{tier.upper()} cache decrypt AUTHENTICATION failure for {redact_cache_key(cache_key)}; "
-            f"failing closed (encryption.fail_closed=True): {error}"
+            f"failing closed (encryption.fail_closed=True): {redact_error_for_log(error)}"
         )
         raise error
-    get_logger().warning(f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {error}")
+    get_logger().warning(
+        f"{tier.upper()} cache decrypt/integrity failure ({reason}) for {redact_cache_key(cache_key)}: {redact_error_for_log(error)}"
+    )
     return reason
 
 
@@ -194,6 +191,34 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
+    """Type guard: backend provides distributed locking (stampede prevention).
+
+    Takes ``object``, not ``BaseBackend`` like its siblings, because the
+    decorator probes the lazily-resolved ``_backend`` cell, which is ``None``
+    until first call and may already be narrowed by another capability guard.
+
+    Checked on the INSTANCE, deliberately — unlike ``supports_swr`` below, which
+    is class-level to keep ``__getattr__`` proxies and mocks off the freshness
+    read path. The asymmetry is the failure direction: a false negative silently
+    drops stampede protection on a hot key, while a false positive raises out of
+    the ``async with`` — and does NOT fail open. The wrapper's handler degrades
+    to lockless execution only for a ``BackendError``; a ``TypeError`` from
+    calling a non-callable propagates to the caller and breaks the decorated
+    function. Hence ``callable``, not ``hasattr``: a backend carrying
+    ``acquire_lock = None`` is not lockable, and must take the lockless path
+    rather than crash the call it was meant to protect.
+
+    Equally deliberate: not ``isinstance(backend, LockableBackend)``. Since
+    CPython 3.12 a ``runtime_checkable`` Protocol check resolves members with
+    ``inspect.getattr_static``, which does not consult ``__getattr__`` — so a
+    delegating backend proxy locks on 3.10/3.11 and silently stops locking on
+    3.12+. Plain ``getattr`` consults ``__getattr__`` and is stable across
+    every supported interpreter.
+    """
+    return callable(getattr(backend, "acquire_lock", None))
 
 
 # Backend type names already warned about, so refresh_ttl_on_get degradation warns at most
@@ -243,19 +268,41 @@ def supports_streaming_write(backend: BaseBackend) -> TypeGuard[BufferWritableBa
 class SWRCapableBackend(Protocol):
     """Backend with server-signaled stale-while-revalidate reads (LAB-381).
 
-    Reads report whether the entry is in its stale-grace window; writes accept
-    the window length. Currently only CachekitIOBackend (the SaaS signals
-    freshness on read — see protocol spec/saas-api.md#stale-while-revalidate).
+    Reads report whether the entry is in its stale-grace window plus the
+    server's remaining freshness in seconds (LAB-557; None from a pre-signal
+    server); writes accept the window length. Currently only CachekitIOBackend
+    (the SaaS signals freshness on read — see protocol
+    spec/saas-api.md#stale-while-revalidate and #remaining-freshness).
     """
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]: ...
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]: ...
 
     def set(self, key: str, value: bytes, ttl: Optional[int] = None, stale_ttl: Optional[int] = None) -> None: ...
 
 
 def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
-    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381)."""
-    return hasattr(backend, "get_with_freshness")
+    """Type guard: backend supports server-signaled SWR stale-grace reads (LAB-381).
+
+    Checked on the backend's CLASS, not the instance: protocol methods live on
+    classes, while instance-level hasattr reads dynamic-attribute objects
+    (unittest.mock.Mock, __getattr__ proxies) as SWR-capable and silently
+    reroutes their reads through the freshness path — reachable without any SWR
+    config since the LAB-557 gate widening (the freshness read now runs for
+    every capable backend, not only when stale_ttl is set).
+    """
+    return callable(getattr(type(backend), "get_with_freshness", None))
+
+
+def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
+    """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
+
+    Third-party SWR backends (0.5.x) and custom CacheHandlerStrategy implementations
+    (0.18.0) built against the 2-tuple signature still return it; None passes through.
+    """
+    if hit is None:
+        return None
+    value, is_stale, *rest = hit
+    return (value, is_stale, rest[0] if rest else None)
 
 
 # Import caching for serializer modules
@@ -318,7 +365,7 @@ def _get_cached_serializer_class(serializer_name: str, import_path: str):
 
             return serializer_class
         except (ImportError, AttributeError) as e:
-            get_logger().warning(f"Failed to import serializer {import_path}: {e}")
+            get_logger().warning(f"Failed to import serializer {import_path}: {redact_error_for_log(e)}")
             raise
 
 
@@ -728,7 +775,7 @@ class CacheSerializationHandler:
             get_logger().info(f"Generated and persisted new deployment UUID: {new_uuid} at {deployment_uuid_file}")
         except Exception as e:
             get_logger().error(
-                f"Failed to persist deployment UUID to {deployment_uuid_file}: {e}. "
+                f"Failed to persist deployment UUID to {deployment_uuid_file}: {redact_error_for_log(e)}. "
                 "UUID will be regenerated on next restart (cache will be invalidated)."
             )
 
@@ -915,7 +962,7 @@ class CacheSerializationHandler:
             raise
         except Exception as e:
             # Don't silently fallback - log error and raise to prevent data loss
-            get_logger().error(f"Serialization failed with {self.serializer_name}: {e}")
+            get_logger().error(f"Serialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
             raise SerializationError(f"Failed to serialize data with {self.serializer_name}: {e}") from e
 
         # L2 oversized-entry ceiling (issue #163): every L2 write flows through here,
@@ -1144,8 +1191,8 @@ class CacheSerializationHandler:
             # SerializationError/EncryptionError: let the outer handler log and handle
             raise
         except Exception as e:
-            get_logger().error(f"Deserialization failed with {self.serializer_name}: {e}")
-            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {e}") from e
+            get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
+            raise SerializationError(f"Failed to deserialize data with {self.serializer_name}: {bounded_error(e)}") from e
 
     def _deserialize_interop(self, data: str | bytes | memoryview, cache_key: str) -> Any:
         """Interop/v1 read path: config decides encryption, never the stored bytes.
@@ -1189,8 +1236,8 @@ class CacheSerializationHandler:
         except (ValueError, SerializationError):
             raise
         except Exception as e:
-            get_logger().error(f"Interop deserialization failed: {e}")
-            raise SerializationError(f"Failed to deserialize interop cache entry: {e}") from e
+            get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
+            raise SerializationError(f"Failed to deserialize interop cache entry: {bounded_error(e)}") from e
 
 
 class CacheOperationHandler:
@@ -1256,7 +1303,9 @@ class CacheOperationHandler:
         try:
             self.on_deserialize_error(error, cache_key)
         except Exception as hook_err:  # observability must never break the miss path
-            get_logger().warning(f"on_deserialize_error hook failed for {cache_key}: {hook_err}")
+            get_logger().warning(
+                f"on_deserialize_error hook failed for {redact_cache_key(cache_key)}: {redact_error_for_log(hook_err)}"
+            )
 
     def get_cache_key(
         self,
@@ -1316,7 +1365,9 @@ class CacheOperationHandler:
             if self._cache_handler is not None:
                 self._cache_handler.delete(cache_key)
         except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            get_logger().warning(
+                f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {redact_error_for_log(del_err)}"
+            )
         self._notify_deserialize_error(e, cache_key)
 
     async def _handle_l2_read_error_async(self, e: SerializationError, cache_key: str) -> None:
@@ -1326,10 +1377,14 @@ class CacheOperationHandler:
             if self._cache_handler is not None:
                 await self._cache_handler.delete_async(cache_key)
         except Exception as del_err:  # best-effort eviction; never mask the miss/recompute
-            get_logger().warning(f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {del_err}")
+            get_logger().warning(
+                f"Failed to evict poisoned L2 entry {redact_cache_key(cache_key)}: {redact_error_for_log(del_err)}"
+            )
         self._notify_deserialize_error(e, cache_key)
 
-    def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
+    def get_cached_value(
+        self, cache_key: str, refresh_ttl: Optional[int] = None
+    ) -> Optional[tuple[bool, Any, Optional[bytes], int]]:
         """Get value from cache if it exists.
 
         Args:
@@ -1337,7 +1392,13 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value) if cache hit, None if cache miss or error
+            Tuple (True, value, raw_bytes, size_bytes) if cache hit, None if cache
+            miss or error. raw_bytes is the serialized envelope so the decorator can
+            backfill L1 without re-serializing (re-encrypting) — same shape as the
+            async variant (LAB-348). It is None on the mmap fast path: the mapped view
+            is confined to this frame and must never reach L1 (#171 blocker C).
+            size_bytes is the envelope's byte length on every hit, mmap included, so
+            payload-size stats never depend on holding the bytes.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1356,7 +1417,8 @@ class CacheOperationHandler:
                 if handle is not None:
                     try:
                         get_logger().cache_hit(cache_key, "Backend(mmap)")
-                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key))
+                        size_bytes = handle.view.nbytes  # payload length; the view is released in `finally`
+                        return (True, self.serialization_handler.deserialize_data(handle.view, cache_key), None, size_bytes)
                     finally:
                         handle.close()
 
@@ -1365,8 +1427,8 @@ class CacheOperationHandler:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-                # Return a tuple (True, value) to distinguish from "no cache entry"
-                return (True, deserialized)
+                # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
+                return (True, deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
@@ -1382,13 +1444,20 @@ class CacheOperationHandler:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[tuple[bool, Any], bool]]:
-        """SWR variant of :meth:`get_cached_value` (LAB-381): also reports staleness.
+    def get_cached_value_with_freshness(
+        self, cache_key: str
+    ) -> Optional[tuple[tuple[bool, Any, bytes, int], bool, Optional[int]]]:
+        """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
+        staleness and the server's remaining freshness in seconds.
 
-        Returns ``((True, value), is_stale)`` on a hit, None on miss/error. The mmap
+        Returns ``((True, value, raw_bytes, size_bytes), is_stale, fresh_for)`` on
+        a hit — the inner tuple matches the async variant so the sync decorator
+        backfills L1 without re-serializing (LAB-348) — None on miss/error.
+        fresh_for is None when no signal exists (pre-signal server,
+        non-SWR backend) — the caller applies legacy L1 TTL behavior. The mmap
         fast path is skipped — SWR is CachekitIO-only, which is not buffer-readable.
         Error semantics mirror get_cached_value: the LAB-108 policy point raises
         DecryptionAuthenticationError when fail-closed (poisoned entry retained as
@@ -1398,13 +1467,17 @@ class CacheOperationHandler:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness")
 
-            hit = self._cache_handler.get_with_freshness(cache_key)
+            # Normalised here too: a custom CacheHandlerStrategy built against the
+            # v0.18.0 2-tuple signature must degrade to fresh_for=None, not have a
+            # strict 3-unpack ValueError swallowed below into a permanent
+            # every-hit-is-a-miss cache bypass (expert-panel finding, LAB-557).
+            hit = _normalize_freshness_hit(self._cache_handler.get_with_freshness(cache_key))
             if hit is None:
                 return None
-            cached_data, is_stale = hit
+            cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized), is_stale)
+            return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1419,28 +1492,33 @@ class CacheOperationHandler:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[tuple[bool, Any, bytes], bool]]:
-        """Async SWR variant (LAB-381): staleness + the raw envelope for L1 backfill.
+    async def get_cached_value_with_freshness_async(
+        self, cache_key: str
+    ) -> Optional[tuple[tuple[bool, Any, bytes, int], bool, Optional[int]]]:
+        """Async SWR variant (LAB-381/LAB-557): staleness + remaining freshness +
+        the raw envelope for L1 backfill.
 
-        Returns ``((True, value, raw_bytes), is_stale)`` on a hit — the 3-tuple
-        matches :meth:`get_cached_value_async` (LAB-111 routing) so the async
-        decorator backfills L1 without re-serializing. None on miss/error; the
-        LAB-108 fail-closed policy propagates DecryptionAuthenticationError.
+        Returns ``((True, value, raw_bytes, size_bytes), is_stale, fresh_for)`` on
+        a hit — the inner tuple matches :meth:`get_cached_value_async` (LAB-111
+        routing) so the async decorator backfills L1 without re-serializing;
+        fresh_for (seconds, None = no signal) bounds that backfill to the
+        server's remaining freshness. None on miss/error; the LAB-108
+        fail-closed policy propagates DecryptionAuthenticationError.
         """
         try:
             if self._cache_handler is None:
                 raise RuntimeError("Cache handler must be set before calling get_cached_value_with_freshness_async")
 
-            hit = await self._cache_handler.get_with_freshness_async(cache_key)
+            hit = _normalize_freshness_hit(await self._cache_handler.get_with_freshness_async(cache_key))
             if hit is None:
                 return None
-            cached_data, is_stale = hit
+            cached_data, is_stale, fresh_for = hit  # same 2-tuple contract as the sync variant above
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
-            return ((True, deserialized, cached_data), is_stale)
+            return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
             # never a legitimate miss, and not tamper. Re-raised past the broad
@@ -1455,10 +1533,12 @@ class CacheOperationHandler:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[Any]:
+    async def get_cached_value_async(
+        self, cache_key: str, refresh_ttl: Optional[int] = None
+    ) -> Optional[tuple[bool, Any, bytes, int]]:
         """Get value from cache if it exists (async version).
 
         Args:
@@ -1466,9 +1546,10 @@ class CacheOperationHandler:
             refresh_ttl: Optional TTL to refresh on hit
 
         Returns:
-            Tuple (True, value, raw_bytes) if cache hit, None if cache miss or error.
-            Unlike the sync variant, the raw serialized envelope is included so the
-            async decorator can backfill L1 without re-serializing (re-encrypting).
+            Tuple (True, value, raw_bytes, size_bytes) if cache hit, None if cache miss
+            or error. The raw serialized envelope is included so the decorator can
+            backfill L1 without re-serializing (re-encrypting); same shape as the sync
+            variant, and size_bytes is its byte length.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1486,7 +1567,7 @@ class CacheOperationHandler:
                 # Pass cache_key for AAD verification (required for encrypted data)
                 deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
                 # Tuple distinguishes a hit from "no cache entry"; raw bytes ride along for L1
-                return (True, deserialized, cached_data)
+                return (True, deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
@@ -1502,7 +1583,7 @@ class CacheOperationHandler:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
         except Exception as e:
-            get_logger().warning(f"Backend operation failed for get on {cache_key}: {e}")
+            get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
     def store_result(
@@ -1577,7 +1658,9 @@ class CacheOperationHandler:
             # silently never cached" (spec-mandated; matches cachekit-ts).
             raise
         except Exception as e:
-            get_logger().warning(f"Failed to store in backend cache: {e}")
+            get_logger().warning(
+                f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
             return None
 
     async def store_result_async(
@@ -1643,7 +1726,9 @@ class CacheOperationHandler:
             # silently never cached" (spec-mandated; matches cachekit-ts).
             raise
         except Exception as e:
-            get_logger().warning(f"Failed to store in backend cache: {e}")
+            get_logger().warning(
+                f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
             return None
 
     def set_cache_handler(self, handler: CacheHandlerStrategy):
@@ -1714,9 +1799,11 @@ class CacheInvalidator:
             self._backend.delete(cache_key)
             get_logger().cache_invalidated(cache_key, "Backend")
         except BackendError as e:
-            get_logger().error(f"Backend operation failed for invalidation on {cache_key}: {e}")
+            get_logger().error(
+                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
         except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {cache_key}: {e}")
+            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
 
     async def invalidate_cache_async(
         self,
@@ -1746,9 +1833,11 @@ class CacheInvalidator:
             self._backend.delete(cache_key)
             get_logger().cache_invalidated(cache_key, "Backend")
         except BackendError as e:
-            get_logger().error(f"Backend operation failed for invalidation on {cache_key}: {e}")
+            get_logger().error(
+                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
         except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {cache_key}: {e}")
+            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
 
 
 @runtime_checkable
@@ -1793,11 +1882,13 @@ class CacheHandlerStrategy(Protocol):
         """Delete key from cache asynchronously."""
         ...
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
-        """Get value plus SWR staleness (LAB-381); (bytes, is_stale) or None."""
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
+        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557);
+        (bytes, is_stale, fresh_for) or None. fresh_for is None from a pre-signal
+        server or a non-SWR backend."""
         ...
 
-    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
         """Async variant of get_with_freshness."""
         ...
 
@@ -1915,12 +2006,12 @@ class StandardCacheHandler:
             if remaining_ttl is not None and remaining_ttl < refresh_ttl * self.ttl_refresh_threshold:
                 await self.backend.refresh_ttl(key, refresh_ttl)
                 get_logger().debug(
-                    f"Refreshed TTL for {key}: {refresh_ttl}s "
+                    f"Refreshed TTL for {redact_cache_key(key)}: {refresh_ttl}s "
                     f"(remaining: {remaining_ttl}s, threshold: {self.ttl_refresh_threshold})"
                 )
         except Exception as e:
             # Log but don't fail the cache operation
-            get_logger().debug(f"Failed to refresh TTL for {key}: {e}")
+            get_logger().debug(f"Failed to refresh TTL for {redact_cache_key(key)}: {redact_error_for_log(e)}")
 
     def get(self, key: str, refresh_ttl: Optional[int] = None) -> Optional[bytes]:
         """Get value from cache using backend.
@@ -1941,10 +2032,10 @@ class StandardCacheHandler:
 
             return value
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     def get_buffer(self, key: str) -> Optional[BufferHandle]:
@@ -1958,43 +2049,46 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.get_buffer, key)
         except BackendError as e:
-            get_logger().error(f"Backend error mmapping key {key}: {e}")
+            get_logger().error(f"Backend error mmapping key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error mmapping key {key}: {e}")
+            get_logger().error(f"Unexpected error mmapping key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
-    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool]]:
-        """Get value plus SWR staleness from an SWR-capable backend (LAB-381).
+    def get_with_freshness(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
+        """Get value plus SWR staleness and remaining freshness (LAB-381/LAB-557).
 
-        Returns ``(bytes, is_stale)`` on a hit, or None on miss/error (same
-        degradation contract as :meth:`get` — an error reads as a miss and the
-        caller takes the synchronous recompute path).
+        Returns ``(bytes, is_stale, fresh_for)`` on a hit, or None on miss/error
+        (same degradation contract as :meth:`get` — an error reads as a miss and
+        the caller takes the synchronous recompute path). Non-SWR backends read
+        as ``(bytes, False, None)`` — no freshness signal, legacy L1 behavior.
         """
         if not supports_swr(self.backend):
             value = self.get(key)
-            return (value, False) if value is not None else None
+            return (value, False, None) if value is not None else None
         try:
-            return self._with_backpressure_and_timeout(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(self._with_backpressure_and_timeout(self.backend.get_with_freshness, key))
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool]]:
+    async def get_with_freshness_async(self, key: str) -> Optional[tuple[bytes, bool, Optional[int]]]:
         """Async variant of :meth:`get_with_freshness` (sync backend call in the thread pool)."""
         if not supports_swr(self.backend):
             value = await self.get_async(key)
-            return (value, False) if value is not None else None
+            return (value, False, None) if value is not None else None
         try:
-            return await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            return _normalize_freshness_hit(
+                await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            )
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     def set(
@@ -2024,10 +2118,10 @@ class StandardCacheHandler:
                 self._with_backpressure_and_timeout(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error setting key {key}: {e}")
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error setting key {key}: {e}")
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     def set_streaming(self, key: str, write_payload: Callable[[BinaryIO], None], ttl: Optional[int] = None) -> Optional[bool]:
@@ -2046,12 +2140,12 @@ class StandardCacheHandler:
             self._with_backpressure_and_timeout(self.backend.set_streaming, key, write_payload, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
             # Producer-side failure (serialization error, max_value_size budget): the backend
             # already discarded its partial write; surface the real cause, not a backend error.
-            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def set_streaming_async(
@@ -2065,10 +2159,10 @@ class StandardCacheHandler:
             await self._with_backpressure_and_timeout_async(self.backend.set_streaming, key, write_payload, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Backend error streaming key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {e}")
+            get_logger().error(f"Streaming serialization failed for key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     def delete(self, key: str) -> bool:
@@ -2083,10 +2177,10 @@ class StandardCacheHandler:
         try:
             return self._with_backpressure_and_timeout(self.backend.delete, key)
         except BackendError as e:
-            get_logger().error(f"Backend error deleting key {key}: {e}")
+            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error deleting key {key}: {e}")
+            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def _with_backpressure_and_timeout_async(self, operation, *args, **kwargs):
@@ -2120,10 +2214,10 @@ class StandardCacheHandler:
 
             return value
         except BackendError as e:
-            get_logger().error(f"Backend error getting key {key}: {e}")
+            get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
         except Exception as e:
-            get_logger().error(f"Unexpected error getting key {key}: {e}")
+            get_logger().error(f"Unexpected error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
 
     async def set_async(
@@ -2147,10 +2241,10 @@ class StandardCacheHandler:
                 await self._with_backpressure_and_timeout_async(self.backend.set, key, value, ttl)
             return True
         except BackendError as e:
-            get_logger().error(f"Backend error setting key {key}: {e}")
+            get_logger().error(f"Backend error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error setting key {key}: {e}")
+            get_logger().error(f"Unexpected error setting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
 
     async def delete_async(self, key: str) -> bool:
@@ -2162,8 +2256,8 @@ class StandardCacheHandler:
             # Run sync backend operation in thread pool
             return await self._with_backpressure_and_timeout_async(self.backend.delete, key)
         except BackendError as e:
-            get_logger().error(f"Backend error deleting key {key}: {e}")
+            get_logger().error(f"Backend error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False
         except Exception as e:
-            get_logger().error(f"Unexpected error deleting key {key}: {e}")
+            get_logger().error(f"Unexpected error deleting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return False

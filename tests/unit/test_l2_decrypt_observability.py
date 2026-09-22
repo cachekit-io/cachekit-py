@@ -64,7 +64,10 @@ class TestL2DecryptFailureWarning:
 
         assert result is None
         assert any("decrypt/integrity failure" in r.message for r in caplog.records)
-        assert any("GCM tag mismatch" in r.message for r in caplog.records)
+        # The exception is rendered by redact_error_for_log (CWE-532, LAB-304): the log
+        # names the type, never the provider's free-form message text.
+        assert any("EncryptionError" in r.message for r in caplog.records)
+        assert not any("GCM tag mismatch" in r.message for r in caplog.records)
 
     def test_generic_exception_does_not_trigger_decrypt_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         """Non-SerializationError (e.g. ConnectionError) uses the generic warning."""
@@ -139,7 +142,7 @@ class TestL2DecryptFailureWarning:
         assert any("Failed to evict poisoned" in r.message for r in caplog.records)
 
     async def test_async_hit_returns_value_and_raw_bytes(self) -> None:
-        """get_cached_value_async returns (True, value, raw_bytes) so the async
+        """get_cached_value_async returns (True, value, raw_bytes, size_bytes) so the async
         decorator can backfill L1 with the serialized envelope without re-serializing."""
         sentinel = object()
         mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
@@ -151,7 +154,7 @@ class TestL2DecryptFailureWarning:
 
         result = await handler.get_cached_value_async("hit:key")
 
-        assert result == (True, sentinel, b"serialized-envelope")
+        assert result == (True, sentinel, b"serialized-envelope", len(b"serialized-envelope"))
 
 
 @pytest.mark.unit

@@ -5,6 +5,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from cachekit._rust_serializer import ByteStorage
+from cachekit.hash_utils import redact_error_for_log
 
 from .auto_serializer import AutoSerializer
 from .base import (
@@ -93,7 +94,7 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
         name: Serializer name ("default", "std", "auto", "arrow", "orjson")
         enable_integrity_checking: Enable integrity checking (default: True)
             - For "default"/"std": Controls ByteStorage layer (True = LZ4 + xxHash3-64, False = pure MessagePack)
-            - For "auto": Controls ByteStorage layer (True = LZ4 + xxHash3-64, False = plain pickle)
+            - For "auto": Controls ByteStorage layer (True = LZ4 + xxHash3-64, False = raw MessagePack, no ByteStorage)
             - For "arrow"/"orjson": Controls xxHash3-64 integrity checking (Python xxhash)
 
     Returns:
@@ -179,7 +180,7 @@ def benchmark_serializers() -> dict[str, Any]:
         try:
             serializers[name] = get_serializer(name)
         except Exception as e:
-            logger.warning(f"Failed to instantiate {name} serializer: {e}")
+            logger.warning(f"Failed to instantiate {name} serializer: {redact_error_for_log(e)}")
     return serializers
 
 

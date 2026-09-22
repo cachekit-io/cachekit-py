@@ -25,6 +25,8 @@ does not regress the on-wire Redis lock name — the Redis backend now owns the
 
 from __future__ import annotations
 
+import logging
+import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -33,6 +35,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from cachekit import cache
+from cachekit.backends.base import LockableBackend
+from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.hash_utils import redact_cache_key
 
 
 class _RecordingLockableBackend:
@@ -196,14 +201,16 @@ class TestWrapperLockTimeoutFallback:
         assert len(backend.lock_keys) == 1
         bare_key = backend.lock_keys[0]
 
-        # The warning must reference the bare cache_key (no ``:lock`` smuggled in)
-        # so operators reading logs see the same key shape that ``get``/``set`` use.
+        # The warning must reference the redacted digest of the BARE cache_key —
+        # a ``:lock``-suffixed key would digest differently, so the bare-key
+        # contract is still pinned. Raw keys never reach logs (CWE-532, LAB-304).
         timeout_warnings = [r for r in caplog.records if "Failed to acquire lock" in r.message]
         assert len(timeout_warnings) == 1, (
             f"expected exactly one lock-timeout warning; got {[r.message for r in caplog.records]!r}"
         )
         msg = timeout_warnings[0].message
-        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert redact_cache_key(bare_key) in msg, f"warning must name the bare cache_key's digest; got {msg!r}"
+        assert bare_key not in msg, f"warning leaked the raw cache_key: {msg!r}"
         assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
 
 
@@ -238,14 +245,16 @@ class TestWrapperLockOperationFailureFallback:
         assert len(backend.lock_keys) == 1
         bare_key = backend.lock_keys[0]
 
-        # The lock-operation-failed warning must reference the bare cache_key —
-        # not a ``:lock``-suffixed variant — matching the protocol contract.
+        # The lock-operation-failed warning must reference the redacted digest of
+        # the bare cache_key — a ``:lock``-suffixed key would digest differently.
+        # Raw keys never reach logs (CWE-532, LAB-304).
         lock_failed_warnings = [r for r in caplog.records if "Lock operation failed" in r.message]
         assert len(lock_failed_warnings) == 1, (
             f"expected one lock-operation-failed warning; got {[r.message for r in caplog.records]!r}"
         )
         msg = lock_failed_warnings[0].message
-        assert bare_key in msg, f"warning must name the bare cache_key {bare_key!r}; got {msg!r}"
+        assert redact_cache_key(bare_key) in msg, f"warning must name the bare cache_key's digest; got {msg!r}"
+        assert bare_key not in msg, f"warning leaked the raw cache_key: {msg!r}"
         assert ":lock" not in msg, f"warning leaked ':lock' suffix: {msg!r}"
 
 
@@ -276,7 +285,7 @@ class TestRedisBackendOwnsLockSuffixOnWire:
                 """Record the lock name (the on-wire key) used to construct the lock."""
                 captured_lock_names.append(name)
 
-            def acquire(self, blocking: bool = True) -> bool:
+            def acquire(self, blocking: bool = True, token: Any = None) -> bool:
                 """Pretend acquisition always succeeds (no real Redis round-trip)."""
                 return True
 
@@ -304,3 +313,158 @@ class TestRedisBackendOwnsLockSuffixOnWire:
         assert ":lock:lock" not in wire_name, (
             f"double ':lock' suffix in Redis wire name: {wire_name!r} — both wrapper and backend appended the suffix"
         )
+
+
+class _LockFailingBackend(_RecordingLockableBackend):
+    """acquire_lock records the key, then fails with a key-carrying BackendError."""
+
+    @asynccontextmanager
+    async def acquire_lock(
+        self,
+        key: str,
+        timeout: float = 10.0,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[bool]:
+        """Raise a BackendError that embeds the cache key, as real backends do."""
+        self.lock_keys.append(key)
+        raise BackendError(
+            "lock backend down",
+            error_type=BackendErrorType.TRANSIENT,
+            operation="acquire_lock",
+            key=key,
+        )
+        yield True  # pragma: no cover — unreachable, satisfies the generator contract
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestLockFailureWarningRedactsKey:
+    """The 'Lock operation failed' warning interpolates ``{e}`` — a BackendError
+    carrying the cache key must not leak it into the log (CodeRabbit PR #264)."""
+
+    async def test_lock_failure_warning_never_logs_raw_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _LockFailingBackend()
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> dict[str, int]:
+            return {"x": x}
+
+        with caplog.at_level(logging.WARNING):
+            result = await my_func(7)
+
+        # Fallback contract intact: lock failure degrades to lock-free execution.
+        assert result == {"x": 7}
+        assert len(backend.lock_keys) == 1
+        raw_key = backend.lock_keys[0]
+
+        lock_warnings = [r.getMessage() for r in caplog.records if "Lock operation failed" in r.getMessage()]
+        assert lock_warnings, "lock failure must be logged"
+        assert not any(raw_key in m for m in lock_warnings), f"raw cache key leaked into lock warning: {lock_warnings!r}"
+        assert any(redact_cache_key(raw_key) in m for m in lock_warnings), "digest must keep the failure correlatable"
+
+
+class _DelegatingBackendProxy:
+    """Backend wrapper that exposes every capability through ``__getattr__``.
+
+    The shape an instrumentation / tenant-routing / retry wrapper takes in user
+    code, and the shape ``tests/backends/fixtures.py`` builds internally. It has
+    no ``acquire_lock`` attribute of its own — only the delegated one.
+    """
+
+    def __init__(self, wrapped: LockableBackend) -> None:
+        """Store the wrapped backend; every attribute access delegates to it."""
+        self._wrapped = wrapped
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any attribute the proxy does not define to the wrapped backend."""
+        return getattr(self._wrapped, name)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestLockCapabilityProbeSeesDelegatingProxies:
+    """The lock-capability probe must stay ``hasattr``-shaped across interpreters.
+
+    ``isinstance(backend, LockableBackend)`` looks equivalent and is not: since
+    CPython 3.12, ``runtime_checkable`` protocol checks resolve members with
+    ``inspect.getattr_static``, which does not consult ``__getattr__``. Swapping
+    the probe for ``isinstance`` therefore keeps locking on 3.10/3.11 and
+    silently drops it on 3.12+ for any delegating backend — a stampede on a hot
+    key with no log line saying protection was lost. This test fails on 3.12+
+    the moment that swap is made again.
+    """
+
+    async def test_proxied_backend_still_takes_the_lock(self) -> None:
+        """A ``__getattr__``-delegated ``acquire_lock`` must still be called."""
+        inner = _RecordingLockableBackend()
+        proxy = _DelegatingBackendProxy(inner)
+
+        # Guard the premise: the proxy is exactly the case the two probes disagree on.
+        from cachekit.backends.base import LockableBackend as _Proto
+
+        assert hasattr(proxy, "acquire_lock")
+        assert not isinstance(proxy, _Proto) or sys.version_info < (3, 12)
+
+        @cache(backend=proxy, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> int:
+            """Trivial cached coroutine used to drive one cache miss through the lock path."""
+            return x * 2
+
+        assert await my_func(7) == 14
+        assert len(inner.lock_keys) == 1, (
+            f"delegating proxy lost stampede protection — acquire_lock was not called "
+            f"(python {sys.version_info.major}.{sys.version_info.minor}); "
+            f"the capability probe must be hasattr-shaped, not isinstance-shaped"
+        )
+
+
+class _NonCallableLockBackend(_RecordingLockableBackend):
+    """Backend that HAS an ``acquire_lock`` attribute which is not callable.
+
+    The shape a feature-flagged or partially-initialised backend takes when it
+    declares the capability slot and leaves it unset. ``hasattr`` cannot tell it
+    apart from a genuinely lockable backend — ``callable`` can.
+    """
+
+    acquire_lock = None  # type: ignore[assignment]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestNonCallableLockAttributeFallsBackToLockless:
+    """A non-callable ``acquire_lock`` must degrade to lockless, never crash the call.
+
+    Under the previous ``hasattr`` probe this backend passed the capability
+    check, the wrapper then called ``None(...)``, and the resulting
+    ``TypeError`` escaped: the wrapper's handler degrades to lockless execution
+    only for a ``BackendError`` and re-raises everything else. So a backend that
+    merely declared the attribute broke every decorated call it was supposed to
+    protect (CodeRabbit PR #313).
+    """
+
+    async def test_non_callable_acquire_lock_does_not_break_the_call(self) -> None:
+        """The decorated function must still return, having taken the lockless path."""
+        backend = _NonCallableLockBackend()
+
+        # Guard the premise: hasattr cannot distinguish this from a lockable backend.
+        assert hasattr(backend, "acquire_lock")
+        assert not callable(getattr(backend, "acquire_lock", None))
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def my_func(x: int) -> int:
+            """Trivial cached coroutine used to drive one cache miss."""
+            return x * 3
+
+        # Previously raised TypeError: 'NoneType' object is not callable.
+        assert await my_func(5) == 15
+
+        # And it genuinely took the lockless branch rather than a swallowed lock.
+        assert backend.lock_keys == [], "no lock should have been taken on a non-lockable backend"
+
+    async def test_capability_probe_rejects_non_callable_attribute(self) -> None:
+        """``supports_locking`` is the single place the callable requirement lives."""
+        from cachekit.cache_handler import supports_locking
+
+        assert supports_locking(_RecordingLockableBackend()) is True
+        assert supports_locking(_NonCallableLockBackend()) is False
+        assert supports_locking(object()) is False

@@ -66,6 +66,22 @@ dependencies = [
     "xxhash>=3.5.0",
     # HTTP client for SaaS backend (cachekit.io)
     "httpx[http2]>=0.28.1",
+    # anyio is transitive via the mandatory httpx dependency above, so it ships
+    # to EVERY install, not just dev. Declared here rather than as a
+    # [tool.uv] constraint because that table is uv-local: it never reaches
+    # requires-dist, so `pip install cachekit` would ignore it. 4.14.2 fixes
+    # GHSA-82r6-8w77-94w6 / CVE-2026-63374 (IDNA-2003 hostname encoding lets a
+    # hijacked connection to an internationalised domain pass TLS certificate
+    # validation; CVSS 9.3), GHSA-5p39-cfhj-2xmp / CVE-2026-64847 (undrained
+    # process-pool stderr pipe deadlocks the worker) and GHSA-3w57-8xmc-8v26 /
+    # CVE-2026-63349 (extra_groups ignored, parent supplementary groups kept).
+    "anyio>=4.14.2",
+    # h2 arrives via the http2 extra on that same mandatory httpx dependency, so
+    # it ships to every install too, and was declared as a [tool.uv] constraint
+    # with the same no-op effect. 4.4.1 fixes GHSA-6hr6-w5qg-qmwg (duplicate Host
+    # headers forwarded across an HTTP/2 -> HTTP/1.1 downgrade — a request
+    # smuggling primitive).
+    "h2>=4.4.1",
 ]
 
 [project.optional-dependencies]
@@ -150,7 +166,6 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "--strict-markers",
     "--verbose",
-    "--basetemp=/tmp/pytest",
     "--doctest-modules",              # Validate docstring examples
     "--doctest-continue-on-failure",  # Report all doctest failures, not just first
     "--markdown-docs",                # Validate markdown documentation examples
@@ -200,8 +215,12 @@ exclude_lines = [
 ]
 
 [dependency-groups]
-dev = [
-    # Testing
+# Core test toolchain — everything tests/unit + tests/critical need on ANY
+# interpreter, including free-threaded CPython: the free-threaded CI lane
+# installs ONLY this group (LAB-511). A dep may live here only if it ships
+# free-threaded wheels or builds cleanly from source on 3.14t; deps that
+# don't (orjson, numpy, pandas, pyarrow) stay in dev below.
+test = [
     "fakeredis>=2.21.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -210,6 +229,19 @@ dev = [
     "pytest-markdown-docs>=0.6.0",
     "pytest-redis>=3.0.0",
     "pymemcache>=4.0.0",
+    # Utilities
+    "faker>=20.0.0",
+    "httpx>=0.28.1",
+    "hypothesis>=6.0.0",
+    "requests>=2.33.0; python_version >= '3.10'",
+    "psutil>=5.9.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.3",
+    "pytest-xdist>=3.8.0",
+    "time-machine>=2.19.0",
+]
+dev = [
+    { include-group = "test" },
     # Competitive comparison suite (tests/competitive/ benchmarks cachekit vs these)
     "cachetools>=5.3.0",
     "aiocache>=0.12.0",
@@ -218,14 +250,7 @@ dev = [
     "ruff>=0.6.0",
     # Utilities
     "bashlex>=0.18",
-    "faker>=20.0.0",
-    "httpx>=0.28.1",
-    "hypothesis>=6.0.0",
     "pip-audit>=2.7.0",
-    "requests>=2.33.0; python_version >= '3.10'",
-    "psutil>=5.9.0",
-    "python-dotenv>=1.0.0",
-    "pyyaml>=6.0.3",
     # Data science support (for testing AutoSerializer with numpy/pandas)
     "numpy>=2.0.2",
     "pandas>=1.3.0",
@@ -233,15 +258,17 @@ dev = [
     # OrjsonSerializer support — now the [json] optional extra; kept here so the
     # orjson tests, doctests, and markdown-docs still resolve it in dev/CI.
     "orjson>=3.9.0",
-    "pytest-xdist>=3.8.0",
-    "time-machine>=2.19.0",
 ]
 # Linux CI only - Atheris requires libFuzzer (not available on macOS without building LLVM)
 fuzz = [
     "atheris>=2.3.0",
 ]
 
-# Override vulnerable transitive dependencies
+# Override vulnerable DEV-ONLY transitive dependencies.
+# This table is uv-local: it constrains resolution of this repo's lockfile and
+# never reaches requires-dist, so a floor placed here does NOT protect anyone who
+# runs `pip install cachekit`. A transitive that reaches users belongs in
+# [project] dependencies instead — see the anyio/h2 entries above.
 [tool.uv]
 constraint-dependencies = [
     "urllib3>=2.7.0",
@@ -249,10 +276,7 @@ constraint-dependencies = [
     "werkzeug>=3.1.4",
     # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixes
     # PYSEC-2026-196 (entry-point path traversal), GHSA-58qw-9mgm-455v (tar/zip
-    # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering).
-    "pip>=26.1.2",
-    # h2 is a transitive dep (httpx[http2] -> h2). 4.4.1 fixes
-    # GHSA-6hr6-w5qg-qmwg (duplicate Host headers forwarded on HTTP/2 ->
-    # HTTP/1.1 downgrade — request smuggling primitive).
-    "h2>=4.4.1",
+    # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering); 26.2 fixes
+    # PYSEC-2026-3721 (doubly-encoded index URLs install to arbitrary paths).
+    "pip>=26.2",
 ]
