@@ -1,6 +1,7 @@
 """Standardized hashing and log-redaction utilities for cachekit.
 
-Uses BLAKE3 for hashing (approximately 2-3 GB/s throughput).
+Runs two digests for two jobs: BLAKE3 for cache-key hashing (approximately
+2-3 GB/s throughput), blake2b for the log-redaction correlation id below.
 
 This is also the leaf home for the log-redaction policy — ``redact_cache_key``,
 ``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532). It lives here, not in
@@ -104,8 +105,8 @@ def redact_error_for_log(error: object) -> str:
     return type(error).__name__
 
 
-def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
-    """Fast hash using BLAKE3 for hot paths.
+def blake3_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
+    """BLAKE3 digest truncated to ``digest_size`` bytes.
 
     Args:
         data: String or bytes to hash
@@ -131,7 +132,7 @@ def function_hash(func_name: str) -> str:
     Returns:
         8-character hex hash (collision probability: ~1 in 4 billion)
     """
-    return fast_hash(func_name, digest_size=4)
+    return blake3_hash(func_name, digest_size=4)
 
 
 def cache_key_hash(args_kwargs_str: str) -> str:
@@ -143,4 +144,4 @@ def cache_key_hash(args_kwargs_str: str) -> str:
     Returns:
         32-character hex hash for cache key uniqueness
     """
-    return fast_hash(args_kwargs_str, digest_size=16)
+    return blake3_hash(args_kwargs_str, digest_size=16)
