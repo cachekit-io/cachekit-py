@@ -18,6 +18,7 @@ from cachekit.backends.base import (
     BufferHandle,
     BufferReadableBackend,
     BufferWritableBackend,
+    LockableBackend,
     TTLInspectableBackend,
 )
 from cachekit.backends.provider import (
@@ -190,6 +191,34 @@ def supports_ttl_inspection(backend: BaseBackend) -> TypeGuard[TTLInspectableBac
         After this check, the type checker knows backend is TTLInspectableBackend.
     """
     return hasattr(backend, "get_ttl") and hasattr(backend, "refresh_ttl")
+
+
+def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
+    """Type guard: backend provides distributed locking (stampede prevention).
+
+    Takes ``object``, not ``BaseBackend`` like its siblings, because the
+    decorator probes the lazily-resolved ``_backend`` cell, which is ``None``
+    until first call and may already be narrowed by another capability guard.
+
+    Checked on the INSTANCE, deliberately — unlike ``supports_swr`` below, which
+    is class-level to keep ``__getattr__`` proxies and mocks off the freshness
+    read path. The asymmetry is the failure direction: a false negative silently
+    drops stampede protection on a hot key, while a false positive raises out of
+    the ``async with`` — and does NOT fail open. The wrapper's handler degrades
+    to lockless execution only for a ``BackendError``; a ``TypeError`` from
+    calling a non-callable propagates to the caller and breaks the decorated
+    function. Hence ``callable``, not ``hasattr``: a backend carrying
+    ``acquire_lock = None`` is not lockable, and must take the lockless path
+    rather than crash the call it was meant to protect.
+
+    Equally deliberate: not ``isinstance(backend, LockableBackend)``. Since
+    CPython 3.12 a ``runtime_checkable`` Protocol check resolves members with
+    ``inspect.getattr_static``, which does not consult ``__getattr__`` — so a
+    delegating backend proxy locks on 3.10/3.11 and silently stops locking on
+    3.12+. Plain ``getattr`` consults ``__getattr__`` and is stable across
+    every supported interpreter.
+    """
+    return callable(getattr(backend, "acquire_lock", None))
 
 
 # Backend type names already warned about, so refresh_ttl_on_get degradation warns at most
