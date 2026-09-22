@@ -285,10 +285,9 @@ class TestKeyCarryingBackendErrorRedaction:
 
 
 class TestStructuredLoggerCacheOperationRedaction:
-    """``StructuredLogger.cache_operation`` is a direct sink.
+    """``StructuredLogger.cache_operation`` is the only structured sink on the class.
 
-    ``cache_hit``/``cache_miss``/``cache_stored`` all funnel through it, so this
-    one method is the whole surface. It must apply the *same* pass-through policy
+    It must apply the *same* pass-through policy
     as the orchestrator sink: a value that arrives already redacted, or is a known
     sentinel, is emitted verbatim. Hashing it a second time would mint a different
     digest for the same key and break correlation between the two sinks
@@ -409,11 +408,13 @@ ERROR_KWARGS = [
 class TestErrorKwargSanitisedAtSink:
     """An ``error`` kwarg is sanitised once, at each structured sink (CWE-532, defence in depth).
 
-    Three in-tree callers, three shapes: ``handle_cache_error`` pre-renders to a str,
-    ``redis_operation_failed`` passes the exception object, and the circuit-breaker path
-    in ``wrapper.py`` passes a str literal. The sink must emit all three key-free, and a
-    str must pass through untouched (re-sanitising one would emit the literal ``"str"``).
-    The assertion runs over the whole payload, not the ``error`` field alone.
+    Two in-tree callers, both str: ``handle_cache_error`` pre-renders via
+    ``redact_error_for_log``, and the circuit-breaker path in ``wrapper.py`` passes a str
+    literal. The raw-exception shape is kept as defence in depth — ``cache_operation``
+    takes ``**kwargs``, so nothing stops a future caller handing it an exception object,
+    and the sink must render that key-free too. A str must pass through untouched
+    (re-sanitising one would emit the literal ``"str"``). The assertion runs over the
+    whole payload, not the ``error`` field alone.
     """
 
     @pytest.mark.parametrize(("error", "rendered"), ERROR_KWARGS)
