@@ -113,7 +113,7 @@ class AsyncLogWriter(threading.Thread):
     """Background thread for async log writing."""
 
     def __init__(self, buffer: LockFreeRingBuffer):
-        super().__init__(daemon=True, name="RedisCache-LogWriter")
+        super().__init__(daemon=True, name="cachekit-LogWriter")
         self.buffer = buffer
         self.running = True
         self._stop_event = threading.Event()
@@ -414,68 +414,10 @@ class StructuredLogger:
             context["correlation_id"] = self._context.correlation_id
         return context
 
-    # Compatibility methods for tests
-    def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure. ``cache_operation`` renders the error key-free (CWE-532)."""
-        self.cache_operation(operation, key, error=error, error_type=type(error).__name__, **kwargs)
-
-    def cache_hit(self, key: str, **kwargs):
-        """Log cache hit."""
-        self.cache_operation("get", key, hit=True, **kwargs)
-
-    def cache_miss(self, key: str, **kwargs):
-        """Log cache miss."""
-        self.cache_operation("get", key, hit=False, **kwargs)
-
-    def cache_stored(self, key: str, **kwargs):
-        """Log cache store operation."""
-        self.cache_operation("set", key, **kwargs)
-
-    def serialization_fallback(self, from_serializer: str, to_serializer: str, reason: str, **kwargs):
-        """Log serialization fallback event."""
-
-        # Log the fallback
-        self.warning(
-            f"Serialization fallback: {from_serializer} -> {to_serializer}",
-            from_serializer=from_serializer,
-            to_serializer=to_serializer,
-            reason=reason,
-            **kwargs,
-        )
-
-    def create_span(self, name: str, **kwargs):
-        """Create a simple tracing span context manager."""
-        return SimpleSpan(self, name, **kwargs)
-
     def __del__(self):
         """Cleanup on deletion."""
         if hasattr(self, "writer"):
             self.writer.stop()
-
-
-class SimpleSpan:
-    """Simple span implementation for tracing integration."""
-
-    def __init__(self, logger: StructuredLogger, name: str, **kwargs):
-        self.logger = logger
-        self.name = name
-        self.kwargs = kwargs
-        self.start_time = None
-
-    def __enter__(self):
-        """Start the span."""
-        self.start_time = time.time()
-        # Generate a simple trace ID if not set
-        if not hasattr(self.logger._context, "trace_id") or not self.logger._context.trace_id:
-            trace_id = f"span-{int(time.time() * 1000000)}"
-            self.logger.set_trace_id(trace_id)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """End the span."""
-        if self.start_time:
-            duration = time.time() - self.start_time
-            self.logger.debug(f"Span completed: {self.name}", span_name=self.name, duration_ms=duration * 1000, **self.kwargs)
 
 
 # Global logger instances cache
