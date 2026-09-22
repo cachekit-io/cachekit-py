@@ -11,6 +11,7 @@ enable advanced features with graceful degradation.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
 
 # Re-export BackendError for convenience (public API)
@@ -269,8 +270,11 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: RedisBackend, CachekitIOBackend (SaaS ``POST /v1/cache/{key}/lock``)
-    - Not supported: FileBackend, L1-only (in-memory)
+    - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and
+      therefore the env-resolved Redis path hand out — and ``CachekitIOBackend``
+      (SaaS ``POST /v1/cache/{key}/lock``).
+    - Not supported: ``RedisBackend`` constructed directly and passed as
+      ``backend=``, ``FileBackend``, L1-only (in-memory).
 
     Contract — bare cache key:
         ``acquire_lock`` receives the **bare cache key**, identical to what
@@ -293,12 +297,12 @@ class LockableBackend(Protocol):
         >>> #             result = expensive_computation()
     """
 
-    async def acquire_lock(
+    def acquire_lock(
         self,
         key: str,
         timeout: float,
         blocking_timeout: Optional[float] = None,
-    ) -> AsyncIterator[bool]:
+    ) -> AbstractAsyncContextManager[bool]:
         """Acquire a distributed lock on key.
 
         Args:
@@ -309,9 +313,11 @@ class LockableBackend(Protocol):
             timeout: How long to hold the lock (seconds) before auto-release
             blocking_timeout: Max time to wait for lock acquisition (None = non-blocking)
 
-        Yields:
-            True if lock was acquired
-            False if timeout occurred waiting for lock
+        Returns:
+            An async context manager yielding True if the lock was acquired,
+            False if the wait timed out. Implementations are ``async``
+            generators wrapped in ``@asynccontextmanager``, so this protocol
+            declares the *decorated* shape.
 
         Raises:
             BackendError: If backend operation fails

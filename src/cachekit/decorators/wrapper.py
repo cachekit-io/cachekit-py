@@ -24,7 +24,9 @@ from ..cache_handler import (
     get_logger,
     handle_decrypt_failure,
     redact_cache_key,
+    supports_locking,
     supports_swr,
+    supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
 from ..interop import (
@@ -46,7 +48,22 @@ from .orchestrator import FeatureOrchestrator
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
+    from ..backends.base import BaseBackend
     from ..serializers.base import SerializerProtocol
+
+
+def _resolve_lazy_backend() -> BaseBackend:
+    """Backend for a decorator that was applied without ``backend=``.
+
+    Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
+    takes effect regardless of whether it ran before or after the module holding
+    the decorated function was imported (LAB-4457).
+    """
+    from ..config.decorator import get_default_backend
+
+    default = get_default_backend()
+    return default if default is not None else get_backend_provider().get_backend()
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -907,9 +924,8 @@ def create_cache_wrapper(
         the caller already got the stale value; the entry hard-expires at evict_at and
         the next request takes the ordinary synchronous miss path (spec degradation)."""
         try:
-            _acquire_lock = getattr(_backend, "acquire_lock", None)
-            if _acquire_lock is not None:
-                async with _acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
+            if supports_locking(_backend):
+                async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
                     await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
@@ -1263,7 +1279,7 @@ def create_cache_wrapper(
 
                 nonlocal _backend
                 if _backend is None:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1672,7 +1688,7 @@ def create_cache_wrapper(
             if interop is not None:
                 if _backend is None:
                     try:
-                        _backend = get_backend_provider().get_backend()
+                        _backend = _resolve_lazy_backend()
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1746,7 +1762,7 @@ def create_cache_wrapper(
             # Initialize backend only when needed (lazy init for performance)
             if _backend is None:
                 try:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1805,7 +1821,7 @@ def create_cache_wrapper(
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
                     # Handle TTL refresh if configured and threshold met
-                    if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
+                    if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
                         try:
                             remaining_ttl = await _backend.get_ttl(cache_key)
                             if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
@@ -1859,7 +1875,7 @@ def create_cache_wrapper(
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
             # Check if backend supports distributed locking
-            if hasattr(_backend, "acquire_lock"):
+            if supports_locking(_backend):
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
@@ -2003,7 +2019,7 @@ def create_cache_wrapper(
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
-            if not hasattr(_backend, "acquire_lock"):
+            if not supports_locking(_backend):
                 logger().debug(
                     f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
                 )
@@ -2078,7 +2094,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
@@ -2138,7 +2154,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
