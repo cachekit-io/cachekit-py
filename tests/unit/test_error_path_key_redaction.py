@@ -31,7 +31,7 @@ from cachekit.cache_handler import (
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.hash_utils import _SENTINEL_KEYS, redact_cache_key
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.logging import UltraOptimizedStructuredLogger
+from cachekit.logging import StructuredLogger
 from cachekit.serializers.base import SerializationError
 
 TENANT_KEY = "ns:tenant-42-alice-secret:func:app.get_user:args:deadbeef:v1"
@@ -285,7 +285,7 @@ class TestKeyCarryingBackendErrorRedaction:
 
 
 class TestStructuredLoggerCacheOperationRedaction:
-    """``UltraOptimizedStructuredLogger.cache_operation`` is a direct sink.
+    """``StructuredLogger.cache_operation`` is a direct sink.
 
     ``cache_hit``/``cache_miss``/``cache_stored`` all funnel through it, so this
     one method is the whole surface. It must apply the *same* pass-through policy
@@ -296,7 +296,7 @@ class TestStructuredLoggerCacheOperationRedaction:
     """
 
     def _emit(self, caplog: pytest.LogCaptureFixture, cache_key: str) -> str:
-        logger = UltraOptimizedStructuredLogger("test.cache_operation")
+        logger = StructuredLogger("test.cache_operation")
 
         with caplog.at_level(logging.INFO, logger="test.cache_operation"):
             logger.cache_operation("get", cache_key, hit=True)
@@ -418,7 +418,7 @@ class TestErrorKwargSanitisedAtSink:
 
     @pytest.mark.parametrize(("error", "rendered"), ERROR_KWARGS)
     def test_logging_sink(self, error: object, rendered: str, caplog: pytest.LogCaptureFixture) -> None:
-        logger = UltraOptimizedStructuredLogger("test.error_kwarg")
+        logger = StructuredLogger("test.error_kwarg")
 
         with caplog.at_level(logging.INFO, logger="test.error_kwarg"):
             logger.cache_operation("set", TENANT_KEY, error=error)

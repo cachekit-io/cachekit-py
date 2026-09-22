@@ -11,18 +11,18 @@ import pytest
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.logging import (
     JsonFormatter,
-    StructuredRedisLogger,
+    StructuredLogger,
     get_structured_logger,
 )
 
 
-class TestStructuredRedisLogger:
-    """Test StructuredRedisLogger functionality."""
+class TestStructuredLogger:
+    """Test StructuredLogger functionality."""
 
     @pytest.fixture
     def logger(self):
         """Create a test logger instance."""
-        return StructuredRedisLogger("test_logger")
+        return StructuredLogger("test_logger")
 
     def test_logger_initialization(self, logger):
         """Test logger initialization."""
@@ -279,7 +279,7 @@ class TestFactoryFunction:
     def test_get_structured_logger(self):
         """Test get_structured_logger factory returns one cached instance per name."""
         logger1 = get_structured_logger("test1")
-        assert isinstance(logger1, StructuredRedisLogger)
+        assert isinstance(logger1, StructuredLogger)
 
         logger1_again = get_structured_logger("test1")
         assert logger1_again is logger1

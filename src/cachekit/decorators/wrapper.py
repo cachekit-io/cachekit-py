@@ -1606,7 +1606,7 @@ def create_cache_wrapper(
                         raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
                     cache_key = f"{namespace or 'default'}:{custom_key}"
                 elif fast_mode:
-                    # Ultra-fast key generation for hot paths (10-50μs savings)
+                    # Fast-path key generation (10-50μs savings)
                     from ..hash_utils import cache_key_hash
 
                     cache_namespace = namespace or "default"

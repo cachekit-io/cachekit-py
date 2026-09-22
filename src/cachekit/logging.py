@@ -1,4 +1,4 @@
-"""Ultra-optimized structured logging with minimal overhead.
+"""Structured logging with minimal overhead.
 
 This module provides lock-free, sampling-based structured logging
 that reduces overhead from 570% to <5% while maintaining functionality.
@@ -151,8 +151,8 @@ class AsyncLogWriter(threading.Thread):
                 pass
 
 
-class UltraOptimizedStructuredLogger:
-    """Ultra-optimized structured logger with <5% overhead.
+class StructuredLogger:
+    """Structured logger with <5% overhead.
 
     Features:
     - Lock-free ring buffer
@@ -456,7 +456,7 @@ class UltraOptimizedStructuredLogger:
 class SimpleSpan:
     """Simple span implementation for tracing integration."""
 
-    def __init__(self, logger: UltraOptimizedStructuredLogger, name: str, **kwargs):
+    def __init__(self, logger: StructuredLogger, name: str, **kwargs):
         self.logger = logger
         self.name = name
         self.kwargs = kwargs
@@ -479,18 +479,18 @@ class SimpleSpan:
 
 
 # Global logger instances cache
-_logger_instances: dict[str, UltraOptimizedStructuredLogger] = {}
+_logger_instances: dict[str, StructuredLogger] = {}
 _logger_lock = threading.Lock()
 
 
-def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
+def get_structured_logger(name: str) -> StructuredLogger:
     """Get or create a structured logger instance.
 
     Args:
         name: Logger name (usually __name__)
 
     Returns:
-        Ultra-optimized structured logger instance
+        Structured logger instance
     """
     # Fast path - check if already exists
     if name in _logger_instances:
@@ -500,12 +500,8 @@ def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
     with _logger_lock:
         # Double-check pattern
         if name not in _logger_instances:
-            _logger_instances[name] = UltraOptimizedStructuredLogger(name)
+            _logger_instances[name] = StructuredLogger(name)
         return _logger_instances[name]
-
-
-# Alias
-StructuredRedisLogger = UltraOptimizedStructuredLogger
 
 
 class JsonFormatter(logging.Formatter):
