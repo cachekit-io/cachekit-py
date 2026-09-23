@@ -334,7 +334,7 @@ def test_function():
     pass
 
 # Secure - encryption + all features
-@cache.secure(master_key="a" * 64)
+@cache.secure(master_key=secret_key)
 def secure_function():
     pass
 
@@ -548,7 +548,7 @@ export CACHEKIT_MASTER_KEY="my-secret-key"
 export CACHEKIT_MASTER_KEY="abcd1234"
 
 # CORRECT - 64 hex characters = 32 bytes
-export CACHEKIT_MASTER_KEY="a1b2c3d4e5f6789012345678901234567890abcdef12345678901234567890"
+export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
 </details>

@@ -31,7 +31,7 @@ def expensive_function():
 # These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (requires CACHEKIT_MASTER_KEY env var)
+@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY)
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)

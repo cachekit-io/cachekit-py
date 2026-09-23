@@ -336,7 +336,7 @@ def get_price(symbol: str):
 def process_payment(amount):
     return payment_gateway.charge(amount)  # illustrative - not defined
 
-@cache.secure(master_key="a" * 64)    # Security-critical: client-side encryption
+@cache.secure(master_key=secret_key)    # Security-critical: client-side encryption
 def get_user_data(user_id: int):
     return db.fetch_user(user_id)  # illustrative - not defined
 
