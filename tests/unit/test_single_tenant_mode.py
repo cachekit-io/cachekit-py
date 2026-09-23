@@ -11,8 +11,10 @@ from unittest.mock import patch
 
 import pytest
 
+from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError, reset_settings
+from cachekit.serializers.base import SerializationError
 
 
 class TestSingleTenantModeValidation:
@@ -192,6 +194,34 @@ class TestTenantIDUsage:
         assert legacy.deserialize_data(current.serialize_data({"who": "new"}, cache_key="user:2"), cache_key="user:2") == {
             "who": "new"
         }
+
+
+class TestMissingTenantIdFailsClosed:
+    """``__init__`` always resolves a single-tenant tenant_id, so ``None`` is our own broken
+    invariant, never an entry fault. These guards are not dead weight: without them the
+    binding's type error surfaces as ``EncryptionError`` — a SerializationError, which the
+    read path files as corruption and answers by evicting a valid entry."""
+
+    def test_write_refuses(self, monkeypatch):
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="61" * 32)
+        handler._single_tenant_id = None
+
+        with pytest.raises(SerializationError, match="single-tenant tenant_id should be set in __init__"):
+            handler.serialize_data({"v": 1}, cache_key="test:key")
+
+    def test_interop_read_fails_loud_not_as_corruption(self, monkeypatch):
+        """KeyringConfigurationError: every read site re-raises it, so the valid shared entry
+        is kept rather than missed and evicted as corrupt."""
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, interop_mode=True, master_key="61" * 32)
+        entry = handler.serialize_data({"v": 1}, cache_key="test:key")
+        handler._single_tenant_id = None
+
+        with pytest.raises(KeyringConfigurationError, match="tenant_id missing"):
+            handler.deserialize_data(entry, cache_key="test:key")
 
 
 class TestErrorMessages:

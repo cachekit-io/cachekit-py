@@ -1158,7 +1158,9 @@ class CacheSerializationHandler:
         try:
             if self.encryption:
                 if self._single_tenant_id is None:
-                    raise SerializationError("interop encryption requires single-tenant mode (tenant_id missing)")
+                    # Our own config is broken, not the entry: fail loud. A SerializationError
+                    # would read as corruption and miss + evict a valid shared entry.
+                    raise KeyringConfigurationError("interop encryption requires single-tenant mode (tenant_id missing)")
                 tenant_id = self._single_tenant_id
                 wrapper = self._get_cached_encryption_wrapper(tenant_id)
                 # Synthesize the metadata the wrapper needs: interop AAD is pinned
