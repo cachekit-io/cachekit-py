@@ -218,7 +218,7 @@ class CachekitIOBackend:
         everything else still comes from the environment.
 
         Raises:
-            ConfigurationError: missing or empty API key, or an API URL that fails
+            ConfigurationError: missing, empty or whitespace-containing API key, or an API URL that fails
                 validation (non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
@@ -231,7 +231,8 @@ class CachekitIOBackend:
         # raw api_key, and `raise ... from None` only hides it — it would still hang off __context__.
         if errors is not None:
             problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
-            hint = _API_KEY_HINT if any(err["loc"] == ("api_key",) for err in errors) else ""
+            key_absent = any(err["loc"] == ("api_key",) and err["type"] in ("missing", "too_short") for err in errors)
+            hint = _API_KEY_HINT if key_absent else ""
             raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
         # Get HTTP clients (hybrid sync/async architecture)

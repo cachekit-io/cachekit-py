@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
+from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError
 
@@ -127,6 +128,34 @@ class TestInit:
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
         with pytest.raises(ConfigurationError, match="api_key"):
             CachekitIOBackend(api_key="")
+
+    @pytest.mark.parametrize("key", ["   ", "ck_live_SECRET_XYZ\n", "ck_live_SECRET XYZ"], ids=["blank", "newline", "inner"])
+    def test_whitespace_key_raises_at_construction(
+        self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        """min_length=1 passes these; the first request then fails with an h11 error echoing the key."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="whitespace") as info:
+            CachekitIOBackend(api_key=key)
+        assert "SECRET" not in str(info.value)
+        assert "requires an API key" not in str(info.value)  # a key WAS given
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
+            {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
+        ],
+        ids=["whitespace", "allowlist"],
+    )
+    def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict) -> None:
+        """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
+        from pydantic import ValidationError
+
+        monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        with pytest.raises(ValidationError) as info:
+            CachekitIOBackendConfig(**kwargs)
+        assert "SECRET" not in str(info.value)
 
     def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""

@@ -103,6 +103,9 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     model_config = SettingsConfigDict(
         **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_",
+        # This class is public: built directly (or via from_env()), a failed validation would
+        # print the raw api_key in str(ValidationError) — tracebacks, logs (CWE-532).
+        hide_input_in_errors=True,
     )
 
     api_url: str = Field(
@@ -133,6 +136,16 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         default=False,
         description="Allow custom API hostnames (disables SSRF hostname allowlist)",
     )
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, v: SecretStr) -> SecretStr:
+        # A bearer token never contains whitespace (RFC 6750); a key read from a secrets file
+        # usually carries a trailing newline. Accepted, it fails on the first request with an h11
+        # error that echoes "Bearer <key>". Reject rather than strip: never rewrite a credential.
+        if any(c.isspace() for c in v.get_secret_value()):
+            raise ValueError("contains whitespace (a trailing newline from a secrets file is the usual cause)")
+        return v
 
     @field_validator("api_url")
     @classmethod

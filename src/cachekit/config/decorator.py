@@ -564,8 +564,8 @@ class DecoratorConfig:
             DecoratorConfig with CachekitIOBackend
 
         Raises:
-            ConfigurationError: If the API key is missing or empty (argument and
-                CACHEKIT_API_KEY), or if ``backend=`` is passed.
+            ConfigurationError: If the API key is missing, empty or contains whitespace
+                (argument and CACHEKIT_API_KEY), or if ``backend=`` is passed.
 
         Example:
             >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)  # pragma: allowlist secret

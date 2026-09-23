@@ -149,13 +149,22 @@ def cache(
         _explicit_l1_only = _explicit_backend and manual_overrides["backend"] is None
         backend = manual_overrides.pop("backend", None)
 
+        if config is not None and not isinstance(config, DecoratorConfig):
+            raise TypeError(
+                f"config parameter must be DecoratorConfig instance, got {type(config).__name__}. "
+                f"Use DecoratorConfig.minimal(), .production(), .secure(), .dev(), or .test()"
+            )
+
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
         # check module-level default set via set_default_backend(). Kept here
         # (not only lazily) because decoration-time validation — the interop
         # backend guard and stale_ttl/SWR capability (LAB-557) — needs the
         # backend when it is already known. If the default is set LATER, the
         # wrapper re-consults it at first call (_resolve_lazy_backend, LAB-4457).
-        if backend is None and not _explicit_l1_only:
+        # A backend already in config= is explicit and beats the default: fetched here, the
+        # default would replace it below — DecoratorConfig.io(api_key=B) under a key-A default
+        # would send tenant B's traffic under key A.
+        if backend is None and not _explicit_l1_only and (config is None or config.backend is None):
             from ..config.decorator import get_default_backend
 
             backend = get_default_backend()
@@ -193,12 +202,7 @@ def cache(
 
         # RORO config takes highest precedence
         if config is not None:
-            # DecoratorConfig instance provided - use it directly with overrides
-            if not isinstance(config, DecoratorConfig):
-                raise TypeError(
-                    f"config parameter must be DecoratorConfig instance, got {type(config).__name__}. "
-                    f"Use DecoratorConfig.minimal(), .production(), .secure(), .dev(), or .test()"
-                )
+            # DecoratorConfig instance provided (type checked above) - use it with overrides
             resolved_config = config
             if manual_overrides or backend is not None:
                 # Apply overrides by creating new DecoratorConfig with merged settings
