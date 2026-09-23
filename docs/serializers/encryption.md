@@ -25,8 +25,9 @@ from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
 # Encrypted JSON (API responses, webhooks, session data)
-# Note: EncryptionWrapper requires CACHEKIT_MASTER_KEY env var or master_key param
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex("a" * 64)), backend=None)
+# Note: EncryptionWrapper requires CACHEKIT_MASTER_KEY env var or master_key param.
+# Encrypting serializers need a backend: backend=None (L1-only) stores raw objects and is refused.
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex("a" * 64)))
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_...",
@@ -35,7 +36,7 @@ def get_api_keys(tenant_id: str):
     }
 
 # Encrypted MessagePack (default - use @cache.secure preset)
-@cache.secure(master_key=bytes.fromhex("a" * 64), backend=None)
+@cache.secure(master_key="a" * 64)
 def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
@@ -47,7 +48,7 @@ from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, ArrowSerializer
 
 # Encrypted DataFrames (patient data, ML features)
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex("a" * 64)), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex("a" * 64)))
 def get_patient_records(hospital_id: int):
     return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
 ```

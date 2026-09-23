@@ -334,7 +334,7 @@ def test_function():
     pass
 
 # Secure - encryption + all features
-@cache.secure(master_key="a" * 64, backend=None)
+@cache.secure(master_key="a" * 64)
 def secure_function():
     pass
 

@@ -9,7 +9,7 @@
 Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. Redis never sees plaintext. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM encryption
+@cache.secure(ttl=300, master_key="a" * 64)  # AES-256-GCM encryption
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # Encrypted in Redis, decrypted in-app (illustrative)
 ```
@@ -27,12 +27,17 @@ from cachekit import cache
 import os
 os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM enabled
+@cache.secure(ttl=300, master_key="a" * 64)  # AES-256-GCM enabled
 def get_sensitive_data(user_id):
     return db.query(SensitiveData).filter_by(id=user_id).first()  # illustrative - db not defined
 
 data = get_sensitive_data(123)  # Encrypted in Redis
 ```
+
+> **`@cache.secure` needs a backend.** `backend=None` (L1-only) stores raw Python objects,
+> which cannot be ciphertext, so the combination is refused at decoration time with a
+> `ConfigurationError`. With a backend configured, L1 *does* stay on — it holds the same
+> ciphertext L2 does.
 
 ---
 
@@ -110,7 +115,7 @@ Python object (plaintext, in-app only)
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption, slower, for sensitive data
+@cache.secure(ttl=300, master_key="a" * 64)  # Encryption, slower, for sensitive data
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # illustrative - db not defined
 ```
@@ -191,7 +196,7 @@ redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
 ### L1 Cache Conflict
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption + L1 cache (stores encrypted bytes)
+@cache.secure(ttl=300, master_key="a" * 64)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
     # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
@@ -212,7 +217,7 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```python notest
 from cachekit import cache
 
-@cache.secure(ttl=3600, master_key="a" * 64, backend=None)  # AES-256-GCM with MessagePack
+@cache.secure(ttl=3600, master_key="a" * 64)  # AES-256-GCM with MessagePack
 def get_user_profile(user_id):
     return db.get_profile(user_id)  # illustrative - db not defined
 
@@ -226,7 +231,7 @@ from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
 # Encrypt JSON API responses (webhooks, sessions, API keys)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()))
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_abcdef123456",
@@ -245,7 +250,7 @@ from cachekit.serializers import EncryptionWrapper, ArrowSerializer
 import pandas as pd
 
 # Encrypt DataFrames with patient data, ML features, analytics
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined
     return pd.read_sql(
@@ -269,7 +274,6 @@ tenant_context = ContextVar("tenant_id")
     ttl=3600,
     master_key="a" * 64,
     tenant_extractor=lambda user_id: tenant_context.get(),
-    backend=None
 )
 def get_user_data(user_id):
     tenant_id = tenant_context.get()
@@ -548,7 +552,7 @@ Cached after first use: No additional overhead
 
 **Encryption + Circuit Breaker**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Both enabled
+@cache.secure(ttl=300, master_key="a" * 64)  # Both enabled
 def get_data():
     # Decryption error → Circuit breaker catches
     # Encryption happens before circuit breaker (at write time)
@@ -557,7 +561,7 @@ def get_data():
 
 **Encryption + L1 Cache**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)
+@cache.secure(ttl=300, master_key="a" * 64)
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
     # No plaintext in memory: encryption at rest in both L1 and L2

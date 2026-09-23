@@ -283,7 +283,7 @@ def fetch(key):
 
 **Circuit Breaker + Encryption**:
 ```python notest
-@cache.secure(master_key="a" * 64, ttl=300, backend=None)  # Both features enabled
+@cache.secure(master_key="a" * 64, ttl=300)  # Both features enabled
 def fetch_sensitive(key):
     # Encryption happens before L2 write
     # If L2 fails → Circuit opens
