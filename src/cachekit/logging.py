@@ -1,7 +1,7 @@
 """Structured logging with minimal overhead.
 
 This module provides lock-free, sampling-based structured logging
-that reduces overhead from 570% to <5% while maintaining functionality.
+with asynchronous batch writes.
 """
 
 import json
@@ -21,24 +21,12 @@ from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 logger = logging.getLogger(__name__)
 
 
-# Global configuration - loaded from settings singleton
-def _get_logging_config():
-    """Get logging configuration from settings."""
-    settings = get_settings()
-    return {
-        "sampling_rate": settings.log_sampling_rate,
-        "ring_buffer_size": settings.log_buffer_size,
-        "batch_size": settings.log_batch_size,
-        "flush_interval": settings.log_flush_interval,
-    }
-
-
-# Load configuration once at module import
-_logging_config = _get_logging_config()
-SAMPLING_RATE = _logging_config["sampling_rate"]
-RING_BUFFER_SIZE = _logging_config["ring_buffer_size"]
-BATCH_SIZE = _logging_config["batch_size"]
-FLUSH_INTERVAL = _logging_config["flush_interval"]
+# Global configuration - loaded once at module import from the settings singleton
+_settings = get_settings()
+SAMPLING_RATE = _settings.log_sampling_rate
+RING_BUFFER_SIZE = _settings.log_buffer_size
+BATCH_SIZE = _settings.log_batch_size
+FLUSH_INTERVAL = _settings.log_flush_interval
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
@@ -152,7 +140,7 @@ class AsyncLogWriter(threading.Thread):
 
 
 class StructuredLogger:
-    """Structured logger with <5% overhead.
+    """Structured logger.
 
     Features:
     - Lock-free ring buffer
@@ -343,48 +331,11 @@ class StructuredLogger:
 
         self.log("INFO", "pool_utilization", utilization=round(utilization, 3), **kwargs)
 
-    def circuit_breaker_state_change(self, from_state: str, to_state: str, reason: Optional[str] = None, **kwargs):
-        """Log circuit breaker state changes - always sampled."""
-        # Update Prometheus metrics if available
-        try:
-            from cachekit.reliability.metrics_collection import circuit_breaker_state
-
-            # Map state names to numeric values
-            state_map = {"CLOSED": 0, "OPEN": 2, "HALF_OPEN": 1}
-            if to_state.upper() in state_map:
-                circuit_breaker_state.set(state_map[to_state.upper()])
-            else:
-                # Invalid state maps to -1
-                circuit_breaker_state.set(-1)
-        except (ImportError, Exception):
-            pass
-
-        # State changes are important - bypass sampling
-        entry = LogEntry(
-            timestamp=time.time(),
-            level="WARNING",
-            message="circuit_breaker_state_change",
-            extra={
-                "logger": self.name,
-                "from_state": from_state,
-                "to_state": to_state,
-                "reason": reason,
-                **kwargs,
-            },
-        )
-        self.buffer.append(entry)
-
     def set_trace_id(self, trace_id: str):
         """Set trace ID for correlation."""
         if not hasattr(self._context, "trace_id"):
             self._context.trace_id = None
         self._context.trace_id = trace_id
-
-    def set_correlation_id(self, correlation_id: str):
-        """Set correlation ID."""
-        if not hasattr(self._context, "correlation_id"):
-            self._context.correlation_id = None
-        self._context.correlation_id = correlation_id
 
     def clear_trace_id(self):
         """Clear trace ID."""
@@ -408,10 +359,6 @@ class StructuredLogger:
         # Only include trace_id if we found one
         if trace_id:
             context["trace_id"] = trace_id
-
-        # Include correlation_id if set
-        if hasattr(self._context, "correlation_id") and self._context.correlation_id:
-            context["correlation_id"] = self._context.correlation_id
         return context
 
     def __del__(self):
@@ -444,29 +391,3 @@ def get_structured_logger(name: str) -> StructuredLogger:
         if name not in _logger_instances:
             _logger_instances[name] = StructuredLogger(name)
         return _logger_instances[name]
-
-
-class JsonFormatter(logging.Formatter):
-    """JSON formatter for log records."""
-
-    def format(self, record):
-        """Format log record as JSON."""
-        log_data = {
-            "timestamp": time.time(),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "logger": record.name,
-            "thread_id": threading.get_ident(),
-        }
-
-        # Include structured context if present
-        if hasattr(record, "structured"):
-            log_data.update(record.structured)  # type: ignore[attr-defined]
-
-        # Include exception info if present
-        if record.exc_info:
-            import traceback
-
-            log_data["exception"] = "".join(traceback.format_exception(*record.exc_info))
-
-        return json.dumps(log_data, separators=(",", ":"))
