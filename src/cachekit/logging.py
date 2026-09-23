@@ -148,7 +148,6 @@ class StructuredLogger:
     - Sampling (10% default)
     - Async batch writes
     - PII key-name masking (password/token/secret/key/auth kwargs)
-    - Near-zero overhead when not sampled
     """
 
     def __init__(self, name: str):
