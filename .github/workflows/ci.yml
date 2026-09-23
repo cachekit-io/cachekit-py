@@ -172,6 +172,28 @@ jobs:
           --junitxml=junit.xml \
           -o junit_family=legacy
 
+    # Executable docs are tests: docstring examples, the docs ground-truth tests
+    # and the docs/ markdown blocks. None of them sit under tests/unit or
+    # tests/critical, so the runs above never collect them. Version-independent,
+    # so once on 3.12 (every PR and push). `!cancelled()` so each suite reports
+    # even when an earlier one failed.
+    #
+    # No REDIS_URL here on purpose: the RedisBackendConfig docstring example
+    # fails `extra_forbidden` when it is exported (#225).
+    - name: Run docstring examples
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      run: uv run pytest --doctest-modules src/cachekit --ignore=src/cachekit/_rust_serializer.py
+
+    - name: Run docs ground-truth tests
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      env:
+        REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
+      run: uv run pytest tests/docs/
+
+    - name: Run markdown documentation examples
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      run: uv run pytest --markdown-docs docs/
+
     # Deterministic memory invariants (RSS/allocation bounds), not wall-clock benchmarks. These
     # are `performance and slow` — the mmap zero-copy read (#171) and the large-object allocation
     # caps (#152). Flaky timing/throughput benchmarks are `performance` WITHOUT `slow` and stay out
@@ -310,7 +332,7 @@ jobs:
         uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
         uv run --no-sync pytest tests/critical/ -m "not slow"
 
-  # Version sync + doc tests (push to main only)
+  # Version sync + dependency CVE scan (push to main only)
   post-merge:
     name: Post-Merge Checks
     if: github.event_name == 'push'
@@ -346,9 +368,6 @@ jobs:
         # by their py3.10+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.
         uv run pip-audit --desc
-
-    - name: Run markdown documentation tests
-      run: make test-docs-examples
 
   # LAB-3500: this repo is public and forkable, so every job runs on
   # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
