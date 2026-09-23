@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import pytest
 
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
@@ -262,3 +264,76 @@ class TestDecoratorConfigToDict:
         assert d["enable_prometheus_metrics"] is False
         assert d["encryption"] is True
         assert d["master_key"] == "[REDACTED]"  # masked (CWE-200)
+
+
+@pytest.mark.unit
+class TestIoPreset:
+    """DecoratorConfig.io / @cache.io credentials and argument rejection (LAB-4643).
+
+    Contract (protocol spec, intent-presets.md § io Credentials / § Explicit Configuration):
+    api_key argument OR CACHEKIT_API_KEY, argument wins, neither -> ConfigurationError at
+    construction; an unsupported argument (backend=) is rejected, never silently dropped.
+    """
+
+    @staticmethod
+    def _key_of(config: DecoratorConfig) -> str:
+        assert isinstance(config.backend, CachekitIOBackend)
+        return config.backend._config.api_key.get_secret_value()
+
+    def test_api_key_argument_builds_backend_with_that_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        assert self._key_of(DecoratorConfig.io(api_key="ck_arg")) == "ck_arg"  # pragma: allowlist secret
+
+    def test_api_key_argument_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+        assert self._key_of(DecoratorConfig.io(api_key="ck_arg")) == "ck_arg"  # pragma: allowlist secret
+
+    def test_env_fallback_when_no_argument(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+        assert self._key_of(DecoratorConfig.io()) == "ck_env"
+
+    def test_missing_both_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match=r"api_key=.*CACHEKIT_API_KEY"):
+            DecoratorConfig.io()
+
+    @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
+    def test_backend_kwarg_rejected(self, backend: object) -> None:
+        with pytest.raises(ConfigurationError, match="does not accept backend="):
+            DecoratorConfig.io(api_key="ck_arg", backend=backend)  # pragma: allowlist secret
+
+    def test_decorator_api_key_reaches_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """@cache.io(api_key=...) hands the key to CachekitIOBackend (the decorator path, not just the classmethod)."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+        seen: dict[str, object] = {}
+
+        class Spy(CachekitIOBackend):
+            def __init__(self, **kwargs: object) -> None:
+                seen.update(kwargs)
+                super().__init__(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("cachekit.backends.cachekitio.CachekitIOBackend", Spy)
+
+        @cache.io(api_key="ck_arg")  # pragma: allowlist secret
+        def fn() -> int:
+            return 1
+
+        assert seen == {"api_key": "ck_arg"}  # pragma: allowlist secret
+
+    def test_decorator_env_fallback_still_works(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+
+        @cache.io()
+        def fn() -> int:
+            return 1
+
+        assert fn.__wrapped__ is not None  # decorated without error
+
+    @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
+    def test_decorator_backend_kwarg_rejected(self, backend: object) -> None:
+        """@cache.io(backend=...) is a ConfigurationError at decoration, not a silent drop."""
+        with pytest.raises(ConfigurationError, match="does not accept backend="):
+
+            @cache.io(api_key="ck_arg", backend=backend)  # pragma: allowlist secret
+            def fn() -> int:
+                return 1

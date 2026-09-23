@@ -203,24 +203,16 @@ class CachekitIOBackend:
         """Initialize cachekit.io backend.
 
         Args:
-            api_url: Override API endpoint URL
-            api_key: Override API key (ck_live_...)
-            timeout: Override request timeout
+            api_url: API endpoint URL. Default: ``CACHEKIT_API_URL``, then ``https://api.cachekit.io``.
+            api_key: API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
+            timeout: Request timeout in seconds. Default: ``CACHEKIT_TIMEOUT``, then 5.0.
 
-        If all are None, loads from environment via pydantic-settings.
+        Each argument left as None is loaded from the environment via pydantic-settings,
+        so ``CachekitIOBackend(api_key=...)`` alone is valid — an explicit argument wins,
+        everything else still comes from the environment.
         """
-        if all(x is None for x in [api_url, api_key, timeout]):
-            # Load from environment
-            self._config = CachekitIOBackendConfig.from_env()  # type: ignore[call-arg]
-        else:
-            # Use provided values
-            if api_url is None or api_key is None:
-                raise ValueError("Both api_url and api_key required if using manual config")
-            self._config = CachekitIOBackendConfig(
-                api_url=api_url,
-                api_key=api_key,  # type: ignore[arg-type]
-                timeout=timeout or 5.0,
-            )
+        overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
+        self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
 
         # Get HTTP clients (hybrid sync/async architecture)
         # Sync client: per-thread, thread-safe, no event loop required

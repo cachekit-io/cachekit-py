@@ -290,7 +290,7 @@ def get_user(user_id: int):
     return fetch_from_db(user_id)
 ```
 
-Everything else — TTL, namespaces, serializers — works the same as with Redis. Swap `@cache` for `@cache.io()` and you're done.
+Everything else — TTL, namespaces, serializers — works the same as with Redis. Swap `@cache` for `@cache.io()` and you're done. Need more than one key in a process? Pass it explicitly: `@cache.io(api_key="ck_...")` — the argument wins over the environment variable.
 
 ### Memcached (Optional)
 

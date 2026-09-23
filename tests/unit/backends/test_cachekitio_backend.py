@@ -98,15 +98,35 @@ class TestInit:
         b = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
         assert b._config.timeout == 5.0
 
-    def test_partial_config_raises_value_error_no_key(self, mock_sync_client: MagicMock) -> None:
-        """api_url without api_key raises ValueError."""
-        with pytest.raises(ValueError, match="Both api_url and api_key required"):
-            CachekitIOBackend(api_url=_TEST_API_URL)
+    def test_api_key_alone_fills_url_and_timeout_from_defaults(
+        self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """api_key without api_url is valid: the URL and timeout come from env / defaults."""
+        monkeypatch.delenv("CACHEKIT_API_URL", raising=False)
+        monkeypatch.delenv("CACHEKIT_TIMEOUT", raising=False)
+        b = CachekitIOBackend(api_key=_TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+        assert b._config.api_url == _TEST_API_URL
+        assert b._config.timeout == 5.0
 
-    def test_partial_config_raises_value_error_no_url(self, mock_sync_client: MagicMock) -> None:
-        """api_key without api_url raises ValueError."""
-        with pytest.raises(ValueError, match="Both api_url and api_key required"):
-            CachekitIOBackend(api_key=_TEST_API_KEY)
+    def test_api_key_argument_beats_env(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicit api_key wins over CACHEKIT_API_KEY."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env_key")  # pragma: allowlist secret
+        b = CachekitIOBackend(api_key=_TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+
+    def test_api_url_alone_reads_key_from_env(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """api_url without api_key is valid when CACHEKIT_API_KEY is set."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
+        b = CachekitIOBackend(api_url="https://api.staging.cachekit.io")
+        assert b._config.api_url == "https://api.staging.cachekit.io"
+        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+
+    def test_no_key_anywhere_raises(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neither api_key nor CACHEKIT_API_KEY: config validation fails (api_key is required)."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="api_key"):
+            CachekitIOBackend(api_url=_TEST_API_URL)
 
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""

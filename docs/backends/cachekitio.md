@@ -32,10 +32,11 @@ def cached_function(x):
 ```python notest
 from cachekit.backends.cachekitio import CachekitIOBackend
 
+# Every argument is optional; anything left out loads from the environment.
 backend = CachekitIOBackend(
-    api_url="https://api.cachekit.io",  # required if not using env
-    api_key="ck_live_...",              # required if not using env
-    timeout=5.0,                        # optional, default: 5.0 seconds
+    api_key="ck_live_...",              # default: CACHEKIT_API_KEY
+    api_url="https://api.cachekit.io",  # default: CACHEKIT_API_URL, then api.cachekit.io
+    timeout=5.0,                        # default: CACHEKIT_TIMEOUT, then 5.0 seconds
 )
 ```
 
@@ -50,7 +51,17 @@ from cachekit import cache
 @cache.io(ttl=300, namespace="my-app")
 def cached_function(x):
     return expensive_computation(x)
+
+# The key is CACHEKIT_API_KEY by default; pass it explicitly to hold
+# more than one key in a process (multi-tenant services, test suites).
+@cache.io(api_key="ck_live_tenant_b", namespace="tenant-b")
+def tenant_b_function(x):
+    return expensive_computation(x)
 ```
+
+`@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
+source, and if you pass `backend=` — it always caches through its own `CachekitIOBackend`.
+To cache through another backend, use `@cache.production(backend=...)`.
 
 ## Health Check
 

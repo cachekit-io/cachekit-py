@@ -107,6 +107,9 @@ def cache(
             sees a snapshot of the caller's ``contextvars`` (so contextvar-based
             tenant extraction works), but no other request-scoped resources —
             open sessions/connections from the request must not be relied on.
+            ``api_key`` (``@cache.io`` only) — the cachekit.io API key; falls back
+            to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
+            own CachekitIOBackend and rejects ``backend=`` with ConfigurationError.
 
     Returns:
         Decorated function with intelligent caching
@@ -133,7 +136,8 @@ def cache(
         # This is a sentinel problem: we need to distinguish between:
         # 1. User passed @cache(backend=None) explicitly -> L1-only mode
         # 2. User didn't pass backend at all -> should try provider
-        _explicit_l1_only = "backend" in manual_overrides and manual_overrides.get("backend") is None
+        _explicit_backend = "backend" in manual_overrides
+        _explicit_l1_only = _explicit_backend and manual_overrides["backend"] is None
         backend = manual_overrides.pop("backend", None)
 
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
@@ -218,7 +222,10 @@ def cache(
         elif _intent == "test":
             resolved_config = DecoratorConfig.test(backend=backend, **manual_overrides)
         elif _intent == "io":
-            # SaaS backend - ignore explicit backend param (io creates its own)
+            # io owns its backend. Hand an explicit backend= back so DecoratorConfig.io
+            # rejects it — one error site for both the decorator and the classmethod.
+            if _explicit_backend:
+                manual_overrides["backend"] = backend
             resolved_config = DecoratorConfig.io(**manual_overrides)
         else:
             # No intent specified - use default DecoratorConfig with overrides

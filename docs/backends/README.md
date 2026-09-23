@@ -166,7 +166,7 @@ def explicit_backend():
     return data()
 ```
 
-`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` and passes it as an explicit `backend` kwarg. No magic, just convenience.
+`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` (from `api_key=` or `CACHEKIT_API_KEY`) and passes it as an explicit `backend` kwarg. No magic, just convenience. Because the preset owns its backend, `@cache.io(backend=...)` raises `ConfigurationError` rather than silently ignoring the argument.
 
 ### 2. Module-Level Default Backend (Middle Priority)
 
