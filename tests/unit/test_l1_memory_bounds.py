@@ -235,11 +235,7 @@ def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
 
 @pytest.mark.unit
 class TestCleanupThreadAfterFork:
-    """LAB-4772: a prefork child must run its own L1 cleanup thread.
-
-    Decorators capture their L1Cache once, at import in the prefork master; the child's
-    only contact with L1 is get/put on that captured instance, never the manager.
-    """
+    """LAB-4772: a prefork child must run its own L1 cleanup thread."""
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_forked_child_restarts_cleanup_on_first_put(self):
@@ -253,18 +249,11 @@ class TestCleanupThreadAfterFork:
             queue = ctx.Queue()
 
             def child(q) -> None:
-                inherited = manager._cleanup_thread
                 cache.put("k", b"v", redis_ttl=1.2)  # minus the 1s ttl buffer: expires in ~0.2s
                 thread = manager._cleanup_thread
                 # No get(): only the background sweep can count this eviction.
                 swept = _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)
-                q.put(
-                    {
-                        "fresh": thread is not None and thread is not inherited,
-                        "alive": thread is not None and thread.is_alive(),
-                        "swept": swept,
-                    }
-                )
+                q.put({"alive": thread is not None and thread.is_alive(), "swept": swept})
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -276,7 +265,7 @@ class TestCleanupThreadAfterFork:
                     process.kill()
 
             assert process.exitcode == 0
-            assert outcome == {"fresh": True, "alive": True, "swept": True}
+            assert outcome == {"alive": True, "swept": True}  # fork leaves the inherited thread dead
         finally:
             manager.stop_background_cleanup()
 
@@ -315,3 +304,27 @@ class TestCleanupThreadAfterFork:
             assert manager._cleanup_thread.is_alive()
         finally:
             manager.stop_background_cleanup()
+
+    def test_racing_first_puts_restart_cleanup_once(self):
+        """Smoke test under the GIL; on the free-threaded lane, dropping the take-over lock fails it."""
+        duplicated = 0
+        for _ in range(200):
+            manager = L1CacheManager(default_max_memory_mb=10)
+            cache = manager.get_cache("hammer-ns")
+            _as_if_forked(manager, parent_ran_cleanup=True)
+            spawns = []
+            spawn = manager._spawn_cleanup_thread
+            manager._spawn_cleanup_thread = lambda interval, spawn=spawn, spawns=spawns: (spawns.append(1), spawn(interval))
+            barrier = threading.Barrier(32)
+            workers = [
+                threading.Thread(target=lambda b=barrier, c=cache: (b.wait(), c.put("k", b"v")), daemon=True) for _ in range(32)
+            ]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join(timeout=10)
+            assert not any(t.is_alive() for t in workers), "take-over deadlocked"
+            manager.stop_background_cleanup()
+            duplicated += len(spawns) != 1
+
+        assert duplicated == 0, f"{duplicated}/200 forked children restarted cleanup more than once"
