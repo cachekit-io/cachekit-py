@@ -85,7 +85,7 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo clippy --locked -- -D warnings
 
-  # PR: single Python version, critical tests only
+  # PR: 3.12 only, unit + critical + executable docs
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -172,11 +172,9 @@ jobs:
           --junitxml=junit.xml \
           -o junit_family=legacy
 
-    # Executable docs are tests: docstring examples, the docs ground-truth tests
-    # and the docs/ markdown blocks. None of them sit under tests/unit or
-    # tests/critical, so the runs above never collect them. Version-independent,
-    # so once on 3.12 (every PR and push). `!cancelled()` so each suite reports
-    # even when an earlier one failed.
+    # Executable docs are tests: docstring examples, tests/docs/ and the docs/
+    # markdown blocks. None of them sit under tests/unit or tests/critical, so
+    # the runs above never collect them.
     #
     # No REDIS_URL here on purpose: the RedisBackendConfig docstring example
     # fails `extra_forbidden` when it is exported (#225).
@@ -184,7 +182,7 @@ jobs:
       if: ${{ !cancelled() && matrix.python-version == '3.12' }}
       run: uv run pytest --doctest-modules src/cachekit --ignore=src/cachekit/_rust_serializer.py
 
-    - name: Run docs ground-truth tests
+    - name: Run tests/docs suite
       if: ${{ !cancelled() && matrix.python-version == '3.12' }}
       env:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
@@ -199,7 +197,7 @@ jobs:
     # caps (#152). Flaky timing/throughput benchmarks are `performance` WITHOUT `slow` and stay out
     # of CI. Version-independent, so run once on 3.12 (~5s) rather than across the push matrix.
     - name: Run memory-invariant tests
-      if: matrix.python-version == '3.12'
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
       env:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
