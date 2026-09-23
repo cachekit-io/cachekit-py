@@ -349,13 +349,13 @@ def secure_function():
 | Intent | Default TTL | SWR | Invalidation | Max Size | Notes |
 |--------|-------------|-----|--------------|----------|-------|
 | `minimal()` | 300 s | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
-| `test()` | none | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
-| `dev()` | none | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
+| `test()` | 300 s | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
+| `dev()` | 300 s | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
 | `production()` | 600 s | L1-only¹ | ✓ | 100 MB | Full observability |
 | `secure()` | 600 s | L1-only¹ | ✓ | 100 MB | AES-256-GCM encryption required |
 | `io()` | 3600 s | ✓ | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
-**Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). `dev()` / `test()` are Python-only presets outside the spec and keep `ttl=None`.
+**Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript; `dev()` / `test()` are Python-only presets and take `minimal`'s 300 s. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). Two consequences of a finite default: an entry this process writes also lives in its L1 for the same TTL (previously L1's own 300 s when no `ttl` was set), and the presets' `swr_enabled` / `stale_ttl` features — which need a positive `ttl` — are now active without an explicit `ttl=`.
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
 

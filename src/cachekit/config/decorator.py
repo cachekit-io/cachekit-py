@@ -162,9 +162,7 @@ class DecoratorConfig:
             return "value"
 
     Attributes:
-        ttl: Time-to-live in seconds. None = no expiration. The intent presets
-            (minimal/production/secure/io) default it per protocol/spec/intent-presets.md;
-            pass ttl=None explicitly to a preset to opt out of expiry.
+        ttl: Time-to-live in seconds (None = no expiration; every preset sets its own default — see each classmethod)
         namespace: Optional namespace prefix for cache keys
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
@@ -487,17 +485,21 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, etc.)
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
             DecoratorConfig optimized for development
 
         Example:
-            >>> config = DecoratorConfig.dev(ttl=60)
+            >>> config = DecoratorConfig.dev()
+            >>> config.ttl
+            300
             >>> config.monitoring.enable_prometheus_metrics
             False
             >>> config.integrity_checking
             True
         """
+        kwargs.setdefault("ttl", 300)
         return cls(
             integrity_checking=True,  # Development: catch data corruption early
             l1=L1CacheConfig(
@@ -526,17 +528,21 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, etc.)
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
             DecoratorConfig optimized for testing
 
         Example:
-            >>> config = DecoratorConfig.test(ttl=10)
+            >>> config = DecoratorConfig.test()
+            >>> config.ttl
+            300
             >>> config.circuit_breaker.enabled
             False
             >>> config.integrity_checking
             False
         """
+        kwargs.setdefault("ttl", 300)
         return cls(
             integrity_checking=False,  # Testing: fast deterministic behavior
             l1=L1CacheConfig(

@@ -86,7 +86,7 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None` on bare `@cache`; presets default to `minimal` 300 s / `production` 600 s / `secure` 600 s / `io` 3600 s per the [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
@@ -613,7 +613,7 @@ config = CachekitConfig(
 )
 ```
 
-**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed. Cache TTL is not a `CachekitConfig` field: each preset applies its own default and `ttl=` on the decorator overrides it ([intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl)).
+**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
 
 
 ---

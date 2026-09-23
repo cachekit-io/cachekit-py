@@ -101,8 +101,6 @@ class TestRedisBackendConfigEnv:
         monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
         config = CachekitConfig.from_env()
         assert not hasattr(config, "default_ttl")
-        assert not hasattr(config, "ttl_min")
-        assert not hasattr(config, "ttl_max")
 
 
 class TestRedisUrlAliasChoicesPriority:

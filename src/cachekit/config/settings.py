@@ -74,10 +74,6 @@ class CachekitConfig(BaseSettings):
         >>> custom.max_retries
         5
 
-        Cache TTL is not a process-wide setting: each intent preset applies its
-        own default (protocol/spec/intent-presets.md) and ``ttl=`` on the decorator
-        overrides it. ``CACHEKIT_DEFAULT_TTL`` is reserved by the spec and ignored.
-
         Master key is masked in repr for security:
 
         >>> from pydantic import SecretStr
@@ -128,7 +124,7 @@ class CachekitConfig(BaseSettings):
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
         # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
-        # Without this, any validation failure on this model (bad TTL bounds,
+        # Without this, any validation failure on this model (an out-of-range size limit,
         # keyring misconfig, ...) embeds the full raw input — including
         # env-sourced master_key and previous_master_keys hex — in startup
         # logs. errors()/json() ignore this flag; __init__ below sanitizes
