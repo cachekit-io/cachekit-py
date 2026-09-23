@@ -12,6 +12,8 @@ explicit False must survive a present CACHEKIT_MASTER_KEY.
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import os
 from typing import Any
 
 import pytest
@@ -268,7 +270,7 @@ class TestAutoActivationDeprecationWarning:
 
     @pytest.fixture(autouse=True)
     def _fresh_process(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED", False)
+        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED_PID", None)
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         reset_settings()
         yield
@@ -310,3 +312,30 @@ class TestAutoActivationDeprecationWarning:
             handler = CacheSerializationHandler(serializer_name="default")
         assert handler.encryption is False
         assert self._activation_records(caplog) == []
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_warns_for_itself(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A forked worker is a new process: it must not inherit the parent's already-fired warning."""
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            CacheSerializationHandler(serializer_name="default")
+            assert len(self._activation_records(caplog)) == 1
+
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q: Any) -> None:
+                caplog.clear()  # the child's copy still holds the parent's record
+                CacheSerializationHandler(serializer_name="default")
+                q.put(len(self._activation_records(caplog)))
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                child_warnings = queue.get(timeout=30)
+            finally:
+                process.join(timeout=30)
+                if process.is_alive():  # a hung child would otherwise block pytest's exit forever
+                    process.kill()
+                    process.join()
+
+        assert child_warnings == 1

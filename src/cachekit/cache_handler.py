@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import warnings
 from collections.abc import Callable
@@ -253,19 +254,21 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
 # Activating encryption from the variable's mere presence is deprecated: this release keeps it and
 # warns once per process; the next minor release raises at construction instead. logger.warning, not
 # DeprecationWarning: Python silences DeprecationWarning outside __main__, so under
-# uvicorn/gunicorn/celery the notice would never surface. Tests reset this flag to observe the warning.
-_AUTO_ACTIVATION_WARNED = False
+# uvicorn/gunicorn/celery the notice would never surface. Keyed by PID rather than a bool so a forked
+# worker, a new process, warns for itself instead of inheriting the parent's fired flag. Tests reset it.
+_AUTO_ACTIVATION_WARNED_PID: int | None = None
 
 
 def _warn_encryption_auto_activation() -> None:
     """Warn ONCE per process that encryption was activated by CACHEKIT_MASTER_KEY's presence."""
-    global _AUTO_ACTIVATION_WARNED
-    if _AUTO_ACTIVATION_WARNED:
+    global _AUTO_ACTIVATION_WARNED_PID
+    pid = os.getpid()
+    if _AUTO_ACTIVATION_WARNED_PID == pid:
         return
-    _AUTO_ACTIVATION_WARNED = True
+    _AUTO_ACTIVATION_WARNED_PID = pid
     get_logger().warning(
         "CACHEKIT_MASTER_KEY is set and a cache with no explicit encryption= was constructed, so "
-        "encryption was auto-enabled (single-tenant) — first occurrence only; audit every preset that "
+        "encryption was auto-enabled (single-tenant) — first occurrence in this process; audit every preset that "
         "states no encryption=. Presence-based activation is deprecated: the next minor release raises "
         "at construction when the key is present with neither an explicit encryption= nor "
         "@cache.secure(...). Declare the intent now — @cache.secure(...) to require encryption; "
