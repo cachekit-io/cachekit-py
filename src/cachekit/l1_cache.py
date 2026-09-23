@@ -403,14 +403,17 @@ class L1CacheManager:
                 return
             self._lock = threading.Lock()
             self._stop_cleanup = threading.Event()
-            restart = self._cleanup_thread is not None
-            self._cleanup_thread = None
-            if restart:
+            if self._cleanup_thread is not None:
                 try:
-                    self._spawn_cleanup_thread(self._cleanup_interval)
-                except Exception as e:  # e.g. RuntimeError("can't start new thread") at a pids cap
-                    # Taken over regardless, so puts don't retry: expiry falls back to lazy-on-read.
-                    logger.warning("L1 cleanup thread restart after fork failed: %s", redact_error_for_log(e))
+                    self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
+                except RuntimeError as e:  # how Thread.start() refuses: "can't start new thread" at a pids cap
+                    # Taken over regardless, so puts don't retry. Anything else is a bug: it propagates
+                    # with the take-over uncommitted, and the next put retries it in full.
+                    self._cleanup_thread = None
+                    logger.warning(
+                        "L1 cleanup thread restart after fork failed: %s; expired entries are now evicted only on read",
+                        redact_error_for_log(e),
+                    )
             self._owner_pid = pid
 
     def get_cache(self, namespace: str = "default", max_size_mb: int | None = None) -> L1Cache:

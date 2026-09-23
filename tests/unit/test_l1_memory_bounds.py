@@ -294,6 +294,29 @@ class TestCleanupThreadAfterFork:
 
         assert cache.get("k1")[0] and cache.get("k2")[0]
         assert sum("restart after fork failed" in r.message for r in caplog.records) == 1
+        assert manager._cleanup_thread is None  # the dead inherited thread, not kept as if running
+
+    def test_unexpected_restart_error_propagates_and_next_put_retries(self, monkeypatch):
+        class BugError(Exception):  # not TypeError: that is put()'s own documented refusal
+            pass
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("bug-ns")
+        _as_if_forked(manager, parent_ran_cleanup=True)
+
+        def broken(self):
+            raise BugError
+
+        monkeypatch.setattr(threading.Thread, "start", broken)
+        with pytest.raises(BugError):
+            cache.put("k", b"v")
+
+        monkeypatch.undo()
+        cache.put("k", b"v")
+        try:
+            assert manager._cleanup_thread is not None and manager._cleanup_thread.is_alive()
+        finally:
+            manager.stop_background_cleanup()
 
     def test_start_replaces_dead_thread_instead_of_noop(self):
         manager = L1CacheManager(default_max_memory_mb=10)
