@@ -104,9 +104,9 @@ Python object (plaintext, in-app only)
 2. **High-volume, low-margin**: Encryption adds 100-500μs
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
-**Mitigation**: Use standard @cache for non-sensitive data:
+**Mitigation**: state `encryption=False` for non-sensitive data:
 ```python notest
-@cache(ttl=300, backend=None)  # No encryption, faster
+@cache(ttl=300, encryption=False, backend=None)  # Explicit plaintext, faster
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
@@ -130,15 +130,16 @@ intent is stated (last row) and logs a warning once per process. Contract: [`pro
 | `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
 | `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
 | `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext) |
-| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process. The next minor release raises at construction instead. |
+| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process; an L1-only cache (`backend=None`, `.local`) holds raw objects and never encrypts. The next minor release raises at construction instead. |
+| No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning |
 
 The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
 call site's encryption state was unreadable from the code — it depended on which pod
 carried which variable — and a pod *missing* the variable wrote plaintext to the backend
 with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
 on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
-only the deprecated no-intent row degrades to plaintext, and the compliance argument below
-holds only on an explicit path.
+every other row can store plaintext, and the compliance argument below holds only on an
+explicit path.
 
 ## What Can Go Wrong
 
