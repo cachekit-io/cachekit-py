@@ -564,24 +564,13 @@ class DecoratorConfig:
             DecoratorConfig with CachekitIOBackend
 
         Raises:
-            ConfigurationError: If no API key is given and CACHEKIT_API_KEY is unset,
-                or if ``backend=`` is passed.
+            ConfigurationError: If the API key is missing or empty (argument and
+                CACHEKIT_API_KEY), or if ``backend=`` is passed.
 
         Example:
-            >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)
+            >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)  # pragma: allowlist secret
             >>> config.ttl
             300
-            >>> config.backend._config.api_key.get_secret_value()
-            'ck_test_key'
-            >>> import os
-            >>> os.environ["CACHEKIT_API_KEY"] = "ck_test_env_key"  # pragma: allowlist secret
-            >>> DecoratorConfig.io().backend._config.api_key.get_secret_value()
-            'ck_test_env_key'
-            >>> del os.environ["CACHEKIT_API_KEY"]  # cleanup
-            >>> DecoratorConfig.io(api_key="ck_test_key", backend=None)
-            Traceback (most recent call last):
-                ...
-            cachekit.config.validation.ConfigurationError: @cache.io does not accept backend=...
         """
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
@@ -593,7 +582,8 @@ class DecoratorConfig:
                 "  @cache.production(backend=my_backend)"
             )
 
-        api_key = api_key or os.environ.get("CACHEKIT_API_KEY")
+        if api_key is None:
+            api_key = os.environ.get("CACHEKIT_API_KEY")
         if not api_key:
             raise ConfigurationError(
                 "@cache.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\n\n"

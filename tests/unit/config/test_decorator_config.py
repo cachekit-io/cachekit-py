@@ -297,6 +297,22 @@ class TestIoPreset:
         with pytest.raises(ConfigurationError, match=r"api_key=.*CACHEKIT_API_KEY"):
             DecoratorConfig.io()
 
+    def test_empty_argument_is_an_error_not_an_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """api_key=settings.tenant_key yielding "" must not silently cache under the env tenant's key."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+        with pytest.raises(ConfigurationError, match="requires an API key"):
+            DecoratorConfig.io(api_key="")
+
+    def test_two_keys_in_one_process_reach_the_wire_separately(self) -> None:
+        """Regression: the per-thread HTTP client was first-wins, so a second key's backend
+        carried the right _config but every request left under the FIRST key's header."""
+        a = DecoratorConfig.io(api_key="ck_tenant_a").backend  # pragma: allowlist secret
+        b = DecoratorConfig.io(api_key="ck_tenant_b").backend  # pragma: allowlist secret
+        assert isinstance(a, CachekitIOBackend) and isinstance(b, CachekitIOBackend)
+        assert a._sync_client.headers["authorization"] == "Bearer ck_tenant_a"
+        assert b._sync_client.headers["authorization"] == "Bearer ck_tenant_b"
+        assert b._async_client.headers["authorization"] == "Bearer ck_tenant_b"
+
     @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
     def test_backend_kwarg_rejected(self, backend: object) -> None:
         with pytest.raises(ConfigurationError, match="does not accept backend="):
@@ -318,16 +334,15 @@ class TestIoPreset:
         def fn() -> int:
             return 1
 
-        assert seen == {"api_key": "ck_arg"}  # pragma: allowlist secret
+        assert seen["api_key"] == "ck_arg"  # pragma: allowlist secret
 
-    def test_decorator_env_fallback_still_works(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
+    def test_decorator_config_kwarg_rejected(self) -> None:
+        """config= would swap the whole preset (and its backend) in silently — reject it like backend=."""
+        with pytest.raises(ConfigurationError, match="does not accept config="):
 
-        @cache.io()
-        def fn() -> int:
-            return 1
-
-        assert fn.__wrapped__ is not None  # decorated without error
+            @cache.io(config=DecoratorConfig.production(backend=None))
+            def fn() -> int:
+                return 1
 
     @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
     def test_decorator_backend_kwarg_rejected(self, backend: object) -> None:

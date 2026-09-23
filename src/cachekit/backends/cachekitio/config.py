@@ -111,6 +111,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     )
     api_key: SecretStr = Field(
         ...,  # Required field
+        min_length=1,  # an empty key would go out as "Bearer " and fail on the first call, not here
         description="API key (ck_live_...) - required for authentication",
     )
     timeout: float = Field(

@@ -1,7 +1,7 @@
 """Unit tests for CachekitIO HTTP client factory.
 
 Tests for backends/cachekitio/client.py covering:
-- Thread-local caching (same client returned on repeated calls)
+- Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
 - Client configuration (base_url, timeout, Authorization header)
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() clears thread-local references
@@ -74,6 +74,16 @@ class TestGetSyncHttpClient:
         auth_header = client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
 
+    def test_distinct_keys_get_distinct_clients(self, config: CachekitIOBackendConfig) -> None:
+        """Regression: a single per-thread client sent every backend's traffic under the FIRST key."""
+        other = CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=1.0)  # noqa: S106
+        c1 = get_sync_http_client(config)
+        c2 = get_sync_http_client(other)
+        assert c1 is not c2
+        assert c2.headers["authorization"] == "Bearer ck_other_key"
+        assert c2.timeout.read == 1.0
+        assert get_sync_http_client(config) is c1
+
 
 @pytest.mark.unit
 class TestGetCachedAsyncHttpClient:
@@ -104,12 +114,12 @@ class TestCloseSyncClient:
     """close_sync_client() cleanup behaviour."""
 
     def test_sets_thread_local_to_none(self, config: CachekitIOBackendConfig) -> None:
-        """After close, thread-local sync_client attribute is None."""
+        """After close, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
         get_sync_http_client(config)
         close_sync_client()
-        assert getattr(client_module._thread_local, "sync_client", None) is None
+        assert not getattr(client_module._thread_local, "sync_clients", {})
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
@@ -121,20 +131,20 @@ class TestResetGlobalClient:
     """reset_global_client() clears all client references."""
 
     def test_clears_sync_thread_local(self, config: CachekitIOBackendConfig) -> None:
-        """After reset, thread-local sync client is None."""
+        """After reset, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
         get_sync_http_client(config)
         reset_global_client()
-        assert getattr(client_module._thread_local, "sync_client", None) is None
+        assert not getattr(client_module._thread_local, "sync_clients", {})
 
     def test_clears_async_thread_local(self, config: CachekitIOBackendConfig) -> None:
-        """After reset, thread-local async client is None."""
+        """After reset, this thread's async client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
         get_cached_async_http_client(config)
         reset_global_client()
-        assert getattr(client_module._thread_local, "async_client", None) is None
+        assert not getattr(client_module._thread_local, "async_clients", {})
 
     def test_new_sync_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh client (different object)."""

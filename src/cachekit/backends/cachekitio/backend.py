@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
 import httpx
+from pydantic import ValidationError
 
 from cachekit.backends.cachekitio.client import get_cached_async_http_client, get_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.config.validation import ConfigurationError
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_error_for_log
 from cachekit.logging import get_structured_logger
@@ -210,9 +212,22 @@ class CachekitIOBackend:
         Each argument left as None is loaded from the environment via pydantic-settings,
         so ``CachekitIOBackend(api_key=...)`` alone is valid — an explicit argument wins,
         everything else still comes from the environment.
+
+        Raises:
+            ConfigurationError: missing or empty API key, or an API URL that fails
+                validation (non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
-        self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
+        try:
+            self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
+        except ValidationError as exc:
+            # `from None` is load-bearing: the chained ValidationError renders the raw
+            # input — api_key included — into tracebacks and logs (CWE-532).
+            problems = "; ".join(
+                f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}"
+                for err in exc.errors(include_input=False)
+            )
+            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}") from None
 
         # Get HTTP clients (hybrid sync/async architecture)
         # Sync client: per-thread, thread-safe, no event loop required

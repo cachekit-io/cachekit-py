@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, TypeVar
 
-from ..config import DecoratorConfig
+from ..config import ConfigurationError, DecoratorConfig
 from .wrapper import create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -109,7 +109,8 @@ def cache(
             open sessions/connections from the request must not be relied on.
             ``api_key`` (``@cache.io`` only) — the cachekit.io API key; falls back
             to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
-            own CachekitIOBackend and rejects ``backend=`` with ConfigurationError.
+            own CachekitIOBackend and rejects ``backend=`` and ``config=`` with
+            ConfigurationError.
 
     Returns:
         Decorated function with intelligent caching
@@ -130,6 +131,14 @@ def cache(
             from .local_wrapper import create_local_wrapper
 
             return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
+
+        # config= would replace the io preset wholesale (any backend, silently), which the
+        # io docstring promises cannot happen. DecoratorConfig.io() already IS the config.
+        if _intent == "io" and config is not None:
+            raise ConfigurationError(
+                "@cache.io() does not accept config= — DecoratorConfig.io() already is the io "
+                "config. For the RORO form use @cache(config=DecoratorConfig.io(...))."
+            )
 
         # Resolve backend at decorator application time
         # Track if backend=None was explicitly passed (L1-only mode)
@@ -224,6 +233,8 @@ def cache(
         elif _intent == "io":
             # io owns its backend. Hand an explicit backend= back so DecoratorConfig.io
             # rejects it — one error site for both the decorator and the classmethod.
+            # `backend` is still the caller's value here: the default lookup above only
+            # runs when no backend= was passed.
             if _explicit_backend:
                 manual_overrides["backend"] = backend
             resolved_config = DecoratorConfig.io(**manual_overrides)

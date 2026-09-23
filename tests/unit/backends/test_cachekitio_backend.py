@@ -14,6 +14,7 @@ import pytest
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.config.validation import ConfigurationError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,18 +116,26 @@ class TestInit:
         b = CachekitIOBackend(api_key=_TEST_API_KEY)
         assert b._config.api_key.get_secret_value() == _TEST_API_KEY
 
-    def test_api_url_alone_reads_key_from_env(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-        """api_url without api_key is valid when CACHEKIT_API_KEY is set."""
-        monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
-        b = CachekitIOBackend(api_url="https://api.staging.cachekit.io")
-        assert b._config.api_url == "https://api.staging.cachekit.io"
-        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
-
-    def test_no_key_anywhere_raises(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Neither api_key nor CACHEKIT_API_KEY: config validation fails (api_key is required)."""
+    def test_no_key_anywhere_raises_at_construction(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neither api_key nor CACHEKIT_API_KEY: ConfigurationError here, not a 401 on the first call."""
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="api_key"):
+        with pytest.raises(ConfigurationError, match="api_key"):
             CachekitIOBackend(api_url=_TEST_API_URL)
+
+    def test_empty_key_raises_at_construction(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty key would go out as 'Bearer ' — reject it where the preset is built."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="api_key"):
+            CachekitIOBackend(api_key="")
+
+    def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""
+        monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        with pytest.raises(ConfigurationError, match="not in allowlist") as info:
+            CachekitIOBackend(api_key="ck_live_SECRET_XYZ", api_url="https://evil.example.com")  # pragma: allowlist secret
+        assert "SECRET" not in str(info.value)
+        assert info.value.__cause__ is None
+        assert info.value.__suppress_context__
 
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""

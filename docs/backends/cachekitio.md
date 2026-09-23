@@ -60,8 +60,8 @@ def tenant_b_function(x):
 ```
 
 `@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
-source, and if you pass `backend=` — it always caches through its own `CachekitIOBackend`.
-To cache through another backend, use `@cache.production(backend=...)`.
+source, and if you pass `backend=` or `config=` — it always caches through its own
+`CachekitIOBackend`. To cache through another backend, use `@cache.production(backend=...)`.
 
 ## Health Check
 
@@ -138,7 +138,7 @@ The API URL is validated on construction — HTTPS required, private/internal IP
 ## Environment Variables
 
 ```bash
-CACHEKIT_API_KEY=ck_live_...          # Required — API key for authentication
+CACHEKIT_API_KEY=ck_live_...          # API key — or pass api_key= to CachekitIOBackend / @cache.io
 CACHEKIT_API_URL=https://api.cachekit.io  # Optional — defaults to api.cachekit.io
 CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 ```
