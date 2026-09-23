@@ -225,6 +225,9 @@ Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 the `cachekit.decorators.orchestrator` logger, and runs the function uncached.
 `REDIS_URL` is a 12-factor fallback and never counts as a conflict.
 
+The Redis prefix scopes L2 only. L1 is shared by every tenant in the process; see
+[Whole-Function Invalidation → Tenant scope](../features/l1-invalidation.md#whole-function-invalidation).
+
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`
 2. Module-level default via `set_default_backend()` (checked at decoration, and

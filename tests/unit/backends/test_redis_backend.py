@@ -11,23 +11,29 @@ and RedisBackend.get() must return those raw bytes (or None) without coercion.
 Regression coverage for the distributed-lock executor stall: ``acquire_lock`` must
 not hold an executor thread while a waiter polls (see
 ``TestRedisLockWaitersDoNotPinExecutorThreads``).
+
+Regression coverage for LAB-4773: a provider-issued backend scopes each operation to the
+calling context's tenant (see ``TestProviderIssuedBackendFollowsTheCallingTenant``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import pytest
+import redis
 from redis.commands.core import Script
 from redis.connection import Encoder
 from redis.lock import Lock
 
 from cachekit.backends.redis import RedisBackend
-from cachekit.backends.redis.provider import PerRequestRedisBackend
+from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider, tenant_context
 
 
 @pytest.mark.unit
@@ -265,7 +271,8 @@ class TestRedisBackendGetContract:
 
 
 class _FakeRedis:
-    """Just enough of ``redis.Redis`` for ``redis.lock.Lock``: SET NX PX plus the release script.
+    """Just enough of ``redis.Redis`` for ``redis.lock.Lock`` (SET NX PX plus the release
+    script) and for a decorator's reads, writes and deletes (TTLs are not modelled).
 
     Guarded by a mutex because ``acquire_lock`` runs each attempt on an executor thread.
     """
@@ -289,6 +296,17 @@ class _FakeRedis:
                 return None
             self._store[name] = value
             return True
+
+    def setex(self, name: str, _ttl: int, value: bytes) -> bool:
+        return bool(self.set(name, value))
+
+    def get(self, name: str) -> bytes | None:
+        with self._mutex:
+            return self._store.get(name)
+
+    def delete(self, name: str) -> int:
+        with self._mutex:
+            return int(self._store.pop(name, None) is not None)
 
     def evalsha(self, _sha: str, _numkeys: int, name: str, token: bytes) -> int:
         """The only script ``Lock`` runs here is LUA_RELEASE: delete iff the token still matches."""
@@ -375,3 +393,90 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
                 assert contended is False
 
         assert len(fake.nx_attempts) == 2, "blocking_timeout=None must be a single SET NX per acquire_lock"
+
+
+@pytest.mark.unit
+class TestProviderIssuedBackendFollowsTheCallingTenant:
+    """LAB-4773: the decorator keeps one backend for the life of the process, so a
+    provider-issued backend must scope each operation to the calling context's tenant."""
+
+    @staticmethod
+    def _as_tenant(tenant, fn, *args):
+        token = tenant_context.set(tenant)
+        try:
+            return fn(*args)
+        finally:
+            tenant_context.reset(token)
+
+    @staticmethod
+    def _tenants(fake: _FakeRedis) -> set[str]:
+        return {key.split(":", 2)[1] for key in fake._store}
+
+    @pytest.mark.parametrize(
+        ("tenant", "wire"),
+        [("org:1", "org%3A1"), (b"acme", "acme"), (7, "7"), (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001")],
+    )
+    def test_tenant_ids_with_a_canonical_str_are_accepted(self, tenant, wire):
+        shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
+        assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
+        assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
+
+    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self):
+        """str() of an arbitrary object (default repr embeds id()) could merge two tenants."""
+        client = Mock()
+        with pytest.raises(TypeError):
+            PerRequestRedisBackend(client, object())  # type: ignore[arg-type]
+        shared = PerRequestRedisBackend(client, "default", follow_context=True)
+        with pytest.raises(TypeError):
+            self._as_tenant(object(), shared.get, "k")
+        client.get.assert_not_called()
+
+    def test_get_backend_falls_back_to_the_tenant_current_at_the_call(self):
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379")
+        try:
+            backend = self._as_tenant("tenant-x", provider.get_backend)
+            # An empty context (a fresh worker thread) has no tenant: the call-time tenant is the fallback.
+            assert contextvars.Context().run(lambda: backend.key_prefix) == "t:tenant-x:"
+            assert self._as_tenant("tenant-y", lambda: backend.key_prefix) == "t:tenant-y:"
+        finally:
+            provider.close()
+
+    def test_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self):
+        from cachekit import cache
+
+        fake = _FakeRedis()
+
+        @cache(ttl=60, backend=PerRequestRedisBackend(fake, "default", follow_context=True), l1_enabled=False)
+        def lookup(x):
+            return x
+
+        self._as_tenant("tenant-a", lookup, 1)
+        self._as_tenant("tenant-b", lookup, 1)
+
+        self._as_tenant("tenant-a", lookup.invalidate_cache)
+        assert self._tenants(fake) == {"tenant-b"}
+        self._as_tenant("tenant-b", lookup.invalidate_cache)  # tenant-b's entry stayed tracked
+        assert fake._store == {}
+
+    async def test_async_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self, monkeypatch):
+        from cachekit import cache
+
+        monkeypatch.setattr(Lock, "lua_release", None)  # bind the release script to this fake (see above)
+        fake = _FakeRedis()
+
+        @cache(ttl=60, backend=PerRequestRedisBackend(fake, "default", follow_context=True), l1_enabled=False)
+        async def lookup(x):
+            return x
+
+        async def as_tenant(tenant, fn, *args):
+            tenant_context.set(tenant)  # each create_task below runs this in its own context copy
+            await fn(*args)
+
+        await asyncio.create_task(as_tenant("tenant-a", lookup, 1))
+        await asyncio.create_task(as_tenant("tenant-b", lookup, 1))
+
+        await asyncio.create_task(as_tenant("tenant-a", lookup.ainvalidate_cache))
+        assert self._tenants(fake) == {"tenant-b"}
+        await asyncio.create_task(as_tenant("tenant-b", lookup.ainvalidate_cache))
+        assert fake._store == {}

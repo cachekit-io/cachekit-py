@@ -531,24 +531,3 @@ class TestTenantScopedPerOperation:
             tenant_context.reset(token)
 
         assert redis_isolated.keys("t:*") == [b"t:tenant-x:k"]
-
-    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self, redis_isolated):
-        """str() of an arbitrary object (default repr embeds id()) could merge two tenants."""
-        import uuid
-
-        backend = PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
-        for tenant, wire in ((7, "7"), (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"), (b"acme", "acme")):
-            token = tenant_context.set(tenant)  # type: ignore[arg-type]
-            try:
-                assert backend.key_prefix == f"t:{wire}:"
-            finally:
-                tenant_context.reset(token)
-
-        with pytest.raises(TypeError):
-            PerRequestRedisBackend(redis_isolated, object())  # type: ignore[arg-type]
-        token = tenant_context.set(object())  # type: ignore[arg-type]
-        try:
-            with pytest.raises(TypeError):
-                backend.get("k")
-        finally:
-            tenant_context.reset(token)

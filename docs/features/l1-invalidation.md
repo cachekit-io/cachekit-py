@@ -191,7 +191,7 @@ get_user.invalidate_cache()
 
 **Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
 
-**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked.
+**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked. L1 is not tenant-scoped: within a process, all tenants share one L1 entry per cache key, so a tenant can be served the value another tenant cached, and `invalidate_cache()` evicts that entry for every tenant. Disable L1 on functions whose results differ by tenant: `@cache(..., l1_enabled=False)`, or with a preset `@cache(config=DecoratorConfig.production(), l1_enabled=False)`.
 
 ---
 
