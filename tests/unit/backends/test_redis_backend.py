@@ -431,12 +431,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
             self._as_tenant(object(), shared.get, "k")
         client.get.assert_not_called()
 
-    def test_get_backend_falls_back_to_the_tenant_current_at_the_call(self):
+    def test_a_context_without_a_tenant_falls_back_to_default_or_the_call_time_tenant(self):
         with patch.object(redis.Redis, "ping"):
             provider = RedisBackendProvider("redis://localhost:6379")
         try:
+            # An empty context (e.g. a thread that inherited none) has no tenant: get_shared_backend()
+            # falls back to "default", get_backend() to the tenant current at the call.
+            shared = self._as_tenant("tenant-x", provider.get_shared_backend)
+            assert contextvars.Context().run(lambda: shared.key_prefix) == "t:default:"
+            assert self._as_tenant("tenant-y", lambda: shared.key_prefix) == "t:tenant-y:"
             backend = self._as_tenant("tenant-x", provider.get_backend)
-            # An empty context (a fresh worker thread) has no tenant: the call-time tenant is the fallback.
             assert contextvars.Context().run(lambda: backend.key_prefix) == "t:tenant-x:"
             assert self._as_tenant("tenant-y", lambda: backend.key_prefix) == "t:tenant-y:"
         finally:
