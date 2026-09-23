@@ -27,6 +27,7 @@ SAMPLING_RATE = _settings.log_sampling_rate
 RING_BUFFER_SIZE = _settings.log_buffer_size
 BATCH_SIZE = _settings.log_batch_size
 FLUSH_INTERVAL = _settings.log_flush_interval
+del _settings  # keep only the four scalars; don't pin a stale config past reset_settings()
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
@@ -171,7 +172,7 @@ class StructuredLogger:
         self.logger = logging.getLogger(name)
 
     def _should_sample(self) -> bool:
-        """Fast sampling decision (~5ns)."""
+        """Fast sampling decision."""
         # Using random for non-cryptographic sampling - performance critical
         return random.randint(0, 99) < self._sampling_threshold  # noqa: S311
 
@@ -184,7 +185,7 @@ class StructuredLogger:
 
     def log(self, level: str, message: str, **kwargs):
         """Main logging method with sampling."""
-        # Fast path - skip if not sampled (~0.5μs overhead)
+        # Fast path - skip if not sampled
         if not self._should_sample():
             return
 
@@ -349,14 +350,7 @@ class StructuredLogger:
             "thread_id": threading.get_ident(),
         }
 
-        # Try to get trace_id from multiple sources
-        trace_id = None
-
-        # 1. Check manually set trace_id first (highest priority)
-        if hasattr(self._context, "trace_id") and self._context.trace_id:
-            trace_id = self._context.trace_id
-
-        # Only include trace_id if we found one
+        trace_id = getattr(self._context, "trace_id", None)
         if trace_id:
             context["trace_id"] = trace_id
         return context
