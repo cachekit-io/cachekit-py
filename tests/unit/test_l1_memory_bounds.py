@@ -7,9 +7,14 @@ vector that also evicts every other useful entry). Such values still live in L2.
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
+import time
+
 import pytest
 
-from cachekit.l1_cache import L1Cache
+from cachekit.l1_cache import L1Cache, L1CacheManager
 
 MB = 1024 * 1024
 
@@ -211,3 +216,100 @@ class TestConfiguredBudgetWiring:
             config = getattr(DecoratorConfig, preset)()
 
         assert config.l1.max_size_mb is None
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
+    """Leave the manager in the state fork() hands a child: dead thread, foreign owner."""
+    manager._cleanup_thread = threading.Thread(target=lambda: None) if parent_ran_cleanup else None
+    manager._owner_pid = -1
+
+
+@pytest.mark.unit
+class TestCleanupThreadAfterFork:
+    """LAB-4772: a prefork child must run its own L1 cleanup thread.
+
+    Decorators capture their L1Cache once, at import in the prefork master; the child's
+    only contact with L1 is get/put on that captured instance, never the manager.
+    """
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_restarts_cleanup_on_first_put(self):
+        import multiprocessing
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("fork-ns")  # captured pre-fork, like a decorator's _l1_cache
+        manager.start_background_cleanup(interval_seconds=0.05)
+        try:
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q) -> None:
+                inherited = manager._cleanup_thread
+                cache.put("k", b"v", redis_ttl=1.2)  # minus the 1s ttl buffer: expires in ~0.2s
+                thread = manager._cleanup_thread
+                # No get(): only the background sweep can count this eviction.
+                swept = _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)
+                q.put(
+                    {
+                        "fresh": thread is not None and thread is not inherited,
+                        "alive": thread is not None and thread.is_alive(),
+                        "swept": swept,
+                    }
+                )
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=30)
+            finally:
+                process.join(timeout=30)
+
+            assert process.exitcode == 0
+            assert outcome == {"fresh": True, "alive": True, "swept": True}
+        finally:
+            manager.stop_background_cleanup()
+
+    def test_cleanup_stopped_in_parent_stays_stopped(self):
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("stopped-ns")
+        _as_if_forked(manager, parent_ran_cleanup=False)
+
+        cache.put("k", b"v")
+
+        assert manager._cleanup_thread is None
+        assert manager._owner_pid == os.getpid()
+
+    def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("refused-ns")
+        _as_if_forked(manager, parent_ran_cleanup=True)
+
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+        with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
+            cache.put("k1", b"v")
+            cache.put("k2", b"v")
+
+        assert cache.get("k1")[0] and cache.get("k2")[0]
+        assert sum("restart after fork failed" in r.message for r in caplog.records) == 1
+
+    def test_start_replaces_dead_thread_instead_of_noop(self):
+        manager = L1CacheManager(default_max_memory_mb=10)
+        manager._cleanup_thread = threading.Thread(target=lambda: None)  # never started: dead
+
+        manager.start_background_cleanup(interval_seconds=60)
+        try:
+            assert manager._cleanup_thread.is_alive()
+        finally:
+            manager.stop_background_cleanup()
