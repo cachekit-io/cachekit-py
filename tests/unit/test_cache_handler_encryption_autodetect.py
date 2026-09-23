@@ -293,6 +293,8 @@ class TestAutoActivationDeprecationWarning:
         assert "@cache.secure(" in records[0].message
         assert "encryption=True" in records[0].message
         assert "encryption=False" in records[0].message
+        # An L1-only cache warns too but holds raw objects: the line must not claim every cache encrypts.
+        assert "L1-only cache (backend=None)" in records[0].message
 
     @pytest.mark.parametrize(
         "kwargs",

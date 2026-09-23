@@ -243,8 +243,10 @@ class EncryptionConfig:
     Tri-state ``enabled`` (issue #128): a plain bool cannot tell "user left it unset"
     from "user explicitly disabled". ``enabled`` is therefore None/True/False:
         - None (default): unset — no encryption intent stated. DEPRECATED activation path:
-          with CACHEKIT_MASTER_KEY set the handler still auto-enables encryption this
-          release and warns once; the next minor release raises at construction.
+          with CACHEKIT_MASTER_KEY set and neither master_key nor tenant_extractor given here,
+          the handler still auto-enables encryption this release and warns once, though an
+          L1-only cache (backend=None) holds raw objects and never encrypts; the next minor
+          release raises at construction.
         - True: force client-side encryption ON (requires master_key + tenant mode).
         - False: explicit hard opt-out — never encrypt, even when a master key is present.
 

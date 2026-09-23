@@ -438,7 +438,9 @@ def create_cache_wrapper(
                    to serializer - wraps ANY serializer with encryption.
                    - None (default): no intent stated. DEPRECATED activation path: with
                      CACHEKIT_MASTER_KEY set this release still auto-enables encryption and
-                     warns once; the next minor release raises at construction.
+                     warns once, except that master_key= or tenant_extractor= keeps it plaintext
+                     and an L1-only cache (backend=None) holds raw objects, never encrypted; the
+                     next minor release raises at construction.
                    - True: force encryption ON (key inline or from CACHEKIT_MASTER_KEY).
                    - False: explicit per-function opt-out — never encrypts, even when
                      CACHEKIT_MASTER_KEY is set (issue #128).
