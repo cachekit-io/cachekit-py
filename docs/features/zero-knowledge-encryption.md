@@ -122,8 +122,8 @@ def get_user_ssn(user_id):
 From the next minor release encryption turns on only where the code says so —
 `@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
 below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
-ciphertext on read; in this release its presence still auto-activates encryption where no
-intent is stated (last row) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+ciphertext on read; in this release its presence can still auto-activate encryption where no
+intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
 
 | Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
 |---|---|---|
