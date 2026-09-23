@@ -15,6 +15,7 @@ import logging
 import multiprocessing
 import os
 import threading
+from multiprocessing.queues import Queue
 from typing import Any
 
 import pytest
@@ -327,7 +328,7 @@ class TestAutoActivationDeprecationWarning:
             ctx = multiprocessing.get_context("fork")
             queue = ctx.Queue()
 
-            def child(q: Any) -> None:
+            def child(q: Queue[int]) -> None:
                 caplog.clear()  # the child's copy still holds the parent's record
                 CacheSerializationHandler(serializer_name="default")
                 q.put(len(self._activation_records(caplog)))
