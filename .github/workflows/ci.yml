@@ -183,7 +183,7 @@ jobs:
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
     # The two uploads below are deliberately treated differently, not defaulted
-    # (LAB-2528 finding 3). coverage.xml is the ONLY input to the
+    # for this reason: coverage.xml is the ONLY input to the
     # project/patch statuses codecov.yml declares, and every flag there sets
     # `carryforward: true` — so a silently-dropped upload does not remove the
     # status, it answers "is this PR's new code 80% covered?" with a previous
@@ -263,7 +263,7 @@ jobs:
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
         fail_ci_if_error: true
 
-  # LAB-511: free-threaded CPython safety net. Runs the core suites on a
+  # Free-threaded CPython safety net. Runs the core suites on a
   # 3.14 free-threaded build and fails if the GIL gets re-enabled, so code
   # whose correctness silently depended on the GIL's memory ordering cannot
   # regress unnoticed. Optional native deps without free-threaded wheels
@@ -353,16 +353,15 @@ jobs:
     - name: Run markdown documentation tests
       run: make test-docs-examples
 
-  # LAB-3500: this repo is public and forkable, so every job runs on
+  # This repo is public and forkable, so every job runs on
   # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
   # deny-list: a deny-list fails open on a new label, a casing variant,
   # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
   # The program is the heredoc below; its regression fixtures are
   # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
   # guard cannot pass anything. This is drift protection for maintainers, NOT
-  # a fork-PR control: a fork PR runs the fork's copy of this file and can
-  # simply delete the guard; the control for that lives in repository and org
-  # runner settings, outside this file.
+  # a fork-PR control; fork-PR control lives in repository and org runner
+  # settings, outside this file.
   runner-drift-guard:
     name: Runner Drift Guard
     runs-on: ubuntu-latest
@@ -385,10 +384,9 @@ jobs:
           # error, never a skip. Exact labels, not a hosted-prefix pattern (a
           # prefix admits any self-hosted label named ubuntu-<anything>) and not
           # a copy of GitHub's image table (it rots): adopting another hosted
-          # image is a deliberate edit to HOSTED. Out of scope, deliberately:
-          # YAML obfuscation (explicit `?` keys, escape sequences, tags on keys)
-          # is a deliberate act, not drift; the control for that lives in
-          # repository and org runner settings, outside this file.
+          # image is a deliberate edit to HOSTED. This catches drift by
+          # maintainers; it is not a fork-PR control, which lives in repository
+          # and org runner settings, outside this file.
           BEGIN { HOSTED = "^(ubuntu|macos|windows)-latest$" }
           FNR == 1 { matrix_indent = -1 }
           { sub(/#.*/, ""); $0 = tolower($0) }
@@ -418,7 +416,7 @@ jobs:
           (/^[[:space:]]*(-[[:space:]]*)?["']?include["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ && matrix_indent >= 0) ||
           /^[[:space:]]*(-[[:space:]]*)?(<<[[:space:]]*:|\*[^*[:space:]])/ ||
           (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
-            printf "::error file=%s,line=%d::line may hide a runner label from the drift guard — write `runs-on: <label>` / `os: [<labels>]` inline; keep `strategy:`, `matrix:`, `include:` as bare keys over a static block (no expressions, anchors, aliases or flow maps); call reusable workflows only from ./.github/workflows/ (LAB-3500)\n", FILENAME, FNR
+            printf "::error file=%s,line=%d::line may hide a runner label from the drift guard — write `runs-on: <label>` / `os: [<labels>]` inline; keep `strategy:`, `matrix:`, `include:` as bare keys over a static block (no expressions, anchors, aliases or flow maps); call reusable workflows only from ./.github/workflows/\n", FILENAME, FNR
             bad = 1
           }
           /^[[:space:]]*(-[[:space:]]*)?["']?runs-on["']?[[:space:]]*:/ ||
@@ -431,7 +429,7 @@ jobs:
             ok = (v != "")
             for (i = 1; i <= n; i++) if (items[i] !~ HOSTED) ok = 0
             if (!ok) {
-              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners (LAB-3500); adopting a new hosted image means extending HOSTED in the runner-drift-guard job of ci.yml\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
+              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners; adopting a new hosted image means extending HOSTED in the runner-drift-guard job of ci.yml\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
               bad = 1
             }
           }

@@ -22,7 +22,7 @@ jobs:
           #   1. lookup failed -> hard fail; we know nothing either way.
           #   2. releases exist but none is GitHub's "latest" -> hard fail. On a repo
           #      that publishes releases that is a tamper or misconfiguration signal,
-          #      and skipping it is the exact shape LAB-984 fell into.
+          #      and skipping it is how a week of no verification once read as healthy.
           #   3. zero releases at all -> skip; nothing has been published yet.
           #
           # Two lookups, each answering exactly one question, because one call
@@ -62,7 +62,7 @@ jobs:
           # incidents, not idle states: an API failure means we know nothing, and
           # "releases exist but none is latest" (all drafts/prereleases) on a repo
           # that publishes to PyPI is tamper or misconfiguration. Skipping either
-          # is the exact shape LAB-984 fell into, so both go red.
+          # is how a week of no verification once read as healthy, so both go red.
           elif ! TAG=$(gh release view --repo "$REPO" --json tagName --jq '.tagName'); then
             echo "::error::$REPO has release(s) but no resolvable latest release — refusing to skip a release that may need attesting"
             exit 1
