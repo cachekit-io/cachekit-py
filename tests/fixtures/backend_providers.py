@@ -81,11 +81,12 @@ class TestBackendProvider(BackendProviderInterface):
         """Get the shared tenant-scoped backend, as DefaultBackendProvider hands out.
 
         Returns:
-            TenantContextRedisBackend wrapping the test client (tenant read per operation)
+            PerRequestRedisBackend wrapping the test client (tenant read per operation,
+            "default" when none is set)
         """
-        from cachekit.backends.redis.provider import TenantContextRedisBackend
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
 
-        return TenantContextRedisBackend(self._client)
+        return PerRequestRedisBackend(self._client, "default", follow_context=True)
 
 
 __all__ = ["TestCacheClientProvider", "TestBackendProvider"]

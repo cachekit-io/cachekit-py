@@ -186,11 +186,13 @@ class TestRedisBackendProviderFactory:
 
         # Multiple get_backend calls should return different backend instances
         # but sharing the same client
-        tenant_context.set("tenant1")
+        token = tenant_context.set("tenant1")
         backend1 = provider.get_backend()
+        tenant_context.reset(token)
 
-        tenant_context.set("tenant2")
+        token = tenant_context.set("tenant2")
         backend2 = provider.get_backend()
+        tenant_context.reset(token)
 
         # Different backend instances
         assert backend1 is not backend2
@@ -406,9 +408,7 @@ class TestTenantScopedPerOperation:
 
     async def test_every_operation_follows_the_calling_context(self, redis_isolated):
         """One shared instance: reads, writes, deletes, TTL ops and locks all re-scope per context."""
-        from cachekit.backends.redis.provider import TenantContextRedisBackend
-
-        backend = TenantContextRedisBackend(redis_isolated)
+        backend = PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
         for tenant, wire in (("tenant-a", "tenant-a"), ("org:b", "org%3Ab")):
             token = tenant_context.set(tenant)
             try:
@@ -467,3 +467,88 @@ class TestTenantScopedPerOperation:
         tenant_context.set(tenant)  # type: ignore[arg-type]  # async test: own context copy
         assert await lookup(1) == 1
         assert _tenant_prefixes(env_resolved_redis) == {str(tenant)}
+
+    def test_provider_handing_out_get_backend_follows_each_calling_tenant(self, env_resolved_redis):
+        """A custom provider returning RedisBackendProvider.get_backend() — the decorator caches it."""
+        import os
+
+        from cachekit import cache
+        from cachekit.backends.provider import BackendProviderInterface
+        from cachekit.di import DIContainer
+
+        redis_provider = RedisBackendProvider(os.environ["CACHEKIT_REDIS_URL"])
+
+        class GetBackendProvider:
+            def get_backend(self):
+                return redis_provider.get_backend()
+
+        DIContainer()._singletons[BackendProviderInterface] = GetBackendProvider()
+
+        @cache(ttl=60, l1_enabled=False)
+        def lookup(x):
+            return x
+
+        try:
+            for tenant in ("tenant-a", "tenant-b"):
+                token = tenant_context.set(tenant)
+                try:
+                    lookup(1)
+                finally:
+                    tenant_context.reset(token)
+        finally:
+            redis_provider.close()
+
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "tenant-b"}
+
+    def test_request_backend_handed_to_a_worker_thread_keeps_its_tenant(self, env_resolved_redis):
+        """A fresh thread has no tenant set: get_backend()'s call-time tenant is the fallback."""
+        import os
+        import threading
+
+        redis_provider = RedisBackendProvider(os.environ["CACHEKIT_REDIS_URL"])
+        token = tenant_context.set("tenant-x")
+        try:
+            backend = redis_provider.get_backend()
+        finally:
+            tenant_context.reset(token)
+
+        try:
+            worker = threading.Thread(target=backend.set, args=("k", b"v"))
+            worker.start()
+            worker.join()
+        finally:
+            redis_provider.close()
+
+        assert env_resolved_redis.keys("t:*") == [b"t:tenant-x:k"]
+
+    def test_direct_binding_is_not_overridden_by_the_context(self, redis_isolated):
+        """Explicit construction (admin / fan-out to another tenant) keeps its tenant."""
+        backend = PerRequestRedisBackend(redis_isolated, "tenant-x")
+        token = tenant_context.set("tenant-y")
+        try:
+            backend.set("k", b"v")
+        finally:
+            tenant_context.reset(token)
+
+        assert redis_isolated.keys("t:*") == [b"t:tenant-x:k"]
+
+    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self, redis_isolated):
+        """str() of an arbitrary object (default repr embeds id()) could merge two tenants."""
+        import uuid
+
+        backend = PerRequestRedisBackend(redis_isolated, "default", follow_context=True)
+        for tenant, wire in ((7, "7"), (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"), (b"acme", "acme")):
+            token = tenant_context.set(tenant)  # type: ignore[arg-type]
+            try:
+                assert backend.key_prefix == f"t:{wire}:"
+            finally:
+                tenant_context.reset(token)
+
+        with pytest.raises(TypeError):
+            PerRequestRedisBackend(redis_isolated, object())  # type: ignore[arg-type]
+        token = tenant_context.set(object())  # type: ignore[arg-type]
+        try:
+            with pytest.raises(TypeError):
+                backend.get("k")
+        finally:
+            tenant_context.reset(token)

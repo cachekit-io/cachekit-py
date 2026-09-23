@@ -195,8 +195,8 @@ from cachekit import cache
 from cachekit.backends.redis.provider import RedisBackendProvider
 
 # The tenant-scoped Redis backend implements LockableBackend; a bare RedisBackend() does not.
-# get_shared_backend() reads tenant_context on every operation, so one instance serves every
-# request (unset → "default"). get_backend() instead binds the tenant current at that call.
+# It reads tenant_context on every operation, so one instance serves every request;
+# get_shared_backend() scopes a context with no tenant set to "default".
 backend = RedisBackendProvider(redis_url="redis://localhost:6379").get_shared_backend()
 
 @cache(ttl=300, backend=backend)

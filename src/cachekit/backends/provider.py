@@ -156,7 +156,7 @@ class DefaultBackendProvider(BackendProviderInterface):
 
     Selection is by a single, unambiguous environment signal. Priority order:
         1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL          → Redis (tenant-scoped TenantContextRedisBackend)
+        2. CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
         3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
         5. REDIS_URL, or nothing set   → Redis, as 2 (12-factor / localhost default)
