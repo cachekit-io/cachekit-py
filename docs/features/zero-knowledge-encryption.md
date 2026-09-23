@@ -117,6 +117,29 @@ def get_user_ssn(user_id):
 
 ---
 
+## Activation: the Master Key Is a Source, Not a Switch
+
+From the next minor release encryption turns on only where the code says so —
+`@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
+below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
+ciphertext on read; in this release its presence still auto-activates encryption where no
+intent is stated (last row) and logs a one-time warning. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+
+| Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
+|---|---|---|
+| `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
+| `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
+| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext) |
+| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a one-time warning. The next minor release raises at construction instead. |
+
+The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
+call site's encryption state was unreadable from the code — it depended on which pod
+carried which variable — and a pod *missing* the variable wrote plaintext to the backend
+with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
+on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
+only the deprecated no-intent row degrades to plaintext, and the compliance argument below
+holds only on an explicit path.
+
 ## What Can Go Wrong
 
 ### Missing Master Key

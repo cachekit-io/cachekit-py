@@ -1,18 +1,22 @@
 """Tests for CacheSerializationHandler encryption auto-detection.
 
 When CACHEKIT_MASTER_KEY is set and encryption is not explicitly configured
-(encryption=None), the handler auto-enables encryption with single_tenant_mode=True.
+(encryption=None), the handler still auto-enables encryption with single_tenant_mode=True —
+DEPRECATED (protocol intent-presets.md § Encryption Activation): this release warns once per
+process, the next minor release raises at construction instead.
 
-Encryption is tri-state (issue #128): None=auto-detect, True=force-on, False=hard
-opt-out. An explicit False must survive fleet-wide CACHEKIT_MASTER_KEY auto-detection.
+Encryption is tri-state (issue #128): None=unset, True=force-on, False=hard opt-out. An
+explicit False must survive a present CACHEKIT_MASTER_KEY.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 
+import cachekit.cache_handler as cache_handler_mod
 from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.singleton import reset_settings
@@ -253,3 +257,56 @@ class TestDecoratorEncryptionFlattening:
         assert isinstance(enc, EncryptionConfig)
         # If the guard failed, enabled would be an EncryptionConfig, not the bool False.
         assert enc.enabled is False
+
+
+@pytest.mark.unit
+class TestAutoActivationDeprecationWarning:
+    """Release-N migration gate: presence-activation warns ONCE per process via logger.warning,
+    naming the explicit spellings (`@cache.secure(...)`, `encryption=True`, `encryption=False`)
+    so the fix is copy-pasteable from the log line.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_process(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED", False)
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        reset_settings()
+        yield
+        reset_settings()
+
+    @staticmethod
+    def _activation_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno == logging.WARNING and "auto-enabled" in r.message]
+
+    def test_warns_once_per_process_and_names_the_explicit_spellings(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            first = CacheSerializationHandler(serializer_name="default")
+            second = CacheSerializationHandler(serializer_name="default")
+
+        # Release N still activates — only the warning is new.
+        assert first.encryption is True and second.encryption is True
+        records = self._activation_records(caplog)
+        assert len(records) == 1, [r.message for r in records]
+        assert "@cache.secure(" in records[0].message
+        assert "encryption=True" in records[0].message
+        assert "encryption=False" in records[0].message
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"encryption": False}, id="explicit-false"),
+            pytest.param({"encryption": True, "single_tenant_mode": True}, id="explicit-true"),
+        ],
+    )
+    def test_explicit_intent_does_not_warn(self, caplog: pytest.LogCaptureFixture, kwargs: dict[str, Any]) -> None:
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            CacheSerializationHandler(serializer_name="default", **kwargs)
+        assert self._activation_records(caplog) == []
+
+    def test_no_key_does_not_warn(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY")
+        reset_settings()
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            handler = CacheSerializationHandler(serializer_name="default")
+        assert handler.encryption is False
+        assert self._activation_records(caplog) == []

@@ -241,14 +241,19 @@ class EncryptionConfig:
     @cache.io), you must set it explicitly.
 
     Tri-state ``enabled`` (issue #128): a plain bool cannot tell "user left it unset"
-    from "user explicitly disabled", so a deliberate opt-out was silently overridden by
-    fleet-wide CACHEKIT_MASTER_KEY auto-detection. ``enabled`` is therefore None/True/False:
-        - None (default): unset — defer to CACHEKIT_MASTER_KEY auto-detection downstream.
+    from "user explicitly disabled". ``enabled`` is therefore None/True/False:
+        - None (default): unset — no encryption intent stated. DEPRECATED activation path:
+          with CACHEKIT_MASTER_KEY set the handler still auto-enables encryption this
+          release and warns once; the next minor release raises at construction.
         - True: force client-side encryption ON (requires master_key + tenant mode).
         - False: explicit hard opt-out — never encrypt, even when a master key is present.
 
+    ``CACHEKIT_MASTER_KEY`` is a key *source* (the fallback for ``enabled=True`` and
+    ``@cache.secure``), not an activation *switch* — protocol ``intent-presets.md``
+    § Encryption Activation.
+
     Attributes:
-        enabled: Tri-state encryption flag (default: None = unset/auto-detect).
+        enabled: Tri-state encryption flag (default: None = unset).
                  True = force-on, False = explicit opt-out.
         master_key: Hex-encoded master key for key derivation (required if enabled=True)
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
@@ -263,7 +268,7 @@ class EncryptionConfig:
                  cachekit_decrypt_failures_total metric, recompute).
 
     Examples:
-        Unset by default (defers to auto-detection, no encryption forced):
+        Unset by default (no intent stated, no encryption forced):
 
         >>> config = EncryptionConfig()
         >>> config.enabled is None
@@ -310,11 +315,11 @@ class EncryptionConfig:
 
         Only the explicit force-on state (enabled=True) requires a master key. The
         unset (None) and explicit opt-out (False) states are both falsy and skip
-        validation — None defers to downstream auto-detection, False never encrypts.
+        validation — neither requires a key; False never encrypts.
 
         The master key may be supplied inline or via the CACHEKIT_MASTER_KEY env var
-        (resolved here so force-on works fleet-wide without inlining the key, matching
-        the handler's own resolution).
+        (resolved here so force-on works without inlining the key, matching the
+        handler's own resolution).
 
         Raises:
             ConfigurationError: If encryption enabled but no master_key (inline or env)

@@ -436,11 +436,12 @@ def create_cache_wrapper(
                    - SerializerProtocol instance: Custom serializer implementing the protocol
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
-                   - None (default): auto-detect from CACHEKIT_MASTER_KEY (fleet-wide opt-in).
-                   - True: force encryption ON.
+                   - None (default): no intent stated. DEPRECATED activation path: with
+                     CACHEKIT_MASTER_KEY set this release still auto-enables encryption and
+                     warns once; the next minor release raises at construction.
+                   - True: force encryption ON (key inline or from CACHEKIT_MASTER_KEY).
                    - False: explicit per-function opt-out — never encrypts, even when
-                     CACHEKIT_MASTER_KEY is set. Use to exclude a single function from
-                     fleet-wide encryption (issue #128).
+                     CACHEKIT_MASTER_KEY is set (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
                          If None: single-tenant mode (uses nil UUID for encryption).

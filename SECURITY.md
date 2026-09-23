@@ -148,6 +148,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 |:------------|:---------------|
 | Key size | Minimum 32 bytes (256 bits) |
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
+| Activation | `@cache.secure` or an explicit encryption option (`encryption=True` + tenant mode) only — the env var is a key source, not a switch (presence-activation deprecated in 0.20.0, removed in the next minor release) |
 | Logging | Never exposed in logs/errors |
 | Derivation | HKDF with unique tenant salts |
 

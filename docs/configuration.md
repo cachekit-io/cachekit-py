@@ -79,7 +79,9 @@ CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
-# Encryption (for @cache.secure)
+# Master key for @cache.secure / encryption=True — a key source, not a switch.
+# Deprecated in 0.20.0: its presence alone still activates encryption on presets that
+# state no encryption= (one-time warning); the next minor release raises instead.
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
 # Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
 # same per-key requirements as CACHEKIT_MASTER_KEY). Entries written under a
