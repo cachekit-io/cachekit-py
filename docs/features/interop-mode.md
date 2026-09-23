@@ -40,7 +40,7 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 | `@cache(interop=..., namespace=...)` | ✅ Spec-identical | Baseline — key and value bytes come only from the interop/v1 spec |
 | `@cache.production(interop=..., ...)` | ✅ Spec-identical | **Recommended.** Reliability profile (circuit breaker, monitoring) affects runtime only, never bytes |
 | `@cache.minimal(interop=..., ...)` | ✅ Spec-identical | Its `integrity_checking=False` is a no-op here — see [Encryption](#encryption) |
-| `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key + deployment UUID |
+| `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key (and the same explicit tenant, if one is configured) |
 | `@cache.io(interop=..., ...)` | ✅ Composes in code | ⚠️ Don't run against CachekitIO until the saas#91 validator deploy is live — see the note at the bottom |
 | `@cache.local(...)` / `@cache(backend=None)` | ❌ Rejected loudly | No shared medium: `.local` raises `TypeError` (it accepts no `interop=`), `backend=None` raises `ConfigurationError` at decoration time |
 
@@ -116,7 +116,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 | :--- | :--- |
 | Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
-| Encryption without an explicit, canonical shared deployment UUID | `ConfigurationError` at decoration time |
+| Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
 | Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |

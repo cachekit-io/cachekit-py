@@ -447,7 +447,8 @@ class CacheSerializationHandler:
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
     - encryption=None: Auto-detect from CACHEKIT_MASTER_KEY (single-tenant if a key is present)
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
-    - encryption=True, tenant_extractor=None: Single-tenant encrypted (nil UUID)
+    - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
+      unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
     - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
 
     Examples:
@@ -658,10 +659,10 @@ class CacheSerializationHandler:
             # Resolve the single-tenant tenant_id (protocol intent-presets.md § Master Key
             # Input, rule 5): explicit deployment_uuid → CACHEKIT_DEPLOYMENT_UUID → "default".
             if self.single_tenant_mode:
-                self._single_tenant_id = self._resolve_single_tenant_id(provided_uuid=self.deployment_uuid)
+                self._single_tenant_id, source = self._resolve_single_tenant_id(provided_uuid=self.deployment_uuid)
                 get_logger().info(
                     "Single-tenant mode initialized",
-                    extra={"tenant_id": self._single_tenant_id},
+                    extra={"tenant_id": self._single_tenant_id, "source": source},
                 )
 
         # Use cached base serializer instance with integrity_checking setting
@@ -691,12 +692,14 @@ class CacheSerializationHandler:
     protocol ``spec/intent-presets.md`` § Master Key Input, rule 5: with no caller-supplied
     tenant, every SDK MUST derive keys and build AAD with the literal ``"default"``, so a
     py, rs and ts client on one master key produce mutually decryptable ciphertext. A
-    per-machine value here (the pre-0.20 persisted ``~/.cachekit/deployment_uuid``) is
+    per-machine value here (the persisted ``~/.cachekit/deployment_uuid`` earlier releases auto-generated) is
     a silent, permanent cross-SDK authentication failure — not a miss.
     """
 
-    def _resolve_single_tenant_id(self, provided_uuid: Optional[str]) -> str:
+    def _resolve_single_tenant_id(self, provided_uuid: Optional[str]) -> tuple[str, str]:
         """Resolve the tenant_id used for HKDF derivation and AAD in single-tenant mode.
+
+        Returns ``(tenant_id, source)``; ``source`` names which of the three rungs below won.
 
         Priority order:
         1. Explicit ``deployment_uuid`` parameter (validated UUID)
@@ -723,10 +726,9 @@ class CacheSerializationHandler:
             except ValueError as e:
                 raise ConfigurationError(f"Invalid {source} (must be valid UUID): {raw}. Error: {e}") from e
             self._require_canonical_tenant_form(raw, validated_uuid, source=source)
-            get_logger().info(f"Using explicit tenant_id from {source}: {validated_uuid}")
-            return validated_uuid
+            return validated_uuid, source
 
-        return self.DEFAULT_TENANT_ID
+        return self.DEFAULT_TENANT_ID, "protocol default"
 
     def _require_canonical_tenant_form(self, raw: str, canonical: str, source: str) -> None:
         """Interop mode: reject a deployment UUID that is not already canonical.
@@ -835,7 +837,7 @@ class CacheSerializationHandler:
         Note:
             Tenant extraction uses FAIL CLOSED security policy:
             - If tenant_extractor provided: extracts tenant_id from args/kwargs or raises ValueError
-            - If single_tenant_mode=True: uses deterministic deployment UUID
+            - If single_tenant_mode=True: uses the tenant_id resolved in __init__ (explicit UUID, else "default")
 
         Examples:
             Serialize a dictionary (no encryption):

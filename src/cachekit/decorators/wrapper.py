@@ -443,7 +443,8 @@ def create_cache_wrapper(
                      fleet-wide encryption (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
-                         If None: single-tenant mode (uses nil UUID for encryption).
+                         If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
+                         CACHEKIT_DEPLOYMENT_UUID is set).
                          If provided: multi-tenant mode (extracts tenant_id from function args/kwargs).
                          FAIL CLOSED: extraction failure raises ValueError (no fallback to shared key).
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).

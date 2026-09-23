@@ -538,7 +538,6 @@ class TestInteropEncryption:
     DEFAULT_TENANT_VECTOR = {
         "cache_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
         "ciphertext_hex": "0d0e0f1011121314151617183c29af318238925ee76d081934adce133c0b4a7c5eb5704102b04582dcbf278ffd",  # pragma: allowlist secret
-        "derived_key_fingerprint_hex": "52d54c97f8e5efaa5bdf58a301f92726",  # pragma: allowlist secret
     }
 
     def test_default_tenant_decrypts_protocol_vector(self, backend: DictBackend, monkeypatch):
