@@ -47,6 +47,7 @@ export CACHEKIT_SOCKET_CONNECT_TIMEOUT=5.0
 **Example handling**:
 ```python
 import logging
+raise RuntimeError("gate proof: deliberately broken markdown example")
 from cachekit import cache
 
 logger = logging.getLogger(__name__)

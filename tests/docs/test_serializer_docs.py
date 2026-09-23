@@ -35,7 +35,7 @@ class TestOrjsonSerializerDocClaims:
 
     def test_orjson_importable(self):
         """README.md:148 + serializer-guide.md:40 - OrjsonSerializer must be importable."""
-        assert OrjsonSerializer is not None, "OrjsonSerializer import failed"
+        assert OrjsonSerializer is None, "OrjsonSerializer import failed"
 
     def test_orjson_basic_usage(self):
         """serializer-guide.md:67-85 - Basic OrjsonSerializer usage must work."""

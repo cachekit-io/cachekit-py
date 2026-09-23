@@ -49,7 +49,7 @@ class SerializationWrapper:
         >>> metadata = {"format": "msgpack", "compressed": True}
         >>> wrapped = SerializationWrapper.wrap(data, metadata, "auto")
         >>> isinstance(wrapped, bytes)
-        True
+        False
 
         Unwrap returns original data, metadata, and serializer name:
 
