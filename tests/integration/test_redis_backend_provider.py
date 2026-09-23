@@ -427,3 +427,43 @@ class TestTenantScopedPerOperation:
                 tenant_context.reset(token)
 
         assert sorted(redis_isolated.keys("t:*")) == [b"t:org%3Ab:k", b"t:tenant-a:k"]
+
+    def test_whole_function_invalidate_keeps_other_tenants_tracked(self, env_resolved_redis):
+        """A no-args invalidate by one tenant must not untrack another tenant's entries."""
+        from cachekit import cache
+
+        @cache(ttl=60, l1_enabled=False)
+        def lookup(x):
+            return x
+
+        def as_tenant(tenant, fn, *args):
+            token = tenant_context.set(tenant)
+            try:
+                return fn(*args)
+            finally:
+                tenant_context.reset(token)
+
+        as_tenant("tenant-a", lookup, 1)
+        as_tenant("tenant-b", lookup, 1)
+        as_tenant("tenant-b", lookup, 2)
+
+        as_tenant("tenant-a", lookup.invalidate_cache)
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-b"}
+
+        as_tenant("tenant-b", lookup.invalidate_cache)
+        assert env_resolved_redis.keys("t:*") == []
+
+    async def test_non_str_tenant_id_is_scoped_not_raised(self, env_resolved_redis):
+        """Apps set UUID / int tenant ids; the async miss path must cache, not raise."""
+        import uuid
+
+        from cachekit import cache
+
+        @cache(ttl=60, l1_enabled=False)
+        async def lookup(x):
+            return x
+
+        tenant = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        tenant_context.set(tenant)  # type: ignore[arg-type]  # async test: own context copy
+        assert await lookup(1) == 1
+        assert _tenant_prefixes(env_resolved_redis) == {str(tenant)}

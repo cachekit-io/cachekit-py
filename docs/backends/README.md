@@ -215,10 +215,10 @@ picks a backend from exactly one environment selector, in this order:
 | Priority | Environment variable        | Backend            |
 |----------|-----------------------------|--------------------|
 | 1        | `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
-| 2        | `CACHEKIT_REDIS_URL`        | `RedisBackend`     |
+| 2        | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
 | 3        | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | 4        | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
-| 5        | `REDIS_URL`, or nothing set | `RedisBackend` (localhost fallback) |
+| 5        | `REDIS_URL`, or nothing set | Redis, as 2 (localhost fallback) |
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on

@@ -476,28 +476,25 @@ class TenantContextRedisBackend(PerRequestRedisBackend):
 
     @property
     def key_prefix(self) -> str:
-        """Wire-level key prefix for the tenant of the CURRENT context (see base class)."""
+        """Wire-level key prefix for the tenant of the CURRENT context (see base class).
+
+        ``str()`` because apps set UUID / int tenant ids despite the annotation; quote() would
+        raise on every operation, and on the async lock path that reaches the caller.
+        """
         tenant_id = tenant_context.get()
-        return f"t:{url_encode('default' if tenant_id is None else tenant_id, safe='')}:"
+        return f"t:{url_encode('default' if tenant_id is None else str(tenant_id), safe='')}:"
 
 
 class RedisBackendProvider:
-    """Provider for Redis backend with singleton pool + per-request wrapper.
+    """Provider for Redis backend with singleton pool + tenant-scoped wrappers.
 
     Fix #1: Creates connection pool ONCE in __init__ (expensive).
     Creates singleton Redis client from pool.
-    get_backend() returns new PerRequestRedisBackend per call (cheap: ~50ns).
 
-    Implements BackendProvider protocol for dependency injection.
-
-    Example:
-        >>> token = tenant_context.set("org:123")
-        >>> # Usage pattern (requires Redis connection):
-        >>> # provider = RedisBackendProvider(redis_url="redis://localhost")
-        >>> # backend = provider.get_backend()
-        >>> # backend.set("key", b"value")
-        >>> # Stored as: t:org%3A123:key
-        >>> tenant_context.reset(token)
+    - get_shared_backend(): one backend for anything held across requests — a decorator's
+      ``backend=``, or a custom BackendProvider. Reads tenant_context per operation.
+    - get_backend(): a new PerRequestRedisBackend bound to the tenant current at the call
+      (cheap: ~50ns) — per-request use only; raises if no tenant is set.
     """
 
     def __init__(self, redis_url: str, pool_size: int = 50):

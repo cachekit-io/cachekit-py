@@ -191,6 +191,8 @@ get_user.invalidate_cache()
 
 **Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
 
+**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked.
+
 ---
 
 ## Multi-Instance Semantics

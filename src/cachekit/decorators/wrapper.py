@@ -820,7 +820,7 @@ def create_cache_wrapper(
         except TypeError as exc:
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
             return
-        _cached_keys.add(cache_key)
+        _cached_keys.add((_l2_scope(), cache_key))
 
     def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
@@ -1033,7 +1033,14 @@ def create_cache_wrapper(
     # When invalidate_cache() is called with no args on a parameterized function,
     # we need to clear ALL entries — but key normalization (hashing of long keys)
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
-    _cached_keys: set[str] = set()
+    # Each entry is (L2 key prefix, cache key): a tenant-scoped backend holds one L2 entry
+    # per tenant under the same cache key, and an invalidation may delete — and stop
+    # tracking — only the calling tenant's (LAB-4773).
+    _cached_keys: set[tuple[str, str]] = set()
+
+    def _l2_scope() -> str:
+        """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
+        return getattr(_backend, "key_prefix", None) or ""
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -1251,7 +1258,7 @@ def create_cache_wrapper(
             try:
                 result = func(*args, **kwargs)
                 _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
-                _cached_keys.add(cache_key)
+                _cached_keys.add((_l2_scope(), cache_key))
                 return result
             finally:
                 features.clear_correlation_id()
@@ -1522,7 +1529,7 @@ def create_cache_wrapper(
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
                 if _l1_cache and cache_key and serialized_bytes:
                     _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
-                _cached_keys.add(cache_key)
+                _cached_keys.add((_l2_scope(), cache_key))
 
                 # Record successful cache set
                 set_duration_ms = (time.time() - start_time) * 1000
@@ -1666,7 +1673,7 @@ def create_cache_wrapper(
                 _stats.record_miss()
                 result = await func(*args, **kwargs)
                 _object_cache.put(cache_key, result, ttl=ttl if ttl is not None else 31536000)
-                _cached_keys.add(cache_key)
+                _cached_keys.add((_l2_scope(), cache_key))
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
@@ -1961,7 +1968,7 @@ def create_cache_wrapper(
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
                             _put_l1(cache_key, serialized_data)
-                            _cached_keys.add(cache_key)
+                            _cached_keys.add((_l2_scope(), cache_key))
 
                             # Record successful cache set
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2047,7 +2054,7 @@ def create_cache_wrapper(
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
                     _put_l1(cache_key, serialized_data)
-                    _cached_keys.add(cache_key)
+                    _cached_keys.add((_l2_scope(), cache_key))
 
                     # Record successful cache set
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2107,20 +2114,23 @@ def create_cache_wrapper(
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
         if not args and not kwargs and _func_has_params:
             # Snapshot prevents RuntimeError if another thread adds during iteration
-            keys_snapshot = set(_cached_keys)
-            for key in keys_snapshot:
+            scope = _l2_scope()
+            for entry in set(_cached_keys):
+                entry_scope, key = entry
                 if _object_cache:
                     _object_cache.delete(key)
                 elif _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
+                    if entry_scope != scope:
+                        continue  # another tenant's L2 entry: not the caller's to delete, stays tracked
                     invalidator.set_backend(_backend)
                     try:
                         _backend.delete(key)
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         continue  # keep key tracked for retry
-                _cached_keys.discard(key)
+                _cached_keys.discard(entry)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
@@ -2133,7 +2143,7 @@ def create_cache_wrapper(
             _object_cache.delete(cache_key)
         elif _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
-        _cached_keys.discard(cache_key)
+        _cached_keys.discard((_l2_scope(), cache_key))
 
         if _backend and not _l1_only_mode:
             invalidator.set_backend(_backend)
@@ -2165,20 +2175,23 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            keys_snapshot = set(_cached_keys)
-            for key in keys_snapshot:
+            scope = _l2_scope()
+            for entry in set(_cached_keys):
+                entry_scope, key = entry
                 if _object_cache:
                     _object_cache.delete(key)
                 elif _l1_cache:
                     _l1_cache.invalidate(key)
                 if _backend and not _l1_only_mode:
+                    if entry_scope != scope:
+                        continue  # another tenant's L2 entry (see the sync twin)
                     invalidator.set_backend(_backend)
                     try:
                         _backend.delete(key)
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         continue
-                _cached_keys.discard(key)
+                _cached_keys.discard(entry)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
@@ -2191,7 +2204,7 @@ def create_cache_wrapper(
             _object_cache.delete(cache_key)
         elif _l1_cache and cache_key:
             _l1_cache.invalidate(cache_key)
-        _cached_keys.discard(cache_key)
+        _cached_keys.discard((_l2_scope(), cache_key))
 
         # Clear L2 cache via invalidator (skip in L1-only mode)
         if _backend and not _l1_only_mode:

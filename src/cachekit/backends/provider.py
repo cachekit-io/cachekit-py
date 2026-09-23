@@ -156,10 +156,10 @@ class DefaultBackendProvider(BackendProviderInterface):
 
     Selection is by a single, unambiguous environment signal. Priority order:
         1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL          → RedisBackend
+        2. CACHEKIT_REDIS_URL          → Redis (tenant-scoped TenantContextRedisBackend)
         3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
-        5. REDIS_URL, or nothing set   → RedisBackend (12-factor / localhost default)
+        5. REDIS_URL, or nothing set   → Redis, as 2 (12-factor / localhost default)
 
     Setting more than one of the four prefixed selectors (1-4) raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
@@ -168,9 +168,9 @@ class DefaultBackendProvider(BackendProviderInterface):
 
     Every backend is a singleton (cached) — the decorator holds whatever this returns
     for the life of the process. The Redis one is tenant-scoped per OPERATION: it reads
-    the tenant_context ContextVar each time it touches Redis, so each request is scoped
-    to its own tenant, and a context with no tenant set (single-tenant mode) is scoped
-    to "default" (LAB-4773).
+    the tenant_context ContextVar each time it touches Redis, so each Redis operation is
+    scoped to the calling context's tenant, and a context with no tenant set
+    (single-tenant mode) is scoped to "default" (LAB-4773).
     """
 
     # Prefixed selectors in priority order. REDIS_URL is the implicit fallback

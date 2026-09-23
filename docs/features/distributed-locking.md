@@ -41,7 +41,7 @@ report = await get_report("2025-01-15")
 > [!NOTE]
 > Locking requires **both** of:
 >
-> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the Redis backend you get from env auto-detection or `RedisBackendProvider` (`PerRequestRedisBackend`). A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without stampede protection.
+> 1. A backend implementing the `LockableBackend` protocol. `CachekitIOBackend` (the SaaS backend behind `api.cachekit.io`) does, and so does the tenant-scoped Redis backend you get from env auto-detection or `RedisBackendProvider(...).get_shared_backend()`. A `RedisBackend` you construct yourself and pass as `backend=` does **not** — it has no `acquire_lock`. Neither do `FileBackend` or pure-L1 (zero-config) caching. All of them silently skip lock acquisition; the function still works, just without stampede protection.
 > 2. An **async** decorated function. Sync wrappers never take the lock path on any backend — see [Async-only](#async-only-sync-functions-are-never-lock-protected).
 
 ---
@@ -339,7 +339,7 @@ A: Your function takes longer than the 5 s `blocking_timeout`, so waiters fall t
 **Q: Locking doesn't seem to be working**
 A: Two things to check:
 1. The decorated function must be **async** — sync wrappers never lock ([Async-only](#async-only-sync-functions-are-never-lock-protected)).
-2. The backend must implement `LockableBackend` (`CachekitIOBackend`, or `PerRequestRedisBackend` from `RedisBackendProvider` — a bare `RedisBackend()` does not). Check it the way the SDK does: `hasattr(backend, "acquire_lock")`. Avoid `isinstance(backend, LockableBackend)` — from CPython 3.12 a `runtime_checkable` protocol check resolves members with `inspect.getattr_static`, so it reports `False` for a backend that delegates `acquire_lock` through `__getattr__`.
+2. The backend must implement `LockableBackend` (`CachekitIOBackend`, or the env-resolved / `RedisBackendProvider(...).get_shared_backend()` Redis backend — a bare `RedisBackend()` does not). Check it the way the SDK does: `hasattr(backend, "acquire_lock")`. Avoid `isinstance(backend, LockableBackend)` — from CPython 3.12 a `runtime_checkable` protocol check resolves members with `inspect.getattr_static`, so it reports `False` for a backend that delegates `acquire_lock` through `__getattr__`.
 
 **Q: How do I know if stampedes are happening?**
 A: Check Prometheus: a spike in `rate(redis_cache_operations_total{status="miss"}[1m])` = stampede risk. See [Prometheus Metrics](prometheus-metrics.md).

@@ -290,21 +290,19 @@ class TestDefaultBackendProvider:
 
             with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
                 with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                        mock_config_instance = mock.MagicMock()
-                        mock_config_class.from_env.return_value = mock_config_instance
-                        mock_config_instance.redis_url = "redis://localhost:6379"
+                    mock_config_instance = mock.MagicMock()
+                    mock_config_class.from_env.return_value = mock_config_instance
+                    mock_config_instance.redis_url = "redis://localhost:6379"
 
-                        mock_provider_instance = mock.MagicMock()
-                        mock_backend_instance = mock.MagicMock()
-                        mock_provider_class.return_value = mock_provider_instance
-                        mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
-                        mock_context.get.return_value = None
+                    mock_provider_instance = mock.MagicMock()
+                    mock_backend_instance = mock.MagicMock()
+                    mock_provider_class.return_value = mock_provider_instance
+                    mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
 
-                        backend = provider.get_backend()
+                    backend = provider.get_backend()
 
-                        assert backend is mock_backend_instance
-                        mock_config_class.from_env.assert_called_once()
+                    assert backend is mock_backend_instance
+                    mock_config_class.from_env.assert_called_once()
 
     def test_get_backend_caches_result(self) -> None:
         """Second call returns cached backend, no re-init."""
@@ -387,17 +385,15 @@ class TestDefaultBackendProvider:
         with mock.patch.dict("os.environ", {"CACHEKIT_REDIS_URL": "redis://localhost:6379"}, clear=True):
             with mock.patch("cachekit.backends.redis.config.RedisBackendConfig") as mock_config_class:
                 with mock.patch("cachekit.backends.redis.provider.RedisBackendProvider") as mock_provider_class:
-                    with mock.patch("cachekit.backends.redis.provider.tenant_context") as mock_context:
-                        mock_config_class.from_env.return_value = mock.MagicMock(redis_url="redis://localhost:6379")
-                        mock_provider_instance = mock.MagicMock()
-                        mock_backend_instance = mock.MagicMock()
-                        mock_provider_class.return_value = mock_provider_instance
-                        mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
-                        mock_context.get.return_value = None
+                    mock_config_class.from_env.return_value = mock.MagicMock(redis_url="redis://localhost:6379")
+                    mock_provider_instance = mock.MagicMock()
+                    mock_backend_instance = mock.MagicMock()
+                    mock_provider_class.return_value = mock_provider_instance
+                    mock_provider_instance.get_shared_backend.return_value = mock_backend_instance
 
-                        backend = provider.get_backend()
+                    backend = provider.get_backend()
 
-                        assert backend is mock_backend_instance
+                    assert backend is mock_backend_instance
 
     def test_get_backend_raises_on_ambiguous_selectors(self) -> None:
         """More than one prefixed selector → ConfigurationError (unambiguous auto-detect)."""
