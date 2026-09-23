@@ -17,6 +17,71 @@ from cachekit.config.decorator import DecoratorConfig
 
 
 @pytest.mark.unit
+class TestPresetDefaultTTL:
+    """protocol/spec/intent-presets.md § Default TTL (LAB-4641).
+
+    Rule 1: every preset applies a finite default TTL when the caller supplies none.
+    Rule 2: an explicit ttl= overrides it. Rule 4: never-expire is an explicit opt-in —
+    here spelled ``ttl=None`` — and never a preset default.
+    """
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            (lambda **kw: DecoratorConfig.minimal(**kw), 300),
+            (lambda **kw: DecoratorConfig.production(**kw), 600),
+            (lambda **kw: DecoratorConfig.secure(master_key="a" * 64, **kw), 600),
+            (lambda **kw: DecoratorConfig.io(**kw), 3600),
+        ],
+        ids=["minimal", "production", "secure", "io"],
+    )
+    def test_canonical_default_and_overrides(self, build, expected, monkeypatch) -> None:
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_key")
+        assert build().ttl == expected
+        assert build(ttl=42).ttl == 42
+        assert build(ttl=None).ttl is None  # explicit no-expiry opt-in
+
+    def test_decorator_path_sends_preset_default_to_backend(self) -> None:
+        """End to end: the wrapper hands the preset default to backend.set(); ttl=None opts out."""
+        from cachekit import cache
+
+        class RecordingBackend:
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+                self.ttls: list[int | None] = []
+
+            def get(self, key: str) -> bytes | None:
+                return self.store.get(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.store[key] = value
+                self.ttls.append(ttl)
+
+            def delete(self, key: str) -> bool:
+                return self.store.pop(key, None) is not None
+
+            def exists(self, key: str) -> bool:
+                return key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, object]]:
+                return True, {}
+
+        defaulted, opted_out = RecordingBackend(), RecordingBackend()
+
+        @cache.production(backend=defaulted)
+        def f() -> int:
+            return 1
+
+        @cache.production(backend=opted_out, ttl=None)
+        def g() -> int:
+            return 1
+
+        assert f() == 1 and g() == 1
+        assert defaulted.ttls == [600]
+        assert opted_out.ttls == [None]
+
+
+@pytest.mark.unit
 class TestMinimalPreset:
     """Test .minimal() preset for maximum throughput."""
 

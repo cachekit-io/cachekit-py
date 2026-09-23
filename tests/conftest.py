@@ -76,7 +76,7 @@ def redis_config_factory(monkeypatch):
 
     Usage:
         def test_something(redis_config_factory):
-            config = redis_config_factory(redis_url="redis://test:6379", default_ttl=7200)
+            config = redis_config_factory(redis_url="redis://test:6379", max_retries=5)
     """
     from cachekit.config import CachekitConfig
 
@@ -89,7 +89,6 @@ def redis_config_factory(monkeypatch):
         env_mapping = {
             "redis_url": "CACHEKIT_REDIS_URL",
             "connection_pool_size": "CACHEKIT_CONNECTION_POOL_SIZE",
-            "default_ttl": "CACHEKIT_DEFAULT_TTL",
             "max_retries": "CACHEKIT_MAX_RETRIES",
             "socket_timeout": "CACHEKIT_SOCKET_TIMEOUT",
             "socket_connect_timeout": "CACHEKIT_SOCKET_CONNECT_TIMEOUT",

@@ -321,20 +321,21 @@ class TestEnvironmentVariables:
     def test_all_cachekit_vars_recognized(self):
         """README.md - documented CACHEKIT_* variables must actually load into settings.
 
-        Asserts live fields (not just default_ttl) so the test can't pass vacuously:
-        with extra="forbid", pydantic-settings silently ignores unknown env vars, so
-        naming a removed knob here would assert nothing (issue #163 review).
+        Asserts live fields so the test can't pass vacuously: with extra="forbid",
+        pydantic-settings silently ignores unknown env vars, so naming a removed knob
+        here would assert nothing (issue #163 review). CACHEKIT_DEFAULT_TTL was removed
+        in LAB-4641 (protocol/spec/intent-presets.md rule 3) and must not reappear here.
         """
         reset_settings()  # Clear singleton cache
-        _env_vars = ("CACHEKIT_DEFAULT_TTL", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB")
+        _env_vars = ("CACHEKIT_MAX_RETRIES", "CACHEKIT_MAX_VALUE_SIZE", "CACHEKIT_L1_MAX_SIZE_MB")
         _previous_env = {key: os.environ.get(key) for key in _env_vars}
-        os.environ["CACHEKIT_DEFAULT_TTL"] = "3600"
+        os.environ["CACHEKIT_MAX_RETRIES"] = "5"
         os.environ["CACHEKIT_MAX_VALUE_SIZE"] = "52428800"
         os.environ["CACHEKIT_L1_MAX_SIZE_MB"] = "64"
         try:
             settings = get_settings()
             assert settings is not None, "README.md - Environment variables not recognized"
-            assert settings.default_ttl == 3600, "README.md - CACHEKIT_DEFAULT_TTL not loaded"
+            assert settings.max_retries == 5, "README.md - CACHEKIT_MAX_RETRIES not loaded"
             assert settings.max_value_size == 52428800, "README.md - CACHEKIT_MAX_VALUE_SIZE not loaded"
             assert settings.l1_max_size_mb == 64, "README.md - CACHEKIT_L1_MAX_SIZE_MB not loaded"
         finally:

@@ -104,7 +104,6 @@ uv run pytest -v --timeout=30
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CACHEKIT_NAMESPACE` | Cache namespace prefix | `sdk_e2e_test` |
-| `CACHEKIT_DEFAULT_TTL` | Default TTL in seconds | `3600` |
 | `CACHEKIT_ARROW_COMPRESSION` | Arrow codec: zstd, lz4, or none | `zstd` |
 
 ### .env Files

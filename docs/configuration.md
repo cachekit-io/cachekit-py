@@ -74,8 +74,7 @@ CACHEKIT_CONNECTION_POOL_SIZE=10
 CACHEKIT_SOCKET_TIMEOUT=1.0
 CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
-# Cache Behavior
-CACHEKIT_DEFAULT_TTL=3600
+# Cache Behavior (TTL is per preset / per decorator, never process-wide — see Intent Presets)
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
@@ -347,14 +346,16 @@ def secure_function():
 
 **Feature Matrix by Intent:**
 
-| Intent | SWR | Invalidation | Max Size | Notes |
-|--------|-----|--------------|----------|-------|
-| `minimal()` | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
-| `test()` | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
-| `dev()` | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
-| `production()` | L1-only¹ | ✓ | 100 MB | Full observability |
-| `secure()` | L1-only¹ | ✓ | 100 MB | AES-256-GCM encryption required |
-| `io()` | ✓ | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| Intent | Default TTL | SWR | Invalidation | Max Size | Notes |
+|--------|-------------|-----|--------------|----------|-------|
+| `minimal()` | 300 s | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
+| `test()` | none | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
+| `dev()` | none | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus |
+| `production()` | 600 s | L1-only¹ | ✓ | 100 MB | Full observability |
+| `secure()` | 600 s | L1-only¹ | ✓ | 100 MB | AES-256-GCM encryption required |
+| `io()` | 3600 s | ✓ | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+
+**Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). `dev()` / `test()` are Python-only presets outside the spec and keep `ttl=None`.
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
 
@@ -417,7 +418,6 @@ For production with Redis:
 ```bash
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
 export CACHEKIT_CONNECTION_POOL_SIZE=20
-export CACHEKIT_DEFAULT_TTL=3600
 export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 

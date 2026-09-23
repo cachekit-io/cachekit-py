@@ -127,7 +127,6 @@ All configuration via environment variables with `CACHEKIT_` prefix:
 ```bash
 # Redis
 CACHEKIT_REDIS_URL=redis://localhost:6379
-CACHEKIT_DEFAULT_TTL=3600
 
 # Memcached
 CACHEKIT_MEMCACHED_SERVERS=mc1:11211,mc2:11211

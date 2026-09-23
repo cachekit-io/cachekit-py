@@ -60,12 +60,10 @@ class TestRedisBackendConfigEnv:
 
     def test_cachekit_config_generic_fields(self, monkeypatch):
         """Test that CachekitConfig loads generic cache settings."""
-        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
         monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "5")
         monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "256")
 
         config = CachekitConfig.from_env()
-        assert config.default_ttl == 7200
         assert config.max_retries == 5
         assert config.l1_max_size_mb == 256
 
@@ -76,7 +74,7 @@ class TestRedisBackendConfigEnv:
         monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", "30")
 
         # Set cache-specific env vars
-        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "1800")
+        monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "7")
         monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "64")
 
         redis_config = RedisBackendConfig.from_env()
@@ -87,12 +85,24 @@ class TestRedisBackendConfigEnv:
         assert redis_config.connection_pool_size == 30
 
         # Verify cache config loaded correctly
-        assert cache_config.default_ttl == 1800
+        assert cache_config.max_retries == 7
         assert cache_config.l1_max_size_mb == 64
 
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
-        assert hasattr(cache_config, "default_ttl")
+        assert hasattr(cache_config, "max_retries")
+
+    def test_no_process_wide_default_ttl(self, monkeypatch):
+        """protocol/spec/intent-presets.md rule 3: no process-wide TTL override.
+
+        CACHEKIT_DEFAULT_TTL is reserved by the spec; setting it must neither
+        surface a field nor break construction (LAB-4641).
+        """
+        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
+        config = CachekitConfig.from_env()
+        assert not hasattr(config, "default_ttl")
+        assert not hasattr(config, "ttl_min")
+        assert not hasattr(config, "ttl_max")
 
 
 class TestRedisUrlAliasChoicesPriority:

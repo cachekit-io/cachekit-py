@@ -40,7 +40,7 @@ class CachekitConfig(BaseSettings):
     """Backend-agnostic cache configuration.
 
     This configuration class provides validation for generic cache parameters
-    including TTL limits, size limits, and monitoring.
+    including size limits, retries, L1 sizing, encryption keys and monitoring.
 
     Backend-specific configuration (connection URLs, pool sizes, etc.) is
     handled by backend-specific config classes.
@@ -52,9 +52,6 @@ class CachekitConfig(BaseSettings):
         early_refresh_ratio: TTL ratio for early cache refresh
         enable_corruption_detection: Whether to enable data integrity checks
         enable_prometheus_metrics: Whether to enable Prometheus metrics collection
-        default_ttl: Default time-to-live for cache entries in seconds
-        ttl_min: Minimum allowed TTL in seconds
-        ttl_max: Maximum allowed TTL in seconds
         max_key_size: Maximum cache key size in bytes
         max_value_size: Maximum cache value size in bytes
         l1_enabled: Enable L1 in-memory cache for performance
@@ -66,8 +63,6 @@ class CachekitConfig(BaseSettings):
         Create with defaults:
 
         >>> config = CachekitConfig()
-        >>> config.default_ttl
-        3600
         >>> config.l1_max_size_mb
         100
         >>> config.max_value_size
@@ -75,18 +70,13 @@ class CachekitConfig(BaseSettings):
 
         Override via constructor:
 
-        >>> custom = CachekitConfig(default_ttl=7200, max_retries=5)
-        >>> custom.default_ttl
-        7200
+        >>> custom = CachekitConfig(max_retries=5)
         >>> custom.max_retries
         5
 
-        TTL validation (default_ttl must be within ttl_min/ttl_max bounds):
-
-        >>> CachekitConfig(default_ttl=30, ttl_min=60)  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        pydantic_core._pydantic_core.ValidationError: ... default_ttl (30) cannot be less than ttl_min (60)...
+        Cache TTL is not a process-wide setting: each intent preset applies its
+        own default (protocol/spec/intent-presets.md) and ``ttl=`` on the decorator
+        overrides it. ``CACHEKIT_DEFAULT_TTL`` is reserved by the spec and ignored.
 
         Master key is masked in repr for security:
 
@@ -220,23 +210,6 @@ class CachekitConfig(BaseSettings):
     enable_prometheus_metrics: bool = Field(
         default=True,
         description="Whether to enable Prometheus metrics collection",
-    )
-
-    # TTL configuration
-    default_ttl: int = Field(
-        default=3600,
-        gt=0,
-        description="Default time-to-live for cache entries in seconds",
-    )
-    ttl_min: int = Field(
-        default=60,
-        gt=0,
-        description="Minimum allowed TTL in seconds",
-    )
-    ttl_max: int = Field(
-        default=86400,  # 24 hours
-        gt=0,
-        description="Maximum allowed TTL in seconds",
     )
 
     # Size limits
@@ -398,31 +371,6 @@ class CachekitConfig(BaseSettings):
 
         return self
 
-    @model_validator(mode="after")
-    def validate_interdependent_fields(self) -> CachekitConfig:
-        """Validate interdependent field relationships.
-
-        Returns:
-            The validated configuration instance
-
-        Raises:
-            ValueError: If field combinations are invalid
-        """
-        # Check retry configuration consistency
-        if not self.retry_on_timeout and self.max_retries > 0:
-            # This is potentially inconsistent but not necessarily wrong
-            # We'll allow it but could log a warning in the future
-            pass
-
-        # Check TTL bounds
-        if self.default_ttl < self.ttl_min:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be less than ttl_min ({self.ttl_min})")
-
-        if self.default_ttl > self.ttl_max:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be greater than ttl_max ({self.ttl_max})")
-
-        return self
-
     def __repr__(self) -> str:
         """Return string representation with sensitive information masked.
 
@@ -496,13 +444,13 @@ class CachekitConfig(BaseSettings):
 
             .. code-block:: bash
 
-                export CACHEKIT_DEFAULT_TTL=7200
+                export CACHEKIT_MAX_RETRIES=5
                 export CACHEKIT_L1_MAX_SIZE_MB=200
 
             .. code-block:: python
 
                 config = CachekitConfig.from_env()
-                print(config.default_ttl)  # 7200
+                print(config.max_retries)  # 5
         """
         # pydantic-settings handles all environment variable reading automatically
         return cls()

@@ -24,7 +24,7 @@ class TestConfigSeparation:
         assert not hasattr(cache_config, "disable_hiredis")
 
         # Verify generic cache fields ARE present
-        assert hasattr(cache_config, "default_ttl")
+        assert hasattr(cache_config, "max_retries")
         assert hasattr(cache_config, "max_value_size")
         assert hasattr(cache_config, "l1_max_size_mb")
 
