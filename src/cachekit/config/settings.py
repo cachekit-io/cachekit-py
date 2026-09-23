@@ -46,16 +46,10 @@ class CachekitConfig(BaseSettings):
     handled by backend-specific config classes.
 
     Attributes:
-        retry_on_timeout: Whether to retry operations on timeout
-        max_retries: Maximum number of retry attempts
-        retry_delay_ms: Delay between retries in milliseconds
-        early_refresh_ratio: TTL ratio for early cache refresh
-        enable_corruption_detection: Whether to enable data integrity checks
         enable_prometheus_metrics: Whether to enable Prometheus metrics collection
         default_ttl: Default time-to-live for cache entries in seconds
         ttl_min: Minimum allowed TTL in seconds
         ttl_max: Maximum allowed TTL in seconds
-        max_key_size: Maximum cache key size in bytes
         max_value_size: Maximum cache value size in bytes
         l1_enabled: Enable L1 in-memory cache for performance
         l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
@@ -75,11 +69,11 @@ class CachekitConfig(BaseSettings):
 
         Override via constructor:
 
-        >>> custom = CachekitConfig(default_ttl=7200, max_retries=5)
+        >>> custom = CachekitConfig(default_ttl=7200, l1_max_size_mb=256)
         >>> custom.default_ttl
         7200
-        >>> custom.max_retries
-        5
+        >>> custom.l1_max_size_mb
+        256
 
         TTL validation (default_ttl must be within ttl_min/ttl_max bounds):
 
@@ -193,30 +187,6 @@ class CachekitConfig(BaseSettings):
             "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),
     )
-    retry_on_timeout: bool = Field(
-        default=True,
-        description="Whether to retry operations on timeout",
-    )
-    max_retries: int = Field(
-        default=3,
-        ge=0,
-        description="Maximum number of retry attempts for cache operations",
-    )
-    retry_delay_ms: int = Field(
-        default=100,
-        gt=0,
-        description="Delay between retries in milliseconds",
-    )
-    early_refresh_ratio: float = Field(
-        default=0.9,
-        ge=0.0,
-        le=1.0,
-        description="Ratio of TTL at which to refresh cache entries",
-    )
-    enable_corruption_detection: bool = Field(
-        default=True,
-        description="Whether to enable data integrity checks using checksums",
-    )
     enable_prometheus_metrics: bool = Field(
         default=True,
         description="Whether to enable Prometheus metrics collection",
@@ -240,11 +210,6 @@ class CachekitConfig(BaseSettings):
     )
 
     # Size limits
-    max_key_size: int = Field(
-        default=1024,  # 1KB
-        gt=0,
-        description="Maximum cache key size in bytes",
-    )
     max_value_size: int = Field(
         default=104857600,  # 100MB
         gt=0,
@@ -408,12 +373,6 @@ class CachekitConfig(BaseSettings):
         Raises:
             ValueError: If field combinations are invalid
         """
-        # Check retry configuration consistency
-        if not self.retry_on_timeout and self.max_retries > 0:
-            # This is potentially inconsistent but not necessarily wrong
-            # We'll allow it but could log a warning in the future
-            pass
-
         # Check TTL bounds
         if self.default_ttl < self.ttl_min:
             raise ValueError(f"default_ttl ({self.default_ttl}) cannot be less than ttl_min ({self.ttl_min})")
@@ -496,13 +455,12 @@ class CachekitConfig(BaseSettings):
 
             .. code-block:: bash
 
-                export CACHEKIT_DEFAULT_TTL=7200
                 export CACHEKIT_L1_MAX_SIZE_MB=200
 
             .. code-block:: python
 
                 config = CachekitConfig.from_env()
-                print(config.default_ttl)  # 7200
+                print(config.l1_max_size_mb)  # 200
         """
         # pydantic-settings handles all environment variable reading automatically
         return cls()
