@@ -212,10 +212,12 @@ jobs:
     # The wrapper's CLI signature check is likewise
     # unenforced there (fail_ci_if_error is its switch; see the pin note below).
     # Accepted because a fork PR runs under `pull_request` on an ephemeral
-    # GitHub-hosted runner with a read-only token, no secrets and no OIDC token,
-    # so an unverified binary there has nothing to steal or persist into; fork
-    # runs also need maintainer approval, and same-repo runs, which verify the
-    # binary and fail closed, far outnumber them.
+    # GitHub-hosted runner with no secrets and no OIDC token. The one credential
+    # an unverified binary there can reach is the job's GITHUB_TOKEN, read-only
+    # on fork PRs and expired when the job ends, and the runner is discarded
+    # afterwards, so nothing persists. Fork runs also need maintainer approval,
+    # and same-repo runs, which verify the binary and fail closed, far outnumber
+    # them.
     #
     # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
     # June 2026 keybase migration fetch the CLI signing key from a deleted account,
