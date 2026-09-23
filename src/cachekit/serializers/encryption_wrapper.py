@@ -122,16 +122,17 @@ class EncryptionWrapper:
         {'pin': 1234}
 
         Rotation is forward-only — the current key re-appearing in the
-        decrypt-only list is a rejected configuration. It raises ValueError
-        (config-class, fail-loud), deliberately NOT EncryptionError, so the
-        read path can never classify a misconfigured keyring as corruption:
+        decrypt-only list is a rejected configuration. It raises
+        KeyringConfigurationError (a ValueError subclass; config-class,
+        fail-loud), deliberately NOT EncryptionError, so the read path can
+        never classify a misconfigured keyring as corruption or a miss:
 
         >>> EncryptionWrapper(
         ...     master_key=b"y" * 32, tenant_id="test-tenant", previous_master_keys=[b"y" * 32]
         ... )  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
             ...
-        ValueError: Keyring configuration invalid: ...
+        KeyringConfigurationError: Keyring configuration invalid: ...
     """
 
     __slots__ = (
@@ -217,21 +218,24 @@ class EncryptionWrapper:
         # of 3, per-key hex/length validation, and the forward-only subset check
         # at load; the Rust Keyring re-validates all three behind the FFI boundary
         # for wrappers constructed with explicit parameters.
-        # Keyring config errors below raise ValueError, NEVER EncryptionError:
-        # EncryptionError is a SerializationError, which the read-path policy
-        # (handle_decrypt_failure) classifies as corruption → fail-open miss +
-        # evict — a misconfigured keyring would silently erode the cache and
-        # mask itself as misses (the LAB-241/LAB-683 config-vs-crypto error
-        # class). ValueError takes the established fail-loud path instead
-        # (serialize_data/deserialize_data re-raise it), exactly like the
-        # settings-load ValidationError.
+        # Keyring config errors below raise KeyringConfigurationError, NEVER
+        # EncryptionError: EncryptionError is a SerializationError, which the
+        # read-path policy (handle_decrypt_failure) classifies as corruption →
+        # fail-open miss + evict — a misconfigured keyring would silently erode
+        # the cache and mask itself as misses (the LAB-241/LAB-683
+        # config-vs-crypto error class). Nor plain ValueError: the handler
+        # re-raises it, but the read sites (CacheOperationHandler.get_cached_value*
+        # and the decorator L1 guards) re-raise only KeyringConfigurationError
+        # and turn anything else into a warning plus a miss. This wrapper is
+        # built lazily on the first read for a tenant, so these faults surface
+        # at a read site as often as at a write.
         if previous_master_keys is None:
             settings = get_settings()
             previous_master_keys = [bytes.fromhex(key.get_secret_value()) for key in settings.previous_master_keys]
 
         for position, previous_key in enumerate(previous_master_keys):
             if len(previous_key) < 32:
-                raise ValueError(
+                raise KeyringConfigurationError(
                     f"Previous master key at position {position} must be at least 32 bytes (256 bits), "
                     f"got {len(previous_key)} — per-key requirements are identical to master_key."
                 )
@@ -242,8 +246,8 @@ class EncryptionWrapper:
         # Keyring for rotation-window reads: master keys live behind the FFI
         # boundary (zeroized on drop in Rust). Re-validates cap/subset/length
         # behind the FFI for wrappers constructed with explicit parameters;
-        # violations raise ValueError from the binding and propagate as-is
-        # (see the config-error taxonomy note above).
+        # violations raise KeyringConfigurationError from the binding and
+        # propagate as-is (see the config-error taxonomy note above).
         self._keyring = Keyring(master_key, list(previous_master_keys))
 
         # Derive tenant-specific keys with domain separation
@@ -255,14 +259,21 @@ class EncryptionWrapper:
         except Exception as e:
             raise EncryptionError(f"Failed to derive tenant keys: {e}") from e
 
-        # Deliberately OUTSIDE the try above. The binding raises ValueError
-        # ("Keyring fingerprint derivation failed: ...") here, which is a keyring
-        # CONFIG failure, and the handler above would relabel it EncryptionError —
-        # a SerializationError, which handle_decrypt_failure classifies as
+        # Deliberately OUTSIDE the try above. The binding raises
+        # KeyringConfigurationError ("Keyring fingerprint derivation failed: ...")
+        # here, and the handler above would relabel it EncryptionError — a
+        # SerializationError, which handle_decrypt_failure classifies as
         # corruption and fails open. A keyring that cannot derive fingerprints
-        # would then present as silent misses plus entry-by-entry eviction: the
-        # exact LAB-241/LAB-683 failure class this PR exists to remove. Let the
-        # ValueError propagate (taxonomy note at the top of __init__).
+        # would then present as silent misses plus entry-by-entry eviction (the
+        # LAB-241/LAB-683 failure class). Let it propagate (taxonomy note above).
+        #
+        # On a read, tenant_id comes from the unauthenticated frame header, so a
+        # fault here must not be one a writer can choose. It is not: both calls
+        # validate tenant_id through the same HKDF input checks, and
+        # derive_tenant_keys above has already accepted this tenant_id (a tenant
+        # it rejects is header rot → EncryptionError → miss + evict). What
+        # reaches this line is a keyring/derivation disagreement in our own
+        # build, never bad input.
         #
         # Python only ever holds the per-entry fingerprints of the HKDF-derived
         # per-tenant encryption keys, current key first — the exact values
@@ -282,10 +293,11 @@ class EncryptionWrapper:
         # values come from independent FFI paths; if a cachekit-core skew ever
         # diverged them, every read would silently route to the no-match path
         # (fail-closed: total read outage; fail-open: warning storm). Fail loud
-        # at construction instead — ValueError, not EncryptionError, for the
-        # same taxonomy reason as the keyring config errors above.
+        # at construction instead — KeyringConfigurationError, for the same
+        # taxonomy reason as the keyring config errors above (a plain ValueError
+        # here would itself become that warning storm at the read sites).
         if self._keyring_fingerprints[0] != self.encryption_key_fingerprint:
-            raise ValueError(
+            raise KeyringConfigurationError(
                 "cachekit-core invariant violation: keyring entry 0 fingerprint does not match "
                 "derive_tenant_keys' encryption fingerprint for the same master key and tenant. "
                 "This indicates a version skew between the keyring and key-derivation paths."

@@ -1187,8 +1187,16 @@ class CacheSerializationHandler:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)
         except (ValueError, SerializationError):
-            # ValueError: cache_key missing for encrypted data — FAIL CLOSED
-            # SerializationError/EncryptionError: let the outer handler log and handle
+            # Re-raised unwrapped so the read sites can classify them; the
+            # broad handler below would relabel them SerializationError.
+            # KeyringConfigurationError (a ValueError): local keyring config
+            # fault, including one raised while building the per-tenant
+            # EncryptionWrapper above. The ONLY ValueError the read sites
+            # re-raise past their `except Exception` — fail-loud. A plain
+            # ValueError (e.g. cache_key missing for encrypted data) is caught
+            # there and becomes a warning plus a miss.
+            # SerializationError/EncryptionError: the read sites' decrypt-failure
+            # policy (handle_decrypt_failure) decides miss + evict vs raise.
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
@@ -1234,6 +1242,8 @@ class CacheSerializationHandler:
                 return wrapper.deserialize_without_key_identity(data, metadata, cache_key)
             return self._base_serializer.deserialize(data)
         except (ValueError, SerializationError):
+            # Same contract as deserialize_data: only KeyringConfigurationError
+            # fails loud at the read sites; a plain ValueError there is a miss.
             raise
         except Exception as e:
             get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")

@@ -243,13 +243,18 @@ pyo3::create_exception!(
     _rust_serializer,
     KeyringConfigurationError,
     PyValueError,
-    "A LOCAL keyring configuration fault on the decrypt path.\n\
+    "A LOCAL keyring configuration fault.\n\
      \n\
-     Strictly limited to faults whose input is our own configuration: an invalid\n\
-     tenant_id reaching HKDF (`KeyDerivation`) and a keyring entry index that does\n\
-     not exist (`KeyringIndexOutOfRange`). These are deploy or caller bugs, and\n\
-     recording them as `auth_tamper` pages an operator for an attack that never\n\
-     happened.\n\
+     Strictly limited to faults whose input is our own configuration or build.\n\
+     On the decrypt path: an invalid tenant_id reaching HKDF (`KeyDerivation`) and\n\
+     a keyring entry index that does not exist (`KeyringIndexOutOfRange`). At\n\
+     EncryptionWrapper construction: a rejected keyring (`Keyring(...)`: cap\n\
+     exceeded, current key in the decrypt-only list, short key), a previous master\n\
+     key below the 32-byte floor, a keyring fingerprint derivation failure, and the\n\
+     keyring-entry-0 vs derive_tenant_keys fingerprint drift guard. These are\n\
+     deploy, caller or build bugs: recording them as `auth_tamper` pages an\n\
+     operator for an attack that never happened, and letting them become a miss\n\
+     hides a broken keyring behind silent recomputes.\n\
      \n\
      Everything whose input is the STORED CIPHERTEXT stays on the tamper path,\n\
      including short/garbled ciphertext. An attacker with backend write access can\n\
@@ -467,8 +472,9 @@ impl PyKeyring {
         let decrypt_only: Vec<Zeroizing<Vec<u8>>> =
             decrypt_only.into_iter().map(Zeroizing::new).collect();
         let refs: Vec<&[u8]> = decrypt_only.iter().map(|key| key.as_slice()).collect();
-        let inner = Keyring::new(current, &refs)
-            .map_err(|e| PyValueError::new_err(format!("Keyring configuration invalid: {}", e)))?;
+        let inner = Keyring::new(current, &refs).map_err(|e| {
+            KeyringConfigurationError::new_err(format!("Keyring configuration invalid: {}", e))
+        })?;
         Ok(Self { inner })
     }
 
@@ -479,7 +485,10 @@ impl PyKeyring {
     #[pyo3(name = "encryption_fingerprints")]
     pub fn encryption_fingerprints(&self, tenant_id: &str) -> PyResult<Vec<Vec<u8>>> {
         let fingerprints = self.inner.encryption_fingerprints(tenant_id).map_err(|e| {
-            PyValueError::new_err(format!("Keyring fingerprint derivation failed: {}", e))
+            KeyringConfigurationError::new_err(format!(
+                "Keyring fingerprint derivation failed: {}",
+                e
+            ))
         })?;
         Ok(fingerprints.into_iter().map(|fp| fp.to_vec()).collect())
     }

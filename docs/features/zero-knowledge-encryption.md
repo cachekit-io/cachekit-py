@@ -458,6 +458,15 @@ config = EncryptionConfig(enabled=True, master_key="a" * 64,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
+**Keyring configuration faults are not a decrypt-failure class.** A keyring the SDK
+cannot use raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) to your caller in both modes. Examples are a previous master key
+shorter than 32 bytes, or the current key repeated in the decrypt-only list, when keys
+reach `EncryptionWrapper` directly rather than through the validated
+`CACHEKIT_PREVIOUS_MASTER_KEYS` setting. The input is your own configuration, not the
+stored bytes, so the fault is never downgraded to a miss. It also never evicts and is
+not counted on `cachekit_decrypt_failures_total`.
+
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
 > in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise
