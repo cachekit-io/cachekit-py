@@ -148,7 +148,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 |:------------|:---------------|
 | Key size | Minimum 32 bytes (256 bits) |
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
-| Activation | `@cache.secure` or an explicit encryption option (`encryption=True` + tenant mode) only — the env var is a key source, not a switch (presence-activation deprecated in 0.20.0, removed in the next minor release) |
+| Activation | `@cache.secure` or an explicit encryption option (`encryption=True` + tenant mode) is the supported path — the env var is a key source, not a switch. **Currently (0.20.0):** if neither is stated, the env var's mere presence still auto-activates encryption and logs a warning once per process (deprecated). The next minor release removes this and raises at construction instead. |
 | Logging | Never exposed in logs/errors |
 | Derivation | HKDF with unique tenant salts |
 

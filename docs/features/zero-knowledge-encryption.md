@@ -144,7 +144,7 @@ holds only on an explicit path.
 
 ### Missing Master Key
 > [!WARNING]
-> `cache.secure` requires a master key. Omitting it raises a `ConfigurationError` at decoration time, not at call time.
+> `cache.secure` requires a master key. Omitting it raises a `ValueError` at decoration time, not at call time.
 
 ```python notest
 # Forget to set master_key parameter

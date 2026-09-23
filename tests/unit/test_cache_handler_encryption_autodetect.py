@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import threading
 from typing import Any
 
 import pytest
@@ -339,3 +340,22 @@ class TestAutoActivationDeprecationWarning:
                     process.join()
 
         assert child_warnings == 1
+
+    def test_concurrent_construction_warns_at_most_once(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Racing threads must not each slip through the check-then-set and double-warn (the
+        check-and-assign is lock-protected; see _auto_activation_lock)."""
+        thread_count = 8
+        barrier = threading.Barrier(thread_count)
+
+        def build() -> None:
+            barrier.wait(timeout=5)
+            CacheSerializationHandler(serializer_name="default")
+
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            threads = [threading.Thread(target=build) for _ in range(thread_count)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+
+        assert len(self._activation_records(caplog)) == 1
