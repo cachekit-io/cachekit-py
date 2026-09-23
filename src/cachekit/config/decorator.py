@@ -582,17 +582,8 @@ class DecoratorConfig:
                 "  @cache.production(backend=my_backend)"
             )
 
-        if api_key is None:
-            api_key = os.environ.get("CACHEKIT_API_KEY")
-        if not api_key:
-            raise ConfigurationError(
-                "@cache.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\n\n"
-                '  @cache.io(api_key="ck_live_your_key_here")\n'  # pragma: allowlist secret
-                "  export CACHEKIT_API_KEY=ck_live_your_key_here\n\n"
-                "Get an API key at: https://cachekit.io"
-            )
-
-        # api_url / timeout still load from the environment inside the backend
+        # The backend's pydantic-settings config is the one reader of CACHEKIT_*: api_key=None
+        # falls back to CACHEKIT_API_KEY there, and a missing or empty key raises there, now.
         backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend

@@ -15,6 +15,7 @@ import pytest_asyncio  # noqa: F401
 from pydantic import SecretStr
 
 from cachekit.backends.cachekitio.client import (
+    close_async_client,
     close_sync_client,
     get_cached_async_http_client,
     get_sync_http_client,
@@ -124,6 +125,44 @@ class TestCloseSyncClient:
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
         close_sync_client()  # no client created yet — must not raise
+
+
+def _raise(*_args: object) -> None:
+    raise RuntimeError("close failed")
+
+
+async def _araise() -> None:
+    raise RuntimeError("close failed")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fail_idx", [0, 1])
+class TestCloseSurvivesAFailingClient:
+    """One client's close raising must not leak the others or leave them cached."""
+
+    @pytest.fixture
+    def other(self, config: CachekitIOBackendConfig) -> CachekitIOBackendConfig:
+        return CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=config.timeout)  # noqa: S106
+
+    def test_sync(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        clients = [get_sync_http_client(config), get_sync_http_client(other)]
+        clients[fail_idx].close = _raise  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="close failed"):
+            close_sync_client()
+        assert clients[1 - fail_idx].is_closed
+        assert not client_module._thread_local.sync_clients
+
+    async def test_async(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        clients = [get_cached_async_http_client(config), get_cached_async_http_client(other)]
+        clients[fail_idx].aclose = _araise  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="close failed"):
+            await close_async_client()
+        assert clients[1 - fail_idx].is_closed
+        assert not client_module._thread_local.async_clients
 
 
 @pytest.mark.unit

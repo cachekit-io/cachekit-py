@@ -292,6 +292,13 @@ class TestIoPreset:
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env")  # pragma: allowlist secret
         assert self._key_of(DecoratorConfig.io()) == "ck_env"
 
+    def test_env_key_resolves_exactly_as_the_backend_does(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: io() read CACHEKIT_API_KEY itself, case-sensitively, and rejected a key the
+        backend's case-insensitive pydantic-settings config would have loaded."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        monkeypatch.setenv("cachekit_api_key", "ck_env")  # pragma: allowlist secret
+        assert self._key_of(DecoratorConfig.io()) == "ck_env"
+
     def test_missing_both_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
         with pytest.raises(ConfigurationError, match=r"api_key=.*CACHEKIT_API_KEY"):

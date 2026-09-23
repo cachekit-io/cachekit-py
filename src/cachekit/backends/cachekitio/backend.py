@@ -54,6 +54,10 @@ STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
+_API_KEY_HINT = (
+    "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
+)
+
 
 def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     """Extract cache metrics and format as HTTP headers.
@@ -223,11 +227,10 @@ class CachekitIOBackend:
         except ValidationError as exc:
             # `from None` is load-bearing: the chained ValidationError renders the raw
             # input — api_key included — into tracebacks and logs (CWE-532).
-            problems = "; ".join(
-                f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}"
-                for err in exc.errors(include_input=False)
-            )
-            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}") from None
+            errors = exc.errors(include_input=False)
+            problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
+            hint = _API_KEY_HINT if any(err["loc"] == ("api_key",) for err in errors) else ""
+            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}") from None
 
         # Get HTTP clients (hybrid sync/async architecture)
         # Sync client: per-thread, thread-safe, no event loop required
