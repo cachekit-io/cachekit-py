@@ -105,7 +105,7 @@ class TestRedisBackendConfigEnv:
             monkeypatch.setenv(f"CACHEKIT_{name}", value)
 
         config = CachekitConfig.from_env()
-        assert [name for name in removed if hasattr(config, name.lower())] == []
+        assert [knob for knob in removed if hasattr(config, knob.lower())] == []
 
 
 class TestRedisUrlAliasChoicesPriority:
