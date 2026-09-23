@@ -255,35 +255,18 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
 # warns once per process; the next minor release raises at construction instead. logger.warning, not
 # DeprecationWarning: Python silences DeprecationWarning outside __main__, so under
 # uvicorn/gunicorn/celery the notice would never surface. Keyed by PID rather than a bool so a forked
-# worker, a new process, warns for itself instead of inheriting the parent's fired flag. Tests reset it.
-_AUTO_ACTIVATION_WARNED_PID: int | None = None
-_auto_activation_lock = threading.Lock()
-
-
-def _reset_auto_activation_lock() -> None:
-    """Replace the lock in a newly forked child.
-
-    Runs from the post-fork handler while the child is still single-threaded, so wholesale
-    lock replacement is safe. The lock must be replaced, not reused: a parent thread holding
-    it at fork time leaves it permanently locked in the child (same rationale as
-    decorators/session.py's _reset_session_state).
-    """
-    global _auto_activation_lock
-    _auto_activation_lock = threading.Lock()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_auto_activation_lock)
+# worker, a new process, warns for itself instead of inheriting the parent's fired flag. One
+# dict.setdefault claims the PID atomically (int key, GIL or free-threaded), so exactly one of any
+# concurrent constructors logs. No lock: a child forked while it is held inherits it held, and uWSGI's
+# default fork never runs an at-fork reset. Tests reset it.
+_AUTO_ACTIVATION_WARNED_PIDS: dict[int, object] = {}
 
 
 def _warn_encryption_auto_activation() -> None:
     """Warn ONCE per process that encryption was activated by CACHEKIT_MASTER_KEY's presence."""
-    global _AUTO_ACTIVATION_WARNED_PID
-    pid = os.getpid()
-    with _auto_activation_lock:
-        if _AUTO_ACTIVATION_WARNED_PID == pid:
-            return
-        _AUTO_ACTIVATION_WARNED_PID = pid
+    claim = object()
+    if _AUTO_ACTIVATION_WARNED_PIDS.setdefault(os.getpid(), claim) is not claim:
+        return
     get_logger().warning(
         "CACHEKIT_MASTER_KEY is set and a cache with no explicit encryption= was constructed, so "
         "encryption was auto-enabled (single-tenant) — first occurrence in this process; audit every preset that "

@@ -271,7 +271,7 @@ class TestAutoActivationDeprecationWarning:
 
     @pytest.fixture(autouse=True)
     def _fresh_process(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED_PID", None)
+        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED_PIDS", {})
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         reset_settings()
         yield
@@ -341,21 +341,45 @@ class TestAutoActivationDeprecationWarning:
 
         assert child_warnings == 1
 
-    def test_concurrent_construction_warns_at_most_once(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Racing threads must not each slip through the check-then-set and double-warn (the
-        check-and-assign is lock-protected; see _auto_activation_lock)."""
-        thread_count = 8
-        barrier = threading.Barrier(thread_count)
+    def test_racing_constructions_warn_once(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """Threads that reach the once-per-process decision together must still log it once.
 
-        def build() -> None:
-            barrier.wait(timeout=5)
-            CacheSerializationHandler(serializer_name="default")
+        The PID stand-in parks each thread at a barrier each time the guard compares or hashes it, so
+        every thread has checked before any records the warning: the interleaving under which a
+        check-then-set, compare or membership, logs once per thread (free-threaded builds reach it
+        without help).
+        """
+        threads = 8
+        barrier = threading.Barrier(threads, timeout=5)  # a lock-serialised guard breaks it, then carries on
 
+        class _ParkingPid(int):
+            def _park(self) -> None:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+
+            def __eq__(self, other: object) -> bool:
+                self._park()
+                return super().__eq__(other)
+
+            def __hash__(self) -> int:
+                self._park()
+                return super().__hash__()
+
+        pid = _ParkingPid(os.getpid())
+        monkeypatch.setattr(os, "getpid", lambda: pid)
+        built: list[CacheSerializationHandler] = []
+        workers = [
+            threading.Thread(target=lambda: built.append(CacheSerializationHandler(serializer_name="default")), daemon=True)
+            for _ in range(threads)
+        ]
         with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            threads = [threading.Thread(target=build) for _ in range(thread_count)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=5)
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=30)
 
+        assert not any(worker.is_alive() for worker in workers)
+        assert len(built) == threads  # a raising constructor would otherwise vanish into a thread warning
         assert len(self._activation_records(caplog)) == 1
