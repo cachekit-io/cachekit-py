@@ -194,10 +194,9 @@ jobs:
     # `Get OIDC token` step is guarded `CC_USE_OIDC == 'true' && CC_FORK != 'true'`,
     # so on a fork it never attempts OIDC, `CC_TOKEN` stays empty, and the upload
     # proceeds TOKENLESS — Codecov's rate-limited path. A bare `true` would let a
-    # 429 nobody controls redden an outside contribution, which on a repo with no
-    # branch protection trains maintainers to merge over red CI: the opposite of
-    # what this ticket is hardening. The flag therefore applies exactly where OIDC
-    # really authenticates.
+    # 429 nobody controls redden an outside contribution, and `CI Success` is a
+    # required check on `main`, so that 429 would block the merge. The flag
+    # therefore applies exactly where OIDC really authenticates.
     #
     # RESIDUAL, now narrowed to the PATCH status: the TOTAL-coverage floor no
     # longer depends on the upload — the final PR pytest run enforces it with
@@ -212,9 +211,13 @@ jobs:
     # already catches a gross coverage regression on the same run.
     # The wrapper's CLI signature check is likewise
     # unenforced there (fail_ci_if_error is its switch; see the pin note below).
-    # Accepted because a fork PR cannot reach the self-hosted `cachekit` runner
-    # without a maintainer approving the run, no fork PR has run here to date, and
-    # a tampered binary reaches same-repo runs first, where it fails closed.
+    # Accepted because a fork PR runs under `pull_request` on an ephemeral
+    # GitHub-hosted runner with no secrets and no OIDC token. The one credential
+    # an unverified binary there can reach is the job's GITHUB_TOKEN, read-only
+    # on fork PRs and expired when the job ends, and the runner is discarded
+    # afterwards, so nothing persists. Fork runs also need maintainer approval,
+    # and same-repo runs, which verify the binary and fail closed, far outnumber
+    # them.
     #
     # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
     # June 2026 keybase migration fetch the CLI signing key from a deleted account,
@@ -352,7 +355,7 @@ jobs:
 
   # LAB-3500: this repo is public and forkable, so every job runs on
   # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
-  # deny-list: a deny-list fails open on a new label, `CacheKit` casing,
+  # deny-list: a deny-list fails open on a new label, a casing variant,
   # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
   # The program is the heredoc below; its regression fixtures are
   # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
