@@ -78,3 +78,45 @@ def test_session_init_hammer_no_partial_publish_observed():
         ) = saved
 
     assert not errors, f"session init raced: {errors!r}"
+
+
+def _race_first_put_after_fork(threads: int) -> int:
+    """Race `threads` first puts in a simulated forked child; return how many cleanup restarts ran."""
+    from cachekit.l1_cache import L1CacheManager
+
+    manager = L1CacheManager(default_max_memory_mb=10)
+    cache = manager.get_cache("hammer-ns")
+    manager._cleanup_thread = threading.Thread(target=lambda: None)  # dead, as fork leaves it
+    manager._owner_pid = -1  # owned by another process
+    starts: list[float] = []
+    start = manager.start_background_cleanup
+
+    def counting_start(interval_seconds: float = 30.0) -> None:
+        starts.append(interval_seconds)
+        start(interval_seconds)
+
+    manager.start_background_cleanup = counting_start
+    barrier = threading.Barrier(threads)
+
+    def put() -> None:
+        barrier.wait()
+        cache.put("k", b"v")
+
+    workers = [threading.Thread(target=put) for _ in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    manager.stop_background_cleanup()
+    return len(starts)
+
+
+def test_l1_fork_takeover_hammer_starts_one_cleanup_thread():
+    """Threads racing a forked child's first L1 put restart the cleanup thread exactly once.
+
+    Smoke test on GIL builds; on the free-threaded lane, dropping the PID-keyed
+    take-over lock in L1CacheManager._check_fork (LAB-4772) starts duplicates here.
+    """
+    duplicated = sum(_race_first_put_after_fork(threads=32) != 1 for _ in range(200))
+
+    assert duplicated == 0, f"{duplicated}/200 forked children restarted cleanup more than once"

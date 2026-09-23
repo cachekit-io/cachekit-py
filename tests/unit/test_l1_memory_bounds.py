@@ -272,6 +272,8 @@ class TestCleanupThreadAfterFork:
                 outcome = queue.get(timeout=30)
             finally:
                 process.join(timeout=30)
+                if process.is_alive():  # a hung child would otherwise block pytest's exit
+                    process.kill()
 
             assert process.exitcode == 0
             assert outcome == {"fresh": True, "alive": True, "swept": True}
