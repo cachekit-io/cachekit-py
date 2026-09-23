@@ -449,9 +449,10 @@ def create_cache_wrapper(
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                            Mutually exclusive with tenant_extractor. Prevents accidental shared
                            keys in multi-tenant deployments by requiring explicit configuration.
-        deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
-                        If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
-                        Must be deterministic (same across restarts) to decrypt cached data.
+        deployment_uuid: Optional explicit tenant_id override for single-tenant mode (validated
+                        UUID). Falls back to CACHEKIT_DEPLOYMENT_UUID, then to the protocol literal
+                        "default" — the cross-SDK default, so a py/rs/ts client on one master key
+                        share ciphertext with no tenant configured at all.
         encryption_fail_closed: Tri-state tamper-failure policy. None (default) defers to
                         CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open). True raises
                         DecryptionAuthenticationError to the caller on AES-GCM authentication

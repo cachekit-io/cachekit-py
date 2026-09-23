@@ -94,8 +94,7 @@ Encryption works unchanged — and cross-SDK. The AES-256-GCM plaintext is the p
     namespace="users",
     encryption=True,
     master_key="a" * 64,
-    single_tenant_mode=True,
-    deployment_uuid="00000000-0000-0000-0000-000000000001",  # share across SDKs
+    single_tenant_mode=True,  # tenant_id "default" — the same literal every SDK derives from
 )
 def get_user(user_id: int):
     return db.fetch(user_id)  # illustrative
@@ -103,8 +102,8 @@ def get_user(user_id: int):
 
 Three constraints, all fail-closed:
 
-- **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. To share encrypted entries across SDKs, configure the same master key **and** the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) everywhere.
-- **The shared tenant must be explicit and canonical.** The machine-local auto-generated deployment UUID is rejected (it differs per host — nothing else could ever decrypt), and the configured value must already be in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys).
+- **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. With no tenant configured, every SDK derives under the protocol literal `"default"` ([intent-presets.md § Master Key Input](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#master-key-input), rule 5), so the same master key alone is enough to share encrypted entries across py, rs and ts.
+- **An explicit tenant must be shared and canonical.** To scope keys to a deployment, set the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) in every SDK, already in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys). There is no machine-local fallback: a per-host value in a key-derivation input is a permanent cross-SDK authentication failure, not a miss.
 - **Config decides, bytes never do.** With encryption enabled, stored bytes are always treated as ciphertext and authenticated before any decode. There is no header to forge, so the CWE-757 downgrade class (see the auto-mode fail-closed read path in [zero-knowledge-encryption.md](zero-knowledge-encryption.md)) cannot exist here.
 
 One thing no guardrail can catch: two *binders* of the same `(namespace, operation)` with different encryption configs. That mismatch is silent — see [Operation Names Are a Contract](#operation-names-are-a-contract-shared-entries).
