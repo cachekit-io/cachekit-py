@@ -65,7 +65,7 @@ class CachekitConfig(BaseSettings):
         >>> config.max_value_size
         104857600
 
-        Override via constructor:
+        Constructor kwargs beat env vars and defaults (a standalone instance; the SDK reads get_settings()):
 
         >>> custom = CachekitConfig(l1_max_size_mb=256)
         >>> custom.l1_max_size_mb

@@ -598,10 +598,10 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 #### Example
 ```python
-from cachekit.config import CachekitConfig
+from cachekit.config import get_settings
 
-# Load from environment variables (recommended)
-config = CachekitConfig()
+# The instance the cache path reads, built from CACHEKIT_* environment variables
+config = get_settings()
 ```
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.

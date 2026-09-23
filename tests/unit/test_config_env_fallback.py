@@ -74,7 +74,7 @@ class TestRedisBackendConfigEnv:
         monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", "30")
 
         # Set cache-specific env vars
-        monkeypatch.setenv("CACHEKIT_MAX_VALUE_SIZE", "26214400")
+        monkeypatch.setenv("CACHEKIT_ARROW_COMPRESSION", "lz4")
         monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "64")
 
         redis_config = RedisBackendConfig.from_env()
@@ -85,12 +85,11 @@ class TestRedisBackendConfigEnv:
         assert redis_config.connection_pool_size == 30
 
         # Verify cache config loaded correctly
-        assert cache_config.max_value_size == 26214400
+        assert cache_config.arrow_compression == "lz4"
         assert cache_config.l1_max_size_mb == 64
 
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
-        assert hasattr(cache_config, "max_value_size")
 
     def test_removed_knob_env_vars_are_ignored(self, monkeypatch):
         """Stale exports of removed CachekitConfig knobs must not break startup."""
