@@ -43,6 +43,8 @@ backend = CachekitIOBackend(
 ## Convenience Shorthand via `@cache.io()`
 
 ```python notest
+import os
+
 from cachekit import cache
 
 # Equivalent to: @cache(backend=CachekitIOBackend())
@@ -54,7 +56,7 @@ def cached_function(x):
 
 # The key is CACHEKIT_API_KEY by default; pass it explicitly to hold
 # more than one key in a process (multi-tenant services, test suites).
-@cache.io(api_key="ck_live_tenant_b", namespace="tenant-b")
+@cache.io(api_key=os.environ["TENANT_B_CACHEKIT_API_KEY"], namespace="tenant-b")
 def tenant_b_function(x):
     return expensive_computation(x)
 ```
