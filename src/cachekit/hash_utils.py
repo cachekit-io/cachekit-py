@@ -1,7 +1,7 @@
 """Standardized hashing and log-redaction utilities for cachekit.
 
-Runs two digests for two jobs: BLAKE3 for cache-key hashing (approximately
-2-3 GB/s throughput), blake2b for the log-redaction correlation id below.
+Runs two digests for two jobs: BLAKE3 for cache-key hashing, blake2b for the
+log-redaction correlation id below.
 
 This is also the leaf home for the log-redaction policy — ``redact_cache_key``,
 ``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532). It lives here, not in
@@ -114,8 +114,6 @@ def blake3_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
 
     Returns:
         Hex string of specified length
-
-    Performance: ~2-3 GB/s throughput
     """
     if isinstance(data, str):
         data = data.encode("utf-8")

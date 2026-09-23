@@ -192,7 +192,7 @@ def get_decorator_kwargs(profile: ReliabilityProfile, overrides: Optional[dict[s
     return kwargs
 
 
-def create_decorator_config(profile: ReliabilityProfile = ReliabilityProfile.BALANCED, **overrides) -> dict[str, Any]:
+def create_decorator_config(profile: ReliabilityProfile = ReliabilityProfile.BALANCED, **overrides: Any) -> dict[str, Any]:
     """Create a decorator configuration dict for a reliability profile.
 
     Args:
