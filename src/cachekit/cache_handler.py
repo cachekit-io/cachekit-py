@@ -1182,6 +1182,8 @@ class CacheSerializationHandler:
                 tenant_id = metadata.tenant_id
                 try:
                     serializer = self._get_cached_encryption_wrapper(tenant_id)
+                    # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
+                    return serializer.deserialize(serialized_data, metadata, cache_key)
                 except KeyringConfigurationError as e:
                     if self.encryption:
                         raise
@@ -1189,10 +1191,7 @@ class CacheSerializationHandler:
                     # us here, so a keyring fault must heal as miss + evict (corruption),
                     # never fail loud — a raise would let a planted frame block recompute
                     # and overwrite of its key until TTL.
-                    raise EncryptionError(f"Config-drift read could not build the keyring: {e}") from e
-
-                # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
-                return serializer.deserialize(serialized_data, metadata, cache_key)
+                    raise EncryptionError(f"Config-drift read hit a keyring fault: {e}") from e
             else:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)

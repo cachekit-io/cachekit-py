@@ -485,7 +485,8 @@ def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -
 
 class TestConstructionFaultsFailLoudAtReadSite:
     """The per-tenant wrapper is built lazily on the first read, so a keyring config
-    fault must escape the read site as KeyringConfigurationError, not a silent miss."""
+    fault must escape the read site as KeyringConfigurationError, not a silent miss —
+    except on config-drift reads, where the header chose the decrypt path."""
 
     CACHE_KEY = "key:a"
 
@@ -583,6 +584,11 @@ class TestConstructionFaultsFailLoudAtReadSite:
             drift_reader.serialize_data({"v": 42}, cache_key=self.CACHE_KEY)
         )
         forged = SerializationWrapper.wrap(envelope, {**metadata, "encrypted": True, "tenant_id": "x"}, serializer_name)
+        # Precondition: the keyring fault really fires (nothing is cached on a raise).
+        # Without it, a plain auth failure on the fingerprint-less frame would also
+        # yield miss + evict and this test would pass vacuously.
+        with pytest.raises(KeyringConfigurationError):
+            drift_reader._get_cached_encryption_wrapper("x")
 
         assert self._read(forged, drift_reader) == (None, [self.CACHE_KEY])
 
