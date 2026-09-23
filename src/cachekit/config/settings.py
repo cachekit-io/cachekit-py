@@ -40,7 +40,7 @@ class CachekitConfig(BaseSettings):
     """Backend-agnostic cache configuration.
 
     This configuration class provides validation for generic cache parameters
-    including TTL limits, size limits, and monitoring.
+    including the value-size limit, L1 sizing, Arrow compression and encryption keys.
 
     Backend-specific configuration (connection URLs, pool sizes, etc.) is
     handled by backend-specific config classes.
@@ -60,8 +60,6 @@ class CachekitConfig(BaseSettings):
         Create with defaults:
 
         >>> config = CachekitConfig()
-        >>> config.default_ttl
-        3600
         >>> config.l1_max_size_mb
         100
         >>> config.max_value_size
@@ -69,9 +67,7 @@ class CachekitConfig(BaseSettings):
 
         Override via constructor:
 
-        >>> custom = CachekitConfig(default_ttl=7200, l1_max_size_mb=256)
-        >>> custom.default_ttl
-        7200
+        >>> custom = CachekitConfig(l1_max_size_mb=256)
         >>> custom.l1_max_size_mb
         256
 

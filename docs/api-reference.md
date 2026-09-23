@@ -602,13 +602,6 @@ from cachekit.config import CachekitConfig
 
 # Load from environment variables (recommended)
 config = CachekitConfig()
-
-# Or override specific fields
-config = CachekitConfig(
-    default_ttl=7200,
-    l1_enabled=True,
-    l1_max_size_mb=100,
-)
 ```
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
