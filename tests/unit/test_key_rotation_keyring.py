@@ -30,7 +30,7 @@ Covers:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -41,6 +41,9 @@ from cachekit.serializers.encryption_wrapper import (
     EncryptionWrapper,
     KeyringConfigurationError,
 )
+
+if TYPE_CHECKING:
+    from cachekit.cache_handler import CacheSerializationHandler
 
 K1 = b"\x11" * 32  # retiring master key
 K2 = b"\x22" * 32  # current master key after rotation
@@ -500,12 +503,12 @@ class TestConstructionFaultsFailLoudAtReadSite:
         yield
         reset_settings()
 
-    def _handler(self) -> Any:
+    def _handler(self) -> CacheSerializationHandler:
         from cachekit.cache_handler import CacheSerializationHandler
 
         return CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=K2.hex())
 
-    def _read(self, entry: bytes, handler: Any = None) -> tuple[Any, list[str]]:
+    def _read(self, entry: bytes, handler: CacheSerializationHandler | None = None) -> tuple[Any, list[str]]:
         """One L2 read by a fresh reader, so its wrapper is built on this read.
         Returns the read-site result and the keys it evicted."""
         from cachekit.cache_handler import CacheOperationHandler
