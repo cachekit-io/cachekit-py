@@ -66,7 +66,10 @@ class BackendProvider(Protocol):
 
     Enables testability and pluggable backends without hardcoding concrete
     implementations. The provider manages backend lifecycle (singleton,
-    pooling, per-request creation, etc.).
+    pooling, etc.). A decorator calls ``get_backend()`` once and keeps the
+    result for the life of the process, so the backend returned must be safe to
+    share across requests — anything request-scoped (e.g. the tenant) has to be
+    resolved per operation, not captured when the backend is built.
 
     Example:
         >>> from cachekit.backends import BackendProvider, BaseBackend

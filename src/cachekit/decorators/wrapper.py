@@ -57,7 +57,10 @@ def _resolve_lazy_backend() -> BaseBackend:
 
     Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
     takes effect regardless of whether it ran before or after the module holding
-    the decorated function was imported (LAB-4457).
+    the decorated function was imported (LAB-4457). The result is kept for the
+    life of the wrapper and shared by every later call, so it must not capture
+    anything request-scoped — the env-resolved Redis backend reads the tenant per
+    operation for exactly this reason (LAB-4773).
     """
     from ..config.decorator import get_default_backend
 
@@ -462,9 +465,9 @@ def create_cache_wrapper(
         l1_enabled: Enable L1 in-memory cache. With encryption=True, L1 stores encrypted bytes
                    (decryption at read time only). Both L1+L2 support any combination with encryption
                    for both performance and security.
-        backend: Optional backend (BaseBackend implementation). If None, uses default
-                 RedisBackendProvider from DI container. Pass explicit backend for testing
-                 or alternative storage (HTTP, DynamoDB, etc.).
+        backend: Optional backend (BaseBackend implementation). If None, resolved on first
+                 call from set_default_backend() or the DI backend provider (env auto-detection).
+                 Held for the wrapper's lifetime, so it must be safe to share across requests.
         circuit_breaker: Enable circuit breaker for fault tolerance
         circuit_breaker_config: Circuit breaker configuration
         backpressure: Enable backpressure control

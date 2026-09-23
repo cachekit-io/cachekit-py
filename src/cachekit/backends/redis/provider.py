@@ -5,7 +5,9 @@ for multi-tenant caching. All Code-Craftsman fixes (#1-#10) are applied.
 
 Architecture:
 - Singleton: Connection pool (expensive, created once in __init__)
-- Per-request: Backend wrapper (cheap ~50ns, tenant-scoped)
+- Per-request: Backend wrapper bound to one tenant (cheap ~50ns) — PerRequestRedisBackend
+- Shared: Backend that reads the tenant at every operation — TenantContextRedisBackend,
+  for anything that outlives a request (the decorator holds its backend for the process)
 - Tenant isolation: Via URL-encoded tenant_id in key prefix (t:{tenant}:{key})
 """
 
@@ -127,7 +129,7 @@ class PerRequestRedisBackend:
             >>> backend._scoped_key("cache:user:profile:settings")
             't:org%3A123:cache:user:profile:settings'
         """
-        return f"t:{self._tenant_id}:{key}"
+        return f"{self.key_prefix}{key}"
 
     def get(self, key: str) -> Optional[bytes]:
         """Retrieve value from Redis storage with tenant scoping.
@@ -442,6 +444,43 @@ class PerRequestRedisBackend:
                 self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
 
 
+class TenantContextRedisBackend(PerRequestRedisBackend):
+    """Redis backend shared across requests: each operation is scoped to the calling context's tenant.
+
+    ``PerRequestRedisBackend`` binds the tenant current when it is built — right for an object
+    built per request, wrong for one held across requests. The decorator resolves its backend
+    once and keeps it for the life of the process, so a bound backend would scope every tenant's
+    reads and writes to whichever tenant called first (LAB-4773). This one reads
+    ``tenant_context`` at every operation instead; a ContextVar read is per thread and per
+    asyncio task, so one instance is safe to share between concurrent requests. A context with
+    no tenant set is scoped to ``"default"`` — single-tenant mode, where nothing sets one.
+
+    Examples:
+        >>> import contextvars
+        >>> from unittest.mock import Mock
+        >>> backend = TenantContextRedisBackend(Mock())
+        >>> token = tenant_context.set("org:123")
+        >>> backend._scoped_key("user:456")
+        't:org%3A123:user:456'
+        >>> tenant_context.reset(token)
+
+        A fresh context — e.g. a new thread — has no tenant set:
+
+        >>> contextvars.Context().run(lambda: backend.key_prefix)
+        't:default:'
+    """
+
+    def __init__(self, client: redis.Redis):
+        """Initialize with the shared Redis client; no tenant is captured here."""
+        self._client = client
+
+    @property
+    def key_prefix(self) -> str:
+        """Wire-level key prefix for the tenant of the CURRENT context (see base class)."""
+        tenant_id = tenant_context.get()
+        return f"t:{url_encode('default' if tenant_id is None else tenant_id, safe='')}:"
+
+
 class RedisBackendProvider:
     """Provider for Redis backend with singleton pool + per-request wrapper.
 
@@ -452,12 +491,13 @@ class RedisBackendProvider:
     Implements BackendProvider protocol for dependency injection.
 
     Example:
-        >>> _ = tenant_context.set("org:123")  # doctest: +ELLIPSIS
+        >>> token = tenant_context.set("org:123")
         >>> # Usage pattern (requires Redis connection):
         >>> # provider = RedisBackendProvider(redis_url="redis://localhost")
         >>> # backend = provider.get_backend()
         >>> # backend.set("key", b"value")
         >>> # Stored as: t:org%3A123:key
+        >>> tenant_context.reset(token)
     """
 
     def __init__(self, redis_url: str, pool_size: int = 50):
@@ -505,6 +545,15 @@ class RedisBackendProvider:
         # Create per-request wrapper (cheap: ~50ns)
         # Fix #9: Fail-fast validation happens in PerRequestRedisBackend.__init__
         return PerRequestRedisBackend(self._client, tenant_id)
+
+    def get_shared_backend(self) -> BaseBackend:
+        """Get one backend for every request — pass THIS to ``@cache(backend=...)``.
+
+        ``get_backend()`` binds the tenant current at the call, so a backend a decorator
+        holds would serve every later request as that tenant. This one reads
+        ``tenant_context`` per operation (see ``TenantContextRedisBackend``).
+        """
+        return TenantContextRedisBackend(self._client)
 
     def close(self) -> None:
         """Close connection pool and cleanup resources."""

@@ -283,3 +283,147 @@ def redis_client(skip_if_no_redis):
         client.close()
     except Exception:
         pass
+
+
+@pytest.fixture
+def env_resolved_redis(redis_isolated, monkeypatch):
+    """Route the decorator's backend resolution through the production DefaultBackendProvider.
+
+    The autouse DI fixture installs a test provider; this swaps in the real one, pointed at
+    the isolated Redis via CACHEKIT_REDIS_URL, so the tests exercise the env-resolved path
+    exactly as an application gets it.
+    """
+    from cachekit.backends.provider import BackendProviderInterface, DefaultBackendProvider
+    from cachekit.config.decorator import set_default_backend
+    from cachekit.di import DIContainer
+
+    kwargs = redis_isolated.connection_pool.connection_kwargs
+    db = kwargs.get("db", 0)
+    # pytest-redis spawns a unix-socket server locally; CI points at a TCP service.
+    url = f"unix://{kwargs['path']}?db={db}" if "path" in kwargs else f"redis://{kwargs['host']}:{kwargs['port']}/{db}"
+    for var in ("CACHEKIT_API_KEY", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CACHEKIT_REDIS_URL", url)
+    set_default_backend(None)
+    DIContainer()._singletons[BackendProviderInterface] = DefaultBackendProvider()
+    return redis_isolated
+
+
+def _tenant_prefixes(client) -> set[str]:
+    return {key.decode().split(":", 2)[1] for key in client.keys("t:*")}
+
+
+@pytest.mark.integration
+class TestTenantScopedPerOperation:
+    """LAB-4773: the decorator resolves its backend once and keeps it, so the backend it
+    holds must scope every operation to the tenant of the calling context — not to the
+    tenant that happened to make the first call."""
+
+    def test_tenants_calling_in_sequence_write_under_their_own_prefix(self, env_resolved_redis):
+        from cachekit import cache
+
+        calls = []
+
+        @cache(ttl=60, l1_enabled=False)  # assert on the L2 keys themselves
+        def lookup(x):
+            calls.append(x)
+            return {"x": x}
+
+        for tenant in ("tenant-a", "org:b"):
+            token = tenant_context.set(tenant)
+            try:
+                assert lookup(1) == {"x": 1}
+            finally:
+                tenant_context.reset(token)
+
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "org%3Ab"}
+        assert calls == [1, 1], "the second tenant must miss, not read the first tenant's entry"
+
+    def test_context_without_a_tenant_uses_default_not_the_first_caller(self, env_resolved_redis):
+        import threading
+
+        from cachekit import cache
+
+        @cache(ttl=60, l1_enabled=False)
+        def lookup(x):
+            return x
+
+        token = tenant_context.set("tenant-a")
+        try:
+            lookup(1)
+        finally:
+            tenant_context.reset(token)
+
+        # A fresh thread starts with an empty context: tenant_context is unset there.
+        worker = threading.Thread(target=lookup, args=(2,))
+        worker.start()
+        worker.join()
+
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "default"}
+
+    async def test_concurrent_async_tenants_stay_isolated(self, env_resolved_redis):
+        import asyncio
+
+        from cachekit import cache
+
+        @cache(ttl=60, l1_enabled=False)
+        async def lookup(x):
+            await asyncio.sleep(0)
+            return x
+
+        async def as_tenant(tenant):
+            tenant_context.set(tenant)  # each task runs in its own copy of the context
+            for x in range(3):
+                await lookup(x)
+
+        await asyncio.gather(*(as_tenant(t) for t in ("tenant-a", "tenant-b", "tenant-c")))
+
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "tenant-b", "tenant-c"}
+        for tenant in ("tenant-a", "tenant-b", "tenant-c"):
+            assert len(env_resolved_redis.keys(f"t:{tenant}:*")) == 3
+
+    def test_invalidate_deletes_only_the_calling_tenants_entry(self, env_resolved_redis):
+        from cachekit import cache
+
+        @cache(ttl=60, l1_enabled=False)
+        def lookup(x):
+            return x
+
+        for tenant in ("tenant-a", "tenant-b"):
+            token = tenant_context.set(tenant)
+            try:
+                lookup(1)
+            finally:
+                tenant_context.reset(token)
+
+        token = tenant_context.set("tenant-b")
+        try:
+            lookup.invalidate_cache(1)
+        finally:
+            tenant_context.reset(token)
+
+        assert _tenant_prefixes(env_resolved_redis) == {"tenant-a"}
+
+    async def test_every_operation_follows_the_calling_context(self, redis_isolated):
+        """One shared instance: reads, writes, deletes, TTL ops and locks all re-scope per context."""
+        from cachekit.backends.redis.provider import TenantContextRedisBackend
+
+        backend = TenantContextRedisBackend(redis_isolated)
+        for tenant, wire in (("tenant-a", "tenant-a"), ("org:b", "org%3Ab")):
+            token = tenant_context.set(tenant)
+            try:
+                assert backend.key_prefix == f"t:{wire}:"
+                backend.set("k", b"v-" + tenant.encode(), ttl=60)
+                assert backend.get("k") == b"v-" + tenant.encode()
+                assert backend.exists("k")
+                assert await backend.refresh_ttl("k", 120)
+                assert 60 < (await backend.get_ttl("k") or 0) <= 120
+                async with backend.acquire_lock("k", timeout=5) as acquired:
+                    assert acquired
+                    assert redis_isolated.exists(f"t:{wire}:k:lock")
+                backend.set("gone", b"x")
+                assert backend.delete("gone")
+            finally:
+                tenant_context.reset(token)
+
+        assert sorted(redis_isolated.keys("t:*")) == [b"t:org%3Ab:k", b"t:tenant-a:k"]

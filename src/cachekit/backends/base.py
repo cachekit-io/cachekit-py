@@ -270,8 +270,9 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and
-      therefore the env-resolved Redis path hand out — and ``CachekitIOBackend``
+    - Supported: the tenant-scoped Redis backends ``RedisBackendProvider`` hands
+      out (``PerRequestRedisBackend``, and ``TenantContextRedisBackend`` — what the
+      env-resolved Redis path uses) and ``CachekitIOBackend``
       (SaaS ``POST /v1/cache/{key}/lock``).
     - Not supported: ``RedisBackend`` constructed directly and passed as
       ``backend=``, ``FileBackend``, L1-only (in-memory).

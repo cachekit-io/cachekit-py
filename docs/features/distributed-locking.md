@@ -192,11 +192,12 @@ leaderboard = await get_leaderboard()
 ### With Redis Backend (Explicit)
 ```python notest
 from cachekit import cache
-from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+from cachekit.backends.redis.provider import RedisBackendProvider
 
-# PerRequestRedisBackend implements LockableBackend; a bare RedisBackend() does not.
-tenant_context.set("default")
-backend = RedisBackendProvider(redis_url="redis://localhost:6379").get_backend()
+# The tenant-scoped Redis backend implements LockableBackend; a bare RedisBackend() does not.
+# get_shared_backend() reads tenant_context on every operation, so one instance serves every
+# request (unset → "default"). get_backend() instead binds the tenant current at that call.
+backend = RedisBackendProvider(redis_url="redis://localhost:6379").get_shared_backend()
 
 @cache(ttl=300, backend=backend)
 async def generate_stats(date):
