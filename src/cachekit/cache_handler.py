@@ -44,6 +44,7 @@ from cachekit.serializers.base import (
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
+    EncryptionError,
     KeyringConfigurationError,
 )
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -1179,7 +1180,16 @@ class CacheSerializationHandler:
                         "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
                     )
                 tenant_id = metadata.tenant_id
-                serializer = self._get_cached_encryption_wrapper(tenant_id)
+                try:
+                    serializer = self._get_cached_encryption_wrapper(tenant_id)
+                except KeyringConfigurationError as e:
+                    if self.encryption:
+                        raise
+                    # Drift read: only the unauthenticated header's encrypted flag brought
+                    # us here, so a keyring fault must heal as miss + evict (corruption),
+                    # never fail loud — a raise would let a planted frame block recompute
+                    # and overwrite of its key until TTL.
+                    raise EncryptionError(f"Config-drift read could not build the keyring: {e}") from e
 
                 # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
                 return serializer.deserialize(serialized_data, metadata, cache_key)
@@ -1187,16 +1197,9 @@ class CacheSerializationHandler:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)
         except (ValueError, SerializationError):
-            # Re-raised unwrapped so the read sites can classify them; the
-            # broad handler below would relabel them SerializationError.
-            # KeyringConfigurationError (a ValueError): local keyring config
-            # fault, including one raised while building the per-tenant
-            # EncryptionWrapper above. The ONLY ValueError the read sites
-            # re-raise past their `except Exception` — fail-loud. A plain
-            # ValueError (e.g. cache_key missing for encrypted data) is caught
-            # there and becomes a warning plus a miss.
-            # SerializationError/EncryptionError: the read sites' decrypt-failure
-            # policy (handle_decrypt_failure) decides miss + evict vs raise.
+            # Re-raised unwrapped for the read sites to classify: only
+            # KeyringConfigurationError fails loud there; a plain ValueError is a miss,
+            # and SerializationError goes through handle_decrypt_failure.
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
@@ -1441,8 +1444,8 @@ class CacheOperationHandler:
                 return (True, deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1489,8 +1492,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1530,8 +1533,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return ((True, deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1580,8 +1583,8 @@ class CacheOperationHandler:
                 return (True, deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the

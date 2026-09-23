@@ -458,14 +458,21 @@ config = EncryptionConfig(enabled=True, master_key="a" * 64,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
-**Keyring configuration faults are not a decrypt-failure class.** A keyring the SDK
-cannot use raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
-`cachekit.serializers`) to your caller in both modes. Examples are a previous master key
-shorter than 32 bytes, or the current key repeated in the decrypt-only list, when keys
-reach `EncryptionWrapper` directly rather than through the validated
-`CACHEKIT_PREVIOUS_MASTER_KEYS` setting. The input is your own configuration, not the
-stored bytes, so the fault is never downgraded to a miss. It also never evicts and is
-not counted on `cachekit_decrypt_failures_total`.
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+shorter than 32 bytes, more than three previous keys, or the current key repeated among
+them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+settings load, so this surfaces only when keys bypass that check: passed to
+`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
+environment's previous keys. The fault never evicts and is not counted on
+`cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
+`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
+decorators it is logged as a cache error and the call runs uncached. Two cases take other
+paths: a missing, non-hex or short *current* master key raises `EncryptionError`, and an
+encryption-disabled handler reading an entry that claims encryption treats the fault as
+corruption (miss + evict), because only the unauthenticated header sent it down the
+decrypt path.
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key

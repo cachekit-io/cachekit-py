@@ -484,12 +484,8 @@ def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -
 
 
 class TestConstructionFaultsFailLoudAtReadSite:
-    """The handler builds its per-tenant EncryptionWrapper lazily, on the first
-    read for a tenant, so a keyring config fault in _setup_encryption can first
-    surface inside a production read site. Those sites re-raise only
-    KeyringConfigurationError; a plain ValueError falls to their
-    `except Exception` and becomes a warning plus a miss — a broken keyring
-    hidden behind silent recomputes, with no metric and no eviction."""
+    """The per-tenant wrapper is built lazily on the first read, so a keyring config
+    fault must escape the read site as KeyringConfigurationError, not a silent miss."""
 
     CACHE_KEY = "key:a"
 
@@ -508,7 +504,7 @@ class TestConstructionFaultsFailLoudAtReadSite:
 
         return CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=K2.hex())
 
-    def _read(self, entry: bytes) -> tuple[Any, list[str]]:
+    def _read(self, entry: bytes, handler: Any = None) -> tuple[Any, list[str]]:
         """One L2 read by a fresh reader, so its wrapper is built on this read.
         Returns the read-site result and the keys it evicted."""
         from cachekit.cache_handler import CacheOperationHandler
@@ -524,7 +520,7 @@ class TestConstructionFaultsFailLoudAtReadSite:
                 deleted.append(cache_key)
                 return True
 
-        reader = CacheOperationHandler(self._handler(), CacheKeyGenerator(), cache_handler=_Backend())
+        reader = CacheOperationHandler(handler or self._handler(), CacheKeyGenerator(), cache_handler=_Backend())
         return reader.get_cached_value(self.CACHE_KEY), deleted
 
     @pytest.mark.parametrize(
@@ -569,6 +565,27 @@ class TestConstructionFaultsFailLoudAtReadSite:
 
         assert self._read(forged) == (None, [self.CACHE_KEY])
 
+    def test_config_drift_read_keyring_fault_stays_a_miss(self, monkeypatch):
+        """An encryption-disabled handler builds a wrapper only when the
+        unauthenticated header claims `encrypted: true`, so the header decides
+        whether its keyring fault fires. Failing loud there would let a planted
+        frame fail every read of its key until TTL; it must heal as miss + evict.
+        Config: programmatic key K2, fleet rotated to K3 with K2 decrypt-only."""
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.singleton import reset_settings
+        from cachekit.serializers.wrapper import SerializationWrapper
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", K3.hex())
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", K2.hex())
+        reset_settings()
+        drift_reader = CacheSerializationHandler(encryption=False, master_key=K2.hex())
+        envelope, metadata, serializer_name = SerializationWrapper.unwrap(
+            drift_reader.serialize_data({"v": 42}, cache_key=self.CACHE_KEY)
+        )
+        forged = SerializationWrapper.wrap(envelope, {**metadata, "encrypted": True, "tenant_id": "x"}, serializer_name)
+
+        assert self._read(forged, drift_reader) == (None, [self.CACHE_KEY])
+
     def test_data_derived_value_error_stays_a_miss(self):
         """The read sites must not be widened to re-raise every ValueError:
         data-derived ones (here a lone surrogate from stored bytes) would let a
@@ -580,15 +597,21 @@ class TestConstructionFaultsFailLoudAtReadSite:
             def get(self, cache_key: str, refresh_ttl: Any = None) -> bytes:
                 return b"stored"
 
+        raised: list[ValueError] = []
+
         class _SerHandler:
             def supports_mmap_read(self) -> bool:
                 return False
 
             def deserialize_data(self, data: Any, cache_key: str) -> Any:
-                raise UnicodeEncodeError("utf-8", "\udc80", 0, 1, "surrogates not allowed")
+                raised.append(UnicodeEncodeError("utf-8", "\udc80", 0, 1, "surrogates not allowed"))
+                raise raised[-1]
 
         handler = CacheOperationHandler(_SerHandler(), CacheKeyGenerator(), cache_handler=_Backend())  # type: ignore[arg-type]
         assert handler.get_cached_value(self.CACHE_KEY) is None
+        # Guard against a vacuous pass: an AttributeError from this fake would
+        # take the same `except Exception` route to None.
+        assert len(raised) == 1
 
 
 class TestEndToEndRotation:

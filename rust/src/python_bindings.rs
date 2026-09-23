@@ -249,8 +249,8 @@ pyo3::create_exception!(
      On the decrypt path: an invalid tenant_id reaching HKDF (`KeyDerivation`) and\n\
      a keyring entry index that does not exist (`KeyringIndexOutOfRange`). At\n\
      EncryptionWrapper construction: a rejected keyring (`Keyring(...)`: cap\n\
-     exceeded, current key in the decrypt-only list, short key), a previous master\n\
-     key below the 32-byte floor, a keyring fingerprint derivation failure, and the\n\
+     exceeded, current key in the decrypt-only list), a previous master key below\n\
+     the 32-byte floor, a keyring fingerprint derivation failure, and the\n\
      keyring-entry-0 vs derive_tenant_keys fingerprint drift guard. These are\n\
      deploy, caller or build bugs: recording them as `auth_tamper` pages an\n\
      operator for an attack that never happened, and letting them become a miss\n\

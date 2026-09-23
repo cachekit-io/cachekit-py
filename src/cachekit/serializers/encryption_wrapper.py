@@ -294,8 +294,7 @@ class EncryptionWrapper:
         # diverged them, every read would silently route to the no-match path
         # (fail-closed: total read outage; fail-open: warning storm). Fail loud
         # at construction instead — KeyringConfigurationError, for the same
-        # taxonomy reason as the keyring config errors above (a plain ValueError
-        # here would itself become that warning storm at the read sites).
+        # taxonomy reason as the keyring config errors above.
         if self._keyring_fingerprints[0] != self.encryption_key_fingerprint:
             raise KeyringConfigurationError(
                 "cachekit-core invariant violation: keyring entry 0 fingerprint does not match "
@@ -642,11 +641,11 @@ class EncryptionWrapper:
             else:
                 decrypted_data = self._keyring.decrypt(self.encryptor, bytes(data), self.tenant_id, aad)
         except KeyringConfigurationError:
-            # Config / ciphertext-structure failure, NOT tamper. Propagates as a
-            # ValueError (KeyringConfigurationError subclasses it) so it takes
-            # the fail-loud path. Converting it below would record `auth_tamper`
-            # and page an operator for an attack that never happened — a bad
-            # tenant_id or a short ciphertext is a deploy bug, not an intrusion.
+            # Config failure, NOT tamper. Propagates as KeyringConfigurationError so
+            # it takes the fail-loud path. Converting it below would record
+            # `auth_tamper` and page an operator for an attack that never happened —
+            # a bad tenant_id is a deploy bug, not an intrusion. (Short or garbled
+            # ciphertext is NOT this class: the binding keeps it tamper-class.)
             raise
         except Exception as e:
             # Exhaustion of all keyring entries is an AES-GCM authentication
