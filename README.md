@@ -329,7 +329,7 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 
 - **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
 - **Prometheus metrics** - Recorded by default (your app owns exposition)
-- **Structured logging** - Context-aware with correlation IDs
+- **Structured logging** - Context-aware, per-operation fields
 - **Health checks** - Comprehensive status endpoints
 
 Every decorated function exposes `cache_info()`, returning a `CacheInfo` named tuple with

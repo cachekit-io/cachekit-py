@@ -1150,10 +1150,6 @@ def create_cache_wrapper(
 
         token = set_current_function_stats(_stats)
 
-        # Generate correlation ID for request tracking
-        correlation_id = features.generate_correlation_id()
-        features.set_correlation_id(correlation_id)
-
         cache_key = None  # Initialize to avoid UnboundLocalError
 
         # Create tracing span for cache operation
@@ -1190,7 +1186,6 @@ def create_cache_wrapper(
             if interop is not None:
                 # Interop/v1: out-of-model arguments MUST be rejected with an
                 # error — never silently degrade to uncached execution.
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 raise
             # Key generation failed - execute function without caching
@@ -1211,7 +1206,6 @@ def create_cache_wrapper(
             try:
                 return func(*args, **kwargs)
             finally:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
         if _l1_only_mode and _object_cache:
             if _l1_swr_active and ttl is not None:
@@ -1239,7 +1233,6 @@ def create_cache_wrapper(
                             # the slot and this exact refresh so a later call retries
                             _l1_swr_slots.release()
                             _object_cache.cancel_refresh(cache_key, version)
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 return cached_value
 
@@ -1251,7 +1244,6 @@ def create_cache_wrapper(
                 _cached_keys.add(cache_key)
                 return result
             finally:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
 
         # L1+L2 MODE: Original behavior with backend initialization
@@ -1313,7 +1305,6 @@ def create_cache_wrapper(
             try:
                 ensure_interop_backend_compatible(_backend)
             except Exception:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 raise
 
@@ -1563,7 +1554,6 @@ def create_cache_wrapper(
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=0.0,
-                correlation_id=correlation_id,
             )
 
             # Execute function without any caching
@@ -1575,8 +1565,6 @@ def create_cache_wrapper(
             features.record_failure(e)
             raise
         finally:
-            # Clear correlation ID after operation
-            features.clear_correlation_id()
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
@@ -1635,7 +1623,7 @@ def create_cache_wrapper(
             # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
             if _l1_only_mode and _object_cache is None:
                 # L1 disabled in L1-only mode -> no cache anywhere; call through
-                # (outer finally clears correlation ID and resets stats context)
+                # (outer finally resets stats context)
                 return await func(*args, **kwargs)
             if _l1_only_mode and _object_cache:
                 if _l1_swr_active and ttl is not None:
@@ -1656,7 +1644,6 @@ def create_cache_wrapper(
                             )
                             _l1_swr_tasks.add(refresh_task)
                             refresh_task.add_done_callback(functools.partial(_l1_swr_task_done, cache_key=cache_key))
-                    features.clear_correlation_id()
                     return cached_value
 
                 # Cache miss - execute function and store raw result
@@ -1684,7 +1671,7 @@ def create_cache_wrapper(
             # early-returns and would bypass the per-call re-check (mirrors
             # sync_wrapper's ordering). Backend is resolved eagerly for interop
             # calls only, so the non-interop L1 fast path is unchanged. The raise
-            # propagates; the outer finally clears correlation ID / stats context.
+            # propagates; the outer finally resets stats context.
             if interop is not None:
                 if _backend is None:
                     try:
@@ -1785,10 +1772,6 @@ def create_cache_wrapper(
 
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()
-            # Create correlation context for distributed tracing
-            correlation_id = None
-            if features._enable_structured_logging:
-                correlation_id = features.create_correlation_id()
 
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
@@ -1862,7 +1845,6 @@ def create_cache_wrapper(
                     cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
                     duration_ms=get_duration_ms,
-                    correlation_id=correlation_id,
                 )
 
             # CACHE MISS - Use distributed lock to prevent thundering herd
@@ -1985,7 +1967,6 @@ def create_cache_wrapper(
                                 cache_key=cache_key or "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
-                                correlation_id=correlation_id,
                             )
 
                         return result
@@ -2071,7 +2052,6 @@ def create_cache_wrapper(
                         cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
-                        correlation_id=correlation_id,
                     )
 
                 return result
@@ -2081,8 +2061,6 @@ def create_cache_wrapper(
                 features.record_failure(e)
                 raise
         finally:
-            # Clear correlation ID after operation (matches sync wrapper)
-            features.clear_correlation_id()
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
