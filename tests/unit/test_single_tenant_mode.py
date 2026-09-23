@@ -11,10 +11,10 @@ from unittest.mock import patch
 
 import pytest
 
-from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError, reset_settings
 from cachekit.serializers.base import SerializationError
+from cachekit.serializers.encryption_wrapper import KeyringConfigurationError
 
 
 class TestSingleTenantModeValidation:
@@ -136,7 +136,6 @@ class TestTenantIDUsage:
     def test_default_tenant_reaches_hkdf_and_aad(self, monkeypatch):
         """With no tenant supplied, the wrapper derives under "default" and the AAD
         carries "default" — asserted on the wrapper, not on a round-trip."""
-        pytest.importorskip("cachekit._rust_serializer")
         monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
         reset_settings()
         handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="61" * 32)
@@ -156,7 +155,6 @@ class TestTenantIDUsage:
 
     def test_deployment_uuid_used_as_tenant_id(self):
         """An explicit deployment UUID is the tenant for HKDF and AAD."""
-        pytest.importorskip("cachekit._rust_serializer")
         provided_uuid = "770fa622-041d-63f6-c938-668877662222"
 
         handler = CacheSerializationHandler(
@@ -177,7 +175,6 @@ class TestTenantIDUsage:
         the wrapper from THAT value (AAD-bound, so not a downgrade vector), so a
         handler now writing under "default" decrypts legacy entries until they age
         out. No flush, no fallback code."""
-        pytest.importorskip("cachekit._rust_serializer")
         monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
         reset_settings()
         legacy_uuid = "770fa622-041d-63f6-c938-668877662222"
@@ -198,9 +195,11 @@ class TestTenantIDUsage:
 
 class TestMissingTenantIdFailsClosed:
     """``__init__`` always resolves a single-tenant tenant_id, so ``None`` is our own broken
-    invariant, never an entry fault. These guards are not dead weight: without them the
-    binding's type error surfaces as ``EncryptionError`` — a SerializationError, which the
-    read path files as corruption and answers by evicting a valid entry."""
+    invariant, never an entry fault. The interop read guard is not dead weight: without it the
+    binding's type error surfaces as ``EncryptionError`` — a SerializationError, which the read
+    path files as corruption and answers by evicting a valid entry. The write guard's
+    ``RuntimeError`` is wrapped into a SerializationError by ``serialize_data``, so a write
+    stores nothing either way."""
 
     def test_write_refuses(self, monkeypatch):
         monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)

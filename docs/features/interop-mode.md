@@ -73,7 +73,7 @@ The flip side: two *differently decorated* Python functions that declare the sam
 
 Treat operation names like queue names or topic names: a **cross-team contract**, not a local variable. Two teams binding `users:get_user` had better agree on the argument list and the meaning of the cached value — the cache will not referee. If two functions must not share entries, give them different operation names.
 
-**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and deployment UUID. The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
+**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and tenant (the implicit `"default"`, or the same explicit `deployment_uuid` everywhere). The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
 
 ## The Cross-SDK Contract
 

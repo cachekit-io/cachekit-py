@@ -557,8 +557,9 @@ class CacheSerializationHandler:
                 raise ConfigurationError(
                     "interop mode does not support tenant_extractor (multi-tenant) encryption: "
                     "interop entries store no metadata header, so the read path cannot recover "
-                    "a per-call tenant. Use single-tenant encryption with an explicitly shared "
-                    "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
+                    "a per-call tenant. Use single_tenant_mode=True instead: the tenant is the "
+                    "protocol literal 'default', so the same master key is enough across SDKs. "
+                    "To scope keys to a deployment, set the same canonical deployment_uuid in every SDK."
                 )
             if isinstance(serializer_name, str) and _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name) != "default":
                 raise ConfigurationError(
