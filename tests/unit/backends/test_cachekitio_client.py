@@ -114,20 +114,20 @@ class TestGetCachedAsyncHttpClient:
 class TestCloseSyncClient:
     """close_sync_client() cleanup behaviour."""
 
-    def test_sets_thread_local_to_none(self, config: CachekitIOBackendConfig) -> None:
+    def test_empties_this_threads_sync_cache(self, config: CachekitIOBackendConfig) -> None:
         """After close, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
         get_sync_http_client(config)
         close_sync_client()
-        assert not getattr(client_module._thread_local, "sync_clients", {})
+        assert not client_module._thread_local.sync_clients
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
         close_sync_client()  # no client created yet — must not raise
 
 
-def _raise(*_args: object) -> None:
+def _raise() -> None:
     raise RuntimeError("close failed")
 
 
@@ -175,7 +175,7 @@ class TestResetGlobalClient:
 
         get_sync_http_client(config)
         reset_global_client()
-        assert not getattr(client_module._thread_local, "sync_clients", {})
+        assert not client_module._thread_local.sync_clients
 
     def test_clears_async_thread_local(self, config: CachekitIOBackendConfig) -> None:
         """After reset, this thread's async client cache is empty."""
@@ -183,7 +183,7 @@ class TestResetGlobalClient:
 
         get_cached_async_http_client(config)
         reset_global_client()
-        assert not getattr(client_module._thread_local, "async_clients", {})
+        assert not client_module._thread_local.async_clients
 
     def test_new_sync_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh client (different object)."""

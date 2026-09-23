@@ -134,8 +134,10 @@ class TestInit:
         with pytest.raises(ConfigurationError, match="not in allowlist") as info:
             CachekitIOBackend(api_key="ck_live_SECRET_XYZ", api_url="https://evil.example.com")  # pragma: allowlist secret
         assert "SECRET" not in str(info.value)
+        assert "requires an API key" not in str(info.value)  # the key hint is for key errors only
+        # No chain at all: __context__ would still hold the ValidationError, whose .errors() carry the key.
         assert info.value.__cause__ is None
-        assert info.value.__suppress_context__
+        assert info.value.__context__ is None
 
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""

@@ -222,15 +222,17 @@ class CachekitIOBackend:
                 validation (non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
+        errors = None
         try:
             self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
         except ValidationError as exc:
-            # `from None` is load-bearing: the chained ValidationError renders the raw
-            # input — api_key included — into tracebacks and logs (CWE-532).
             errors = exc.errors(include_input=False)
+        # Raised OUTSIDE the except block (CWE-532): the ValidationError's own .errors() keep the
+        # raw api_key, and `raise ... from None` only hides it — it would still hang off __context__.
+        if errors is not None:
             problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
             hint = _API_KEY_HINT if any(err["loc"] == ("api_key",) for err in errors) else ""
-            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}") from None
+            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
         # Get HTTP clients (hybrid sync/async architecture)
         # Sync client: per-thread, thread-safe, no event loop required

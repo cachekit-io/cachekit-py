@@ -582,8 +582,8 @@ class DecoratorConfig:
                 "  @cache.production(backend=my_backend)"
             )
 
-        # The backend's pydantic-settings config is the one reader of CACHEKIT_*: api_key=None
-        # falls back to CACHEKIT_API_KEY there, and a missing or empty key raises there, now.
+        # io() never reads the env itself: CachekitIOBackendConfig resolves api_key (argument wins,
+        # else CACHEKIT_API_KEY) and raises ConfigurationError on a missing or empty key, at construction.
         backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend
