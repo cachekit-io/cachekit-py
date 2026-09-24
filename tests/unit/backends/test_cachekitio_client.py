@@ -212,6 +212,24 @@ def test_releasing_the_last_backend_closes_its_sync_client(monkeypatch: pytest.M
 
 
 @pytest.mark.unit
+def test_failed_close_on_release_is_logged_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A close() failure in __del__ is logged at debug instead of vanishing silently."""
+    from unittest.mock import MagicMock
+
+    from cachekit.backends.cachekitio import client as client_module
+
+    def fail(self: httpx.Client) -> None:
+        raise RuntimeError("close failed")
+
+    log = MagicMock()
+    monkeypatch.setattr(client_module, "_logger", log)
+    monkeypatch.setattr(client_module._SyncClient, "close", fail)
+    client_module._SyncClient().__del__()
+    log.debug.assert_called()
+    assert "RuntimeError" in log.debug.call_args.args[0]
+
+
+@pytest.mark.unit
 async def test_rebuilt_backend_never_inherits_a_dying_async_client() -> None:
     """Guard: closing an async client from __del__ (aclose's coroutine holds the client)
     resurrects it, so the weak cache handed the dying client to the next backend with the

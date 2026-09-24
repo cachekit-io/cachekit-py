@@ -15,24 +15,34 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from cachekit.hash_utils import redact_error_for_log
+from cachekit.logging import get_structured_logger
+
 if TYPE_CHECKING:
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
 _ClientKey = tuple[str, str, float, int]
 
+_logger = get_structured_logger(__name__)
+
 
 # The weak caches below release a client when its last backend goes; this closes a sync
 # client at that moment instead of leaving its pool to socket finalizers (the pattern the
-# Anthropic and OpenAI Python SDKs use for their httpx wrappers). Exceptions are suppressed
-# because __del__ has no caller to report to and may run during interpreter shutdown.
+# Anthropic and OpenAI Python SDKs use for their httpx wrappers). A close failure is logged at
+# debug, never raised: __del__ has no caller to report to. The log call itself is guarded
+# because __del__ may run during interpreter shutdown, after logging is torn down.
 # No async twin: aclose()'s coroutine holds the client, so scheduling it from __del__
 # resurrects the client and the weak cache hands the dying client to the next backend with
 # that key; nor is the loop that owns its connections known here.
 class _SyncClient(httpx.Client):
     def __del__(self) -> None:
-        if not self.is_closed:
+        if self.is_closed:
+            return
+        try:
+            self.close()
+        except Exception as e:
             with suppress(Exception):
-                self.close()
+                _logger.debug(f"Closing a released cachekit.io HTTP client failed: {redact_error_for_log(e)}")
 
 
 class _ThreadClients(threading.local):
