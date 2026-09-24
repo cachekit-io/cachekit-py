@@ -324,9 +324,10 @@ async def fetch_sensitive(x):
 
 Lock waiters that time out log a `Failed to acquire lock for {key} after 5.0s`
 warning; lock backend errors log a `Lock operation failed … executing without
-lock` warning. For miss-rate monitoring (stampede detection), use the `status`
-label on `redis_cache_operations_total` — see
-[Prometheus Metrics](prometheus-metrics.md).
+lock` warning. For miss-rate monitoring (stampede detection), watch `operation="set"` on
+`cache_operations_total` as a cache-write proxy — misses write back, but it can
+double-count (when stats collection is on) or miss failed writes, so treat it as a proxy,
+not an exact miss count — see [Prometheus Metrics](prometheus-metrics.md).
 
 ---
 
@@ -341,7 +342,7 @@ A: Two things to check:
 2. The backend must implement `LockableBackend` (`CachekitIOBackend`, or `PerRequestRedisBackend` from `RedisBackendProvider` — a bare `RedisBackend()` does not). Check it the way the SDK does: `hasattr(backend, "acquire_lock")`. Avoid `isinstance(backend, LockableBackend)` — from CPython 3.12 a `runtime_checkable` protocol check resolves members with `inspect.getattr_static`, so it reports `False` for a backend that delegates `acquire_lock` through `__getattr__`.
 
 **Q: How do I know if stampedes are happening?**
-A: Check Prometheus: a spike in `rate(redis_cache_operations_total{status="miss"}[1m])` = stampede risk. See [Prometheus Metrics](prometheus-metrics.md).
+A: Check Prometheus: a spike in `rate(cache_operations_total{operation="set"}[1m])` (a cache-write proxy — misses write back) suggests stampede risk. See [Prometheus Metrics](prometheus-metrics.md).
 
 ---
 
