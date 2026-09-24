@@ -269,6 +269,63 @@ class TestCleanupThreadAfterFork:
         finally:
             manager.stop_background_cleanup()
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    @pytest.mark.parametrize("put_from_new_thread", [False, True], ids=["forking-thread", "reused-ident"])
+    def test_forked_child_survives_cache_lock_held_at_fork(self, put_from_new_thread):
+        import multiprocessing
+        import queue as queue_mod
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("held-ns")
+        cache.put("pre-fork", b"v")
+        manager.start_background_cleanup(interval_seconds=0.05)
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with cache._lock:
+                held.set()
+                release.wait()
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert held.wait(5)
+        try:
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q) -> None:
+                def put() -> None:
+                    cache.put("live", b"v")
+                    cache.put("short", b"v", redis_ttl=1.2)  # minus the 1s ttl buffer: expires in ~0.2s
+
+                if put_from_new_thread:  # the child's first new thread reuses the dead holder's ident
+                    t = threading.Thread(target=put)
+                    t.start()
+                    t.join()
+                else:
+                    put()
+                found = cache.get("live")[0]  # from the forking thread, never the holder's ident
+                swept = _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)
+                q.put({"found": found, "swept": swept})
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=20)
+            except queue_mod.Empty:
+                outcome = "child deadlocked on the lock held at fork"
+            finally:
+                process.join(timeout=10)
+                if process.is_alive():  # a hung child would otherwise block pytest's exit
+                    process.kill()
+
+            assert outcome == {"found": True, "swept": True}
+            assert process.exitcode == 0
+        finally:
+            release.set()
+            holder.join(5)
+            manager.stop_background_cleanup()
+
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("stopped-ns")

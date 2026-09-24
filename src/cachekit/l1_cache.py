@@ -201,6 +201,10 @@ class L1Cache:
             )
             return
 
+        # Before the first _lock use: the take-over replaces a _lock orphaned by fork.
+        if self._before_store is not None:
+            self._before_store()
+
         # Estimate size
         size = self._estimate_size(value)
 
@@ -221,9 +225,6 @@ class L1Cache:
             )
             return
 
-        if self._before_store is not None:
-            self._before_store()
-
         with self._lock:
             # Check if key already exists
             if key in self._cache:
@@ -240,6 +241,22 @@ class L1Cache:
 
             # Move to end (most recently used)
             self._cache.move_to_end(key)
+
+    def _reset_lock_after_fork(self) -> None:
+        """Replace _lock if a parent thread held it at fork; call only from a fork take-over.
+
+        The holder does not exist in the child, so the lock never releases. _is_owned() first:
+        a thread started in the child can reuse the dead holder's ident and so "own" its hold.
+        The timeout waits out a child thread briefly holding the lock legitimately. An orphaned
+        holder may have left the entries half-updated, so they are dropped; L2 still has them.
+        """
+        lock = self._lock
+        if not lock._is_owned() and lock.acquire(timeout=1.0):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            lock.release()
+            return
+        self._lock = threading.RLock()
+        self._cache.clear()
+        self._current_memory_bytes = 0
 
     def _remove_entry(self, key: str) -> None:
         """Remove entry from cache and update memory tracking.
@@ -386,12 +403,14 @@ class L1CacheManager:
         """Take over inherited state in a forked child; restart cleanup if the parent ran it.
 
         Threads don't survive fork(): a prefork child (Gunicorn --preload, Celery prefork)
-        inherits _cleanup_thread dead, and _lock/_stop_cleanup as parent state a parent
-        thread may have held at fork. An owner-PID check rather than an os.register_at_fork
-        hook: uWSGI forks without running Python's at-fork hooks, and a thread started
-        inside one is unsafe. L1Cache.put runs this (not get: getpid() is a syscall costing
-        about an L1 hit), so any child that grows its L1 gets a live cleanup thread. A
-        thread the parent had stopped stays stopped.
+        inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache._lock as
+        parent state a parent thread may have held at fork. An owner-PID check rather than an
+        os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
+        thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
+        syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
+        thread. A thread the parent had stopped stays stopped. Known limit: a child whose
+        first touch of a cache is a get() still blocks if a parent thread held that cache's
+        lock at fork.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -403,6 +422,8 @@ class L1CacheManager:
                 return
             self._lock = threading.Lock()
             self._stop_cleanup = threading.Event()
+            for cache in self._caches.values():  # before the cleanup worker takes their locks
+                cache._reset_lock_after_fork()
             if self._cleanup_thread is not None:
                 try:
                     self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
