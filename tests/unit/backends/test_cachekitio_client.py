@@ -10,6 +10,7 @@ Tests for backends/cachekitio/client.py covering:
 
 from __future__ import annotations
 
+import httpx
 import pytest
 import pytest_asyncio  # noqa: F401
 from pydantic import SecretStr
@@ -47,8 +48,6 @@ class TestGetSyncHttpClient:
 
     def test_returns_httpx_client(self, config: CachekitIOBackendConfig) -> None:
         """Factory returns an httpx.Client instance."""
-        import httpx
-
         client = get_sync_http_client(config)
         assert isinstance(client, httpx.Client)
 
@@ -75,6 +74,14 @@ class TestGetSyncHttpClient:
         auth_header = client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
 
+    def test_closed_cached_client_is_a_miss(self, config: CachekitIOBackendConfig) -> None:
+        """A cached client that was closed (e.g. mid-release on another thread) is never handed out."""
+        c1 = get_sync_http_client(config)
+        c1.close()
+        c2 = get_sync_http_client(config)
+        assert c2 is not c1
+        assert not c2.is_closed
+
     def test_distinct_keys_get_distinct_clients(self, config: CachekitIOBackendConfig) -> None:
         """Regression: a single per-thread client sent every backend's traffic under the FIRST key."""
         other = CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=1.0)  # noqa: S106
@@ -92,8 +99,6 @@ class TestGetCachedAsyncHttpClient:
 
     def test_returns_httpx_async_client(self, config: CachekitIOBackendConfig) -> None:
         """Factory returns an httpx.AsyncClient instance."""
-        import httpx
-
         client = get_cached_async_http_client(config)
         assert isinstance(client, httpx.AsyncClient)
 
@@ -175,12 +180,51 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
     from cachekit.backends.cachekitio import client as client_module
     from cachekit.backends.cachekitio.backend import CachekitIOBackend
 
-    live = CachekitIOBackend(api_key="ck_live_tenant")  # pragma: allowlist secret
+    live = CachekitIOBackend(api_key="ck_test_live_backend")  # pragma: allowlist secret
     for i in range(20):
-        CachekitIOBackend(api_key=f"ck_rotated_{i}")  # pragma: allowlist secret
+        CachekitIOBackend(api_key=f"ck_test_rotated_{i}")  # pragma: allowlist secret
     gc.collect()
     assert list(client_module._thread_local.sync_clients.values()) == [live._sync_client]
     assert list(client_module._thread_local.async_clients.values()) == [live._async_client]
+
+
+@pytest.mark.unit
+def test_releasing_the_last_backend_closes_its_sync_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A released client is close()d on release, not left to socket finalizers."""
+    from cachekit.backends.cachekitio import client as client_module
+    from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+    closed: list[int] = []
+    real_close = client_module._SyncClient.close
+
+    def spy(self: httpx.Client) -> None:
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(client_module._SyncClient, "close", spy)
+    first = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
+    second = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
+    client_id = id(first._sync_client)
+    del first
+    assert closed == []  # still shared with a live backend
+    del second
+    assert closed == [client_id]
+
+
+@pytest.mark.unit
+async def test_rebuilt_backend_never_inherits_a_dying_async_client() -> None:
+    """Guard: closing an async client from __del__ (aclose's coroutine holds the client)
+    resurrects it, so the weak cache handed the dying client to the next backend with the
+    same key, which then failed every call once the close ran."""
+    import asyncio
+
+    from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+    released = CachekitIOBackend(api_key="ck_test_rebuilt")  # pragma: allowlist secret
+    del released
+    rebuilt = CachekitIOBackend(api_key="ck_test_rebuilt")  # pragma: allowlist secret
+    await asyncio.sleep(0)
+    assert not rebuilt._async_client.is_closed
 
 
 @pytest.mark.unit
