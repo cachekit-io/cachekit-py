@@ -1,11 +1,11 @@
-"""Tests for single-tenant mode with deterministic UUID (MEDIUM-02).
+"""Tests for single-tenant mode tenant_id resolution (MEDIUM-02, LAB-4666).
 
-This module tests the explicit single-tenant mode configuration
-that requires deployment_uuid for cryptographic key isolation.
+Single-tenant mode derives keys and builds AAD from ONE tenant_id, resolved once
+in ``__init__``: explicit ``deployment_uuid`` → ``CACHEKIT_DEPLOYMENT_UUID`` → the
+protocol literal ``"default"`` (spec/intent-presets.md § Master Key Input, rule 5).
 """
 
 import os
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +13,8 @@ import pytest
 
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError, reset_settings
+from cachekit.serializers.base import SerializationError
+from cachekit.serializers.encryption_wrapper import KeyringConfigurationError
 
 
 class TestSingleTenantModeValidation:
@@ -59,10 +61,10 @@ class TestSingleTenantModeValidation:
         assert handler.encryption is False
 
 
-class TestDeterministicUUIDGeneration:
-    """Test deterministic UUID generation (MEDIUM-02, Criterion 2)."""
+class TestTenantIdResolution:
+    """Explicit tenant sources win; otherwise the protocol literal "default"."""
 
-    def test_provided_uuid_has_highest_priority(self, tmp_path):
+    def test_provided_uuid_has_highest_priority(self):
         """Explicitly provided UUID should be used."""
         provided_uuid = "550e8400-e29b-41d4-a716-446655440000"
 
@@ -72,11 +74,11 @@ class TestDeterministicUUIDGeneration:
             deployment_uuid=provided_uuid,
         )
 
-        assert handler._deployment_uuid_value == provided_uuid
+        assert handler._single_tenant_id == provided_uuid
 
     def test_provided_uuid_validation(self):
         """Invalid UUID format should raise ConfigurationError."""
-        with pytest.raises(ConfigurationError, match="Invalid deployment_uuid format"):
+        with pytest.raises(ConfigurationError, match="Invalid deployment_uuid parameter"):
             CacheSerializationHandler(
                 encryption=True,
                 single_tenant_mode=True,
@@ -94,123 +96,131 @@ class TestDeterministicUUIDGeneration:
                 single_tenant_mode=True,
             )
 
-            assert handler._deployment_uuid_value == env_uuid
+            assert handler._single_tenant_id == env_uuid
 
     def test_invalid_env_var_raises_error(self):
         """Invalid UUID in environment variable should raise ConfigurationError."""
         with patch.dict(os.environ, {"CACHEKIT_DEPLOYMENT_UUID": "invalid-uuid"}):
             reset_settings()  # Clear cached settings to pick up new env var
-            with pytest.raises(ConfigurationError, match="Invalid deployment_uuid in configuration"):
+            with pytest.raises(ConfigurationError, match="Invalid CACHEKIT_DEPLOYMENT_UUID"):
                 CacheSerializationHandler(
                     encryption=True,
                     single_tenant_mode=True,
                 )
 
-    def test_persistent_file_created_when_no_uuid_provided(self, tmp_path, monkeypatch):
-        """Should create persistent file when no UUID provided or in env."""
-        # Clear any environment variable from previous tests
+    def test_default_is_protocol_literal_and_never_machine_local(self, tmp_path, monkeypatch):
+        """No explicit tenant → literal "default" (spec rule 5); the legacy persisted
+        ``~/.cachekit/deployment_uuid`` is neither read nor written — a per-host value
+        in a KDF input is a permanent cross-SDK auth failure, not a miss."""
         monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
-        reset_settings()  # Clear cached settings
-
-        # Use temporary home directory
+        reset_settings()
         fake_home = tmp_path / "home"
-        fake_home.mkdir()
+        legacy_file = fake_home / ".cachekit" / "deployment_uuid"
+        legacy_file.parent.mkdir(parents=True)
+        legacy_file.write_text("770fa622-041d-63f6-c938-668877662222")
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
-        handler = CacheSerializationHandler(
-            encryption=True,
-            single_tenant_mode=True,
-        )
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True)
 
-        # Verify UUID was generated and is valid
-        assert handler._deployment_uuid_value is not None
-        uuid.UUID(handler._deployment_uuid_value)  # Should not raise
-
-        # Verify file was created
-        uuid_file = fake_home / ".cachekit" / "deployment_uuid"
-        assert uuid_file.exists()
-        assert uuid_file.read_text().strip() == handler._deployment_uuid_value
-
-        # Verify file permissions (owner read/write only)
-        assert uuid_file.stat().st_mode & 0o777 == 0o600
-
-    def test_persistent_file_reused_across_restarts(self, tmp_path, monkeypatch):
-        """Same UUID should be used across multiple handler initializations (determinism)."""
-        # Use temporary home directory
-        fake_home = tmp_path / "home"
-        fake_home.mkdir()
-        monkeypatch.setattr(Path, "home", lambda: fake_home)
-
-        # First initialization - creates UUID file
-        handler1 = CacheSerializationHandler(
-            encryption=True,
-            single_tenant_mode=True,
-        )
-        uuid1 = handler1._deployment_uuid_value
-
-        # Second initialization - should reuse same UUID
-        handler2 = CacheSerializationHandler(
-            encryption=True,
-            single_tenant_mode=True,
-        )
-        uuid2 = handler2._deployment_uuid_value
-
-        # CRITICAL: Must be same UUID for determinism
-        assert uuid1 == uuid2
-
-    def test_corrupted_file_regenerated(self, tmp_path, monkeypatch):
-        """Corrupted UUID file should be regenerated."""
-        # Use temporary home directory
-        fake_home = tmp_path / "home"
-        fake_home.mkdir()
-        monkeypatch.setattr(Path, "home", lambda: fake_home)
-
-        # Create corrupted UUID file
-        uuid_file = fake_home / ".cachekit" / "deployment_uuid"
-        uuid_file.parent.mkdir(parents=True, exist_ok=True)
-        uuid_file.write_text("corrupted-not-a-uuid")
-
-        # Should regenerate valid UUID
-        handler = CacheSerializationHandler(
-            encryption=True,
-            single_tenant_mode=True,
-        )
-
-        # Verify new UUID is valid
-        assert handler._deployment_uuid_value is not None
-        uuid.UUID(handler._deployment_uuid_value)  # Should not raise
-        assert handler._deployment_uuid_value != "corrupted-not-a-uuid"
+        assert handler._single_tenant_id == CacheSerializationHandler.DEFAULT_TENANT_ID == "default"
+        assert legacy_file.read_text() == "770fa622-041d-63f6-c938-668877662222"  # untouched, ignored
 
 
 class TestTenantIDUsage:
-    """Test tenant_id usage in single-tenant mode (MEDIUM-02, Criterion 3)."""
+    """The resolved tenant_id is what HKDF derives from AND what the AAD binds."""
 
-    def test_deployment_uuid_used_as_tenant_id(self, tmp_path, monkeypatch):
-        """Deployment UUID should be used as tenant_id for encryption."""
-        fake_home = tmp_path / "home"
-        fake_home.mkdir()
-        monkeypatch.setattr(Path, "home", lambda: fake_home)
+    # protocol test-vectors/encryption.json → default_tenant.derived_key_fingerprint_hex:
+    # HKDF-SHA256(master_key = 0x61 * 32 — hex "61"*32, NOT "a"*64 — tenant "default") encryption-key fingerprint.
+    DEFAULT_TENANT_FINGERPRINT = "52d54c97f8e5efaa5bdf58a301f92726"  # pragma: allowlist secret
 
+    def test_default_tenant_reaches_hkdf_and_aad(self, monkeypatch):
+        """With no tenant supplied, the wrapper derives under "default" and the AAD
+        carries "default" — asserted on the wrapper, not on a round-trip."""
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="61" * 32)
+
+        handler.serialize_data({"message": "hello"}, cache_key="test:key")
+
+        wrapper = handler._encryption_wrapper_cache["default"]
+        assert wrapper.tenant_id == "default"
+        # HKDF input: the derived key is the protocol's pinned default-tenant key.
+        assert wrapper.tenant_keys.encryption_fingerprint().hex() == self.DEFAULT_TENANT_FINGERPRINT
+        # AAD component 1 is the same literal (v0x03: version byte, then len(4 BE) + tenant_id).
+        _, metadata = wrapper.serialize({"message": "hello"}, cache_key="test:key")
+        aad = wrapper._create_aad(metadata, "test:key")
+        assert aad[:1] == b"\x03"
+        assert aad[1:5] == len(b"default").to_bytes(4, "big")
+        assert aad[5:12] == b"default"
+
+    def test_deployment_uuid_used_as_tenant_id(self):
+        """An explicit deployment UUID is the tenant for HKDF and AAD."""
         provided_uuid = "770fa622-041d-63f6-c938-668877662222"
-        master_key_hex = "a" * 64  # 32-byte key in hex
 
         handler = CacheSerializationHandler(
             encryption=True,
             single_tenant_mode=True,
             deployment_uuid=provided_uuid,
-            master_key=master_key_hex,
+            master_key="a" * 64,
         )
 
-        # Serialize some data
-        test_data = {"message": "hello"}
-        serialized = handler.serialize_data(test_data, cache_key="test:key")
+        serialized = handler.serialize_data({"message": "hello"}, cache_key="test:key")
+        assert handler._encryption_wrapper_cache[provided_uuid].tenant_id == provided_uuid
+        assert handler.deserialize_data(serialized, cache_key="test:key") == {"message": "hello"}
 
-        # Verify serialization succeeds (proves tenant_id was valid)
-        assert serialized is not None
+    def test_legacy_uuid_tenant_ciphertext_still_decrypts(self, monkeypatch):
+        """Migration: entries written under the pre-"default" UUID tenant stay readable.
 
-        # Verify deserialization works (proves determinism)
-        deserialized = handler.deserialize_data(serialized, cache_key="test:key")
-        assert deserialized == test_data
+        The CK frame header carries tenant_id and the auto-mode read path derives
+        the wrapper from THAT value (AAD-bound, so not a downgrade vector), so a
+        handler now writing under "default" decrypts legacy entries until they age
+        out. No flush, no fallback code."""
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        legacy_uuid = "770fa622-041d-63f6-c938-668877662222"
+        legacy = CacheSerializationHandler(
+            encryption=True, single_tenant_mode=True, deployment_uuid=legacy_uuid, master_key="a" * 64
+        )
+        current = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="a" * 64)
+        assert current._single_tenant_id == "default"
+
+        legacy_bytes = legacy.serialize_data({"who": "legacy"}, cache_key="user:1")
+
+        assert current.deserialize_data(legacy_bytes, cache_key="user:1") == {"who": "legacy"}
+        # And the reverse: a legacy-pinned reader still decrypts new "default" entries.
+        assert legacy.deserialize_data(current.serialize_data({"who": "new"}, cache_key="user:2"), cache_key="user:2") == {
+            "who": "new"
+        }
+
+
+class TestMissingTenantIdFailsClosed:
+    """``__init__`` always resolves a single-tenant tenant_id, so ``None`` is our own broken
+    invariant, never an entry fault. The interop read guard is not dead weight: without it the
+    binding's type error surfaces as ``EncryptionError`` — a SerializationError, which the read
+    path files as corruption and answers by evicting a valid entry. The write guard's
+    ``RuntimeError`` is wrapped into a SerializationError by ``serialize_data``, so a write
+    stores nothing either way."""
+
+    def test_write_refuses(self, monkeypatch):
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key="61" * 32)
+        handler._single_tenant_id = None
+
+        with pytest.raises(SerializationError, match="single-tenant tenant_id should be set in __init__"):
+            handler.serialize_data({"v": 1}, cache_key="test:key")
+
+    def test_interop_read_fails_loud_not_as_corruption(self, monkeypatch):
+        """KeyringConfigurationError: every read site re-raises it, so the valid shared entry
+        is kept rather than missed and evicted as corrupt."""
+        monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
+        reset_settings()
+        handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, interop_mode=True, master_key="61" * 32)
+        entry = handler.serialize_data({"v": 1}, cache_key="test:key")
+        handler._single_tenant_id = None
+
+        with pytest.raises(KeyringConfigurationError, match="tenant_id missing"):
+            handler.deserialize_data(entry, cache_key="test:key")
 
 
 class TestErrorMessages:

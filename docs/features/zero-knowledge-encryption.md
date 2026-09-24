@@ -347,6 +347,12 @@ Tenant ID: tenant_context.get()
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
 
+Single-tenant mode (no tenant_extractor):
+  tenant_id = deployment_uuid | CACHEKIT_DEPLOYMENT_UUID | "default"
+  "default" is the protocol literal every SDK derives from (intent-presets.md
+  § Master Key Input, rule 5), used identically for HKDF and AAD — one master
+  key is enough for py, rs and ts to share ciphertext.
+
 Properties:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
