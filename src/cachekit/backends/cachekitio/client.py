@@ -27,20 +27,22 @@ _logger = get_structured_logger(__name__)
 
 
 class SyncClientLease:
-    """A hold on a shared per-thread sync client, closed once the last lease for its config goes.
+    """Sole owner of a cached per-thread sync client, which is closed once its last holder drops the lease.
 
     Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
     on its own drops the lease at once, and with it the client.
     """
 
-    # The weak cache points at leases, never at clients, and a lease has no __del__. When the last
-    # backend drops one, CPython clears weak references to it before any finalizer runs, so a lookup
-    # on another thread sees either the live lease or a miss, never a client mid-close. A __del__ on
-    # the cached object cannot promise that: it runs while weak references still resolve, so a
-    # concurrent lookup revives the object and then inherits the close.
+    # The weak cache points at leases, never at clients, and a lease has no __del__. A backend can be
+    # released on a thread other than the one that built it; CPython clears weak references to the
+    # lease before any finalizer runs, so a lookup racing that release sees either the live lease or a
+    # miss, never a client mid-close. A __del__ on the cached object cannot promise that: it runs while
+    # weak references still resolve, so the racing lookup revives the object and inherits the close.
     def __init__(self, config: CachekitIOBackendConfig) -> None:
         self.client = httpx.Client(**_client_kwargs(config))
-        # atexit=False: no network I/O during interpreter exit; the process reclaims the sockets.
+        # atexit=False: exit-time finalizers run while daemon threads (stale-while-revalidate) are still
+        # alive, so closing then could pull a client out from under an in-flight request. The process
+        # reclaims the sockets at exit anyway.
         weakref.finalize(self, _close_released_client, self.client).atexit = False
 
 
@@ -59,8 +61,9 @@ class _ThreadClients(threading.local):
     # Values are weak: each CachekitIOBackend holds its sync lease and async client strongly, so
     # each stays cached while some backend uses it and is dropped when the last one goes (a sync
     # client is closed then too, see SyncClientLease).
-    # ponytail: a released async client is never closed — its sockets are reclaimed by their
-    # finalizers, with a ResourceWarning each — and a backend built and discarded per call gets
+    # ponytail: a released async client is never closed — a finalizer cannot await aclose(), nor
+    # knows which event loop owns the connections — so its sockets are reclaimed by their
+    # finalizers, with a ResourceWarning each; and a backend built and discarded per call gets
     # no pool reuse. Hold one backend per key, or add a small strong LRU in front if per-call
     # construction matters.
     def __init__(self) -> None:
@@ -121,7 +124,7 @@ def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
 
     Returns:
         SyncClientLease: its ``.client`` is the thread-local sync client for exactly this config,
-        open for as long as some lease on it is held
+        open for as long as the lease is held
     """
     leases = _thread_local.sync_leases
     key = _client_key(config)

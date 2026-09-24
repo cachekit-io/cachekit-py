@@ -2,7 +2,7 @@
 
 Tests for backends/cachekitio/client.py covering:
 - Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
-- Sync client lifecycle: open while a lease is held, closed once the last lease goes
+- Sync client lifecycle: open while its lease is held, closed once the lease is dropped
 - Client configuration (base_url, timeout, Authorization header)
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() clears thread-local references

@@ -155,11 +155,14 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         Raises:
             ValueError: If URL is invalid, uses non-HTTPS, or targets private IP
         """
+        # Never echo the URL: its userinfo may carry credentials (CWE-532). urlparse's own error can
+        # quote the whole netloc, so it is kept off the chain too: raised outside the except block.
         try:
             parsed = urlparse(v)
-        except Exception as e:
-            # Never echo the URL: its userinfo may carry credentials (CWE-532).
-            raise ValueError("Invalid API URL: could not be parsed") from e
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            raise ValueError("Invalid API URL: could not be parsed")
 
         # Enforce HTTPS protocol
         if parsed.scheme != "https":

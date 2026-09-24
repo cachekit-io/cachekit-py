@@ -236,7 +236,8 @@ class CachekitIOBackend:
             raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
         # Get HTTP clients (hybrid sync/async architecture)
-        # Sync client: per-thread, thread-safe, no event loop required; the lease keeps it open
+        # Sync client: per-thread, thread-safe, no event loop required. _sync_lease is never read:
+        # it is held only to keep the client open, and dropping it closes the client.
         # Async client: per-thread, event loop safe
         self._sync_lease = lease_sync_http_client(self._config)
         self._sync_client = self._sync_lease.client

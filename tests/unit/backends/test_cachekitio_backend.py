@@ -145,10 +145,8 @@ class TestInit:
         [
             {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
             {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
-            # An unparseable URL once went into the message whole, userinfo credentials and all.
-            {"api_key": _TEST_API_KEY, "api_url": "https://user:SECRET_PW@[::1"},  # pragma: allowlist secret
         ],
-        ids=["whitespace", "allowlist", "unparseable-url"],
+        ids=["whitespace", "allowlist"],
     )
     def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
         """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
@@ -158,6 +156,19 @@ class TestInit:
         with pytest.raises(ValidationError) as info:
             CachekitIOBackendConfig(**kwargs)
         assert "SECRET" not in str(info.value)
+
+    def test_unparseable_url_error_carries_no_credentials(self) -> None:
+        """CWE-532: the message once held the whole URL, and urlparse's own error (NFKC-invalid netloc)
+        quotes userinfo too, so neither may reach the message or the chain pydantic keeps in ctx."""
+        from pydantic import ValidationError
+
+        url = "https://user:SECRET_PW\uff0fx@api.cachekit.io"  # pragma: allowlist secret
+        with pytest.raises(ValidationError) as info:
+            CachekitIOBackendConfig(api_key=_TEST_API_KEY, api_url=url)
+        error = info.value.errors(include_input=False)[0]["ctx"]["error"]
+        assert "SECRET" not in str(error)
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
     def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""
