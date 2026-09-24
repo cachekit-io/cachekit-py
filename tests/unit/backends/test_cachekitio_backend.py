@@ -56,8 +56,8 @@ def mock_sync_client() -> Any:
     """Yield a mock httpx.Client and patch both client factories during backend init."""
     client = MagicMock(spec=httpx.Client)
     with patch(
-        "cachekit.backends.cachekitio.backend.get_sync_http_client",
-        return_value=client,
+        "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+        return_value=MagicMock(client=client),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
@@ -173,7 +173,10 @@ class TestInit:
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""
         monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
-        with patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=MagicMock(spec=httpx.Client)):
+        with patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        ):
             with patch(
                 "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
                 return_value=MagicMock(spec=httpx.AsyncClient),

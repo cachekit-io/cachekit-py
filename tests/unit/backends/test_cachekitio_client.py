@@ -2,6 +2,7 @@
 
 Tests for backends/cachekitio/client.py covering:
 - Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
+- Sync client lifecycle: open while a lease is held, closed once the last lease goes
 - Client configuration (base_url, timeout, Authorization header)
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() clears thread-local references
@@ -19,7 +20,7 @@ from cachekit.backends.cachekitio.client import (
     close_async_client,
     close_sync_client,
     get_cached_async_http_client,
-    get_sync_http_client,
+    lease_sync_http_client,
     reset_global_client,
 )
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
@@ -43,54 +44,46 @@ def _cleanup() -> None:  # type: ignore[return]
 
 
 @pytest.mark.unit
-class TestGetSyncHttpClient:
+class TestLeaseSyncHttpClient:
     """Sync HTTP client factory behaviour."""
 
-    def test_returns_httpx_client(self, config: CachekitIOBackendConfig) -> None:
-        """Factory returns an httpx.Client instance."""
-        client = get_sync_http_client(config)
-        assert isinstance(client, httpx.Client)
+    def test_lease_holds_an_httpx_client(self, config: CachekitIOBackendConfig) -> None:
+        """The lease carries an httpx.Client instance."""
+        lease = lease_sync_http_client(config)
+        assert isinstance(lease.client, httpx.Client)
 
     def test_same_instance_on_repeated_calls(self, config: CachekitIOBackendConfig) -> None:
-        """Thread-local caching: same object returned every time within a thread."""
-        c1 = get_sync_http_client(config)
-        c2 = get_sync_http_client(config)
-        assert c1 is c2
+        """Thread-local caching: same lease (and client) returned every time within a thread."""
+        l1 = lease_sync_http_client(config)
+        l2 = lease_sync_http_client(config)
+        assert l1 is l2
 
     def test_base_url_configured(self, config: CachekitIOBackendConfig) -> None:
         """Client base_url matches config.api_url."""
-        client = get_sync_http_client(config)
+        lease = lease_sync_http_client(config)
         # httpx stores base_url as a URL object; compare string representation
-        assert str(client.base_url).rstrip("/") == config.api_url.rstrip("/")
+        assert str(lease.client.base_url).rstrip("/") == config.api_url.rstrip("/")
 
     def test_timeout_configured(self, config: CachekitIOBackendConfig) -> None:
         """Client timeout matches config.timeout."""
-        client = get_sync_http_client(config)
-        assert client.timeout.read == config.timeout
+        lease = lease_sync_http_client(config)
+        assert lease.client.timeout.read == config.timeout
 
     def test_authorization_header(self, config: CachekitIOBackendConfig) -> None:
         """Authorization header is Bearer <api_key>."""
-        client = get_sync_http_client(config)
-        auth_header = client.headers.get("authorization", "")
+        lease = lease_sync_http_client(config)
+        auth_header = lease.client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
-
-    def test_closed_cached_client_is_a_miss(self, config: CachekitIOBackendConfig) -> None:
-        """A cached client that was closed (e.g. mid-release on another thread) is never handed out."""
-        c1 = get_sync_http_client(config)
-        c1.close()
-        c2 = get_sync_http_client(config)
-        assert c2 is not c1
-        assert not c2.is_closed
 
     def test_distinct_keys_get_distinct_clients(self, config: CachekitIOBackendConfig) -> None:
         """Regression: a single per-thread client sent every backend's traffic under the FIRST key."""
         other = CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=1.0)  # noqa: S106
-        c1 = get_sync_http_client(config)
-        c2 = get_sync_http_client(other)
-        assert c1 is not c2
-        assert c2.headers["authorization"] == "Bearer ck_other_key"
-        assert c2.timeout.read == 1.0
-        assert get_sync_http_client(config) is c1
+        l1 = lease_sync_http_client(config)
+        l2 = lease_sync_http_client(other)
+        assert l1.client is not l2.client
+        assert l2.client.headers["authorization"] == "Bearer ck_other_key"
+        assert l2.client.timeout.read == 1.0
+        assert lease_sync_http_client(config) is l1
 
 
 @pytest.mark.unit
@@ -123,10 +116,10 @@ class TestCloseSyncClient:
         """After close, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
-        client = get_sync_http_client(config)
+        lease = lease_sync_http_client(config)
         close_sync_client()
-        assert client.is_closed
-        assert not client_module._thread_local.sync_clients
+        assert lease.client.is_closed
+        assert not client_module._thread_local.sync_leases
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
@@ -153,12 +146,13 @@ class TestCloseSurvivesAFailingClient:
     def test_sync(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
         from cachekit.backends.cachekitio import client as client_module
 
-        clients = [get_sync_http_client(config), get_sync_http_client(other)]
-        clients[fail_idx].close = _raise  # type: ignore[method-assign]
+        leases = [lease_sync_http_client(config), lease_sync_http_client(other)]
+        leases[fail_idx].client.close = _raise  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="close failed"):
             close_sync_client()
-        assert clients[1 - fail_idx].is_closed
-        assert not client_module._thread_local.sync_clients
+        assert leases[1 - fail_idx].client.is_closed
+        assert not client_module._thread_local.sync_leases
+        del leases[fail_idx].client.close  # else the release finalizer later hits _raise
 
     async def test_async(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
         from cachekit.backends.cachekitio import client as client_module
@@ -184,24 +178,23 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
     for i in range(20):
         CachekitIOBackend(api_key=f"ck_test_rotated_{i}")  # pragma: allowlist secret
     gc.collect()
-    assert list(client_module._thread_local.sync_clients.values()) == [live._sync_client]
+    assert list(client_module._thread_local.sync_leases.values()) == [live._sync_lease]
     assert list(client_module._thread_local.async_clients.values()) == [live._async_client]
 
 
 @pytest.mark.unit
 def test_releasing_the_last_backend_closes_its_sync_client(monkeypatch: pytest.MonkeyPatch) -> None:
     """A released client is close()d on release, not left to socket finalizers."""
-    from cachekit.backends.cachekitio import client as client_module
     from cachekit.backends.cachekitio.backend import CachekitIOBackend
 
     closed: list[int] = []
-    real_close = client_module._SyncClient.close
+    real_close = httpx.Client.close
 
     def spy(self: httpx.Client) -> None:
         closed.append(id(self))
         real_close(self)
 
-    monkeypatch.setattr(client_module._SyncClient, "close", spy)
+    monkeypatch.setattr(httpx.Client, "close", spy)
     first = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
     second = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
     client_id = id(first._sync_client)
@@ -212,21 +205,49 @@ def test_releasing_the_last_backend_closes_its_sync_client(monkeypatch: pytest.M
 
 
 @pytest.mark.unit
+def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a client-level __del__ runs while weak references to the client still resolve,
+    so a backend built mid-release revived the dying client, which then closed under it."""
+    import threading
+
+    from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+    closing, resume = threading.Event(), threading.Event()
+    real_close = httpx.Client.close
+
+    def slow_close(self: httpx.Client) -> None:
+        closing.set()
+        resume.wait(5)
+        real_close(self)
+
+    monkeypatch.setattr(httpx.Client, "close", slow_close)
+    holder = [CachekitIOBackend(api_key="ck_test_race")]  # pragma: allowlist secret
+    releaser = threading.Thread(target=holder.clear)  # the last backend is released on another thread
+    releaser.start()
+    assert closing.wait(5)
+    rebuilt = CachekitIOBackend(api_key="ck_test_race")  # pragma: allowlist secret
+    resume.set()
+    releaser.join(5)
+    assert not rebuilt._sync_client.is_closed
+
+
+@pytest.mark.unit
 def test_failed_close_on_release_is_logged_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A close() failure in __del__ is logged at debug instead of vanishing silently."""
+    """A socket that will not close on release is logged at debug, with no free-form error text."""
     from unittest.mock import MagicMock
 
     from cachekit.backends.cachekitio import client as client_module
 
     def fail(self: httpx.Client) -> None:
-        raise RuntimeError("close failed")
+        raise OSError("close failed with SECRET_DETAIL")
 
     log = MagicMock()
     monkeypatch.setattr(client_module, "_logger", log)
-    monkeypatch.setattr(client_module._SyncClient, "close", fail)
-    client_module._SyncClient().__del__()
-    log.debug.assert_called()
-    assert "RuntimeError" in log.debug.call_args.args[0]
+    monkeypatch.setattr(httpx.Client, "close", fail)
+    client_module._close_released_client(httpx.Client())
+    log.debug.assert_called_once()
+    assert "OSError" in log.debug.call_args.kwargs["error"]
+    assert "SECRET_DETAIL" not in repr(log.debug.call_args)
 
 
 @pytest.mark.unit
@@ -253,10 +274,10 @@ class TestResetGlobalClient:
         """After reset, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
-        client = get_sync_http_client(config)  # held, so only the reset can empty the cache
+        lease = lease_sync_http_client(config)  # held, so only the reset can empty the cache
         reset_global_client()
-        assert not client_module._thread_local.sync_clients
-        assert not client.is_closed
+        assert not client_module._thread_local.sync_leases
+        assert not lease.client.is_closed
 
     def test_clears_async_thread_local(self, config: CachekitIOBackendConfig) -> None:
         """After reset, this thread's async client cache is empty."""
@@ -269,10 +290,10 @@ class TestResetGlobalClient:
 
     def test_new_sync_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh client (different object)."""
-        c1 = get_sync_http_client(config)
+        l1 = lease_sync_http_client(config)
         reset_global_client()
-        c2 = get_sync_http_client(config)
-        assert c1 is not c2
+        l2 = lease_sync_http_client(config)
+        assert l1.client is not l2.client
 
     def test_new_async_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh async client (different object)."""

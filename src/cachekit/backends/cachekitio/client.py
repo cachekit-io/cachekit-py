@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 import weakref
-from contextlib import AsyncExitStack, ExitStack, suppress
+from contextlib import AsyncExitStack, ExitStack
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -26,36 +26,45 @@ _ClientKey = tuple[str, str, float, int]
 _logger = get_structured_logger(__name__)
 
 
-# The weak caches below release a client when its last backend goes; this closes a sync
-# client at that moment instead of leaving its pool to socket finalizers (the pattern the
-# Anthropic and OpenAI Python SDKs use for their httpx wrappers). A close failure is logged at
-# debug, never raised: __del__ has no caller to report to. The log call itself is guarded
-# because __del__ may run during interpreter shutdown, after logging is torn down.
-# No async twin: aclose()'s coroutine holds the client, so scheduling it from __del__
-# resurrects the client and the weak cache hands the dying client to the next backend with
-# that key; nor is the loop that owns its connections known here.
-class _SyncClient(httpx.Client):
-    def __del__(self) -> None:
-        if self.is_closed:
-            return
-        try:
-            self.close()
-        except Exception as e:
-            with suppress(Exception):
-                _logger.debug(f"Closing a released cachekit.io HTTP client failed: {redact_error_for_log(e)}")
+class SyncClientLease:
+    """A hold on a shared per-thread sync client, closed once the last lease for its config goes.
+
+    Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
+    on its own drops the lease at once, and with it the client.
+    """
+
+    # The weak cache points at leases, never at clients, and a lease has no __del__. When the last
+    # backend drops one, CPython clears weak references to it before any finalizer runs, so a lookup
+    # on another thread sees either the live lease or a miss, never a client mid-close. A __del__ on
+    # the cached object cannot promise that: it runs while weak references still resolve, so a
+    # concurrent lookup revives the object and then inherits the close.
+    def __init__(self, config: CachekitIOBackendConfig) -> None:
+        self.client = httpx.Client(**_client_kwargs(config))
+        # atexit=False: no network I/O during interpreter exit; the process reclaims the sockets.
+        weakref.finalize(self, _close_released_client, self.client).atexit = False
+
+
+def _close_released_client(client: httpx.Client) -> None:
+    # A finalizer has no caller to report to, so the expected failure (a socket that will not close
+    # cleanly) is logged, not raised. Anything else is a bug; the interpreter reports it as
+    # unraisable instead of it vanishing here.
+    try:
+        client.close()
+    except OSError as e:
+        _logger.debug("Closing a released cachekit.io HTTP client failed", error=redact_error_for_log(e))
 
 
 class _ThreadClients(threading.local):
     # threading.local runs __init__ once per thread, on that thread's first access.
-    # Values are weak: each CachekitIOBackend holds its clients strongly, so a client stays
-    # cached while some backend uses it and is dropped when the last one goes (a sync client
-    # is closed then too, see _SyncClient).
+    # Values are weak: each CachekitIOBackend holds its sync lease and async client strongly, so
+    # each stays cached while some backend uses it and is dropped when the last one goes (a sync
+    # client is closed then too, see SyncClientLease).
     # ponytail: a released async client is never closed — its sockets are reclaimed by their
     # finalizers, with a ResourceWarning each — and a backend built and discarded per call gets
     # no pool reuse. Hold one backend per key, or add a small strong LRU in front if per-call
     # construction matters.
     def __init__(self) -> None:
-        self.sync_clients: weakref.WeakValueDictionary[_ClientKey, httpx.Client] = weakref.WeakValueDictionary()
+        self.sync_leases: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
         self.async_clients: weakref.WeakValueDictionary[_ClientKey, httpx.AsyncClient] = weakref.WeakValueDictionary()
 
 
@@ -104,23 +113,23 @@ def get_cached_async_http_client(config: CachekitIOBackendConfig) -> httpx.Async
     return client
 
 
-def get_sync_http_client(config: CachekitIOBackendConfig) -> httpx.Client:
-    """Get the per-thread sync HTTP client for this config (created on first use).
+def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
+    """Lease the per-thread sync HTTP client for this config (created on first use).
 
     Args:
         config: cachekit.io backend configuration
 
     Returns:
-        httpx.Client: Thread-local sync HTTP client for exactly this config
+        SyncClientLease: its ``.client`` is the thread-local sync client for exactly this config,
+        open for as long as some lease on it is held
     """
-    clients = _thread_local.sync_clients
+    leases = _thread_local.sync_leases
     key = _client_key(config)
-    client = clients.get(key)
-    # Closed counts as a miss: a client whose last backend was just released on another thread
-    # can still be reachable here while its __del__ closes it.
-    if client is None or client.is_closed:
-        client = clients[key] = _SyncClient(**_client_kwargs(config))
-    return client
+    # Bind to a local first: the weak dict alone would let a fresh lease die on insertion.
+    lease = leases.get(key)
+    if lease is None:
+        lease = leases[key] = SyncClientLease(config)
+    return lease
 
 
 # The exit stack runs every pushed close even when an earlier one raises, then re-raises:
@@ -136,11 +145,11 @@ async def close_async_client() -> None:
 
 def close_sync_client() -> None:
     """Close this thread's sync client instances (useful for cleanup)."""
-    clients = _thread_local.sync_clients
+    leases = _thread_local.sync_leases
     with ExitStack() as stack:
-        for client in clients.values():
-            stack.callback(client.close)
-        clients.clear()
+        for lease in leases.values():
+            stack.callback(lease.client.close)
+        leases.clear()
 
 
 def reset_global_client() -> None:
@@ -149,12 +158,13 @@ def reset_global_client() -> None:
     Note: This does not properly close clients. Use close_*_client() for proper cleanup.
     """
     _thread_local.async_clients.clear()
-    _thread_local.sync_clients.clear()
+    _thread_local.sync_leases.clear()
 
 
 __all__ = [
     "get_cached_async_http_client",
-    "get_sync_http_client",
+    "SyncClientLease",
+    "lease_sync_http_client",
     "close_async_client",
     "close_sync_client",
     "reset_global_client",
