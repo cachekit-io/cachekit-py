@@ -217,7 +217,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If `CACHEKIT_API_KEY` is not set
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 
@@ -666,31 +666,13 @@ For comprehensive backend guide with examples and implementation patterns, see *
 
 ### Backend Resolution Priority
 
-When `@cache` is used without explicit `backend` parameter, resolution follows this 3-tier priority:
+When `@cache` is used without an explicit `backend` parameter, resolution follows this priority:
 
-1. **Explicit backend parameter** (highest priority)
-   ```python notest
-   custom_backend = HTTPBackend("https://api.example.com")
-   @cache(backend=custom_backend)  # Uses custom backend explicitly
-   def my_function():
-       return "result"
-   ```
+1. **Explicit backend** — `@cache(backend=...)`, then a backend inside `config=`
+2. **Module-level default** — `set_default_backend(...)`
+3. **Environment auto-detection** — `CACHEKIT_API_KEY`, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR`, with `REDIS_URL` as a fallback
 
-2. **Default RedisBackend** (middle priority)
-   ```python notest
-   @cache  # Uses RedisBackend with CACHEKIT_REDIS_URL or REDIS_URL
-   def my_function():
-       return "result"
-   ```
-
-3. **Environment variable configuration** (lowest priority)
-   ```bash
-   # Primary: CACHEKIT_REDIS_URL
-   CACHEKIT_REDIS_URL=redis://localhost:6379/0
-
-   # Fallback: REDIS_URL
-   REDIS_URL=redis://localhost:6379/0
-   ```
+Examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
 
 ### L1-Only Mode (No Backend)
 
