@@ -145,8 +145,10 @@ class TestInit:
         [
             {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
             {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
+            # An unparseable URL once went into the message whole, userinfo credentials and all.
+            {"api_key": _TEST_API_KEY, "api_url": "https://user:SECRET_PW@[::1"},  # pragma: allowlist secret
         ],
-        ids=["whitespace", "allowlist"],
+        ids=["whitespace", "allowlist", "unparseable-url"],
     )
     def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
         """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""

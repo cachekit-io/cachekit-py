@@ -158,7 +158,8 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         try:
             parsed = urlparse(v)
         except Exception as e:
-            raise ValueError(f"Invalid API URL: {v}") from e
+            # Never echo the URL: its userinfo may carry credentials (CWE-532).
+            raise ValueError("Invalid API URL: could not be parsed") from e
 
         # Enforce HTTPS protocol
         if parsed.scheme != "https":
