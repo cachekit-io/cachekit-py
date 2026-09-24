@@ -148,7 +148,7 @@ class TestInit:
         ],
         ids=["whitespace", "allowlist"],
     )
-    def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict) -> None:
+    def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
         """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
         from pydantic import ValidationError
 
