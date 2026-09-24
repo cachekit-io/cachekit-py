@@ -147,6 +147,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 
 **Security notes:**
 - `CACHEKIT_API_URL` must use HTTPS. HTTP is rejected at startup.
+- Credentials in the URL (`user:password@`) are rejected: the API key is the only credential.
 - Private/internal IP addresses are blocked (SSRF protection). This includes `10.x`, `172.16-31.x`, `192.168.x`, `127.x`, and link-local ranges.
 - `CACHEKIT_ALLOW_CUSTOM_HOST=true` disables the hostname allowlist. Only use with trusted configuration (e.g., a local test server running over HTTPS with a self-signed cert).
 

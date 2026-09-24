@@ -217,7 +217,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If `CACHEKIT_API_KEY` is not set
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 

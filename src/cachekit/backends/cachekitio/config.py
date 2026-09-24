@@ -167,12 +167,13 @@ class CachekitIOBackendConfig(BaseBackendConfig):
 
         # Userinfo never authenticates here: httpx sends it as Basic auth in place of the Bearer key,
         # and its INFO log prints the full request URL, password included (CWE-532).
-        if parsed.username is not None or parsed.password is not None:
+        if "@" in parsed.netloc:
             raise ValueError("API URL must not contain credentials (user:password@)")
 
         # Enforce HTTPS protocol
         if parsed.scheme != "https":
-            raise ValueError(f"API URL must use HTTPS protocol, got: {parsed.scheme}://")
+            # No scheme echo: in "user:pw@host" urlparse reads the username as the scheme.
+            raise ValueError("API URL must use HTTPS protocol")
 
         # Reject private/internal IP addresses
         hostname = parsed.hostname or ""

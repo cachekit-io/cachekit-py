@@ -62,8 +62,8 @@ def tenant_b_function(x):
 ```
 
 `@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
-source, if the key contains whitespace (usually a trailing newline from a secrets file), or
-if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
+source, if the key contains whitespace (usually a trailing newline from a secrets file), if
+`CACHEKIT_API_URL` fails validation, or if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
 To cache through another backend, use `@cache.production(backend=...)`.
 
 The RORO form `@cache(config=DecoratorConfig.io(api_key=...))` keeps its own key even when

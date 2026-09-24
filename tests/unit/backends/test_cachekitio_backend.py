@@ -178,6 +178,13 @@ class TestInit:
             CachekitIOBackend(api_key=_TEST_API_KEY, api_url=f"https://{userinfo}api.cachekit.io")
         assert "SECRET" not in str(info.value)
 
+    def test_https_error_never_echoes_a_schemeless_url(self, mock_sync_client: MagicMock) -> None:
+        """Without a scheme, urlparse reads the username as one, and the HTTPS error once echoed it."""
+        url = "SECRETUSER:pw@api.cachekit.io"  # pragma: allowlist secret
+        with pytest.raises(ConfigurationError, match="must use HTTPS") as info:
+            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=url)
+        assert "secretuser" not in str(info.value).lower()  # urlparse lowercases the scheme
+
     def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""
         monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
