@@ -139,7 +139,7 @@ fast_backend = backend.with_timeout(1.0)  # 1-second timeout variant
 
 ## Security
 
-The API URL is validated on construction — HTTPS required, private/internal IP addresses blocked. The default allowlist restricts connections to `api.cachekit.io` and `api.staging.cachekit.io`. Set `CACHEKIT_ALLOW_CUSTOM_HOST=true` to override (testing only).
+The API URL is validated on construction — HTTPS required, credentials in the URL (`user:password@`) rejected, private/internal IP addresses blocked. The default allowlist restricts connections to `api.cachekit.io` and `api.staging.cachekit.io`. Set `CACHEKIT_ALLOW_CUSTOM_HOST=true` to override (testing only).
 
 ## Environment Variables
 

@@ -219,7 +219,7 @@ class CachekitIOBackend:
 
         Raises:
             ConfigurationError: missing, empty or whitespace-containing API key, or an API URL that fails
-                validation (non-HTTPS, private address, host not in the allowlist).
+                validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
         errors = None

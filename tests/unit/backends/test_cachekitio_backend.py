@@ -170,6 +170,14 @@ class TestInit:
         assert error.__cause__ is None
         assert error.__context__ is None
 
+    @pytest.mark.parametrize("userinfo", ["user:SECRET_PW@", "SECRET_USER@"], ids=["user-password", "user-only"])
+    def test_url_with_userinfo_is_rejected(self, mock_sync_client: MagicMock, userinfo: str) -> None:
+        """httpx sends URL userinfo as Basic auth in place of the Bearer key, and its INFO log prints the
+        full request URL, password included (CWE-532): such a URL never authenticated, so reject it."""
+        with pytest.raises(ConfigurationError, match="must not contain credentials") as info:
+            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=f"https://{userinfo}api.cachekit.io")
+        assert "SECRET" not in str(info.value)
+
     def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""
         monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)

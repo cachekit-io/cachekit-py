@@ -94,6 +94,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     Security:
         SSRF protection is enabled by default. The api_url is validated to:
         - Require HTTPS protocol
+        - Reject credentials in the URL (user:password@); the API key is the only credential
         - Reject private/internal IP addresses (10.x, 172.16-31.x, 192.168.x, etc.)
         - Only allow known hostnames (api.cachekit.io, api.staging.cachekit.io)
 
@@ -153,7 +154,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         """Validate API URL with SSRF protection.
 
         Raises:
-            ValueError: If URL is invalid, uses non-HTTPS, or targets private IP
+            ValueError: If URL is invalid, carries credentials, uses non-HTTPS, or targets private IP
         """
         # Never echo the URL: its userinfo may carry credentials (CWE-532). urlparse's own error can
         # quote the whole netloc, so it is kept off the chain too: raised outside the except block.
@@ -163,6 +164,11 @@ class CachekitIOBackendConfig(BaseBackendConfig):
             parsed = None
         if parsed is None:
             raise ValueError("Invalid API URL: could not be parsed")
+
+        # Userinfo never authenticates here: httpx sends it as Basic auth in place of the Bearer key,
+        # and its INFO log prints the full request URL, password included (CWE-532).
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("API URL must not contain credentials (user:password@)")
 
         # Enforce HTTPS protocol
         if parsed.scheme != "https":
