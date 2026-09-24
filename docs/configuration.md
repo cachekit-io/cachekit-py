@@ -138,7 +138,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 
 | Variable | Type | Default | Required | Description |
 |----------|------|---------|----------|-------------|
-| `CACHEKIT_API_KEY` | `SecretStr` | — | Yes | API key (`ck_live_...`) for authentication |
+| `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
 | `CACHEKIT_MAX_RETRIES` | `int` | `3` | No | Max retry attempts for transient errors |
