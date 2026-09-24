@@ -254,9 +254,16 @@ class L1Cache:
         if not lock._is_owned() and lock.acquire(timeout=1.0):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
             lock.release()
             return
-        self._lock = threading.RLock()
+        logger.warning(
+            "L1Cache %s: dropped %d entries (%d bytes) after fork; a parent thread held its lock",
+            self.namespace,
+            len(self._cache),
+            self._current_memory_bytes,
+        )
+        # Clear before publishing the new lock: the orphaned one still shuts every other thread out.
         self._cache.clear()
         self._current_memory_bytes = 0
+        self._lock = threading.RLock()
 
     def _remove_entry(self, key: str) -> None:
         """Remove entry from cache and update memory tracking.
@@ -408,9 +415,10 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread. A thread the parent had stopped stays stopped. Known limit: a child whose
-        first touch of a cache is a get() still blocks if a parent thread held that cache's
-        lock at fork.
+        thread. A thread the parent had stopped stays stopped. Known limit: a get() that reaches
+        a cache lock orphaned at fork before any put in the child has run this hangs for the
+        child's life. Decorated functions get() before they put(), so their first call in that
+        namespace is exposed.
         """
         pid = os.getpid()
         if self._owner_pid == pid:

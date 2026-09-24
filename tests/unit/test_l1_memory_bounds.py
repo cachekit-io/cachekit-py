@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -335,6 +336,26 @@ class TestCleanupThreadAfterFork:
 
         assert manager._cleanup_thread is None
         assert manager._owner_pid == os.getpid()
+
+    def test_orphaned_cache_lock_drop_is_exclusive_and_logged(self, caplog):
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("orphan-ns")
+        cache.put("pre-fork", b"v")
+        _as_if_forked(manager, parent_ran_cleanup=False)
+        orphaned = cache._lock
+        orphaned.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
+
+        class ClearUnderOrphanedLock(OrderedDict):
+            def clear(self) -> None:
+                assert cache._lock is orphaned  # a fresh lock here would let a get() in mid-clear
+                super().clear()
+
+        cache._cache = ClearUnderOrphanedLock(cache._cache)
+        with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
+            cache.put("k", b"v")
+
+        assert not cache.get("pre-fork")[0] and cache.get("k")[0]
+        assert any("dropped 1 entries" in r.message for r in caplog.records)
 
     def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
