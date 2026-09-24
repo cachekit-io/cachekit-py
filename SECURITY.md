@@ -150,6 +150,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
 | Logging | Never exposed in logs/errors |
 | Derivation | HKDF with unique tenant salts |
+| Single-tenant `tenant_id` | Literal `"default"` (protocol cross-SDK default) unless `deployment_uuid` / `CACHEKIT_DEPLOYMENT_UUID` is set; the same value binds HKDF and AAD |
 
 </details>
 
