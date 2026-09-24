@@ -118,8 +118,9 @@ class TestCloseSyncClient:
         """After close, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
-        get_sync_http_client(config)
+        client = get_sync_http_client(config)
         close_sync_client()
+        assert client.is_closed
         assert not client_module._thread_local.sync_clients
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
@@ -166,6 +167,23 @@ class TestCloseSurvivesAFailingClient:
 
 
 @pytest.mark.unit
+def test_discarded_backends_do_not_accumulate_clients() -> None:
+    """Regression: a strong per-config cache kept a client pair per distinct key forever, so
+    rotating keys (or with_timeout per call) grew a long-lived thread's pools without bound."""
+    import gc
+
+    from cachekit.backends.cachekitio import client as client_module
+    from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+    live = CachekitIOBackend(api_key="ck_live_tenant")  # pragma: allowlist secret
+    for i in range(20):
+        CachekitIOBackend(api_key=f"ck_rotated_{i}")  # pragma: allowlist secret
+    gc.collect()
+    assert list(client_module._thread_local.sync_clients.values()) == [live._sync_client]
+    assert list(client_module._thread_local.async_clients.values()) == [live._async_client]
+
+
+@pytest.mark.unit
 class TestResetGlobalClient:
     """reset_global_client() clears all client references."""
 
@@ -173,17 +191,19 @@ class TestResetGlobalClient:
         """After reset, this thread's sync client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
-        get_sync_http_client(config)
+        client = get_sync_http_client(config)  # held, so only the reset can empty the cache
         reset_global_client()
         assert not client_module._thread_local.sync_clients
+        assert not client.is_closed
 
     def test_clears_async_thread_local(self, config: CachekitIOBackendConfig) -> None:
         """After reset, this thread's async client cache is empty."""
         from cachekit.backends.cachekitio import client as client_module
 
-        get_cached_async_http_client(config)
+        client = get_cached_async_http_client(config)  # held, so only the reset can empty the cache
         reset_global_client()
         assert not client_module._thread_local.async_clients
+        assert not client.is_closed
 
     def test_new_sync_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh client (different object)."""

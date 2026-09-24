@@ -62,7 +62,7 @@ def tenant_b_function(x):
 ```
 
 `@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
-source, if the key contains whitespace (usually a trailing newline from a secrets file), and
+source, if the key contains whitespace (usually a trailing newline from a secrets file), or
 if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
 To cache through another backend, use `@cache.production(backend=...)`.
 
@@ -166,8 +166,10 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 - Latency: ~10–50ms L2 (HTTP/2, region-dependent)
 - Sync and async support (hybrid client architecture)
-- Connection pooling built-in (default: 10 connections)
-- Automatic retries on transient errors (default: 3)
+- Connection pooling built-in (default: 10 connections). Backends created on the same thread with the
+  same key, URL, timeout and pool size share one pool while any of them is alive. When the last one is
+  garbage-collected the pool is dropped without a graceful close (Python emits a `ResourceWarning` per
+  socket), so create one backend per key and reuse it
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 
