@@ -328,11 +328,13 @@ def get_data():
 
 ### E021: Deserialization failed
 
-**Message**: `msgpack.exceptions.UnpackException` or `json.JSONDecodeError`
+**Message**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, or `Cache entry is not a decodable MessagePack payload ...`
 
-**Error Code**: `DeserializationError`
+**Error Code**: `SerializationError` (same class as E020 — there is no separate `DeserializationError` class)
 
-**Cause**: Cached data is corrupted or wrong serializer used for decoding
+**Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see E003 above.
+
+**What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see E003 above.)
 
 **Solution**:
 ```bash

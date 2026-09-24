@@ -68,8 +68,8 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         assert result2 == result1
         assert call_count == 1  # Function not called again
 
-    def test_single_tenant_mode_uses_nil_uuid(self):
-        """CRITICAL: Single-tenant mode (no tenant_extractor) should use nil UUID as default."""
+    def test_single_tenant_mode_round_trips(self):
+        """CRITICAL: Single-tenant mode (no tenant_extractor) stores and reads back encrypted data."""
         call_count = 0
 
         @cache.secure(master_key="a" * 64, ttl=300, namespace="single_tenant")

@@ -77,6 +77,60 @@ class TestDataFrameSeriesReadRoutes:
         data, _ = s.serialize(value)
         _assert_equal(s.deserialize(data), value)
 
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_cross_config_written_off_read_on_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """LAB-2736 follow-up: an entry written with integrity off (no ByteStorage envelope,
+        no checksum ever computed) must raise, not reconstruct, when read by a reader with
+        integrity on — a same-shaped DataFrame/Series with silently wrong values is far more
+        dangerous than a raw-dict/TypeError, so this path never falls through like the
+        generic msgpack path does. Confirmed exploitable before this test existed: 6427/7208
+        single-bit flips on such an entry decoded to a different-valued DataFrame with no
+        error at all, and even the UNCORRUPTED entry decoded successfully despite never
+        having been checksummed. Matches StandardSerializer's stricter contract."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_cross_config_written_on_read_off_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """The other direction: an enveloped entry (metadata.compressed=True) read by a reader
+        with integrity off must raise explicitly. Before the gate this only failed by luck —
+        the envelope happens to msgpack-decode as a list, not the dict the columnar decoder
+        expects — and surfaced as a misleading "forged columnar payload" error."""
+        writer = _no_arrow(enable_integrity_checking=True)
+        reader = _no_arrow(enable_integrity_checking=False)
+        data, meta = writer.serialize(value)
+        assert meta.compressed is True
+
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_corrupted_integrity_off_entry_read_on_fails_closed_not_silently_wrong(
+        self, value: pd.DataFrame | pd.Series
+    ) -> None:
+        """The actual exploited shape: bit-flip an entry that was written with integrity
+        off, then read it with integrity on. Every flip must raise SerializationError —
+        none may silently return a DataFrame/Series with different values than what was
+        written. A sample across the byte range (not exhaustive, for CI speed) is enough
+        to pin the contract; the exhaustive proof (7208/7208 raised, 0 silent-wrong) was
+        run by hand before this fix landed."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        for byte_idx in range(0, len(data), max(1, len(data) // 40)):
+            corrupted = bytearray(data)
+            corrupted[byte_idx] ^= 0xFF
+            try:
+                out = reader.deserialize(bytes(corrupted), meta)
+            except SerializationError:
+                continue
+            pytest.fail(f"byte {byte_idx} flip silently returned {out!r} instead of raising")
+
 
 @pytest.mark.unit
 class TestDeserializedArraysAreWritable:
@@ -138,6 +192,94 @@ class TestDataFrameSeriesCorruptionDiagnostic:
         corrupted[len(corrupted) // 2] ^= 0xFF
         with pytest.raises(SerializationError):
             s.deserialize(bytes(corrupted), meta)
+
+
+@pytest.mark.unit
+class TestEnvelopeVerificationVsNotAnEnvelope:
+    """LAB-2736: ``retrieve()`` raises a distinct type for a verified-but-corrupt envelope
+    (checksum/decompression/size failure) vs. bytes that were never a ByteStorage envelope
+    at all (e.g. written with integrity checking off). ``deserialize`` must fail closed on
+    the former and keep falling through to the plain-msgpack path only on the latter.
+    """
+
+    def test_corrupted_payload_names_the_integrity_failure(self) -> None:
+        s = AutoSerializer()
+        data, meta = s.serialize({"nums": list(range(2000))})
+
+        corrupted = bytearray(data)
+        corrupted[len(corrupted) // 2] ^= 0xFF
+        with pytest.raises(SerializationError) as exc_info:
+            s.deserialize(bytes(corrupted), meta)
+
+        message = str(exc_info.value)
+        assert "envelope verification" in message
+        assert "not a decodable MessagePack" not in message
+
+    def test_plain_msgpack_written_with_integrity_off_still_falls_through(self) -> None:
+        off = AutoSerializer(enable_integrity_checking=False)
+        payload = {"a": 1, "b": [1, 2, 3]}
+        data, _ = off.serialize(payload)
+
+        on = AutoSerializer(enable_integrity_checking=True)
+        assert on.deserialize(data) == payload
+
+    def test_structurally_corrupt_envelope_on_generic_path_fails_closed(self) -> None:
+        """LAB-2736 follow-up: metadata.compressed=True (the writer's own record that this
+        entry should be a verified envelope) plus a structural parse failure — not just a
+        checksum mismatch — must still raise, not fall through to unpackb_bounded on the
+        still-enveloped bytes. Truncation forces DeserializationFailed (structural), the
+        other branch of retrieve()'s failure taxonomy from the checksum-mismatch case
+        ``test_corrupted_payload_names_the_integrity_failure`` already covers above."""
+        s = AutoSerializer(enable_integrity_checking=True)
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        truncated = data[: len(data) // 4]
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(truncated, meta)
+
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
+        """Writer on, reader off, generic msgpack: retrieve() never runs, so nothing sets
+        envelope_error and the compressed=True gate below it never fires. Before the gate
+        the read fell through to unpackb on the ENVELOPE bytes and silently returned its
+        positional fields — ``[payload, checksum, size, format]`` — as the cached value."""
+        on = AutoSerializer(enable_integrity_checking=True)
+        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        off = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            off.deserialize(data, meta)
+
+    def test_verified_envelope_format_comes_from_the_envelope_not_the_header(self) -> None:
+        """``metadata.original_type`` is a plaintext-header field. With it None (one flipped
+        header byte), the former ``hasattr(...) else format_id`` never reached ``format_id``
+        and a checksum-verified Series envelope decoded as a dict — an unauthenticated field
+        silently overriding the authenticated one. The envelope's own format record wins."""
+        s = AutoSerializer()
+        series = pd.Series([1.0, 2.0, 3.0], name="v")
+        data, meta = s.serialize(series)
+        meta.original_type = None
+
+        out = s.deserialize(data, meta)
+        assert isinstance(out, pd.Series)
+        pd.testing.assert_series_equal(out, series)
+
+    def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
+        """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
+        CK-header byte outside any authentication tag. Flipping it False on a structurally
+        corrupt integrity-on envelope let the generic path decode the envelope itself and
+        return its four positional fields as the cached value. The gate must not consult it."""
+        s = AutoSerializer()
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]
+        envelope[1] = list(envelope[1])
+        envelope[1][0] = "x"  # non-u8 checksum element: the envelope fails to PARSE, not to verify
+        corrupted = msgpack.packb(envelope)
+        meta.compressed = False
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(corrupted, meta)
 
 
 # A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a

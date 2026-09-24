@@ -137,7 +137,11 @@ def cache(
         backend = manual_overrides.pop("backend", None)
 
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
-        # check module-level default set via set_default_backend()
+        # check module-level default set via set_default_backend(). Kept here
+        # (not only lazily) because decoration-time validation — the interop
+        # backend guard and stale_ttl/SWR capability (LAB-557) — needs the
+        # backend when it is already known. If the default is set LATER, the
+        # wrapper re-consults it at first call (_resolve_lazy_backend, LAB-4457).
         if backend is None and not _explicit_l1_only:
             from ..config.decorator import get_default_backend
 

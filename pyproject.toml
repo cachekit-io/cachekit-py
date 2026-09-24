@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.18.0"
+version = "0.19.0"
 description = "Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CachekitIO."
 readme = "README.md"
 license = {text = "MIT"}
@@ -66,6 +66,22 @@ dependencies = [
     "xxhash>=3.5.0",
     # HTTP client for SaaS backend (cachekit.io)
     "httpx[http2]>=0.28.1",
+    # anyio is transitive via the mandatory httpx dependency above, so it ships
+    # to EVERY install, not just dev. Declared here rather than as a
+    # [tool.uv] constraint because that table is uv-local: it never reaches
+    # requires-dist, so `pip install cachekit` would ignore it. 4.14.2 fixes
+    # GHSA-82r6-8w77-94w6 / CVE-2026-63374 (IDNA-2003 hostname encoding lets a
+    # hijacked connection to an internationalised domain pass TLS certificate
+    # validation; CVSS 9.3), GHSA-5p39-cfhj-2xmp / CVE-2026-64847 (undrained
+    # process-pool stderr pipe deadlocks the worker) and GHSA-3w57-8xmc-8v26 /
+    # CVE-2026-63349 (extra_groups ignored, parent supplementary groups kept).
+    "anyio>=4.14.2",
+    # h2 arrives via the http2 extra on that same mandatory httpx dependency, so
+    # it ships to every install too, and was declared as a [tool.uv] constraint
+    # with the same no-op effect. 4.4.1 fixes GHSA-6hr6-w5qg-qmwg (duplicate Host
+    # headers forwarded across an HTTP/2 -> HTTP/1.1 downgrade — a request
+    # smuggling primitive).
+    "h2>=4.4.1",
 ]
 
 [project.optional-dependencies]
@@ -248,7 +264,11 @@ fuzz = [
     "atheris>=2.3.0",
 ]
 
-# Override vulnerable transitive dependencies
+# Override vulnerable DEV-ONLY transitive dependencies.
+# This table is uv-local: it constrains resolution of this repo's lockfile and
+# never reaches requires-dist, so a floor placed here does NOT protect anyone who
+# runs `pip install cachekit`. A transitive that reaches users belongs in
+# [project] dependencies instead — see the anyio/h2 entries above.
 [tool.uv]
 constraint-dependencies = [
     "urllib3>=2.7.0",
@@ -259,8 +279,4 @@ constraint-dependencies = [
     # confusion) and GHSA-jp4c-xjxw-mgf9 (self-update import ordering); 26.2 fixes
     # PYSEC-2026-3721 (doubly-encoded index URLs install to arbitrary paths).
     "pip>=26.2",
-    # h2 is a transitive dep (httpx[http2] -> h2). 4.4.1 fixes
-    # GHSA-6hr6-w5qg-qmwg (duplicate Host headers forwarded on HTTP/2 ->
-    # HTTP/1.1 downgrade — request smuggling primitive).
-    "h2>=4.4.1",
 ]
