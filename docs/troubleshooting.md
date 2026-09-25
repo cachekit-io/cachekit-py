@@ -215,15 +215,16 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 
 **Quick fix**:
 ```bash
-# Generate valid encryption key
+# First-time setup only: generate a valid encryption key
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-
-# Clear cache if key was rotated
-redis-cli FLUSHDB
 
 # Restart application
 python app.py
 ```
+
+If the key was rotated, do not generate a new key or flush: keep the old key
+decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS` and follow the
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 </details>
 
@@ -445,15 +446,11 @@ python -c "import os; print(len(os.getenv('CACHEKIT_MASTER_KEY', '')))"
 
 **Solutions**:
 
-1. **Key was rotated** (most common):
-```bash
-# Clear Redis to remove incompatible cached data
-redis-cli FLUSHDB
-
-# Keep new key and restart application
-export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-python app.py
-```
+1. **Key was rotated** (most common): keep the old key decrypt-only in
+   `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3) so entries it
+   wrote stay readable, and follow the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/). Do not
+   flush or mint another key: a flush drops unrelated data on a shared
+   database, and a fresh key only repeats the failure.
 
 2. **Wrong key still in use**:
 ```bash
