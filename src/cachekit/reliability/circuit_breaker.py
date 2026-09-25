@@ -66,8 +66,9 @@ class CircuitBreakerConfig:
             Higher values ensure more stable recovery.
         timeout_seconds: How long to stay OPEN before testing recovery.
             Balance between giving service time to recover vs detecting recovery quickly.
-        half_open_requests: Max concurrent requests allowed during HALF_OPEN testing.
-            Usually 1 to minimize load during recovery testing.
+        half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
+            not a concurrency limit). Must be >= success_threshold, or a cycle can
+            never collect enough successes to close.
         excluded_error_types: BackendErrorType values that don't count as failures.
             Example: BackendErrorType.PERMANENT for config errors
 
@@ -97,7 +98,7 @@ class CircuitBreakerConfig:
     failure_threshold: int = 5  # Opens circuit after 5 consecutive failures
     success_threshold: int = 3  # Closes circuit after 3 consecutive successes
     timeout_seconds: float = 30.0  # Wait 30s before testing recovery
-    half_open_requests: int = 1  # Allow 1 test request at a time
+    half_open_requests: int = 3  # Probes per HALF_OPEN cycle; must reach success_threshold to close
     excluded_error_types: tuple[BackendErrorType, ...] = ()  # No excluded error types by default
 
     def __post_init__(self):
@@ -404,14 +405,18 @@ class CircuitBreaker:
         self._on_success()
 
     def should_attempt_call(self) -> bool:
-        """Check if a call should be attempted (for testing).
+        """Admit or reject a call — the live admission check.
 
-        This method is primarily intended for unit testing the circuit breaker's
-        request-allowing logic. It returns whether the circuit breaker would allow
-        a request in its current state.
+        ``FeatureOrchestrator.should_allow_request`` calls this for every
+        decorated call. It is not a pure query: once ``timeout_seconds`` has
+        passed since the last failure it moves OPEN to HALF_OPEN, and in
+        HALF_OPEN each ``True`` consumes one of the cycle's
+        ``half_open_requests`` probe slots. Record the outcome of every admitted
+        call with ``record_success`` / ``record_failure``; never record a
+        rejection.
 
         Returns:
-            True if the circuit breaker would allow a request, False otherwise.
+            True if the call may proceed, False if it must fail fast.
         """
         return self._allow_request()
 

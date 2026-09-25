@@ -62,20 +62,19 @@ def operation(x):
 | State | Behavior | Transition |
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
-| **OPEN** | Return stale/None, don't call Redis | After cooldown → HALF_OPEN |
-| **HALF_OPEN** | Try one Redis call | Success → CLOSED, Failure → OPEN |
+| **OPEN** | Skip the backend: the function runs uncached | First call after the cooldown (default 30s since the last failure) → HALF_OPEN |
+| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further calls run uncached | 3 successes (`success_threshold`) → CLOSED, any failure → OPEN |
 
 **Example scenario**:
 ```
 Pod A tries to cache fetch at 12:00:00
 Backend working: CLOSED state, success
 Backend fails at 12:00:05
-Requests 1-5: Errors accumulated
-Request 6: Circuit OPENS → returns None
-Requests 7-34: Circuit OPEN, returns None (no Redis calls)
-Request 35: Circuit tries HALF_OPEN (one Redis call)
-Redis back up: Success → Circuit CLOSES
-Request 36: Normal operation resumes
+Requests 1-5: Errors accumulated; the 5th failure OPENS the circuit
+Requests 6-34: Circuit OPEN, function runs uncached (no backend calls)
+Request 35 (30s after the last failure): Circuit goes HALF_OPEN, probe 1 of 3
+Requests 35-37: Backend back up, all 3 probes succeed → Circuit CLOSES
+Request 38: Normal operation resumes
 ```
 
 ---
@@ -231,25 +230,32 @@ class CircuitBreaker:
                 return func()  # Normal operation
             except Exception:
                 self.failure_count += 1
+                self.last_failure_time = time.time()
                 if self.failure_count >= threshold:  # threshold = config value
                     self.state = "OPEN"  # Open circuit
                 raise
 
-        elif self.state == "OPEN":
-            if time.time() - self.last_failure_time > cooldown:  # cooldown = config value
-                self.state = "HALF_OPEN"  # Try recovery
-            else:
-                return None  # Return None without calling
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time <= cooldown:  # cooldown = config value
+                return uncached(func)  # Rejected: no backend call, not counted as a failure
+            self.state = "HALF_OPEN"  # Try recovery
+            self.probes = self.successes = 0
 
-        elif self.state == "HALF_OPEN":
+        if self.state == "HALF_OPEN":
+            if self.probes >= half_open_requests:  # probe budget, default 3
+                return uncached(func)  # Budget spent: rejected, not a failure
+            self.probes += 1
             try:
                 result = func()
-                self.state = "CLOSED"  # Recovered!
-                self.failure_count = 0
-                return result
             except Exception:
                 self.state = "OPEN"  # Recovery failed
+                self.last_failure_time = time.time()
                 raise
+            self.successes += 1
+            if self.successes >= success_threshold:  # default 3
+                self.state = "CLOSED"  # Recovered!
+                self.failure_count = 0
+            return result
 ```
 
 ### Integration with Caching

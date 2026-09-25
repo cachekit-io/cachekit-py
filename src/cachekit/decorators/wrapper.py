@@ -1280,26 +1280,29 @@ def create_cache_wrapper(
 
         # L1+L2 MODE: Original behavior with backend initialization
 
+        # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
+        # with its probe budget spent) - run the function uncached. This sits
+        # outside the try below on purpose: that except records a failure, and a
+        # rejection is not one. Recorded, every rejected call would push the OPEN
+        # window forward and reopen HALF_OPEN, so the breaker never recovers.
+        if features.circuit_breaker and not features.should_allow_request():
+            features.log_cache_operation(
+                operation="circuit_breaker_open",
+                key=cache_key,
+                namespace=namespace or "default",
+                serializer="rust",
+                error="Circuit breaker rejected the request",
+                error_type="CircuitBreakerOpen",
+            )
+            features.clear_correlation_id()
+            reset_current_function_stats(token)
+            return func(*args, **kwargs)
+
         with features.create_span("redis_cache", span_attributes) as span:
             try:
                 # Add cache key to span attributes
                 if span:
                     features.set_span_attributes(span, {"cache.key": cache_key})
-
-                # Guard clause: Circuit breaker check - fail fast if circuit is open
-                if features.circuit_breaker and not features.should_allow_request():
-                    features.log_cache_operation(
-                        operation="circuit_breaker_open",
-                        key=cache_key,
-                        namespace=namespace or "default",
-                        serializer="rust",
-                        error="Circuit breaker is OPEN",
-                        error_type="CircuitBreakerOpen",
-                    )
-                    # Circuit breaker fail-fast: raise exception immediately
-                    raise BackendError(  # noqa: F823, type: ignore[name-defined]
-                        "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
-                    )
 
                 nonlocal _backend
                 if _backend is None:
