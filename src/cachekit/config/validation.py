@@ -51,27 +51,14 @@ class RedactingSettings(BaseSettings):
     ``hide_input_in_errors`` only affects ``str()``/``repr()``: ``errors()`` and ``json()`` still
     snapshot the raw input, which for a settings model is cleartext credentials (a master key, an
     API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
-    (``loc == ()``) snapshots the whole input dict. A failed construction is re-raised as a copy
-    with every input redacted and each error's type, loc, msg and ctx kept. The copy is still a
-    ValidationError (a ValueError), so fail-loud propagation paths are unchanged.
+    (``loc == ()``) snapshots the whole input dict. A failure in the constructor (``from_env()``
+    included) or a ``model_validate*`` classmethod is re-raised as a copy with every input redacted
+    and each error's type, loc, msg and ctx kept. The copy is still a ValidationError (a
+    ValueError), so fail-loud propagation paths are unchanged.
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        sanitized_error: ValidationError | SettingsError | None = None
-        try:
-            super().__init__(**kwargs)
-        except ValidationError as e:
-            sanitized_error = _redacted_copy(e)
-        except SettingsError as e:
-            # An env value that fails to decode (JSON for a list field) chains the decoder's error,
-            # which holds the raw value; the message names only the field and the source.
-            sanitized_error = SettingsError(str(e))
-        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
-        # `raise ... from None` only suppresses display; the original (with raw
-        # inputs recoverable via .errors()) would still hang off __context__
-        # for anything that walks exception chains.
-        if sanitized_error is not None:
-            raise sanitized_error
+        _redacting(functools.partial(super().__init__, **kwargs))
 
     # pydantic calls the overridden __init__ only for mapping input. Malformed JSON, a non-object
     # document, non-mapping input and the strings mode fail in the core validator first, so the
@@ -90,23 +77,31 @@ class RedactingSettings(BaseSettings):
 
 
 def _redacting(validate: Callable[[], _T]) -> _T:
-    """Run ``validate``, re-raising a ValidationError as its redacted copy with no chain.
+    """Run ``validate``, re-raising a failure with no raw input and no chain.
 
-    Not a context manager: raising from ``__exit__`` would chain the original, raw inputs and all.
+    A ValidationError becomes its redacted copy. A SettingsError (an env value that fails to decode
+    chains the decoder's error, which holds the raw value) or a UnicodeError (an env file that is
+    not valid UTF-8 carries the file's bytes) becomes a SettingsError with only its message, which
+    names what failed without quoting it. Not a context manager: raising from ``__exit__`` would
+    chain the original, raw inputs and all.
     """
-    sanitized_error: ValidationError | None = None
+    sanitized_error: ValidationError | SettingsError | None = None
     try:
         return validate()
     except ValidationError as e:
         sanitized_error = _redacted_copy(e)
-    raise sanitized_error  # outside the except block, as in RedactingSettings.__init__
+    except (SettingsError, UnicodeError) as e:
+        sanitized_error = SettingsError(str(e))
+    # Raised OUTSIDE the except block so __context__/__cause__ stay None: `raise ... from None` only
+    # suppresses display, and the original would still hang off __context__ for chain walkers.
+    raise sanitized_error
 
 
 def _redacted_copy(error: ValidationError) -> ValidationError:
     """Rebuild ``error`` with every input replaced by ``"[REDACTED]"``.
 
     Must not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
-    chain the original, raw inputs and all. Kept out of ``__init__`` so the raw ``err`` dicts are
+    chain the original, raw inputs and all. Kept out of ``_redacting`` so the raw ``err`` dicts are
     gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
     lose their traceback and chain in place.
     """
@@ -128,30 +123,22 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
                 if isinstance(value, BaseException):
                     # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
                     # validator's locals (the raw value), and its chain can quote the raw value. Drop
-                    # both; its type, args and str(), hence msg, are unchanged. Set through
+                    # both; its type and args are unchanged, and so is its str() unless that read the
+                    # dropped chain, in which case the rebuilt msg no longer quotes it. Set through
                     # BaseException's own descriptors: a frozen or property-overriding subclass
                     # would raise on plain assignment.
                     for attr in ("__traceback__", "__context__", "__cause__"):
                         getattr(BaseException, attr).__set__(value, None)
             detail["ctx"] = ctx
         sanitized.append(detail)
-    # A built-in type re-renders its msg for an input mode, and the error does not say which mode
-    # raised it ("Input should be an object" is JSON; "... a valid dictionary ..." is Python). Keep
-    # the rebuild whose messages all match, so every error keeps its built-in type and url.
-    msgs = [err["msg"] for err in errors]
+    # A ValidationError renders every msg in one input mode and does not say which ("Input should be
+    # an object" is JSON; "... a valid dictionary ..." is Python). Keep the Python rebuild when it
+    # reproduces the msgs, else the JSON one, so every built-in keeps its type and url. Never copy an
+    # original msg back in: one rendered from a validator exception's chain would quote the raw value.
     python_copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
-    rebuilt = python_copy.errors(include_url=False)
-    if [err["msg"] for err in rebuilt] == msgs:
+    if [err["msg"] for err in python_copy.errors(include_url=False)] == [err["msg"] for err in errors]:
         return python_copy
-    json_copy = ValidationError.from_exception_data(error.title, sanitized, input_type="json", hide_input=True)
-    if [err["msg"] for err in json_copy.errors(include_url=False)] == msgs:
-        return json_copy
-    # Neither mode matches every error: rebuild the mismatches from their original msg, without a url.
-    # Equal lengths by construction; strict=False because raising here would chain the original.
-    for err, detail, python_err in zip(errors, sanitized, rebuilt, strict=False):
-        if python_err["msg"] != err["msg"]:
-            detail["type"] = PydanticCustomError(err["type"], err["msg"], err.get("ctx"))  # pyright: ignore[reportArgumentType]
-    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
+    return ValidationError.from_exception_data(error.title, sanitized, input_type="json", hide_input=True)
 
 
 def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import pathlib
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -62,6 +63,26 @@ class _FrozenErrorConfig(BaseBackendConfig):
     @classmethod
     def reject(cls, v: str) -> str:
         raise _FrozenError("bad URL")
+
+
+class _ChainQuotingError(ValueError):
+    """A validator exception whose message is rendered from its cause, which quotes the raw value."""
+
+    def __str__(self) -> str:
+        return f"bad port: {self.__cause__}"
+
+
+class _ChainQuotingConfig(BaseBackendConfig):
+    port: str = ""
+
+    @field_validator("port")
+    @classmethod
+    def reject(cls, v: str) -> str:
+        try:
+            int(v)
+        except ValueError as exc:
+            raise _ChainQuotingError() from exc
+        return v
 
 
 @pytest.mark.unit
@@ -158,6 +179,41 @@ class TestRedactingSettings:
         assert "SECRET_VALUE" not in str(exc_info.value)
         assert exc_info.value.__context__ is None
         assert exc_info.value.__cause__ is None
+
+    def test_undecodable_env_file_leaves_no_route_to_the_secret(self, tmp_path: pathlib.Path) -> None:
+        """An env file that is not UTF-8 raises UnicodeDecodeError, which carries the whole file's bytes."""
+        from pydantic_settings import SettingsError
+
+        env_file = tmp_path / ".env"
+        env_file.write_bytes(b"CACHEKIT_MASTER_KEY=SECRET_VALUE\n# caf\xe9\n")
+
+        with pytest.raises(SettingsError) as exc_info:
+            CachekitConfig(_env_file=env_file)  # type: ignore[call-arg]
+        for rendered in (str(exc_info.value), repr(exc_info.value)):
+            assert "SECRET_VALUE" not in rendered
+        assert (exc_info.value.__context__, exc_info.value.__cause__) == (None, None)
+
+        with pytest.raises(ValidationError) as validate_info:
+            CachekitConfig.model_validate({"_env_file": env_file})
+        _assert_no_route_to(validate_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: _ChainQuotingConfig(port="SECRET_VALUE"),
+            lambda: _ChainQuotingConfig.model_validate_json('{"port": "SECRET_VALUE"}'),
+        ],
+        ids=["constructor", "model_validate_json"],
+    )
+    def test_msg_rendered_from_the_dropped_chain_is_not_restored(self, build: Callable[[], object]) -> None:
+        """Dropping a ctx exception's chain changes a msg rendered from it; the rebuild must keep the new msg
+        rather than copy the original, which quoted the raw value, back in."""
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("value_error", ("port",), "Value error, bad port: None")
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     @pytest.mark.parametrize(
         ("config_cls", "doc", "expected"),
