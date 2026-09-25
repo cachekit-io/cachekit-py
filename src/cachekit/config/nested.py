@@ -253,7 +253,8 @@ class EncryptionConfig:
         master_key: Hex-encoded master key for key derivation (required if enabled=True)
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
-        deployment_uuid: Optional deployment-specific UUID for single-tenant mode (default: None)
+        deployment_uuid: Optional explicit tenant_id override for single-tenant mode (default: None →
+                 CACHEKIT_DEPLOYMENT_UUID, else the protocol literal "default")
         fail_closed: Tri-state tamper-failure policy (default: None = defer to the
                  CACHEKIT_ENCRYPTION_FAIL_CLOSED env setting, which defaults to False).
                  True = raise DecryptionAuthenticationError to the caller on AES-GCM

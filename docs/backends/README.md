@@ -166,47 +166,72 @@ def explicit_backend():
     return data()
 ```
 
-`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` and passes it as an explicit `backend` kwarg. No magic, just convenience.
+`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` (from `api_key=` or `CACHEKIT_API_KEY`) and passes it as an explicit `backend` kwarg. No magic, just convenience. Because the preset owns its backend, `@cache.io(backend=...)` raises `ConfigurationError` rather than silently ignoring the argument.
+
+A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it.
 
 ### 2. Module-Level Default Backend (Middle Priority)
 
-```python notest
+```python
+import tempfile
+
 from cachekit import cache
 from cachekit.config.decorator import set_default_backend
 from cachekit.backends.file import FileBackend, FileBackendConfig
 
 # Set once at application startup
-file_backend = FileBackend(FileBackendConfig(cache_dir="/var/cache/myapp"))
+file_backend = FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp()))
 set_default_backend(file_backend)
 
 # All decorators now use file backend — no backend= needed
 @cache.minimal(ttl=300)
-def fast_lookup():
-    return data()
+def fast_lookup(x: int) -> int:
+    return x * 2
 
 @cache.production(ttl=600)
-def critical_function():
-    return data()
+def critical_function(x: int) -> int:
+    return x * 3
+
+assert fast_lookup(2) == 4 and critical_function(2) == 6
+
+set_default_backend(None)  # clear the default
 ```
 
 Call `set_default_backend(None)` to clear the default. Works with any backend (Redis, File, CachekitIO, custom).
 
+**Import order does not matter, but configuration must happen before a decorated
+function's first call.** A decorator applied
+without `backend=` pins the default when it is first seen — at decoration if
+already set, otherwise at first call — so the usual layout (business modules
+imported at the top of the file, `set_default_backend()` in `main()`) works.
+Later `set_default_backend()` calls do not re-point already-pinned functions.
+Exception: `stale_ttl` and `@cache.io`'s default stale window validate SWR
+capability at decoration, so set a CachekitIO default *before* importing modules
+that use them.
+
 ### 3. Environment Variable Auto-Detection (Lowest Priority)
 
-```bash
-# Primary: CACHEKIT_REDIS_URL
-CACHEKIT_REDIS_URL=redis://prod.example.com:6379
+If no explicit backend and no module-level default, `DefaultBackendProvider`
+picks a backend from exactly one environment selector, in this order:
 
-# Fallback: REDIS_URL
-REDIS_URL=redis://localhost:6379
-```
+| Priority | Environment variable        | Backend            |
+|----------|-----------------------------|--------------------|
+| 1        | `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
+| 2        | `CACHEKIT_REDIS_URL`        | `RedisBackend`     |
+| 3        | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
+| 4        | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
+| 5        | `REDIS_URL`, or nothing set | `RedisBackend` (localhost fallback) |
 
-If no explicit backend and no module-level default, cachekit creates a RedisBackend from environment variables.
+Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
+`ConfigurationError` at first call. The decorator catches it, logs a WARNING on
+the `cachekit.decorators.orchestrator` logger, and runs the function uncached.
+`REDIS_URL` is a 12-factor fallback and never counts as a conflict.
 
 **Resolution order**:
-1. Check for explicit `backend` parameter in `@cache(backend=...)`
-2. Check for module-level default via `set_default_backend()`
-3. Create RedisBackend from environment variables (CACHEKIT_REDIS_URL > REDIS_URL)
+1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
+2. Module-level default via `set_default_backend()` (checked at decoration, and
+   again at first call if still unset)
+3. Environment auto-detection per the table above
 
 ## Performance Considerations
 

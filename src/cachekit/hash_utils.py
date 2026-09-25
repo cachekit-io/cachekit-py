@@ -105,7 +105,7 @@ def redact_error_for_log(error: object) -> str:
 
 
 def fast_hash(data: Union[str, bytes], digest_size: int = 8) -> str:
-    """Ultra-fast hash using BLAKE3 - optimized for hot paths.
+    """Fast hash using BLAKE3 for hot paths.
 
     Args:
         data: String or bytes to hash

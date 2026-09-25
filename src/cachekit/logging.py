@@ -1,4 +1,4 @@
-"""Ultra-optimized structured logging with minimal overhead.
+"""Structured logging with minimal overhead.
 
 This module provides lock-free, sampling-based structured logging
 that reduces overhead from 570% to <5% while maintaining functionality.
@@ -113,7 +113,7 @@ class AsyncLogWriter(threading.Thread):
     """Background thread for async log writing."""
 
     def __init__(self, buffer: LockFreeRingBuffer):
-        super().__init__(daemon=True, name="RedisCache-LogWriter")
+        super().__init__(daemon=True, name="cachekit-LogWriter")
         self.buffer = buffer
         self.running = True
         self._stop_event = threading.Event()
@@ -151,8 +151,8 @@ class AsyncLogWriter(threading.Thread):
                 pass
 
 
-class UltraOptimizedStructuredLogger:
-    """Ultra-optimized structured logger with <5% overhead.
+class StructuredLogger:
+    """Structured logger with <5% overhead.
 
     Features:
     - Lock-free ring buffer
@@ -414,83 +414,25 @@ class UltraOptimizedStructuredLogger:
             context["correlation_id"] = self._context.correlation_id
         return context
 
-    # Compatibility methods for tests
-    def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure. ``cache_operation`` renders the error key-free (CWE-532)."""
-        self.cache_operation(operation, key, error=error, error_type=type(error).__name__, **kwargs)
-
-    def cache_hit(self, key: str, **kwargs):
-        """Log cache hit."""
-        self.cache_operation("get", key, hit=True, **kwargs)
-
-    def cache_miss(self, key: str, **kwargs):
-        """Log cache miss."""
-        self.cache_operation("get", key, hit=False, **kwargs)
-
-    def cache_stored(self, key: str, **kwargs):
-        """Log cache store operation."""
-        self.cache_operation("set", key, **kwargs)
-
-    def serialization_fallback(self, from_serializer: str, to_serializer: str, reason: str, **kwargs):
-        """Log serialization fallback event."""
-
-        # Log the fallback
-        self.warning(
-            f"Serialization fallback: {from_serializer} -> {to_serializer}",
-            from_serializer=from_serializer,
-            to_serializer=to_serializer,
-            reason=reason,
-            **kwargs,
-        )
-
-    def create_span(self, name: str, **kwargs):
-        """Create a simple tracing span context manager."""
-        return SimpleSpan(self, name, **kwargs)
-
     def __del__(self):
         """Cleanup on deletion."""
         if hasattr(self, "writer"):
             self.writer.stop()
 
 
-class SimpleSpan:
-    """Simple span implementation for tracing integration."""
-
-    def __init__(self, logger: UltraOptimizedStructuredLogger, name: str, **kwargs):
-        self.logger = logger
-        self.name = name
-        self.kwargs = kwargs
-        self.start_time = None
-
-    def __enter__(self):
-        """Start the span."""
-        self.start_time = time.time()
-        # Generate a simple trace ID if not set
-        if not hasattr(self.logger._context, "trace_id") or not self.logger._context.trace_id:
-            trace_id = f"span-{int(time.time() * 1000000)}"
-            self.logger.set_trace_id(trace_id)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """End the span."""
-        if self.start_time:
-            duration = time.time() - self.start_time
-            self.logger.debug(f"Span completed: {self.name}", span_name=self.name, duration_ms=duration * 1000, **self.kwargs)
-
-
 # Global logger instances cache
-_logger_instances: dict[str, UltraOptimizedStructuredLogger] = {}
+_logger_instances: dict[str, StructuredLogger] = {}
 _logger_lock = threading.Lock()
 
 
-def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
+def get_structured_logger(name: str) -> StructuredLogger:
     """Get or create a structured logger instance.
 
     Args:
         name: Logger name (usually __name__)
 
     Returns:
-        Ultra-optimized structured logger instance
+        Structured logger instance
     """
     # Fast path - check if already exists
     if name in _logger_instances:
@@ -500,12 +442,8 @@ def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
     with _logger_lock:
         # Double-check pattern
         if name not in _logger_instances:
-            _logger_instances[name] = UltraOptimizedStructuredLogger(name)
+            _logger_instances[name] = StructuredLogger(name)
         return _logger_instances[name]
-
-
-# Alias
-StructuredRedisLogger = UltraOptimizedStructuredLogger
 
 
 class JsonFormatter(logging.Formatter):
