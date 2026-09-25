@@ -67,8 +67,8 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  CacheKeyGenerator.generate_key(func, args, kwargs, namespace)              │
 │                                                                             │
-│  Key Structure: "ns:{namespace}:func:{module}.{qualname}:args:{blake2b}"    │
-│  Example: "ns:users:func:myapp.get_user:args:7a8b9c0d1e2f3a4b"              │
+│  Key Structure: "ns:{ns}:func:{module}.{qualname}:args:{blake2b}:{flags}"   │
+│  Example: "ns:users:func:myapp.get_user:args:7a8b9c0d1e2f3a4b:1s"           │
 │                                                                             │
 │  Blake2b Hashing (16-byte digest = 32 hex chars):                           │
 │  • Fast paths for primitives (str, int, float, bool, None)                  │
@@ -372,8 +372,12 @@ def custom_function():
 ### Key Structure
 
 ```
-ns:{namespace}:func:{module}.{qualname}:args:{blake2b_hash}
+ns:{namespace}:func:{module}.{qualname}:args:{blake2b_hash}:{ic_flag}{serializer_code}
 ```
+
+Trailing suffix: `1`/`0` for integrity checking, then a one-character serializer code
+(`s` standard, `a` auto, `o` orjson, `w` arrow, `l` reference/local; `x` plus four hex
+digits for any serializer passed as an instance). See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces).
 
 > **SDK convention, not a server contract.** The CachekitIO backend validates
 > keys security-only (length cap, charset whitelist, `..` rejection,
@@ -390,7 +394,7 @@ def get_user(user_id: int, include_profile: bool = True):
     return db.query(...)
 
 # Call: get_user(123, include_profile=True)
-# Key:  "ns:users:func:myapp.get_user:args:7a8b9c0d1e2f3a4b"
+# Key:  "ns:users:func:myapp.get_user:args:7a8b9c0d1e2f3a4b:1s"
 ```
 
 ### Blake2b Hashing Algorithm
