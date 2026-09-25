@@ -18,12 +18,14 @@ def get_user_ssn(user_id):
 ```
 
 > [!WARNING]
-> **Encryption requires a backend. `backend=None` does not encrypt anything.**
+> **Encryption requires a backend. `backend=None` refuses it.**
 > `backend=None` selects L1-only mode, which stores **live Python object
-> references** in process memory — it never serializes, so the encryption layer is
-> never reached and the master key is accepted, validated, and then never used.
-> `@cache.secure(master_key=..., backend=None)` raises nothing and encrypts nothing:
-> the values stay readable in a heap or core dump. The same object is also handed to
+> references** in process memory — it never serializes, so it cannot hold ciphertext.
+> `@cache.secure(master_key=..., backend=None)`, `encryption=True` and an
+> `EncryptionWrapper` serializer with `backend=None` all raise `ConfigurationError` when
+> the decorator is applied. A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt an
+> L1-only cache either: plain `@cache(backend=None)` values stay readable in a heap or
+> core dump. The same object is also handed to
 > every caller, so mutating a returned value corrupts the cached entry for everyone
 > else. Use L1-only mode for non-sensitive data; for encrypted caching pass a real
 > backend (`RedisBackend`, `CachekitIOBackend`, …), where L1 then holds ciphertext
@@ -227,11 +229,11 @@ def get_user_ssn(user_id):
 
 ### Missing Master Key
 > [!WARNING]
-> `cache.secure` requires a master key. Omitting it raises a `ValueError` at decoration time, not at call time — this is the fail-closed guarantee that distinguishes `.secure` from env-var auto-detection (see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key) above).
+> `cache.secure` requires a master key: `master_key=` or `CACHEKIT_MASTER_KEY`. With neither, it raises a `ValueError` at decoration time, not at call time — this is the fail-closed guarantee that distinguishes `.secure` from env-var auto-detection (see [Which Path](#which-path-cachesecure-vs-cacheio--cachekit_master_key) above).
 
 ```python notest
-# Forget to set master_key parameter
-@cache.secure(ttl=300)  # Missing master_key!
+# No master_key= and CACHEKIT_MASTER_KEY unset
+@cache.secure(ttl=300)
 def operation(x):
     return sensitive_data(x)  # illustrative - sensitive_data not defined
 
@@ -306,7 +308,7 @@ def get_sensitive_data():
     # WITH a backend, L1 stores encrypted bytes (~50ns hits vs 2-7ms Redis)
     # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
-    # With backend=None instead, NONE of the above holds — see the warning at the top
+    # With backend=None instead, this decorator raises ConfigurationError — see the warning at the top
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
 
@@ -342,7 +344,7 @@ from cachekit.backends.redis import RedisBackend
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
 # Encrypt JSON API responses (webhooks, sessions, API keys).
-# A real backend is required — backend=None never serializes, so it never encrypts.
+# A real backend is required — backend=None (L1-only) is refused with ConfigurationError.
 @cache(
     serializer=EncryptionWrapper(serializer=OrjsonSerializer()),
     backend=RedisBackend(os.environ["REDIS_URL"]),
@@ -369,7 +371,7 @@ from cachekit.backends.redis import RedisBackend
 from cachekit.serializers import EncryptionWrapper, ArrowSerializer
 
 # Encrypt DataFrames with patient data, ML features, analytics.
-# A real backend is required — backend=None never serializes, so it never encrypts.
+# A real backend is required — backend=None (L1-only) is refused with ConfigurationError.
 @cache(
     serializer=EncryptionWrapper(serializer=ArrowSerializer()),
     backend=RedisBackend(os.environ["REDIS_URL"]),
@@ -392,7 +394,7 @@ df = get_patient_records(42)
 > **`tenant_extractor` is not a tenancy boundary.** Cache keys carry no tenant
 > component — the key is `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so tenants
 > calling with identical arguments address the same entry. Give each tenant its own
-> `namespace`, or its own deployment. With `backend=None` nothing is encrypted at all
+> `namespace`, or its own deployment. Encryption with `backend=None` is refused outright
 > (see the warning at the top of this page).
 >
 > `tenant_extractor` requires an object implementing `.extract(args, kwargs)` — a
@@ -556,7 +558,11 @@ them (cachekit-py#170):
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
-  serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
+  serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
+  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
+  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
+  AAD construction before any tag check runs — it is corruption, not tamper, and the
+  entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter
@@ -715,7 +721,7 @@ import os
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
     # No plaintext at rest in L1 or L2 — decryption only at read time (< 1ms exposure).
-    # This holds only because a backend is configured; backend=None stores raw objects.
+    # This holds only because a backend is configured; backend=None raises ConfigurationError.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
 

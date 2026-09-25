@@ -338,7 +338,7 @@ def test_function():
     pass
 
 # Secure - encryption + all features. Needs a real backend: backend=None is
-# L1-only mode, which never serializes and therefore never encrypts.
+# L1-only mode, which stores raw objects, so it raises ConfigurationError.
 @cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend("redis://localhost:6379"))
 def secure_function():
     pass
@@ -553,7 +553,7 @@ export CACHEKIT_MASTER_KEY="my-secret-key"
 export CACHEKIT_MASTER_KEY="abcd1234"
 
 # CORRECT - 64 hex characters = 32 bytes
-export CACHEKIT_MASTER_KEY="a1b2c3d4e5f6789012345678901234567890abcdef12345678901234567890"
+export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
 </details>

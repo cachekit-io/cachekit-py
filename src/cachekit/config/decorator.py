@@ -6,7 +6,6 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
@@ -26,9 +25,6 @@ if TYPE_CHECKING:
 
 
 # Backend Resolution Layer
-
-# Sentinel for unset explicit backend parameter
-_UNSET = object()
 
 # Module-level default backend (set via set_default_backend())
 _default_backend: BaseBackend | None = None
@@ -78,62 +74,6 @@ def get_default_backend() -> BaseBackend | None:
         True
     """
     return _default_backend
-
-
-def _resolve_backend(explicit_backend: object = _UNSET) -> BaseBackend | None:
-    """Resolve backend via three-tier lookup.
-
-    Priority order:
-    1. Explicit backend= kwarg (highest priority)
-    2. Module-level default (set_default_backend)
-    3. REDIS_URL environment variable (auto-create RedisBackend)
-
-    Zero-config UX: If REDIS_URL is set, backend is auto-created.
-    Fail-fast: If no backend configured, raise helpful ConfigurationError.
-
-    Args:
-        explicit_backend: Explicit backend from decorator kwarg (use UNSET sentinel for not provided)
-
-    Returns:
-        Resolved backend instance or None for explicit L1-only mode
-
-    Raises:
-        ConfigurationError: If no backend configured and REDIS_URL not set
-    """
-    # Tier 1: Explicit backend parameter (highest priority)
-    if explicit_backend is not _UNSET:
-        return explicit_backend  # type: ignore[return-value]
-
-    # Tier 2: Module-level default
-    if _default_backend is not None:
-        return _default_backend
-
-    # Tier 3: Auto-create from env var (CACHEKIT_REDIS_URL > REDIS_URL)
-    # Check if either env var is set as signal to create Redis backend
-    # Actual URL resolution handled by RedisBackendConfig via AliasChoices
-    if os.environ.get("CACHEKIT_REDIS_URL") or os.environ.get("REDIS_URL"):
-        # Lazy import to avoid circular dependency
-        from cachekit.backends.redis import RedisBackend
-
-        # RedisBackend() resolves its own client provider: a DI-registered
-        # CacheClientProvider when present, else a per-instance pool from env
-        # config. The eager container.get() this used to do crashed the
-        # zero-config path — nothing registers the provider by default (#222).
-        return RedisBackend()
-
-    # No backend configured - fail fast with helpful message
-    raise ConfigurationError(
-        "No backend configured.\n\n"
-        "Quick fix (90% of cases):\n"
-        "  export REDIS_URL=redis://localhost:6379\n\n"
-        "Or explicitly configure:\n"
-        "  from cachekit import set_default_backend\n"
-        "  from cachekit.backends import RedisBackend\n"
-        "  set_default_backend(RedisBackend('redis://localhost:6379'))\n\n"
-        "Or use L1-only mode (no Redis):\n"
-        "  @cache(backend=None)  # In-memory cache only\n\n"
-        "See: https://github.com/cachekit-io/cachekit-py/blob/main/docs/guides/backend-guide.md"
-    )
 
 
 @dataclass(frozen=True)
@@ -396,8 +336,8 @@ class DecoratorConfig:
                    encryption may reduce compliance scope (see docs/features/zero-knowledge-encryption.md)
         Architecture: With a backend configured, both L1 and L2 store encrypted bytes
                       (encrypt-at-rest everywhere). NOT so with backend=None: L1-only mode
-                      stores raw Python objects and never serializes, so nothing is encrypted
-                      and master_key is unused. Encryption requires a backend.
+                      stores raw Python objects and never serializes, so applying the decorator
+                      raises ConfigurationError. Encryption requires a backend.
 
         Note: .secure does NOT pin the SaaS. Backend resolution is the same as every preset:
               an explicit backend (backend= or one inside config=; the only order-independent tier), then set_default_backend()

@@ -287,7 +287,7 @@ import os
 
 from cachekit.backends.redis import RedisBackend
 
-# Encryption requires a real backend — backend=None is L1-only and encrypts nothing.
+# Encryption requires a real backend — backend=None is L1-only and raises ConfigurationError.
 @cache.secure(
     master_key=os.environ["CACHEKIT_MASTER_KEY"],
     ttl=300,

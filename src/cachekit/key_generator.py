@@ -9,6 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import UUID
 
@@ -35,14 +36,48 @@ class CacheKeyGenerator:
     MAX_KEY_LENGTH = 250  # Practical cache key length limit (Redis, Memcached, etc.)
     KEY_PREFIX_LENGTH = 50  # Length of prefix to keep when shortening keys
 
-    # Serializer codes for compact metadata encoding (1 char each)
-    SERIALIZER_CODES = {
-        "std": "s",  # StandardSerializer (multi-language MessagePack)
-        "auto": "a",  # AutoSerializer (Python-specific, NumPy/pandas)
-        "orjson": "o",  # OrjsonSerializer (JSON-based)
-        "arrow": "w",  # ArrowSerializer (columnar format, w=arroW)
-        "local": "l",  # Reference caching (no serialization)
-    }
+    # Canonical serializer name -> 1-char code for the compact metadata suffix.
+    # CANONICAL NAMES ONLY; alias spellings resolve through SERIALIZER_NAME_ALIASES.
+    # Read-only: a mutation here would silently re-key every entry process-wide.
+    SERIALIZER_CODES = MappingProxyType(
+        {
+            "default": "s",  # StandardSerializer (multi-language MessagePack)
+            "auto": "a",  # AutoSerializer (Python-specific, NumPy/pandas)
+            "orjson": "o",  # OrjsonSerializer (JSON-based)
+            "arrow": "w",  # ArrowSerializer (columnar format, w=arroW)
+            "local": "l",  # Reference caching (no serialization)
+        }
+    )
+
+    # Alias spelling -> canonical name. Single source of truth: CacheSerializationHandler
+    # reads this to canonicalize the serializer name it writes into the frame header, so
+    # the key's serializer code and the stored envelope's serializer tag are derived from
+    # one map and cannot drift apart (#167, LAB-4351). Read-only for the same reason as
+    # SERIALIZER_CODES: mutating it would desync the key from the frame tag.
+    SERIALIZER_NAME_ALIASES = MappingProxyType({"std": "default", "standard": "default", "pythonic": "auto"})
+
+    # Prefix applied to a user-supplied SerializerProtocol instance's identity before the
+    # code lookup. Angle brackets are not legal in a Python identifier, so a class name can
+    # never collide with a SERIALIZER_CODES key — without this a custom class literally
+    # named `auto` would take AutoSerializer's code AND pass the deserialize-time
+    # serializer-name guard, which compares that same string, and would read the genuine
+    # AutoSerializer's entries. (The frame-tag collision is pre-existing; keeping the
+    # keyspaces apart is what closes the reachable path.)
+    CUSTOM_SERIALIZER_PREFIX = "<custom>:"
+
+    # Prefix for the code of any serializer identity outside SERIALIZER_CODES. Such a code
+    # is this prefix plus 4 hex digits derived from the identity, so it is DISTINCT per
+    # serializer rather than one shared bucket: a shared bucket would put every serializer
+    # instance on one key and reproduce LAB-4351 exactly — two decorators, same key,
+    # different frame tags, each evicting the other on every read at a 0% hit rate. An
+    # instance is the only way to configure a built-in (ArrowSerializer(return_format=...)),
+    # so that path is common, not exotic.
+    # ponytail: 16 bits, so distinct identities collide at ~1/65536 — a hit-rate risk only,
+    # since a collision still leaves the frame tags different and the mismatch guard fires.
+    # Two instances of the SAME class with different constructor arguments share a code AND
+    # a frame tag, so the guard does NOT separate them; use distinct namespaces (LAB-4351).
+    UNKNOWN_SERIALIZER_CODE = "x"
+    _UNKNOWN_CODE_DIGEST_BYTES = 2
 
     # Regex for chars allowed in the func component of a cache key.
     # The [a-zA-Z0-9_.]{1,200} shape is SDK convention (the SaaS validates
@@ -78,7 +113,10 @@ class CacheKeyGenerator:
             kwargs: Keyword arguments passed to the function
             namespace: Optional namespace prefix for the key
             integrity_checking: Whether integrity checking is enabled (ByteStorage vs plain MessagePack)
-            serializer_type: Serializer type code ("std", "auto", "orjson", "arrow", "local")
+            serializer_type: Serializer name, canonical ("default") or alias ("std"). Any
+                identity outside SERIALIZER_CODES — including every user-supplied serializer
+                instance, which arrives prefixed with CUSTOM_SERIALIZER_PREFIX — encodes as
+                UNKNOWN_SERIALIZER_CODE plus 4 hex digits derived from that identity.
 
         Returns:
             A consistent string key for caching
@@ -106,7 +144,7 @@ class CacheKeyGenerator:
         # Add compact metadata suffix: :<ic><serializer_code>
         # Example: ":1s" = integrity_checking=True, serializer=std
         ic_flag = "1" if integrity_checking else "0"
-        serializer_code = self.SERIALIZER_CODES.get(serializer_type, "s")  # Default to "s" if unknown
+        serializer_code = self.serializer_code(serializer_type)
         key_parts.extend([ic_flag, serializer_code])
 
         # Single join operation reduces string allocations
@@ -114,6 +152,37 @@ class CacheKeyGenerator:
 
         # Ensure key is within practical limits and contains no problematic characters
         return self._normalize_key(key)
+
+    @classmethod
+    def serializer_code(cls, serializer_type: str) -> str:
+        """Metadata-suffix code for a serializer identity.
+
+        One character for the serializers in SERIALIZER_CODES (alias spellings resolve
+        first); otherwise UNKNOWN_SERIALIZER_CODE plus 4 hex digits derived from the
+        identity, which separates unrecognised serializers into their own keyspaces up to
+        the two-byte digest's 65,536 codes. A collision there is possible, not impossible:
+        two identities sharing a code share a key, and the reader's serializer-name check
+        against the envelope — not this code — is what stops a mis-deserialization.
+
+        Raises:
+            TypeError: If ``serializer_type`` is not a str.
+            ValueError: If ``serializer_type`` is empty. A missing identity must fail here,
+                not fall back to a default code: a fallback is a shared bucket, and a key
+                computed from it is one nothing wrote — an invalidator holding it would
+                report a successful delete of an entry that is still there.
+        """
+        # Guard here, not per caller: every key (write path, CacheInvalidator, direct
+        # generate_key users) passes through this one function.
+        if not isinstance(serializer_type, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"serializer_type must be str, got {type(serializer_type).__name__}")
+        if not serializer_type:
+            raise ValueError("serializer_type must not be empty")
+        canonical = cls.SERIALIZER_NAME_ALIASES.get(serializer_type, serializer_type)
+        code = cls.SERIALIZER_CODES.get(canonical)
+        if code is not None:
+            return code
+        digest = hashlib.blake2b(canonical.encode("utf-8"), digest_size=cls._UNKNOWN_CODE_DIGEST_BYTES).hexdigest()
+        return cls.UNKNOWN_SERIALIZER_CODE + digest
 
     def _blake2b_hash(self, args: tuple, kwargs: dict) -> str:
         """Generate hash using MessagePack + Blake2b-256.

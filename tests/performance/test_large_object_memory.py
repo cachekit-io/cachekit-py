@@ -298,7 +298,7 @@ def test_file_backend_read_python_allocations_bounded(tmp_path: Path) -> None:
     tracemalloc.stop()
 
     assert hit is not None, "end-to-end File read missed (errors read as miss — check logs)"
-    pd.testing.assert_frame_equal(hit[1], df)
+    pd.testing.assert_frame_equal(hit.value, df)
     assert peak / logical < 0.5, (
         f"File-backend end-to-end read peak {peak / logical:.2f}x logical — a full-payload copy is "
         f"back in the read path (expected ~0.0x zero-copy; ~1x = bytes() coercion, ~2x = os.read "
@@ -333,7 +333,7 @@ def test_file_backend_bytes_read_python_allocations_bounded(tmp_path: Path) -> N
     tracemalloc.stop()
 
     assert hit is not None, "end-to-end File read missed (errors read as miss — check logs)"
-    assert hit[1] == payload
+    assert hit.value == payload
     assert peak / len(payload) < 3.5, (
         f"File-backend bytes read peak {peak / len(payload):.2f}x payload — a full-payload read-side "
         f"copy crept back in (known cost ~3x: payload os.read + decode + output; LAB-770 removed "
@@ -417,7 +417,7 @@ def test_file_backend_end_to_end_read_peak_rss_bounded(tmp_path: Path) -> None:
         hit = operation.get_cached_value({key!r})
         peak = vmhwm_kib()
         assert hit is not None, "end-to-end File read missed"
-        assert hit[1].shape == ({rows}, {cols}), f"wrong shape: {{hit[1].shape}}"
+        assert hit.value.shape == ({rows}, {cols}), f"wrong shape: {{hit.value.shape}}"
         print(base, peak)
         """
         )

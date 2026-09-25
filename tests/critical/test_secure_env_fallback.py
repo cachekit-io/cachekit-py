@@ -26,7 +26,7 @@ class TestSecureEnvFallback:
 
         try:
 
-            @cache.secure(backend=None, ttl=300)
+            @cache.secure(ttl=300)
             def secure_from_env(x: int) -> int:
                 return x * 2
 
@@ -42,7 +42,7 @@ class TestSecureEnvFallback:
         try:
             with pytest.raises(ValueError, match="CACHEKIT_MASTER_KEY"):
 
-                @cache.secure(backend=None)
+                @cache.secure()
                 def secure_no_key():
                     pass
         finally:
@@ -57,7 +57,7 @@ class TestSecureEnvFallback:
 
         try:
 
-            @cache.secure(master_key=explicit_key, backend=None, ttl=60)
+            @cache.secure(master_key=explicit_key, ttl=60)
             def secure_explicit(x: int) -> int:
                 return x
 

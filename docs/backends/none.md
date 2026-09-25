@@ -6,12 +6,13 @@ Use `backend=None` to run cachekit as a pure in-memory cache — no Redis, no Me
 features that do not need a backend (TTL, namespacing, metrics).
 
 > [!WARNING]
-> **Encryption is not one of them. `backend=None` does not encrypt anything.**
+> **Encryption is not one of them. `backend=None` refuses it.**
 > L1-only mode stores **live Python object references** in process memory and never
-> serializes, so the encryption layer is never reached: a `master_key` is validated
-> at decoration time and then discarded. `@cache.secure(master_key=..., backend=None)`
-> raises nothing and encrypts nothing — the values stay readable in a heap or core
-> dump. The same object is handed to every caller, so mutating a returned value
+> serializes, so it cannot hold ciphertext:
+> `@cache.secure(backend=None)`, `encryption=True` and an `EncryptionWrapper` serializer
+> all raise `ConfigurationError` when the decorator is applied, and a fleet-wide
+> `CACHEKIT_MASTER_KEY` leaves plain `@cache(backend=None)` values readable in a heap or
+> core dump. The same object is handed to every caller, so mutating a returned value
 > corrupts the cached entry for everyone else. Use L1-only mode for non-sensitive
 > data; for encrypted caching pass a real backend (`RedisBackend`,
 > `CachekitIOBackend`, …), where L1 then holds ciphertext like L2 does. See
@@ -63,11 +64,10 @@ No network calls. No serialization to bytes. No backend initialization.
 
 ## With Intent Presets
 
-Every preset except `@cache.io` and `@cache.local` accepts `backend=None` (`.io` owns
-its backend and raises `ConfigurationError` on any `backend=`; `.local` accepts no
-`backend=` at all and raises `TypeError`), but a preset's backend-dependent
-behaviour does not survive it — `@cache.secure` in particular accepts the key and
-encrypts nothing (see the warning above):
+Every preset except `@cache.secure`, `@cache.io` and `@cache.local` accepts `backend=None`
+(`.secure` raises `ConfigurationError`, see below; `.io` owns its backend and raises
+`ConfigurationError` on any `backend=`; `.local` accepts no `backend=` at all and raises
+`TypeError`), and a preset's backend-dependent behaviour does not survive it:
 
 ```python notest
 from cachekit import cache
@@ -81,11 +81,11 @@ def fast_lookup(key: str) -> dict:
 @cache.production(backend=None, ttl=300)
 def resilient_lookup(key: str) -> dict:
     return fetch_data(key)
-
-# NOT supported: @cache.secure(backend=None) stores plaintext objects, not ciphertext.
-# For encrypted caching, pass a real backend:
-#     @cache.secure(master_key=os.environ["CACHEKIT_MASTER_KEY"], backend=RedisBackend(...))
 ```
+
+`@cache.secure(backend=None)` is refused at decoration time with `ConfigurationError`:
+L1-only stores raw Python objects, which cannot be ciphertext. The same applies to
+`encryption=True` and to an `EncryptionWrapper` serializer.
 
 ## Upgrade Path
 
@@ -112,7 +112,7 @@ No API changes. No code rewrite. Same decorator, same function signature.
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
-- Encryption: Yes (L1 stores ciphertext)
+- Encryption: No — `@cache.secure` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either.
 - Metrics: Yes (if monitoring configured)
 
 ---
