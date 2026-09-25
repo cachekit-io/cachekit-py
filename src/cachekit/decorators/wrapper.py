@@ -30,6 +30,7 @@ from ..cache_handler import (
     supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
+from ..config.validation import ConfigurationError
 from ..interop import (
     InteropError,
     bind_flat_args,
@@ -41,8 +42,9 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
+from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, KeyringConfigurationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -563,8 +565,6 @@ def create_cache_wrapper(
     # that bypass DecoratorConfig validation.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
-        from ..config.validation import ConfigurationError
-
         try:
             validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
         except InteropError as e:
@@ -583,6 +583,25 @@ def create_cache_wrapper(
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
         _interop_sig = inspect.signature(func)
+
+    # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
+    # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the
+    # L1-only ObjectCache path below never serializes — so @cache.secure(backend=None)
+    # reported encryption.enabled=True while holding plaintext. Refuse at decoration; a
+    # "serialized L1 without L2" mode does not exist and a warning would keep the leak.
+    # `encryption` is the pre-resolution tri-state: None (env auto-detect, live in
+    # cache_handler.py until LAB-4642 removes it) is deliberately NOT refused — the spec
+    # says key presence never activates, so it must not activate a refusal either.
+    _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
+        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
+    )
+    if _l1_only_mode and (encryption or _encrypting_serializer):
+        raise ConfigurationError(
+            "encryption requires a backend: backend=None is L1-only and stores raw Python "
+            "objects, which cannot be ciphertext. Drop backend=None (the backend then "
+            "resolves from CACHEKIT_API_KEY / REDIS_URL / set_default_backend()) or pass "
+            "one explicitly to keep @cache.secure / encryption=True."
+        )
 
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
@@ -715,8 +734,6 @@ def create_cache_wrapper(
     _l2_swr_capable_at_decoration = _l2_freshness_capable()
     _stale_ttl: int | None = None
     if stale_ttl is not None:
-        from ..config.validation import ConfigurationError
-
         # Type-check BEFORE the zero opt-out test: bool is an int subclass and
         # False == 0 == 0.0, so without this ordering True silently means a
         # 1-second window and False/0.0 silently opt out unvalidated.

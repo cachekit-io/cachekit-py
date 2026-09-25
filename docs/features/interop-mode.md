@@ -93,7 +93,7 @@ Encryption works unchanged — and cross-SDK. The AES-256-GCM plaintext is the p
     interop="get_user",
     namespace="users",
     encryption=True,
-    master_key="a" * 64,
+    master_key=secret_key,
     single_tenant_mode=True,  # tenant_id "default" — the same literal every SDK derives from
 )
 def get_user(user_id: int):
