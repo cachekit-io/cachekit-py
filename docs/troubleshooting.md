@@ -14,9 +14,8 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- `failure_threshold` (default 5) consecutive failures were detected — backend errors, or exceptions raised by the decorated function itself (sync functions, or async functions on a backend without distributed locking)
-- Circuit breaker protection is preventing cascading failures
-- Cache is temporarily disabled to avoid overwhelming backend
+- Five consecutive failures were detected: exceptions raised by the decorated function itself (sync functions, or async functions on a backend without distributed locking), or a failure to create the backend client. Backend read and write failures do not currently count
+- Caching is disabled for this function until the process restarts
 
 **Solutions**:
 
@@ -33,8 +32,8 @@ env | grep REDIS
 export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
-3. **Wait for circuit breaker to reset**:
-- After 30 seconds the breaker goes half-open and tests the backend again
+3. **Restart the process to reset the breaker**:
+- An open breaker does not currently close on its own (a known defect), so it stays open until the process restarts
 - While open, sync functions run without caching. Async functions currently raise `UnboundLocalError` while the breaker is open (a known defect) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
@@ -295,7 +294,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **A rate-limited request is not retried** — the call runs uncached. Five consecutive failures open the circuit breaker, which stops sending requests to cachekit.io for 30 seconds (see [Circuit breaker open](error-codes.md#circuit-breaker-open)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **A rate-limited request is not retried** — the call runs uncached, and the failure does not count toward the circuit breaker. If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -356,7 +355,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **Circuit breaker will engage automatically** after repeated timeouts, allowing your application to continue running without blocking on the cache backend.
+4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker.
 
 </details>
 

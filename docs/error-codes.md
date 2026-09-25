@@ -364,12 +364,11 @@ redis-cli FLUSHDB
 
 **Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Consecutive failures reached `failure_threshold` (default 5). Backend errors count. Exceptions raised by the decorated function itself also count for sync functions, and for async functions on a backend without distributed locking: five in a row open the breaker even when the backend is healthy. For async functions on a backend with distributed locking (Redis, CachekitIO), only a `BackendError` from the function counts.
+**Cause**: Five consecutive failures. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself, or a failure to create the backend client. For async functions on a backend with distributed locking (Redis, CachekitIO), only a `BackendError` from the function counts. Five in a row open the breaker even when the backend is healthy.
 
 **What it means**:
-- Redis or backend is experiencing issues
-- Circuit breaker is protecting against cascading failures
-- Cache is temporarily disabled
+- Your function raised five times in a row, or the backend client could not be created
+- Caching is disabled for this function until the process restarts
 
 **Solutions**:
 
@@ -379,9 +378,8 @@ redis-cli ping
 # Output: PONG means Redis is healthy
 ```
 
-2. **Wait for circuit breaker to reset**:
-- After 30 seconds the breaker goes half-open and tests the backend again
-- During recovery, requests execute function without caching
+2. **Restart the process to reset the breaker**:
+- An open breaker does not currently close on its own (a known defect): it never goes half-open, so it stays open until the process restarts
 
 3. **Fix the underlying issue**:
 ```bash
@@ -473,7 +471,7 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry. Every failure type counts toward opening the circuit breaker.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry, and these failures do not count toward the circuit breaker.
 
 ### Authentication failure (401/403)
 
@@ -515,7 +513,7 @@ def get_data():
 
 **Cause**: Request volume exceeds the rate limit for the API key tier
 
-**Behavior**: TRANSIENT — counts toward the circuit breaker's failure threshold.
+**Behavior**: TRANSIENT — logged, and the call runs uncached.
 
 **Solutions**:
 
@@ -542,15 +540,15 @@ def get_data():
 
 **Cause**: Transient server-side error at the CachekitIO API
 
-**Behavior**: TRANSIENT — if sustained, the circuit breaker opens.
+**Behavior**: TRANSIENT — logged, and the call runs uncached.
 
-**What happens when circuit breaker opens**:
+**What happens while server errors persist**:
 ```python notest
 @cache.io(ttl=300)
 def my_function():
     return expensive_operation()
 
-# When server errors persist and circuit breaker opens:
+# While server errors persist:
 # - Function still executes: expensive_operation() runs
 # - Cache is bypassed: result is NOT cached
 # - No exception raised: caller gets result normally
@@ -579,7 +577,7 @@ def my_function():
 
 **Cause**: HTTP request to the CachekitIO API exceeded the configured timeout
 
-**Behavior**: TIMEOUT — counts toward the circuit breaker's failure threshold.
+**Behavior**: TIMEOUT — logged, and the call runs uncached.
 
 **Solution**:
 ```bash
@@ -597,7 +595,7 @@ export CACHEKIT_TIMEOUT=10.0
 
 **Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable
 
-**Behavior**: TRANSIENT — the circuit breaker opens after sustained failures.
+**Behavior**: TRANSIENT — logged, and the call runs uncached.
 
 **Solutions**:
 
@@ -628,7 +626,7 @@ echo $CACHEKIT_API_URL
 | `ConnectError`, `NetworkError` | `TRANSIENT` |
 | Other | `UNKNOWN` |
 
-No type is retried, and every type counts toward the circuit breaker.
+No type is retried, and none counts toward the circuit breaker.
 
 ---
 
