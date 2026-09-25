@@ -269,12 +269,14 @@ df = get_patient_records(42)
 > **`tenant_extractor` is not a tenancy boundary.** Cache keys carry no tenant
 > component — the key is `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so tenants
 > calling with identical arguments address the same entry. Give each tenant its own
-> `namespace`, or its own deployment.
+> `namespace` or its own deployment, or make the tenant id a keyword argument of the
+> cached function so it is part of the args hash.
 >
 > `tenant_extractor` requires an object implementing `.extract(args, kwargs)`, such as
 > `ArgumentNameExtractor` or `ContextVarExtractor`, and tenant ids must be valid UUIDs.
-> A bare `lambda` or a non-UUID id fails on every call: the failure is logged and the
-> function runs uncached.
+> `ContextVarExtractor.set_tenant_id()` rejects a non-UUID id with `ValueError`. With
+> `ArgumentNameExtractor` a non-UUID id fails at store time, and a bare `lambda` fails on
+> every call; either way the failure is logged and the result is not written to the cache.
 
 ### Key Rotation Pattern
 
@@ -334,7 +336,7 @@ Decryption:
 ### Per-Tenant Key Derivation
 ```
 Master key: CACHEKIT_MASTER_KEY
-Tenant ID: tenant_context.get()
+Tenant ID: tenant_extractor.extract(args, kwargs)  (or the single-tenant id below)
 
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
