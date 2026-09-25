@@ -100,12 +100,12 @@ def your_function(args):
 
 #### Reliability Parameters
 
-- **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`:
+- **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`. Today only `failure_threshold` changes decorator behaviour: an OPEN circuit on the `@cache` path does not currently leave OPEN on its own, so the three recovery settings are reported but have no effect yet (see the limitation in [Circuit Breaker](features/circuit-breaker.md)):
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
   - `failure_threshold` (`int`, default: `5`) - Consecutive failures before opening circuit
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
-  - `recovery_timeout` (`float`, default: `30.0`) - Seconds before attempting recovery (reported as `timeout_seconds`)
-  - `half_open_requests` (`int`, default: `1`) - Test requests allowed in half-open state
+  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `>= 0`
+  - `half_open_requests` (`int`, default: `1`) - Total probe requests admitted per half-open cycle (not a concurrency limit)
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests

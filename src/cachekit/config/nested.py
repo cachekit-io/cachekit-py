@@ -7,6 +7,7 @@ timeout, backpressure, monitoring, encryption).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -82,14 +83,20 @@ class CircuitBreakerConfig:
         enabled: Enable circuit breaker protection (default: True)
         failure_threshold: Consecutive failures before opening circuit (default: 5)
         success_threshold: Consecutive successes in HALF_OPEN to close circuit (default: 3)
-        recovery_timeout: Seconds to wait before attempting recovery (default: 30.0)
-        half_open_requests: Max concurrent requests during HALF_OPEN state (default: 1)
+        recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
+            probe; finite and >= 0 (default: 30.0)
+        half_open_requests: Total probe requests admitted per HALF_OPEN cycle, not a
+            concurrency limit (default: 1)
 
-    The four knobs configure the live breaker (``recovery_timeout`` becomes its
-    ``timeout_seconds``); ``fn.get_health_status()["circuit_breaker"]["config"]``
-    reports what a decorated function runs with. This is the class
-    ``@cache(circuit_breaker=...)`` takes. ``cachekit.CircuitBreakerConfig`` is a
-    different class that configures a standalone ``CircuitBreaker``.
+    The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
+    ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``
+    reports them. Today only ``failure_threshold`` changes decorator behaviour: an
+    OPEN circuit on the ``@cache`` path does not currently leave OPEN on its own, so
+    the three recovery knobs are reported but have no effect yet. Their defaults
+    equal ``cachekit.reliability.CircuitBreakerConfig()``'s, and a test pins that.
+
+    This is the class ``@cache(circuit_breaker=...)`` takes. ``cachekit.CircuitBreakerConfig``
+    is a different class that configures a standalone ``CircuitBreaker``.
 
     Examples:
         Create with defaults:
@@ -133,8 +140,8 @@ class CircuitBreakerConfig:
             raise ConfigurationError(f"success_threshold must be >= 1, got {self.success_threshold}")
         if self.half_open_requests < 1:
             raise ConfigurationError(f"half_open_requests must be >= 1, got {self.half_open_requests}")
-        if self.recovery_timeout < 0:
-            raise ConfigurationError(f"recovery_timeout must be >= 0, got {self.recovery_timeout}")
+        if not math.isfinite(self.recovery_timeout) or self.recovery_timeout < 0:
+            raise ConfigurationError(f"recovery_timeout must be a finite number >= 0, got {self.recovery_timeout!r}")
 
 
 @dataclass(frozen=True)

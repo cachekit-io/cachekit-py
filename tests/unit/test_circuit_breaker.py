@@ -505,8 +505,9 @@ class TestCircuitBreaker:
         assert breaker.state == CircuitState.CLOSED
 
 
-# The live breaker's defaults (reliability.CircuitBreakerConfig) as reported by get_health_status().
-_LIVE_BREAKER_DEFAULTS = {"failure_threshold": 5, "success_threshold": 3, "timeout_seconds": 30.0, "half_open_requests": 1}
+# The reliability class's defaults, in the shape get_health_status() reports. Derived, not literal:
+# the decorator's nested defaults must track this class, so a change to either side goes red here.
+_LIVE_BREAKER_DEFAULTS = CircuitBreaker(CircuitBreakerConfig()).get_stats()["config"]
 
 
 def _decorate(is_async: bool, **decorator_kwargs):
@@ -549,6 +550,12 @@ class TestDecoratorConfiguresLiveBreaker:
 
     def test_no_breaker_argument_keeps_live_defaults(self, is_async):
         assert _live_breaker_config(_decorate(is_async, ttl=300, backend=None)) == _LIVE_BREAKER_DEFAULTS
+
+    def test_nested_defaults_map_to_reliability_defaults(self, is_async):
+        """nested.CircuitBreakerConfig() through the wrapper's mapping equals reliability.CircuitBreakerConfig()."""
+        wrapped = _decorate(is_async, ttl=300, backend=None, circuit_breaker=NestedCircuitBreakerConfig())
+
+        assert _live_breaker_config(wrapped) == _LIVE_BREAKER_DEFAULTS
 
 
 class TestIntentPresetsKeepLiveBreakerDefaults:

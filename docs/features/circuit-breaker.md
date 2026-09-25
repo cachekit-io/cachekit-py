@@ -46,13 +46,13 @@ from cachekit.config.nested import CircuitBreakerConfig
     circuit_breaker=CircuitBreakerConfig(
         enabled=True,  # Default: True
         failure_threshold=3,  # Open after 3 consecutive failures (default: 5)
-        recovery_timeout=10.0,  # Try recovery after 10s (default: 30.0)
+        recovery_timeout=10.0,  # Cooldown before a recovery probe (default: 30.0)
     )
 )
 def operation(x):
     return do_expensive_computation()
 
-# The live breaker reports the settings it runs with
+# The live breaker reports the settings it was built with
 live = operation.get_health_status()["circuit_breaker"]["config"]
 assert live["failure_threshold"] == 3
 assert live["timeout_seconds"] == 10.0  # recovery_timeout
@@ -63,8 +63,17 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `enabled` | `bool` | `True` | Turn the breaker on or off |
 | `failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
-| `recovery_timeout` | `float` | `30.0` | Seconds OPEN before a recovery attempt (reported as `timeout_seconds`) |
-| `half_open_requests` | `int` | `1` | Test requests allowed in HALF_OPEN |
+| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`) |
+| `half_open_requests` | `int` | `1` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit) |
+
+> [!WARNING]
+> **Current limitation:** on the `@cache` path, a circuit that opens does not currently leave
+> OPEN on its own; it stays OPEN until the process restarts. So today only `failure_threshold`
+> changes how a decorated function behaves. `success_threshold`, `recovery_timeout` and
+> `half_open_requests` are accepted and reported by `get_health_status()`, but have no effect yet.
+> The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples
+> on this page so they run anywhere) it is never consulted. The examples show configuration,
+> not protection.
 
 > [!IMPORTANT]
 > `circuit_breaker=` takes `cachekit.config.nested.CircuitBreakerConfig`. The top-level
@@ -164,7 +173,8 @@ from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(ttl=300, circuit_breaker=CircuitBreakerConfig(recovery_timeout=1.0), backend=None)
 def problematic_function():
-    # Problem: Circuit keeps cycling OPEN → HALF_OPEN → OPEN
+    # Problem: a 1s cooldown re-probes a still-failing backend every second
+    # (OPEN → HALF_OPEN → OPEN). Not reachable today; see Current limitation above.
     # Solution: Increase cooldown to 30-60 seconds
     return expensive_operation()  # illustrative - not defined
 
@@ -225,7 +235,7 @@ from cachekit.config.nested import CircuitBreakerConfig
     # Tune these based on your Redis reliability
     circuit_breaker=CircuitBreakerConfig(
         failure_threshold=10,  # Open after 10 failures
-        recovery_timeout=60.0,  # Wait 60s before retry
+        recovery_timeout=60.0,  # Cooldown before a recovery probe
     )
 )
 def fetch_data(key):

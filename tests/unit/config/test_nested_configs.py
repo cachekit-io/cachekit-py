@@ -125,10 +125,11 @@ class TestCircuitBreakerConfig:
         with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
             config.validate()
 
-    def test_validate_recovery_timeout_negative(self) -> None:
-        """Test validation fails when recovery_timeout < 0."""
-        config = CircuitBreakerConfig(recovery_timeout=-1.0)
-        with pytest.raises(ConfigurationError, match="recovery_timeout must be >= 0, got -1.0"):
+    @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+    def test_validate_recovery_timeout_rejects_negative_and_non_finite(self, bad: float) -> None:
+        """NaN or inf would reach the live breaker and it could never half-open."""
+        config = CircuitBreakerConfig(recovery_timeout=bad)
+        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number >= 0"):
             config.validate()
 
 
