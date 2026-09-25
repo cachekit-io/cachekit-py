@@ -589,8 +589,6 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
-- **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
@@ -600,17 +598,10 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 #### Example
 ```python
-from cachekit.config import CachekitConfig
+from cachekit.config import get_settings
 
-# Load from environment variables (recommended)
-config = CachekitConfig()
-
-# Or override specific fields
-config = CachekitConfig(
-    default_ttl=7200,
-    l1_enabled=True,
-    l1_max_size_mb=100,
-)
+# The instance the cache path reads, built from CACHEKIT_* environment variables
+config = get_settings()
 ```
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
