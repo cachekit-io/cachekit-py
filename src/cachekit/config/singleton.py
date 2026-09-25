@@ -35,8 +35,8 @@ def get_settings() -> CachekitConfig:
         >>> settings = get_settings()
         >>> settings.l1_max_size_mb
         100
-        >>> settings.max_retries
-        3
+        >>> settings.max_value_size
+        104857600
 
     Note:
         This function is thread-safe and uses double-checked locking for performance.
