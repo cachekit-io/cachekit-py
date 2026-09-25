@@ -110,8 +110,9 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
     gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
     lose their traceback and chain in place.
     """
+    errors = error.errors(include_url=False)
     sanitized: list[InitErrorDetails] = []
-    for err in error.errors(include_url=False):
+    for err in errors:
         ctx = err.get("ctx")
         error_type: str | PydanticCustomError = err["type"]
         if error_type not in _BUILTIN_ERROR_TYPES:
@@ -132,7 +133,16 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
                         getattr(BaseException, attr).__set__(value, None)
             detail["ctx"] = ctx
         sanitized.append(detail)
-    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
+    copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
+    # A built-in type re-renders its msg in Python input mode, so a JSON-mode one ("Input should be
+    # an object") would change wording. Rebuild any such error from its original msg instead.
+    reworded = False
+    # Equal lengths by construction; strict=False because raising here would chain the original.
+    for err, detail, rebuilt in zip(errors, sanitized, copy.errors(include_url=False), strict=False):
+        if rebuilt["msg"] != err["msg"]:
+            detail["type"] = PydanticCustomError(err["type"], err["msg"], err.get("ctx"))  # pyright: ignore[reportArgumentType]
+            reworded = True
+    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True) if reworded else copy
 
 
 def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:

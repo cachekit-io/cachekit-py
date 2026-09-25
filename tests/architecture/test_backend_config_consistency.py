@@ -235,6 +235,16 @@ class TestModelConfigConsistency:
         assert exc_info.value.__context__ is None
         assert exc_info.value.__cause__ is None
 
+    @pytest.mark.parametrize("config_cls", [CachekitIOBackendConfig, CachekitConfig])
+    def test_json_mode_messages_survive_redaction(self, config_cls: type[BaseBackendConfig | CachekitConfig]) -> None:
+        """The copy re-renders a built-in type's msg in Python input mode; a JSON-mode error keeps its own."""
+        with pytest.raises(ValidationError) as exc_info:
+            config_cls.model_validate_json('["SECRET_VALUE"]')
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("model_type", (), "Input should be an object")
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
     def test_non_builtin_error_types_are_redacted_too(self) -> None:
         """A type pydantic-core cannot rebuild by name must still come back as a redacted ValidationError.
 
