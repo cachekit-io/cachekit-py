@@ -4,7 +4,11 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Connection, timeout, serialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs a warning and runs the function without caching. Decryption failures raise only when fail-closed is on.
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Three exceptions to that rule:
+
+- Decryption failures raise only when fail-closed is on.
+- With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
+- An **async** function raises `UnboundLocalError` once the circuit breaker opens (a known defect; sync functions degrade as described).
 
 ## Encryption Errors
 
@@ -86,13 +90,12 @@ except ValueError:
 
 **Exception**: `DecryptionAuthenticationError` (`from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError`, a `SerializationError` subclass)
 
-**What it means**: By default a `@cache.secure` read does not raise. It logs `... cache decrypt/integrity failure (auth_tamper) for ...`, evicts the entry and recomputes. The exception reaches your code only with fail-closed on: `CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`, or `EncryptionConfig(fail_closed=True)` on the decorator.
+**What it means**: By default a `@cache.secure` read does not raise. It logs `... cache decrypt/integrity failure (auth_tamper) for ...`, evicts the entry and recomputes. The exception reaches your code only with fail-closed on: `CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`, or `@cache.secure(fail_closed=True)` on the decorator.
 
 **Cause**:
 - Master key was changed (old encrypted data can't be decrypted)
 - Cached data was corrupted during storage/retrieval
 - Data was modified externally
-- Nonce collision (extremely rare)
 
 **When it occurs**:
 ```python notest
@@ -154,9 +157,10 @@ python app.py
 
 ## Connection Errors
 
-None of these raise to a `@cache`-decorated caller. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching:
+None of these raise to a `@cache`-decorated caller. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching. Depending on where the failure happens, the log line is one of:
 
-`Cache operation '...' failed for key '...': ...` (the last part names the error, e.g. `BackendError(transient)`)
+- `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
+- `Backend error getting key ...: BackendError(...)` (ERROR)
 
 The redis-py exceptions below reach your code only when you use a Redis client directly.
 
@@ -164,7 +168,7 @@ The redis-py exceptions below reach your code only when you use a Redis client d
 
 **Message**: `Error ... connecting to ...` (redis-py), e.g. `Error 111 connecting to localhost:6379. Connection refused.`
 
-**Exception**: `redis.exceptions.ConnectionError`, logged as above, not raised
+**Exception**: none — `redis.exceptions.ConnectionError`, logged as above
 
 **Cause**: Redis is not running, URL is incorrect, or network is unreachable
 
@@ -216,7 +220,7 @@ nc -zv localhost 6379
 
 **Message**: `Timeout connecting to server` or `Timeout reading from ...` (redis-py)
 
-**Exception**: `redis.exceptions.TimeoutError`, logged as above, not raised
+**Exception**: none — `redis.exceptions.TimeoutError`, logged as above
 
 **Cause**: Network latency too high or Redis is slow to respond
 
@@ -253,7 +257,7 @@ ping redis-server.example.com
 
 **Message**: `Too many connections` (redis-py)
 
-**Exception**: `redis.exceptions.ConnectionError`, logged as above, not raised
+**Exception**: none — `redis.exceptions.MaxConnectionsError` (a `ConnectionError` subclass; the asyncio client raises plain `ConnectionError`), logged as above
 
 **Cause**: Too many concurrent requests exceeding connection pool size
 
@@ -274,7 +278,7 @@ export CACHEKIT_CONNECTION_POOL_SIZE=100
 
 **Message** (logged): `Serialization failed with ...: TypeError`, then `Failed to store in backend cache for ...: SerializationError`
 
-**Exception**: none raised to a `@cache`-decorated caller: the result is returned but not stored in the backend. Calling the serializer directly raises `TypeError`, e.g. `StandardSerializer does not support custom classes (Python-specific types). ...` or `StandardSerializer does not support pandas DataFrames or Series (Python-specific types). ...`
+**Exception**: none raised to a `@cache`-decorated caller: the result is returned but not stored in the backend. The exception is `@cache(interop=...)`: there an unsupported return value raises `InteropError` (a `ValueError` subclass, `from cachekit.interop import InteropError`) by design, so a cross-SDK entry is never silently skipped. Calling the serializer directly raises `TypeError`, e.g. `StandardSerializer does not support custom classes (Python-specific types). ...` or `StandardSerializer does not support pandas DataFrames or Series (Python-specific types). ...`
 
 **Cause**: The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`. Custom classes, dataclasses and DataFrames are not supported.
 
@@ -328,9 +332,11 @@ def get_json_data():
 
 ### Deserialization failed
 
-**Message**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, or `Cache entry is not a decodable MessagePack payload ...`
+**Error text**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, or `Cache entry is not a decodable MessagePack payload ...`
 
-**Exception**: `SerializationError` (the same class as the unsupported-type error above — there is no separate `DeserializationError` class)
+**Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`
+
+**Exception**: none under `@cache` — the entry is evicted and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
 
 **Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see *Decryption failed* above.
 
@@ -355,9 +361,9 @@ redis-cli FLUSHDB
 
 **Message** (logged): `Circuit breaker ... transitioned to OPEN`
 
-**Exception**: none. While the breaker is open, `@cache` skips the backend and runs the function.
+**Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Consecutive backend failures reached `failure_threshold` (default 5)
+**Cause**: Consecutive failures reached `failure_threshold` (default 5). Backend errors count, and so do exceptions raised by the decorated function itself: five in a row open the breaker even when the backend is healthy.
 
 **What it means**:
 - Redis or backend is experiencing issues
@@ -373,7 +379,7 @@ redis-cli ping
 ```
 
 2. **Wait for circuit breaker to reset**:
-- After `timeout_seconds` (default 30) the breaker goes half-open and tests the backend again
+- After `recovery_timeout` (default 30 seconds, `CircuitBreakerConfig`) the breaker goes half-open and tests the backend again
 - During recovery, requests execute function without caching
 
 3. **Fix the underlying issue**:
@@ -394,7 +400,7 @@ redis-cli ping
 def my_function():
     return expensive_operation()
 
-# When circuit breaker is open:
+# When circuit breaker is open (sync functions):
 # - Function still executes: expensive_operation() runs
 # - Cache is bypassed: result is NOT cached
 # - No exception raised: caller gets result normally
@@ -466,19 +472,19 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. Each HTTP response is classified into a `BackendErrorType` that drives circuit breaker and retry behavior.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry. Every failure type counts toward opening the circuit breaker unless you list it in `CircuitBreakerConfig.excluded_error_types` (empty by default).
 
 ### Authentication failure (401/403)
 
 **Message**: `Authentication failed: HTTP 401` or `Authentication failed: HTTP 403`
 
-**Exception**: `BackendError` / `BackendErrorType.AUTHENTICATION`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.AUTHENTICATION`)
 
 **Cause**:
 - API key is missing, invalid, or revoked
 - API key does not have permission for the requested operation
 
-**Behavior**: No retry. Alert ops immediately.
+**Behavior**: Alert ops: every call runs uncached until the key is fixed.
 
 **Solution**:
 ```bash
@@ -504,11 +510,11 @@ def get_data():
 
 **Message**: `Rate limit exceeded`
 
-**Exception**: `BackendError` / `BackendErrorType.TRANSIENT`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
 **Cause**: Request volume exceeds the rate limit for the API key tier
 
-**Behavior**: TRANSIENT — auto-retry with exponential backoff. Circuit breaker counts toward failure threshold.
+**Behavior**: TRANSIENT — counts toward the circuit breaker's failure threshold.
 
 **Solutions**:
 
@@ -531,11 +537,11 @@ def get_data():
 
 **Message**: `Server error: HTTP 500` (or 502, 503, 504, etc.)
 
-**Exception**: `BackendError` / `BackendErrorType.TRANSIENT`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
 **Cause**: Transient server-side error at the CachekitIO API
 
-**Behavior**: TRANSIENT — auto-retry with backoff. If sustained, circuit breaker opens and function executes without caching.
+**Behavior**: TRANSIENT — if sustained, the circuit breaker opens.
 
 **What happens when circuit breaker opens**:
 ```python notest
@@ -554,28 +560,13 @@ def my_function():
 
 ### Client error (4xx)
 
-**Message**: `Client error: HTTP 400` (or 404, 413, etc.)
+**Message**: `Client error: HTTP 400` (or 404, etc.). A 413 reads `Value too large for cachekit.io backend (HTTP 413): value exceeds the server's maximum cache value size`.
 
-**Exception**: `BackendError` / `BackendErrorType.PERMANENT`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.PERMANENT`)
 
 **Cause**: Malformed request — invalid cache key format, payload too large, or other client-side issue
 
-**Behavior**: PERMANENT — no retry. Check your cache key and payload.
-
-**Common causes and fixes**:
-```python notest
-from cachekit import cache
-
-# WRONG - cache key contains invalid characters
-@cache.io(ttl=300, key="my key with spaces")
-def get_data(user_id):
-    return fetch(user_id)
-
-# CORRECT - use valid key characters
-@cache.io(ttl=300, key="my_key_{user_id}")
-def get_data(user_id):
-    return fetch(user_id)
-```
+**Behavior**: PERMANENT — the same request fails the same way. Check your cache key and payload size.
 
 ---
 
@@ -583,24 +574,15 @@ def get_data(user_id):
 
 **Message**: `Request timeout: ...`
 
-**Exception**: `BackendError` / `BackendErrorType.TIMEOUT`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.TIMEOUT`)
 
 **Cause**: HTTP request to the CachekitIO API exceeded the configured timeout
 
-**Behavior**: TIMEOUT — configurable retry behavior. Circuit breaker counts toward failure threshold.
+**Behavior**: TIMEOUT — counts toward the circuit breaker's failure threshold.
 
 **Solution**:
-```python notest
-from cachekit import cache
-
-# Increase timeout for slow network conditions
-@cache.io(ttl=300, timeout=10.0)  # seconds
-def get_data():
-    return fetch()
-```
-
 ```bash
-# Or via environment variable
+# Increase the request timeout (seconds)
 export CACHEKIT_TIMEOUT=10.0
 ```
 
@@ -610,11 +592,11 @@ export CACHEKIT_TIMEOUT=10.0
 
 **Message**: `Connection failed: ...`
 
-**Exception**: `BackendError` / `BackendErrorType.TRANSIENT`
+**Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
 **Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable
 
-**Behavior**: TRANSIENT — auto-retry with backoff. Circuit breaker opens after sustained failures, allowing function to execute without caching.
+**Behavior**: TRANSIENT — the circuit breaker opens after sustained failures.
 
 **Solutions**:
 
@@ -635,70 +617,17 @@ echo $CACHEKIT_API_URL
 
 ### CachekitIO error classification summary
 
-| HTTP Status / Exception | `BackendErrorType` | Auto-Retry | Circuit Breaker |
-|---|---|---|---|
-| 401, 403 | `AUTHENTICATION` | No | No |
-| 429 | `TRANSIENT` | Yes (backoff) | Yes |
-| 5xx | `TRANSIENT` | Yes (backoff) | Yes |
-| 4xx (other) | `PERMANENT` | No | No |
-| `TimeoutException` | `TIMEOUT` | Configurable | Yes |
-| `ConnectError`, `NetworkError` | `TRANSIENT` | Yes (backoff) | Yes |
-| Other | `UNKNOWN` | No | No |
+| HTTP Status / Exception | `BackendErrorType` |
+|---|---|
+| 401, 403 | `AUTHENTICATION` |
+| 429 | `TRANSIENT` |
+| 5xx | `TRANSIENT` |
+| 413, other 4xx | `PERMANENT` |
+| `TimeoutException` | `TIMEOUT` |
+| `ConnectError`, `NetworkError` | `TRANSIENT` |
+| Other | `UNKNOWN` |
 
----
-
-## Error Handling Best Practices
-
-### Log errors for debugging
-
-```python
-import logging
-from cachekit import cache
-
-logger = logging.getLogger(__name__)
-
-@cache()
-def safe_function(x):
-    try:
-        return expensive_operation(x)
-    except Exception as e:
-        logger.error(f"Caching error: {e}", exc_info=True)
-        raise
-```
-
-### Graceful degradation
-
-```python
-from cachekit import cache
-
-@cache()
-def resilient_function(x):
-    try:
-        return compute(x)
-    except Exception:
-        logger.warning("Using fallback value")
-        return fallback_value(x)
-```
-
-### Monitor for errors
-
-```python
-from cachekit import cache
-import time
-
-error_count = 0
-
-@cache()
-def monitored_function(x):
-    global error_count
-    try:
-        return compute(x)
-    except Exception as e:
-        error_count += 1
-        if error_count > 10:
-            logger.critical("Too many errors, disabling cache")
-        raise
-```
+No type is retried. All count toward the circuit breaker by default; `CircuitBreakerConfig(excluded_error_types=(...))` exempts the ones you list.
 
 ---
 
