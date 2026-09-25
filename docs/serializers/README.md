@@ -41,11 +41,11 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 ## Migration Guide
 
-### Breaking change in v0.19.0: the key carries the real serializer
+### Breaking change in v0.20.0: the key carries the real serializer
 
-Before v0.19.0 the serializer half of the key suffix was a constant: **every key ended `:1s`
-whatever serializer was configured** (`:0s` with `integrity_checking=False`). From v0.19.0 the
-code reflects the serializer in use — the "Before v0.19.0" column in the table below — so keys
+Before v0.20.0 the serializer half of the key suffix was a constant: **every key ended `:1s`
+whatever serializer was configured** (`:0s` with `integrity_checking=False`). From v0.20.0 the
+code reflects the serializer in use — the "Before v0.20.0" column in the table below — so keys
 change identity on upgrade, with no change on your side, for:
 
 - `serializer="auto"` / `"pythonic"`, `"orjson"`, `"arrow"` → now `:1a`, `:1o`, `:1w`;
@@ -60,10 +60,20 @@ pre-upgrade entries are never read again. Two decorators over one function that 
 in serializer used to evict each other on every call through the `Serializer mismatch` path;
 they now coexist.
 
-**Before you deploy:** pre-upgrade entries are unreachable from the upgraded code, so
-`invalidate_cache()` cannot delete them. If you cache personal data, or rely on invalidation
-reaching entries written before the upgrade, follow the retention warning
-[below](#changing-serializers-separate-keyspaces) — **after the last v0.18 replica is
+**What invalidation still reaches.** Upgraded code never *reads* a pre-upgrade entry, but
+single-key invalidation — `fn.invalidate_cache(*args)` / `await fn.ainvalidate_cache(*args)`
+on a decorator with a generated key — deletes both the current key and the pre-v0.20.0
+`:{integrity_flag}s` key for the same arguments. An erasure through the SDK therefore removes
+the pre-upgrade copy too, including one an old replica wrote during a rolling deploy. The
+cost: a default-serializer decorator over the same function, namespace and arguments loses
+that entry and recomputes once.
+
+**What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
+arguments you never invalidate, and no-argument `invalidate_cache()` / `cache_clear()` only
+deletes the keys the current process wrote — in a freshly deployed process that is none of the
+old ones. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
+entry gone rather than aging out, follow the flush procedure in the retention warning
+[below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
 writing `:1s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
 orphans the old keyspace rather than deleting it; the retention step still applies.
@@ -74,7 +84,7 @@ The serializer is part of the cache key. The key's trailing metadata suffix is
 `{integrity_flag}{serializer_code}` — `1`/`0` for integrity checking, then one character
 for the serializer:
 
-| Configured as | Code | Suffix | Before v0.19.0 |
+| Configured as | Code | Suffix | Before v0.20.0 |
 | :--- | :---: | :--- | :--- |
 | `serializer="std"` / `"default"` / `"standard"` (the default) | `s` | `:1s` | `:1s` |
 | `serializer="auto"` / `"pythonic"` | `a` | `:1a` | `:1s` |
@@ -134,12 +144,17 @@ def get_data():
 > On a hot path, roll it out behind your usual warm-up or stampede controls.
 
 > [!WARNING]
-> **Orphaned entries are a data-retention question, not just a hit-rate one.** Once the key
-> changes, `invalidate_cache()` computes the *new* key and can no longer reach the old copy
-> — a deletion for erasure, consent withdrawal or permission revocation will report success
-> while the previous entry survives until its TTL expires, or indefinitely if no TTL is set.
+> **Orphaned entries are a data-retention question, not just a hit-rate one.** When you
+> change a function's serializer, `invalidate_cache()` computes the *new* key and cannot
+> reach the old copy — a deletion for erasure, consent withdrawal or permission revocation
+> will report success while the previous entry survives until its TTL expires, or
+> indefinitely if no TTL is set. The one old key it does reach is the default serializer's
+> `:{integrity_flag}s` key, kept for the v0.20.0 upgrade (see
+> [above](#breaking-change-in-v0200-the-key-carries-the-real-serializer)); a move from one
+> non-default serializer to another, say `"auto"` to `"arrow"`, is not covered.
 > If you cache personal data, **flush the affected namespace** when you change a serializer
-> or upgrade across a release that re-keys it, rather than relying on expiry. The SDK has no
+> rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
+> single-key invalidation will not reach. The SDK has no
 > bulk delete — `cache_clear()` only knows the keys the current process wrote — so flush on
 > the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
 > matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush

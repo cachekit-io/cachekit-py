@@ -250,6 +250,30 @@ class TestCacheInvalidatorRedaction:
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
 
+    async def test_legacy_key_failure_logs_redacted_at_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A non-default serializer also deletes the pre-0.20.0 key (LAB-5288); both failures log redacted at ERROR."""
+        error = ValueError(f"illegal input: {TENANT_KEY}")
+
+        def cached_func(user: str) -> str:
+            return user
+
+        for invoke in ("sync", "async"):
+            backend = _FailingBackend(error)
+            invalidator = CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend, serializer_type="auto")
+            caplog.clear()
+            with caplog.at_level(logging.ERROR):
+                if invoke == "sync":
+                    invalidator.invalidate_cache(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+                else:
+                    await invalidator.invalidate_cache_async(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+
+            current_key, legacy_key = backend.received_keys
+            assert legacy_key.endswith(":1s") and not current_key.endswith(":1s")
+            error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(error_records) == 2, invoke
+            _assert_redacted(caplog, current_key)
+            _assert_redacted(caplog, legacy_key)
+
 
 class TestKeyCarryingBackendErrorRedaction:
     """A BackendError that carries the raw key must not leak it through ``{e}``.
