@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import pathlib
+import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -353,6 +354,36 @@ class TestRedactingSettings:
         for exc in (file_info.value, custom_info.value):
             _assert_no_route_to(exc, "SECRET_VALUE")
 
+    def test_unprintable_ctx_exception_reports_nothing_raw(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When a ctx exception's str() fails once its chain is dropped, the exception it raises is reported to
+        sys.unraisablehook as the msgs are read. Redaction runs outside the except, so no report has the raw
+        original as its context."""
+
+        class UnprintableOnceCutError(ValueError):
+            def __str__(self) -> str:
+                return f"bad port: {self.__cause__.args[0]}"  # pyright: ignore[reportOptionalMemberAccess]
+
+        class PortConfig(BaseBackendConfig):
+            port: str = ""
+
+            @field_validator("port")
+            @classmethod
+            def reject(cls, v: str) -> str:
+                try:
+                    int(v)
+                except ValueError as exc:
+                    raise UnprintableOnceCutError() from exc
+                return v
+
+        reports: list[BaseException | None] = []
+        monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reports.append(unraisable.exc_value))
+        with pytest.raises(ValidationError) as exc_info:
+            PortConfig(port="SECRET_VALUE")
+
+        assert reports, "str() no longer fails once the chain is dropped; the test no longer reaches the hook"
+        assert all(report is not None and report.__context__ is None for report in reports)
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
     def test_custom_error_msg_is_not_formatted_twice(self) -> None:
         """A custom error formats its template with its ctx on every render. A rendered msg that still quotes a
         ctx placeholder must stay literal rather than pull that ctx value into str()."""
@@ -363,6 +394,7 @@ class TestRedactingSettings:
             @field_validator("url")
             @classmethod
             def reject(cls, v: str) -> str:
+                # value before detail: the first render leaves {value} literal, for a second format to fill.
                 raise PydanticCustomError("bad_url", "Invalid {detail}", {"value": "SECRET_VALUE", "detail": "{value}"})
 
         with pytest.raises(ValidationError) as exc_info:
