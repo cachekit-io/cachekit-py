@@ -35,7 +35,7 @@ def get_user_ssn(user_id):
 
 Enable encryption with single decorator:
 
-> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at import. One exception: on the fail-open `@cache.io()` path a missing *master* key raises nothing — the function caches plaintext.
+> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at import. Two exceptions on the fail-open `@cache.io()` path: a missing *master* key raises nothing and caches plaintext; a malformed one logs on every call while the function runs uncached.
 
 ```python notest
 from cachekit import cache
