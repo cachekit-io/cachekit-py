@@ -272,11 +272,12 @@ def test_function():
 | `test()` | ❌ |
 | `dev()` | L1-only¹ |
 | `production()` | L1-only¹ |
-| `secure()` | L1-only¹ |
+| `secure()` | ❌³ |
 | `io()` | ✓² |
 
 ¹ Within-TTL SWR runs only in L1-only mode (`backend=None`) — with a backend configured, `swr_enabled` has no effect (see the callout at the top of this page).
 ² `@cache.io` ships past-TTL SWR via [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) (default-on), using the CachekitIO backend's freshness signal — a different mechanism from the L1-only within-TTL refresh described here.
+³ `@cache.secure` raises `ConfigurationError` with `backend=None` (L1-only stores raw objects, which cannot be ciphertext), so the L1-only SWR never runs for it.
 
 ---
 
