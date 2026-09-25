@@ -459,3 +459,43 @@ class TestInvalidationReachesPre020Keys:
 
         assert backend.deleted == [current_key, legacy_key]
         assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
+
+    @pytest.mark.parametrize("namespace", ["ns", "n" * 300], ids=["short", "hashed-long-key"])
+    @pytest.mark.parametrize("integrity_checking", [True, False], ids=["ic1", "ic0"])
+    @pytest.mark.parametrize(
+        "serializer_type",
+        [
+            *CacheKeyGenerator.SERIALIZER_CODES,
+            *CacheKeyGenerator.SERIALIZER_NAME_ALIASES,
+            f"{CacheKeyGenerator.CUSTOM_SERIALIZER_PREFIX}my.Serializer",
+        ],
+    )
+    def test_code_shortcut_never_drops_the_legacy_key(
+        self, serializer_type: str, integrity_checking: bool, namespace: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Skipping the second generate_key on equal codes must return exactly the distinct keys.
+
+        The reference is both keys generated in full and de-duplicated: if the code shortcut
+        ever disagreed with generate_key's own canonicalisation, the legacy key would be dropped.
+        """
+        generator = CacheKeyGenerator()
+
+        def fn(x: int) -> int:
+            return x
+
+        current = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type=serializer_type)
+        legacy = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type="default")
+        expected = list(dict.fromkeys([current, legacy]))
+
+        calls: list[str] = []
+        real_generate_key = generator.generate_key
+
+        def counting_generate_key(*args: Any, **kwargs: Any) -> str:
+            calls.append(kwargs["serializer_type"])
+            return real_generate_key(*args, **kwargs)
+
+        monkeypatch.setattr(generator, "generate_key", counting_generate_key)
+        invalidator = CacheInvalidator(generator, integrity_checking=integrity_checking, serializer_type=serializer_type)
+
+        assert invalidator._invalidation_keys(fn, (1,), {}, namespace) == expected
+        assert len(calls) == len(expected), f"arguments hashed {len(calls)}x for {len(expected)} distinct key(s)"

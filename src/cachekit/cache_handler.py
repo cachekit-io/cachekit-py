@@ -1794,10 +1794,15 @@ class CacheInvalidator:
         cache_key = self.key_generator.generate_key(
             func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
         )
+        # generate_key reads serializer_type only through serializer_code, so equal codes mean
+        # a byte-identical key: skip hashing the arguments a second time.
+        serializer_code = self.key_generator.serializer_code
+        if serializer_code(self.serializer_type) == serializer_code(self._LEGACY_SERIALIZER_TYPE):
+            return [cache_key]
         legacy_key = self.key_generator.generate_key(
             func, args, kwargs, namespace, self.integrity_checking, serializer_type=self._LEGACY_SERIALIZER_TYPE
         )
-        return [cache_key] if legacy_key == cache_key else [cache_key, legacy_key]
+        return [cache_key, legacy_key]
 
     @staticmethod
     def _delete(backend: BaseBackend, cache_key: str) -> None:

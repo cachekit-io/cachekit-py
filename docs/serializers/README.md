@@ -45,7 +45,7 @@ For caching Pydantic models, see [Caching Pydantic Models](pydantic.md).
 
 Before v0.20.0 the serializer half of the key suffix was a constant: **every key ended `:1s`
 whatever serializer was configured** (`:0s` with `integrity_checking=False`). From v0.20.0 the
-code reflects the serializer in use — the "Before v0.20.0" column in the table below — so keys
+code reflects the serializer in use — the "Suffix" column in the table below — so keys
 change identity on upgrade, with no change on your side, for:
 
 - `serializer="auto"` / `"pythonic"`, `"orjson"`, `"arrow"` → now `:1a`, `:1o`, `:1w`;
