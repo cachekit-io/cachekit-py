@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five consecutive failures were detected: exceptions raised by the decorated function itself (sync functions, or async functions on a backend without distributed locking), or a failure to create the backend client. Backend read and write failures do not currently count
+- Five failures in total since the process started (successes do not reset the count): exceptions raised by the decorated function itself, or a failure to create the backend client. Backend read and write failures do not currently count
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` as a backend failure and calls the function a second time, so the caller gets the second call's result or exception (async functions retry this way only on a backend with distributed locking). Your function's exceptions also count toward `failure_threshold`: five in a row open the breaker and stop caching for that namespace, even with a healthy backend. The exception is async functions on a backend with distributed locking (Redis, CachekitIO), where only a `BackendError` counts.
+Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's five-failure limit: five in total open the breaker for that function and stop caching it, even with a healthy backend. For some async configurations only a `BackendError` counts.
 
 </details>
 
@@ -294,7 +294,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **A rate-limited request is not retried** — the call runs uncached, and the failure does not count toward the circuit breaker. If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the call runs uncached, and the failure does not count toward the circuit breaker. Async calls currently poll the service for up to 5 seconds per call on a 429 (a known defect, see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -355,7 +355,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker.
+4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker. Async calls currently wait up to 5 seconds per call before running uncached (a known defect, see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
 
 </details>
 

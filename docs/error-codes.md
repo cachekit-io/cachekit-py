@@ -4,11 +4,12 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Three exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Four exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
 - An **async** function raises `UnboundLocalError` once the circuit breaker opens (a known defect; sync functions degrade as described).
+- An **async** function can currently raise the backend's own exception instead of degrading (a known defect): `redis.exceptions.ConnectionError` on every call once Redis goes away after the first successful call, and `httpx.HTTPStatusError` on a CachekitIO 401, 403 or 400, without running the function. On a CachekitIO 429, 5xx or timeout, each async call can wait up to 5 seconds before it runs.
 
 ## Encryption Errors
 
@@ -158,7 +159,7 @@ python app.py
 
 ## Connection Errors
 
-None of these raise to a `@cache`-decorated caller. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching. Depending on where the failure happens, the log line is one of:
+None of these raise to a sync `@cache`-decorated caller, or to an async one whose Redis was unreachable from the start. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching. An async function whose Redis goes away after a successful call currently raises `redis.exceptions.ConnectionError` on every call instead (a known defect). Depending on where the failure happens, the log line is one of:
 
 - `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
 - `Backend error getting key ...: BackendError(...)` (ERROR)
@@ -364,10 +365,10 @@ redis-cli FLUSHDB
 
 **Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Five consecutive failures. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself, or a failure to create the backend client. For async functions on a backend with distributed locking (Redis, CachekitIO), only a `BackendError` from the function counts. Five in a row open the breaker even when the backend is healthy.
+**Cause**: Five failures in total since the process started — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), or a failure to create the backend client. Each decorated function has its own breaker, and five such failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function raised five times in a row, or the backend client could not be created
+- Your function has raised five times since the process started, or the backend client could not be created
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
@@ -471,7 +472,9 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry, and these failures do not count toward the circuit breaker.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. For sync functions none raises: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. These failures do not count toward the circuit breaker.
+
+Async functions currently behave differently (a known defect). A 401, 403 or 400 raises `httpx.HTTPStatusError` to the caller without running the function. A 429, 5xx or timeout makes the call poll the service for up to 5 seconds before running the function, so every such call takes about 5 seconds.
 
 ### Authentication failure (401/403)
 
@@ -626,7 +629,7 @@ echo $CACHEKIT_API_URL
 | `ConnectError`, `NetworkError` | `TRANSIENT` |
 | Other | `UNKNOWN` |
 
-No type is retried, and none counts toward the circuit breaker.
+For sync functions no type is retried, and none counts toward the circuit breaker. For async functions, see the note at the top of this section.
 
 ---
 
