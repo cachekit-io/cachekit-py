@@ -424,7 +424,10 @@ them (cachekit-py#170):
 
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or the entry claims a different tenant. Raised as
+  between cache keys), or the entry claims a different tenant. The plaintext frame
+  header fields bound into the AAD (`tenant_id`, `format`, `compressed`,
+  `original_type`) are unencrypted but authenticated by the tag, so a header value that
+  still encodes but differs from what was written also fails here. Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
@@ -433,10 +436,9 @@ them (cachekit-py#170):
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
-  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
-  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
-  AAD construction before any tag check runs — it is corruption, not tamper, and the
-  entry is evicted and recomputed even in fail-closed mode.
+  non-string or non-UTF-8-encodable `original_type` in the frame header. Such a value
+  cannot be built into the AAD at all, so no tag check runs — the read is
+  corruption-class, and the entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter

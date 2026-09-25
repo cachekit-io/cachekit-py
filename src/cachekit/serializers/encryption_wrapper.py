@@ -520,8 +520,9 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # AAD build sits OUTSIDE the tag-verification try: a header-rot failure here is
-        # corruption (evict), never tamper (retained under fail_closed) — see _create_aad.
+        # AAD build sits OUTSIDE the tag-verification try: a header value that cannot be
+        # built into the AAD fails here as corruption (evict), never tamper (retained under
+        # fail_closed). A value that builds but differs fails the tag below — see _create_aad.
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -715,10 +716,12 @@ class EncryptionWrapper:
         ]
 
         # `original_type` arrives untyped from the plaintext CK header (json.loads →
-        # SerializationMetadata.from_dict passes it straight through). The header is an
-        # AAD INPUT, not AEAD-authenticated content, so a non-string or non-encodable
-        # value here is header rot — corruption-class, evicted by the read path — not
-        # tamper. Gate on presence, not truthiness: 0 / False / [] / {} are rot too.
+        # SerializationMetadata.from_dict passes it straight through). Header fields bound
+        # into the AAD are authenticated by the GCM tag: a string that encodes but differs
+        # from what was written fails tag verification as tamper. A non-string or
+        # non-encodable value cannot be built into the AAD at all, so no tag check runs —
+        # it is corruption-class, evicted by the read path. Gate on presence, not
+        # truthiness: 0 / False / [] / {} cannot be built into the AAD either.
         original_type = metadata.original_type
         if original_type is not None and not isinstance(original_type, str):
             raise SerializationError(f"Corrupt frame header: original_type must be a string, got {type(original_type).__name__}")
