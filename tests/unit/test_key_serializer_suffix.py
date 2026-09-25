@@ -19,8 +19,10 @@ from typing import Any
 import pytest
 
 from cachekit import cache
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
+from cachekit.serializers.standard_serializer import StandardSerializer
 
 
 class _RecordingBackend:
@@ -311,10 +313,7 @@ def _pre_020_key(current_key: str) -> str:
     return f"{head}:{suffix[0]}s"
 
 
-def _non_default_serializers() -> list[Any]:
-    from cachekit.serializers.standard_serializer import StandardSerializer
-
-    return [pytest.param("auto", id="auto"), pytest.param(StandardSerializer(), id="instance")]
+NON_DEFAULT_SERIALIZERS = [pytest.param("auto", id="auto"), pytest.param(StandardSerializer(), id="instance")]
 
 
 class _FailOnKeysBackend(_RecordingBackend):
@@ -327,8 +326,6 @@ class _FailOnKeysBackend(_RecordingBackend):
     def delete(self, key: str) -> bool:
         if key in self.fail_on:
             self.deleted.append(key)
-            from cachekit.backends.errors import BackendError, BackendErrorType
-
             raise BackendError("delete refused", error_type=BackendErrorType.TRANSIENT)
         return super().delete(key)
 
@@ -342,7 +339,7 @@ class TestInvalidationReachesPre020Keys:
     key returns normally while the pre-upgrade copy survives to its TTL.
     """
 
-    @pytest.mark.parametrize("serializer", _non_default_serializers())
+    @pytest.mark.parametrize("serializer", NON_DEFAULT_SERIALIZERS)
     def test_sync_invalidate_deletes_current_and_legacy_key(self, serializer: Any):
         backend = _RecordingBackend()
         calls = 0
@@ -366,7 +363,7 @@ class TestInvalidationReachesPre020Keys:
         fn(1)
         assert calls == 2
 
-    @pytest.mark.parametrize("serializer", _non_default_serializers())
+    @pytest.mark.parametrize("serializer", NON_DEFAULT_SERIALIZERS)
     async def test_async_invalidate_deletes_current_and_legacy_key(self, serializer: Any):
         backend = _RecordingBackend()
         calls = 0
@@ -423,25 +420,42 @@ class TestInvalidationReachesPre020Keys:
         assert backend.deleted == [current_key]
 
     @pytest.mark.parametrize("failing", ["legacy", "current"])
-    async def test_one_failed_delete_does_not_skip_the_other(self, failing: str):
-        """Each delete is independent: a failure on one key still attempts the other, sync and async."""
+    def test_one_failed_delete_does_not_skip_the_other(self, failing: str):
+        """Each delete is independent: a failure on one key still attempts the other."""
+        backend = _FailOnKeysBackend()
 
-        def cached(x: int) -> int:
+        @cache(backend=backend, ttl=None, namespace="lab5288-fail", serializer="auto")
+        def fn(x: int) -> int:
             return x
 
-        for invoke in ("sync", "async"):
-            backend = _FailOnKeysBackend()
-            invalidator = CacheInvalidator(CacheKeyGenerator(), backend, serializer_type="auto")
-            current_key = CacheKeyGenerator().generate_key(cached, (1,), {}, "lab5288-fail", True, serializer_type="auto")
-            legacy_key = _pre_020_key(current_key)
-            backend.store = {current_key: b"new", legacy_key: b"old"}
-            backend.fail_on = {legacy_key if failing == "legacy" else current_key}
+        fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"old"
+        backend.fail_on = {legacy_key if failing == "legacy" else current_key}
+        backend.deleted.clear()
 
-            if invoke == "sync":
-                invalidator.invalidate_cache(cached, (1,), {}, "lab5288-fail")
-            else:
-                await invalidator.invalidate_cache_async(cached, (1,), {}, "lab5288-fail")
+        fn.invalidate_cache(1)
 
-            assert backend.deleted == [current_key, legacy_key], invoke
-            survivor = legacy_key if failing == "legacy" else current_key
-            assert list(backend.store) == [survivor], invoke
+        assert backend.deleted == [current_key, legacy_key]
+        assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
+
+    @pytest.mark.parametrize("failing", ["legacy", "current"])
+    async def test_one_failed_delete_does_not_skip_the_other_async(self, failing: str):
+        backend = _FailOnKeysBackend()
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-fail-async", serializer="auto")
+        async def fn(x: int) -> int:
+            return x
+
+        await fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"old"
+        backend.fail_on = {legacy_key if failing == "legacy" else current_key}
+        backend.deleted.clear()
+
+        await fn.ainvalidate_cache(1)
+
+        assert backend.deleted == [current_key, legacy_key]
+        assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]

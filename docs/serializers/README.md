@@ -68,6 +68,11 @@ the pre-upgrade copy too, including one an old replica wrote during a rolling de
 cost: a default-serializer decorator over the same function, namespace and arguments loses
 that entry and recomputes once.
 
+The reverse direction is not covered. An erasure served by a v0.19 replica during the rollout,
+or by any replica after a rollback to v0.19, deletes only the `:1s` key, so a copy that a
+v0.20.0 replica wrote under the new key survives. Re-issue any erasure made during the
+rollout once the last v0.19 replica is retired, or cover it with the flush below.
+
 **What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
 arguments you never invalidate, and no-argument `invalidate_cache()` / `cache_clear()` only
 deletes the keys the current process wrote — in a freshly deployed process that is none of the
@@ -150,8 +155,9 @@ def get_data():
 > will report success while the previous entry survives until its TTL expires, or
 > indefinitely if no TTL is set. The one old key it does reach is the default serializer's
 > `:{integrity_flag}s` key, kept for the v0.20.0 upgrade (see
-> [above](#breaking-change-in-v0200-the-key-carries-the-real-serializer)); a move from one
-> non-default serializer to another, say `"auto"` to `"arrow"`, is not covered.
+> [above](#breaking-change-in-v0200-the-key-carries-the-real-serializer)). Any move *away*
+> from a non-default serializer is not covered — to another one (`"auto"` to `"arrow"`) or
+> to the default (`"auto"` to `"default"`, or to `@cache.secure`, which requires it).
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no
