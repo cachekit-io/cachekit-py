@@ -262,7 +262,7 @@ class CachekitConfig(BaseSettings):
     # Deployment and feature flags
     deployment_uuid: Optional[str] = Field(
         default=None,
-        description="Deployment UUID for tracking (env: CACHEKIT_DEPLOYMENT_UUID)",
+        description='Explicit single-tenant encryption tenant_id (validated UUID); unset → the protocol literal "default" (env: CACHEKIT_DEPLOYMENT_UUID)',
     )
     dev_mode: bool = Field(
         default=False,

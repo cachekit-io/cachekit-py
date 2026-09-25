@@ -69,7 +69,7 @@ jobs:
   sync-release-pr:
     name: Sync release PR with main
     needs: release-please
-    # Keep the open release PR mergeable with no manual rebase (LAB-335 / PR #214).
+    # Keep the open release PR mergeable with no manual rebase (PR #214).
     # release-please only regenerates its PR when a RELEASABLE commit (feat/fix/
     # perf/security/revert) lands on main; the hidden changelog types (chore/docs/
     # test/ci/..., e.g. Renovate lockfile bumps) advance main without regeneration,

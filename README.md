@@ -435,7 +435,7 @@ CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
 
 # CachekitIO SaaS Backend (closed beta — request access at cachekit.io)
-CACHEKIT_API_KEY="your-api-key"             # Required for @cache.io()  # pragma: allowlist secret
+CACHEKIT_API_KEY="your-api-key"             # For @cache.io() — or pass api_key= directly  # pragma: allowlist secret
 CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
 
 # Memcached Backend (optional: pip install cachekit[memcached])
