@@ -116,10 +116,11 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
         ctx = err.get("ctx")
         error_type: str | PydanticCustomError = err["type"]
         if "url" not in err or error_type not in _BUILTIN_ERROR_TYPES:
-            # Only built-in types rebuild from their name, and only they carry a url: a PydanticCustomError
-            # may reuse a built-in name ("value_error") without the ctx that name requires. Any other
-            # (pydantic's own Path fields raise "path_type") rebuilds from its rendered msg, which pydantic
-            # produced, hence not a LiteralString.
+            # Only built-in types rebuild from their name. The url marks a real built-in: a PydanticCustomError
+            # has none and may reuse a built-in name ("value_error") without the ctx that name requires. The
+            # name check guards against a url on a type this pydantic-core's ErrorType does not list, since a
+            # wrong rebuild-by-name raises here and chains the original. Any other (pydantic's own Path fields
+            # raise "path_type") rebuilds from its rendered msg, which pydantic produced, hence not a LiteralString.
             error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
