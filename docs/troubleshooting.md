@@ -452,14 +452,17 @@ python -c "import os; print(len(os.getenv('CACHEKIT_MASTER_KEY', '')))"
    flush or mint another key: a flush drops unrelated data on a shared
    database, and a fresh key only repeats the failure.
 
-2. **Wrong key still in use**:
+2. **Wrong key on some instances** (configuration drift): compare a hash of the
+   key across instances — never print the key itself:
 ```bash
-# Verify current key
-python -c "import os; print(os.getenv('CACHEKIT_MASTER_KEY')[:16] + '...')"
-
-# Revert to original key if available
-export CACHEKIT_MASTER_KEY=<original-key>
+python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CACHEKIT_MASTER_KEY'])).hexdigest()[:16])"
 ```
+   An instance whose hash differs from the rest is misconfigured. Do not fix it
+   by setting `CACHEKIT_MASTER_KEY` back to a key that has already encrypted
+   and been retired: re-promoting a key resumes its used AES-GCM nonce budget
+   (see [Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)).
+   Move the drifted instance forward to the fleet's current key, and keep the
+   key it wrote with decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS`.
 
 3. **Data corruption**:
 ```bash
