@@ -184,7 +184,7 @@ def cache(
 
         # Map flattened tri-state encryption flag + related kwargs to nested EncryptionConfig.
         # Tri-state (issue #128): @cache(encryption=False) is a DELIBERATE opt-out that must
-        # survive fleet-wide CACHEKIT_MASTER_KEY auto-detection. None=auto, True=force, False=off.
+        # survive a present CACHEKIT_MASTER_KEY. None=unset, True=force, False=off.
         #
         # Scope: ONLY the bare/default decorator path (no config=, no _intent). Intent presets
         # (.secure, .io, ...) own their encryption-param handling, and config= is the RORO form.

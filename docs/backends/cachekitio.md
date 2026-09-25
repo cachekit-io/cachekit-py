@@ -206,7 +206,7 @@ def get_user_profile(user_id: str) -> dict:
 - Per-tenant key derivation via HKDF — cryptographic isolation between namespaces
 - The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
 - With `@cache.secure`: SaaS is out of scope for HIPAA/PCI (stores only ciphertext)
-- Without `@cache.secure`: SaaS stores plaintext, may be in compliance scope
+- Without encryption: SaaS stores plaintext, may be in compliance scope
 
 **Requirements**:
 

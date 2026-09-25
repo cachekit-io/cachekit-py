@@ -132,6 +132,27 @@ class TestDecoratorConfigValidation:
 
 
 @pytest.mark.unit
+class TestDecoratorConfigBoolEncryptionKwarg:
+    """`encryption=True/False` is the explicit encryption spelling on every preset.
+
+    Presets forward kwargs raw to the dataclass, so the bool must be coerced to an
+    EncryptionConfig before validate() — previously it died with AttributeError.
+    """
+
+    def test_false_constructs_as_explicit_opt_out(self) -> None:
+        off = DecoratorConfig.production(backend=None, encryption=False)
+        assert off.encryption == EncryptionConfig(enabled=False)
+
+    def test_true_is_rejected_with_a_configuration_error_not_attribute_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+        with pytest.raises(ConfigurationError):
+            DecoratorConfig.production(backend=None, encryption=True)
+
+
+@pytest.mark.unit
 class TestDecoratorConfigToDict:
     """Test to_dict() method for backward compatibility."""
 

@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import warnings
 from collections.abc import Callable
@@ -242,6 +243,42 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
     )
 
 
+# Release-N migration gate (protocol/spec/intent-presets.md § Encryption Activation):
+# CACHEKIT_MASTER_KEY is a key SOURCE — fallback for .secure / encryption=True, and legacy-decrypt of
+# stale ciphertext on read (EncryptionWrapper resolves it itself) — never an activation SWITCH.
+# Activating encryption from the variable's mere presence is deprecated: this release keeps it and
+# warns once per process; the next minor release raises at construction instead. An L1-only cache
+# (explicit backend=None) is auto-activated too, so it warns and its serializer is checked, yet it stores
+# raw objects: the message says so rather than skipping it, as the next release raises for it as well.
+# logger.warning, not
+# DeprecationWarning: Python silences DeprecationWarning outside __main__, so under
+# uvicorn/gunicorn/celery the notice would never surface. Keyed by PID rather than a bool so a forked
+# worker, a new process, warns for itself instead of inheriting the parent's fired flag. One
+# dict.setdefault claims the PID atomically (int key, GIL or free-threaded), so exactly one of any
+# concurrent constructors logs. No lock: a child forked while it is held inherits it held, and uWSGI's
+# default fork never runs an at-fork reset. Tests reset it.
+_AUTO_ACTIVATION_WARNED_PIDS: dict[int, object] = {}
+
+
+def _warn_encryption_auto_activation() -> None:
+    """Warn ONCE per process that encryption was activated by CACHEKIT_MASTER_KEY's presence."""
+    claim = object()
+    if _AUTO_ACTIVATION_WARNED_PIDS.setdefault(os.getpid(), claim) is not claim:
+        return
+    get_logger().warning(
+        "CACHEKIT_MASTER_KEY is set and a cache with no explicit encryption= was constructed (first occurrence in "
+        "this process), so encryption was auto-enabled (single-tenant). Audit every preset that states no "
+        "encryption=: not every such cache is encrypted — an L1-only cache (explicit backend=None) is auto-enabled "
+        "too but stores raw, unencrypted objects, and a cache given master_key= or tenant_extractor= stays "
+        "plaintext. Presence-based activation is deprecated: the next minor release raises at construction, "
+        "L1-only caches included, when the key is present with neither an explicit encryption= nor "
+        "@cache.secure(...). Declare the intent now — @cache.secure(...) to require encryption; "
+        "encryption=True with single_tenant_mode=True (on a preset: "
+        "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; or "
+        "encryption=False to store plaintext. Stale ciphertext is still decrypted on read either way."
+    )
+
+
 def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBackend]:
     """Type guard: backend can return a zero-copy buffer via get_buffer (#171, File/POSIX only).
 
@@ -451,7 +488,9 @@ class CacheSerializationHandler:
     - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
 
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
-    - encryption=None: Auto-detect from CACHEKIT_MASTER_KEY (single-tenant if a key is present)
+    - encryption=None: no intent stated — plaintext. DEPRECATED: while CACHEKIT_MASTER_KEY is set and neither
+      master_key nor tenant_extractor is passed, this release still auto-enables single-tenant encryption
+      and warns once. The next minor release raises whenever a master key is present and encryption is unset
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
       unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
@@ -509,11 +548,14 @@ class CacheSerializationHandler:
                             - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy), "orjson" (JSON)
                             - SerializerProtocol instance: Custom serializer implementing the protocol
             encryption: Tri-state encryption control (wraps serializer with EncryptionWrapper):
-                        - None (default): auto-detect from CACHEKIT_MASTER_KEY. Single-tenant mode
-                          is auto-enabled when a master key is present.
+                        - None (default): no intent stated. DEPRECATED activation path: with
+                          CACHEKIT_MASTER_KEY set and no master_key or tenant_extractor passed, this
+                          release still auto-enables single-tenant encryption and warns once per
+                          process. The next minor release raises at construction whenever a master
+                          key is present and encryption is unset. Pass True or False.
                         - True: force encryption ON (requires a master key + explicit tenant mode).
                         - False: explicit hard opt-out. Never encrypts, even when CACHEKIT_MASTER_KEY
-                          is set fleet-wide. This is the deliberate per-function escape hatch.
+                          is set; stale ciphertext is still decrypted on read (legacy-decrypt).
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (tenant_id "default" unless overridden).
@@ -582,13 +624,14 @@ class CacheSerializationHandler:
                 )
 
         # Tri-state encryption resolution. `encryption` is None/True/False:
-        #   None  -> auto-detect from CACHEKIT_MASTER_KEY (fleet-wide convergence point)
+        #   None  -> no intent stated. DEPRECATED activation: with CACHEKIT_MASTER_KEY set and no
+        #            master_key/tenant_extractor (the guard below), this release auto-enables encryption
+        #            (warns once); the next minor release raises whenever a key is present.
         #   True  -> explicit force-on (validated below)
         #   False -> explicit hard opt-out; honored even when a master key is present
         #
-        # Auto-detection is the ONLY path that may flip encryption on and auto-set
-        # single_tenant_mode. An explicit False MUST NOT be promoted to True just
-        # because CACHEKIT_MASTER_KEY exists (issue #128).
+        # Why: see _warn_encryption_auto_activation above. An explicit False MUST NOT be promoted to
+        # True just because CACHEKIT_MASTER_KEY exists (issue #128).
         if encryption is None:
             encryption = False
             if master_key is None and tenant_extractor is None:
@@ -597,6 +640,7 @@ class CacheSerializationHandler:
                     encryption = True
                     master_key = settings.master_key.get_secret_value()
                     single_tenant_mode = True
+                    _warn_encryption_auto_activation()
 
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor
