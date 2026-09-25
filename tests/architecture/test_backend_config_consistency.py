@@ -14,6 +14,7 @@ Why this matters:
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Callable
 
 import pytest
@@ -192,6 +193,22 @@ class TestModelConfigConsistency:
             monkeypatch.setenv(name, value)
         with pytest.raises(ValidationError) as exc_info:
             build()
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
+    @pytest.mark.parametrize("method", ["model_validate", "model_validate_json", "model_validate_strings"])
+    def test_model_validate_methods_redact_every_input(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str
+    ) -> None:
+        """The inherited validate classmethods build a model too. pydantic routes model_validate and
+        model_validate_json through the overridden __init__, but not model_validate_strings."""
+        data = {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}
+        with pytest.raises(ValidationError) as exc_info:
+            if method == "model_validate_json":
+                config_cls.model_validate_json(json.dumps(data))
+            else:
+                getattr(config_cls, method)(data)
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 

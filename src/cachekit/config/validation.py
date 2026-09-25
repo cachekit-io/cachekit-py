@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 from pydantic import ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
+
+if TYPE_CHECKING:
+    from typing_extensions import Self  # typing.Self is 3.11+
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,17 @@ class RedactingSettings(BaseSettings):
         # for anything that walks exception chains.
         if sanitized_error is not None:
             raise sanitized_error
+
+    @classmethod
+    def model_validate_strings(cls, obj: Any, **kwargs: Any) -> Self:
+        """Redact like ``__init__``. pydantic routes ``model_validate`` and ``model_validate_json``
+        through an overridden ``__init__``, but not this one."""
+        sanitized_error: ValidationError | None = None
+        try:
+            return super().model_validate_strings(obj, **kwargs)
+        except ValidationError as e:
+            sanitized_error = _redacted_copy(e)
+        raise sanitized_error  # outside the except block, as in __init__
 
 
 def _redacted_copy(error: ValidationError) -> ValidationError:
