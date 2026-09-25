@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, TypeVar
 
-from ..config import DecoratorConfig
+from ..config import ConfigurationError, DecoratorConfig
 from .wrapper import create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -107,6 +107,10 @@ def cache(
             sees a snapshot of the caller's ``contextvars`` (so contextvar-based
             tenant extraction works), but no other request-scoped resources —
             open sessions/connections from the request must not be relied on.
+            ``api_key`` (``@cache.io`` only) — the cachekit.io API key; falls back
+            to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
+            own CachekitIOBackend and rejects ``backend=`` and ``config=`` with
+            ConfigurationError.
 
     Returns:
         Decorated function with intelligent caching
@@ -128,17 +132,39 @@ def cache(
 
             return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
 
+        # config= would replace the io preset wholesale (any backend, silently), which the
+        # io docstring promises cannot happen. DecoratorConfig.io() already IS the config.
+        if _intent == "io" and config is not None:
+            raise ConfigurationError(
+                "@cache.io() does not accept config= — DecoratorConfig.io() already is the io "
+                "config. For the RORO form use @cache(config=DecoratorConfig.io(...))."
+            )
+
         # Resolve backend at decorator application time
         # Track if backend=None was explicitly passed (L1-only mode)
         # This is a sentinel problem: we need to distinguish between:
         # 1. User passed @cache(backend=None) explicitly -> L1-only mode
         # 2. User didn't pass backend at all -> should try provider
-        _explicit_l1_only = "backend" in manual_overrides and manual_overrides.get("backend") is None
+        _explicit_backend = "backend" in manual_overrides
+        _explicit_l1_only = _explicit_backend and manual_overrides["backend"] is None
         backend = manual_overrides.pop("backend", None)
 
+        if config is not None and not isinstance(config, DecoratorConfig):
+            raise TypeError(
+                f"config parameter must be DecoratorConfig instance, got {type(config).__name__}. "
+                f"Use DecoratorConfig.minimal(), .production(), .secure(), .dev(), or .test()"
+            )
+
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
-        # check module-level default set via set_default_backend()
-        if backend is None and not _explicit_l1_only:
+        # check module-level default set via set_default_backend(). Kept here
+        # (not only lazily) because decoration-time validation — the interop
+        # backend guard and stale_ttl/SWR capability (LAB-557) — needs the
+        # backend when it is already known. If the default is set LATER, the
+        # wrapper re-consults it at first call (_resolve_lazy_backend, LAB-4457).
+        # A backend already in config= is explicit and beats the default: fetched here, the
+        # default would replace it below — DecoratorConfig.io(api_key=B) under a key-A default
+        # would send tenant B's traffic under key A.
+        if backend is None and not _explicit_l1_only and (config is None or config.backend is None):
             from ..config.decorator import get_default_backend
 
             backend = get_default_backend()
@@ -176,12 +202,7 @@ def cache(
 
         # RORO config takes highest precedence
         if config is not None:
-            # DecoratorConfig instance provided - use it directly with overrides
-            if not isinstance(config, DecoratorConfig):
-                raise TypeError(
-                    f"config parameter must be DecoratorConfig instance, got {type(config).__name__}. "
-                    f"Use DecoratorConfig.minimal(), .production(), .secure(), .dev(), or .test()"
-                )
+            # DecoratorConfig instance provided (type checked above) - use it with overrides
             resolved_config = config
             if manual_overrides or backend is not None:
                 # Apply overrides by creating new DecoratorConfig with merged settings
@@ -214,7 +235,12 @@ def cache(
         elif _intent == "test":
             resolved_config = DecoratorConfig.test(backend=backend, **manual_overrides)
         elif _intent == "io":
-            # SaaS backend - ignore explicit backend param (io creates its own)
+            # io owns its backend. Hand an explicit backend= back so DecoratorConfig.io
+            # rejects it — one error site for both the decorator and the classmethod.
+            # `backend` is still the caller's value here: the default lookup above only
+            # runs when no backend= was passed.
+            if _explicit_backend:
+                manual_overrides["backend"] = backend
             resolved_config = DecoratorConfig.io(**manual_overrides)
         else:
             # No intent specified - use default DecoratorConfig with overrides

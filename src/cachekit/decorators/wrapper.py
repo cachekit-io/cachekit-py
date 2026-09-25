@@ -16,6 +16,7 @@ from cachekit.hash_utils import redact_error_for_log
 
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
+    CacheHit,
     CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -24,7 +25,9 @@ from ..cache_handler import (
     get_logger,
     handle_decrypt_failure,
     redact_cache_key,
+    supports_locking,
     supports_swr,
+    supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
 from ..interop import (
@@ -46,7 +49,22 @@ from .orchestrator import FeatureOrchestrator
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
+    from ..backends.base import BaseBackend
     from ..serializers.base import SerializerProtocol
+
+
+def _resolve_lazy_backend() -> BaseBackend:
+    """Backend for a decorator that was applied without ``backend=``.
+
+    Consulted at FIRST CALL, not at decoration, so ``set_default_backend()``
+    takes effect regardless of whether it ran before or after the module holding
+    the decorated function was imported (LAB-4457).
+    """
+    from ..config.decorator import get_default_backend
+
+    default = get_default_backend()
+    return default if default is not None else get_backend_provider().get_backend()
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -426,15 +444,17 @@ def create_cache_wrapper(
                      fleet-wide encryption (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
-                         If None: single-tenant mode (uses nil UUID for encryption).
+                         If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
+                         CACHEKIT_DEPLOYMENT_UUID is set).
                          If provided: multi-tenant mode (extracts tenant_id from function args/kwargs).
                          FAIL CLOSED: extraction failure raises ValueError (no fallback to shared key).
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                            Mutually exclusive with tenant_extractor. Prevents accidental shared
                            keys in multi-tenant deployments by requiring explicit configuration.
-        deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
-                        If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
-                        Must be deterministic (same across restarts) to decrypt cached data.
+        deployment_uuid: Optional explicit tenant_id override for single-tenant mode (validated
+                        UUID). Falls back to CACHEKIT_DEPLOYMENT_UUID, then to the protocol literal
+                        "default" — the cross-SDK default, so a py/rs/ts client on one master key
+                        share ciphertext with no tenant configured at all.
         encryption_fail_closed: Tri-state tamper-failure policy. None (default) defers to
                         CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open). True raises
                         DecryptionAuthenticationError to the caller on AES-GCM authentication
@@ -585,7 +605,13 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    invalidator = CacheInvalidator(key_generator, integrity_checking=integrity_checking)
+    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
+    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
+    invalidator = CacheInvalidator(
+        key_generator,
+        integrity_checking=integrity_checking,
+        serializer_type=serialization_handler.serializer_key_name,
+    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
@@ -762,7 +788,7 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[Any, bool, int | None]:
+    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -802,15 +828,16 @@ def create_cache_wrapper(
             return
         _cached_keys.add(cache_key)
 
-    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
-        size_bytes is computed here rather than read from the handler's
-        size_bytes tuple slot (LAB-348), so this label never depends on the
-        handler's tuple shape; the two agree on every in-contract async hit.
+        size_bytes is the length CacheHit already measured (LAB-3757), not a
+        recompute from the envelope. CacheHit.size_bytes is set on every hit
+        including the mmap fast path, where envelope is None and there are no
+        bytes to measure -- so this label never depends on holding the bytes.
 
         Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
         every call site sits inside an `except Exception` that falls through to
@@ -838,16 +865,13 @@ def create_cache_wrapper(
             features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
-                # Defensive encode for an out-of-contract backend: both async readers
-                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
-                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                 features.record_cache_operation(
                     operation="get",
                     namespace=namespace or "default",
                     serializer="rust",
                     success=True,
                     duration_ms=get_duration_ms,
-                    size_bytes=len(envelope),
+                    size_bytes=size_bytes,
                     hit=True,
                 )
         except (ValueError, TypeError) as exc:
@@ -907,9 +931,8 @@ def create_cache_wrapper(
         the caller already got the stale value; the entry hard-expires at evict_at and
         the next request takes the ordinary synchronous miss path (spec degradation)."""
         try:
-            _acquire_lock = getattr(_backend, "acquire_lock", None)
-            if _acquire_lock is not None:
-                async with _acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
+            if supports_locking(_backend):
+                async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
                     await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
@@ -1269,7 +1292,7 @@ def create_cache_wrapper(
 
                 nonlocal _backend
                 if _backend is None:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1412,8 +1435,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
-                _found, result, cached_data, size_bytes = cached_result
+                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1660,7 +1683,7 @@ def create_cache_wrapper(
             if interop is not None:
                 if _backend is None:
                     try:
-                        _backend = get_backend_provider().get_backend()
+                        _backend = _resolve_lazy_backend()
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1734,7 +1757,7 @@ def create_cache_wrapper(
             # Initialize backend only when needed (lazy init for performance)
             if _backend is None:
                 try:
-                    _backend = get_backend_provider().get_backend()
+                    _backend = _resolve_lazy_backend()
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1781,19 +1804,19 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
-                    _found, result, cached_data, _size_bytes = cached_result
+                    # Cache hit: envelope is the raw serialized bytes for L1 backfill
+                    result, cached_data = cached_result.value, cached_result.envelope
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    _record_l2_hit_async(cached_data, get_duration_ms)
+                    _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
                     # Handle TTL refresh if configured and threshold met
-                    if refresh_ttl_on_get and ttl and hasattr(_backend, "get_ttl") and hasattr(_backend, "refresh_ttl"):
+                    if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
                         try:
                             remaining_ttl = await _backend.get_ttl(cache_key)
                             if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
@@ -1847,7 +1870,7 @@ def create_cache_wrapper(
             blocking_timeout = 5.0  # Wait up to 5 seconds to acquire lock
 
             # Check if backend supports distributed locking
-            if hasattr(_backend, "acquire_lock"):
+            if supports_locking(_backend):
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
@@ -1865,9 +1888,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1895,9 +1918,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1991,7 +2014,7 @@ def create_cache_wrapper(
                     # Fall through to execute without locking
 
             # Execute without locking (either backend doesn't support it or lock failed)
-            if not hasattr(_backend, "acquire_lock"):
+            if not supports_locking(_backend):
                 logger().debug(
                     f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
                 )
@@ -2066,7 +2089,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
@@ -2122,7 +2145,7 @@ def create_cache_wrapper(
         # we should NOT try to get a backend from the provider
         if not _l1_only_mode and _backend is None:
             try:
-                _backend = get_backend_provider().get_backend()
+                _backend = _resolve_lazy_backend()
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))

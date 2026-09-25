@@ -217,7 +217,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If `CACHEKIT_API_KEY` is not set
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 
@@ -402,7 +402,7 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
 
 > [!WARNING]
 > - **ArrowSerializer is NOT PHP-compatible** - Use StandardSerializer or OrjsonSerializer for PHP
-> - Changing serializers requires cache invalidation (see Serializer Switching section below)
+> - Changing serializers re-keys the function — expect a one-time cold cache (see Serializer Switching section below)
 
 > [!TIP]
 > **StandardSerializer is the default** - No configuration needed for multi-language compatibility.
@@ -543,26 +543,32 @@ The `serializer` parameter accepts:
 
 ### Serializer Switching
 
-When you change a function's serializer, the decorator **automatically detects mismatches**:
+The serializer is part of the cache key, so changing it moves the function to a **separate
+keyspace** rather than colliding with its old entries:
 
 ```python
-# BEFORE: Using StandardSerializer (default)
+# BEFORE: Using StandardSerializer (default) -> keys end in ":1s"
 @cache
 def get_data():
     return df
 
-# AFTER: Switching to ArrowSerializer
+# AFTER: Switching to ArrowSerializer -> keys end in ":1w"
 @cache(serializer="arrow")
 def get_data():
     return df
 
 # First call after change:
-# 1. Cache hit returns old StandardSerializer data
-# 2. Deserializer detects format mismatch
-# 3. Error message explains the mismatch
-# 4. Function executes, caches with new serializer
-# 5. Subsequent calls work normally
+# 1. Cache miss (different key)
+# 2. Function executes, caches under the new serializer's key
+# 3. Subsequent calls hit normally
+# 4. Old entries are never read again and expire on their TTL
 ```
+
+See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces)
+for the code table, the cold-cache warning, and the data-retention caveat on orphaned entries.
+Upgrading from v0.18 or earlier? Keys for non-default serializers change identity without any
+change on your side — see
+[Breaking change in v0.19.0](serializers/README.md#breaking-change-in-v0190-the-key-carries-the-real-serializer).
 
 **Best Practice**: Use namespace versioning for zero-downtime migrations:
 
@@ -589,8 +595,6 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
-- **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
@@ -600,17 +604,10 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 #### Example
 ```python
-from cachekit.config import CachekitConfig
+from cachekit.config import get_settings
 
-# Load from environment variables (recommended)
-config = CachekitConfig()
-
-# Or override specific fields
-config = CachekitConfig(
-    default_ttl=7200,
-    l1_enabled=True,
-    l1_max_size_mb=100,
-)
+# The instance the cache path reads, built from CACHEKIT_* environment variables
+config = get_settings()
 ```
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
@@ -666,31 +663,13 @@ For comprehensive backend guide with examples and implementation patterns, see *
 
 ### Backend Resolution Priority
 
-When `@cache` is used without explicit `backend` parameter, resolution follows this 3-tier priority:
+When `@cache` is used without an explicit `backend` parameter, resolution follows this priority:
 
-1. **Explicit backend parameter** (highest priority)
-   ```python notest
-   custom_backend = HTTPBackend("https://api.example.com")
-   @cache(backend=custom_backend)  # Uses custom backend explicitly
-   def my_function():
-       return "result"
-   ```
+1. **Explicit backend** — `@cache(backend=...)`, then a backend inside `config=`
+2. **Module-level default** — `set_default_backend(...)`
+3. **Environment auto-detection** — `CACHEKIT_API_KEY`, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR`, with `REDIS_URL` as a fallback
 
-2. **Default RedisBackend** (middle priority)
-   ```python notest
-   @cache  # Uses RedisBackend with CACHEKIT_REDIS_URL or REDIS_URL
-   def my_function():
-       return "result"
-   ```
-
-3. **Environment variable configuration** (lowest priority)
-   ```bash
-   # Primary: CACHEKIT_REDIS_URL
-   CACHEKIT_REDIS_URL=redis://localhost:6379/0
-
-   # Fallback: REDIS_URL
-   REDIS_URL=redis://localhost:6379/0
-   ```
+Examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
 
 ### L1-Only Mode (No Backend)
 
@@ -838,10 +817,15 @@ HTTP server or register a `/metrics` route; wire up `prometheus_client` expositi
 names carry no `cachekit_` prefix:
 
 - `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
-- `redis_cache_operations_total` - Load-control operation counter. Labels: `operation`, `status`, `serializer`, `namespace`
+- `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
 - `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
 - `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
 - `circuit_breaker_state` - Circuit breaker state gauge (0=CLOSED, 1=OPEN, 2=HALF_OPEN). Labels: `namespace`, `state`
+
+The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
+preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
+emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
+rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
 See the [Prometheus Metrics guide](features/prometheus-metrics.md) for exposition setup,
 query examples, and alerting rules.
