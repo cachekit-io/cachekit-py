@@ -175,8 +175,9 @@ wave — throttle or batch the eviction if the recompute cost is high. Either wa
 eviction to cachekit's keys so unrelated data in the same Redis database survives:
 
 ```bash
-# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
-redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+# Evict only this namespace's cachekit entries. The Redis backend stores keys
+# as t:<tenant>:ns:<namespace>:... — <tenant> is "default" unless you set one.
+redis-cli --scan --pattern 't:<tenant>:ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
 # FLUSHDB is only safe when the database is dedicated to cachekit
 # then deploy with CACHEKIT_MASTER_KEY set

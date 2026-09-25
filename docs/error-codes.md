@@ -128,11 +128,14 @@ current key, and keep the key it wrote with decrypt-only in
 
 **Option 3: Data corruption**
 ```bash
-# If you suspect data corruption, clear cache
-redis-cli FLUSHDB
+# Evict only this namespace's cachekit entries. The Redis backend stores keys
+# as t:<tenant>:ns:<namespace>:... — <tenant> is "default" unless you set one.
+redis-cli --scan --pattern 't:<tenant>:ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
-# Restart application - will recompute all cached values
-python app.py
+# Only if this Redis database is dedicated to cachekit:
+# redis-cli FLUSHDB
+
+# The function recomputes and re-caches on the next call
 ```
 
 **Prevention**: rotate with the keyring, not a key swap — follow the

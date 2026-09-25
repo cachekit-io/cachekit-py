@@ -466,10 +466,14 @@ python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CA
 
 3. **Data corruption**:
 ```bash
-# If data is corrupted, clearing cache is safe
-redis-cli FLUSHDB
+# Evict only this namespace's cachekit entries. The Redis backend stores keys
+# as t:<tenant>:ns:<namespace>:... — <tenant> is "default" unless you set one.
+redis-cli --scan --pattern 't:<tenant>:ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
-# Function will recompute and re-cache with current key
+# Only if this Redis database is dedicated to cachekit:
+# redis-cli FLUSHDB
+
+# The function recomputes and re-caches with the current key
 ```
 
 </details>
