@@ -24,10 +24,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from cachekit.config.validation import redact_validation_error
+from cachekit.config.validation import RedactingSettings
 
 # Keys that child classes MUST override (not inherited from base)
 _CHILD_OVERRIDE_KEYS = frozenset({"env_prefix"})
@@ -54,7 +53,7 @@ def inherit_config(base_cls: type[BaseSettings]) -> dict[str, Any]:
     return {k: v for k, v in base_cls.model_config.items() if k not in _CHILD_OVERRIDE_KEYS}
 
 
-class BaseBackendConfig(BaseSettings):
+class BaseBackendConfig(RedactingSettings):
     """Base class for all backend configurations.
 
     Provides consistent settings for environment variable parsing,
@@ -72,6 +71,7 @@ class BaseBackendConfig(BaseSettings):
             - case_sensitive=False for env var flexibility
             - extra="forbid" for strict validation (catch typos)
             - populate_by_name=True for alias support
+            - hide_input_in_errors=True so no error text echoes a credential
 
     Example:
         >>> class MyBackendConfig(BaseBackendConfig):
@@ -87,23 +87,10 @@ class BaseBackendConfig(BaseSettings):
         case_sensitive=False,
         extra="forbid",
         populate_by_name=True,
+        # Backend configs hold credentials (an API key, a password in a Redis URL). RedactingSettings
+        # redacts errors()/json() on construction; this keeps str()/repr() input-free on every path.
+        hide_input_in_errors=True,
     )
-
-    def __init__(self, **kwargs: Any) -> None:
-        """Construct the config; a validation failure never carries a raw input (CWE-532).
-
-        Backend configs hold credentials (an API key, a password in a Redis URL). A
-        ValidationError's errors() and json() snapshot the raw input whatever the model's
-        hide_input_in_errors, so the error is rebuilt with every input redacted.
-        """
-        sanitized_error: ValidationError | None = None
-        try:
-            super().__init__(**kwargs)
-        except ValidationError as e:
-            sanitized_error = redact_validation_error(e)
-        # Raised OUTSIDE the except block: the original, raw inputs and all, would hang off __context__.
-        if sanitized_error is not None:
-            raise sanitized_error
 
     @classmethod
     def from_env(cls) -> BaseBackendConfig:

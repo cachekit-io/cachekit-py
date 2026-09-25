@@ -180,7 +180,7 @@ All sensitive values are automatically masked:
 | Health endpoints | ✅ |
 | Monitoring output | ✅ |
 
-**Implementation**: Uses `pydantic-settings` with `SecretStr` for automatic redaction. A configuration that fails validation (`CachekitConfig`, or any backend config such as `CachekitIOBackendConfig`, built directly or via `from_env()`) raises a `pydantic.ValidationError` whose every input reads `"[REDACTED]"` on `str()`, `errors()` and `json()` alike, with no exception chain back to the raw values. Each error keeps its `type`, `loc`, `msg` and `ctx`, so it still names the field that failed and why.
+**Implementation**: Uses `pydantic-settings` with `SecretStr` for automatic redaction. Constructing `CachekitConfig` or any backend config (such as `CachekitIOBackendConfig`) through its constructor or `from_env()` with an invalid value raises a `pydantic.ValidationError` that carries no raw input: `str()` omits inputs, every `input` in `errors()` and `json()` reads `"[REDACTED]"`, and no exception chain leads back to the raw values. Each error keeps its `type`, `loc`, `msg` and `ctx`, so it still names the field that failed and why.
 
 ### SSRF Protection
 

@@ -227,8 +227,8 @@ class CachekitIOBackend:
             self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
         except ValidationError as exc:
             errors = exc.errors(include_input=False)
-        # Raised OUTSIDE the except block (CWE-532): the ValidationError's own .errors() keep the
-        # raw api_key, and `raise ... from None` only hides it — it would still hang off __context__.
+        # Raised OUTSIDE the except block (CWE-532): the ValidationError's traceback holds the config's
+        # raw kwargs, and `raise ... from None` only hides it — it would still hang off __context__.
         if errors is not None:
             problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
             key_absent = any(err["loc"] == ("api_key",) and err["type"] in ("missing", "too_short") for err in errors)

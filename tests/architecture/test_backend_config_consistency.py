@@ -35,6 +35,7 @@ REQUIRED_MODEL_CONFIG_KEYS = {
     "case_sensitive": False,
     "extra": "forbid",
     "populate_by_name": True,
+    "hide_input_in_errors": True,
 }
 
 
@@ -106,8 +107,8 @@ class TestModelConfigConsistency:
     def test_validation_errors_redact_every_input(self, config_cls: type[BaseBackendConfig]) -> None:
         """CWE-532: backend configs hold credentials, so no surface of a ValidationError may carry a raw input.
 
-        Pinned here, not per backend: BaseBackendConfig.__init__ does the redacting, and a subclass that
-        overrides __init__ without calling it would silently lose it.
+        Pinned here, not per backend: the inherited RedactingSettings.__init__ does the redacting, and a
+        subclass that overrides __init__ without calling it would silently lose it.
         """
         from pydantic import ValidationError
 
@@ -120,6 +121,42 @@ class TestModelConfigConsistency:
         assert all(err["input"] == "[REDACTED]" for err in exc.errors())
         assert exc.__context__ is None
         assert exc.__cause__ is None
+
+    def test_non_builtin_error_types_are_redacted_too(self) -> None:
+        """A type pydantic-core cannot rebuild by name must still come back as a redacted ValidationError.
+
+        Rebuilding by name raised KeyError inside the except, chaining the raw original. pydantic's own
+        Path fields raise "path_type"; a subclass validator may raise PydanticCustomError with a ctx.
+        """
+        from pydantic import ValidationError, field_validator
+        from pydantic_core import PydanticCustomError
+
+        class StrictURLConfig(BaseBackendConfig):
+            url: str = ""
+
+            @field_validator("url")
+            @classmethod
+            def reject(cls, v: str) -> str:
+                raise PydanticCustomError("bad_url", "bad URL (port {port})", {"port": 6379})
+
+        with pytest.raises(ValidationError) as file_info:
+            FileBackendConfig(cache_dir=None, totally_fake_field_that_doesnt_exist="SECRET_VALUE")  # type: ignore[arg-type,call-arg]
+        with pytest.raises(ValidationError) as custom_info:
+            StrictURLConfig(url="redis://:SECRET_VALUE@host")
+
+        assert [err["type"] for err in file_info.value.errors()] == ["path_type", "extra_forbidden"]
+        [custom] = custom_info.value.errors()
+        assert (custom["type"], custom["loc"], custom["msg"], custom["ctx"]) == (
+            "bad_url",
+            ("url",),
+            "bad URL (port 6379)",
+            {"port": 6379},
+        )
+        for exc in (file_info.value, custom_info.value):
+            for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+                assert "SECRET_VALUE" not in rendered
+            assert all(err["input"] == "[REDACTED]" for err in exc.errors())
+            assert exc.__context__ is None
 
 
 class TestFromEnvClassmethod:

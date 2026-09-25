@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import logging
+from typing import Any, get_args
 
 from pydantic import ValidationError
-from pydantic_core import InitErrorDetails
+from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic_core.core_schema import ErrorType
+from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
+
+_BUILTIN_ERROR_TYPES = frozenset(get_args(ErrorType))
 
 
 class ConfigurationError(Exception):
@@ -33,24 +38,48 @@ class ConfigurationError(Exception):
     pass
 
 
-def redact_validation_error(error: ValidationError) -> ValidationError:
-    """Return a copy of a settings ``ValidationError`` with every input redacted (CWE-532).
+class RedactingSettings(BaseSettings):
+    """``BaseSettings`` whose validation errors never carry a raw input (CWE-532).
 
     ``hide_input_in_errors`` only affects ``str()``/``repr()``: ``errors()`` and ``json()`` still
     snapshot the raw input, which for a settings model is cleartext credentials (a master key, an
     API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
-    (``loc == ()``) snapshots the whole input dict. The copy keeps each error's type, loc, msg and ctx.
+    (``loc == ()``) snapshots the whole input dict. A failed construction is re-raised as a copy
+    with every input redacted and each error's type, loc, msg and ctx kept. The copy is still a
+    ValidationError (a ValueError), so fail-loud propagation paths are unchanged.
+    """
 
-    Raise the copy OUTSIDE the ``except`` block that caught the original: ``raise ... from None``
-    only hides the chain, and the original would still hang off ``__context__``.
+    def __init__(self, **kwargs: Any) -> None:
+        sanitized_error: ValidationError | None = None
+        try:
+            super().__init__(**kwargs)
+        except ValidationError as e:
+            sanitized_error = _redacted_copy(e)
+        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
+        # `raise ... from None` only suppresses display; the original (with raw
+        # inputs recoverable via .errors()) would still hang off __context__
+        # for anything that walks exception chains.
+        if sanitized_error is not None:
+            raise sanitized_error
 
-    Only pydantic's built-in error types can be rebuilt; a ``PydanticCustomError`` type raises
-    ``KeyError`` here.
+
+def _redacted_copy(error: ValidationError) -> ValidationError:
+    """Rebuild ``error`` with every input replaced by ``"[REDACTED]"``.
+
+    Must not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
+    chain the original, raw inputs and all. Kept out of ``__init__`` so the raw ``err`` dicts are
+    gone from the frame that raises.
     """
     sanitized: list[InitErrorDetails] = []
     for err in error.errors(include_url=False):
-        detail: InitErrorDetails = {"type": err["type"], "loc": err["loc"], "input": "[REDACTED]"}
         ctx = err.get("ctx")
+        error_type: str | PydanticCustomError = err["type"]
+        if error_type not in _BUILTIN_ERROR_TYPES:
+            # Only built-in types rebuild from their name. Any other (pydantic's own Path fields raise
+            # "path_type", a validator may raise PydanticCustomError) rebuilds from its rendered msg,
+            # which pydantic produced, hence not a LiteralString.
+            error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
+        detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
             detail["ctx"] = ctx
         sanitized.append(detail)

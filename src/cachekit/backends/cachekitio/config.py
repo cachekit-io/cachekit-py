@@ -104,9 +104,6 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     model_config = SettingsConfigDict(
         **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_",
-        # This class is public: built directly (or via from_env()), a failed validation would
-        # print the raw api_key in str(ValidationError) — tracebacks, logs (CWE-532).
-        hide_input_in_errors=True,
     )
 
     api_url: str = Field(
