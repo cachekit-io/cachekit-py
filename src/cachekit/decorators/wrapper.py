@@ -514,8 +514,14 @@ def create_cache_wrapper(
         l1_enabled = config.l1.enabled
         l1_max_size_mb = config.l1.max_size_mb
 
-        # Circuit breaker settings
+        # Circuit breaker settings: the nested knobs configure the live (reliability) breaker
         circuit_breaker = config.circuit_breaker.enabled
+        circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold=config.circuit_breaker.failure_threshold,
+            success_threshold=config.circuit_breaker.success_threshold,
+            timeout_seconds=config.circuit_breaker.recovery_timeout,
+            half_open_requests=config.circuit_breaker.half_open_requests,
+        )
 
         # Backpressure settings
         backpressure = config.backpressure.enabled
@@ -643,19 +649,10 @@ def create_cache_wrapper(
     # This maintains security while enabling sub-microsecond cache hits.
 
     # Initialize feature orchestrator using EXISTING reliability/monitoring modules
-    # Convert CircuitBreakerConfig to dict if provided
-    cb_config_dict: dict[str, Any] | None = None
-    if circuit_breaker_config is not None:
-        cb_config_dict = (
-            circuit_breaker_config.model_dump()  # type: ignore[union-attr]
-            if hasattr(circuit_breaker_config, "model_dump")
-            else circuit_breaker_config
-        )
-
     features = FeatureOrchestrator(
         namespace=namespace or "default",
         circuit_breaker_enabled=use_circuit_breaker,
-        circuit_breaker_config=cb_config_dict or {},  # Use empty dict as default
+        circuit_breaker_config=circuit_breaker_config,  # None = reliability defaults
         backpressure_enabled=use_backpressure,
         backpressure_config={"max_concurrent": max_concurrent_requests} if use_backpressure else None,
         collect_stats=use_collect_stats,
