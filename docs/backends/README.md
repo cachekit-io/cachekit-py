@@ -166,7 +166,9 @@ def explicit_backend():
     return data()
 ```
 
-`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` and passes it as an explicit `backend` kwarg. No magic, just convenience.
+`@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` (from `api_key=` or `CACHEKIT_API_KEY`) and passes it as an explicit `backend` kwarg. No magic, just convenience. Because the preset owns its backend, `@cache.io(backend=...)` raises `ConfigurationError` rather than silently ignoring the argument.
+
+A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it.
 
 ### 2. Module-Level Default Backend (Middle Priority)
 
@@ -229,7 +231,7 @@ The Redis prefix scopes L2 only. L1 is shared by every tenant in the process; se
 [Whole-Function Invalidation → Tenant scope](../features/l1-invalidation.md#whole-function-invalidation).
 
 **Resolution order**:
-1. Explicit `backend` parameter in `@cache(backend=...)`
+1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
 2. Module-level default via `set_default_backend()` (checked at decoration, and
    again at first call if still unset)
 3. Environment auto-detection per the table above

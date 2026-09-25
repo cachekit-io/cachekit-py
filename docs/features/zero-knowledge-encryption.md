@@ -9,7 +9,7 @@
 Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. Redis never sees plaintext. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM encryption
+@cache.secure(ttl=300, master_key=secret_key)  # AES-256-GCM encryption
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # Encrypted in Redis, decrypted in-app (illustrative)
 ```
@@ -23,16 +23,21 @@ Enable encryption with single decorator:
 ```python notest
 from cachekit import cache
 
-# Set master key (hex-encoded)
-import os
-os.environ["CACHEKIT_MASTER_KEY"] = "a" * 64  # 32 bytes
-
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # AES-256-GCM enabled
+# Key comes from CACHEKIT_MASTER_KEY (64 hex chars) when master_key is omitted.
+@cache.secure(ttl=300)  # AES-256-GCM enabled
 def get_sensitive_data(user_id):
     return db.query(SensitiveData).filter_by(id=user_id).first()  # illustrative - db not defined
 
 data = get_sensitive_data(123)  # Encrypted in Redis
 ```
+
+Later examples pass the key explicitly as `master_key=secret_key`: your 64-hex-char key string,
+loaded from a secret store. Never a literal in source.
+
+> **`@cache.secure` needs a backend.** `backend=None` (L1-only) stores raw Python objects,
+> which cannot be ciphertext, so the combination is refused at decoration time with a
+> `ConfigurationError`. With a backend configured, L1 *does* stay on — it holds the same
+> ciphertext L2 does.
 
 ---
 
@@ -110,7 +115,7 @@ Python object (plaintext, in-app only)
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption, slower, for sensitive data
+@cache.secure(ttl=300, master_key=secret_key)  # Encryption, slower, for sensitive data
 def get_user_ssn(user_id):
     return db.get_ssn(user_id)  # illustrative - db not defined
 ```
@@ -121,11 +126,11 @@ def get_user_ssn(user_id):
 
 ### Missing Master Key
 > [!WARNING]
-> `cache.secure` requires a master key. Omitting it raises a `ConfigurationError` at decoration time, not at call time.
+> `cache.secure` requires a master key: `master_key=` or `CACHEKIT_MASTER_KEY`. With neither, it raises a `ValueError` at decoration time, not at call time.
 
 ```python notest
-# Forget to set master_key parameter
-@cache.secure(ttl=300)  # Missing master_key!
+# No master_key= and CACHEKIT_MASTER_KEY unset
+@cache.secure(ttl=300)
 def operation(x):
     return sensitive_data(x)  # illustrative - sensitive_data not defined
 
@@ -191,7 +196,7 @@ redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
 
 ### L1 Cache Conflict
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Encryption + L1 cache (stores encrypted bytes)
+@cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
     # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
@@ -212,7 +217,7 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```python notest
 from cachekit import cache
 
-@cache.secure(ttl=3600, master_key="a" * 64, backend=None)  # AES-256-GCM with MessagePack
+@cache.secure(ttl=3600)  # AES-256-GCM with MessagePack, key from CACHEKIT_MASTER_KEY
 def get_user_profile(user_id):
     return db.get_profile(user_id)  # illustrative - db not defined
 
@@ -226,7 +231,7 @@ from cachekit import cache
 from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
 
 # Encrypt JSON API responses (webhooks, sessions, API keys)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()))
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_abcdef123456",
@@ -245,7 +250,7 @@ from cachekit.serializers import EncryptionWrapper, ArrowSerializer
 import pandas as pd
 
 # Encrypt DataFrames with patient data, ML features, analytics
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()), backend=None)
+@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined
     return pd.read_sql(
@@ -267,9 +272,8 @@ tenant_context = ContextVar("tenant_id")
 
 @cache.secure(
     ttl=3600,
-    master_key="a" * 64,
+    master_key=secret_key,
     tenant_extractor=lambda user_id: tenant_context.get(),
-    backend=None
 )
 def get_user_data(user_id):
     tenant_id = tenant_context.get()
@@ -347,6 +351,12 @@ Tenant ID: tenant_context.get()
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
 
+Single-tenant mode (no tenant_extractor):
+  tenant_id = deployment_uuid | CACHEKIT_DEPLOYMENT_UUID | "default"
+  "default" is the protocol literal every SDK derives from (intent-presets.md
+  § Master Key Input, rule 5), used identically for HKDF and AAD — one master
+  key is enough for py, rs and ts to share ciphertext.
+
 Properties:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
@@ -422,7 +432,11 @@ them (cachekit-py#170):
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
-  serializer mismatch, or a deserialize failure on *already-authenticated* plaintext.
+  serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
+  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
+  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
+  AAD construction before any tag check runs — it is corruption, not tamper, and the
+  entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter
@@ -449,12 +463,12 @@ export CACHEKIT_ENCRYPTION_FAIL_CLOSED=1
 
 ```python notest
 # Per-function (overrides the env setting in either direction)
-@cache.secure(master_key="a" * 64, fail_closed=True)
+@cache.secure(master_key=secret_key, fail_closed=True)
 def get_payment_token(user_id: int): ...
 
 # Or via explicit EncryptionConfig
 from cachekit.config.nested import EncryptionConfig
-config = EncryptionConfig(enabled=True, master_key="a" * 64,
+config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
@@ -548,7 +562,7 @@ Cached after first use: No additional overhead
 
 **Encryption + Circuit Breaker**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)  # Both enabled
+@cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
     # Decryption error → Circuit breaker catches
     # Encryption happens before circuit breaker (at write time)
@@ -557,7 +571,7 @@ def get_data():
 
 **Encryption + L1 Cache**:
 ```python notest
-@cache.secure(ttl=300, master_key="a" * 64, backend=None)
+@cache.secure(ttl=300, master_key=secret_key)
 def get_data():
     # L1 cache enabled: stores encrypted bytes (security + performance)
     # No plaintext in memory: encryption at rest in both L1 and L2

@@ -138,7 +138,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 
 | Variable | Type | Default | Required | Description |
 |----------|------|---------|----------|-------------|
-| `CACHEKIT_API_KEY` | `SecretStr` | — | Yes | API key (`ck_live_...`) for authentication |
+| `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
 | `CACHEKIT_MAX_RETRIES` | `int` | `3` | No | Max retry attempts for transient errors |
@@ -147,6 +147,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 
 **Security notes:**
 - `CACHEKIT_API_URL` must use HTTPS. HTTP is rejected at startup.
+- Credentials in the URL (`user:password@`) are rejected: the API key is the only credential.
 - Private/internal IP addresses are blocked (SSRF protection). This includes `10.x`, `172.16-31.x`, `192.168.x`, `127.x`, and link-local ranges.
 - `CACHEKIT_ALLOW_CUSTOM_HOST=true` disables the hostname allowlist. Only use with trusted configuration (e.g., a local test server running over HTTPS with a self-signed cert).
 
@@ -334,7 +335,7 @@ def test_function():
     pass
 
 # Secure - encryption + all features
-@cache.secure(master_key="a" * 64, backend=None)
+@cache.secure(master_key=secret_key)
 def secure_function():
     pass
 
@@ -548,7 +549,7 @@ export CACHEKIT_MASTER_KEY="my-secret-key"
 export CACHEKIT_MASTER_KEY="abcd1234"
 
 # CORRECT - 64 hex characters = 32 bytes
-export CACHEKIT_MASTER_KEY="a1b2c3d4e5f6789012345678901234567890abcdef12345678901234567890"
+export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
 </details>
