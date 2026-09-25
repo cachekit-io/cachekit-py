@@ -1008,11 +1008,12 @@ class CacheSerializationHandler:
 
         Raises:
             ValueError: If cache_key is empty when data is encrypted
-            SerializationError: If deserialization fails (including AAD mismatch), or if
-                this handler has encryption enabled and the entry's header claims
-                plaintext — the header is unauthenticated, so an encryption-enabled
-                handler never routes to the plaintext deserializer (fail closed,
-                CWE-757 downgrade protection). Callers treat this as a cache miss.
+            SerializationError: If deserialization fails (including AAD mismatch or a
+                corrupt/unparseable envelope frame header), or if this handler has
+                encryption enabled and the entry's header claims plaintext — the
+                header is unauthenticated, so an encryption-enabled handler never
+                routes to the plaintext deserializer (fail closed, CWE-757 downgrade
+                protection). Callers treat this as a cache miss.
 
         Examples:
             Basic round-trip (serialize then deserialize):
@@ -1050,12 +1051,15 @@ class CacheSerializationHandler:
             return self._deserialize_interop(data, cache_key)
 
         try:
-            # Unwrap cache data envelope
-            serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
-
-            # Convert metadata
-            serialization_metadata = _get_cached_serializer_class("metadata", "cachekit.serializers.SerializationMetadata")
-            metadata = serialization_metadata.from_dict(metadata_dict)
+            # unwrap/from_dict raise bare ValueError subclasses on frame faults. The
+            # `except ValueError: raise` arm below exists only for the missing-cache_key
+            # fail-closed check, so convert here or a corrupt header bypasses the L2
+            # `except SerializationError` eviction and survives to TTL (LAB-4075).
+            try:
+                serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
+                metadata = SerializationMetadata.from_dict(metadata_dict)
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                raise SerializationError(f"Corrupt cache envelope: {bounded_error(e)}") from e
 
             # Get base serializer
             base_serializer = self._base_serializer
