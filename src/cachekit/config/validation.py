@@ -8,7 +8,7 @@ from typing import Any, get_args
 from pydantic import ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_core.core_schema import ErrorType
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsError
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +50,15 @@ class RedactingSettings(BaseSettings):
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        sanitized_error: ValidationError | None = None
+        sanitized_error: ValidationError | SettingsError | None = None
         try:
             super().__init__(**kwargs)
         except ValidationError as e:
             sanitized_error = _redacted_copy(e)
+        except SettingsError as e:
+            # An env value that fails to decode (JSON for a list field) chains the decoder's error,
+            # which holds the raw value; the message names only the field and the source.
+            sanitized_error = SettingsError(str(e))
         # Raised OUTSIDE the except block so __context__/__cause__ stay None —
         # `raise ... from None` only suppresses display; the original (with raw
         # inputs recoverable via .errors()) would still hang off __context__
@@ -68,7 +72,8 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
 
     Must not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
     chain the original, raw inputs and all. Kept out of ``__init__`` so the raw ``err`` dicts are
-    gone from the frame that raises.
+    gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
+    lose their traceback and chain in place.
     """
     sanitized: list[InitErrorDetails] = []
     for err in error.errors(include_url=False):
@@ -85,8 +90,11 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
                 if isinstance(value, BaseException):
                     # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
                     # validator's locals (the raw value), and its chain can quote the raw value. Drop
-                    # both; its type, args and str(), hence msg, are unchanged.
-                    value.__traceback__ = value.__context__ = value.__cause__ = None
+                    # both; its type, args and str(), hence msg, are unchanged. Set through
+                    # BaseException's own descriptors: a frozen or property-overriding subclass
+                    # would raise on plain assignment.
+                    for attr in ("__traceback__", "__context__", "__cause__"):
+                        getattr(BaseException, attr).__set__(value, None)
             detail["ctx"] = ctx
         sanitized.append(detail)
     return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)

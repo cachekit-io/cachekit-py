@@ -13,10 +13,11 @@ Why this matters:
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError, field_validator
 
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
@@ -44,7 +45,12 @@ REQUIRED_MODEL_CONFIG_KEYS = {
 
 
 def _assert_no_route_to(exc: ValidationError, secret: str) -> None:
-    """CWE-532: nothing reachable from a config ValidationError may lead back to ``secret``."""
+    """CWE-532: ``secret`` is absent from every rendering, every input is redacted, the error has no
+    chain, and every exception in a ctx has lost its traceback and chain.
+
+    The error's own traceback is not checked: it reaches the caller's frames, which hold what the
+    caller passed.
+    """
     for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
         assert secret not in rendered
     assert exc.__context__ is None
@@ -53,9 +59,23 @@ def _assert_no_route_to(exc: ValidationError, secret: str) -> None:
         assert err["input"] == "[REDACTED]"
         for value in (err.get("ctx") or {}).values():
             if isinstance(value, BaseException):
-                # A validator's exception: its traceback frames hold the validator's locals (the raw
-                # value, as a SecretStr or not) and its chain can quote the raw value too.
                 assert (value.__traceback__, value.__context__, value.__cause__) == (None, None, None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenError(ValueError):
+    """A validator exception whose attributes cannot be set by plain assignment."""
+
+    reason: str
+
+
+class _FrozenErrorConfig(BaseBackendConfig):
+    url: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def reject(cls, v: str) -> str:
+        raise _FrozenError("bad URL")
 
 
 class TestBackendConfigInheritance:
@@ -135,26 +155,58 @@ class TestModelConfigConsistency:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     @pytest.mark.parametrize(
-        "build",
+        ("env", "build"),
         [
-            lambda: CachekitIOBackendConfig(api_key="ck_live_SECRET_VALUE\n"),  # pragma: allowlist secret
-            lambda: CachekitIOBackendConfig(
-                api_key="ck_live_SECRET_VALUE",  # pragma: allowlist secret
-                api_url="https://evil.example.com",
+            ({}, lambda: CachekitIOBackendConfig(api_key="ck_live_SECRET_VALUE\n")),  # pragma: allowlist secret
+            ({"CACHEKIT_API_KEY": "ck_live_SECRET_VALUE\n"}, CachekitIOBackendConfig.from_env),  # pragma: allowlist secret
+            (
+                {
+                    "CACHEKIT_API_KEY": "ck_live_SECRET_VALUE",  # pragma: allowlist secret
+                    "CACHEKIT_API_URL": "https://evil.example.com",
+                },
+                CachekitIOBackendConfig.from_env,
             ),
-            lambda: CachekitConfig(previous_master_keys=[SecretStr("SECRET_VALUE")]),
-            lambda: MemcachedBackendConfig(servers=["mc1:SECRET_VALUE"]),
-            lambda: MemcachedBackendConfig(servers=["user:SECRET_VALUE@mc1"]),
+            ({"CACHEKIT_PREVIOUS_MASTER_KEYS": "SECRET_VALUE"}, CachekitConfig),
+            ({}, lambda: MemcachedBackendConfig(servers=["mc1:SECRET_VALUE"])),
+            ({}, lambda: MemcachedBackendConfig(servers=["SECRET_VALUE@mc1"])),
+            ({}, lambda: _FrozenErrorConfig(url="SECRET_VALUE")),
         ],
-        ids=["io-whitespace-key", "io-allowlist", "keyring-bad-hex", "memcached-port", "memcached-format"],
+        ids=[
+            "io-whitespace-key",
+            "io-env-whitespace-key",
+            "io-env-allowlist",
+            "keyring-env-bad-hex",
+            "memcached-port",
+            "memcached-format",
+            "frozen-validator-exception",
+        ],
     )
-    def test_validator_errors_leave_no_route_to_the_secret(self, build: Callable[[], object]) -> None:
+    def test_validator_errors_leave_no_route_to_the_secret(
+        self, monkeypatch: pytest.MonkeyPatch, env: dict[str, str], build: Callable[[], object]
+    ) -> None:
         """A validator's own exception rides along in ctx["error"]: its message, its chain and its
-        traceback's frame locals must not recover the value it rejected."""
+        traceback's frame locals must not recover the value it rejected. On the from_env() path that
+        exception is the only thing still holding the value."""
+        monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
         with pytest.raises(ValidationError) as exc_info:
             build()
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    def test_undecodable_env_value_leaves_no_route_to_the_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A list field's env value must be JSON; the decoder's error, chained to pydantic-settings'
+        SettingsError, holds the raw value."""
+        from pydantic_settings import SettingsError
+
+        monkeypatch.setenv("CACHEKIT_MEMCACHED_SERVERS", "user:SECRET_VALUE@mc1:11211")
+        with pytest.raises(SettingsError) as exc_info:
+            MemcachedBackendConfig.from_env()
+
+        assert "SECRET_VALUE" not in str(exc_info.value)
+        assert exc_info.value.__context__ is None
+        assert exc_info.value.__cause__ is None
 
     def test_non_builtin_error_types_are_redacted_too(self) -> None:
         """A type pydantic-core cannot rebuild by name must still come back as a redacted ValidationError.
@@ -162,7 +214,6 @@ class TestModelConfigConsistency:
         Rebuilding by name raised KeyError inside the except, chaining the raw original. pydantic's own
         Path fields raise "path_type"; a subclass validator may raise PydanticCustomError with a ctx.
         """
-        from pydantic import field_validator
         from pydantic_core import PydanticCustomError
 
         class StrictURLConfig(BaseBackendConfig):

@@ -122,7 +122,7 @@ class MemcachedBackendConfig(BaseBackendConfig):
             except ValueError:
                 raise ValueError(f"servers[{i}]: port must be numeric") from None
             if not (1 <= port <= 65535):
-                raise ValueError(f"servers[{i}]: port must be 1-65535, got {port}")
+                raise ValueError(f"servers[{i}]: port must be 1-65535")
         return v
 
     @classmethod
