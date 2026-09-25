@@ -75,10 +75,11 @@ python -c "
 import os
 key = os.getenv('CACHEKIT_MASTER_KEY', '')
 try:
-    bytes.fromhex(key)
-    print(f'Valid key: {len(key)} hex chars ({len(key)//2} bytes)')
+    n = len(bytes.fromhex(key))
 except ValueError:
     print('Invalid hex')
+else:
+    print(f'Valid key: {n} bytes' if n >= 32 else f'Too short: {n} bytes (need at least 32)')
 "
 ```
 
@@ -363,7 +364,7 @@ redis-cli FLUSHDB
 
 **Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Consecutive failures reached `failure_threshold` (default 5). Backend errors count, and so do exceptions raised by the decorated function itself: five in a row open the breaker even when the backend is healthy.
+**Cause**: Consecutive failures reached `failure_threshold` (default 5). Backend errors count. Exceptions raised by the decorated function itself also count for sync functions, and for async functions on a backend without distributed locking: five in a row open the breaker even when the backend is healthy. For async functions on a backend with distributed locking (Redis, CachekitIO), only a `BackendError` from the function counts.
 
 **What it means**:
 - Redis or backend is experiencing issues

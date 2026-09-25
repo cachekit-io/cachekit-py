@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- `failure_threshold` (default 5) consecutive failures were detected — backend errors, or exceptions raised by the decorated function itself
+- `failure_threshold` (default 5) consecutive failures were detected — backend errors, or exceptions raised by the decorated function itself (sync functions, or async functions on a backend without distributed locking)
 - Circuit breaker protection is preventing cascading failures
 - Cache is temporarily disabled to avoid overwhelming backend
 
@@ -43,7 +43,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function pass through to the caller unchanged, but they also count toward `failure_threshold`: five in a row open the breaker and stop caching for that namespace, even with a healthy backend.
+Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` as a backend failure and calls the function a second time, so the caller gets the second call's result or exception (async functions retry this way only on a backend with distributed locking). Your function's exceptions also count toward `failure_threshold`: five in a row open the breaker and stop caching for that namespace, even with a healthy backend. The exception is async functions on a backend with distributed locking (Redis, CachekitIO), where only a `BackendError` counts.
 
 </details>
 
