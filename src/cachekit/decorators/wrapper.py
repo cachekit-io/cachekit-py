@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.errors import BackendError, BackendErrorType
+from ..backends.errors import BackendError
 from ..cache_handler import (
     CacheHit,
     CacheInvalidator,
@@ -1285,7 +1285,7 @@ def create_cache_wrapper(
         # outside the try below on purpose: that except records a failure, and a
         # rejection is not one. Recorded, every rejected call would push the OPEN
         # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        if features.circuit_breaker and not features.should_allow_request():
+        if not features.should_allow_request():
             features.log_cache_operation(
                 operation="circuit_breaker_open",
                 key=cache_key,
@@ -1694,13 +1694,20 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
-            # Guard clause: Circuit breaker check - fail fast if circuit is open
-            # This prevents cascading failures
+            # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
+            # with its probe budget spent) - run the function uncached, as
+            # sync_wrapper does. Not recorded as a failure: a rejection is not one.
+            # The outer finally clears correlation ID / stats context.
             if not features.should_allow_request():
-                # Circuit breaker fail-fast: raise exception immediately
-                raise BackendError(  # noqa: F823  # pyright: ignore[reportUnboundVariable]
-                    "Circuit breaker OPEN - failing fast", error_type=BackendErrorType.TRANSIENT
+                features.log_cache_operation(
+                    operation="circuit_breaker_open",
+                    key=cache_key,
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    error="Circuit breaker rejected the request",
+                    error_type="CircuitBreakerOpen",
                 )
+                return await func(*args, **kwargs)
 
             nonlocal _backend
 
@@ -2029,8 +2036,6 @@ def create_cache_wrapper(
                 except Exception as e:
                     # Check if this is a lock-related exception or function execution exception
                     # BackendError may wrap function exceptions - check original_exception
-                    from cachekit.backends.errors import BackendError
-
                     # If it's not a Backend error, it's from the function - re-raise
                     if not isinstance(e, BackendError):
                         raise

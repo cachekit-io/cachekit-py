@@ -35,6 +35,8 @@ class CircuitState(Enum):
     OPEN -> HALF_OPEN: After timeout_seconds have elapsed
     HALF_OPEN -> CLOSED: After success_threshold successful requests
     HALF_OPEN -> OPEN: On any failure during testing
+    HALF_OPEN -> HALF_OPEN: A fresh probe cycle, when the probe budget is spent
+        and no outcome has ended the cycle within timeout_seconds
 
     Examples:
         >>> CircuitState.CLOSED.value
@@ -64,8 +66,10 @@ class CircuitBreakerConfig:
             Lower values make the circuit more sensitive to errors.
         success_threshold: Number of consecutive successes in HALF_OPEN before closing.
             Higher values ensure more stable recovery.
-        timeout_seconds: How long to stay OPEN before testing recovery.
-            Balance between giving service time to recover vs detecting recovery quickly.
+        timeout_seconds: How long to stay OPEN before testing recovery, and how long
+            a HALF_OPEN cycle whose probes report no outcome waits before starting a
+            fresh one. Balance between giving service time to recover vs detecting
+            recovery quickly.
         half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
             not a concurrency limit). Must be >= success_threshold, or a cycle can
             never collect enough successes to close.
@@ -215,6 +219,7 @@ class CircuitBreaker:
         self._last_failure_time = 0.0  # Timestamp of last failure (for timeout)
         self._half_open_permits = 0  # Current test requests in HALF_OPEN
         self._half_open_total_attempts = 0  # Total requests attempted in HALF_OPEN cycle
+        self._half_open_since = 0.0  # When the current HALF_OPEN cycle started
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
         # Initialize Prometheus metric for this namespace
@@ -229,6 +234,8 @@ class CircuitBreaker:
            - If yes: Transition to HALF_OPEN and check permits
            - If no: Reject request
         3. HALF_OPEN: Check if test permits available
+           - If the budget is spent and the cycle is older than timeout_seconds:
+             start a fresh cycle and admit
 
         Thread-safe: Uses double-checked locking to ensure atomic state transitions.
         """
@@ -263,7 +270,14 @@ class CircuitBreaker:
                         return self._allow_half_open_request()
                 return False  # Still in timeout period - reject
 
-            # HALF_OPEN state - limited testing
+            # HALF_OPEN state - limited testing.
+            # A cycle ends only when a probe records an outcome. A probe that exits
+            # without one (a cancelled async call, a fail-closed raise) would hold
+            # its slot forever, so a spent cycle that outlives timeout_seconds
+            # starts over instead of rejecting every call until restart.
+            budget_spent = self._half_open_total_attempts >= self.config.half_open_requests
+            if budget_spent and current_time - self._half_open_since > self.config.timeout_seconds:
+                self._transition_to_half_open()
             return self._allow_half_open_request()
 
     def _allow_half_open_request(self) -> bool:
@@ -314,6 +328,14 @@ class CircuitBreaker:
             return
 
         with self._lock:
+            # Guard clause: already OPEN. A failure recorded now comes from a call
+            # that was never admitted (key generation runs before admission) or
+            # from one admitted before the breaker opened. Counting it would push
+            # _last_failure_time forward and keep the breaker OPEN under steady
+            # traffic.
+            if self._state == CircuitState.OPEN:
+                return
+
             # Decrement permits if in HALF_OPEN state
             if self._state == CircuitState.HALF_OPEN:
                 self._half_open_permits = max(0, self._half_open_permits - 1)
@@ -350,6 +372,7 @@ class CircuitBreaker:
         self._success_count = 0
         self._half_open_permits = 0
         self._half_open_total_attempts = 0  # Reset attempt counter for new HALF_OPEN cycle
+        self._half_open_since = time.time()
         circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to HALF_OPEN")
 
@@ -409,11 +432,12 @@ class CircuitBreaker:
 
         ``FeatureOrchestrator.should_allow_request`` calls this for every
         decorated call. It is not a pure query: once ``timeout_seconds`` has
-        passed since the last failure it moves OPEN to HALF_OPEN, and in
+        passed since the breaker opened it moves OPEN to HALF_OPEN, and in
         HALF_OPEN each ``True`` consumes one of the cycle's
-        ``half_open_requests`` probe slots. Record the outcome of every admitted
-        call with ``record_success`` / ``record_failure``; never record a
-        rejection.
+        ``half_open_requests`` probe slots. A spent cycle that no outcome has
+        ended within ``timeout_seconds`` starts over with a fresh budget. Record
+        the outcome of every admitted call with ``record_success`` /
+        ``record_failure``; never record a rejection.
 
         Returns:
             True if the call may proceed, False if it must fail fast.
