@@ -34,6 +34,7 @@ Born from production debugging of caching failures:
 Example Usage:
     ```python
     from cachekit import cache
+    from cachekit.config.nested import CircuitBreakerConfig
 
     # Intelligent cache with zero configuration (90% of use cases)
     @cache
@@ -58,7 +59,7 @@ Example Usage:
         return fetch_remote(key)
 
     # Manual configuration when needed (1% of use cases)
-    @cache(ttl=3600, namespace="custom", circuit_breaker=True)
+    @cache(ttl=3600, namespace="custom", circuit_breaker=CircuitBreakerConfig(failure_threshold=10))
     def custom_function():
         return special_computation()
 

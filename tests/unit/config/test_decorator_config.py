@@ -115,6 +115,13 @@ class TestDecoratorConfigValidation:
         with pytest.raises(ConfigurationError, match="failure_threshold must be >= 1, got 0"):
             DecoratorConfig(circuit_breaker=CircuitBreakerConfig(failure_threshold=0))
 
+    def test_top_level_circuit_breaker_config_rejected_naming_the_nested_class(self) -> None:
+        """cachekit.CircuitBreakerConfig is the reliability class; circuit_breaker= takes the nested one (LAB-5340)."""
+        import cachekit
+
+        with pytest.raises(TypeError, match=r"cachekit\.config\.nested\.CircuitBreakerConfig"):
+            DecoratorConfig(circuit_breaker=cachekit.CircuitBreakerConfig(failure_threshold=1))  # type: ignore[arg-type]
+
     def test_validate_delegates_to_backpressure_config(self) -> None:
         """Test validation delegates to BackpressureConfig."""
         with pytest.raises(ConfigurationError, match="max_concurrent_requests must be >= 1, got 0"):
@@ -172,7 +179,6 @@ class TestDecoratorConfigToDict:
                 success_threshold=5,
                 recovery_timeout=60,
                 half_open_requests=2,
-                excluded_exceptions=(ValueError,),
             )
         )
         d = config.to_dict()
@@ -181,7 +187,7 @@ class TestDecoratorConfigToDict:
         assert d["success_threshold"] == 5
         assert d["recovery_timeout"] == 60
         assert d["half_open_requests"] == 2
-        assert d["excluded_exceptions"] == (ValueError,)
+        assert "excluded_exceptions" not in d
 
     def test_to_dict_flattens_backpressure_config(self) -> None:
         """Test to_dict() flattens BackpressureConfig."""
