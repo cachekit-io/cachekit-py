@@ -35,7 +35,7 @@ def get_user_ssn(user_id):
 
 Enable encryption with single decorator:
 
-> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there — with a clear error — rather than as a `KeyError`/`ValueError` raised at decoration time, when the module is imported (and, on the fail-open `@cache.io()` path, not at all).
+> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at decoration time, when the module is imported, and the exception type depends on what is wrong: `KeyError` from `os.environ[...]` for a missing variable, `ValueError` from `@cache.secure` when no key is found at all, and `ConfigurationError` (from `cachekit.config.validation` — not a `ValueError` subclass) for a malformed or too-short key passed to `@cache.secure`. On the fail-open `@cache.io()` path nothing raises at all: a missing key caches plaintext, and a malformed one logs a WARNING on every call while the function runs uncached.
 
 ```python notest
 from cachekit import cache
