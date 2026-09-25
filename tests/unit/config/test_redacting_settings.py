@@ -107,13 +107,13 @@ class _CustomChainQuotingConfig(BaseBackendConfig):
 class _UnrebuildableCtxConfig(BaseBackendConfig):
     """A validator whose custom ctx defeats the rebuild: an object posing as an exception, or a non-str key."""
 
+    ctx_kind: str = "proxy"  # before url, so url's validator can read it
     url: str = ""
-    ctx_kind: str = "proxy"
 
     @field_validator("url")
     @classmethod
     def reject(cls, v: str, info: ValidationInfo) -> str:
-        if info.data.get("ctx_kind") == "proxy":
+        if info.data["ctx_kind"] == "proxy":  # indexed: a missing ctx_kind is a KeyError, not the other branch
             raise PydanticCustomError("bad_url", "bad URL: {error}", {"error": MagicMock(spec=ValueError)})
         raise PydanticCustomError("bad_url", "bad URL", {1: "one"})  # type: ignore[dict-item]
 
@@ -249,9 +249,16 @@ class TestRedactingSettings:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     @pytest.mark.parametrize("ctx_kind", ["proxy", "non-str-key"])
-    def test_an_error_the_rebuild_cannot_handle_withholds_its_details(self, ctx_kind: str) -> None:
-        """The rebuild runs inside the except; if a validator's ctx makes it raise, that failure would chain the
-        original, raw inputs and all. It comes back as one ctx-less error with the details withheld."""
+    def test_an_error_the_rebuild_cannot_handle_withholds_its_details(
+        self, ctx_kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a validator's ctx makes the rebuild raise, that failure's traceback holds the original, raw inputs
+        and all. It comes back as one ctx-less error with the details withheld, and one warning names the
+        failure's type only, logged with no exception active for a handler's sys.exc_info() to reach."""
+        from cachekit.config import validation
+
+        warnings: list[tuple[str, BaseException | None]] = []
+        monkeypatch.setattr(validation.logger, "warning", lambda msg, *args: warnings.append((msg % args, sys.exc_info()[1])))
         with pytest.raises(ValidationError) as exc_info:
             _UnrebuildableCtxConfig(ctx_kind=ctx_kind, url="SECRET_VALUE")
 
@@ -259,6 +266,8 @@ class TestRedactingSettings:
         assert (err["type"], err["loc"], err["msg"]) == ("redaction_failed", (), "Validation failed; details withheld")
         assert "ctx" not in err
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+        msg = "_UnrebuildableCtxConfig: config validation error details withheld; redacting it raised TypeError"
+        assert warnings == [(msg, None)]
 
     def test_custom_error_template_is_read_after_the_chain_is_dropped(self) -> None:
         """A custom error rebuilds from its rendered msg; rendered before its ctx exception lost its chain, that

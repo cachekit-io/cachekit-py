@@ -12,6 +12,8 @@ from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
 
+from cachekit.hash_utils import redact_error_for_log
+
 if TYPE_CHECKING:
     from typing_extensions import Self  # typing.Self is 3.11+
 
@@ -56,7 +58,8 @@ class RedactingSettings(BaseSettings):
     and each error's type and loc kept, and its msg and ctx too, except where a ctx exception's msg
     came from its dropped traceback or chain, or a custom error's msg would change when formatted
     again with its own ctx (that ctx is dropped). An error that cannot be rebuilt at all comes back
-    as one ctx-less error that withholds the details. The copy is still a ValidationError (a
+    as one ctx-less error that withholds the details, and a warning names only the type of what the
+    rebuild raised. The copy is still a ValidationError (a
     ValueError), so fail-loud propagation paths are unchanged.
     """
 
@@ -99,14 +102,21 @@ def _redacting(validate: Callable[[], _T]) -> _T:
     # ctx exception's str() raises once its chain is dropped is reported to sys.unraisablehook as the
     # msgs are read.
     if isinstance(failure, ValidationError):
+        withheld_because: str | None = None
         try:
             failure = _redacted_copy(failure)  # also drops this frame's last reference to the original
-        except Exception:
+        except Exception as e:
             # A validator's ctx can defeat the rebuild (an object posing as an exception, a non-str ctx
             # key); withhold the details rather than raise a traceback whose frames hold the original.
+            withheld_because = redact_error_for_log(e)
             withheld = PydanticCustomError("redaction_failed", "Validation failed; details withheld")
             failure = ValidationError.from_exception_data(
                 failure.title, [{"type": withheld, "loc": (), "input": "[REDACTED]"}], hide_input=True
+            )
+        if withheld_because is not None:
+            # Logged outside the except, so a handler that reads sys.exc_info() gets nothing.
+            logger.warning(
+                "%s: config validation error details withheld; redacting it raised %s", failure.title, withheld_because
             )
     raise failure
 
