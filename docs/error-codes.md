@@ -9,7 +9,7 @@ Configuration errors raise when the decorator is applied. Backend failures (conn
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
 - An **async** function raises `UnboundLocalError` once the circuit breaker opens (a known defect; sync functions degrade as described).
-- An **async** function can currently raise the backend's own exception instead of degrading (a known defect): `redis.exceptions.ConnectionError` on every call once Redis goes away after the first successful call, and `httpx.HTTPStatusError` on a CachekitIO 401, 403 or 400, without running the function. On a CachekitIO 429, 5xx or timeout, each async call can wait up to 5 seconds before it runs.
+- An **async** function can currently raise the backend's own exception instead of degrading (a known defect): `redis.exceptions.ConnectionError` on every call once Redis goes away after the first successful call, and `httpx.HTTPStatusError` on a CachekitIO 401, 403 or 400, without running the function. On a CachekitIO 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
 
 ## Encryption Errors
 
@@ -451,7 +451,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379
 
 **Message** (logged): `Failed to acquire lock for ... after 5.0s, checking cache`
 
-**Exception**: none. On a cache miss, an async `@cache` function on a lock-capable backend (Redis, CachekitIO) waits up to 5 seconds for the per-key lock. If another process still holds it, cachekit checks the cache once more, then runs the function itself.
+**Exception**: none. On a cache miss, an async `@cache` function on CachekitIO, or Redis configured via `CACHEKIT_REDIS_URL`, waits about 5 seconds (plus request time) for the per-key lock. If another process still holds it, cachekit checks the cache once more, then runs the function itself.
 
 **Cause**: Distributed lock could not be acquired (another process holds the lock)
 
@@ -474,7 +474,7 @@ redis-cli DEL <lock-key>
 
 These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. For sync functions none raises: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. These failures do not count toward the circuit breaker.
 
-Async functions currently behave differently (a known defect). A 401, 403 or 400 raises `httpx.HTTPStatusError` to the caller without running the function. A 429, 5xx or timeout makes the call poll the service for up to 5 seconds before running the function, so every such call takes about 5 seconds.
+Async functions currently behave differently (a known defect). A 401, 403 or 400 raises `httpx.HTTPStatusError` to the caller without running the function. On a 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
 
 ### Authentication failure (401/403)
 
