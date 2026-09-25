@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
@@ -232,7 +233,9 @@ class TestRedactingSettings:
         self, config_cls: type[BaseBackendConfig | CachekitConfig], doc: str, expected: tuple[str, tuple[str, ...], str]
     ) -> None:
         """from_exception_data renders a built-in type's msg in Python input mode by default; a JSON-mode error
-        keeps its own msg and, being still a built-in type, its url."""
+        keeps its own msg and, being still a built-in type, its url. The memcached document is an object, so
+        __init__ redacts its field error in Python mode first; pydantic re-renders that error in JSON mode, and
+        model_validate_json redacts the result."""
         with pytest.raises(ValidationError) as exc_info:
             config_cls.model_validate_json(doc)
 
@@ -247,7 +250,6 @@ class TestRedactingSettings:
         Rebuilding by name raised KeyError inside the except, chaining the raw original. pydantic's own
         Path fields raise "path_type"; a subclass validator may raise PydanticCustomError with a ctx.
         """
-        from pydantic_core import PydanticCustomError
 
         class StrictURLConfig(BaseBackendConfig):
             url: str = ""
@@ -273,13 +275,32 @@ class TestRedactingSettings:
         for exc in (file_info.value, custom_info.value):
             _assert_no_route_to(exc, "SECRET_VALUE")
 
+    def test_custom_error_msg_is_not_formatted_twice(self) -> None:
+        """A custom error formats its template with its ctx on every render. A rendered msg that still quotes a
+        ctx placeholder must stay literal rather than pull that ctx value into str()."""
+
+        class QuotingConfig(BaseBackendConfig):
+            url: str = ""
+
+            @field_validator("url")
+            @classmethod
+            def reject(cls, v: str) -> str:
+                raise PydanticCustomError("bad_url", "Invalid {detail}", {"value": "SECRET_VALUE", "detail": "{value}"})
+
+        with pytest.raises(ValidationError) as exc_info:
+            QuotingConfig(url="x")
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("bad_url", ("url",), "Invalid {value}")
+        assert "ctx" not in err
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
     @pytest.mark.parametrize("ctx", [None, {"port": 6379}])
     def test_custom_error_named_like_a_builtin_stays_custom(self, ctx: dict[str, int] | None) -> None:
         """A PydanticCustomError named "value_error" is not the built-in: it has no url and no ctx["error"].
 
         Rebuilding it by name raised TypeError inside the except, chaining the raw original.
         """
-        from pydantic_core import PydanticCustomError
 
         class StrictURLConfig(BaseBackendConfig):
             url: str = ""

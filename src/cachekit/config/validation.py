@@ -53,8 +53,9 @@ class RedactingSettings(BaseSettings):
     API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
     (``loc == ()``) snapshots the whole input dict. A failure in the constructor (``from_env()``
     included) or a ``model_validate*`` classmethod is re-raised as a copy with every input redacted
-    and each error's type, loc, msg and ctx kept. The copy is still a ValidationError (a
-    ValueError), so fail-loud propagation paths are unchanged.
+    and each error's type, loc, msg and ctx kept (a custom error whose msg would re-format with its
+    ctx drops the ctx). The copy is still a ValidationError (a ValueError), so fail-loud propagation
+    paths are unchanged.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -116,7 +117,12 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
             # name check guards against a url on a type this pydantic-core's ErrorType does not list, since a
             # wrong rebuild-by-name raises here and chains the original. Any other (pydantic's own Path fields
             # raise "path_type") rebuilds from its rendered msg, which pydantic produced, hence not a LiteralString.
+            # A custom error formats that msg with its ctx on every render, and pydantic-core takes a custom type's
+            # ctx from the error alone: a msg still holding a {key} of its ctx (a ctx value quoting a placeholder)
+            # would format twice and put that ctx value into str(), so such an error drops its ctx.
             error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
+            if error_type.message() != err["msg"]:
+                error_type = PydanticCustomError(err["type"], err["msg"])  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
             for value in ctx.values():
