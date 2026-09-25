@@ -106,23 +106,25 @@ get_data()  # Can't decrypt old data with new key
 **Solutions**:
 
 **Option 1: Key was rotated (most common)**
-```bash
-# Clear cache of incompatible data
-redis-cli FLUSHDB
 
-# Keep new key and restart application
-export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-python app.py
-# Function will recompute and cache with new key
+Keep the old key decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated
+hex, max 3) so entries it wrote stay readable, and follow the
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/). Do not flush or mint another key: a flush drops
+unrelated data on a shared database, and a fresh key only repeats the failure.
+
+**Option 2: Wrong key on some instances (configuration drift)**
+
+Compare a hash of the key across instances — never print the key itself:
+```bash
+python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CACHEKIT_MASTER_KEY'])).hexdigest()[:16])"
 ```
 
-**Option 2: Revert to original key**
-```bash
-# If you have the original key stored safely
-export CACHEKIT_MASTER_KEY=<original-key-here>
-python app.py
-# Cached data can now be decrypted
-```
+An instance whose hash differs from the rest is misconfigured. Do not fix it by
+setting `CACHEKIT_MASTER_KEY` back to a key that has already encrypted and been
+retired: re-promoting a key resumes its used AES-GCM nonce budget (see
+[Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)). Move the drifted instance forward to the fleet's
+current key, and keep the key it wrote with decrypt-only in
+`CACHEKIT_PREVIOUS_MASTER_KEYS`.
 
 **Option 3: Data corruption**
 ```bash
@@ -133,17 +135,8 @@ redis-cli FLUSHDB
 python app.py
 ```
 
-**Prevention**:
-```bash
-# Before rotating keys, clear cache
-redis-cli FLUSHDB
-
-# Then update key
-export CACHEKIT_MASTER_KEY=new_key
-
-# Restart application
-python app.py
-```
+**Prevention**: rotate with the keyring, not a key swap — follow the
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/) (see also [Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)).
 
 ---
 
