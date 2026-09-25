@@ -6,9 +6,10 @@ process, and the SaaS stores opaque ciphertext. (The env key enables encryption
 fleet-wide via settings — no decorator change needed.) Only a holder of the
 master key can recover the plaintext; the SaaS never sees the key.
 
-``@cache.io`` builds its own CachekitIO backend and ignores an injected one, so
-the ciphertext is captured for the zero-knowledge / tamper checks via a
-class-level monkeypatch of ``CachekitIOBackend.set``.
+``@cache.io`` builds its own CachekitIO backend and rejects an injected one
+(``backend=`` is a ConfigurationError), so the ciphertext is captured for the
+zero-knowledge / tamper checks via a class-level monkeypatch of
+``CachekitIOBackend.set``.
 
 Two constraints encoded here:
     1. The SaaS enforces a strict cache-key format — ``func`` must match
@@ -137,8 +138,9 @@ def io_env(master_key: str) -> Iterator[None]:
 def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Record the last (key, value) the SDK writes to the SaaS.
 
-    ``@cache.io`` builds its own backend, so we patch the class method rather
-    than inject — capturing the real SaaS-compliant key and the exact bytes sent.
+    ``@cache.io`` builds its own backend (and rejects ``backend=``), so we patch
+    the class method rather than inject — capturing the real SaaS-compliant key
+    and the exact bytes sent.
     """
     holder: dict[str, object] = {"key": None, "value": None}
     original = CachekitIOBackend.set

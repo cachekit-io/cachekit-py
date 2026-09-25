@@ -120,7 +120,7 @@ config = CachekitIOBackendConfig(
 # CACHEKIT_API_URL=https://cache.internal.company.com
 ```
 
-**Important**: Even with `allow_custom_host=True`, private IP addresses are still blocked. The allowlist bypass only affects hostname validation.
+**Important**: Even with `allow_custom_host=True`, private IP addresses and credentials in the URL (`user:password@`) are still rejected. The allowlist bypass only affects hostname validation.
 
 ## Environment Variables
 

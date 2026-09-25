@@ -456,7 +456,8 @@ class CacheSerializationHandler:
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
     - encryption=None: Auto-detect from CACHEKIT_MASTER_KEY (single-tenant if a key is present)
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
-    - encryption=True, tenant_extractor=None: Single-tenant encrypted (nil UUID)
+    - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
+      unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
     - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
 
     Examples:
@@ -518,12 +519,13 @@ class CacheSerializationHandler:
                           is set fleet-wide. This is the deliberate per-function escape hatch.
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
-                             If None: single-tenant mode (uses nil UUID).
+                             If None: single-tenant mode (tenant_id "default" unless overridden).
                              If provided: multi-tenant mode (extracts tenant_id, FAIL CLOSED).
             single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                                Mutually exclusive with tenant_extractor.
-            deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
-                            If not provided, uses env var or persistent file.
+            deployment_uuid: Optional explicit tenant_id override for single-tenant mode
+                            (validated UUID). Falls back to CACHEKIT_DEPLOYMENT_UUID, then to the
+                            protocol literal "default" — the cross-SDK default every SDK derives from.
             master_key: Optional master key for encryption (hex-encoded). If not provided,
                        reads from CACHEKIT_MASTER_KEY environment variable.
             enable_integrity_checking: Enable integrity checking (default: True)
@@ -551,7 +553,7 @@ class CacheSerializationHandler:
         self.serializer_name = serializer_name
         self.enable_integrity_checking = enable_integrity_checking
         self.interop_mode = interop_mode
-        self._deployment_uuid_value: Optional[str] = None
+        self._single_tenant_id: Optional[str] = None
 
         # Interop mode (interop/v1, spec/interop-mode.md): values are ONE plain
         # MessagePack document — no ByteStorage envelope and no CK v3 frame, so
@@ -564,8 +566,9 @@ class CacheSerializationHandler:
                 raise ConfigurationError(
                     "interop mode does not support tenant_extractor (multi-tenant) encryption: "
                     "interop entries store no metadata header, so the read path cannot recover "
-                    "a per-call tenant. Use single-tenant encryption with an explicitly shared "
-                    "CACHEKIT_DEPLOYMENT_UUID across SDKs instead."
+                    "a per-call tenant. Use single_tenant_mode=True instead: the tenant is the "
+                    "protocol literal 'default', so the same master key is enough across SDKs. "
+                    "To scope keys to a deployment, set the same canonical deployment_uuid in every SDK."
                 )
             if isinstance(serializer_name, str) and _SERIALIZER_NAME_ALIASES.get(serializer_name, serializer_name) != "default":
                 raise ConfigurationError(
@@ -630,7 +633,7 @@ class CacheSerializationHandler:
                 raise ConfigurationError(
                     "Encryption requires explicit tenant mode. "
                     "Provide tenant_extractor for multi-tenant OR "
-                    "set single_tenant_mode=True with deployment_uuid for single-tenant."
+                    "set single_tenant_mode=True for single-tenant."
                 )
 
             # Prevent both modes from being enabled simultaneously
@@ -663,15 +666,13 @@ class CacheSerializationHandler:
                     f"cross_sdk_compatible ClassVar to True and guarantee a language-agnostic wire format."
                 )
 
-            # Generate deterministic deployment UUID for single-tenant mode
+            # Resolve the single-tenant tenant_id (protocol intent-presets.md § Master Key
+            # Input, rule 5): explicit deployment_uuid → CACHEKIT_DEPLOYMENT_UUID → "default".
             if self.single_tenant_mode:
-                self._deployment_uuid_value = self._get_deterministic_deployment_uuid(provided_uuid=self.deployment_uuid)
+                self._single_tenant_id, source = self._resolve_single_tenant_id(provided_uuid=self.deployment_uuid)
                 get_logger().info(
                     "Single-tenant mode initialized",
-                    extra={
-                        "deployment_uuid": self._deployment_uuid_value,
-                        "source": "provided" if self.deployment_uuid else "auto-generated",
-                    },
+                    extra={"tenant_id": self._single_tenant_id, "source": source},
                 )
 
         # Use cached base serializer instance with integrity_checking setting
@@ -695,100 +696,49 @@ class CacheSerializationHandler:
         self._encryption_cache_lock = threading.RLock()
         self._encryption_cache_maxsize = 256
 
-    def _get_deterministic_deployment_uuid(self, provided_uuid: Optional[str]) -> str:
-        """Get deployment UUID with determinism guarantee (MEDIUM-02, Criterion 2).
+    DEFAULT_TENANT_ID = "default"
+    """Implicit single-tenant ``tenant_id`` — the protocol's cross-SDK literal.
 
-        Deterministic UUID ensures encrypted cache data remains readable after restarts.
-        Non-deterministic UUID (e.g., using time.time()) causes complete cache invalidation.
+    protocol ``spec/intent-presets.md`` § Master Key Input, rule 5: with no caller-supplied
+    tenant, every SDK MUST derive keys and build AAD with the literal ``"default"``, so a
+    py, rs and ts client on one master key produce mutually decryptable ciphertext. A
+    per-machine value here (the persisted ``~/.cachekit/deployment_uuid`` earlier releases auto-generated) is
+    a silent, permanent cross-SDK authentication failure — not a miss.
+    """
+
+    def _resolve_single_tenant_id(self, provided_uuid: Optional[str]) -> tuple[str, str]:
+        """Resolve the tenant_id used for HKDF derivation and AAD in single-tenant mode.
+
+        Returns ``(tenant_id, source)``; ``source`` names which of the three rungs below won.
 
         Priority order:
-        1. Explicit provided_uuid (user-controlled, highest priority)
-        2. Environment variable CACHEKIT_DEPLOYMENT_UUID (recommended for prod)
-        3. Persistent file storage (auto-generated, survives restarts)
-        4. NEVER use time.time() or random values (breaks decryption)
+        1. Explicit ``deployment_uuid`` parameter (validated UUID)
+        2. ``CACHEKIT_DEPLOYMENT_UUID`` configuration (validated UUID)
+        3. The protocol literal ``"default"`` (:attr:`DEFAULT_TENANT_ID`)
 
-        Args:
-            provided_uuid: Optional UUID provided by user
-
-        Returns:
-            Validated and deterministic deployment UUID
+        There is deliberately no machine-local source: the tenant is a key-derivation
+        input, so anything that differs per host differs per key.
 
         Raises:
-            ConfigurationError: If UUID format is invalid
+            ConfigurationError: If an explicit UUID is malformed (or, in interop mode,
+                not in canonical lowercase-hyphenated form).
         """
         import uuid
-        from pathlib import Path
 
-        # Option 1: Explicit UUID provided by user
-        if provided_uuid:
+        for raw, source in (
+            (provided_uuid, "deployment_uuid parameter"),
+            (get_settings().deployment_uuid, "CACHEKIT_DEPLOYMENT_UUID"),
+        ):
+            if not raw:
+                continue
             try:
-                # Validate UUID format
-                validated_uuid = str(uuid.UUID(provided_uuid))
-                self._require_canonical_tenant_form(provided_uuid, validated_uuid, source="deployment_uuid parameter")
-                get_logger().info(f"Using provided deployment UUID: {validated_uuid}")
-                return validated_uuid
+                validated_uuid = str(uuid.UUID(raw))
             except ValueError as e:
-                raise ConfigurationError(
-                    f"Invalid deployment_uuid format (must be valid UUID): {provided_uuid}. Error: {e}"
-                ) from e
+                raise ConfigurationError(f"Invalid {source} (must be valid UUID): {raw}. Error: {e}") from e
+            self._require_canonical_tenant_form(raw, validated_uuid, source=source)
+            return validated_uuid, source
 
-        # Option 2: Configuration (recommended for production)
-        settings = get_settings()
-        if settings.deployment_uuid:
-            try:
-                validated_uuid = str(uuid.UUID(settings.deployment_uuid))
-                self._require_canonical_tenant_form(settings.deployment_uuid, validated_uuid, source="CACHEKIT_DEPLOYMENT_UUID")
-                get_logger().info(f"Using deployment UUID from configuration: {validated_uuid}")
-                return validated_uuid
-            except ValueError as e:
-                raise ConfigurationError(
-                    f"Invalid deployment_uuid in configuration (must be valid UUID): {settings.deployment_uuid}. Error: {e}"
-                ) from e
-
-        # Interop mode never falls through to the machine-local sources below:
-        # the persistent-file / freshly-generated UUID is random PER HOST, so
-        # two processes (or two SDKs) would silently derive different AES keys
-        # — every cross-host read fails auth, entries evict each other in a
-        # recompute loop, and on metered-misses billing every miss costs money.
-        # Cross-SDK encryption only works with an explicitly shared tenant.
-        if self.interop_mode:
-            raise ConfigurationError(
-                "interop mode with encryption requires an explicitly shared deployment UUID "
-                "(deployment_uuid parameter or CACHEKIT_DEPLOYMENT_UUID): the auto-generated "
-                "machine-local UUID differs per host, so other processes and SDKs could never "
-                "decrypt entries written here. Configure the same canonical lowercase UUID "
-                "in every SDK sharing this cache."
-            )
-
-        # Option 3: Persistent file storage (auto-generated, survives restarts)
-        deployment_uuid_file = Path.home() / ".cachekit" / "deployment_uuid"
-
-        if deployment_uuid_file.exists():
-            # Read existing UUID from file
-            stored_uuid = deployment_uuid_file.read_text().strip()
-            try:
-                validated_uuid = str(uuid.UUID(stored_uuid))
-                self._require_canonical_tenant_form(stored_uuid, validated_uuid, source=str(deployment_uuid_file))
-                get_logger().info(f"Using persistent deployment UUID from {deployment_uuid_file}")
-                return validated_uuid
-            except ValueError:
-                # Corrupted file - regenerate
-                get_logger().warning(f"Corrupted deployment UUID file: {deployment_uuid_file}. Regenerating...")
-
-        # Generate new UUID and persist to file
-        new_uuid = str(uuid.uuid4())
-        try:
-            deployment_uuid_file.parent.mkdir(parents=True, exist_ok=True)
-            deployment_uuid_file.write_text(new_uuid)
-            deployment_uuid_file.chmod(0o600)  # Read/write for owner only
-            get_logger().info(f"Generated and persisted new deployment UUID: {new_uuid} at {deployment_uuid_file}")
-        except Exception as e:
-            get_logger().error(
-                f"Failed to persist deployment UUID to {deployment_uuid_file}: {redact_error_for_log(e)}. "
-                "UUID will be regenerated on next restart (cache will be invalidated)."
-            )
-
-        return new_uuid
+        return self.DEFAULT_TENANT_ID, "protocol default"
 
     def _require_canonical_tenant_form(self, raw: str, canonical: str, source: str) -> None:
         """Interop mode: reject a deployment UUID that is not already canonical.
@@ -897,7 +847,7 @@ class CacheSerializationHandler:
         Note:
             Tenant extraction uses FAIL CLOSED security policy:
             - If tenant_extractor provided: extracts tenant_id from args/kwargs or raises ValueError
-            - If single_tenant_mode=True: uses deterministic deployment UUID
+            - If single_tenant_mode=True: uses the tenant_id resolved in __init__ (explicit UUID, else "default")
 
         Examples:
             Serialize a dictionary (no encryption):
@@ -938,12 +888,11 @@ class CacheSerializationHandler:
                     # If extraction fails, ValueError bubbles up (FAIL CLOSED - no fallback)
                     tenant_id = self.tenant_extractor.extract(args, kwargs)
                 else:
-                    # MEDIUM-02: Single-tenant mode with deterministic UUID
-                    # Uses cached deployment UUID (generated in __init__)
-                    # Constructor guarantees single_tenant_mode=True here (validated in __init__)
-                    if self._deployment_uuid_value is None:
-                        raise RuntimeError("deployment_uuid should be set in __init__ for single-tenant mode")
-                    tenant_id = self._deployment_uuid_value
+                    # Single-tenant mode: tenant_id resolved once in __init__
+                    # (explicit deployment_uuid / CACHEKIT_DEPLOYMENT_UUID, else "default").
+                    if self._single_tenant_id is None:
+                        raise RuntimeError("single-tenant tenant_id should be set in __init__")
+                    tenant_id = self._single_tenant_id
 
                 # CRITICAL-03 FIX: Use cached EncryptionWrapper to prevent 360K key copies/hour
                 # Gets cached instance (thread-safe LRU, maxsize=256) instead of creating new one
@@ -1218,9 +1167,11 @@ class CacheSerializationHandler:
             raise SerializationError("interop cache entries are binary; got str from backend")
         try:
             if self.encryption:
-                if self._deployment_uuid_value is None:
-                    raise SerializationError("interop encryption requires single-tenant mode (deployment UUID missing)")
-                tenant_id = self._deployment_uuid_value
+                if self._single_tenant_id is None:
+                    # Our own config is broken, not the entry: fail loud. A SerializationError
+                    # would read as corruption and miss + evict a valid shared entry.
+                    raise KeyringConfigurationError("interop encryption requires single-tenant mode (tenant_id missing)")
+                tenant_id = self._single_tenant_id
                 wrapper = self._get_cached_encryption_wrapper(tenant_id)
                 # Synthesize the metadata the wrapper needs: interop AAD is pinned
                 # to format=msgpack, compressed=False, NO original_type (exactly

@@ -1,4 +1,4 @@
-"""Optimized connection pool monitoring with <3% overhead.
+"""Connection pool monitoring with <3% overhead.
 
 This module provides lazy, sampling-based connection pool monitoring
 that reduces overhead from 1409% to <3% while maintaining functionality.
@@ -84,8 +84,8 @@ class CachedPoolMetrics:
         return time.time() - self.last_update > self.cache_duration
 
 
-class OptimizedPoolMonitor:
-    """Optimized pool monitor with <3% overhead.
+class PoolMonitor:
+    """Pool monitor with <3% overhead.
 
     Features:
     - Lazy stats calculation with 5-second caching
@@ -101,7 +101,7 @@ class OptimizedPoolMonitor:
         >>> mock_pool_manager = Mock()
         >>> mock_pool_manager.is_sync_initialized = False
         >>> mock_pool_manager.pool = None
-        >>> monitor = OptimizedPoolMonitor(mock_pool_manager, sampling_rate=0.01)
+        >>> monitor = PoolMonitor(mock_pool_manager, sampling_rate=0.01)
         >>> monitor.sampling_rate
         0.01
 
@@ -127,7 +127,7 @@ class OptimizedPoolMonitor:
     """
 
     def __init__(self, pool_manager, sampling_rate: float = 0.01):
-        """Initialize optimized monitor.
+        """Initialize the monitor.
 
         Args:
             pool_manager: The connection pool manager to monitor

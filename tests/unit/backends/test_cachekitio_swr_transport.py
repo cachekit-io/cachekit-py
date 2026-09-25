@@ -38,7 +38,10 @@ def _response(status: int, content: bytes = b"", headers: dict[str, str] | None 
 @pytest.fixture
 def backend() -> CachekitIOBackend:
     with (
-        patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=MagicMock(spec=httpx.Client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        ),
         patch(
             "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
             return_value=MagicMock(spec=httpx.AsyncClient),

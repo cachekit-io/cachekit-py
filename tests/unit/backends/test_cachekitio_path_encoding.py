@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json as _json
 from collections.abc import Callable
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
 import httpx
@@ -82,7 +82,7 @@ def _make_backend() -> tuple[CachekitIOBackend, list[httpx.Request]]:
     sync_client = httpx.Client(base_url=_TEST_API_URL, transport=transport)
     async_client = httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)
     with (
-        patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=sync_client),
+        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=sync_client)),
         patch("cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=async_client),
     ):
         return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY), seen
