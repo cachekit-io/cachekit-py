@@ -400,7 +400,7 @@ class DecoratorConfig:
                       and master_key is unused. Encryption requires a backend.
 
         Note: .secure does NOT pin the SaaS. Backend resolution is the same as every preset:
-              explicit backend= kwarg (the only order-independent tier), then set_default_backend()
+              an explicit backend (backend= or one inside config=; the only order-independent tier), then set_default_backend()
               (read at decoration, and again at first call if still unset), then environment
               auto-detect at FIRST CALL. So with
               REDIS_URL set and CACHEKIT_API_KEY unset, encrypted values silently go to Redis, and

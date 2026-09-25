@@ -35,7 +35,7 @@ def get_user_ssn(user_id):
 
 Enable encryption with single decorator:
 
-> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at decoration time, when the module is imported, and the exception type depends on what is wrong: `KeyError` from `os.environ[...]` for a missing variable, `ValueError` from `@cache.secure` when no key is found at all, and `ConfigurationError` (from `cachekit.config.validation` — not a `ValueError` subclass) for a malformed or too-short key passed to `@cache.secure`. On the fail-open `@cache.io()` path nothing raises at all: a missing key caches plaintext, and a malformed one logs a WARNING on every call while the function runs uncached.
+> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at import. One exception: on the fail-open `@cache.io()` path a missing *master* key raises nothing — the function caches plaintext.
 
 ```python notest
 from cachekit import cache
@@ -96,7 +96,7 @@ canonical statement.
 > SaaS, `CACHEKIT_REDIS_URL` → Redis, `CACHEKIT_MEMCACHED_SERVERS`, `CACHEKIT_FILE_CACHE_DIR`)
 > — two or more set at once raises `ConfigurationError`, there is no fallthrough between
 > them; none set → `REDIS_URL` / localhost Redis. Only an
-> explicit `backend=` is order-independent: the first call pins the backend, so a
+> explicit backend (`backend=` or one inside `config=`) is order-independent: the first call pins the backend, so a
 > `set_default_backend()` that runs after it never re-points the function. Consequences:
 > (1) in a 12-factor environment where `REDIS_URL` is set and `CACHEKIT_API_KEY`
 > is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
@@ -106,7 +106,10 @@ canonical statement.
 > call (e.g. two auto-detect selectors set at once) is **swallowed** — the `ConfigurationError` is logged at WARNING as a
 > `client_creation` failure and the function runs **uncached on every call**, with
 > **L1 never populated** — so a cold cache stays cold.
-> Alert on `client_creation_failed`. When the SaaS is the requirement, pass
+> Alert on the WARNING it logs on the `cachekit.decorators.orchestrator` logger,
+> `Cache operation 'client_creation' failed…` (see
+> [Environment Variable Auto-Detection](../backends/README.md#3-environment-variable-auto-detection-lowest-priority)).
+> When the SaaS is the requirement, pass
 > `backend=CachekitIOBackend()` explicitly — auditable in code and immune to
 > environment drift.
 
@@ -386,27 +389,14 @@ df = get_patient_records(42)
 ### Multi-Tenant Isolation
 
 > [!CAUTION]
-> **The per-tenant example previously shown here did not isolate tenants, and has
-> been removed rather than corrected.** Run against this version, the documented
-> form returned tenant A's cached value to tenant B. Two causes, and the first is
-> enough on its own:
+> **`tenant_extractor` is not a tenancy boundary.** Cache keys carry no tenant
+> component — the key is `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so tenants
+> calling with identical arguments address the same entry. Give each tenant its own
+> `namespace`, or its own deployment. With `backend=None` nothing is encrypted at all
+> (see the warning at the top of this page).
 >
-> - it passed `backend=None`, so nothing was serialized, no key was derived and no
->   encryption ran at all (see the warning at the top of this page); and
-> - the cache key carries **no tenant component** — the key is
->   `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so both tenants address the same
->   entry, and separation depends entirely on the decrypt step failing.
->
-> Supplying a real backend is **not** by itself a sufficient correction: with a
-> backend and the supported `ContextVarExtractor`, the same call still returned the
-> first tenant's value in our check. Until that is root-caused, this page will not
-> show a pattern it cannot demonstrate. `tenant_extractor` also requires an object
-> implementing `.extract(args, kwargs)` — a bare `lambda` raises `AttributeError` —
-> and tenant ids must be valid UUIDs.
->
-> **Do not rely on `tenant_extractor` as a tenancy boundary.** Give each tenant its
-> own `namespace`, or its own deployment, and treat per-tenant key derivation as
-> defence in depth rather than the control that separates them.
+> `tenant_extractor` requires an object implementing `.extract(args, kwargs)` — a
+> bare `lambda` raises `AttributeError` — and tenant ids must be valid UUIDs.
 
 ### Key Rotation Pattern
 
@@ -481,11 +471,9 @@ Properties of the derivation itself:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
 
-What that does NOT give you: the cache key carries no tenant component, so both
-tenants address the same entry and separation rests entirely on the decrypt step
-rejecting the other tenant's ciphertext. That is a fail-closed behaviour, not an
-isolation boundary, and it does not hold at all when nothing is encrypted
-(backend=None). See Multi-Tenant Isolation above before relying on this.
+This is not a tenancy boundary: the cache key carries no tenant component, so
+tenants calling with identical arguments address the same entry. See Multi-Tenant
+Isolation above.
 ```
 
 ### Nonce Generation (Uniqueness)
@@ -796,10 +784,6 @@ export default {
 
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
-- ✅ Per-tenant key derivation with fail-closed extraction — a tenant's ciphertext is
-  not readable under another tenant's key, and a failed extraction raises rather than
-  falling back to a shared key. This is **not** a tenancy boundary on its own: cache
-  keys carry no tenant component (see [Multi-Tenant Isolation](#multi-tenant-isolation))
 - ✅ Supports GDPR/HIPAA/PCI-DSS arguments on the fail-closed path (`@cache.secure` + explicit backend — see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 

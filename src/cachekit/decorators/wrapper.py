@@ -483,12 +483,10 @@ def create_cache_wrapper(
     Security Note:
         When encryption=True and tenant_extractor is provided, tenant ID extraction
         uses FAIL CLOSED security policy. If extraction fails, ValueError propagates to caller
-        (no fallback to shared encryption key). That is the whole of the guarantee: a
-        missing or unparseable tenant never silently shares one tenant's key. It is NOT
-        a tenancy boundary — cache keys carry no tenant component, so two tenants calling
-        with identical arguments address the same entry, and separation rests entirely on
-        the decrypt step failing. Do not rely on this for cross-tenant isolation; use
-        separate namespaces. See docs/features/zero-knowledge-encryption.md.
+        (no fallback to shared encryption key). It is NOT a tenancy boundary — cache keys
+        carry no tenant component, so two tenants calling with identical arguments address
+        the same entry. Give each tenant its own namespace or deployment. See
+        docs/features/zero-knowledge-encryption.md.
     """
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values
@@ -623,8 +621,7 @@ def create_cache_wrapper(
     # NOT so under _l1_only_mode (backend=None): that path stores raw Python object
     # references via ObjectCache and never serializes, so the encryption layer is never
     # reached and master_key goes unused. Documented in
-    # docs/features/zero-knowledge-encryption.md; a decoration-time guard is tracked
-    # separately (compare the interop guard above, which rejects the same combination).
+    # docs/features/zero-knowledge-encryption.md.
 
     # Initialize feature orchestrator using EXISTING reliability/monitoring modules
     # Convert CircuitBreakerConfig to dict if provided

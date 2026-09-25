@@ -19,7 +19,7 @@ The backend stores opaque ciphertext only. The master key never leaves the clien
 
 ## Basic Usage
 
-> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at decoration time, when the module is imported, and the exception type depends on what is wrong: `KeyError` from `os.environ[...]` for a missing variable; for a malformed key, `ValueError` from `bytes.fromhex(...)`, `EncryptionError` from `EncryptionWrapper` for a too-short one, and `ConfigurationError` (from `cachekit.config.validation`) from `@cache.secure` — neither of the last two is a `ValueError` subclass. On the fail-open `@cache.io()` path nothing raises at all: a missing key caches plaintext, and a malformed one logs a WARNING on every call while the function runs uncached.
+> **Configuration is read inline (`os.environ[...]`) in these examples to keep them short.** In an application, load and validate configuration once at startup, so a missing or malformed value fails there with a clear error. Read inline, it fails at import.
 
 ```python notest
 # notest: @cache.secure validation requires CACHEKIT_MASTER_KEY before conftest runs
