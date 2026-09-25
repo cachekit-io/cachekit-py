@@ -426,8 +426,11 @@ them (cachekit-py#170):
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
   between cache keys), or the entry claims a different tenant. The plaintext frame
   header fields bound into the AAD (`tenant_id`, `format`, `compressed`,
-  `original_type`) are unencrypted but authenticated by the tag, so a header value that
-  still encodes but differs from what was written also fails here. Raised as
+  `original_type`) are unencrypted, but the AAD built from them is authenticated by the
+  tag: a header change that produces different AAD bytes also fails here. (What is
+  authenticated is the constructed AAD, not the header's JSON bytes — a re-encoding that
+  yields identical AAD, such as `compressed` stored as `"True"` instead of `true`, reads
+  successfully.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the

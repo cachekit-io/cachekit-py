@@ -522,7 +522,8 @@ class EncryptionWrapper:
 
         # AAD build sits OUTSIDE the tag-verification try: a header value that cannot be
         # built into the AAD fails here as corruption (evict), never tamper (retained under
-        # fail_closed). A value that builds but differs fails the tag below — see _create_aad.
+        # fail_closed). A value that builds into different AAD bytes fails the tag below — see
+        # _create_aad.
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -716,9 +717,9 @@ class EncryptionWrapper:
         ]
 
         # `original_type` arrives untyped from the plaintext CK header (json.loads →
-        # SerializationMetadata.from_dict passes it straight through). Header fields bound
-        # into the AAD are authenticated by the GCM tag: a string that encodes but differs
-        # from what was written fails tag verification as tamper. A non-string or
+        # SerializationMetadata.from_dict passes it straight through). The AAD built from the
+        # header is authenticated by the GCM tag (the header's JSON bytes are not): a string
+        # that encodes into different AAD bytes fails tag verification as tamper. A non-string or
         # non-encodable value cannot be built into the AAD at all, so no tag check runs —
         # it is corruption-class, evicted by the read path. Gate on presence, not
         # truthiness: 0 / False / [] / {} cannot be built into the AAD either.
