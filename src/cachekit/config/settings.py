@@ -26,8 +26,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from .validation import redact_validation_error
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
@@ -161,18 +162,7 @@ class CachekitConfig(BaseSettings):
         try:
             super().__init__(**kwargs)
         except ValidationError as e:
-            sanitized: list[InitErrorDetails] = []
-            for err in e.errors(include_url=False):
-                detail: InitErrorDetails = {
-                    "type": err["type"],
-                    "loc": err["loc"],
-                    "input": "[REDACTED]",
-                }
-                ctx = err.get("ctx")
-                if ctx:
-                    detail["ctx"] = ctx
-                sanitized.append(detail)
-            sanitized_error = ValidationError.from_exception_data(e.title, sanitized, hide_input=True)
+            sanitized_error = redact_validation_error(e)
         # Raised OUTSIDE the except block so __context__/__cause__ stay None —
         # `raise ... from None` only suppresses display; the original (with raw
         # inputs recoverable via .errors()) would still hang off __context__

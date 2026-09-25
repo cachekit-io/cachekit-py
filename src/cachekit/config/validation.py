@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 
+from pydantic import ValidationError
+from pydantic_core import InitErrorDetails
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +31,30 @@ class ConfigurationError(Exception):
     """
 
     pass
+
+
+def redact_validation_error(error: ValidationError) -> ValidationError:
+    """Return a copy of a settings ``ValidationError`` with every input redacted (CWE-532).
+
+    ``hide_input_in_errors`` only affects ``str()``/``repr()``: ``errors()`` and ``json()`` still
+    snapshot the raw input, which for a settings model is cleartext credentials (a master key, an
+    API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
+    (``loc == ()``) snapshots the whole input dict. The copy keeps each error's type, loc, msg and ctx.
+
+    Raise the copy OUTSIDE the ``except`` block that caught the original: ``raise ... from None``
+    only hides the chain, and the original would still hang off ``__context__``.
+
+    Only pydantic's built-in error types can be rebuilt; a ``PydanticCustomError`` type raises
+    ``KeyError`` here.
+    """
+    sanitized: list[InitErrorDetails] = []
+    for err in error.errors(include_url=False):
+        detail: InitErrorDetails = {"type": err["type"], "loc": err["loc"], "input": "[REDACTED]"}
+        ctx = err.get("ctx")
+        if ctx:
+            detail["ctx"] = ctx
+        sanitized.append(detail)
+    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
 
 
 def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:

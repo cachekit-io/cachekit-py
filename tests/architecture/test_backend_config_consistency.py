@@ -102,6 +102,25 @@ class TestModelConfigConsistency:
             f"{config_cls.__name__} should reject unknown fields with extra='forbid'"
         )
 
+    @pytest.mark.parametrize("config_cls", BACKEND_CONFIGS)
+    def test_validation_errors_redact_every_input(self, config_cls: type[BaseBackendConfig]) -> None:
+        """CWE-532: backend configs hold credentials, so no surface of a ValidationError may carry a raw input.
+
+        Pinned here, not per backend: BaseBackendConfig.__init__ does the redacting, and a subclass that
+        overrides __init__ without calling it would silently lose it.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc_info:
+            config_cls(totally_fake_field_that_doesnt_exist="SECRET_VALUE")  # type: ignore[call-arg]
+
+        exc = exc_info.value
+        for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+            assert "SECRET_VALUE" not in rendered
+        assert all(err["input"] == "[REDACTED]" for err in exc.errors())
+        assert exc.__context__ is None
+        assert exc.__cause__ is None
+
 
 class TestFromEnvClassmethod:
     """Ensure all configs have from_env() classmethod."""

@@ -24,7 +24,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from cachekit.config.validation import redact_validation_error
 
 # Keys that child classes MUST override (not inherited from base)
 _CHILD_OVERRIDE_KEYS = frozenset({"env_prefix"})
@@ -85,6 +88,22 @@ class BaseBackendConfig(BaseSettings):
         extra="forbid",
         populate_by_name=True,
     )
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Construct the config; a validation failure never carries a raw input (CWE-532).
+
+        Backend configs hold credentials (an API key, a password in a Redis URL). A
+        ValidationError's errors() and json() snapshot the raw input whatever the model's
+        hide_input_in_errors, so the error is rebuilt with every input redacted.
+        """
+        sanitized_error: ValidationError | None = None
+        try:
+            super().__init__(**kwargs)
+        except ValidationError as e:
+            sanitized_error = redact_validation_error(e)
+        # Raised OUTSIDE the except block: the original, raw inputs and all, would hang off __context__.
+        if sanitized_error is not None:
+            raise sanitized_error
 
     @classmethod
     def from_env(cls) -> BaseBackendConfig:
