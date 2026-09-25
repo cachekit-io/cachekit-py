@@ -191,7 +191,7 @@ get_user.invalidate_cache()
 
 **Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
 
-**Custom `key=` functions:** both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2 (other processes miss on their next read). No-arg `invalidate_cache()` is supported too, but only for entries this process wrote — the tracked-key set does not survive a restart, so after a deploy use the exact-args form.
+**Custom `key=` functions:** both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. Other processes that already hold the entry in their own L1 keep serving it until its L1 TTL expires (see [Multi-Instance Semantics](#multi-instance-semantics)). No-arg `invalidate_cache()` is supported too, but only for entries this process wrote — the tracked-key set does not survive a restart, so after a deploy use the exact-args form.
 
 ---
 

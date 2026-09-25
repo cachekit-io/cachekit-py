@@ -11,6 +11,7 @@ count — never by re-deriving the key in the test.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -47,7 +48,13 @@ def _user_key(user_id: int) -> str:
     return f"user:{user_id}"
 
 
-def _decorate(backend: RecordingBackend, namespace: str, **mode: Any):
+def _decorate(
+    backend: RecordingBackend,
+    namespace: str,
+    *,
+    key: Callable[..., str] | None = None,
+    fast_mode: bool = False,
+) -> Callable[[Callable[..., Any]], Any]:
     """L1 disabled so every read/write/delete hits the RecordingBackend.
 
     key= must go through the public @cache path (create_cache_wrapper only reads
@@ -55,10 +62,10 @@ def _decorate(backend: RecordingBackend, namespace: str, **mode: Any):
     field, so it goes through create_cache_wrapper directly.
     """
 
-    def apply(fn):
-        if mode.get("fast_mode"):
-            return create_cache_wrapper(fn, backend=backend, l1_enabled=False, namespace=namespace, **mode)
-        return cache(backend=backend, l1_enabled=False, namespace=namespace, **mode)(fn)
+    def apply(fn: Callable[..., Any]) -> Any:
+        if fast_mode:
+            return create_cache_wrapper(fn, backend=backend, l1_enabled=False, namespace=namespace, fast_mode=True)
+        return cache(backend=backend, l1_enabled=False, namespace=namespace, key=key)(fn)
 
     return apply
 
