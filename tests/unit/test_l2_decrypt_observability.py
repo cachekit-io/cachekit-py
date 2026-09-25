@@ -19,7 +19,7 @@ from unittest import mock
 import pytest
 
 from cachekit import cache
-from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
+from cachekit.cache_handler import CacheHit, CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import SerializationError
 from cachekit.serializers.encryption_wrapper import EncryptionError
@@ -145,8 +145,8 @@ class TestL2DecryptFailureWarning:
         assert any("Failed to evict poisoned" in r.message for r in caplog.records)
 
     async def test_async_hit_returns_value_and_raw_bytes(self) -> None:
-        """get_cached_value_async returns (True, value, raw_bytes, size_bytes) so the async
-        decorator can backfill L1 with the serialized envelope without re-serializing."""
+        """get_cached_value_async returns a CacheHit so the async decorator can
+        backfill L1 with the serialized envelope without re-serializing."""
         sentinel = object()
         mock_serialization = mock.MagicMock(spec=CacheSerializationHandler)
         mock_serialization.deserialize_data.return_value = sentinel
@@ -157,7 +157,7 @@ class TestL2DecryptFailureWarning:
 
         result = await handler.get_cached_value_async("hit:key")
 
-        assert result == (True, sentinel, b"serialized-envelope", len(b"serialized-envelope"))
+        assert result == CacheHit(sentinel, b"serialized-envelope", len(b"serialized-envelope"))
 
 
 @pytest.mark.unit
