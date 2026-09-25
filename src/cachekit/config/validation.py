@@ -133,16 +133,23 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
                         getattr(BaseException, attr).__set__(value, None)
             detail["ctx"] = ctx
         sanitized.append(detail)
-    copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
-    # A built-in type re-renders its msg in Python input mode, so a JSON-mode one ("Input should be
-    # an object") would change wording. Rebuild any such error from its original msg instead.
-    reworded = False
+    # A built-in type re-renders its msg for an input mode, and the error does not say which mode
+    # raised it ("Input should be an object" is JSON; "... a valid dictionary ..." is Python). Keep
+    # the rebuild whose messages all match, so every error keeps its built-in type and url.
+    msgs = [err["msg"] for err in errors]
+    python_copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
+    rebuilt = python_copy.errors(include_url=False)
+    if [err["msg"] for err in rebuilt] == msgs:
+        return python_copy
+    json_copy = ValidationError.from_exception_data(error.title, sanitized, input_type="json", hide_input=True)
+    if [err["msg"] for err in json_copy.errors(include_url=False)] == msgs:
+        return json_copy
+    # Neither mode matches every error: rebuild the mismatches from their original msg, without a url.
     # Equal lengths by construction; strict=False because raising here would chain the original.
-    for err, detail, rebuilt in zip(errors, sanitized, copy.errors(include_url=False), strict=False):
-        if rebuilt["msg"] != err["msg"]:
+    for err, detail, python_err in zip(errors, sanitized, rebuilt, strict=False):
+        if python_err["msg"] != err["msg"]:
             detail["type"] = PydanticCustomError(err["type"], err["msg"], err.get("ctx"))  # pyright: ignore[reportArgumentType]
-            reworded = True
-    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True) if reworded else copy
+    return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
 
 
 def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:

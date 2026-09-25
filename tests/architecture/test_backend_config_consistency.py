@@ -235,14 +235,30 @@ class TestModelConfigConsistency:
         assert exc_info.value.__context__ is None
         assert exc_info.value.__cause__ is None
 
-    @pytest.mark.parametrize("config_cls", [CachekitIOBackendConfig, CachekitConfig])
-    def test_json_mode_messages_survive_redaction(self, config_cls: type[BaseBackendConfig | CachekitConfig]) -> None:
-        """The copy re-renders a built-in type's msg in Python input mode; a JSON-mode error keeps its own."""
+    @pytest.mark.parametrize(
+        ("config_cls", "doc", "expected"),
+        [
+            (CachekitIOBackendConfig, '["SECRET_VALUE"]', ("model_type", (), "Input should be an object")),
+            (CachekitConfig, '["SECRET_VALUE"]', ("model_type", (), "Input should be an object")),
+            (
+                MemcachedBackendConfig,
+                '{"servers": "SECRET_VALUE"}',
+                ("list_type", ("servers",), "Input should be a valid array"),
+            ),
+        ],
+        ids=["io-model-type", "cfg-model-type", "memcached-list-type"],
+    )
+    def test_json_mode_messages_survive_redaction(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], doc: str, expected: tuple[str, tuple[str, ...], str]
+    ) -> None:
+        """from_exception_data renders a built-in type's msg in Python input mode by default; a JSON-mode error
+        keeps its own msg and, being still a built-in type, its url."""
         with pytest.raises(ValidationError) as exc_info:
-            config_cls.model_validate_json('["SECRET_VALUE"]')
+            config_cls.model_validate_json(doc)
 
         [err] = exc_info.value.errors()
-        assert (err["type"], err["loc"], err["msg"]) == ("model_type", (), "Input should be an object")
+        assert (err["type"], err["loc"], err["msg"]) == expected
+        assert err["url"].endswith(f"/v/{expected[0]}")
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     def test_non_builtin_error_types_are_redacted_too(self) -> None:
