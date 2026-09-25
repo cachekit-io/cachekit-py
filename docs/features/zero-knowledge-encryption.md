@@ -472,6 +472,22 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+shorter than 32 bytes, more than three previous keys, or the current key repeated among
+them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+settings load, so this surfaces only when keys bypass that check: passed to
+`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
+environment's previous keys. Outside config-drift reads (below), the fault never
+evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
+`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
+decorators an L2 read logs it as a cache error and runs the call uncached. Two cases take
+other paths: a missing or short *current* master key raises `EncryptionError`, and an
+encryption-disabled handler reading an entry that claims encryption treats the fault as
+corruption (miss + evict), because only the unauthenticated header sent it down the
+decrypt path.
+
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
 > in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise

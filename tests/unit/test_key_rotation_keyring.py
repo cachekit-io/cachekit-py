@@ -17,6 +17,9 @@ Covers:
   further keyring entries are attempted.
 - No match: pre-keyring mismatch semantics unchanged (fail-closed raises before
   attempting; fail-open attempts the current key only).
+- Construction-time keyring config faults reach the caller of a production read
+  site as KeyringConfigurationError, never a warning-and-miss; header rot and
+  data-derived ValueErrors stay a miss.
 - End-to-end rotation round-trip through CacheSerializationHandler with the env
   configuration: write under k1, rotate to k2 with k1 decrypt-only, read without
   re-encryption; drop k1, read follows the fail policy.
@@ -26,7 +29,8 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -35,7 +39,11 @@ from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionWrapper,
+    KeyringConfigurationError,
 )
+
+if TYPE_CHECKING:
+    from cachekit.cache_handler import CacheSerializationHandler
 
 K1 = b"\x11" * 32  # retiring master key
 K2 = b"\x22" * 32  # current master key after rotation
@@ -450,6 +458,169 @@ class TestDecryptErrorTaxonomy:
         with pytest.raises(ValueError) as exc_info:
             ew.EncryptionWrapper(master_key=K1, tenant_id=TENANT, previous_master_keys=[])
         assert not isinstance(exc_info.value, SerializationError)
+
+
+def _settings_previous_keys(monkeypatch: pytest.MonkeyPatch, keys: list[bytes]) -> None:
+    """Hand the wrapper previous keys that skip settings-load validation — the
+    position of any caller that passes previous_master_keys explicitly."""
+    import cachekit.serializers.encryption_wrapper as ew
+
+    stub = SimpleNamespace(previous_master_keys=[SecretStr(key.hex()) for key in keys])
+    monkeypatch.setattr(ew, "get_settings", lambda: stub)
+
+
+def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -> None:
+    """Make the REAL keyring binding fingerprint a different tenant than the
+    wrapper asked for, so the fault (and its exception class) comes from Rust."""
+    import cachekit.serializers.encryption_wrapper as ew
+
+    real_keyring = ew.Keyring
+
+    class _Keyring:
+        def __init__(self, *args: Any) -> None:
+            self._real = real_keyring(*args)
+
+        def encryption_fingerprints(self, tenant_id: str) -> list[bytes]:
+            return self._real.encryption_fingerprints(tenant_for(tenant_id))
+
+    monkeypatch.setattr(ew, "Keyring", _Keyring)
+
+
+class TestConstructionFaultsFailLoudAtReadSite:
+    """The per-tenant wrapper is built lazily on the first read, so a keyring config
+    fault must escape the read site as KeyringConfigurationError, not a silent miss —
+    except on config-drift reads, where the header chose the decrypt path."""
+
+    CACHE_KEY = "key:a"
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
+        monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
+        reset_settings()
+        yield
+        reset_settings()
+
+    def _handler(self) -> CacheSerializationHandler:
+        from cachekit.cache_handler import CacheSerializationHandler
+
+        return CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=K2.hex())
+
+    def _read(self, entry: bytes, handler: CacheSerializationHandler | None = None) -> tuple[Any, list[str]]:
+        """One L2 read by a fresh reader, so its wrapper is built on this read.
+        Returns the read-site result and the keys it evicted."""
+        from cachekit.cache_handler import CacheOperationHandler
+        from cachekit.key_generator import CacheKeyGenerator
+
+        deleted: list[str] = []
+
+        class _Backend:
+            def get(self, cache_key: str, refresh_ttl: Any = None) -> bytes:
+                return entry
+
+            def delete(self, cache_key: str) -> bool:
+                deleted.append(cache_key)
+                return True
+
+        reader = CacheOperationHandler(handler or self._handler(), CacheKeyGenerator(), cache_handler=_Backend())
+        return reader.get_cached_value(self.CACHE_KEY), deleted
+
+    @pytest.mark.parametrize(
+        ("inject", "match"),
+        [
+            pytest.param(
+                lambda mp: _settings_previous_keys(mp, [b"\x0a" * 31]), "identical to master_key", id="short-previous-key"
+            ),
+            pytest.param(lambda mp: _settings_previous_keys(mp, [K2]), "Keyring configuration invalid", id="keyring-rejected"),
+            pytest.param(
+                lambda mp: _fingerprints_for_tenant(mp, lambda tenant: ""),
+                "Keyring fingerprint derivation failed",
+                id="fingerprint-derivation",
+            ),
+            pytest.param(
+                lambda mp: _fingerprints_for_tenant(mp, lambda tenant: tenant + "-skew"),
+                "invariant violation",
+                id="drift-guard",
+            ),
+        ],
+    )
+    def test_construction_fault_escapes_read_site(self, monkeypatch, inject, match):
+        entry = self._handler().serialize_data({"v": 42}, cache_key=self.CACHE_KEY)
+        inject(monkeypatch)
+
+        with pytest.raises(KeyringConfigurationError, match=match):
+            self._read(entry)
+
+    def test_header_tenant_rot_stays_a_miss(self):
+        """The frame's tenant_id is unauthenticated and picks the tenant the
+        wrapper is built for. derive_tenant_keys must reject a bad one as
+        corruption (miss + evict) BEFORE the keyring fingerprint call, whose
+        failure is now fail-loud: a raise means no recompute and no overwrite,
+        so a planted entry would fail every read of its key forever."""
+        from cachekit.serializers.wrapper import SerializationWrapper
+
+        envelope, metadata, serializer_name = SerializationWrapper.unwrap(
+            self._handler().serialize_data({"v": 42}, cache_key=self.CACHE_KEY)
+        )
+        # One byte past cachekit-core's MAX_TENANT_SALT_LENGTH (1024).
+        forged = SerializationWrapper.wrap(envelope, {**metadata, "tenant_id": "t" * 1025}, serializer_name)
+
+        assert self._read(forged) == (None, [self.CACHE_KEY])
+
+    def test_config_drift_read_keyring_fault_stays_a_miss(self, monkeypatch):
+        """An encryption-disabled handler builds a wrapper only when the
+        unauthenticated header claims `encrypted: true`, so the header decides
+        whether its keyring fault fires. Failing loud there would let a planted
+        frame fail every read of its key until TTL; it must heal as miss + evict.
+        Config: programmatic key K2, fleet rotated to K3 with K2 decrypt-only."""
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.singleton import reset_settings
+        from cachekit.serializers.wrapper import SerializationWrapper
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", K3.hex())
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", K2.hex())
+        reset_settings()
+        drift_reader = CacheSerializationHandler(encryption=False, master_key=K2.hex())
+        envelope, metadata, serializer_name = SerializationWrapper.unwrap(
+            drift_reader.serialize_data({"v": 42}, cache_key=self.CACHE_KEY)
+        )
+        forged = SerializationWrapper.wrap(envelope, {**metadata, "encrypted": True, "tenant_id": "x"}, serializer_name)
+        # Precondition: the keyring fault really fires (nothing is cached on a raise).
+        # Without it, a plain auth failure on the fingerprint-less frame would also
+        # yield miss + evict and this test would pass vacuously.
+        with pytest.raises(KeyringConfigurationError):
+            drift_reader._get_cached_encryption_wrapper("x")
+
+        assert self._read(forged, drift_reader) == (None, [self.CACHE_KEY])
+
+    def test_data_derived_value_error_stays_a_miss(self):
+        """The read sites must not be widened to re-raise every ValueError:
+        data-derived ones (here a lone surrogate from stored bytes) would let a
+        planted entry fail every read of its key forever."""
+        from cachekit.cache_handler import CacheOperationHandler
+        from cachekit.key_generator import CacheKeyGenerator
+
+        class _Backend:
+            def get(self, cache_key: str, refresh_ttl: Any = None) -> bytes:
+                return b"stored"
+
+        raised: list[ValueError] = []
+
+        class _SerHandler:
+            def supports_mmap_read(self) -> bool:
+                return False
+
+            def deserialize_data(self, data: Any, cache_key: str) -> Any:
+                raised.append(UnicodeEncodeError("utf-8", "\udc80", 0, 1, "surrogates not allowed"))
+                raise raised[-1]
+
+        handler = CacheOperationHandler(_SerHandler(), CacheKeyGenerator(), cache_handler=_Backend())  # type: ignore[arg-type]
+        assert handler.get_cached_value(self.CACHE_KEY) is None
+        # Guard against a vacuous pass: an AttributeError from this fake would
+        # take the same `except Exception` route to None.
+        assert len(raised) == 1
 
 
 class TestEndToEndRotation:
