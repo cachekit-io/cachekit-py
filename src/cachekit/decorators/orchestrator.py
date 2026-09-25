@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
 from ..monitoring.correlation_tracking import CorrelationTracker
-from ..monitoring.pool_monitor import OptimizedPoolMonitor
+from ..monitoring.pool_monitor import PoolMonitor
 
 # Import EXISTING modules - no duplication
 from ..reliability import (
@@ -127,14 +127,14 @@ class FeatureOrchestrator:
         return self._correlation_tracker
 
     @property
-    def pool_monitor(self) -> Optional[OptimizedPoolMonitor]:
+    def pool_monitor(self) -> Optional[PoolMonitor]:
         """Get pool monitor."""
         return self._pool_monitor
 
     def set_pool_manager(self, pool_manager) -> None:
         """Initialize pool monitor with pool manager."""
         if pool_manager and not self._pool_monitor:
-            self._pool_monitor = OptimizedPoolMonitor(pool_manager)
+            self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
         """Check if request should be allowed based on circuit breaker state."""

@@ -181,6 +181,25 @@ class TestSetDefaultBackendWithFileBackend:
         finally:
             set_default_backend(original)
 
+    def test_set_default_backend_after_decoration(self, tmp_path: Path) -> None:
+        """set_default_backend() called AFTER decoration still takes effect at first call (LAB-4457)."""
+        original = get_default_backend()
+        try:
+            set_default_backend(None)
+
+            @cache.minimal(ttl=300)  # decorate FIRST: default is None here
+            def compute(x: int) -> int:
+                return x * 5
+
+            chosen = _make_file_backend(tmp_path, subdir="chosen")
+            set_default_backend(chosen)  # configure SECOND
+
+            assert compute(2) == 10
+            # Proof the explicit choice was used, not the env-detected fallback.
+            assert any((tmp_path / "chosen").iterdir())
+        finally:
+            set_default_backend(original)
+
     def test_explicit_backend_overrides_default(self, tmp_path: Path) -> None:
         """Explicit backend= kwarg takes precedence over set_default_backend()."""
         default_backend = _make_file_backend(tmp_path, subdir="default_cache")

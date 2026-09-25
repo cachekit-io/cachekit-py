@@ -70,16 +70,14 @@ happens when it isn't, and which backend you actually reach. "Zero-knowledge" co
 | Encryption | Forced ON in code (`EncryptionConfig.enabled=True`) | Auto-detected from the env var (tri-state `enabled=None`) |
 | **No master key present** | **Fails closed** — raises `ValueError` at decoration time (the `CACHEKIT_MASTER_KEY` fallback is read then, at import) | **Fails open** — silently caches plaintext to the SaaS. The key is read **at decoration time**: one loaded later (dotenv in `main()`, a startup vault hook) is never seen, and every call ships plaintext |
 | Integrity checking | Forced `True` on the preset path; **not** re-forced when you pass `integrity_checking=` alongside `@cache(config=DecoratorConfig.secure(...))` | On by preset default |
-| Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` is unsupported, see note below; requires `CACHEKIT_API_KEY` at decoration time |
-| Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF derivation exists but is **not a tenancy boundary** — see Multi-Tenant Isolation | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one deployment-wide derived key, no per-tenant isolation |
+| Backend | Pinned **only** by the explicit `backend=` shown — omit it and resolution falls to env auto-detect (footgun below) | `CachekitIOBackend` created by the preset — `backend=` raises, see note below; requires an API key (`api_key=` or `CACHEKIT_API_KEY`) at decoration time |
+| Tenant mode | `single_tenant_mode` derived from `tenant_extractor`; per-tenant HKDF derivation exists but is **not a tenancy boundary** — see Multi-Tenant Isolation | **Forced single-tenant** — `tenant_extractor` is not accepted; every entry is encrypted under one single-tenant derived key (tenant `"default"` unless a deployment UUID is set), no per-tenant isolation |
 | Backend SWR (`stale_ttl`) | Off unless requested | On by default (`stale_ttl` sized from `ttl`); the refresh re-runs the function **concurrently with the remainder of the request** (scheduled before the value is returned) — on a daemon thread for sync functions, as an `asyncio` task on the caller's loop for async ones — so it must not touch request-scoped **or non-thread-safe** resources. Arguments are deep-copied before scheduling, so a session passed *as an argument* is never shared — but a non-copyable argument silently skips the refresh entirely (logged at DEBUG) — on an instance method `self` is that argument, so a service class holding a lock, a client or an open connection disables SWR permanently and quietly. The sharing route that does bite is a `ContextVar`-bound session, which the context snapshot deliberately carries into the refresh. `stale_ttl=0` opts out |
 
 **`@cache.io()` does not take a `backend=` argument.** The preset always
-constructs its own `CachekitIOBackend`: a non-`None` `backend=` passed to the
-decorator is silently discarded, and `backend=None` flips the wrapper into
-L1-only mode (in-process memory — the SaaS is never contacted, despite the
-`.io` name). To target any other backend, use a different preset with an
-explicit `backend=`.
+constructs its own `CachekitIOBackend`, so any `backend=` — `None` included —
+raises `ConfigurationError` at decoration. To target any other backend, use a
+different preset with an explicit `backend=`.
 
 **Rule of thumb**: encryption as a **security requirement** → `@cache.secure` +
 explicit backend. The intent is auditable in code. Encryption as a **fleet-wide
@@ -91,14 +89,15 @@ canonical statement.
 
 > [!WARNING]
 > **`@cache.secure` does NOT pin the SaaS backend.** Backend resolution is the
-> same lookup as every preset: explicit `backend=` → `set_default_backend()` **as
-> read at decoration time** → environment auto-detect at **first call**. Auto-detect
+> same lookup as every preset: explicit `backend=` → `set_default_backend()` (read at
+> decoration, and again at first call if still unset) → environment auto-detect at
+> **first call**. Auto-detect
 > picks whichever **single** prefixed selector is set (`CACHEKIT_API_KEY` → cachekit.io
 > SaaS, `CACHEKIT_REDIS_URL` → Redis, `CACHEKIT_MEMCACHED_SERVERS`, `CACHEKIT_FILE_CACHE_DIR`)
 > — two or more set at once raises `ConfigurationError`, there is no fallthrough between
 > them; none set → `REDIS_URL` / localhost Redis. Only an
-> explicit `backend=` is order-independent: a `set_default_backend()` that runs
-> after the decorated module has been imported is silently ignored. Consequences:
+> explicit `backend=` is order-independent: the first call pins the backend, so a
+> `set_default_backend()` that runs after it never re-points the function. Consequences:
 > (1) in a 12-factor environment where `REDIS_URL` is set and `CACHEKIT_API_KEY`
 > is not, `@cache.secure` **silently encrypts to Redis instead of the SaaS**;
 > (2) for a provider-resolved decorator — `.secure` without `backend=`, `.production`,
@@ -471,6 +470,12 @@ Tenant ID: tenant_context.get()
 
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
+
+Single-tenant mode (no tenant_extractor):
+  tenant_id = deployment_uuid | CACHEKIT_DEPLOYMENT_UUID | "default"
+  "default" is the protocol literal every SDK derives from (intent-presets.md
+  § Master Key Input, rule 5), used identically for HKDF and AAD — one master
+  key is enough for py, rs and ts to share ciphertext.
 
 Properties of the derivation itself:
 - Tenant A's key ≠ Tenant B's key

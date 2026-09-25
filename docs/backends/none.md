@@ -63,9 +63,10 @@ No network calls. No serialization to bytes. No backend initialization.
 
 ## With Intent Presets
 
-All presets accept `backend=None`, but a preset's backend-dependent behaviour does
-not survive it — `@cache.secure` in particular accepts the key and encrypts nothing
-(see the warning above):
+Every preset except `@cache.io` accepts `backend=None` (`.io` owns its backend and
+raises `ConfigurationError` on any `backend=`), but a preset's backend-dependent
+behaviour does not survive it — `@cache.secure` in particular accepts the key and
+encrypts nothing (see the warning above):
 
 ```python notest
 from cachekit import cache

@@ -719,6 +719,7 @@ class TestColumnarFallbackExtensionDtypes:
     def test_nullable_dtypes_and_objects_roundtrip(self):
         pd = pytest.importorskip("pandas")
         ser = AutoSerializer(enable_integrity_checking=False)
+        ser._arrow_serializer = None  # force the msgpack-columnar DataFrame fallback path
         df = pd.DataFrame(
             {
                 "ints": pd.array([1, 2, None, 4], dtype="Int64"),  # capital -> missed numeric branch before
@@ -728,10 +729,8 @@ class TestColumnarFallbackExtensionDtypes:
             }
         )
 
-        data = ser._serialize_dataframe(df)  # previously raised: msgpack can't pack pd.NA
-        # _decode_columnar decodes the msgpack body then hands the document to
-        # _deserialize_dataframe (which now takes a decoded document, not bytes).
-        out = ser._decode_columnar(data, "dataframe")
+        data, metadata = ser.serialize(df)  # previously raised: msgpack can't pack pd.NA
+        out = ser.deserialize(data, metadata)
 
         assert list(out.columns) == ["ints", "floats", "objs", "plain"]
         assert out.shape == (4, 4)
@@ -746,12 +745,13 @@ class TestColumnarFallbackExtensionDtypes:
         pd = pytest.importorskip("pandas")
         pytest.importorskip("pyarrow")
         ser = AutoSerializer(enable_integrity_checking=False)
+        ser._arrow_serializer = None  # force the msgpack-columnar DataFrame fallback path
         # "int64[pyarrow]".startswith("int") was True -> hit the numeric branch ->
         # .values.tobytes() AttributeError on the Arrow extension array, before the fix.
         df = pd.DataFrame({"x": pd.array([1, 2, 3], dtype="int64[pyarrow]")})
 
-        data = ser._serialize_dataframe(df)
-        out = ser._decode_columnar(data, "dataframe")
+        data, metadata = ser.serialize(df)
+        out = ser.deserialize(data, metadata)
 
         assert out["x"].tolist() == [1, 2, 3]
 
@@ -760,8 +760,8 @@ class TestColumnarFallbackExtensionDtypes:
         ser = AutoSerializer(enable_integrity_checking=False)
         s = pd.Series(pd.array([1, 2, None, 4], dtype="Int64"), name="n")
 
-        data = ser._serialize_series(s)  # previously raised on the pd.NA sentinel
-        out = ser._decode_columnar(data, "series")
+        data, metadata = ser.serialize(s)  # previously raised on the pd.NA sentinel
+        out = ser.deserialize(data, metadata)
 
         assert out.name == "n"
         assert out.iloc[0] == 1 and out.iloc[3] == 4
@@ -773,6 +773,7 @@ class TestColumnarFallbackExtensionDtypes:
         ser = AutoSerializer(enable_integrity_checking=False)
         s = pd.Series(pd.array([1, 2, 3], dtype="int64[pyarrow]"), name="x")
 
-        out = ser._decode_columnar(ser._serialize_series(s), "series")
+        data, metadata = ser.serialize(s)
+        out = ser.deserialize(data, metadata)
 
         assert out.tolist() == [1, 2, 3]

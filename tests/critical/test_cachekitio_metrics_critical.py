@@ -30,7 +30,7 @@ def _make_response(status_code: int = 200, content: bytes = b"") -> httpx.Respon
 def mock_sync_client():
     client = MagicMock(spec=httpx.Client)
     with (
-        patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=client),
+        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=client)),
         patch(
             "cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=MagicMock(spec=httpx.AsyncClient)
         ),
@@ -43,7 +43,10 @@ def mock_async_client():
     """Mock both clients but yield the async one for async tests."""
     async_client = MagicMock(spec=httpx.AsyncClient)
     with (
-        patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=MagicMock(spec=httpx.Client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        ),
         patch("cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=async_client),
     ):
         yield async_client

@@ -39,6 +39,13 @@ fn _rust_serializer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add byte storage class
     m.add_class::<python_bindings::PyByteStorage>()?;
 
+    // ByteStorage.retrieve() envelope-verification-failure taxonomy (LAB-2736). Same
+    // __module__ patch as KeyringConfigurationError below: create_exception! sets it to the
+    // bare "_rust_serializer", which breaks pickling back to a parent process otherwise.
+    let envelope_integrity_error = m.py().get_type::<python_bindings::EnvelopeIntegrityError>();
+    envelope_integrity_error.setattr("__module__", "cachekit._rust_serializer")?;
+    m.add("EnvelopeIntegrityError", envelope_integrity_error)?;
+
     // Standalone integrity primitive — registered unconditionally (usable with
     // the checksum feature alone; must not vanish when encryption is off)
     m.add_function(wrap_pyfunction!(python_bindings::checksum_py, m)?)?;
