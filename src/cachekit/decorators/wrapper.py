@@ -2137,6 +2137,18 @@ def create_cache_wrapper(
                 except Exception as e:
                     _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
 
+    async def _delete_l2_async(backend: Any, key: str) -> None:
+        """Delete an L2 key without blocking the event loop.
+
+        Prefers the backend's native ``delete_async`` coroutine; otherwise runs the
+        sync ``delete`` in a worker thread (as the cache handler does). Errors propagate.
+        """
+        delete_async = getattr(backend, "delete_async", None)
+        if inspect.iscoroutinefunction(delete_async):
+            await delete_async(key)
+        else:
+            await asyncio.to_thread(backend.delete, key)
+
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
 
@@ -2162,7 +2174,7 @@ def create_cache_wrapper(
                 if _backend and not _l1_only_mode:
                     invalidator.set_backend(_backend)
                     try:
-                        _backend.delete(key)
+                        await _delete_l2_async(_backend, key)
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         continue
@@ -2188,7 +2200,7 @@ def create_cache_wrapper(
                 # Log at ERROR (matching CacheInvalidator): a failed delete keeps
                 # serving stale data (for interop, to OTHER SDKs too).
                 try:
-                    _backend.delete(cache_key)
+                    await _delete_l2_async(_backend, cache_key)
                 except Exception as e:
                     _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
 

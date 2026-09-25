@@ -178,20 +178,20 @@ for uid in [1, 2, 3]:
 
 ### Whole-Function Invalidation
 
-Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry this process has written for that function:
+Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every key this process has tracked for that function — tracked keys are those it wrote, or backfilled into L1 from an L2 hit:
 
 ```python notest
 @cache
 def get_user(user_id: int):
     return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
 
-# Clear all get_user entries written by this process (L1 + L2)
+# Clear all get_user keys tracked by this process (L1 + L2)
 get_user.invalidate_cache()
 ```
 
-**Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
+**Limitation:** Key tracking is process-local. L2 entries this process never tracked (written by *other* processes and never backfilled into this L1) are not deleted; they remain until their TTL expires.
 
-**Custom `key=` functions:** both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. Other processes that already hold the entry in their own L1 keep serving it until its L1 TTL expires (see [Multi-Instance Semantics](#multi-instance-semantics)). No-arg `invalidate_cache()` is supported too, but only for entries this process wrote — the tracked-key set does not survive a restart, so after a deploy use the exact-args form.
+**Custom `key=` functions:** both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. Other processes that already hold the entry in their own L1 keep serving it until its L1 TTL expires (see [Multi-Instance Semantics](#multi-instance-semantics)). No-arg `invalidate_cache()` is supported too, but only for tracked keys (written or backfilled from L2 by this process) — the tracked-key set does not survive a restart, so after a deploy use the exact-args form.
 
 ---
 

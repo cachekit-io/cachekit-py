@@ -11,6 +11,7 @@ count — never by re-deriving the key in the test.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -129,3 +130,76 @@ class TestInvalidateCustomKey:
         assert get_user(1) == 1
         get_user.invalidate_cache(1)
         assert get_user(1) == 2
+
+
+class ThreadRecordingBackend(RecordingBackend):
+    """Records which thread each sync delete ran on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_threads: list[int] = []
+
+    def delete(self, key: str) -> bool:
+        self.delete_threads.append(threading.get_ident())
+        return super().delete(key)
+
+
+class AsyncDeleteBackend(RecordingBackend):
+    """Offers a native delete_async; the sync delete must not be called from async code."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.async_deleted: list[str] = []
+
+    def delete(self, key: str) -> bool:
+        raise AssertionError("sync delete called from ainvalidate_cache")
+
+    async def delete_async(self, key: str) -> bool:
+        self.async_deleted.append(key)
+        return self.store.pop(key, None) is not None
+
+
+_MODES = pytest.mark.parametrize("mode", [{"key": _user_key}, {"fast_mode": True}], ids=["custom_key", "fast_mode"])
+_NO_ARGS = pytest.mark.parametrize("no_args", [False, True], ids=["args", "no_args"])
+
+
+@pytest.mark.unit
+class TestAsyncInvalidateNonBlocking:
+    """ainvalidate_cache must never run a blocking L2 delete on the event loop."""
+
+    @_MODES
+    @_NO_ARGS
+    @pytest.mark.asyncio
+    async def test_sync_backend_delete_runs_in_worker_thread(self, mode: dict[str, Any], no_args: bool):
+        backend = ThreadRecordingBackend()
+
+        @_decorate(backend, "nonblocking_thread", **mode)
+        async def get_user(user_id: int) -> int:
+            return user_id
+
+        await get_user(1)
+        (written_key,) = backend.store
+
+        await (get_user.ainvalidate_cache() if no_args else get_user.ainvalidate_cache(1))
+
+        assert backend.deleted == [written_key]
+        assert backend.delete_threads
+        assert threading.get_ident() not in backend.delete_threads, "sync delete ran on the event loop thread"
+
+    @_MODES
+    @_NO_ARGS
+    @pytest.mark.asyncio
+    async def test_native_delete_async_preferred(self, mode: dict[str, Any], no_args: bool):
+        backend = AsyncDeleteBackend()
+
+        @_decorate(backend, "nonblocking_native", **mode)
+        async def get_user(user_id: int) -> int:
+            return user_id
+
+        await get_user(1)
+        (written_key,) = backend.store
+
+        await (get_user.ainvalidate_cache() if no_args else get_user.ainvalidate_cache(1))
+
+        assert backend.async_deleted == [written_key]
+        assert not backend.store
