@@ -66,13 +66,13 @@ def _encode_tenant(tenant_id: object) -> str:
     """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
 
     Apps set int / UUID tenant ids despite the annotation; their ``str()`` is canonical, so
-    they are accepted. Anything else except str / bytes raises TypeError (fail closed): the
-    ``str()`` of an arbitrary object, e.g. a default repr embedding ``id()``, can map two
-    tenants to one prefix. bool is refused although it subclasses int: ``True`` is not a tenant.
+    they are accepted: UUID with the subclasses drivers return (asyncpg, uuid6), int by exact
+    type, since an int subclass can change ``str()`` (``str(True)`` is 'True'; an IntEnum's
+    differs between Python versions). Anything else except str / bytes raises TypeError (fail
+    closed): the ``str()`` of an arbitrary object, e.g. a default repr embedding ``id()``, can
+    map two tenants to one prefix.
     """
-    if isinstance(tenant_id, bool):
-        raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
-    if isinstance(tenant_id, (int, uuid.UUID)):
+    if type(tenant_id) is int or isinstance(tenant_id, uuid.UUID):
         tenant_id = str(tenant_id)
     if not isinstance(tenant_id, (str, bytes)):
         raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")

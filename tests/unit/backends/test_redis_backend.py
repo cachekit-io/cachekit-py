@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import enum
 import logging
 import threading
 import time
@@ -627,29 +628,29 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
 
     @pytest.mark.parametrize(
         ("tenant", "wire"),
-        [("org:1", "org%3A1"), (b"acme", "acme"), (7, "7"), (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001")],
+        [
+            ("org:1", "org%3A1"),
+            (b"acme", "acme"),
+            (7, "7"),
+            (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"),
+            # asyncpg / uuid6 hand out uuid.UUID subclasses
+            (type("DriverUUID", (uuid.UUID,), {})(int=1), "00000000-0000-0000-0000-000000000001"),
+        ],
     )
     def test_tenant_ids_with_a_canonical_str_are_accepted(self, tenant, wire):
         shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
         assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
         assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
 
-    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self):
-        """str() of an arbitrary object (default repr embeds id()) could merge two tenants."""
+    @pytest.mark.parametrize(
+        "tenant", [object(), True, False, enum.IntEnum("Org", "A").A], ids=["object", "True", "False", "IntEnum"]
+    )
+    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self, tenant):
+        """str() of an arbitrary object (default repr embeds id()) could merge two tenants; an int
+        subclass can change str() (str(True) is 'True', an IntEnum's varies by Python version)."""
         client = Mock()
         with pytest.raises(TypeError):
-            PerRequestRedisBackend(client, object())  # type: ignore[arg-type]
-        shared = PerRequestRedisBackend(client, "default", follow_context=True)
-        with pytest.raises(TypeError):
-            self._as_tenant(object(), shared.get, "k")
-        client.get.assert_not_called()
-
-    @pytest.mark.parametrize("tenant", [True, False])
-    def test_bool_tenant_ids_are_refused(self, tenant):
-        """bool is an int subclass: without an explicit check it would select t:True: / t:False:."""
-        client = Mock()
-        with pytest.raises(TypeError):
-            PerRequestRedisBackend(client, tenant)  # type: ignore[arg-type]
+            PerRequestRedisBackend(client, tenant)
         shared = PerRequestRedisBackend(client, "default", follow_context=True)
         with pytest.raises(TypeError):
             self._as_tenant(tenant, shared.get, "k")
