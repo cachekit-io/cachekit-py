@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import time_machine
 
+from cachekit.backends.errors import BackendError
 from cachekit.reliability import (
     CircuitBreaker,
     CircuitBreakerConfig,
@@ -238,55 +239,86 @@ class TestCircuitBreakerRaceConditions:
 
         This verifies that the double-checked locking pattern works correctly
         when many threads are simultaneously checking and potentially transitioning states.
+
+        The clock is frozen and the threads run in lockstep rounds. Within a round every
+        thread attempts one call, and an admitted operation does not complete until every
+        thread has been admitted or rejected — so a HALF_OPEN probe holds its permit while
+        the other threads contend for it. Between rounds a barrier action advances the
+        clock past the recovery timeout. Every third round injects failures and trips the
+        breaker; the round after it admits exactly ``half_open_requests`` probes and closes
+        the circuit; the remaining rounds run CLOSED. Transition coverage is driven by the
+        test, not left to how the OS happens to schedule ``time.sleep``.
         """
         config = CircuitBreakerConfig(
             failure_threshold=1,
             success_threshold=1,  # Quick recovery for rapid transitions
-            timeout_seconds=0.05,  # Very short timeout for rapid transitions
+            timeout_seconds=0.05,
             half_open_requests=1,
         )
         breaker = CircuitBreaker(config, namespace="test")
+        num_threads, num_rounds = 10, 10
 
-        # Track all state changes
-        state_changes = []
-        change_lock = threading.Lock()
+        admitted_per_round = [0] * num_rounds
+        observed_states: set[CircuitState] = set()
+        tally_lock = threading.Lock()
 
-        def rapid_operations():
-            """Perform rapid operations to trigger state changes."""
-            for i in range(10):
-                # Alternate between success and failure to trigger transitions
-                if i % 3 == 0:  # Occasional failure
-                    mock_func = MagicMock(side_effect=Exception("Failure"))
-                else:
-                    mock_func = MagicMock(return_value="success")
+        with time_machine.travel(0, tick=False) as traveller:
+            # Barrier timeouts are hang guards only: without them one dead worker would
+            # leave the other nine blocked until the CI job timeout, with no traceback.
+            arrivals = threading.Barrier(num_threads)
+            # The action runs once per round, by the last thread to arrive, before any is
+            # released — the only place the clock moves, never while a thread is inside the breaker.
+            round_end = threading.Barrier(
+                num_threads,
+                action=lambda: traveller.shift(timedelta(seconds=config.timeout_seconds * 2)),
+            )
 
-                try:
-                    _result = guarded_call(breaker, mock_func)
-                    with change_lock:
-                        state_changes.append(("success", breaker._state))
-                except Exception:
-                    with change_lock:
-                        state_changes.append(("failure", breaker._state))
+            def succeed():
+                arrivals.wait(timeout=30)
+                return "success"
 
-                # Small delay to allow state transitions
-                time.sleep(0.01)
+            def fail():
+                arrivals.wait(timeout=30)
+                raise RuntimeError("Failure")
 
-        # Run multiple threads performing rapid operations
-        num_threads = 10
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [executor.submit(rapid_operations) for _ in range(num_threads)]
-            for future in as_completed(futures):
-                future.result()
+            def lockstep_operations():
+                for i in range(num_rounds):
+                    try:
+                        guarded_call(breaker, fail if i % 3 == 0 else succeed)
+                        admitted = True
+                    except BackendError:  # rejected by the breaker before the operation ran
+                        arrivals.wait(timeout=30)
+                        admitted = False
+                    except RuntimeError:  # admitted; the injected failure was recorded
+                        admitted = True
 
-        # Verify no invalid state transitions occurred
-        # All observed states should be valid
-        valid_states = {CircuitState.CLOSED, CircuitState.OPEN, CircuitState.HALF_OPEN}
-        for _operation, state in state_changes:
-            assert state in valid_states, f"Invalid state observed: {state}"
+                    with breaker._lock:
+                        state = breaker._state
+                    with tally_lock:
+                        if admitted:
+                            admitted_per_round[i] += 1
+                        observed_states.add(state)
 
-        # We should have observed multiple state transitions
-        unique_states = {state for _, state in state_changes}
-        assert len(unique_states) >= 2, "Should have observed multiple states during rapid transitions"
+                    round_end.wait(timeout=30)
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(lockstep_operations) for _ in range(num_threads)]
+                for future in as_completed(futures):
+                    future.result()
+
+        # A failure round admits every thread: the breaker stays CLOSED until the first
+        # failure is recorded, which cannot happen before all have been admitted. The round
+        # after it finds the clock past the timeout and admits exactly half_open_requests
+        # probes — the double-checked OPEN -> HALF_OPEN transition and the permit cap under
+        # contention. Every other round runs CLOSED and admits everyone.
+        expected = [config.half_open_requests if i % 3 == 1 else num_threads for i in range(num_rounds)]
+        assert admitted_per_round == expected, f"Admitted per round {admitted_per_round} != {expected}"
+
+        assert observed_states <= {CircuitState.CLOSED, CircuitState.OPEN, CircuitState.HALF_OPEN}
+        # Round 0 trips the breaker and round 1 recovers it, so both are seen on every run.
+        assert {CircuitState.OPEN, CircuitState.CLOSED} <= observed_states, (
+            f"Should have observed the breaker trip and recover, saw only {observed_states}"
+        )
 
     def test_timeout_race_condition_prevention(self):
         """Test that timeout checks don't create race conditions.

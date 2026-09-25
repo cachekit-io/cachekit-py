@@ -129,6 +129,20 @@ We use MessagePack (safe binary serialization) with type preservation via schema
 + import msgpack  # Safe binary serialization
 ```
 
+### Bounded Decompression (ByteStorage envelopes)
+
+The default read path is `decrypt → ByteStorage.retrieve (LZ4 + xxHash3) →
+MessagePack decode`. This SDK does **not** implement LZ4 — it delegates to
+cachekit-core's bounded `extract()`, which caps the decompressed output at
+`min(512 MiB, 1000 × compressed_len)` before decompressing rather than trusting
+the envelope's self-declared `original_size`. The xxHash3-64 checksum is
+unkeyed, so it detects corruption and does not gate a forging attacker. See
+[cachekit-core Decompression limits][core-decompress] for the numbers and the
+constrained-runtime caveat.
+
+The MessagePack size caps sit on the already-decompressed bytes, so they are
+downstream of that bound.
+
 ### Zero-Knowledge Encryption
 
 When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the server never sees plaintext:
@@ -193,7 +207,7 @@ See [SSRF Protection](docs/features/ssrf-protection.md) for full details, includ
 
 Cache keys can embed caller-supplied tenant/user identifiers, so **the SDK's own loggers** (`cachekit.*`) never emit them verbatim ([CWE-532][cwe-532]). Every cachekit log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction. Both structured cache-operation sinks (`FeatureOrchestrator.log_cache_operation`, `StructuredLogger.cache_operation`) also sanitise an exception passed as `error=` themselves — pass the exception object, never `str(e)`, which is emitted as-is. `BackendError` redacts the key in its formatted text (`str(e)` carries `key=<redacted:…>`), while the `.key` attribute keeps the raw caller-supplied key for programmatic use — never log `e.key`. Its free-form `message` is caller-supplied and third-party exception text (a redis `ResponseError` naming the key, a pymemcache illegal-input error echoing it) has unknown provenance — so **no cachekit log line renders `str(e)`**. Every logging call that mentions an exception goes through `redact_error_for_log`, which emits only the exception type plus, for `BackendError`, its `BackendErrorType` classification; the full exception stays on the object (`original_exception`, `.message`) for programmatic access. Operators lose the provider's message text in the log line and keep it on the exception. An architecture test (`tests/unit/test_log_redaction_architecture.py`) walks every logging call in the package — `logger.*()`, `get_logger().*()`, `getattr(logger, level)()` — and fails CI if a key-shaped value reaches one unredacted in the message, `%s` arguments, or `extra=`; if an exception — any name bound by `except ... as`, a conventional name (`e`, `exc`, `err`, `error`, `*_err`), or an attribute of one — reaches one outside `redact_error_for_log`; or if a call emits a traceback (`logger.exception`, `exc_info=`). The guarantee does not depend on the next contributor remembering it. It is flow-insensitive: build log lines inline, not via a pre-formatted variable, and bind exceptions with `except ... as` or a conventional name (an `Exception`-typed parameter called `failure` is invisible to it), or the guard cannot see them.
 
-**Scope — transport logs are not covered.** The CachekitIO backend addresses entries by key in the request path (`GET /v1/cache/{key}`), and `httpx` logs every request line — method, full URL, status — at `INFO` on its own `httpx` logger. An application that enables `INFO` globally (`logging.basicConfig(level=logging.INFO)`) will therefore see raw keys in *httpx's* output on every operation, exactly as it would see any REST resource path. cachekit does not mute a third-party logger on your behalf; if your keys carry identifiers, silence or raise the level of that logger in your logging config:
+**Scope — transport logs are not covered.** The CachekitIO backend addresses entries by key in the request path (`GET /v1/cache/{key}`), and `httpx` logs every request line — method, full URL, status — at `INFO` on its own `httpx` logger. An application that enables `INFO` globally (`logging.basicConfig(level=logging.INFO)`) will therefore see raw keys in *httpx's* output on every operation, exactly as it would see any REST resource path. That line never carries a password: an API URL with credentials (`user:password@`) is rejected at construction. cachekit does not mute a third-party logger on your behalf; if your keys carry identifiers, silence or raise the level of that logger in your logging config:
 
 ```python
 import logging
@@ -326,6 +340,55 @@ Reports are archived in `reports/security/` for compliance and audit trails.
 
 ## Known Limitations
 
+### Arrow IPC Decompression Is Unbounded
+
+> [!WARNING]
+> `ArrowSerializer` (`serializer="arrow"`, requires the `[data]` extra) does not
+> read through cachekit-core's bounded `extract()`. `deserialize()` hands the
+> body to `pa.ipc.open_file(...).read_all()`, which decompresses with no size or
+> ratio limit. Measured: a 2,570-byte envelope expands to 64 MiB (26,112:1), and
+> 8,714 bytes to 256 MiB (30,805:1) — ratios cachekit-core rejects at 1000:1.
+> Tracked in LAB-2730.
+
+Neither existing control covers it:
+
+- **The `[8-byte xxHash3-64][Arrow IPC]` prefix is not authentication.** It is
+  unkeyed, so a backend-write attacker recomputes it — and they need not
+  bother, because `deserialize()` also accepts raw `ARROW1` bodies with no
+  checksum at all (the legacy integrity-off branch).
+- **`max_value_size` is enforced on the write path only** (`cache_handler.py`),
+  so it is a producer-side quota, not a check on bytes coming back off the wire.
+
+**Exposure**: non-secure Arrow caches on a backend an attacker can write to.
+`arrow_compression` defaults to `"zstd"`, so compression is on by default *once
+Arrow is selected*; Arrow itself is opt-in. Secure (`@cache.secure`) caches
+authenticate via AES-256-GCM before the reader sees anything, so they are not
+exposed.
+
+**A sound bound exists, and it costs the compression feature.** Uncompressed
+Arrow IPC allocates in proportion to its own length (measured ratio 1.000), so
+refusing bodies that declare `BodyCompression` on read makes `len(body)` a
+genuine pre-decompression bound. That requires writing `compression="none"` too,
+or every read of our own entries fails — which is a wire-size and L1-footprint
+decision, not a drive-by fix. Keeping compression instead means summing each
+buffer's uncompressed-length prefix before decompressing; `pa.ipc.read_message`
+exposes the first buffer's prefix but not the rest, so that needs a
+bounds-checked walk of the record-batch Flatbuffers metadata. LAB-2730 carries
+both options.
+
+Approaches that do **not** work, so nobody re-derives them: pyarrow exposes no
+read-side size limit and no allocation-limiting memory pool; accumulating
+`batch.nbytes` across `reader.get_batch(i)` is defeated because a forged
+envelope declares one batch (our writer chunks to ~8 MiB, an attacker does not);
+and a `table.nbytes` check after `read_all()` runs after the allocation it is
+meant to prevent.
+
+**Mitigations available now**: use `@cache.secure` for Arrow caches on
+untrusted backends, or run with an enforced process memory limit. Setting
+`compression=None` on the serializer does **not** mitigate — `deserialize()`
+decompresses according to the stored stream's own metadata and never consults
+that setting.
+
 ### Cryptographic Security
 
 > [!NOTE]
@@ -419,6 +482,7 @@ We appreciate responsible disclosure from the security community. Security resea
 [core-security]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md
 [core-deps]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#dependencies
 [core-kani]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#kani-verification
+[core-decompress]: https://github.com/cachekit-io/cachekit-core/blob/main/SECURITY.md#decompression-limits
 [rustsec]: https://rustsec.org/
 [cwe-502]: https://cwe.mitre.org/data/definitions/502.html
 [cwe-532]: https://cwe.mitre.org/data/definitions/532.html

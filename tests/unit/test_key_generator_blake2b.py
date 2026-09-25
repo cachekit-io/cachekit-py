@@ -208,8 +208,9 @@ class TestBlake2bKeyGeneration:
         """Test SERIALIZER_CODES constant is correct."""
         gen = CacheKeyGenerator()
 
+        # Canonical names only — alias spellings live in SERIALIZER_NAME_ALIASES (LAB-4351).
         expected_codes = {
-            "std": "s",
+            "default": "s",
             "auto": "a",
             "orjson": "o",
             "arrow": "w",
@@ -217,6 +218,12 @@ class TestBlake2bKeyGeneration:
         }
 
         assert gen.SERIALIZER_CODES == expected_codes
+        assert gen.SERIALIZER_NAME_ALIASES == {"std": "default", "standard": "default", "pythonic": "auto"}
+        # The custom bucket must stay disjoint from every real serializer's code.
+        assert gen.UNKNOWN_SERIALIZER_CODE not in expected_codes.values()
+        # A serializer instance's identity can never be spelled as a table key.
+        assert gen.CUSTOM_SERIALIZER_PREFIX + "auto" not in expected_codes
+        assert gen.serializer_code(gen.CUSTOM_SERIALIZER_PREFIX + "auto") != expected_codes["auto"]
 
     def test_bytes_type_support(self):
         """Test that bytes type is supported."""
