@@ -293,6 +293,30 @@ class TestModelConfigConsistency:
         for exc in (file_info.value, custom_info.value):
             _assert_no_route_to(exc, "SECRET_VALUE")
 
+    @pytest.mark.parametrize("ctx", [None, {"port": 6379}])
+    def test_custom_error_named_like_a_builtin_stays_custom(self, ctx: dict[str, int] | None) -> None:
+        """A PydanticCustomError named "value_error" is not the built-in: it has no url and no ctx["error"].
+
+        Rebuilding it by name raised TypeError inside the except, chaining the raw original.
+        """
+        from pydantic_core import PydanticCustomError
+
+        class StrictURLConfig(BaseBackendConfig):
+            url: str = ""
+
+            @field_validator("url")
+            @classmethod
+            def reject(cls, v: str) -> str:
+                raise PydanticCustomError("value_error", "rejected (port {port})" if ctx else "rejected", ctx)
+
+        with pytest.raises(ValidationError) as exc_info:
+            StrictURLConfig(url="redis://:SECRET_VALUE@host")
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("value_error", ("url",), "rejected (port 6379)" if ctx else "rejected")
+        assert "url" not in err
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
 
 class TestFromEnvClassmethod:
     """Ensure all configs have from_env() classmethod."""

@@ -110,15 +110,16 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
     gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
     lose their traceback and chain in place.
     """
-    errors = error.errors(include_url=False)
+    errors = error.errors()
     sanitized: list[InitErrorDetails] = []
     for err in errors:
         ctx = err.get("ctx")
         error_type: str | PydanticCustomError = err["type"]
-        if error_type not in _BUILTIN_ERROR_TYPES:
-            # Only built-in types rebuild from their name. Any other (pydantic's own Path fields raise
-            # "path_type", a validator may raise PydanticCustomError) rebuilds from its rendered msg,
-            # which pydantic produced, hence not a LiteralString.
+        if "url" not in err or error_type not in _BUILTIN_ERROR_TYPES:
+            # Only built-in types rebuild from their name, and only they carry a url: a PydanticCustomError
+            # may reuse a built-in name ("value_error") without the ctx that name requires. Any other
+            # (pydantic's own Path fields raise "path_type") rebuilds from its rendered msg, which pydantic
+            # produced, hence not a LiteralString.
             error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
