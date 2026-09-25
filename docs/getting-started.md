@@ -623,7 +623,7 @@ for i in range(3):
 | Resource | Description |
 |:---------|:------------|
 | [Troubleshooting Guide](troubleshooting.md) | Solutions for common errors |
-| [Error Codes](error-codes.md) | Complete error code reference |
+| [Error Reference](error-codes.md) | Exceptions cachekit raises or logs |
 
 ---
 
