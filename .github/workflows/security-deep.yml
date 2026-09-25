@@ -156,7 +156,7 @@ jobs:
     #     exhaustion exits 0 above, so a target still alive at 15 min is hung
     #     (and libFuzzer traps SIGTERM, hence the -k hard kill).
     #   - Zero matched targets fails the job: a glob that stops matching must
-    #     not "pass" having fuzzed nothing (LAB-1136 post-mortem pattern).
+    #     not "pass" having fuzzed nothing.
     - name: Run Atheris fuzz targets (10 min each)
       run: |
         mkdir -p tests/fuzzing/artifacts

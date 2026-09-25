@@ -40,7 +40,7 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 | `@cache(interop=..., namespace=...)` | ✅ Spec-identical | Baseline — key and value bytes come only from the interop/v1 spec |
 | `@cache.production(interop=..., ...)` | ✅ Spec-identical | **Recommended.** Reliability profile (circuit breaker, monitoring) affects runtime only, never bytes |
 | `@cache.minimal(interop=..., ...)` | ✅ Spec-identical | Its `integrity_checking=False` is a no-op here — see [Encryption](#encryption) |
-| `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key + deployment UUID |
+| `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key (and the same explicit tenant, if one is configured) |
 | `@cache.io(interop=..., ...)` | ✅ Composes in code | ⚠️ Don't run against CachekitIO until the saas#91 validator deploy is live — see the note at the bottom |
 | `@cache.local(...)` / `@cache(backend=None)` | ❌ Rejected loudly | No shared medium: `.local` raises `TypeError` (it accepts no `interop=`), `backend=None` raises `ConfigurationError` at decoration time |
 
@@ -73,7 +73,7 @@ The flip side: two *differently decorated* Python functions that declare the sam
 
 Treat operation names like queue names or topic names: a **cross-team contract**, not a local variable. Two teams binding `users:get_user` had better agree on the argument list and the meaning of the cached value — the cache will not referee. If two functions must not share entries, give them different operation names.
 
-**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and deployment UUID. The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
+**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and tenant (the implicit `"default"`, or the same explicit `deployment_uuid` everywhere). The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
 
 ## The Cross-SDK Contract
 
@@ -94,8 +94,7 @@ Encryption works unchanged — and cross-SDK. The AES-256-GCM plaintext is the p
     namespace="users",
     encryption=True,
     master_key=secret_key,
-    single_tenant_mode=True,
-    deployment_uuid="00000000-0000-0000-0000-000000000001",  # share across SDKs
+    single_tenant_mode=True,  # tenant_id "default" — the same literal every SDK derives from
 )
 def get_user(user_id: int):
     return db.fetch(user_id)  # illustrative
@@ -103,8 +102,8 @@ def get_user(user_id: int):
 
 Three constraints, all fail-closed:
 
-- **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. To share encrypted entries across SDKs, configure the same master key **and** the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) everywhere.
-- **The shared tenant must be explicit and canonical.** The machine-local auto-generated deployment UUID is rejected (it differs per host — nothing else could ever decrypt), and the configured value must already be in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys).
+- **Single-tenant only.** Interop entries carry no metadata header, so the read path cannot recover a per-call tenant; `tenant_extractor` is rejected at decoration time. With no tenant configured, every SDK derives under the protocol literal `"default"` ([intent-presets.md § Master Key Input](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#master-key-input), rule 5), so the same master key alone is enough to share encrypted entries across py, rs and ts.
+- **An explicit tenant must be shared and canonical.** To scope keys to a deployment, set the same `deployment_uuid` (or `CACHEKIT_DEPLOYMENT_UUID`) in every SDK, already in canonical lowercase-hyphenated form (Python would otherwise normalize it before key derivation while other SDKs use the raw string — silently different keys). There is no machine-local fallback: a per-host value in a key-derivation input is a permanent cross-SDK authentication failure, not a miss.
 - **Config decides, bytes never do.** With encryption enabled, stored bytes are always treated as ciphertext and authenticated before any decode. There is no header to forge, so the CWE-757 downgrade class (see the auto-mode fail-closed read path in [zero-knowledge-encryption.md](zero-knowledge-encryption.md)) cannot exist here.
 
 One thing no guardrail can catch: two *binders* of the same `(namespace, operation)` with different encryption configs. That mismatch is silent — see [Operation Names Are a Contract](#operation-names-are-a-contract-shared-entries).
@@ -117,7 +116,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 | :--- | :--- |
 | Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
-| Encryption without an explicit, canonical shared deployment UUID | `ConfigurationError` at decoration time |
+| Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
 | Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
