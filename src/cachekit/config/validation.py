@@ -104,8 +104,19 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
     Must not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
     chain the original, raw inputs and all. Kept out of ``_redacting`` so the raw ``err`` dicts are
     gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
-    lose their traceback and chain in place.
+    lose their traceback and chain in place, first, so that no msg read afterwards quotes them.
     """
+    for err in error.errors():
+        for value in (err.get("ctx") or {}).values():
+            if isinstance(value, BaseException):
+                # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
+                # validator's locals (the raw value), and its chain can quote the raw value. Drop both,
+                # through BaseException's own descriptors: a frozen or property-overriding subclass would
+                # raise on plain assignment. Its type and args are unchanged.
+                for attr in ("__traceback__", "__context__", "__cause__"):
+                    getattr(BaseException, attr).__set__(value, None)
+    # Read the msgs only now: one rendered from a ctx exception's str() that read its chain no longer
+    # quotes it. Every msg below (a custom error's template, the mode check) is the post-drop one.
     errors = error.errors()
     sanitized: list[InitErrorDetails] = []
     for err in errors:
@@ -125,22 +136,12 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
                 error_type = PydanticCustomError(err["type"], err["msg"])  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
-            for value in ctx.values():
-                if isinstance(value, BaseException):
-                    # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
-                    # validator's locals (the raw value), and its chain can quote the raw value. Drop
-                    # both; its type and args are unchanged, and so is its str() unless that read the
-                    # dropped chain, in which case the rebuilt msg no longer quotes it. Set through
-                    # BaseException's own descriptors: a frozen or property-overriding subclass
-                    # would raise on plain assignment.
-                    for attr in ("__traceback__", "__context__", "__cause__"):
-                        getattr(BaseException, attr).__set__(value, None)
             detail["ctx"] = ctx
         sanitized.append(detail)
     # A ValidationError renders every msg in one input mode and does not say which ("Input should be
     # an object" is JSON; "... a valid dictionary ..." is Python). Keep the Python rebuild when it
     # reproduces the msgs, else the JSON one, so every built-in keeps its type and url. Never copy an
-    # original msg back in: one rendered from a validator exception's chain would quote the raw value.
+    # original msg back in.
     python_copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
     if [err["msg"] for err in python_copy.errors(include_url=False)] == [err["msg"] for err in errors]:
         return python_copy

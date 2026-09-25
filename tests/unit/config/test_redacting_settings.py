@@ -14,7 +14,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
 
 from cachekit.backends.base_config import BaseBackendConfig
@@ -75,6 +75,7 @@ class _ChainQuotingError(ValueError):
 
 class _ChainQuotingConfig(BaseBackendConfig):
     port: str = ""
+    mapping: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("port")
     @classmethod
@@ -83,6 +84,21 @@ class _ChainQuotingConfig(BaseBackendConfig):
             int(v)
         except ValueError as exc:
             raise _ChainQuotingError() from exc
+        return v
+
+
+class _CustomChainQuotingConfig(BaseBackendConfig):
+    port: str = ""
+
+    @field_validator("port")
+    @classmethod
+    def reject(cls, v: str) -> str:
+        try:
+            int(v)
+        except ValueError as exc:
+            quoting = _ChainQuotingError()
+            quoting.__cause__ = exc
+            raise PydanticCustomError("bad_port", "rejected: {error}", {"error": quoting}) from None
         return v
 
 
@@ -214,6 +230,40 @@ class TestRedactingSettings:
 
         [err] = exc_info.value.errors()
         assert (err["type"], err["loc"], err["msg"]) == ("value_error", ("port",), "Value error, bad port: None")
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    def test_custom_error_template_is_read_after_the_chain_is_dropped(self) -> None:
+        """A custom error rebuilds from its rendered msg; rendered before its ctx exception lost its chain, that
+        msg would quote the raw value and become the rebuilt error's template."""
+        with pytest.raises(ValidationError) as exc_info:
+            _CustomChainQuotingConfig(port="SECRET_VALUE")
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("bad_port", ("port",), "rejected: bad port: None")
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize(
+        ("build", "dict_msg"),
+        [
+            (lambda: _ChainQuotingConfig(port="SECRET_VALUE", mapping="nope"), "Input should be a valid dictionary"),
+            (
+                lambda: _ChainQuotingConfig.model_validate_json('{"port": "SECRET_VALUE", "mapping": "nope"}'),
+                "Input should be an object",
+            ),
+        ],
+        ids=["constructor", "model_validate_json"],
+    )
+    def test_a_msg_changed_by_the_dropped_chain_leaves_the_others_in_their_mode(
+        self, build: Callable[[], object], dict_msg: str
+    ) -> None:
+        """The rebuild's input mode is chosen by comparing msgs; comparing against a msg as it rendered before
+        its chain was dropped makes the Python rebuild look wrong and flips every other error to JSON wording."""
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        by_loc = {err["loc"]: err for err in exc_info.value.errors()}
+        assert by_loc[("port",)]["msg"] == "Value error, bad port: None"
+        assert (by_loc[("mapping",)]["type"], by_loc[("mapping",)]["msg"]) == ("dict_type", dict_msg)
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     @pytest.mark.parametrize(
