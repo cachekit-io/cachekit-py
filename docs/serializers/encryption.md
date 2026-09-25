@@ -4,7 +4,7 @@
 
 **EncryptionWrapper** adds client-side AES-256-GCM encryption to **any** serializer. It is a composable wrapper — it serializes data using an inner serializer, then encrypts the result before storage.
 
-For comprehensive documentation of cachekit's zero-knowledge encryption architecture, key management, per-tenant isolation, nonce handling, and authentication guarantees, see [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md).
+For comprehensive documentation of cachekit's zero-knowledge encryption architecture, key management, multi-tenant limits, nonce handling, and authentication guarantees, see [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md).
 
 ## Overview
 
@@ -99,7 +99,7 @@ Encryption adds minimal overhead:
 
 ## See Also
 
-- [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md) — Full encryption docs: key management, per-tenant isolation, nonce handling, compliance
+- [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md) — Full encryption docs: key management, multi-tenant limits, nonce handling, compliance
 - [StandardSerializer](default.md) — General-purpose inner serializer
 - [OrjsonSerializer](orjson.md) — JSON inner serializer
 - [ArrowSerializer](arrow.md) — DataFrame inner serializer

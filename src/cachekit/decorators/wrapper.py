@@ -449,7 +449,8 @@ def create_cache_wrapper(
                          If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
                          CACHEKIT_DEPLOYMENT_UUID is set).
                          If provided: multi-tenant mode (extracts tenant_id from function args/kwargs).
-                         FAIL CLOSED: extraction failure raises ValueError (no fallback to shared key).
+                         If extraction fails, nothing is cached: the failure is logged at WARNING and
+                         the call runs uncached (no fallback to a shared key).
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                            Mutually exclusive with tenant_extractor. Prevents accidental shared
                            keys in multi-tenant deployments by requiring explicit configuration.
@@ -484,9 +485,12 @@ def create_cache_wrapper(
                 exclusive with key= and fast_mode. None (default) = auto mode.
 
     Security Note:
-        When encryption=True and tenant_extractor is provided, tenant ID extraction
-        uses FAIL CLOSED security policy. If extraction fails, ValueError propagates to caller
-        (no fallback to shared encryption key). This ensures cryptographic tenant isolation.
+        When encryption=True and tenant_extractor is provided: if extraction fails, nothing
+        is cached: the failure is logged at WARNING and the call runs uncached. There is no
+        fallback to a shared key. It is NOT a tenancy boundary — cache keys
+        carry no tenant component, so two tenants calling with identical arguments address
+        the same entry. Give each tenant its own namespace or deployment. See
+        docs/features/zero-knowledge-encryption.md.
     """
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values
