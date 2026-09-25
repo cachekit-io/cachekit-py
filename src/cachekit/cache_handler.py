@@ -1771,6 +1771,52 @@ class CacheInvalidator:
         """
         self._backend = backend
 
+    # Pre-0.20.0 releases never passed the serializer to generate_key, so every generated
+    # key ended in the default code `s` whatever the serializer was (LAB-4351). A
+    # deployment upgraded from one still holds those entries — and old replicas keep
+    # writing them during a rolling deploy — at a key the current code never computes.
+    # Invalidating only the current key would let an erasure return normally while the
+    # pre-upgrade copy survives to its TTL, or forever at ttl=None. So invalidation also
+    # deletes the legacy key. Over-deleting costs a `default`-serializer decorator on the
+    # same function and arguments one recompute; under-deleting leaks retained data.
+    # Remove only in a major release whose notes declare upgrades from below 0.20.0
+    # unsupported: ttl=None entries never age out, so no TTL clock can retire this.
+    _LEGACY_SERIALIZER_TYPE = "default"
+
+    def _invalidation_keys(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        namespace: str | None,
+    ) -> list[str]:
+        """The current key, plus the pre-0.20.0 key when the serializer code differs."""
+        cache_key = self.key_generator.generate_key(
+            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
+        )
+        # generate_key reads serializer_type only through serializer_code, so equal codes mean
+        # a byte-identical key: skip hashing the arguments a second time.
+        serializer_code = self.key_generator.serializer_code
+        if serializer_code(self.serializer_type) == serializer_code(self._LEGACY_SERIALIZER_TYPE):
+            return [cache_key]
+        legacy_key = self.key_generator.generate_key(
+            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self._LEGACY_SERIALIZER_TYPE
+        )
+        return [cache_key, legacy_key]
+
+    @staticmethod
+    def _delete(backend: BaseBackend, cache_key: str) -> None:
+        """Delete one key; a failure is logged, never raised, so later deletes still run."""
+        try:
+            backend.delete(cache_key)
+            get_logger().cache_invalidated(cache_key, "Backend")
+        except BackendError as e:
+            get_logger().error(
+                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
+            )
+        except Exception as e:
+            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
+
     def invalidate_cache(
         self,
         func: Callable[..., Any],
@@ -1778,7 +1824,7 @@ class CacheInvalidator:
         kwargs: dict[str, Any],
         namespace: str | None,
     ) -> None:
-        """Invalidate cache entry.
+        """Invalidate cache entry, including its pre-0.20.0 key (see _LEGACY_SERIALIZER_TYPE).
 
         Args:
             func: Cached function
@@ -1791,19 +1837,8 @@ class CacheInvalidator:
         """
         if self._backend is None:
             raise RuntimeError("Backend must be set before calling invalidate_cache")
-        cache_key = self.key_generator.generate_key(
-            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
-        )
-
-        try:
-            self._backend.delete(cache_key)
-            get_logger().cache_invalidated(cache_key, "Backend")
-        except BackendError as e:
-            get_logger().error(
-                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
-            )
-        except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
+        for cache_key in self._invalidation_keys(func, args, kwargs, namespace):
+            self._delete(self._backend, cache_key)
 
     async def invalidate_cache_async(
         self,
@@ -1812,7 +1847,7 @@ class CacheInvalidator:
         kwargs: dict[str, Any],
         namespace: str | None,
     ) -> None:
-        """Invalidate cache entry (async version).
+        """Invalidate cache entry (async version), including its pre-0.20.0 key.
 
         Args:
             func: Cached function
@@ -1825,21 +1860,10 @@ class CacheInvalidator:
         """
         if self._backend is None:
             raise RuntimeError("Backend must be set before calling invalidate_cache_async")
-        cache_key = self.key_generator.generate_key(
-            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
-        )
-
-        try:
-            # Note: BaseBackend methods are sync (not async)
-            # We call sync method from async context (will be wrapped in executor by caller if needed)
-            self._backend.delete(cache_key)
-            get_logger().cache_invalidated(cache_key, "Backend")
-        except BackendError as e:
-            get_logger().error(
-                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
-            )
-        except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
+        # Note: BaseBackend methods are sync (not async)
+        # We call sync method from async context (will be wrapped in executor by caller if needed)
+        for cache_key in self._invalidation_keys(func, args, kwargs, namespace):
+            self._delete(self._backend, cache_key)
 
 
 @runtime_checkable

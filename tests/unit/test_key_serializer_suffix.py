@@ -19,8 +19,10 @@ from typing import Any
 import pytest
 
 from cachekit import cache
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
+from cachekit.serializers.standard_serializer import StandardSerializer
 
 
 class _RecordingBackend:
@@ -299,3 +301,201 @@ class TestSerializerCodeTable:
 
         assert len(backend.store) == 2, f"two serializer instances shared a key: {list(backend.store)}"
         assert calls == 2, f"expected 2 misses then hits, got {calls} calls — the two decorators are evicting each other"
+
+
+def _pre_020_key(current_key: str) -> str:
+    """The key a pre-0.20.0 release wrote for the same call: same key, serializer code ``s``.
+
+    Derived from the key the write path produced, not from ``generate_key``, so the test
+    pins the legacy key's shape independently of the code under test.
+    """
+    head, suffix = current_key.rsplit(":", 1)
+    return f"{head}:{suffix[0]}s"
+
+
+NON_DEFAULT_SERIALIZERS = [pytest.param("auto", id="auto"), pytest.param(StandardSerializer(), id="instance")]
+
+
+class _FailOnKeysBackend(_RecordingBackend):
+    """Recording backend whose delete raises for chosen keys, after recording the attempt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_on: set[str] = set()
+
+    def delete(self, key: str) -> bool:
+        if key in self.fail_on:
+            self.deleted.append(key)
+            raise BackendError("delete refused", error_type=BackendErrorType.TRANSIENT)
+        return super().delete(key)
+
+
+@pytest.mark.unit
+class TestInvalidationReachesPre020Keys:
+    """`invalidate_cache(args)` also deletes the pre-0.20.0 `:{ic}s` entry (LAB-5288).
+
+    Before LAB-4351 every generated key ended in `s`. After upgrading, a non-default
+    serializer writes and invalidates a new key, so an erasure that deletes only the new
+    key returns normally while the pre-upgrade copy survives to its TTL.
+    """
+
+    @pytest.mark.parametrize("serializer", NON_DEFAULT_SERIALIZERS)
+    def test_sync_invalidate_deletes_current_and_legacy_key(self, serializer: Any):
+        backend = _RecordingBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-sync", serializer=serializer)
+        def fn(x: int) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"v": x}
+
+        fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        assert legacy_key != current_key
+        backend.store[legacy_key] = b"pre-0.20.0 plaintext copy"
+
+        fn.invalidate_cache(1)
+
+        assert legacy_key not in backend.store, "pre-0.20.0 entry survived invalidation"
+        assert current_key not in backend.store
+        fn(1)
+        assert calls == 2
+
+    @pytest.mark.parametrize("serializer", NON_DEFAULT_SERIALIZERS)
+    async def test_async_invalidate_deletes_current_and_legacy_key(self, serializer: Any):
+        backend = _RecordingBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-async", serializer=serializer)
+        async def fn(x: int) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"v": x}
+
+        await fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        assert legacy_key != current_key
+        backend.store[legacy_key] = b"pre-0.20.0 plaintext copy"
+
+        await fn.ainvalidate_cache(1)
+
+        assert legacy_key not in backend.store, "pre-0.20.0 entry survived invalidation"
+        assert current_key not in backend.store
+        await fn(1)
+        assert calls == 2
+
+    def test_default_serializer_issues_exactly_one_delete(self):
+        """Code `s` already is the legacy key: no second round-trip."""
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="lab5288-default", serializer="default")
+        def fn(x: int) -> int:
+            return x
+
+        fn(1)
+        (current_key,) = backend.store
+        assert _suffix(current_key) == "1s"
+        backend.deleted.clear()
+
+        fn.invalidate_cache(1)
+
+        assert backend.deleted == [current_key]
+
+    async def test_default_serializer_issues_exactly_one_delete_async(self):
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="lab5288-default-async", serializer="default")
+        async def fn(x: int) -> int:
+            return x
+
+        await fn(1)
+        (current_key,) = backend.store
+        backend.deleted.clear()
+
+        await fn.ainvalidate_cache(1)
+
+        assert backend.deleted == [current_key]
+
+    @pytest.mark.parametrize("failing", ["legacy", "current"])
+    def test_one_failed_delete_does_not_skip_the_other(self, failing: str):
+        """Each delete is independent: a failure on one key still attempts the other."""
+        backend = _FailOnKeysBackend()
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-fail", serializer="auto")
+        def fn(x: int) -> int:
+            return x
+
+        fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"old"
+        backend.fail_on = {legacy_key if failing == "legacy" else current_key}
+        backend.deleted.clear()
+
+        fn.invalidate_cache(1)
+
+        assert backend.deleted == [current_key, legacy_key]
+        assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
+
+    @pytest.mark.parametrize("failing", ["legacy", "current"])
+    async def test_one_failed_delete_does_not_skip_the_other_async(self, failing: str):
+        backend = _FailOnKeysBackend()
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-fail-async", serializer="auto")
+        async def fn(x: int) -> int:
+            return x
+
+        await fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"old"
+        backend.fail_on = {legacy_key if failing == "legacy" else current_key}
+        backend.deleted.clear()
+
+        await fn.ainvalidate_cache(1)
+
+        assert backend.deleted == [current_key, legacy_key]
+        assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
+
+    @pytest.mark.parametrize("namespace", ["ns", "n" * 300], ids=["short", "hashed-long-key"])
+    @pytest.mark.parametrize("integrity_checking", [True, False], ids=["ic1", "ic0"])
+    @pytest.mark.parametrize(
+        "serializer_type",
+        [
+            *CacheKeyGenerator.SERIALIZER_CODES,
+            *CacheKeyGenerator.SERIALIZER_NAME_ALIASES,
+            f"{CacheKeyGenerator.CUSTOM_SERIALIZER_PREFIX}my.Serializer",
+        ],
+    )
+    def test_code_shortcut_never_drops_the_legacy_key(
+        self, serializer_type: str, integrity_checking: bool, namespace: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Skipping the second generate_key on equal codes must return exactly the distinct keys.
+
+        The reference is both keys generated in full and de-duplicated: if the code shortcut
+        ever disagreed with generate_key's own canonicalisation, the legacy key would be dropped.
+        """
+        generator = CacheKeyGenerator()
+
+        def fn(x: int) -> int:
+            return x
+
+        current = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type=serializer_type)
+        legacy = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type="default")
+        expected = list(dict.fromkeys([current, legacy]))
+
+        calls: list[str] = []
+        real_generate_key = generator.generate_key
+
+        def counting_generate_key(*args: Any, **kwargs: Any) -> str:
+            calls.append(kwargs["serializer_type"])
+            return real_generate_key(*args, **kwargs)
+
+        monkeypatch.setattr(generator, "generate_key", counting_generate_key)
+        invalidator = CacheInvalidator(generator, integrity_checking=integrity_checking, serializer_type=serializer_type)
+
+        assert invalidator._invalidation_keys(fn, (1,), {}, namespace) == expected
+        assert len(calls) == len(expected), f"arguments hashed {len(calls)}x for {len(expected)} distinct key(s)"
