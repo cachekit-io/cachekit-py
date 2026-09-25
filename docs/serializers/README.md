@@ -69,9 +69,9 @@ cost: a default-serializer decorator over the same function, namespace and argum
 that entry and recomputes once.
 
 The reverse direction is not covered. An erasure served by a v0.19 replica during the rollout,
-or by any replica after a rollback to v0.19, deletes only the `:1s` key, so a copy that a
-v0.20.0 replica wrote under the new key survives. Re-issue any erasure made during the
-rollout once the last v0.19 replica is retired, or cover it with the flush below.
+or by any replica after a rollback to v0.19, deletes only the `:{integrity_flag}s` key, so a
+copy that a v0.20.0 replica wrote under the new key survives. Re-issue any erasure made during
+the rollout once the last v0.19 replica is retired, or cover it with the flush below.
 
 **What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
 arguments you never invalidate, and no-argument `invalidate_cache()` / `cache_clear()` only
@@ -80,7 +80,7 @@ old ones. So if you cache personal data under `ttl=None`, or otherwise need ever
 entry gone rather than aging out, follow the flush procedure in the retention warning
 [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
-writing `:1s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
+writing `:{integrity_flag}s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
 orphans the old keyspace rather than deleting it; the retention step still applies.
 
 ### Changing Serializers: Separate Keyspaces
