@@ -222,7 +222,7 @@ class TestCacheInvalidatorRedaction:
 
     def _invalidator(self, error: Exception) -> tuple[CacheInvalidator, _FailingBackend]:
         backend = _FailingBackend(error)
-        return CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend), backend
+        return CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend, serializer_type="default"), backend
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_sync_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:

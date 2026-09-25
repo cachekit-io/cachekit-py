@@ -1,6 +1,5 @@
 """Unit tests for structured logging module."""
 
-import json
 import logging
 import threading
 import time
@@ -9,7 +8,6 @@ from unittest.mock import patch
 import pytest
 
 from cachekit.logging import (
-    JsonFormatter,
     StructuredLogger,
     get_structured_logger,
 )
@@ -137,84 +135,6 @@ class TestStructuredLogger:
         # Each thread should have its own trace ID
         assert results["thread1"] == "trace-1"
         assert results["thread2"] == "trace-2"
-
-
-class TestJsonFormatter:
-    """Test JSON formatter functionality."""
-
-    def test_format_basic_record(self):
-        """Test formatting basic log record."""
-        formatter = JsonFormatter()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=10,
-            msg="Test message",
-            args=(),
-            exc_info=None,
-        )
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert data["level"] == "INFO"
-        assert data["logger"] == "test.logger"
-        assert data["message"] == "Test message"
-        assert "timestamp" in data
-        assert "thread_id" in data
-
-    def test_format_with_structured_context(self):
-        """Test formatting with structured context."""
-        formatter = JsonFormatter()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=10,
-            msg="Cache operation",
-            args=(),
-            exc_info=None,
-        )
-
-        # Add structured context
-        record.structured = {"operation": "get", "cache_key": "test_key", "hit": True}
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert data["operation"] == "get"
-        assert data["cache_key"] == "test_key"
-        assert data["hit"] is True
-
-    def test_format_with_exception(self):
-        """Test formatting with exception info."""
-        formatter = JsonFormatter()
-
-        try:
-            raise ValueError("Test exception")
-        except ValueError:
-            import sys
-
-            exc_info = sys.exc_info()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.ERROR,
-            pathname="test.py",
-            lineno=10,
-            msg="Error occurred",
-            args=(),
-            exc_info=exc_info,
-        )
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert "exception" in data
-        assert "ValueError: Test exception" in data["exception"]
 
 
 class TestFactoryFunction:

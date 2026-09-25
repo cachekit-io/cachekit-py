@@ -68,8 +68,8 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         assert result2 == result1
         assert call_count == 1  # Function not called again
 
-    def test_single_tenant_mode_uses_nil_uuid(self):
-        """CRITICAL: Single-tenant mode (no tenant_extractor) should use nil UUID as default."""
+    def test_single_tenant_mode_round_trips(self):
+        """CRITICAL: Single-tenant mode (no tenant_extractor) stores and reads back encrypted data."""
         call_count = 0
 
         @cache.secure(master_key="a" * 64, ttl=300, namespace="single_tenant")
@@ -393,10 +393,13 @@ class TestEncryptionIntegration(RedisIsolationMixin):
         df1 = load_balances("acct-1")
         assert df1["balance"].iloc[0] == 424242.0
 
-        # Raw Redis bytes must be ciphertext, not the plaintext column value.
-        key_gen = CacheKeyGenerator()
-        cache_key = key_gen.generate_key(load_balances, ("acct-1",), {}, "enc_arrow_crit")
-        raw = self.redis_client.get(self.get_scoped_key(cache_key))
+        # Raw Redis bytes must be ciphertext, not the plaintext column value. Read the key
+        # the decorator actually wrote rather than re-deriving one: a custom serializer
+        # *instance* keys under its own serializer code, so a hand-built key would name a
+        # different entry (LAB-4351).
+        written = self.redis_client.keys(self.get_scoped_key("ns:enc_arrow_crit*"))
+        assert len(written) == 1, f"Expected exactly one Arrow cache entry, got: {written}"
+        raw = self.redis_client.get(written[0])
         assert raw is not None, "Encrypted Arrow data should be stored in Redis"
         assert b"424242" not in raw, "Balance must NOT appear in plaintext in Redis"
         assert b"acct-1" not in raw, "Account id must NOT appear in plaintext in Redis"
