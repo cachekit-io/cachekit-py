@@ -68,8 +68,10 @@ def _encode_tenant(tenant_id: object) -> str:
     Apps set int / UUID tenant ids despite the annotation; their ``str()`` is canonical, so
     they are accepted. Anything else except str / bytes raises TypeError (fail closed): the
     ``str()`` of an arbitrary object, e.g. a default repr embedding ``id()``, can map two
-    tenants to one prefix.
+    tenants to one prefix. bool is refused although it subclasses int: ``True`` is not a tenant.
     """
+    if isinstance(tenant_id, bool):
+        raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
     if isinstance(tenant_id, (int, uuid.UUID)):
         tenant_id = str(tenant_id)
     if not isinstance(tenant_id, (str, bytes)):

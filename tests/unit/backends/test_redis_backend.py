@@ -644,6 +644,17 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
             self._as_tenant(object(), shared.get, "k")
         client.get.assert_not_called()
 
+    @pytest.mark.parametrize("tenant", [True, False])
+    def test_bool_tenant_ids_are_refused(self, tenant):
+        """bool is an int subclass: without an explicit check it would select t:True: / t:False:."""
+        client = Mock()
+        with pytest.raises(TypeError):
+            PerRequestRedisBackend(client, tenant)  # type: ignore[arg-type]
+        shared = PerRequestRedisBackend(client, "default", follow_context=True)
+        with pytest.raises(TypeError):
+            self._as_tenant(tenant, shared.get, "k")
+        client.get.assert_not_called()
+
     def test_a_context_without_a_tenant_falls_back_to_default_or_the_call_time_tenant(self):
         with patch.object(redis.Redis, "ping"):
             provider = RedisBackendProvider("redis://localhost:6379")
