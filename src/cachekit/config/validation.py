@@ -53,9 +53,11 @@ class RedactingSettings(BaseSettings):
     API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
     (``loc == ()``) snapshots the whole input dict. A failure in the constructor (``from_env()``
     included) or a ``model_validate*`` classmethod is re-raised as a copy with every input redacted
-    and each error's type, loc, msg and ctx kept (a custom error whose msg would re-format with its
-    ctx drops the ctx). The copy is still a ValidationError (a ValueError), so fail-loud propagation
-    paths are unchanged.
+    and each error's type and loc kept, and its msg and ctx too, except where a ctx exception's msg
+    came from its dropped traceback or chain, or a custom error's msg would change when formatted
+    again with its own ctx (that ctx is dropped). An error that cannot be rebuilt at all comes back
+    as one ctx-less error that withholds the details. The copy is still a ValidationError (a
+    ValueError), so fail-loud propagation paths are unchanged.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -90,7 +92,15 @@ def _redacting(validate: Callable[[], _T]) -> _T:
     try:
         return validate()
     except ValidationError as e:
-        sanitized_error = _redacted_copy(e)
+        try:
+            sanitized_error = _redacted_copy(e)
+        except Exception:
+            # A validator's ctx can defeat the rebuild (an object posing as an exception, a non-str ctx
+            # key); withhold the details rather than let the failure chain the original.
+            withheld = PydanticCustomError("redaction_failed", "Validation failed; details withheld")
+            sanitized_error = ValidationError.from_exception_data(
+                e.title, [{"type": withheld, "loc": (), "input": "[REDACTED]"}], hide_input=True
+            )
     except (SettingsError, UnicodeError) as e:
         sanitized_error = SettingsError(str(e))
     # Raised OUTSIDE the except block so __context__/__cause__ stay None: `raise ... from None` only
@@ -101,8 +111,9 @@ def _redacting(validate: Callable[[], _T]) -> _T:
 def _redacted_copy(error: ValidationError) -> ValidationError:
     """Rebuild ``error`` with every input replaced by ``"[REDACTED]"``.
 
-    Must not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
-    chain the original, raw inputs and all. Kept out of ``_redacting`` so the raw ``err`` dicts are
+    Should not raise: it runs inside the ``except`` that caught ``error``, so an exception here would
+    chain the original, raw inputs and all (``_redacting`` withholds the details if it does). Kept out
+    of ``_redacting`` so the raw ``err`` dicts are
     gone from the frame that raises. Side effect: exceptions in a ctx are shared with ``error`` and
     lose their traceback and chain in place, first, so that no msg read afterwards quotes them.
     """
@@ -128,20 +139,19 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
             # name check guards against a url on a type this pydantic-core's ErrorType does not list, since a
             # wrong rebuild-by-name raises here and chains the original. Any other (pydantic's own Path fields
             # raise "path_type") rebuilds from its rendered msg, which pydantic produced, hence not a LiteralString.
-            # A custom error formats that msg with its ctx on every render, and pydantic-core takes a custom type's
-            # ctx from the error alone: a msg still holding a {key} of its ctx (a ctx value quoting a placeholder)
-            # would format twice and put that ctx value into str(), so such an error drops its ctx.
             error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
+            # A custom error formats its template with its own ctx on every render. When that changes the
+            # rendered msg (a ctx value that quotes a placeholder), formatting it again would put a ctx value
+            # into the msg, so keep the msg verbatim and drop the ctx.
             if error_type.message() != err["msg"]:
                 error_type = PydanticCustomError(err["type"], err["msg"])  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
-        if ctx:
+        if ctx and isinstance(error_type, str):  # a custom error carries its own ctx, or none
             detail["ctx"] = ctx
         sanitized.append(detail)
     # A ValidationError renders every msg in one input mode and does not say which ("Input should be
     # an object" is JSON; "... a valid dictionary ..." is Python). Keep the Python rebuild when it
-    # reproduces the msgs, else the JSON one, so every built-in keeps its type and url. Never copy an
-    # original msg back in.
+    # reproduces the msgs, else the JSON one, so every built-in keeps its type and url.
     python_copy = ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
     if [err["msg"] for err in python_copy.errors(include_url=False)] == [err["msg"] for err in errors]:
         return python_copy

@@ -12,9 +12,10 @@ import json
 import pathlib
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, ValidationInfo, field_validator
 from pydantic_core import PydanticCustomError
 
 from cachekit.backends.base_config import BaseBackendConfig
@@ -100,6 +101,20 @@ class _CustomChainQuotingConfig(BaseBackendConfig):
             quoting.__cause__ = exc
             raise PydanticCustomError("bad_port", "rejected: {error}", {"error": quoting}) from None
         return v
+
+
+class _UnrebuildableCtxConfig(BaseBackendConfig):
+    """A validator whose custom ctx defeats the rebuild: an object posing as an exception, or a non-str key."""
+
+    url: str = ""
+    ctx_kind: str = "proxy"
+
+    @field_validator("url")
+    @classmethod
+    def reject(cls, v: str, info: ValidationInfo) -> str:
+        if info.data.get("ctx_kind") == "proxy":
+            raise PydanticCustomError("bad_url", "bad URL: {error}", {"error": MagicMock(spec=ValueError)})
+        raise PydanticCustomError("bad_url", "bad URL", {1: "one"})  # type: ignore[dict-item]
 
 
 @pytest.mark.unit
@@ -232,6 +247,18 @@ class TestRedactingSettings:
         assert (err["type"], err["loc"], err["msg"]) == ("value_error", ("port",), "Value error, bad port: None")
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
+    @pytest.mark.parametrize("ctx_kind", ["proxy", "non-str-key"])
+    def test_an_error_the_rebuild_cannot_handle_withholds_its_details(self, ctx_kind: str) -> None:
+        """The rebuild runs inside the except; if a validator's ctx makes it raise, that failure would chain the
+        original, raw inputs and all. It comes back as one ctx-less error with the details withheld."""
+        with pytest.raises(ValidationError) as exc_info:
+            _UnrebuildableCtxConfig(ctx_kind=ctx_kind, url="SECRET_VALUE")
+
+        [err] = exc_info.value.errors()
+        assert (err["type"], err["loc"], err["msg"]) == ("redaction_failed", (), "Validation failed; details withheld")
+        assert "ctx" not in err
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
     def test_custom_error_template_is_read_after_the_chain_is_dropped(self) -> None:
         """A custom error rebuilds from its rendered msg; rendered before its ctx exception lost its chain, that
         msg would quote the raw value and become the rebuilt error's template."""
@@ -257,7 +284,8 @@ class TestRedactingSettings:
         self, build: Callable[[], object], dict_msg: str
     ) -> None:
         """The rebuild's input mode is chosen by comparing msgs; comparing against a msg as it rendered before
-        its chain was dropped makes the Python rebuild look wrong and flips every other error to JSON wording."""
+        its chain was dropped makes the Python rebuild look wrong and flips every other error to JSON wording.
+        The constructor case pins that; the JSON case is a control (JSON wording either way)."""
         with pytest.raises(ValidationError) as exc_info:
             build()
 
