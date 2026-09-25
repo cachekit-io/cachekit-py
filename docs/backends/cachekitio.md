@@ -203,7 +203,7 @@ def get_user_profile(user_id: str) -> dict:
 
 **Why this matters**:
 - `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
-- Per-tenant key derivation via HKDF — cryptographic isolation between namespaces
+- Per-tenant key derivation via HKDF — not a tenancy boundary; see [Multi-Tenant Isolation](../features/zero-knowledge-encryption.md#multi-tenant-isolation)
 - The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
 - With `@cache.secure`: SaaS is out of scope for HIPAA/PCI (stores only ciphertext)
 - Without `@cache.secure`: SaaS stores plaintext, may be in compliance scope
