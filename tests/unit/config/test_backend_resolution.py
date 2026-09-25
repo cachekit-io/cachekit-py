@@ -1,7 +1,7 @@
 """Unit tests for backend resolution on the ``@cache(config=...)`` path.
 
-An explicit backend (``backend=`` kwarg or ``config.backend``) beats the module default set via
-``set_default_backend()``; the default only fills a config that carries no backend.
+Precedence: ``backend=`` kwarg > ``config.backend`` > the ``set_default_backend()`` default;
+the default only fills a config that carries no backend.
 """
 
 from __future__ import annotations
