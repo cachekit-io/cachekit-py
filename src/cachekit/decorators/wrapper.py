@@ -423,7 +423,6 @@ def create_cache_wrapper(
     interop: str | None = None,
     # L1-only mode flag
     _l1_only_mode: bool = False,
-    **kwargs: Any,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
