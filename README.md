@@ -235,6 +235,7 @@ def test_cached_function():
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
+- Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/2d56cce231e193141f09df9316f9afac17a1538e/test-vectors/decode-bounds.json) vectors
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.
@@ -431,7 +432,7 @@ CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
 
 # CachekitIO SaaS Backend (closed beta — request access at cachekit.io)
-CACHEKIT_API_KEY="your-api-key"             # Required for @cache.io()  # pragma: allowlist secret
+CACHEKIT_API_KEY="your-api-key"             # For @cache.io() — or pass api_key= directly  # pragma: allowlist secret
 CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
 
 # Memcached Backend (optional: pip install cachekit[memcached])

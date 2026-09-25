@@ -10,6 +10,8 @@ import time
 from collections import defaultdict
 from typing import Any, ClassVar, Optional
 
+from cachekit.hash_utils import redact_error_for_log
+
 logger = logging.getLogger(__name__)
 
 # Thread-safe metrics storage
@@ -188,7 +190,7 @@ class AsyncMetricsCollector:
                 continue
             except Exception as e:
                 # Log error but keep worker running
-                logger.error(f"Error processing metric in worker thread: {e}")
+                logger.error(f"Error processing metric in worker thread: {redact_error_for_log(e)}")
 
     def _process_metric(self, metric_data: dict):
         """Process a single metric."""
@@ -211,7 +213,7 @@ class AsyncMetricsCollector:
                     self._metrics[name][key] = value
 
         except Exception as e:
-            logger.debug(f"Failed to process metric {metric_data.get('name', 'unknown')}: {e}")
+            logger.debug(f"Failed to process metric {metric_data.get('name', 'unknown')}: {redact_error_for_log(e)}")
 
     def _try_prometheus_metric(self, metric_type: str, name: str, value: float, labels: dict) -> bool:
         """Try to record using Prometheus metrics if available."""
@@ -232,7 +234,7 @@ class AsyncMetricsCollector:
                 return False
 
         except (ImportError, AttributeError, Exception) as e:
-            logger.debug(f"Prometheus metric not available for {name}: {e}")
+            logger.debug(f"Prometheus metric not available for {name}: {redact_error_for_log(e)}")
 
         return False
 
@@ -369,7 +371,7 @@ class PrometheusMetricsRegistry:
                     cls._registry[name] = metric
                 except Exception as e:
                     # If Prometheus metric creation fails, return a compatible mock
-                    logger.warning(f"Failed to create Prometheus metric {name}: {e}")
+                    logger.warning(f"Failed to create Prometheus metric {name}: {redact_error_for_log(e)}")
                     cls._registry[name] = MetricsCollector(name)
 
             return cls._registry[name]

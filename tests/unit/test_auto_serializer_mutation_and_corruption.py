@@ -12,14 +12,26 @@ as raw msgpack — losing the corruption diagnostic. A checksum mismatch must su
 DataFrames route through ArrowSerializer when pyarrow is installed, so the columnar msgpack path
 (``_serialize_dataframe`` / the ``"dataframe"`` branch) is exercised by disabling the arrow
 serializer. Series never use arrow, so they hit the columnar path unconditionally.
+
+LAB-2503: ``TestDataFrameSeriesReadRoutes`` pins every DataFrame/Series read route (metadata x
+integrity, and metadata-less via the envelope's format_id); it lives here because this file
+already forces the columnar path.
 """
 
 from __future__ import annotations
 
+import functools
+import logging
+from unittest import mock
+
+import msgpack
 import pytest
 
+from cachekit._rust_serializer import ByteStorage
+from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, handle_decrypt_failure
+from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers import AutoSerializer
-from cachekit.serializers.base import SerializationError
+from cachekit.serializers.base import ERROR_ECHO_MAX, SerializationError, bounded_error
 
 # Requires the [data] extra — absent e.g. in the free-threaded CI lane until
 # numpy/pandas ship free-threaded wheels (LAB-511).
@@ -27,11 +39,97 @@ np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 
 
-def _no_arrow() -> AutoSerializer:
+def _no_arrow(**kwargs: bool) -> AutoSerializer:
     """An AutoSerializer forced onto the columnar msgpack DataFrame path (pyarrow absent)."""
-    s = AutoSerializer()
+    s = AutoSerializer(**kwargs)
     s._arrow_serializer = None
     return s
+
+
+def _assert_equal(out: pd.DataFrame | pd.Series, expected: pd.DataFrame | pd.Series) -> None:
+    if isinstance(expected, pd.DataFrame):
+        pd.testing.assert_frame_equal(out, expected)
+    else:
+        pd.testing.assert_series_equal(out, expected)
+
+
+FRAME = pd.DataFrame({"x": np.arange(5, dtype=np.float64), "n": np.arange(5, dtype=np.int64)})
+SERIES = pd.Series(np.arange(8, dtype=np.float64), name="v")
+
+
+@pytest.mark.unit
+class TestDataFrameSeriesReadRoutes:
+    """Every route a DataFrame/Series read can take must reconstruct the value: with metadata
+    on both integrity settings, and — the decorator read path may carry none — from the
+    verified envelope's own format_id (LAB-2503 moved that route under the fail-closed guard).
+    """
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    @pytest.mark.parametrize("integrity", [True, False], ids=["integrity-on", "integrity-off"])
+    def test_roundtrip_with_metadata(self, value: pd.DataFrame | pd.Series, integrity: bool) -> None:
+        s = _no_arrow(enable_integrity_checking=integrity)
+        data, meta = s.serialize(value)
+        _assert_equal(s.deserialize(data, meta), value)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_roundtrip_without_metadata_via_envelope_format_id(self, value: pd.DataFrame | pd.Series) -> None:
+        s = _no_arrow()
+        data, _ = s.serialize(value)
+        _assert_equal(s.deserialize(data), value)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_cross_config_written_off_read_on_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """LAB-2736 follow-up: an entry written with integrity off (no ByteStorage envelope,
+        no checksum ever computed) must raise, not reconstruct, when read by a reader with
+        integrity on — a same-shaped DataFrame/Series with silently wrong values is far more
+        dangerous than a raw-dict/TypeError, so this path never falls through like the
+        generic msgpack path does. Confirmed exploitable before this test existed: 6427/7208
+        single-bit flips on such an entry decoded to a different-valued DataFrame with no
+        error at all, and even the UNCORRUPTED entry decoded successfully despite never
+        having been checksummed. Matches StandardSerializer's stricter contract."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_cross_config_written_on_read_off_fails_closed(self, value: pd.DataFrame | pd.Series) -> None:
+        """The other direction: an enveloped entry (metadata.compressed=True) read by a reader
+        with integrity off must raise explicitly. Before the gate this only failed by luck —
+        the envelope happens to msgpack-decode as a list, not the dict the columnar decoder
+        expects — and surfaced as a misleading "forged columnar payload" error."""
+        writer = _no_arrow(enable_integrity_checking=True)
+        reader = _no_arrow(enable_integrity_checking=False)
+        data, meta = writer.serialize(value)
+        assert meta.compressed is True
+
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            reader.deserialize(data, meta)
+
+    @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])
+    def test_corrupted_integrity_off_entry_read_on_fails_closed_not_silently_wrong(
+        self, value: pd.DataFrame | pd.Series
+    ) -> None:
+        """The actual exploited shape: bit-flip an entry that was written with integrity
+        off, then read it with integrity on. Every flip must raise SerializationError —
+        none may silently return a DataFrame/Series with different values than what was
+        written. A sample across the byte range (not exhaustive, for CI speed) is enough
+        to pin the contract; the exhaustive proof (7208/7208 raised, 0 silent-wrong) was
+        run by hand before this fix landed."""
+        writer = _no_arrow(enable_integrity_checking=False)
+        reader = _no_arrow(enable_integrity_checking=True)
+        data, meta = writer.serialize(value)
+
+        for byte_idx in range(0, len(data), max(1, len(data) // 40)):
+            corrupted = bytearray(data)
+            corrupted[byte_idx] ^= 0xFF
+            try:
+                out = reader.deserialize(bytes(corrupted), meta)
+            except SerializationError:
+                continue
+            pytest.fail(f"byte {byte_idx} flip silently returned {out!r} instead of raising")
 
 
 @pytest.mark.unit
@@ -94,3 +192,280 @@ class TestDataFrameSeriesCorruptionDiagnostic:
         corrupted[len(corrupted) // 2] ^= 0xFF
         with pytest.raises(SerializationError):
             s.deserialize(bytes(corrupted), meta)
+
+
+@pytest.mark.unit
+class TestEnvelopeVerificationVsNotAnEnvelope:
+    """LAB-2736: ``retrieve()`` raises a distinct type for a verified-but-corrupt envelope
+    (checksum/decompression/size failure) vs. bytes that were never a ByteStorage envelope
+    at all (e.g. written with integrity checking off). ``deserialize`` must fail closed on
+    the former and keep falling through to the plain-msgpack path only on the latter.
+    """
+
+    def test_corrupted_payload_names_the_integrity_failure(self) -> None:
+        s = AutoSerializer()
+        data, meta = s.serialize({"nums": list(range(2000))})
+
+        corrupted = bytearray(data)
+        corrupted[len(corrupted) // 2] ^= 0xFF
+        with pytest.raises(SerializationError) as exc_info:
+            s.deserialize(bytes(corrupted), meta)
+
+        message = str(exc_info.value)
+        assert "envelope verification" in message
+        assert "not a decodable MessagePack" not in message
+
+    def test_plain_msgpack_written_with_integrity_off_still_falls_through(self) -> None:
+        off = AutoSerializer(enable_integrity_checking=False)
+        payload = {"a": 1, "b": [1, 2, 3]}
+        data, _ = off.serialize(payload)
+
+        on = AutoSerializer(enable_integrity_checking=True)
+        assert on.deserialize(data) == payload
+
+    def test_structurally_corrupt_envelope_on_generic_path_fails_closed(self) -> None:
+        """LAB-2736 follow-up: metadata.compressed=True (the writer's own record that this
+        entry should be a verified envelope) plus a structural parse failure — not just a
+        checksum mismatch — must still raise, not fall through to unpackb_bounded on the
+        still-enveloped bytes. Truncation forces DeserializationFailed (structural), the
+        other branch of retrieve()'s failure taxonomy from the checksum-mismatch case
+        ``test_corrupted_payload_names_the_integrity_failure`` already covers above."""
+        s = AutoSerializer(enable_integrity_checking=True)
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        truncated = data[: len(data) // 4]
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(truncated, meta)
+
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
+        """Writer on, reader off, generic msgpack: retrieve() never runs, so nothing sets
+        envelope_error and the compressed=True gate below it never fires. Before the gate
+        the read fell through to unpackb on the ENVELOPE bytes and silently returned its
+        positional fields — ``[payload, checksum, size, format]`` — as the cached value."""
+        on = AutoSerializer(enable_integrity_checking=True)
+        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+        assert meta.compressed is True
+
+        off = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="integrity checking disabled"):
+            off.deserialize(data, meta)
+
+    def test_verified_envelope_format_comes_from_the_envelope_not_the_header(self) -> None:
+        """``metadata.original_type`` is a plaintext-header field. With it None (one flipped
+        header byte), the former ``hasattr(...) else format_id`` never reached ``format_id``
+        and a checksum-verified Series envelope decoded as a dict — an unauthenticated field
+        silently overriding the authenticated one. The envelope's own format record wins."""
+        s = AutoSerializer()
+        series = pd.Series([1.0, 2.0, 3.0], name="v")
+        data, meta = s.serialize(series)
+        meta.original_type = None
+
+        out = s.deserialize(data, meta)
+        assert isinstance(out, pd.Series)
+        pd.testing.assert_series_equal(out, series)
+
+    def test_flipping_compressed_in_the_header_cannot_reopen_the_fall_through(self) -> None:
+        """The fail-closed gate used to be ``... and metadata.compressed`` — a plaintext
+        CK-header byte outside any authentication tag. Flipping it False on a structurally
+        corrupt integrity-on envelope let the generic path decode the envelope itself and
+        return its four positional fields as the cached value. The gate must not consult it."""
+        s = AutoSerializer()
+        data, meta = s.serialize({"a": 1, "b": [1, 2, 3]})
+        envelope = msgpack.unpackb(data)  # [compressed_data, checksum, original_size, format]
+        envelope[1] = list(envelope[1])
+        envelope[1][0] = "x"  # non-u8 checksum element: the envelope fails to PARSE, not to verify
+        corrupted = msgpack.packb(envelope)
+        meta.compressed = False
+
+        with pytest.raises(SerializationError, match="envelope verification"):
+            s.deserialize(corrupted, meta)
+
+
+# A well-formed __ndarray__ marker: the object hook turns it into an ndarray wherever it sits, so a
+# forged document can put an array where the writer only ever puts a list or a dict. M8[2s] is a
+# dtype numpy accepts and pandas then asserts on (AssertionError, outside PAYLOAD_DECODE_ERRORS).
+NDARRAY_M8_2S = {"__ndarray__": True, "dtype": "M8[2s]", "shape": [1], "data": b"\x00" * 8}
+F8_COLUMN = {"type": "numeric", "data": b"\x00" * 8, "dtype": "<f8"}
+# A marker msgpack decodes (the walk admits 1024 levels) but repr() cannot on 3.10/3.11 (RecursionError).
+DEEP_LIST = functools.reduce(lambda acc, _: [acc], range(1000), [])
+
+
+def _entry(kind: str, body: dict) -> bytes:
+    """A checksummed ``dataframe`` / ``series`` entry carrying ``body``."""
+    return bytes(ByteStorage("msgpack").store(msgpack.packb(body), kind))
+
+
+def _columnar_entry(kind: str, column: dict) -> bytes:
+    """A checksummed ``dataframe`` / ``series`` entry whose single column is ``column``."""
+    body = (
+        {"columns": ["x"], "index": None, "data": {"x": column}}
+        if kind == "dataframe"
+        else {"name": None, "index": None, **column}
+    )
+    return _entry(kind, body)
+
+
+@pytest.mark.unit
+class TestForgedColumnarPayloadIsRefused:
+    """Forged DataFrame/Series documents are refused before pandas sees them (LAB-2503): a numeric
+    column dtype the writer never emits (``M8[0ns]`` passes ``np.frombuffer`` and then kills the
+    process with SIGFPE inside pandas — uncatchable), a column type marker other than the two the
+    writer emits, and an ndarray smuggled via the ``__ndarray__`` hook into a field the writer only
+    ever fills with a list or a dict.
+    """
+
+    @pytest.mark.parametrize("dtype", ["M8[0ns]", "m8[0ns]", "U4"])
+    @pytest.mark.parametrize("kind", ["dataframe", "series"])
+    def test_forged_column_dtype_is_a_serialization_error(self, kind: str, dtype: str) -> None:
+        entry = _columnar_entry(kind, {**F8_COLUMN, "dtype": dtype})
+        with pytest.raises(SerializationError, match="Forged columnar dtype"):
+            AutoSerializer().deserialize(entry)
+
+    @pytest.mark.parametrize("marker", ["forged", DEEP_LIST], ids=["unknown-string", "list-nested-1000-deep"])
+    @pytest.mark.parametrize("kind", ["dataframe", "series"])
+    def test_unknown_column_type_marker_is_refused(self, kind: str, marker: object) -> None:
+        entry = _columnar_entry(kind, {"type": marker, "data": [1, 2]})
+        with pytest.raises(SerializationError, match="Forged columnar payload: .* type is"):
+            AutoSerializer().deserialize(entry)
+
+    @pytest.mark.parametrize(
+        "kind, body",
+        [
+            ("dataframe", {"columns": ["x"], "index": None, "data": {"x": NDARRAY_M8_2S}}),
+            ("dataframe", {"columns": ["x"], "index": None, "data": {"x": {"type": "object", "data": NDARRAY_M8_2S}}}),
+            ("dataframe", {"columns": NDARRAY_M8_2S, "index": None, "data": {"x": F8_COLUMN}}),
+            ("dataframe", {"columns": ["x"], "index": NDARRAY_M8_2S, "data": {"x": F8_COLUMN}}),
+            ("dataframe", {"columns": ["x"], "index": None, "data": NDARRAY_M8_2S}),
+            ("series", {"name": None, "index": None, "type": "object", "data": NDARRAY_M8_2S}),
+            ("series", {"name": None, "index": NDARRAY_M8_2S, **F8_COLUMN}),
+        ],
+        ids=[
+            "df-column-is-ndarray",
+            "df-object-data-is-ndarray",
+            "df-columns-is-ndarray",
+            "df-index-is-ndarray",
+            "df-data-is-ndarray",
+            "series-object-data-is-ndarray",
+            "series-index-is-ndarray",
+        ],
+    )
+    def test_ndarray_where_the_writer_emits_a_list_or_dict_is_refused(self, kind: str, body: dict) -> None:
+        with pytest.raises(SerializationError, match="Forged columnar payload"):
+            AutoSerializer().deserialize(_entry(kind, body))
+
+    @pytest.mark.parametrize(
+        "kind, body",
+        [("dataframe", [1, 2]), ("series", 7)],
+        ids=["dataframe-body-is-list", "series-body-is-int"],
+    )
+    def test_non_dict_document_is_refused(self, kind: str, body: object) -> None:
+        # The writer always emits a dict body; a forged non-dict decodes cleanly under the msgpack
+        # bound and now hits the _expect shape gate directly (the dead bytes-preamble that used to
+        # sit ahead of it is gone), so the "document is <type>" guard is reachable in production.
+        with pytest.raises(SerializationError, match="Forged columnar payload: document is"):
+            AutoSerializer().deserialize(_entry(kind, body))  # type: ignore[arg-type]
+
+
+def _numpy_raw(dtype: bytes, shape: bytes) -> bytes:
+    return b"NUMPY_RAW" + len(dtype).to_bytes(2, "little") + dtype + len(shape).to_bytes(2, "little") + shape
+
+
+class TestForgedNumpyMetadataIsRefused:
+    """NUMPY_RAW dtype/shape metadata is untrusted: slicing past the end silently shortens and a
+    partial 4-byte chunk used to parse as a dimension, so a forged 1-byte zero shape chunk built
+    an EMPTY array instead of raising (CodeRabbit on cachekit-py#276)."""
+
+    @pytest.mark.parametrize(
+        ("payload", "why"),
+        [
+            (_numpy_raw(b"<f8", b"\x00"), "1-byte shape chunk parsed as dimension 0 -> empty array"),
+            (_numpy_raw(b"<f8", b"\x01\x00\x00"), "3-byte shape chunk (not 4-aligned)"),
+            (
+                b"NUMPY_RAW" + (3).to_bytes(2, "little") + b"<f8" + (8).to_bytes(2, "little") + b"\x01\x00\x00\x00",
+                "shape shorter than its length prefix",
+            ),
+            (b"NUMPY_RAW" + (9).to_bytes(2, "little") + b"<f8", "dtype shorter than its length prefix"),
+        ],
+    )
+    def test_truncated_or_misaligned_metadata_is_a_serialization_error(self, payload: bytes, why: str) -> None:
+        pytest.importorskip("numpy")
+        with pytest.raises(SerializationError, match="truncated or misaligned"):
+            AutoSerializer(enable_integrity_checking=False).deserialize(payload)
+
+    def test_well_formed_numpy_still_round_trips(self) -> None:
+        np = pytest.importorskip("numpy")
+        arr = np.arange(6, dtype="<f8").reshape(2, 3)
+        s = AutoSerializer(enable_integrity_checking=False)
+        np.testing.assert_array_equal(s.deserialize(s.serialize(arr)[0]), arr)
+
+
+def _oversized_forged_error() -> SerializationError:
+    """The SerializationError raised by decoding a poisoned columnar entry that carries a 1 MiB
+    column name and a 4 KB forged dtype — the real error object the read-path log sites echo."""
+    big_name = "n" * (1024 * 1024)  # 1 MiB column name (already capped in the field echo, #276)
+    big_dtype = "z" * 4096  # 4 KB forged dtype — numpy echoes the whole string, uncapped (LAB-3131)
+    body = {
+        "columns": [big_name],
+        "index": None,
+        "data": {big_name: {"type": "numeric", "data": b"", "dtype": big_dtype}},
+    }
+    with pytest.raises(SerializationError) as excinfo:
+        AutoSerializer().deserialize(_entry("dataframe", body))
+    return excinfo.value
+
+
+@pytest.mark.unit
+class TestForgedEntryErrorEchoIsBounded:
+    """LAB-3131 AC1: a poisoned columnar entry of any size logs O(1)-bounded text at every wrap
+    site. #276 capped the per-field marker/column echoes, but ``_dtype_from_untrusted`` still
+    echoed the full forged dtype, so the SerializationError message — and every log line built
+    from it — grew with the payload. The bound is applied once, at each read-path wrap site, via
+    :func:`bounded_error`.
+    """
+
+    def test_bounded_error_clips_and_neutralizes_control_chars(self) -> None:
+        # Over-length text is clipped to O(1) with the true length preserved for forensics.
+        clipped = bounded_error(SerializationError("x" * (1024 * 1024)))
+        assert len(clipped) <= ERROR_ECHO_MAX + 64
+        assert "1048576 chars total" in clipped
+        # Every line/terminal-control char is escaped, so the result is one terminal-safe line —
+        # not just \n/\r (ANSI \x1b, vertical tab \x0b, Unicode line-sep U+2028 all handled).
+        raw = "a\nb\rc\x1bd\x0be" + chr(0x2028) + "f"  # newline, CR, ANSI ESC, VT, U+2028 line-sep
+        unsafe = bounded_error(SerializationError(raw))
+        assert not any(ch in unsafe for ch in "\n\r\x1b\x0b" + chr(0x2028))
+        assert "\\x1b" in unsafe
+
+    def test_forged_dtype_produces_an_unbounded_message(self) -> None:
+        # Guards the premise: without the bound the echoed text really is huge (the 4 KB dtype is
+        # in there in full), so the assertions below are proving the bound does real work.
+        assert len(str(_oversized_forged_error())) > 4096
+
+    def test_handle_decrypt_failure_warning_line_is_bounded(self, caplog) -> None:
+        # _handle_l2_read_error and the wrapper L1 SerializationError guard both route the poisoned
+        # error here; this is the WARNING line emitted on every poisoned read.
+        err = _oversized_forged_error()
+        with caplog.at_level(logging.WARNING):
+            handle_decrypt_failure(err, tier="l2", cache_key="ns:app:key", fail_closed=False)
+        lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
+        # Line = fixed template + one bounded_error() echo, so it is O(1) in ERROR_ECHO_MAX,
+        # independent of the (multi-MB) forged payload.
+        assert lines and all(len(line) < ERROR_ECHO_MAX + 256 for line in lines)
+
+    def test_end_to_end_l2_read_of_forged_entry_logs_bounded_line(self, caplog) -> None:
+        # The real read plumbing: get_cached_value -> _handle_l2_read_error -> handle_decrypt_failure.
+        # Catches a regression if a future edit logs the poisoned error ahead of the bounded site.
+        err = _oversized_forged_error()
+        serialization = mock.MagicMock(spec=CacheSerializationHandler)
+        serialization.deserialize_data.side_effect = err
+        serialization.encryption_fail_closed = False  # real bool: a MagicMock is truthy -> fail-closed
+        serialization.supports_mmap_read.return_value = False
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator())
+        backend = mock.MagicMock()
+        backend.get.return_value = b"poisoned-entry-bytes"
+        handler.set_cache_handler(backend)
+
+        with caplog.at_level(logging.WARNING):
+            assert handler.get_cached_value("ns:app:key") is None  # fail-open miss
+        lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
+        assert lines and all(len(line) < ERROR_ECHO_MAX + 256 for line in lines)

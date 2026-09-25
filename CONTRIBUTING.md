@@ -189,11 +189,18 @@ make test-cov
 
 **Important**: pytest-redis is required for all Redis-dependent tests. If tests fail with "pytest-redis is required", run `uv sync` to install dependencies.
 
+**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` unset, see [#225](https://github.com/cachekit-io/cachekit-py/issues/225)), `uv run pytest tests/docs/` and `make test-docs-quick`.
+
 ### Test Coverage
 
 - Aim for >85% coverage for new code
 - All public APIs must have tests
 - Edge cases and error conditions must be tested
+- CI enforces a **total-coverage floor** inside pytest on every PR
+  (`--cov-fail-under`, value in `.github/workflows/ci.yml`), independent of the
+  Codecov upload — a PR whose combined coverage falls below it fails the `Tests`
+  job. `make test-cov` enforces the same floor locally. Codecov still reports the
+  finer-grained new-code (patch) coverage on top of this.
 
 **Rust Test Coverage**:
 - ByteStorage module: 82% coverage (measured via LLVM source-based coverage)

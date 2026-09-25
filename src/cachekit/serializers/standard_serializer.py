@@ -27,7 +27,7 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -313,13 +313,18 @@ class StandardSerializer:
 
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
-            metadata: Optional metadata (ignored - MessagePack is self-describing)
+            metadata: Optional metadata. Only ``compressed`` is read: with integrity checking
+                off, an entry the writer enveloped (``compressed=True``) is rejected rather
+                than decoded as plain MessagePack (see Raises).
 
         Returns:
             Deserialized Python object
 
         Raises:
-            SerializationError: If data is malformed, not valid MessagePack, or integrity check fails
+            SerializationError: If data is malformed, not valid MessagePack, or integrity check
+                fails; also, with integrity checking off, if ``metadata.compressed`` says the
+                writer enveloped the entry — this reader has no ByteStorage to verify or unwrap
+                it, and unpackb on the envelope bytes would return its fields as the value.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -335,18 +340,19 @@ class StandardSerializer:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
             else:
-                # No ByteStorage - data is pure MessagePack
+                # No ByteStorage — an enveloped entry cannot be verified or unwrapped here (see Raises).
+                if metadata is not None and metadata.compressed:
+                    raise SerializationError(
+                        "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
+                    )
                 msgpack_data = data
 
             # Deserialize MessagePack
-            return msgpack.unpackb(msgpack_data, **self._msgpack_unpack_opts)
+            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
-        except (msgpack.exceptions.UnpackException, ValueError, TypeError, BufferError) as e:
-            # BufferError: a non-u8 buffer exporter (e.g. numpy float array) rejected at the
-            # PyO3 boundary. Pre-LAB-770 bytes() coerced these to raw bytes and envelope
-            # validation rejected the garbage as ValueError; same contract, new cause.
+        except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
 

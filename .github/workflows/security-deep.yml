@@ -13,28 +13,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Deep security analysis (< 2 hours) - nightly scheduled
+  # Deep security analysis - nightly scheduled
   kani-verification:
     name: Kani Formal Verification
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Pin rustup/cargo to /tmp (single fs) to avoid EXDEV on toolchain staging,
-      # and so the kani-verifier binary lands in a known, PATH-able location. The
-      # runner's default CARGO_HOME/bin is not on PATH, so cargo-kani exited 127.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-    - name: Put cargo bin on PATH
-      run: echo "/tmp/cargo/bin" >> "$GITHUB_PATH"
-
-    - name: Ensure stable toolchain
-      run: |
-        # Runner image ships stable; only install if missing.
-        # Full `toolchain install` can hit EXDEV in containers (rust-lang/rustup#1239).
-        rustup toolchain list | grep -q stable || rustup toolchain install stable
 
     - name: Install Kani
       run: |
@@ -48,17 +33,15 @@ jobs:
 
   fuzzing:
     name: Extended Fuzzing (3 targets × 1h)
-    runs-on: cachekit
-    # Budget: ~2 min rustup + ~10 min cargo-fuzz install (CARGO_HOME=/tmp/cargo,
-    # no cross-run cache) + ~10 min ASAN builds + 3 x 60 min fuzz time
-    # (-max_total_time is pure fuzz time, excluding builds) + slack.
+    runs-on: ubuntu-latest
+    # Budget: ~2 min rustup + ~10 min cargo-fuzz install + ~10 min ASAN builds
+    # + 3 x 60 min fuzz time (-max_total_time is pure fuzz time, excluding
+    # builds) + slack. Must stay under the 360 min GitHub-hosted hard cap.
+    # No rust-cache here on purpose: a nightly job's 10 min install is noise
+    # against 180 min of fuzz time, and it would be one more cache competing
+    # for the repo's 10 GB budget (fuzz-smoke.yml caches the same toolchain
+    # where PR latency matters).
     timeout-minutes: 240
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
-      # toolchain across overlay/hostPath boundaries on the ARC runner pod
-      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -72,7 +55,7 @@ jobs:
 
     - name: Install cargo-fuzz
       # Version-pinned: a floating `cargo install` hands a hijacked cargo-fuzz
-      # release immediate code exec on the self-hosted runner. Same pattern as
+      # release immediate code exec on the CI runner. Same pattern as
       # kani-verifier above and fuzz-smoke.yml.
       run: cargo install --locked cargo-fuzz --version 0.13.2
 
@@ -133,56 +116,86 @@ jobs:
 
   atheris-fuzzing:
     name: Atheris Python-Rust Fuzzing
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+    # No uv or Rust cache on this nightly job: the cold `uv sync` (maturin
+    # build included) is noise against 30 min of fuzz time, and an unsuffixed
+    # uv cache would just restore the cp312 wheel set the PR jobs save.
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        enable-cache: false
+
     # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
-    # interpreter uv builds atheris from sdist, which needs clang + libFuzzer
-    # (find_libfuzzer.sh) — absent on the self-hosted runner, so install fails
-    # before any fuzzing runs. Both uv sync and uv run must pin, or uv run
-    # re-resolves to a different interpreter and re-triggers the source build.
+    # interpreter uv builds atheris from sdist, which needs clang plus a
+    # matching libFuzzer archive (find_libfuzzer.sh) that runner images do not
+    # reliably ship, so install fails before any fuzzing runs. Both uv sync and
+    # uv run must pin, or uv run re-resolves to a different interpreter and
+    # re-triggers the source build.
     - name: Install dependencies
       run: |
         uv sync --group dev --group fuzz --python 3.11
 
+    # Exit-code contract — no `|| true`, every non-zero exit fails the job.
+    # (scripts/fuzz-python.sh carries the same contract for local runs; keep
+    # the budgets and flags in the two files in sync.)
+    #   - Pass is libFuzzer exiting 0 when -max_total_time=600 expires cleanly.
+    #   - A crash, OOM, or uncaught Python exception exits non-zero and fails
+    #     the job. atheris.Setup(sys.argv, ...) forwards flags to libFuzzer, so
+    #     -artifact_prefix drops the reproducer in tests/fuzzing/artifacts/.
+    #     No corpus dir is passed, so that directory only ever holds crash
+    #     artifacts — a file there is always a finding, never corpus growth.
+    #   - A hung input is caught by libFuzzer's own per-input watchdog
+    #     (-timeout=60), which writes a timeout-* reproducer and exits
+    #     non-zero. `timeout -k 30s 15m` is the backstop for hangs in native
+    #     code where that watchdog can't fire: exit 124 is a deliberate
+    #     FAILURE, not budget exhaustion — the fuzz budget is 600 s and budget
+    #     exhaustion exits 0 above, so a target still alive at 15 min is hung
+    #     (and libFuzzer traps SIGTERM, hence the -k hard kill).
+    #   - Zero matched targets fails the job: a glob that stops matching must
+    #     not "pass" having fuzzed nothing.
     - name: Run Atheris fuzz targets (10 min each)
       run: |
-        for fuzz_target in tests/fuzzing/fuzz_*.py; do
-          if [ -f "$fuzz_target" ]; then
-            echo "Fuzzing $fuzz_target..."
-            timeout 10m uv run --python 3.11 python "$fuzz_target" -max_total_time=600 || true
-          fi
-        done
-
-    - name: Upload crash corpus
-      if: always()
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-      with:
-        name: atheris-crashes-${{ github.run_id }}
-        path: tests/fuzzing/corpus/
-
-    - name: Report fuzzing results
-      if: always()
-      run: |
-        if [ -d tests/fuzzing/corpus/ ] && find tests/fuzzing/corpus/ -mindepth 1 ! -name '.gitignore' -print -quit | grep -q .; then
-          echo "⚠️  Crashes discovered during Atheris fuzzing!"
-          ls -lh tests/fuzzing/corpus/
+        mkdir -p tests/fuzzing/artifacts
+        shopt -s nullglob
+        targets=(tests/fuzzing/fuzz_*.py)
+        if [ "${#targets[@]}" -eq 0 ]; then
+          echo "::error::no Atheris targets matched tests/fuzzing/fuzz_*.py — refusing to pass having fuzzed nothing"
           exit 1
         fi
-        echo "✅ No crashes discovered during Atheris fuzzing"
+        for fuzz_target in "${targets[@]}"; do
+          echo "Fuzzing $fuzz_target..."
+          timeout -k 30s 15m uv run --python 3.11 python "$fuzz_target" \
+            -max_total_time=600 -timeout=60 -artifact_prefix=tests/fuzzing/artifacts/
+        done
+
+    # No "Report fuzzing results" step: now that `|| true` is gone, a crash
+    # fails its own fuzz step, so a trailing check could only ever run in the
+    # no-crash case and print ✅ — a named green step incapable of failing,
+    # the manufactured-evidence pattern the Extended Fuzzing job above already
+    # removed. (The old gate also inspected tests/fuzzing/corpus/, a directory
+    # nothing ever wrote to.) The fuzz steps' exit codes are the signal; this
+    # upload preserves the reproducer, which would otherwise die with the
+    # ephemeral runner.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: atheris-crash-artifacts
+        path: tests/fuzzing/artifacts/
+        # Public repo: a crash reproducer is a ready-made PoC for anyone while
+        # it is retrievable. 7 days covers triage of a nightly red without
+        # leaving a month-long public exploit window.
+        retention-days: 7
+        if-no-files-found: warn
 
   miri-full:
     name: Miri Full Suite
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages a nightly
-      # toolchain across overlay/hostPath boundaries on the ARC runner pod
-      # (rust-lang/rustup#1239). Same pattern as fuzz-smoke.yml.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -198,14 +211,8 @@ jobs:
 
   sanitizers:
     name: Sanitizers (ASan, TSan, MSan)
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      # Avoid EXDEV "cross-device link" errors when rustup stages the nightly
-      # toolchain / rust-src across overlay/hostPath boundaries on the ARC runner
-      # pod (rust-lang/rustup#1239). Same pattern as fuzzing / miri-full jobs.
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
     strategy:
       fail-fast: false
       matrix:
@@ -252,7 +259,7 @@ jobs:
 
   generate-security-report:
     name: Generate Security Report
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
     steps:

@@ -8,6 +8,10 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+import msgpack
+
+from cachekit._rust_serializer import check_msgpack_structure
+
 
 @runtime_checkable
 class SerializerProtocol(Protocol):
@@ -320,3 +324,118 @@ class SuspiciousCacheEntryError(SerializationError):
     """
 
     pass
+
+
+# ---------------------------------------------------------------------------
+# Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
+# ---------------------------------------------------------------------------
+
+#: cachekit's own nesting ceiling, enforced by the Rust ``check_msgpack_structure``
+#: walk before msgpack-python ever sees the document. Two constraints pin it: the
+#: protocol requires every SDK's bound to sit in 32..=1024, and it must not exceed
+#: msgpack-python's C unpacker stack (a document at the ceiling has to decode after
+#: passing the walk; tests/unit/protocol/test_decode_bounds.py checks exactly that).
+MSGPACK_MAX_NESTING = 1024
+
+#: Everything a corrupted or forged payload can make a decode raise, for serializers
+#: to turn into ``SerializationError``. msgpack's own errors are ``ValueError``
+#: subclasses; the AutoSerializer object hook and the NumPy/DataFrame/Series
+#: reconstructors add ``TypeError`` (``np.frombuffer`` on a forged dtype string),
+#: ``OverflowError`` (a forged dict dtype whose itemsize is past C long), ``SyntaxError``
+#: (numpy's comma-string dtype parser runs ``ast.literal_eval`` on a forged shape prefix
+#: such as ``"(1,f8"``), ``KeyError`` / ``AttributeError`` (indexing a dict that is not
+#: the shape they wrote); ``BufferError`` is a non-u8 buffer exporter rejected at the
+#: PyO3 boundary (LAB-770). Anything else — above all ``RuntimeError`` for a missing
+#: optional dependency — is an environment fault, not a bad cache entry, and must bubble.
+PAYLOAD_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError, BufferError, SyntaxError)
+
+#: Character cap for any untrusted-payload-derived error text that a read path logs or folds into
+#: an outer message. A forged/corrupt cache entry controls the exception text — numpy echoes a
+#: whole forged dtype string, an inner ``{e}`` wrap carries it up — so it is unbounded. Measured
+#: on the pre-#276 code, an 8.3 KB envelope carrying a 1 MiB column name produced a 4.19 MB log
+#: line (505x); post-#276 the marker/column echoes are capped but ``_dtype_from_untrusted`` still
+#: echoes the full dtype (a 1 MiB forged dtype still floods). ``repr`` escapes newlines but the
+#: read paths log ``str(e)``, so :func:`bounded_error` also collapses them — one poisoned read is
+#: always exactly one bounded log line (LAB-3131).
+ERROR_ECHO_MAX = 512
+
+#: Every char that could split a log record into extra lines or spoof a terminal, escaped so an
+#: attacker-controlled error message is always ONE terminal-safe line: all C0 controls (incl.
+#: ``\n``/``\r``/``\x0b``/``\x0c``), DEL, the C1 range (incl. NEL ``\x85``), and the Unicode
+#: line/paragraph separators ``U+2028``/``U+2029``. Applied by :func:`bounded_error` after the
+#: length clip, so the escape expansion works on a bounded string, never the raw payload.
+_LOG_UNSAFE_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7F, *range(0x80, 0xA0))}
+_LOG_UNSAFE_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+def bounded_error(exc: BaseException) -> str:
+    """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
+    logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
+
+    Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
+    wraps in ``cache_handler``) rather than per field: the bound then holds for
+    every attacker-inflatable field — marker, column name, dtype — including ones a future field
+    would add. Over-length text is truncated with the true length appended so the message still
+    says "this was huge", then every line/terminal-control char is escaped
+    (:data:`_LOG_UNSAFE_ESCAPES`) so one poisoned read is always exactly one line with no injected
+    ANSI or newlines. Clipping before escaping keeps output O(1) (escape expansion applies to at
+    most ``ERROR_ECHO_MAX`` chars). Log sinks do not use this: they render exceptions via
+    ``cachekit.hash_utils.redact_error_for_log``, which echoes no exception text at all.
+    """
+    text = str(exc)
+    if len(text) > ERROR_ECHO_MAX:
+        text = f"{text[:ERROR_ECHO_MAX]}… [truncated, {len(text)} chars total]"
+    return text.translate(_LOG_UNSAFE_ESCAPES)
+
+
+def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
+    """Decode one untrusted MessagePack document under cachekit-owned bounds.
+
+    Why not plain ``msgpack.unpackb``: a collection header costs 1-5 bytes but may
+    declare up to 2**32-1 elements, and the C unpacker pre-allocates the container
+    (``PyList_New(n)``) *before* decoding the children. Nested headers stack those
+    allocations depth-first, so the library's per-collection default cap
+    (``max_*_len = len(data)``) still permits ~8 x 1024 x len(data) bytes of
+    transient heap — measured 10 KB -> 67 MB.
+
+    The bound is the Rust extension's zero-copy, header-only walk
+    (``check_msgpack_structure``, documented there) run before the decode. It
+    rejects a document that nests deeper than :data:`MSGPACK_MAX_NESTING` or whose
+    open headers declare more elements or bytes than the remaining input can back.
+    Every element that survives is backed by >= 1 input byte, so the real decode's
+    total container pre-allocation is bounded by len(data) rather than by
+    depth x declared length. The explicit ``max_*_len=len(data)`` caps on
+    ``unpackb`` are unreachable once the walk passes; they are defence in depth
+    against a walk regression, not an independent bound.
+
+    Every rejection is a ``ValueError`` (``FormatError``, ``ExtraData``, or the
+    walk's own ``ValueError`` naming the violated bound), which the read paths
+    already turn into a controlled cache miss. Trailing bytes are still rejected
+    by ``unpackb`` itself.
+
+    Examples:
+        >>> unpackb_bounded(msgpack.packb({"a": [1, 2]}), raw=False)
+        {'a': [1, 2]}
+        >>> unpackb_bounded(b"\\xdc\\x07\\xd0" * 5000)  # 15 KB nested-header bomb
+        Traceback (most recent call last):
+        ...
+        ValueError: Unpack failed: MessagePack document declares more elements than the input can back
+        >>> unpackb_bounded(b"\\x91" * 1025 + b"\\xc0")  # one level past the ceiling
+        Traceback (most recent call last):
+        ...
+        ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
+    """
+    if isinstance(data, memoryview):
+        # The walk (PyBuffer<u8>) and the decode must see one flat byte string: cast("B") flattens a
+        # multi-dimensional view and retypes any C-contiguous format ("b"/"c"/"H"...) to unsigned bytes
+        # without copying, so len(data) is the byte count the max_*_len caps need; a non-contiguous
+        # view has no flat form and is copied.
+        data = data.cast("B") if data.c_contiguous else bytes(data)
+    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
+        # A mutable exporter (bytearray, a memoryview over one) could change between the walk and
+        # the decode, so both must see one immutable document. bytes and a memoryview of bytes stay
+        # zero-copy — the same containment proof the Rust side's bytes_view uses.
+        data = bytes(data)
+    n = len(data)
+    check_msgpack_structure(data, MSGPACK_MAX_NESTING)
+    return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)

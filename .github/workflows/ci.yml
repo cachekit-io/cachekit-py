@@ -25,10 +25,19 @@ jobs:
   # Lint, format, type check (runs on all events)
   quick-check:
     name: Format & Lint
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # `uv sync` builds the Rust extension via maturin into ./target, and clippy
+    # below compiles the same workspace — cache the dependency artifacts and the
+    # cargo registry across runs.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies
       run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
@@ -76,12 +85,12 @@ jobs:
       if: success() || failure()
       run: cd rust && cargo clippy --locked -- -D warnings
 
-  # PR: single Python version, critical tests only
+  # PR: 3.12 only, unit + critical + executable docs
   # Push: full matrix, full test suite
   test:
     name: Tests (Python ${{ matrix.python-version }})
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write  # Required for Codecov OIDC
@@ -99,6 +108,19 @@ jobs:
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
+
+    # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
+    # leg — with one shared key the first leg to save wins and every other leg
+    # restores foreign pyo3 artifacts and rebuilds anyway (cargo fingerprints
+    # catch the mismatch), so the cache would thrash instead of hit.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: py${{ matrix.python-version }}
+
     - name: Install dependencies
       run: uv sync --python ${{ matrix.python-version }} --group dev
 
@@ -114,11 +136,18 @@ jobs:
           --cov-report=term \
           --junitxml=junit-unit.xml \
           -o junit_family=legacy
+        # --cov-fail-under evaluates the *combined* unit+critical total (the
+        # --cov-append accumulation), so it gates this final invocation only, and
+        # reddens the job in pytest independent of the Codecov upload (rationale:
+        # residual-risk note below). 82 = lowest same-repo PR cumulative TOTAL
+        # across the PR matrix minus codecov.yml's declared 2% tolerance, floored;
+        # keep it in step with the Makefile test-cov floor.
         uv run pytest tests/critical/ -m "not slow" \
           --cov=src/cachekit \
           --cov-append \
           --cov-report=xml \
           --cov-report=term \
+          --cov-fail-under=82 \
           --junitxml=junit.xml \
           -o junit_family=legacy
 
@@ -143,36 +172,118 @@ jobs:
           --junitxml=junit.xml \
           -o junit_family=legacy
 
+    # Executable docs are tests: docstring examples, tests/docs/ and the docs/
+    # markdown blocks. None of them sit under tests/unit or tests/critical, so
+    # the runs above never collect them.
+    #
+    # No REDIS_URL here on purpose: the RedisBackendConfig docstring example
+    # fails `extra_forbidden` when it is exported (#225).
+    - name: Run docstring examples
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      run: uv run pytest --doctest-modules src/cachekit --ignore=src/cachekit/_rust_serializer.py
+
+    - name: Run tests/docs suite
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      env:
+        REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
+      run: uv run pytest tests/docs/
+
+    - name: Run markdown documentation examples
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
+      run: uv run pytest --markdown-docs docs/
+
     # Deterministic memory invariants (RSS/allocation bounds), not wall-clock benchmarks. These
     # are `performance and slow` — the mmap zero-copy read (#171) and the large-object allocation
     # caps (#152). Flaky timing/throughput benchmarks are `performance` WITHOUT `slow` and stay out
     # of CI. Version-independent, so run once on 3.12 (~5s) rather than across the push matrix.
     - name: Run memory-invariant tests
-      if: matrix.python-version == '3.12'
+      if: ${{ !cancelled() && matrix.python-version == '3.12' }}
       env:
         REDIS_URL: redis://localhost:6379  # autouse redis-isolation fixture uses external Redis when set (else spawns a binary the runner lacks)
       run: uv run pytest tests/performance/ -m "performance and slow" -q
 
+    # The two uploads below are deliberately treated differently, not defaulted.
+    # coverage.xml is the ONLY input to the
+    # project/patch statuses codecov.yml declares, and every flag there sets
+    # `carryforward: true` — so a silently-dropped upload does not remove the
+    # status, it answers "is this PR's new code 80% covered?" with a previous
+    # run's numbers.
+    #
+    # Scoped to same-repo events rather than a bare `true`, because of what the
+    # action actually does on a fork (read at the pinned SHA, not assumed): its
+    # `Get OIDC token` step is guarded `CC_USE_OIDC == 'true' && CC_FORK != 'true'`,
+    # so on a fork it never attempts OIDC, `CC_TOKEN` stays empty, and the upload
+    # proceeds TOKENLESS — Codecov's rate-limited path. A bare `true` would let a
+    # 429 nobody controls redden an outside contribution, and `CI Success` is a
+    # required check on `main`, so that 429 would block the merge. The flag
+    # therefore applies exactly where OIDC really authenticates.
+    #
+    # RESIDUAL, now narrowed to the PATCH status: the TOTAL-coverage floor no
+    # longer depends on the upload — the final PR pytest run enforces it with
+    # `--cov-fail-under` (above), so a dropped or degraded upload can no longer
+    # answer the total-coverage question with an earlier commit's carryforward;
+    # the job reddens inside pytest first, on same-repo and fork PRs alike. What
+    # Codecov still solely owns is the new-code PATCH status: it is diff-level,
+    # stays `carryforward: true`, and is not enforced locally, so on a fork PR
+    # whose tokenless upload is silently dropped it can still answer "is this
+    # PR's new code 80% covered?" with a previous run's numbers. Accepted: that
+    # status is a reporting signal, not a merge floor, and the local total floor
+    # already catches a gross coverage regression on the same run.
+    # The wrapper's CLI signature check is likewise
+    # unenforced there (fail_ci_if_error is its switch; see the pin note below).
+    # Accepted because a fork PR runs under `pull_request` on an ephemeral
+    # GitHub-hosted runner with no secrets and no OIDC token. The one credential
+    # an unverified binary there can reach is the job's GITHUB_TOKEN, read-only
+    # on fork PRs and expired when the job ends, and the runner is discarded
+    # afterwards, so nothing persists. Fork runs also need maintainer approval,
+    # and same-repo runs, which verify the binary and fail closed, far outnumber
+    # them.
+    #
+    # Do not re-pin below v7.0.0 (fb8b3582): releases published before Codecov's
+    # June 2026 keybase migration fetch the CLI signing key from a deleted account,
+    # so `gpg --verify` can never pass. The wrapper stops there only when
+    # fail_ci_if_error is true; otherwise it prints "CLI integrity verified" and runs
+    # the unverified binary. Accepted flip side: a keybase.io outage now fails
+    # same-repo CI closed, not open.
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
         files: ./coverage.xml
         use_oidc: true
-        fail_ci_if_error: false
+        fail_ci_if_error: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
 
+    # fail_ci_if_error is true here too, for a different reason: it is also the
+    # wrapper's signature-enforcement switch (see the pin note above), so false
+    # would let an unverified binary run. The "don't redden CI" intent lives in
+    # continue-on-error instead: junit.xml feeds Codecov Test Analytics (flaky-test
+    # history) only and nothing gates on it, so a Codecov-side outage marks this
+    # step failed-and-continued and the job stays green.
+    # That downgrade is visibility only: the wrapper exits before it chmods or runs
+    # the binary, so a bad signature here still runs no downloaded code. Nor does it hide
+    # an integrity failure on same-repo events: the coverage step above verifies the
+    # same CLI, key and checksum hard-fail first, so a signature that cannot pass
+    # reddens the job there before this step runs.
+    #
+    # `handle_no_reports_found` is left at its default (false) on both uploads on
+    # purpose: it would also swallow "the report was never written", which is the
+    # silent degradation these settings exist to prevent. On coverage.xml a green job
+    # that uploaded nothing is a trust bug; on junit.xml continue-on-error already
+    # accepts a green job, and false there keeps the failed step visible as an
+    # annotation instead of hiding it.
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5
+      continue-on-error: true
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
         files: ./junit.xml
         report_type: test_results
         use_oidc: true
         flags: ${{ github.event_name == 'push' && 'full' || 'critical' }}-python-${{ matrix.python-version }}
-        fail_ci_if_error: false
+        fail_ci_if_error: true
 
-  # LAB-511: free-threaded CPython safety net. Runs the core suites on a
+  # Free-threaded CPython safety net. Runs the core suites on a
   # 3.14 free-threaded build and fails if the GIL gets re-enabled, so code
   # whose correctness silently depended on the GIL's memory ordering cannot
   # regress unnoticed. Optional native deps without free-threaded wheels
@@ -182,8 +293,8 @@ jobs:
   # transparently falls back to its pure-Python parser.
   test-freethreaded:
     name: Tests (Python 3.14t, GIL disabled)
-    runs-on: cachekit
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -192,6 +303,13 @@ jobs:
         docker run -d --name redis -p 6379:6379 \
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: py3.14t
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Install dependencies (test group only)
       run: uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
@@ -215,14 +333,21 @@ jobs:
         uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
         uv run --no-sync pytest tests/critical/ -m "not slow"
 
-  # Version sync + doc tests (push to main only)
+  # Version sync + dependency CVE scan (push to main only)
   post-merge:
     name: Post-Merge Checks
     if: github.event_name == 'push'
-    runs-on: cachekit
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+
+    # `uv sync` below builds the Rust extension via maturin — cache its dependencies.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
     - name: Check Python ↔ Rust version consistency
       run: |
@@ -239,27 +364,113 @@ jobs:
     - name: Scan Python dependencies for CVEs
       run: |
         # No suppressions: every prior CVE is resolved at source on the py3.10+
-        # resolution. urllib3>=2.7.0 and pip>=26.1.2 are pinned via
+        # resolution. urllib3>=2.7.0 and pip>=26.2 are pinned via
         # [tool.uv] constraint-dependencies; pygments/pyarrow advisories cleared
         # by their py3.10+ fix versions. Keep this list IDENTICAL to
         # security-fast.yml's pip-audit so the two cannot drift.
         uv run pip-audit --desc
 
-    - name: Run markdown documentation tests
-      run: make test-docs-examples
+  # This repo is public and forkable, so every job runs on
+  # GitHub-hosted runners, never on self-hosted ones. Allow-list, not
+  # deny-list: a deny-list fails open on a new label, a casing variant,
+  # `${{ vars.X }}` indirection or the mapping form `runs-on: {group:, labels:}`.
+  # The program is the heredoc below; its regression fixtures are
+  # .github/scripts/runner-drift-guard-selftest.sh, run first so a broken
+  # guard cannot pass anything. This is drift protection for maintainers, NOT
+  # a fork-PR control; that lives in repository and org runner settings.
+  runner-drift-guard:
+    name: Runner Drift Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    # The program stays in this workflow file on purpose: GITHUB_TOKEN cannot
+    # write .github/workflows/, so a `contents: write` job (release-please) or
+    # a compromised action could rewrite a script under .github/scripts/ but
+    # not this heredoc. It is written to a temp file so the self-test and the
+    # scan run the same bytes.
+    - name: Write the guard program
+      run: |
+        cat > "$RUNNER_TEMP/runner-drift-guard.awk" <<'AWK'
+          # Allow-list, fail closed: every runs-on value, and every os value
+          # inside a matrix block, must be one of the exact hosted labels in
+          # HOSTED or the matrix.os expression. This is a line scanner, not a
+          # YAML parser: a line that could hide a runner label from it is an
+          # error, never a skip. Exact labels, not a hosted-prefix pattern (a
+          # prefix admits any self-hosted label named ubuntu-<anything>) and not
+          # a copy of GitHub's image table (it rots): adopting another hosted
+          # image is a deliberate edit to HOSTED.
+          BEGIN { HOSTED = "^(ubuntu|macos|windows)-latest$" }
+          FNR == 1 { matrix_indent = -1 }
+          { sub(/#.*/, ""); $0 = tolower($0) }
+          /^[[:space:]]*$/ { next }
+          # Track the matrix block by indentation: a bare os: is validated only
+          # there, because the same key names a workflow_dispatch input or an
+          # action with: parameter, which select no runner. The tracker arms
+          # only on a bare `matrix:` line — anything else on that line (an
+          # expression, anchor, alias, tag or flow map) leaves the block unread,
+          # so the rule below rejects the line instead of guessing what is on it.
+          {
+            match($0, /^[[:space:]]*(-[[:space:]]*)?/)
+            indent = RLENGTH
+            if (matrix_indent >= 0 && indent <= matrix_indent) matrix_indent = -1
+          }
+          /^[[:space:]]*(-[[:space:]]*)?["']?matrix["']?[[:space:]]*:[[:space:]]*$/ { matrix_indent = indent }
+          # Lines that may hide a runner label: a flow mapping carrying a
+          # runner/strategy/matrix key; strategy: or matrix: with any inline
+          # value, include: with one inside a matrix; a YAML merge key or a bare
+          # alias item; a job calling a reusable workflow in another repo (its
+          # runs-on is outside this scan; ./.github/workflows/ callees are
+          # scanned). Accepted false positives, all fail-closed: an env/with key
+          # named matrix or strategy with an inline value; a flow map with an
+          # os key.
+          /[{,][[:space:]]*["']?(runs-on|os|strategy|matrix|include)["']?[[:space:]]*:/ ||
+          /^[[:space:]]*(-[[:space:]]*)?["']?(strategy|matrix)["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?include["']?[[:space:]]*:[[:space:]]*[^[:space:]]/ && matrix_indent >= 0) ||
+          /^[[:space:]]*(-[[:space:]]*)?(<<[[:space:]]*:|\*[^*[:space:]])/ ||
+          (/^[[:space:]]*uses[[:space:]]*:/ && /\/\.github\/workflows\// && !/uses[[:space:]]*:[[:space:]]*["']?\.\//) {
+            printf "::error file=%s,line=%d::line may hide a runner label from the drift guard — write `runs-on: <label>` / `os: [<labels>]` inline; keep `strategy:`, `matrix:`, `include:` as bare keys over a static block (no expressions, anchors, aliases or flow maps); call reusable workflows only from ./.github/workflows/\n", FILENAME, FNR
+            bad = 1
+          }
+          /^[[:space:]]*(-[[:space:]]*)?["']?runs-on["']?[[:space:]]*:/ ||
+          (/^[[:space:]]*(-[[:space:]]*)?["']?os["']?[[:space:]]*:/ && matrix_indent >= 0) {
+            v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+            if (v ~ /^["']?\$\{\{[[:space:]]*matrix\.os[[:space:]]*\}\}["']?$/) next
+            if (v ~ /^\[/ && v !~ /\]$/) v = ""
+            gsub(/[][ "']/, "", v)
+            n = split(v, items, ",")
+            ok = (v != "")
+            for (i = 1; i <= n; i++) if (items[i] !~ HOSTED) ok = 0
+            if (!ok) {
+              printf "::error file=%s,line=%d::runner value \"%s\" is not an allow-listed GitHub-hosted label — this public repo runs only on GitHub-hosted runners; adopting a new hosted image means extending HOSTED in the runner-drift-guard job of ci.yml\n", FILENAME, FNR, (v == "" ? "<value not inline on this line>" : v)
+              bad = 1
+            }
+          }
+          END { exit bad }
+        AWK
+
+    - name: Guard self-test (regression fixtures)
+      run: bash .github/scripts/runner-drift-guard-selftest.sh "$RUNNER_TEMP/runner-drift-guard.awk"
+
+    # One awk pass, no shell pipeline: a program error exits non-zero and fails
+    # the step (fail closed) instead of reading as "no match".
+    - name: Every runs-on / matrix os value is an allow-listed GitHub-hosted label
+      run: awk -f "$RUNNER_TEMP/runner-drift-guard.awk" .github/workflows/*.y*ml
 
   # Summary job (required for branch protection)
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [quick-check, test, test-freethreaded]
+    needs: [quick-check, test, test-freethreaded, runner-drift-guard]
     if: always()
     steps:
     - name: Check all jobs succeeded
       run: |
         if [[ "${{ needs.quick-check.result }}" != "success" ]] || \
            [[ "${{ needs.test.result }}" != "success" ]] || \
-           [[ "${{ needs.test-freethreaded.result }}" != "success" ]]; then
+           [[ "${{ needs.test-freethreaded.result }}" != "success" ]] || \
+           [[ "${{ needs.runner-drift-guard.result }}" != "success" ]]; then
           echo "One or more jobs failed"
           exit 1
         fi

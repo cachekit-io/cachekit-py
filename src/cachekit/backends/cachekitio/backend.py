@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
 import httpx
+from pydantic import ValidationError
 
-from cachekit.backends.cachekitio.client import get_cached_async_http_client, get_sync_http_client
+from cachekit.backends.cachekitio.client import get_cached_async_http_client, lease_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.config.validation import ConfigurationError
 from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.hash_utils import redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
@@ -50,6 +53,10 @@ LEGACY_TTL_HEADER = "X-TTL"
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
+
+_API_KEY_HINT = (
+    "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
+)
 
 
 def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
@@ -159,7 +166,7 @@ def _inject_metrics_headers(stats: _FunctionStats | None) -> dict[str, str]:
     except Exception as e:
         # Session header generation failed - continue without session headers
         # This ensures backend requests never fail due to session tracking issues
-        _logger.debug(f"Session header generation failed: {e}")
+        _logger.debug(f"Session header generation failed: {redact_error_for_log(e)}")
         session_headers = {}
 
     # Build metrics headers
@@ -202,29 +209,38 @@ class CachekitIOBackend:
         """Initialize cachekit.io backend.
 
         Args:
-            api_url: Override API endpoint URL
-            api_key: Override API key (ck_live_...)
-            timeout: Override request timeout
+            api_url: API endpoint URL. Default: ``CACHEKIT_API_URL``, then ``https://api.cachekit.io``.
+            api_key: API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
+            timeout: Request timeout in seconds. Default: ``CACHEKIT_TIMEOUT``, then 5.0.
 
-        If all are None, loads from environment via pydantic-settings.
+        Each argument left as None is loaded from the environment via pydantic-settings,
+        so ``CachekitIOBackend(api_key=...)`` alone is valid — an explicit argument wins,
+        everything else still comes from the environment.
+
+        Raises:
+            ConfigurationError: missing, empty or whitespace-containing API key, or an API URL that fails
+                validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
-        if all(x is None for x in [api_url, api_key, timeout]):
-            # Load from environment
-            self._config = CachekitIOBackendConfig.from_env()  # type: ignore[call-arg]
-        else:
-            # Use provided values
-            if api_url is None or api_key is None:
-                raise ValueError("Both api_url and api_key required if using manual config")
-            self._config = CachekitIOBackendConfig(
-                api_url=api_url,
-                api_key=api_key,  # type: ignore[arg-type]
-                timeout=timeout or 5.0,
-            )
+        overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
+        errors = None
+        try:
+            self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
+        except ValidationError as exc:
+            errors = exc.errors(include_input=False)
+        # Raised OUTSIDE the except block (CWE-532): the ValidationError's own .errors() keep the
+        # raw api_key, and `raise ... from None` only hides it — it would still hang off __context__.
+        if errors is not None:
+            problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
+            key_absent = any(err["loc"] == ("api_key",) and err["type"] in ("missing", "too_short") for err in errors)
+            hint = _API_KEY_HINT if key_absent else ""
+            raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
         # Get HTTP clients (hybrid sync/async architecture)
-        # Sync client: per-thread, thread-safe, no event loop required
+        # Sync client: per-thread, thread-safe, no event loop required. _sync_lease is never read:
+        # it is held only to keep the client open, and dropping it closes the client.
         # Async client: per-thread, event loop safe
-        self._sync_client = get_sync_http_client(self._config)
+        self._sync_lease = lease_sync_http_client(self._config)
+        self._sync_client = self._sync_lease.client
         self._async_client = get_cached_async_http_client(self._config)
 
     @staticmethod

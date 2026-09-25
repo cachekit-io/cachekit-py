@@ -13,7 +13,9 @@ import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
+from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.config.validation import ConfigurationError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,8 +56,8 @@ def mock_sync_client() -> Any:
     """Yield a mock httpx.Client and patch both client factories during backend init."""
     client = MagicMock(spec=httpx.Client)
     with patch(
-        "cachekit.backends.cachekitio.backend.get_sync_http_client",
-        return_value=client,
+        "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+        return_value=MagicMock(client=client),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
@@ -98,20 +100,109 @@ class TestInit:
         b = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
         assert b._config.timeout == 5.0
 
-    def test_partial_config_raises_value_error_no_key(self, mock_sync_client: MagicMock) -> None:
-        """api_url without api_key raises ValueError."""
-        with pytest.raises(ValueError, match="Both api_url and api_key required"):
+    def test_api_key_alone_fills_url_and_timeout_from_defaults(
+        self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """api_key without api_url is valid: the URL and timeout come from env / defaults."""
+        monkeypatch.delenv("CACHEKIT_API_URL", raising=False)
+        monkeypatch.delenv("CACHEKIT_TIMEOUT", raising=False)
+        b = CachekitIOBackend(api_key=_TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+        assert b._config.api_url == _TEST_API_URL
+        assert b._config.timeout == 5.0
+
+    def test_api_key_argument_beats_env(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicit api_key wins over CACHEKIT_API_KEY."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env_key")  # pragma: allowlist secret
+        b = CachekitIOBackend(api_key=_TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+
+    def test_no_key_anywhere_raises_at_construction(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neither api_key nor CACHEKIT_API_KEY: ConfigurationError here, not a 401 on the first call."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="api_key"):
             CachekitIOBackend(api_url=_TEST_API_URL)
 
-    def test_partial_config_raises_value_error_no_url(self, mock_sync_client: MagicMock) -> None:
-        """api_key without api_url raises ValueError."""
-        with pytest.raises(ValueError, match="Both api_url and api_key required"):
-            CachekitIOBackend(api_key=_TEST_API_KEY)
+    def test_empty_key_raises_at_construction(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty key would go out as 'Bearer ' — reject it where the preset is built."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="api_key"):
+            CachekitIOBackend(api_key="")
+
+    @pytest.mark.parametrize("key", ["   ", "ck_live_SECRET_XYZ\n", "ck_live_SECRET XYZ"], ids=["blank", "newline", "inner"])
+    def test_whitespace_key_raises_at_construction(
+        self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        """min_length=1 passes these; the first request then fails with an h11 error echoing the key."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="whitespace") as info:
+            CachekitIOBackend(api_key=key)
+        assert "SECRET" not in str(info.value)
+        assert "requires an API key" not in str(info.value)  # a key WAS given
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
+            {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
+        ],
+        ids=["whitespace", "allowlist"],
+    )
+    def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
+        """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
+        from pydantic import ValidationError
+
+        monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        with pytest.raises(ValidationError) as info:
+            CachekitIOBackendConfig(**kwargs)
+        assert "SECRET" not in str(info.value)
+
+    def test_unparseable_url_error_carries_no_credentials(self) -> None:
+        """CWE-532: the message once held the whole URL, and urlparse's own error (NFKC-invalid netloc)
+        quotes userinfo too, so neither may reach the message or the chain pydantic keeps in ctx."""
+        from pydantic import ValidationError
+
+        url = "https://user:SECRET_PW\uff0fx@api.cachekit.io"  # pragma: allowlist secret
+        with pytest.raises(ValidationError) as info:
+            CachekitIOBackendConfig(api_key=_TEST_API_KEY, api_url=url)
+        error = info.value.errors(include_input=False)[0]["ctx"]["error"]
+        assert "SECRET" not in str(error)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+
+    @pytest.mark.parametrize("userinfo", ["user:SECRET_PW@", "SECRET_USER@"], ids=["user-password", "user-only"])
+    def test_url_with_userinfo_is_rejected(self, mock_sync_client: MagicMock, userinfo: str) -> None:
+        """httpx sends URL userinfo as Basic auth in place of the Bearer key, and its INFO log prints the
+        full request URL, password included (CWE-532): such a URL never authenticated, so reject it."""
+        with pytest.raises(ConfigurationError, match="must not contain credentials") as info:
+            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=f"https://{userinfo}api.cachekit.io")
+        assert "SECRET" not in str(info.value)
+
+    def test_https_error_never_echoes_a_schemeless_url(self, mock_sync_client: MagicMock) -> None:
+        """Without a scheme, urlparse reads the username as one, and the HTTPS error once echoed it."""
+        url = "SECRETUSER:pw@api.cachekit.io"  # pragma: allowlist secret
+        with pytest.raises(ConfigurationError, match="must use HTTPS") as info:
+            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=url)
+        assert "secretuser" not in str(info.value).lower()  # urlparse lowercases the scheme
+
+    def test_config_error_never_echoes_the_key(self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CWE-532: a rejected api_url must not carry the key into the exception text or its chain."""
+        monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        with pytest.raises(ConfigurationError, match="not in allowlist") as info:
+            CachekitIOBackend(api_key="ck_live_SECRET_XYZ", api_url="https://evil.example.com")  # pragma: allowlist secret
+        assert "SECRET" not in str(info.value)
+        assert "requires an API key" not in str(info.value)  # the key hint is for key errors only
+        # No chain at all: __context__ would still hold the ValidationError, whose .errors() carry the key.
+        assert info.value.__cause__ is None
+        assert info.value.__context__ is None
 
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""
         monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
-        with patch("cachekit.backends.cachekitio.backend.get_sync_http_client", return_value=MagicMock(spec=httpx.Client)):
+        with patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        ):
             with patch(
                 "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
                 return_value=MagicMock(spec=httpx.AsyncClient),

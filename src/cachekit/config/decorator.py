@@ -6,7 +6,6 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
@@ -480,51 +479,53 @@ class DecoratorConfig:
         )
 
     @classmethod
-    def io(cls, **kwargs: Any) -> DecoratorConfig:
+    def io(cls, api_key: str | None = None, **kwargs: Any) -> DecoratorConfig:
         """cachekit.io SaaS backend profile: HTTP-based caching via api.cachekit.io.
 
         Use cases: Zero-infrastructure caching, edge caching, multi-region deployments
         Features: Full L1+L2 caching, circuit breaker, production-grade reliability
 
-        Configuration via environment variables:
-            CACHEKIT_API_KEY: API key for authentication (required)
-            CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
+        Credentials: ``api_key`` argument, falling back to the ``CACHEKIT_API_KEY``
+        environment variable. An explicit argument wins, so one process can hold
+        two keys (multi-tenant services, test suites). Neither present is a
+        ConfigurationError here, at construction — never on the first cache call.
+        ``CACHEKIT_API_URL`` overrides the endpoint (default: https://api.cachekit.io).
 
         Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
         AES-256-GCM encryption — no code changes needed. Auto-detection happens in
         CacheSerializationHandler and applies to ALL presets, not just .io().
 
         Args:
-            **kwargs: Overrides (ttl, namespace, etc.)
+            api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
+            **kwargs: Overrides (ttl, namespace, etc.). ``backend`` is not one — io always
+                caches through its own CachekitIOBackend and rejects ``backend=``.
 
         Returns:
             DecoratorConfig with CachekitIOBackend
 
         Raises:
-            ConfigurationError: If CACHEKIT_API_KEY is not set
+            ConfigurationError: If the API key is missing, empty or contains whitespace
+                (argument and CACHEKIT_API_KEY), if CACHEKIT_API_URL fails validation, or if
+                ``backend=`` is passed.
 
         Example:
-            >>> import os
-            >>> os.environ["CACHEKIT_API_KEY"] = "ck_test_key"
-            >>> config = DecoratorConfig.io(ttl=300)
+            >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)  # pragma: allowlist secret
             >>> config.ttl
             300
-            >>> del os.environ["CACHEKIT_API_KEY"]  # cleanup
         """
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 
-        # Check for API key before creating backend
-        if not os.environ.get("CACHEKIT_API_KEY"):
+        if "backend" in kwargs:
             raise ConfigurationError(
-                "CACHEKIT_API_KEY environment variable required for @cache.io\n\n"
-                "Set your API key:\n"
-                "  export CACHEKIT_API_KEY=ck_live_your_key_here\n\n"
-                "Get an API key at: https://cachekit.io"
+                "@cache.io does not accept backend= — it always caches through CachekitIOBackend.\n\n"
+                "To cache through another backend, use a different preset:\n"
+                "  @cache.production(backend=my_backend)"
             )
 
-        # Create backend (loads config from environment)
-        backend = CachekitIOBackend()
+        # io() never reads the env itself: CachekitIOBackendConfig resolves api_key (argument wins,
+        # else CACHEKIT_API_KEY) and raises ConfigurationError on a missing or empty key, at construction.
+        backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend
         # Encryption auto-detected from CACHEKIT_MASTER_KEY in CacheSerializationHandler

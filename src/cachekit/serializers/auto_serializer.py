@@ -58,9 +58,10 @@ except ImportError:
     HAS_ARROW_SERIALIZER = False
     ArrowSerializer = None  # type: ignore[assignment,misc]
 
-from cachekit._rust_serializer import ByteStorage
+from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
+from cachekit.hash_utils import redact_error_for_log
 
-from .base import SerializationError, SerializationFormat, SerializationMetadata
+from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,68 @@ def _is_plain_numpy_numeric(dtype: Any) -> bool:
     "int64[pyarrow]" wrongly matches it). Used by the no-pyarrow columnar fallback.
     """
     return HAS_PANDAS and not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
+
+
+def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
+    """``np.dtype(spec)`` for a dtype the cache entry itself supplies, refusing what the writer never emits.
+
+    A forged ``M8[0ns]`` (zero datetime unit multiplier) passes ``np.frombuffer`` and then kills
+    the process with SIGFPE inside pandas — a signal no ``except`` can catch — so it is refused
+    before any array is built. Columnar (DataFrame/Series) entries only ever carry dtypes that
+    pass ``_is_plain_numpy_numeric``, the write-side predicate, so ``numeric_only`` mirrors it.
+    """
+    dtype = np.dtype(spec)
+    if numeric_only and not _is_plain_numpy_numeric(dtype):
+        raise SerializationError(f"Forged columnar dtype {dtype}: the writer only emits plain NumPy numeric columns")
+    if dtype.kind in "Mm" and np.datetime_data(dtype)[1] == 0:
+        raise SerializationError(f"Forged dtype {dtype}: a zero datetime unit multiplier crashes pandas")
+    return dtype
+
+
+def _expect(value: Any, kind: type, what: str) -> Any:
+    """Refuse a columnar field whose type the writer never emits.
+
+    The ``__ndarray__`` object hook can substitute an attacker-typed ndarray for any field of a
+    forged DataFrame/Series document; pandas then asserts (``AssertionError``) or indexing raises
+    ``IndexError`` — both outside ``PAYLOAD_DECODE_ERRORS``. The writer emits ``list`` for
+    ``columns`` / ``index`` / object data and ``dict`` for the document and each column.
+    """
+    if not isinstance(value, kind):
+        raise SerializationError(f"Forged columnar payload: {what} is {type(value).__name__}, expected {kind.__name__}")
+    return value
+
+
+def _column_values(info: dict[str, Any], what: str) -> Any:
+    """Rebuild one column's values from the ``{type, data[, dtype]}`` the writer emits (``dtype`` only for ``"numeric"``).
+
+    ``type`` is an allow-list, not a numeric/else switch: an unknown marker must not be read as object data.
+    """
+    marker = info["type"]
+    if marker == "numeric":
+        # .copy() → writable values that do not alias the source buffer (#157).
+        return np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
+    if marker == "object":
+        return _expect(info["data"], list, f"{what} data")
+    # Attacker-chosen: echo a str capped at 40 chars; never repr() a structure (RecursionError on 3.10/3.11 at depth ~1000).
+    shown = marker if isinstance(marker, str) else type(marker).__name__
+    raise SerializationError(f"Forged columnar payload: {what} type is {shown!r:.40}, expected 'numeric' or 'object'")
+
+
+def _column_trio(series: Any) -> dict[str, Any]:
+    """Build one column's/Series' marker — the write-side mirror of :func:`_column_values`.
+
+    The marker is the 3-key ``{type: "numeric", data, dtype}`` for a plain-numeric column and the
+    2-key ``{type: "object", data}`` otherwise (the ``dtype`` key is numeric-only) — "trio" names
+    the maximal numeric form. One writer for both the DataFrame-column and the bare-Series paths, so
+    the marker set and key order live in a single place and a third marker cannot be added to one
+    side only (the AC3 goal). Plain NumPy
+    numeric dtypes take the raw-buffer path; everything else (nullable/extension dtypes) takes the
+    NA-safe object path so pd.NA/NaT do not crash msgpack (#160). Wire bytes and key order MUST
+    stay byte-identical to the interop fixtures.
+    """
+    if _is_plain_numpy_numeric(series.dtype):
+        return {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
+    return {"type": "object", "data": _na_safe_object_list(series)}
 
 
 def _na_safe_object_list(series: Any) -> list:
@@ -297,7 +360,7 @@ def _auto_object_hook(obj: Any) -> Any:
             if "data" not in obj or "shape" not in obj or "dtype" not in obj:
                 raise SerializationError("Invalid ndarray format: missing required fields in cached data")
             # .copy(): writable result that does not alias the source buffer (the L1-cached bytes on a hit) — #157.
-            return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"]).copy()
+            return np.frombuffer(obj["data"], dtype=_dtype_from_untrusted(obj["dtype"])).reshape(obj["shape"]).copy()
 
     return obj
 
@@ -512,6 +575,35 @@ class AutoSerializer:
 
         Returns:
             Any: Deserialized Python object
+
+        Raises:
+            SerializationError: A ByteStorage envelope was present but failed verification
+                (checksum mismatch, decompression bomb/failure, size mismatch) — genuine
+                corruption or tampering — or a payload that failed to decode inside a
+                verified envelope.
+
+                With integrity checking ON, any entry that arrives WITH metadata — DataFrame,
+                Series, or generic msgpack alike — must come from a verified envelope: a
+                ``retrieve()`` failure of any kind, including "not an envelope at all",
+                raises rather than reconstructing from bytes nothing verified (matches
+                :class:`StandardSerializer`'s no-fall-through contract). No field of
+                ``metadata`` steers that decision: the CK header it comes from is plaintext,
+                so a single flipped byte there must not be able to open the fall-through.
+                Inside a verified envelope, the format is taken from the envelope's own
+                record, never from the header.
+
+                The one fall-through that remains is a call with NO metadata at all
+                (``deserialize(data)`` — the direct-API contract the type-marker corruption
+                tests exercise): bytes that never parse as an envelope are decoded as plain
+                msgpack, and that decode's own structural validation is what catches a forged
+                entry. With integrity checking OFF the reader has no ByteStorage at all, so
+                nothing on this path is verified — that is what ``@cache.minimal`` chooses.
+
+                A reader with integrity checking OFF additionally raises on any
+                dataframe/series/msgpack entry whose ``metadata.compressed`` says the writer
+                enveloped it: this reader has no ByteStorage to verify — or even unwrap — the
+                envelope, and decoding its bytes as plain msgpack would hand back the
+                envelope's positional fields as the cached value.
         """
         # coerce unwrap's zero-copy memoryview; no-op when already bytes (enables .startswith below + Rust retrieve)
         data = bytes(data)
@@ -539,66 +631,78 @@ class AutoSerializer:
                         "Cannot deserialize Arrow format: ArrowSerializer not available. "
                         "Install with: pip install 'cachekit[data]'"
                     )
-            elif detected_format == "dataframe":
-                if self.enable_integrity_checking and len(data) > 4:
-                    # Unwrap the ByteStorage envelope. A checksum mismatch (raised by retrieve) fails
-                    # closed with a clear corruption error instead of being swallowed and re-parsed as
-                    # raw msgpack, which lost the diagnostic and produced a confusing error (#156).
-                    # The unpack/build sits OUTSIDE this guard so a genuine post-retrieve error surfaces
-                    # as itself rather than being mistaken for corruption.
-                    try:
-                        original_data, _ = self._byte_storage.retrieve(data)
-                    except (ValueError, SerializationError) as e:
-                        raise SerializationError(f"DataFrame integrity check failed (corrupted cache entry): {e}") from e
-                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_dataframe(unpacked_data)
-                # Integrity off: data is direct msgpack (no envelope)
-                unpacked_data = msgpack.unpackb(data, **self._msgpack_unpack_opts)
-                return self._deserialize_dataframe(unpacked_data)
-            elif detected_format == "series":
-                if self.enable_integrity_checking and len(data) > 4:
-                    # Same fail-closed contract as the DataFrame branch above (#156).
-                    try:
-                        original_data, _ = self._byte_storage.retrieve(data)
-                    except (ValueError, SerializationError) as e:
-                        raise SerializationError(f"Series integrity check failed (corrupted cache entry): {e}") from e
-                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_series(unpacked_data)
-                # Integrity off: data is direct msgpack (no envelope)
-                unpacked_data = msgpack.unpackb(data, **self._msgpack_unpack_opts)
-                return self._deserialize_series(unpacked_data)
+            # From here down (dataframe, series, generic msgpack) metadata.compressed records whether
+            # the writer enveloped the entry — numpy/arrow routed out above, their flag means codec.
+            # An integrity-off reader cannot verify or unwrap it: fail closed (see Raises: above).
+            if getattr(metadata, "compressed", False) and not self.enable_integrity_checking:
+                raise SerializationError(
+                    "Cache entry was written with integrity checking on but this reader has "
+                    f"integrity checking disabled (format={detected_format!r})"
+                )
+            if detected_format in ("dataframe", "series"):
+                if not self.enable_integrity_checking:
+                    # Integrity off: data is direct msgpack (no envelope)
+                    return self._decode_columnar(data, detected_format)
+                # Integrity on: a DataFrame/Series MUST come from a verified envelope —
+                # see the Raises: section above for why this never falls through.
+                try:
+                    original_data, _ = self._byte_storage.retrieve(data)
+                except ValueError as e:
+                    raise self._envelope_failure(e, detected_format) from e
+                return self._decode_columnar(original_data, detected_format)
 
         # For Rust-envelope formats, use the Rust layer
+        envelope_error: Exception | None = None
         if self.enable_integrity_checking:
             try:
                 # Use Rust layer for decompression and validation
                 original_data, format_id = self._byte_storage.retrieve(data)
-
-                # Use metadata if available, otherwise fall back to format_id from envelope
-                if metadata and hasattr(metadata, "original_type"):
-                    detected_format = metadata.original_type
-                else:
-                    detected_format = format_id
-
-                # Deserialize based on detected format
-                if detected_format == "numpy":
-                    return self._deserialize_numpy(original_data)
-                elif detected_format == "dataframe":
-                    # Unpack the msgpack data first, then pass to DataFrame deserializer
-                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_dataframe(unpacked_data)
-                elif detected_format == "series":
-                    # Unpack the msgpack data first, then pass to Series deserializer
-                    unpacked_data = msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-                    return self._deserialize_series(unpacked_data)
-                else:  # msgpack
-                    return msgpack.unpackb(original_data, **self._msgpack_unpack_opts)
-            except SerializationError:
-                # Re-raise SerializationError (corruption detection) without swallowing
-                raise
+            except EnvelopeIntegrityError as e:
+                # The envelope parsed but failed verification (checksum, decompression bomb,
+                # size mismatch) — genuine corruption or tampering. Must fail closed, never
+                # fall through to a re-parse as plain msgpack/NumPy (that would either raise a
+                # confusing "not decodable" error or, worse, decode envelope bytes as if they
+                # were the payload).
+                raise self._envelope_failure(e) from e
             except Exception as e:
-                # If Rust envelope parsing fails for other reasons, try Python-only deserialization
-                logger.debug(f"Rust envelope parsing failed, falling back to Python-only deserialization: {e}")
+                # Not a ByteStorage envelope at all (e.g. written with integrity checking off):
+                # fall through to the Python-only paths below, keeping the reason for the
+                # final error.
+                envelope_error = e
+                logger.debug(
+                    f"Rust envelope parsing failed, falling back to Python-only deserialization: {redact_error_for_log(e)}"
+                )
+            else:
+                # The envelope verified (checksum matched), so its payload is exactly what was
+                # stored; a payload that then fails to decode is corruption or a forged entry
+                # (LAB-2503 decode bomb) and MUST fail closed. Falling through here used to
+                # re-decode the ENVELOPE bytes as plain MessagePack and return its positional
+                # fields as the cached value — wrong data, silently.
+                # The format comes from INSIDE the verified envelope. metadata.original_type is a
+                # plaintext-header field: with it None (one flipped header byte) the former
+                # `hasattr(...) else format_id` never reached format_id, and a checksum-verified
+                # Series came back as a dict.
+                detected_format = format_id
+                try:
+                    if detected_format == "numpy":
+                        return self._deserialize_numpy(original_data)
+                    if detected_format in ("dataframe", "series"):
+                        return self._decode_columnar(original_data, detected_format)
+                    return unpackb_bounded(original_data, **self._msgpack_unpack_opts)
+                except PAYLOAD_DECODE_ERRORS as e:
+                    raise SerializationError(
+                        f"Cache entry payload failed to decode inside a verified envelope (format={detected_format!r}): {e}"
+                    ) from e
+
+        # Reached with integrity on when retrieve() raised the "not an envelope" ValueError
+        # (envelope_error is set), or with integrity off (envelope_error is None; a
+        # compressed=true entry was already rejected above). With integrity on, a call that
+        # carries metadata fails closed here — see Raises:. This must NOT consult
+        # metadata.compressed: that field lives in the plaintext CK header, so gating on it
+        # let one flipped byte reopen the fall-through and return the envelope's positional
+        # fields as the cached value. Only the metadata-absent direct-API call falls through.
+        if envelope_error is not None and metadata is not None:
+            raise self._envelope_failure(envelope_error) from envelope_error
 
         # Check for Arrow IPC format before msgpack fall-through
         # Arrow data may have xxHash3-64 checksum prefix (8 bytes) or be direct Arrow IPC
@@ -621,13 +725,17 @@ class AutoSerializer:
 
         # Python-only path (no Rust compression) - direct msgpack deserialization
         try:
-            return msgpack.unpackb(data, **self._msgpack_unpack_opts)
-        except SerializationError:
-            # Re-raise SerializationError (corruption detection) without swallowing
-            raise
-        except Exception:
-            # If msgpack fails for other reasons, try NumPy-specific deserialization
-            return self._deserialize_numpy(data)
+            return unpackb_bounded(data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as msgpack_error:
+            # NUMPY_RAW entries were routed structurally at the top, so nothing reaching here can be
+            # a NumPy payload (and a NumPy attempt would raise RuntimeError without the [data]
+            # extra). Report every reason for the miss: the msgpack one is the decode-bound
+            # rejection for a forged entry and must not vanish behind the envelope error.
+            raise SerializationError(
+                "Cache entry is not a decodable MessagePack payload"
+                f"{f' (envelope: {envelope_error})' if envelope_error else ''}"
+                f" (msgpack: {msgpack_error})"
+            ) from msgpack_error
 
     def _serialize_numpy(self, arr: np.ndarray) -> bytes:  # type: ignore[name-defined]
         """Serialize a NumPy array into the ``NUMPY_RAW`` binary format.
@@ -701,7 +809,7 @@ class AutoSerializer:
             # Read dtype
             dtype_len = int.from_bytes(data[offset : offset + 2], byteorder="little")
             offset += 2
-            dtype_str = data[offset : offset + dtype_len].decode("utf-8")
+            dtype_bytes = data[offset : offset + dtype_len]
             offset += dtype_len
 
             # Read shape
@@ -709,6 +817,13 @@ class AutoSerializer:
             offset += 2
             shape_data = data[offset : offset + shape_len]
             offset += shape_len
+
+            # Slicing past the end silently shortens, and a partial 4-byte chunk would parse as a
+            # dimension (a forged 1-byte zero chunk = shape (0,) = an empty array instead of an
+            # error). Untrusted metadata must be exactly what its length prefix claims.
+            if len(dtype_bytes) != dtype_len or len(shape_data) != shape_len or shape_len % 4:
+                raise SerializationError("Invalid NumPy data format - truncated or misaligned dtype/shape metadata")
+            dtype_str = dtype_bytes.decode("utf-8")
 
             # Reconstruct shape from packed integers
             shape = []
@@ -721,9 +836,12 @@ class AutoSerializer:
             # not alias the source bytes (the L1-cached buffer on a hit) — see #157. frombuffer alone
             # returns a read-only view aliasing the input.
             raw_bytes = data[offset:]
-            arr = np.frombuffer(raw_bytes, dtype=dtype_str).copy()
+            arr = np.frombuffer(raw_bytes, dtype=_dtype_from_untrusted(dtype_str)).copy()
             return arr.reshape(shape)
-        except (ValueError, IndexError, UnicodeDecodeError) as e:
+        except (ValueError, TypeError, IndexError, SyntaxError) as e:
+            # TypeError: np.frombuffer on a forged dtype string; SyntaxError: numpy's comma-string
+            # dtype parser runs ast.literal_eval on a forged shape prefix such as "(1,f8";
+            # UnicodeDecodeError is a ValueError.
             raise SerializationError(f"Failed to deserialize NumPy array: {e}") from e
 
     def _serialize_dataframe(self, df: pd.DataFrame) -> bytes:
@@ -743,15 +861,10 @@ class AutoSerializer:
             "data": {},
         }
 
-        # Serialize each column separately
+        # Serialize each column separately — _column_trio is the single writer shared with
+        # _serialize_series and mirrored by the _column_values decoder.
         for col in df.columns:
-            series = df[col]
-            # Fast raw-buffer path only for plain NumPy numeric dtypes; nullable/extension
-            # dtypes fall through to the NA-safe object path (see helper docstrings).
-            if _is_plain_numpy_numeric(series.dtype):
-                serialized["data"][col] = {"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)}  # type: ignore[union-attr]
-            else:
-                serialized["data"][col] = {"type": "object", "data": _na_safe_object_list(series)}
+            serialized["data"][col] = _column_trio(df[col])
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
@@ -760,40 +873,33 @@ class AutoSerializer:
         else:
             return msgpack_data  # type: ignore[return-value]
 
-    def _deserialize_dataframe(self, data) -> pd.DataFrame:
-        """Deserialize DataFrame from column-wise data.
+    def _deserialize_dataframe(self, document) -> pd.DataFrame:
+        """Rebuild a DataFrame from the already-decoded columnar ``document``.
+
+        ``document`` is the msgpack-decoded body — every production caller (the verified-envelope
+        route in :meth:`deserialize` and :meth:`_decode_columnar`) decodes under
+        ``unpackb_bounded`` first, so this method never touches the wire bytes and never re-runs
+        the decode bound. A forged non-dict body is refused by the ``_expect`` shape gate.
 
         Requires: pandas installed (HAS_PANDAS=True)
 
         Raises:
             RuntimeError: If pandas not installed
+            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
 
-        # If data is already unpacked (from Rust layer), use it directly
-        if isinstance(data, dict):
-            serialized = data
-        else:
-            # Otherwise unpack msgpack
-            serialized = msgpack.unpackb(data, **self._msgpack_unpack_opts)
-
-        # Reconstruct DataFrame column by column
+        serialized = _expect(document, dict, "document")
         columns_data = {}
-        for col, col_info in serialized["data"].items():
-            if col_info["type"] == "numeric":
-                # Reconstruct from NumPy bytes; .copy() → writable, non-aliasing column (#157).
-                arr = np.frombuffer(col_info["data"], dtype=col_info["dtype"]).copy()
-                columns_data[col] = arr
-            else:
-                # Use object data directly
-                columns_data[col] = col_info["data"]
-
-        df = pd.DataFrame(columns_data, columns=serialized["columns"])
+        for col, col_info in _expect(serialized["data"], dict, "data").items():
+            what = f"column {col!r:.40}"  # col is attacker-chosen: cap the echo
+            columns_data[col] = _column_values(_expect(col_info, dict, what), what)
+        df = pd.DataFrame(columns_data, columns=_expect(serialized["columns"], list, "columns"))
 
         # Restore index if it was serialized
         if serialized["index"] is not None:
-            df.index = pd.Index(serialized["index"])
+            df.index = pd.Index(_expect(serialized["index"], list, "index"))
 
         return df
 
@@ -812,13 +918,9 @@ class AutoSerializer:
             "index": series.index.tolist() if series.index.name or not series.index.equals(pd.RangeIndex(len(series))) else None,
         }
 
-        # Same dtype handling as _serialize_dataframe: plain NumPy numeric uses the raw
-        # buffer; nullable/extension dtypes take the NA-safe object path so pd.NA/NaT
-        # do not crash msgpack (#160).
-        if _is_plain_numpy_numeric(series.dtype):
-            serialized.update({"type": "numeric", "data": series.values.tobytes(), "dtype": str(series.dtype)})  # type: ignore[union-attr]
-        else:
-            serialized.update({"type": "object", "data": _na_safe_object_list(series)})
+        # Same {type, data[, dtype]} trio as each DataFrame column, appended after name/index
+        # so the on-wire key order is {name, index, type, data[, dtype]} (byte-compatible).
+        serialized.update(_column_trio(series))
 
         msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
 
@@ -827,37 +929,51 @@ class AutoSerializer:
         else:
             return msgpack_data  # type: ignore[return-value]
 
-    def _deserialize_series(self, data) -> pd.Series:
-        """Deserialize Pandas Series.
+    def _deserialize_series(self, document) -> pd.Series:
+        """Rebuild a Series from the already-decoded columnar ``document``.
+
+        ``document`` is the msgpack-decoded body; the same decoded-only contract as
+        :meth:`_deserialize_dataframe` (its callers run ``unpackb_bounded`` first). A forged
+        non-dict body is refused by the ``_expect`` shape gate.
 
         Requires: pandas installed (HAS_PANDAS=True)
 
         Raises:
             RuntimeError: If pandas not installed
+            SerializationError: forged document shape — see ``_expect`` / ``_column_values``
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
 
-        # If data is already unpacked (from Rust layer), use it directly
-        if isinstance(data, dict):
-            serialized = data
-        else:
-            # Otherwise unpack msgpack
-            serialized = msgpack.unpackb(data, **self._msgpack_unpack_opts)
-
-        if serialized["type"] == "numeric":
-            # .copy() → writable Series values that do not alias the source buffer (#157).
-            values = np.frombuffer(serialized["data"], dtype=serialized["dtype"]).copy()
-        else:
-            values = serialized["data"]
-
-        series = pd.Series(values, name=serialized["name"])
+        serialized = _expect(document, dict, "document")
+        series = pd.Series(_column_values(serialized, "series"), name=serialized["name"])
 
         # Restore index if it was serialized
         if serialized["index"] is not None:
-            series.index = pd.Index(serialized["index"])
+            series.index = pd.Index(_expect(serialized["index"], list, "index"))
 
         return series
+
+    @staticmethod
+    def _envelope_failure(cause: Exception, detected_format: str | None = None) -> SerializationError:
+        """One canonical ``SerializationError`` for every envelope-verification failure in
+        ``deserialize`` — see its ``Raises:`` section for the fail-closed contract this backs."""
+        suffix = f" (format={detected_format!r})" if detected_format else ""
+        return SerializationError(f"Cache entry failed envelope verification (corrupted cache entry){suffix}: {cause}")
+
+    def _decode_columnar(self, payload: bytes | bytearray | memoryview, kind: str) -> pd.DataFrame | pd.Series:
+        """Decode a ``dataframe`` / ``series`` payload, failing closed as ``SerializationError``.
+
+        The metadata routes in ``deserialize`` reach here outside the verified-envelope
+        normaliser, and the read handler treats only ``SerializationError`` as a read error
+        (evict + tamper hook) — a bare ``ValueError`` from the decode bound would be logged as
+        a backend fault and the poisoned entry kept (LAB-2503).
+        """
+        build = self._deserialize_dataframe if kind == "dataframe" else self._deserialize_series
+        try:
+            return build(unpackb_bounded(payload, **self._msgpack_unpack_opts))
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(f"Cache entry payload failed to decode as {kind}: {e}") from e
 
     def _serialize_msgpack(self, obj: Any) -> bytes:
         """Serialize general object with MessagePack."""
@@ -908,10 +1024,9 @@ class AutoSerializer:
         else:
             # Python-only mode validation
             try:
-                msgpack.unpackb(data, **self._msgpack_unpack_opts)
+                unpackb_bounded(data, **self._msgpack_unpack_opts)
                 return True
-            except (msgpack.exceptions.UnpackException, ValueError, TypeError, AttributeError):
-                # AttributeError can occur when datetime_object_hook tries to restore invalid data
+            except PAYLOAD_DECODE_ERRORS:
                 return False
 
 
