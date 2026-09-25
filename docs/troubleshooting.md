@@ -34,7 +34,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
 3. **Wait for circuit breaker to reset**:
-- After `recovery_timeout` (default 30 seconds, `CircuitBreakerConfig`) the breaker goes half-open and tests the backend again
+- After 30 seconds the breaker goes half-open and tests the backend again
 - While open, sync functions run without caching. Async functions currently raise `UnboundLocalError` while the breaker is open (a known defect) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
@@ -295,7 +295,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **The circuit breaker handles backoff automatically** — no manual retry logic needed. If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **A rate-limited request is not retried** — the call runs uncached. Five consecutive failures open the circuit breaker, which stops sending requests to cachekit.io for 30 seconds (see [Circuit breaker open](error-codes.md#circuit-breaker-open)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 

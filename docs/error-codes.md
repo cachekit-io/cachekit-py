@@ -380,7 +380,7 @@ redis-cli ping
 ```
 
 2. **Wait for circuit breaker to reset**:
-- After `recovery_timeout` (default 30 seconds, `CircuitBreakerConfig`) the breaker goes half-open and tests the backend again
+- After 30 seconds the breaker goes half-open and tests the backend again
 - During recovery, requests execute function without caching
 
 3. **Fix the underlying issue**:
@@ -473,7 +473,7 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry. Every failure type counts toward opening the circuit breaker unless you list it in `CircuitBreakerConfig.excluded_error_types` (empty by default).
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises to a `@cache`-decorated caller: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. There is no automatic retry. Every failure type counts toward opening the circuit breaker.
 
 ### Authentication failure (401/403)
 
@@ -628,7 +628,7 @@ echo $CACHEKIT_API_URL
 | `ConnectError`, `NetworkError` | `TRANSIENT` |
 | Other | `UNKNOWN` |
 
-No type is retried. All count toward the circuit breaker by default; `CircuitBreakerConfig(excluded_error_types=(...))` exempts the ones you list.
+No type is retried, and every type counts toward the circuit breaker.
 
 ---
 
