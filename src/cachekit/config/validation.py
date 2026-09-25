@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
-from typing import TYPE_CHECKING, Any, get_args
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
 from pydantic import ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
@@ -16,6 +18,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BUILTIN_ERROR_TYPES = frozenset(get_args(ErrorType))
+
+_T = TypeVar("_T")
 
 
 class ConfigurationError(Exception):
@@ -69,16 +73,33 @@ class RedactingSettings(BaseSettings):
         if sanitized_error is not None:
             raise sanitized_error
 
+    # pydantic calls the overridden __init__ only for mapping input. Malformed JSON, a non-object
+    # document, non-mapping input and the strings mode fail in the core validator first, so the
+    # model_validate* classmethods redact on their own.
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
+        return _redacting(functools.partial(super().model_validate, obj, **kwargs))
+
+    @classmethod
+    def model_validate_json(cls, json_data: str | bytes | bytearray, **kwargs: Any) -> Self:
+        return _redacting(functools.partial(super().model_validate_json, json_data, **kwargs))
+
     @classmethod
     def model_validate_strings(cls, obj: Any, **kwargs: Any) -> Self:
-        """Redact like ``__init__``. pydantic routes ``model_validate`` and ``model_validate_json``
-        through an overridden ``__init__``, but not this one."""
-        sanitized_error: ValidationError | None = None
-        try:
-            return super().model_validate_strings(obj, **kwargs)
-        except ValidationError as e:
-            sanitized_error = _redacted_copy(e)
-        raise sanitized_error  # outside the except block, as in __init__
+        return _redacting(functools.partial(super().model_validate_strings, obj, **kwargs))
+
+
+def _redacting(validate: Callable[[], _T]) -> _T:
+    """Run ``validate``, re-raising a ValidationError as its redacted copy with no chain.
+
+    Not a context manager: raising from ``__exit__`` would chain the original, raw inputs and all.
+    """
+    sanitized_error: ValidationError | None = None
+    try:
+        return validate()
+    except ValidationError as e:
+        sanitized_error = _redacted_copy(e)
+    raise sanitized_error  # outside the except block, as in RedactingSettings.__init__
 
 
 def _redacted_copy(error: ValidationError) -> ValidationError:

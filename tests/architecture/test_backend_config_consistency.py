@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError, field_validator
@@ -197,18 +198,27 @@ class TestModelConfigConsistency:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
-    @pytest.mark.parametrize("method", ["model_validate", "model_validate_json", "model_validate_strings"])
+    @pytest.mark.parametrize(
+        ("method", "data"),
+        [
+            ("model_validate", {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}),
+            ("model_validate", "SECRET_VALUE"),
+            ("model_validate", SimpleNamespace(totally_fake_field_that_doesnt_exist="SECRET_VALUE")),
+            ("model_validate_json", json.dumps({"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"})),
+            ("model_validate_json", '{"api_key": "SECRET_VALUE",'),  # pragma: allowlist secret
+            ("model_validate_json", '["SECRET_VALUE"]'),
+            ("model_validate_strings", {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}),
+        ],
+        ids=["dict", "non-mapping", "object", "json-object", "json-malformed", "json-array", "strings"],
+    )
     def test_model_validate_methods_redact_every_input(
-        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
     ) -> None:
-        """The inherited validate classmethods build a model too. pydantic routes model_validate and
-        model_validate_json through the overridden __init__, but not model_validate_strings."""
-        data = {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}
+        """The inherited validate classmethods build a model too. pydantic calls __init__ only for
+        mapping input; malformed JSON, a non-object document, non-mapping input and the strings mode
+        fail in the core validator before it."""
         with pytest.raises(ValidationError) as exc_info:
-            if method == "model_validate_json":
-                config_cls.model_validate_json(json.dumps(data))
-            else:
-                getattr(config_cls, method)(data)
+            getattr(config_cls, method)(data)
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
