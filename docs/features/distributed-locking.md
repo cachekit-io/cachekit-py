@@ -29,7 +29,7 @@ Distributed locking is enabled by default when the backend supports it:
 ```python notest
 from cachekit import cache
 
-@cache(ttl=300)  # Locking active on LockableBackend (e.g. RedisBackend, CachekitIOBackend)
+@cache(ttl=300)  # Locking active on LockableBackend (e.g. the tenant-scoped Redis backend, CachekitIOBackend)
 async def get_report(date):
     return db.generate_report(date)  # Expensive operation
 
@@ -162,7 +162,7 @@ Three behavioural edges to design around:
 # the lock itself self-expires after 30 s (lock_timeout) as the safety net.
 ```
 
-On `RedisBackend`, cancelling the task mid-`acquire_lock` does not orphan the
+On the tenant-scoped Redis backend, cancelling the task mid-`acquire_lock` does not orphan the
 lock: the in-flight `SET NX` and the release both run to completion — however
 many cancellations land — before the `CancelledError` propagates. Only Redis
 failing the release leaves the key, until the same 30 s TTL as the crash case

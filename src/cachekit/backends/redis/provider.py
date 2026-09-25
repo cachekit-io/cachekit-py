@@ -443,6 +443,8 @@ class PerRequestRedisBackend:
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
         # (the wrapper no longer pollutes the cache_key passed in).
+        # Resolve it here, in the caller's context: run_in_executor does not carry contextvars,
+        # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
         try:
             from redis.lock import Lock
