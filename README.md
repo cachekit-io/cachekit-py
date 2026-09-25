@@ -152,8 +152,8 @@ def get_price(symbol: str):
 def process_payment(amount):
     return payment_gateway.charge(amount)
 
-# Security-critical: PII, medical, financial
-@cache.secure
+# Security-critical: PII, medical, financial (needs a key: master_key= or CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)
 def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
@@ -266,7 +266,7 @@ def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
 
 # Encrypted DataFrames for sensitive data
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
+@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex(secret_key)))
 def get_patient_data(hospital_id: int):
     return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
 ```

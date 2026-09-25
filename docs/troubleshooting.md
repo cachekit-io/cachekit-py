@@ -383,12 +383,16 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
 
 ---
 
-## Error Code Reference
+## Error Reference
+
+Short forms of the entries in the [Error Reference](error-codes.md), which lists each exception class and whether it reaches your code.
 
 <details>
-<summary><strong>E001: CACHEKIT_MASTER_KEY not set</strong></summary>
+<summary><strong>CACHEKIT_MASTER_KEY not set</strong></summary>
 
-**Message**: "CACHEKIT_MASTER_KEY environment variable must be set"
+**Message**: "cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable"
+
+**Exception**: `ValueError`, raised when the decorator is applied
 
 **Cause**: Using `@cache.secure()` without encryption key configured
 
@@ -409,9 +413,11 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 </details>
 
 <details>
-<summary><strong>E002: Invalid Key Format</strong></summary>
+<summary><strong>Invalid Key Format</strong></summary>
 
-**Message**: "CACHEKIT_MASTER_KEY must be hex-encoded, minimum 32 bytes"
+**Message**: "CACHEKIT_MASTER_KEY must be hex-encoded: ..." or "CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ..."
+
+**Exception**: `ConfigurationError` (`cachekit.config.validation`), raised when the decorator is applied. Not a `ValueError` subclass.
 
 **Cause**: Master key is not valid hex or too short
 
@@ -434,9 +440,11 @@ python -c "import os; print(len(os.getenv('CACHEKIT_MASTER_KEY', '')))"
 </details>
 
 <details>
-<summary><strong>E003: Decryption Failed - Authentication Tag Mismatch</strong></summary>
+<summary><strong>Decryption Failed - Authentication Tag Mismatch</strong></summary>
 
-**Message**: "Decryption failed: authentication tag verification failed"
+**Message**: "Decryption failed: ..." (or "Key fingerprint mismatch: ..." / "Tenant mismatch: ...")
+
+**Exception**: `DecryptionAuthenticationError`, raised to the caller only with fail-closed on (`CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`). By default the read logs a warning, evicts the entry and recomputes.
 
 **Cause**:
 - Master key was changed (can't decrypt old data)
@@ -475,34 +483,44 @@ redis-cli FLUSHDB
 </details>
 
 <details>
-<summary><strong>E004: Serialization Compatibility Error</strong></summary>
+<summary><strong>Serialization Compatibility Error</strong></summary>
 
-**Message**: "Could not serialize object of type X"
+**Message** (logged): "Serialization failed with ...: TypeError", then "Failed to store in backend cache for ...: SerializationError"
 
-**Cause**: Data type not supported by serializer
+**Exception**: none raised to a `@cache`-decorated caller: the result is returned but not stored in the backend
+
+**Cause**: Data type not supported by serializer. The default serializer handles `None`, `bool`, `int`, `float`, `str`, `bytes`, `list`, `tuple`, `dict`, `datetime`, `date` and `time`.
 
 **When it occurs**:
-```python notest
+```python
 from cachekit import cache
-import datetime
+from dataclasses import dataclass
 
-# WRONG - datetime not serializable by default serializer
+@dataclass
+class Point:
+    x: int
+    y: int
+
+# WRONG - dataclass not serializable by the default serializer
 @cache()
-def get_timestamp():
-    return datetime.datetime.now()
+def get_point():
+    return Point(1, 2)
 ```
 
 **Solution**:
-```python notest
+```python
 from cachekit import cache
-from cachekit.serializers import OrjsonSerializer
-import datetime
+from dataclasses import asdict, dataclass
 
-# OrjsonSerializer handles datetime natively (converts to ISO-8601 string)
-@cache(serializer=OrjsonSerializer(), backend=None)
-def get_timestamp():
-    return {"ts": datetime.datetime.now()}
-```
+@dataclass
+class Point:
+    x: int
+    y: int
+
+# Return plain data instead
+@cache()
+def get_point():
+    return asdict(Point(1, 2))
 ```
 
 </details>
