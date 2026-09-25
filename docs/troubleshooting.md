@@ -464,16 +464,34 @@ python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CA
    Move the drifted instance forward to the fleet's current key, and keep the
    key it wrote with decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS`.
 
-3. **Data corruption**:
+3. **Data corruption**: evict the entry, and the function recomputes and
+   re-caches it with the current key on the next call.
+
+Evict the suspect entry through the decorated function, with the same
+arguments and in the same tenant context as the failing read. It derives the key
+the read used and clears both L1 and L2:
+
+```python notest
+get_data.invalidate_cache(user_id)         # sync function
+await get_data.ainvalidate_cache(user_id)  # async function
+```
+
+Called with no arguments it evicts only the keys this process has cached, not
+the fleet's. It does not cover a function with a custom `key=`: delete that
+entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`.
+
+For bulk eviction, delete by prefix:
+
 ```bash
-# Evict only this namespace's cachekit entries. The Redis backend stores keys
-# as t:<tenant>:ns:<namespace>:... — <tenant> is "default" unless you set one.
-redis-cli --scan --pattern 't:<tenant>:ns:<your-namespace>:*' | xargs -r redis-cli DEL
+# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
+# unless you set one.
+# Namespaced function (@cache.secure(namespace="users", ...)):
+redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
+# No namespace (the default): keys start with func:<module>.<qualname>
+redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
 
 # Only if this Redis database is dedicated to cachekit:
 # redis-cli FLUSHDB
-
-# The function recomputes and re-caches with the current key
 ```
 
 </details>
