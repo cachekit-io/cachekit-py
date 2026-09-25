@@ -16,6 +16,7 @@ from cachekit.hash_utils import redact_error_for_log
 
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
+    CacheHit,
     CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -29,6 +30,7 @@ from ..cache_handler import (
     supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
+from ..config.validation import ConfigurationError
 from ..interop import (
     InteropError,
     bind_flat_args,
@@ -40,8 +42,9 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
+from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, KeyringConfigurationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -562,8 +565,6 @@ def create_cache_wrapper(
     # that bypass DecoratorConfig validation.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
-        from ..config.validation import ConfigurationError
-
         try:
             validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
         except InteropError as e:
@@ -582,6 +583,25 @@ def create_cache_wrapper(
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
         _interop_sig = inspect.signature(func)
+
+    # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
+    # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the
+    # L1-only ObjectCache path below never serializes — so @cache.secure(backend=None)
+    # reported encryption.enabled=True while holding plaintext. Refuse at decoration; a
+    # "serialized L1 without L2" mode does not exist and a warning would keep the leak.
+    # `encryption` is the pre-resolution tri-state: None (env auto-detect, live in
+    # cache_handler.py until LAB-4642 removes it) is deliberately NOT refused — the spec
+    # says key presence never activates, so it must not activate a refusal either.
+    _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
+        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
+    )
+    if _l1_only_mode and (encryption or _encrypting_serializer):
+        raise ConfigurationError(
+            "encryption requires a backend: backend=None is L1-only and stores raw Python "
+            "objects, which cannot be ciphertext. Drop backend=None (the backend then "
+            "resolves from CACHEKIT_API_KEY / REDIS_URL / set_default_backend()) or pass "
+            "one explicitly to keep @cache.secure / encryption=True."
+        )
 
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
@@ -604,7 +624,13 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    invalidator = CacheInvalidator(key_generator, integrity_checking=integrity_checking)
+    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
+    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
+    invalidator = CacheInvalidator(
+        key_generator,
+        integrity_checking=integrity_checking,
+        serializer_type=serialization_handler.serializer_key_name,
+    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
@@ -708,8 +734,6 @@ def create_cache_wrapper(
     _l2_swr_capable_at_decoration = _l2_freshness_capable()
     _stale_ttl: int | None = None
     if stale_ttl is not None:
-        from ..config.validation import ConfigurationError
-
         # Type-check BEFORE the zero opt-out test: bool is an int subclass and
         # False == 0 == 0.0, so without this ordering True silently means a
         # 1-second window and False/0.0 silently opt out unvalidated.
@@ -781,7 +805,7 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[Any, bool, int | None]:
+    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -821,15 +845,16 @@ def create_cache_wrapper(
             return
         _cached_keys.add(cache_key)
 
-    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
-        size_bytes is computed here rather than read from the handler's
-        size_bytes tuple slot (LAB-348), so this label never depends on the
-        handler's tuple shape; the two agree on every in-contract async hit.
+        size_bytes is the length CacheHit already measured (LAB-3757), not a
+        recompute from the envelope. CacheHit.size_bytes is set on every hit
+        including the mmap fast path, where envelope is None and there are no
+        bytes to measure -- so this label never depends on holding the bytes.
 
         Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
         every call site sits inside an `except Exception` that falls through to
@@ -857,16 +882,13 @@ def create_cache_wrapper(
             features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
-                # Defensive encode for an out-of-contract backend: both async readers
-                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
-                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                 features.record_cache_operation(
                     operation="get",
                     namespace=namespace or "default",
                     serializer="rust",
                     success=True,
                     duration_ms=get_duration_ms,
-                    size_bytes=len(envelope),
+                    size_bytes=size_bytes,
                     hit=True,
                 )
         except (ValueError, TypeError) as exc:
@@ -1424,8 +1446,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
-                _found, result, cached_data, size_bytes = cached_result
+                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1811,12 +1833,12 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
-                    _found, result, cached_data, _size_bytes = cached_result
+                    # Cache hit: envelope is the raw serialized bytes for L1 backfill
+                    result, cached_data = cached_result.value, cached_result.envelope
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    _record_l2_hit_async(cached_data, get_duration_ms)
+                    _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1895,9 +1917,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1925,9 +1947,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1973,6 +1995,8 @@ def create_cache_wrapper(
                                     namespace=namespace or "default",
                                     success=True,
                                     duration_ms=set_duration_ms,
+                                    serializer="rust",
+                                    hit=False,  # Was a miss
                                 )
 
                         except InteropError:
@@ -2059,6 +2083,8 @@ def create_cache_wrapper(
                             namespace=namespace or "default",
                             success=True,
                             duration_ms=set_duration_ms,
+                            serializer="rust",
+                            hit=False,  # Was a miss
                         )
 
                 except InteropError:

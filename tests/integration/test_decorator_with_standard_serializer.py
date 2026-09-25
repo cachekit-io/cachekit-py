@@ -104,12 +104,11 @@ class TestDecoratorWithStandardSerializer:
         assert result2["count"] == 1  # Same cached result
         assert call_count == 1  # Function not called again
 
-        # Verify raw key uses StandardSerializer suffix
-        gen = CacheKeyGenerator()
-        raw_key = gen.generate_key(
-            get_data, ("test_key",), {}, namespace="explicit_std", integrity_checking=True, serializer_type="std"
-        )
-        assert raw_key.endswith("1s") or ":1s" in raw_key, f"Expected ':1s' in raw key, got: {raw_key}"
+        # The key the decorator actually wrote must carry the StandardSerializer code.
+        keys = redis_test_client.keys("t:default:ns:explicit_std*")
+        assert len(keys) == 1, f"Expected exactly one cache key, got: {keys}"
+        written = keys[0].decode() if isinstance(keys[0], bytes) else keys[0]
+        assert written.endswith(":1s"), f"Expected ':1s' suffix on the decorator's key, got: {written}"
 
     def test_explicit_auto_serializer_selection(self, redis_test_client):
         """Verify explicit serializer='auto' uses AutoSerializer with :1a suffix."""
@@ -131,25 +130,29 @@ class TestDecoratorWithStandardSerializer:
         assert result2["count"] == 1
         assert call_count == 1
 
-        # Verify raw key uses AutoSerializer suffix (:1a)
-        gen = CacheKeyGenerator()
-        raw_key = gen.generate_key(
-            get_data, ("auto_key",), {}, namespace="explicit_auto", integrity_checking=True, serializer_type="auto"
-        )
-        assert raw_key.endswith("1a") or ":1a" in raw_key, f"Expected ':1a' in raw key for AutoSerializer, got: {raw_key}"
+        # The key the decorator actually wrote must carry the AutoSerializer code (LAB-4351).
+        # Asserting on a key we hand generate_key ourselves would pin nothing: the bug was
+        # that the decorator never passed serializer_type at all.
+        keys = redis_test_client.keys("t:default:ns:explicit_auto*")
+        assert len(keys) == 1, f"Expected exactly one cache key, got: {keys}"
+        written = keys[0].decode() if isinstance(keys[0], bytes) else keys[0]
+        assert written.endswith(":1a"), f"Expected ':1a' suffix on the decorator's key, got: {written}"
 
     def test_cross_serializer_isolation(self, redis_test_client):
         """Verify different serializers create different cache keys for same function arguments."""
         std_count = 0
         auto_count = 0
 
-        @cache(ttl=60, serializer="std", namespace="serializer_std")
+        # One shared namespace on purpose: with different namespaces the keys would differ
+        # for a reason that has nothing to do with the serializer, and the test would pass
+        # against the LAB-4351 bug it is meant to catch.
+        @cache(ttl=60, serializer="std", namespace="serializer_iso")
         def compute_std(x: int) -> dict:
             nonlocal std_count
             std_count += 1
             return {"result": x * 2, "count": std_count, "serializer": "std"}
 
-        @cache(ttl=60, serializer="auto", namespace="serializer_auto")
+        @cache(ttl=60, serializer="auto", namespace="serializer_iso")
         def compute_auto(x: int) -> dict:
             nonlocal auto_count
             auto_count += 1
@@ -164,24 +167,13 @@ class TestDecoratorWithStandardSerializer:
         assert std_count == 1
         assert auto_count == 1
 
-        # Verify different cache keys exist
-        std_keys = redis_test_client.keys("t:default:ns:serializer_std*")
-        auto_keys = redis_test_client.keys("t:default:ns:serializer_auto*")
-
-        assert len(std_keys) > 0, "Expected StandardSerializer cache key"
-        assert len(auto_keys) > 0, "Expected AutoSerializer cache key"
-
-        # Verify raw keys have different serializer suffixes
-        gen = CacheKeyGenerator()
-        raw_key_std = gen.generate_key(
-            compute_std, (5,), {}, namespace="serializer_std", integrity_checking=True, serializer_type="std"
+        # Two distinct keys in one namespace, separated only by the serializer code.
+        written = sorted(
+            k.decode() if isinstance(k, bytes) else k for k in redis_test_client.keys("t:default:ns:serializer_iso*")
         )
-        raw_key_auto = gen.generate_key(
-            compute_auto, (5,), {}, namespace="serializer_auto", integrity_checking=True, serializer_type="auto"
-        )
-
-        assert raw_key_std.endswith("1s") or ":1s" in raw_key_std, f"Expected ':1s' for StandardSerializer, got: {raw_key_std}"
-        assert raw_key_auto.endswith("1a") or ":1a" in raw_key_auto, f"Expected ':1a' for AutoSerializer, got: {raw_key_auto}"
+        assert len(written) == 2, f"Expected two distinct cache keys, got: {written}"
+        suffixes = {k.rsplit(":", 1)[-1] for k in written}
+        assert suffixes == {"1s", "1a"}, f"Expected ':1s' and ':1a' suffixes, got: {suffixes}"
 
     def test_real_redis_integration_with_cache_hits_and_misses(self, redis_test_client):
         """Verify actual cache hits and misses with real Redis backend."""

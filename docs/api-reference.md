@@ -31,7 +31,7 @@ def expensive_function():
 # These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key=secret_key, backend=None)  # Security-critical: PII, medical, financial (requires CACHEKIT_MASTER_KEY env var)
+@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY)
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)
@@ -402,7 +402,7 @@ Does your app need multi-language cache access (PHP/JS/Java/etc)?
 
 > [!WARNING]
 > - **ArrowSerializer is NOT PHP-compatible** - Use StandardSerializer or OrjsonSerializer for PHP
-> - Changing serializers requires cache invalidation (see Serializer Switching section below)
+> - Changing serializers re-keys the function — expect a one-time cold cache (see Serializer Switching section below)
 
 > [!TIP]
 > **StandardSerializer is the default** - No configuration needed for multi-language compatibility.
@@ -543,26 +543,32 @@ The `serializer` parameter accepts:
 
 ### Serializer Switching
 
-When you change a function's serializer, the decorator **automatically detects mismatches**:
+The serializer is part of the cache key, so changing it moves the function to a **separate
+keyspace** rather than colliding with its old entries:
 
 ```python
-# BEFORE: Using StandardSerializer (default)
+# BEFORE: Using StandardSerializer (default) -> keys end in ":1s"
 @cache
 def get_data():
     return df
 
-# AFTER: Switching to ArrowSerializer
+# AFTER: Switching to ArrowSerializer -> keys end in ":1w"
 @cache(serializer="arrow")
 def get_data():
     return df
 
 # First call after change:
-# 1. Cache hit returns old StandardSerializer data
-# 2. Deserializer detects format mismatch
-# 3. Error message explains the mismatch
-# 4. Function executes, caches with new serializer
-# 5. Subsequent calls work normally
+# 1. Cache miss (different key)
+# 2. Function executes, caches under the new serializer's key
+# 3. Subsequent calls hit normally
+# 4. Old entries are never read again and expire on their TTL
 ```
+
+See [Changing Serializers](serializers/README.md#changing-serializers-separate-keyspaces)
+for the code table, the cold-cache warning, and the data-retention caveat on orphaned entries.
+Upgrading from v0.18 or earlier? Keys for non-default serializers change identity without any
+change on your side — see
+[Breaking change in v0.19.0](serializers/README.md#breaking-change-in-v0190-the-key-carries-the-real-serializer).
 
 **Best Practice**: Use namespace versioning for zero-downtime migrations:
 
@@ -589,8 +595,6 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`max_retries`** (`int`, default: `3`) - Maximum retry attempts (env: `CACHEKIT_MAX_RETRIES`)
-- **`retry_delay_ms`** (`int`, default: `100`) - Delay between retries in milliseconds (env: `CACHEKIT_RETRY_DELAY_MS`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
@@ -600,17 +604,10 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 #### Example
 ```python
-from cachekit.config import CachekitConfig
+from cachekit.config import get_settings
 
-# Load from environment variables (recommended)
-config = CachekitConfig()
-
-# Or override specific fields
-config = CachekitConfig(
-    default_ttl=7200,
-    l1_enabled=True,
-    l1_max_size_mb=100,
-)
+# The instance the cache path reads, built from CACHEKIT_* environment variables
+config = get_settings()
 ```
 
 **Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.

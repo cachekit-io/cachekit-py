@@ -60,13 +60,11 @@ class TestRedisBackendConfigEnv:
 
     def test_cachekit_config_generic_fields(self, monkeypatch):
         """Test that CachekitConfig loads generic cache settings."""
-        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
-        monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "5")
+        monkeypatch.setenv("CACHEKIT_MAX_VALUE_SIZE", "52428800")
         monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "256")
 
         config = CachekitConfig.from_env()
-        assert config.default_ttl == 7200
-        assert config.max_retries == 5
+        assert config.max_value_size == 52428800
         assert config.l1_max_size_mb == 256
 
     def test_backend_and_cache_configs_independent(self, monkeypatch):
@@ -76,7 +74,7 @@ class TestRedisBackendConfigEnv:
         monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", "30")
 
         # Set cache-specific env vars
-        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "1800")
+        monkeypatch.setenv("CACHEKIT_ARROW_COMPRESSION", "lz4")
         monkeypatch.setenv("CACHEKIT_L1_MAX_SIZE_MB", "64")
 
         redis_config = RedisBackendConfig.from_env()
@@ -87,12 +85,27 @@ class TestRedisBackendConfigEnv:
         assert redis_config.connection_pool_size == 30
 
         # Verify cache config loaded correctly
-        assert cache_config.default_ttl == 1800
+        assert cache_config.arrow_compression == "lz4"
         assert cache_config.l1_max_size_mb == 64
 
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
-        assert hasattr(cache_config, "default_ttl")
+
+    def test_removed_knob_env_vars_are_ignored(self, monkeypatch):
+        """Stale exports of removed CachekitConfig knobs must not break startup."""
+        removed = {
+            "RETRY_ON_TIMEOUT": "false",
+            "MAX_RETRIES": "5",
+            "RETRY_DELAY_MS": "250",
+            "EARLY_REFRESH_RATIO": "0.5",
+            "ENABLE_CORRUPTION_DETECTION": "false",
+            "MAX_KEY_SIZE": "2048",
+        }
+        for name, value in removed.items():
+            monkeypatch.setenv(f"CACHEKIT_{name}", value)
+
+        config = CachekitConfig.from_env()
+        assert [knob for knob in removed if hasattr(config, knob.lower())] == []
 
 
 class TestRedisUrlAliasChoicesPriority:

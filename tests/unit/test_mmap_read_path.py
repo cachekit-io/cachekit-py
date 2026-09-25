@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cachekit.cache_handler import (
+    CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
@@ -106,7 +107,7 @@ class TestGetCachedValueMmapBranch:
         result = self._handler(sh, ch).get_cached_value("k")
 
         # No envelope (the mmap view never reaches L1, blocker C), but the payload size still rides along
-        assert result == (True, sentinel, None, 4096)
+        assert result == CacheHit(sentinel, None, 4096)
         ch.get_buffer.assert_called_once_with("k")
         ch.get.assert_not_called()  # normal read path NOT used on the mmap hit
         sh.deserialize_data.assert_called_once_with(handle.view, "k")
@@ -135,7 +136,7 @@ class TestGetCachedValueMmapBranch:
 
         ch.get_buffer.assert_called_once()
         ch.get.assert_called_once()  # fell through
-        assert result == (True, "val", b"frame", 5)  # os.read fallback carries the envelope for L1
+        assert result == CacheHit("val", b"frame", 5)  # os.read fallback carries the envelope for L1
 
 
 @pytest.mark.unit
@@ -168,10 +169,8 @@ class TestMmapReadEndToEnd:
             hit = oh.get_cached_value("k")
 
         assert hit is not None
-        found, value, envelope, size_bytes = hit
-        assert found is True
-        assert envelope is None  # mmap hit: nothing to backfill into L1
-        assert size_bytes == len(payload)  # ...yet the payload size is accounted without an os.read copy
-        pd.testing.assert_frame_equal(value, df)
+        assert hit.envelope is None  # mmap hit: nothing to backfill into L1
+        assert hit.size_bytes == len(payload)  # ...yet the payload size is accounted without an os.read copy
+        pd.testing.assert_frame_equal(hit.value, df)
         gb.assert_called_once()  # the real mmap path was taken
         g.assert_not_called()  # not the os.read fallback

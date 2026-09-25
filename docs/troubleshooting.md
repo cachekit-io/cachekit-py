@@ -394,7 +394,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
 
 **When it occurs**:
 ```python notest
-# WRONG - will raise E001
+# Raises when CACHEKIT_MASTER_KEY is unset and no master_key= is passed
 @cache.secure(ttl=300)
 def get_sensitive_data():
     return secrets
