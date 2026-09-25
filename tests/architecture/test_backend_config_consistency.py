@@ -13,13 +13,17 @@ Why this matters:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
+from pydantic import SecretStr, ValidationError
 
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.config.settings import CachekitConfig
 
 # All backend config classes that must follow the pattern
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
@@ -37,6 +41,21 @@ REQUIRED_MODEL_CONFIG_KEYS = {
     "populate_by_name": True,
     "hide_input_in_errors": True,
 }
+
+
+def _assert_no_route_to(exc: ValidationError, secret: str) -> None:
+    """CWE-532: nothing reachable from a config ValidationError may lead back to ``secret``."""
+    for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+        assert secret not in rendered
+    assert exc.__context__ is None
+    assert exc.__cause__ is None
+    for err in exc.errors():
+        assert err["input"] == "[REDACTED]"
+        for value in (err.get("ctx") or {}).values():
+            if isinstance(value, BaseException):
+                # A validator's exception: its traceback frames hold the validator's locals (the raw
+                # value, as a SecretStr or not) and its chain can quote the raw value too.
+                assert (value.__traceback__, value.__context__, value.__cause__) == (None, None, None)
 
 
 class TestBackendConfigInheritance:
@@ -110,17 +129,32 @@ class TestModelConfigConsistency:
         Pinned here, not per backend: the inherited RedactingSettings.__init__ does the redacting, and a
         subclass that overrides __init__ without calling it would silently lose it.
         """
-        from pydantic import ValidationError
-
         with pytest.raises(ValidationError) as exc_info:
             config_cls(totally_fake_field_that_doesnt_exist="SECRET_VALUE")  # type: ignore[call-arg]
 
-        exc = exc_info.value
-        for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
-            assert "SECRET_VALUE" not in rendered
-        assert all(err["input"] == "[REDACTED]" for err in exc.errors())
-        assert exc.__context__ is None
-        assert exc.__cause__ is None
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: CachekitIOBackendConfig(api_key="ck_live_SECRET_VALUE\n"),  # pragma: allowlist secret
+            lambda: CachekitIOBackendConfig(
+                api_key="ck_live_SECRET_VALUE",  # pragma: allowlist secret
+                api_url="https://evil.example.com",
+            ),
+            lambda: CachekitConfig(previous_master_keys=[SecretStr("SECRET_VALUE")]),
+            lambda: MemcachedBackendConfig(servers=["mc1:SECRET_VALUE"]),
+            lambda: MemcachedBackendConfig(servers=["user:SECRET_VALUE@mc1"]),
+        ],
+        ids=["io-whitespace-key", "io-allowlist", "keyring-bad-hex", "memcached-port", "memcached-format"],
+    )
+    def test_validator_errors_leave_no_route_to_the_secret(self, build: Callable[[], object]) -> None:
+        """A validator's own exception rides along in ctx["error"]: its message, its chain and its
+        traceback's frame locals must not recover the value it rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
     def test_non_builtin_error_types_are_redacted_too(self) -> None:
         """A type pydantic-core cannot rebuild by name must still come back as a redacted ValidationError.
@@ -128,7 +162,7 @@ class TestModelConfigConsistency:
         Rebuilding by name raised KeyError inside the except, chaining the raw original. pydantic's own
         Path fields raise "path_type"; a subclass validator may raise PydanticCustomError with a ctx.
         """
-        from pydantic import ValidationError, field_validator
+        from pydantic import field_validator
         from pydantic_core import PydanticCustomError
 
         class StrictURLConfig(BaseBackendConfig):
@@ -153,10 +187,7 @@ class TestModelConfigConsistency:
             {"port": 6379},
         )
         for exc in (file_info.value, custom_info.value):
-            for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
-                assert "SECRET_VALUE" not in rendered
-            assert all(err["input"] == "[REDACTED]" for err in exc.errors())
-            assert exc.__context__ is None
+            _assert_no_route_to(exc, "SECRET_VALUE")
 
 
 class TestFromEnvClassmethod:

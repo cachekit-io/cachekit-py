@@ -112,16 +112,17 @@ class MemcachedBackendConfig(BaseBackendConfig):
         """
         if not v:
             raise ValueError("At least one Memcached server must be specified")
-        for server in v:
+        # Messages name the entry by index, never quote it: a malformed entry may carry a credential.
+        for i, server in enumerate(v):
             if ":" not in server:
-                raise ValueError(f"Server address must be in 'host:port' format, got: {server!r}")
+                raise ValueError(f"servers[{i}]: address must be in 'host:port' format")
             _, port_str = server.rsplit(":", 1)
             try:
                 port = int(port_str)
             except ValueError:
-                raise ValueError(f"Port must be numeric, got: {server!r}") from None
+                raise ValueError(f"servers[{i}]: port must be numeric") from None
             if not (1 <= port <= 65535):
-                raise ValueError(f"Port must be 1-65535, got {port} in {server!r}")
+                raise ValueError(f"servers[{i}]: port must be 1-65535, got {port}")
         return v
 
     @classmethod

@@ -81,6 +81,12 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
             error_type = PydanticCustomError(err["type"], err["msg"], ctx)  # pyright: ignore[reportArgumentType]
         detail: InitErrorDetails = {"type": error_type, "loc": err["loc"], "input": "[REDACTED]"}
         if ctx:
+            for value in ctx.values():
+                if isinstance(value, BaseException):
+                    # A validator's exception (ctx["error"]) keeps its traceback, whose frames hold the
+                    # validator's locals (the raw value), and its chain can quote the raw value. Drop
+                    # both; its type, args and str(), hence msg, are unchanged.
+                    value.__traceback__ = value.__context__ = value.__cause__ = None
             detail["ctx"] = ctx
         sanitized.append(detail)
     return ValidationError.from_exception_data(error.title, sanitized, hide_input=True)
