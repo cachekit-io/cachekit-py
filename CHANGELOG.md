@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.20.0](https://github.com/cachekit-io/cachekit-py/compare/v0.19.0...v0.20.0) (2026-09-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* **decorators:** refuse encryption with backend=None — L1-only held plaintext (LAB-4665) ([#322](https://github.com/cachekit-io/cachekit-py/issues/322))
+* **logging:** `cachekit.logging.JsonFormatter` is removed; importing it now raises ImportError. `StructuredLogger.circuit_breaker_state_change` and `StructuredLogger.set_correlation_id` are removed and now raise AttributeError. No deprecation aliases. Use `set_trace_id` / `clear_trace_id` (or `cachekit.monitoring.correlation_tracking`) for request correlation, and your own `logging.Formatter` subclass for JSON output.
+* **reliability:** cachekit.reliability.create_optimized_decorator_config is renamed to cachekit.reliability.create_decorator_config. Update imports; no alias is provided. cachekit.hash_utils.fast_hash is renamed to blake3_hash (module-internal, never exported from the package).
+* **keys:** cache keys for any serializer other than the default change identity on upgrade — no configuration change is required to be affected. A deployment using `serializer="auto"`, `"orjson"`, `"arrow"`, or any serializer passed as an instance was writing `:1s` keys and will now write `:1a`, `:1o`, `:1w` or an `x`-prefixed code. That function's entire working set recomputes once at deploy, so plan a cold cache or roll out behind existing warm-up / stampede controls. Deployments on the default serializer are unaffected: their keys were already `:1s` and stay `:1s`. Orphaned entries are also a retention question, not only a hit-rate one: once the key changes, `invalidate_cache()` computes the new key and can no longer reach the old copy, so a deletion for erasure, consent withdrawal or permission revocation reports success while the pre-upgrade entry survives to its TTL — or indefinitely where `ttl=None`. Flush the affected namespaces on upgrade if you cache personal data rather than relying on expiry.
+* **config:** CachekitConfig drops retry_on_timeout, max_retries, retry_delay_ms, early_refresh_ratio, enable_corruption_detection and max_key_size, and no longer reads CACHEKIT_RETRY_ON_TIMEOUT, CACHEKIT_MAX_RETRIES, CACHEKIT_RETRY_DELAY_MS, CACHEKIT_EARLY_REFRESH_RATIO, CACHEKIT_ENABLE_CORRUPTION_DETECTION or CACHEKIT_MAX_KEY_SIZE. None of them changed behaviour. Passing one to CachekitConfig(...) now raises ValidationError; CachekitConfig ignores a still-exported env var, so startup is unaffected. CachekitIOBackendConfig declares its own max_retries under the same prefix and still parses CACHEKIT_MAX_RETRIES; this release does not change it. Integrity checking is set per decorator (integrity_checking=), refresh-ahead timing by L1CacheConfig.swr_threshold_ratio, and Memcached retries by MemcachedBackendConfig.retry_attempts.
+* **decorators:** `CachekitIOBackend(...)` configuration errors (missing, empty or whitespace-containing API key; invalid API URL) now raise `cachekit.config.ConfigurationError` at construction instead of `ValueError` or pydantic `ValidationError`, so code catching `ValueError` there must catch `ConfigurationError`. `@cache.io(backend=...)` and `@cache.io(config=...)` now raise `ConfigurationError` instead of silently ignoring the argument. Under `set_default_backend()`, `@cache(config=...)` now uses the backend inside `config=` instead of the module default. `cachekit.backends.cachekitio.client.get_sync_http_client()` is replaced by `lease_sync_http_client()`, which returns a `SyncClientLease`: hold the lease for as long as its `.client` is used, because the client is closed when the lease is dropped.
+* **encryption:** single-tenant tenant_id defaults to "default", not a deployment UUID (LAB-4666) ([#321](https://github.com/cachekit-io/cachekit-py/issues/321))
+
+### Bug Fixes
+
+* **cache_handler:** evict on corrupt CK frame header, not just payload (LAB-4075) ([#307](https://github.com/cachekit-io/cachekit-py/issues/307)) ([ed799c1](https://github.com/cachekit-io/cachekit-py/commit/ed799c133db435a39e87d363474bd23f5ff5624a))
+* **decorators:** [@cache](https://github.com/cache).io accepts api_key= and rejects backend= (LAB-4643) ([#320](https://github.com/cachekit-io/cachekit-py/issues/320)) ([4d36167](https://github.com/cachekit-io/cachekit-py/commit/4d3616759cdf491ef46f9e103b47fa043e217d18))
+* **decorators:** async miss-store records carry serializer/hit like sync (LAB-3755) ([#295](https://github.com/cachekit-io/cachekit-py/issues/295)) ([b733196](https://github.com/cachekit-io/cachekit-py/commit/b733196b3f918a436947daa4e86d5208ff021d9c))
+* **decorators:** refuse encryption with backend=None — L1-only held plaintext (LAB-4665) ([#322](https://github.com/cachekit-io/cachekit-py/issues/322)) ([f5340f6](https://github.com/cachekit-io/cachekit-py/commit/f5340f65b40ff11ca8a918fa0d753bc58eee81f4))
+* **encryption:** classify a non-string original_type header as corruption, not tamper (LAB-4350) ([#310](https://github.com/cachekit-io/cachekit-py/issues/310)) ([2403e7e](https://github.com/cachekit-io/cachekit-py/commit/2403e7ee437e6059c20469ca7237e0c0e2e22fbb))
+* **encryption:** single-tenant tenant_id defaults to "default", not a deployment UUID (LAB-4666) ([#321](https://github.com/cachekit-io/cachekit-py/issues/321)) ([c5da48a](https://github.com/cachekit-io/cachekit-py/commit/c5da48a702840698546bcc1e369c1c475c7dcfa2))
+* **keys:** put the real serializer identity in the cache key (LAB-4351) ([#311](https://github.com/cachekit-io/cachekit-py/issues/311)) ([ee65250](https://github.com/cachekit-io/cachekit-py/commit/ee65250b9d9f2d8842eb760c0197190bd0b5b0a0))
+* **redis:** classify ClusterDownError as TRANSIENT (LAB-5327) ([#339](https://github.com/cachekit-io/cachekit-py/issues/339)) ([e93b693](https://github.com/cachekit-io/cachekit-py/commit/e93b693ef6bb93fd0db8b4167c66ad0223bb13db))
+* **redis:** release a lock won after acquire_lock cancellation (LAB-3606) ([#293](https://github.com/cachekit-io/cachekit-py/issues/293)) ([4cfdc63](https://github.com/cachekit-io/cachekit-py/commit/4cfdc63a67991f117d75275feb57912ab861b4b7))
+
+
+### Code Refactoring
+
+* **config:** remove six CachekitConfig knobs nothing reads (LAB-4740) ([#324](https://github.com/cachekit-io/cachekit-py/issues/324)) ([27e1f95](https://github.com/cachekit-io/cachekit-py/commit/27e1f95dc727e1b2c03ebed8c4dfd42f7caa1ad2))
+* **logging:** remove circuit_breaker_state_change, set_correlation_id and JsonFormatter (LAB-4638) ([#317](https://github.com/cachekit-io/cachekit-py/issues/317)) ([0a71361](https://github.com/cachekit-io/cachekit-py/commit/0a71361593a44f1df9ba7f7d14f73a1cf0795022))
+* **reliability:** rename create_optimized_decorator_config and fast_hash (LAB-4619) ([#315](https://github.com/cachekit-io/cachekit-py/issues/315)) ([8d49e38](https://github.com/cachekit-io/cachekit-py/commit/8d49e38752b2c5e1a2c552b18b28f1f2d8eb4cd2))
+
 ## [0.19.0](https://github.com/cachekit-io/cachekit-py/compare/v0.18.0...v0.19.0) (2026-09-22)
 
 
