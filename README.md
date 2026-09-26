@@ -165,7 +165,7 @@ def get_user_profile(user_id: int):
 | Backpressure | ✅ | ✅ | - | ✅ | ✅ |
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
-| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | ✅ |
+| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
 | L1 Invalidation | - | - | - | ✅ | ✅ |
 | Prometheus Metrics | - | - | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
