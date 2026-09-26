@@ -152,8 +152,8 @@ def get_price(symbol: str):
 def process_payment(amount):
     return payment_gateway.charge(amount)
 
-# Security-critical: PII, medical, financial
-@cache.secure
+# Security-critical: PII, medical, financial (needs a key: master_key= or CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)
 def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
@@ -253,7 +253,7 @@ def test_cached_function():
 <summary><strong>Serializer Examples</strong></summary>
 
 ```python
-from cachekit.serializers import OrjsonSerializer, ArrowSerializer, EncryptionWrapper
+from cachekit.serializers import OrjsonSerializer, ArrowSerializer
 
 # Fast JSON for API responses
 @cache.production(serializer=OrjsonSerializer())
@@ -264,11 +264,30 @@ def get_api_response(endpoint: str):
 @cache(serializer=ArrowSerializer())
 def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
+```
 
-# Encrypted DataFrames for sensitive data
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
+Encrypted DataFrames go through `@cache.secure`, which takes any serializer. A file backend keeps this example self-contained; production uses Redis or cachekit.io:
+
+```python
+import tempfile
+from cachekit.backends.file import FileBackend, FileBackendConfig
+from cachekit.serializers import ArrowSerializer
+
+calls = 0
+
+@cache.secure(
+    master_key=secret_key,
+    serializer=ArrowSerializer(),
+    backend=FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp())),
+)
 def get_patient_data(hospital_id: int):
-    return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
+    global calls
+    calls += 1
+    return pd.DataFrame({"hospital_id": [hospital_id], "patients": [42]})
+
+get_patient_data(7)
+get_patient_data(7)  # second call is served from the encrypted cache
+assert calls == 1
 ```
 
 </details>
