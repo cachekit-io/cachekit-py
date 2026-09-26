@@ -126,6 +126,8 @@ class TestDrainTracked:
         """A script aborted by a failing UNLINK is not rolled back, so a member must leave the
         set only after its own key is unlinked: every member no longer tracked has its key gone,
         and the member whose UNLINK failed stays tracked for the next drain."""
+        if int(client.info("server")["redis_version"].split(".")[0]) < 6:
+            pytest.skip("ACL users need Redis 6+")
         pool = client.connection_pool
         client.execute_command("ACL", "SETUSER", "drain_limited", "on", "nopass", f"~t:self:{REG}", "~t:self:ok*", "+@all")
         try:

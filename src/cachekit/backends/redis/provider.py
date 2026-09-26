@@ -51,7 +51,11 @@ _DRAIN_WARN_KEYS = 100_000
 # key unlinked is always inside this backend's own tenant prefix. A member leaves the set
 # only after its own UNLINK: Redis does not roll back a script that errors midway, so
 # removing members first (SPOP) would lose every one whose key a failed call never reached.
+# replicate_commands() lets writes follow the random SRANDMEMBER on a 6.x server configured
+# with lua-replicate-commands no; effects replication is the default from 5.0, and 7.0+
+# keeps the call as a no-op.
 _DRAIN_SCRIPT = """
+redis.replicate_commands()
 local members = redis.call('SRANDMEMBER', KEYS[1], ARGV[2])
 for i = 1, #members do
     redis.call('UNLINK', ARGV[1] .. members[i])
