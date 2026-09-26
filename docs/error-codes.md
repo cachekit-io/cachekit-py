@@ -334,7 +334,7 @@ def get_data():
 
 **Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see E003 above.
 
-**What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see E003 above.)
+**What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see E003 above.) One direct-API cause is an `integrity_checking` mismatch between the writer and reader — see [AutoSerializer's cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch).
 
 **Solution**:
 ```bash
