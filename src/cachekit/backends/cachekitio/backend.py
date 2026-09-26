@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import random
 import time
@@ -19,9 +20,10 @@ from cachekit.backends.cachekitio.client import get_cached_async_http_client, le
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.backends.redis.provider import _await_uninterrupted
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.hash_utils import redact_error_for_log
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
 
 # Module-level logger
 _logger = get_structured_logger(__name__)
+# Unsampled stdlib logger for one-off lock warnings that _logger's sampling could drop.
+logger = logging.getLogger(__name__)
 
 # Lock capability token travels in this request header, never the query string:
 # a ?lock_id= query leaks the token into access/proxy logs and OpenTelemetry
@@ -725,6 +729,30 @@ class CachekitIOBackend:
 
         return lock_id if isinstance(lock_id, str) else None
 
+    async def _try_acquire_lock_drained(self, lock_key: str, timeout: float) -> str | None:
+        """``_try_acquire_lock``, run to completion even if the caller is cancelled meanwhile.
+
+        A cancel thrown into the in-flight POST loses the server's answer, not the grant, so the
+        attempt runs as its own Task and is drained. If the caller was cancelled, a won lock is
+        released before the cancel propagates, and a failed attempt is logged: the cancel always
+        wins, otherwise the wrapper would carry on (or retry) in a task that was cancelled.
+        """
+        attempt = asyncio.ensure_future(self._try_acquire_lock(lock_key, timeout))
+        try:
+            return await _await_uninterrupted(attempt)
+        except asyncio.CancelledError:
+            if attempt.cancelled():
+                raise  # the attempt itself was cancelled (e.g. asyncio.run teardown): no outcome to read
+            if (err := attempt.exception()) is not None:
+                logger.warning(
+                    "CachekitIO lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                    redact_cache_key(lock_key),
+                    redact_error_for_log(err),
+                )
+            elif (won := attempt.result()) is not None:
+                await self._release_lock(lock_key, won)
+            raise
+
     @asynccontextmanager
     async def acquire_lock(
         self,
@@ -749,7 +777,7 @@ class CachekitIOBackend:
         """
         lock_id: str | None = None
         try:
-            lock_id = await self._try_acquire_lock(key, timeout)
+            lock_id = await self._try_acquire_lock_drained(key, timeout)
 
             if lock_id is None and blocking_timeout is not None:
                 deadline = time.monotonic() + blocking_timeout
@@ -761,7 +789,7 @@ class CachekitIOBackend:
                     # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
                     jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
                     await asyncio.sleep(min(delay, remaining) * jitter)
-                    lock_id = await self._try_acquire_lock(key, timeout)
+                    lock_id = await self._try_acquire_lock_drained(key, timeout)
                     delay = min(delay * 2, 0.5)
 
             yield lock_id is not None
@@ -775,7 +803,13 @@ class CachekitIOBackend:
         Best-effort: swallows ``BackendError`` and returns False so a release failure
         inside ``__aexit__`` cannot mask the user's exception. The server-side ``timeout``
         on the lock is the safety net if the DELETE never lands.
+
+        Drained: the DELETE runs as its own Task to completion however many cancels land
+        meanwhile; a cancel thrown into it would otherwise leave the lock held.
         """
+        return await _await_uninterrupted(asyncio.ensure_future(self._delete_lock(lock_key, lock_id)))
+
+    async def _delete_lock(self, lock_key: str, lock_id: str) -> bool:
         # lock_key is caller-controlled → percent-encode it into the path. lock_id is a
         # capability token and travels in the X-CacheKit-Lock-Id header, NOT the query
         # string (CWE-532): a ?lock_id= query leaks it into access/proxy logs and OTel
@@ -785,6 +819,8 @@ class CachekitIOBackend:
             await self._request_async("DELETE", f"{encoded_key}/lock", headers={LOCK_ID_HEADER: lock_id})
             return True
         except BackendError:
+            # Swallowed inside the drained Task, not around the drain: once a cancel has landed the
+            # drain re-raises it, and an error left on the Task surfaces only at GC as "never retrieved".
             return False
 
     # ==================== TTLInspectableBackend Protocol ====================
