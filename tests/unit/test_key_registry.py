@@ -239,6 +239,39 @@ class TestTrackingSites:
         assert "since the last warning: 1)" in warnings[0]
         assert "since the last warning: 50)" in warnings[1]
 
+    def test_concurrent_track_failures_emit_one_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        n = 32
+        barrier = threading.Barrier(n, timeout=10)
+
+        class BarrierBackend(TrackingBackend):
+            def track_key(self, registry_id: str, key: str) -> None:
+                barrier.wait()  # every writer fails at once
+                raise BackendError("track failed")
+
+        class SlowHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                time.sleep(0.02)  # a slow sink widens any check-to-claim gap
+
+        @cache(backend=BarrierBackend(), ttl=60, namespace="track_burst")
+        def f(x: int) -> int:
+            return x
+
+        slow = SlowHandler(logging.WARNING)
+        wrapper_logger = logging.getLogger("cachekit.decorators.wrapper")
+        wrapper_logger.addHandler(slow)
+        try:
+            with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+                threads = [threading.Thread(target=f, args=(i,)) for i in range(n)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(10)
+        finally:
+            wrapper_logger.removeHandler(slow)
+        assert not barrier.broken
+        warnings = [r for r in caplog.records if "Key tracking failed" in r.getMessage()]
+        assert len(warnings) == 1  # the window is claimed atomically, not after logging returns
+
     def test_fallback_to_local_when_not_trackable(self) -> None:
         backend = PlainBackend()
         assert not supports_key_tracking(backend)

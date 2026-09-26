@@ -837,22 +837,25 @@ def create_cache_wrapper(
         try:
             _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
         except Exception as e:
-            # Unlocked: racing threads can at worst miscount or emit one extra WARNING in a
-            # window. The volume stays bounded, which is all the throttle is for.
-            _track_failures += 1
-            now = time.monotonic()
-            if now - _track_warned_at < _TRACK_WARN_INTERVAL_SECONDS:
+            # Claim the window under the lock, log outside it: concurrent failures then emit
+            # one WARNING, and a slow log sink never serializes the failing writers.
+            with _track_warn_lock:
+                _track_failures += 1
+                now = time.monotonic()
+                failures = 0
+                if now - _track_warned_at >= _TRACK_WARN_INTERVAL_SECONDS:
+                    failures, _track_failures, _track_warned_at = _track_failures, 0, now
+            if not failures:
                 _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
                 return
             _logger.warning(
                 "Key tracking failed in registry %s (failures since the last warning: %d); other processes' "
                 "drains miss those keys until their TTL. Latest key %s: %s",
                 redact_cache_key(_registry_id),
-                _track_failures,
+                failures,
                 redact_cache_key(cache_key),
                 redact_error_for_log(e),
             )
-            _track_warned_at, _track_failures = now, 0
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
@@ -1131,6 +1134,7 @@ def create_cache_wrapper(
     # track_key failure WARNING throttle: when it last fired (monotonic), failures since.
     _track_warned_at = float("-inf")
     _track_failures = 0
+    _track_warn_lock = threading.Lock()
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
