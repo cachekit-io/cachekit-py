@@ -147,8 +147,8 @@ other operations, so this is an operation-success rate, not a hit rate.
 ```
 
 For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
-writes back, but it is a write proxy — it can double-count when stats collection is on
-and records nothing for a failed write — so treat it as a proxy, not an exact miss count.
+writes back, but it is a write proxy — it records nothing for a failed write — so treat it
+as a proxy, not an exact miss count.
 
 ```promql
 # Cache-write rate as a miss-rate proxy (see caveats above)

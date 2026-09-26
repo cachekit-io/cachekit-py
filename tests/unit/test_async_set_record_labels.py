@@ -1,10 +1,9 @@
 """Async miss-store stats parity (LAB-3755).
 
-The sync wrapper records its miss-store as ``operation="set", serializer="rust",
-hit=False``. The async wrapper's two miss-store sites — under the distributed
-lock and on the no-lock fallback — recorded ``set`` with neither label, so the
-Prometheus sink filed async sets under ``serializer="unknown"`` with no hit
-marker. Both async paths are pinned here through the real decorator stack; the
+The sync wrapper records its miss-store as ``operation="set", serializer="rust"``.
+The async wrapper's two miss-store sites — under the distributed lock and on the
+no-lock fallback — recorded ``set`` without the label, so the Prometheus sink filed
+async sets under ``serializer="unknown"``. Both async paths are pinned here through the real decorator stack; the
 backend decides which path runs (``acquire_lock`` present → locked).
 """
 
@@ -17,8 +16,8 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.l1_cache import get_l1_cache_manager
+from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
 
 class _ByteStore:
@@ -64,13 +63,12 @@ def setup_di_for_redis_isolation() -> Iterator[None]:
 
 @pytest.fixture
 def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Capture the wrapper's explicit features.record_cache_operation(...) calls, keyword args as passed.
+    """Capture every cache-operation metric record, keyword args as passed.
 
-    Patched at the orchestrator, not the collector: record_success() also forwards an
-    operation-context record to the collector, which would shadow the labels under test.
+    Patched at the collector, the metrics sink: every record that reaches Prometheus passes here.
     """
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(FeatureOrchestrator, "record_cache_operation", lambda self, **kw: calls.append(kw))
+    monkeypatch.setattr(AsyncMetricsCollector, "record_cache_operation", lambda self, **kw: calls.append(kw))
     return calls
 
 
@@ -86,6 +84,5 @@ async def test_async_miss_store_records_sync_set_labels(recorded: list[dict[str,
     assert await compute() == {"answer": 42}
     assert backend.store  # the miss reached L2, so a set record must exist
 
-    sets = [c for c in recorded if c["operation"] == "set"]
-    assert len(sets) == 1
-    assert (sets[0].get("serializer"), sets[0].get("hit")) == ("rust", False)  # what the sync miss-store passes
+    assert len(recorded) == 1  # one miss, one record: the set
+    assert (recorded[0]["operation"], recorded[0].get("serializer")) == ("set", "rust")  # what the sync miss-store passes

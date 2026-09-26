@@ -887,7 +887,6 @@ def create_cache_wrapper(
                     success=True,
                     duration_ms=get_duration_ms,
                     size_bytes=size_bytes,
-                    hit=True,
                 )
         except (ValueError, TypeError) as exc:
             # The collector's documented refusals: duplicated timeseries, a label set
@@ -1359,7 +1358,6 @@ def create_cache_wrapper(
                             success=True,
                             duration_ms=0.001,  # ~1μs for L1 hit
                             size_bytes=len(l1_bytes),
-                            hit=True,
                         )
 
                     features.log_cache_operation(
@@ -1479,7 +1477,6 @@ def create_cache_wrapper(
                         success=True,
                         duration_ms=duration * 1000,
                         size_bytes=size_bytes,
-                        hit=True,
                     )
 
                 # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
@@ -1556,7 +1553,6 @@ def create_cache_wrapper(
                         success=True,
                         duration_ms=total_latency,
                         serializer="rust",
-                        hit=False,  # Was a miss
                     )
 
             except InteropError:
@@ -1744,7 +1740,6 @@ def create_cache_wrapper(
                                 success=True,
                                 duration_ms=0.001,  # Sub-microsecond
                                 size_bytes=len(l1_bytes),
-                                hit=True,
                             )
 
                         # Record L1 hit for cache_info()
@@ -1994,7 +1989,6 @@ def create_cache_wrapper(
                                     success=True,
                                     duration_ms=set_duration_ms,
                                     serializer="rust",
-                                    hit=False,  # Was a miss
                                 )
 
                         except InteropError:
@@ -2082,7 +2076,6 @@ def create_cache_wrapper(
                             success=True,
                             duration_ms=set_duration_ms,
                             serializer="rust",
-                            hit=False,  # Was a miss
                         )
 
                 except InteropError:
