@@ -6,7 +6,6 @@ performance with different levels of reliability features.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
 
 from cachekit.health import HealthLevel
 
@@ -161,73 +160,6 @@ def get_profile_config(profile: ReliabilityProfile) -> ProfileConfig:
     return PROFILE_CONFIGS[profile]
 
 
-def get_decorator_kwargs(profile: ReliabilityProfile, overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Get decorator kwargs for a reliability profile.
-
-    Args:
-        profile: The reliability profile
-        overrides: Optional parameter overrides
-
-    Returns:
-        Dictionary of decorator parameters
-    """
-    config = get_profile_config(profile)
-
-    # Convert profile config to decorator parameters
-    kwargs = {
-        # Core reliability features
-        "circuit_breaker": config.circuit_breaker,
-        "backpressure": config.backpressure,
-        "max_concurrent_requests": config.max_concurrent_requests,
-        # Monitoring features
-        "collect_stats": config.collect_stats,
-        "enable_tracing": config.async_metrics,  # Map to tracing for now
-        "enable_structured_logging": config.enable_structured_logging,
-    }
-
-    # Apply any overrides
-    if overrides:
-        kwargs.update(overrides)
-
-    return kwargs
-
-
-def create_decorator_config(profile: ReliabilityProfile = ReliabilityProfile.BALANCED, **overrides: Any) -> dict[str, Any]:
-    """Create a decorator configuration dict for a reliability profile.
-
-    Args:
-        profile: Base reliability profile
-        **overrides: Parameter overrides
-
-    Returns:
-        The profile's settings plus ``_``-prefixed tuning keys
-    """
-    config = get_profile_config(profile)
-
-    decorator_config = {
-        # Core reliability
-        "circuit_breaker": config.circuit_breaker,
-        "backpressure": config.backpressure,
-        "max_concurrent_requests": config.max_concurrent_requests,
-        # Monitoring
-        "collect_stats": config.collect_stats,
-        "enable_tracing": config.async_metrics,
-        "enable_structured_logging": config.enable_structured_logging,
-        # Performance optimizations
-        "_use_async_metrics": config.async_metrics,
-        "_use_lightweight_health": True,
-        "_health_check_level": config.health_check_level.value,
-        "_backpressure_read_ops": config.backpressure_read_operations,
-        "_metrics_batch_size": config.metrics_batch_size,
-        "_metrics_flush_interval": config.metrics_flush_interval,
-    }
-
-    # Apply overrides
-    decorator_config.update(overrides)
-
-    return decorator_config
-
-
 def get_profile_description(profile: ReliabilityProfile) -> str:
     """Get human-readable description of a profile.
 
@@ -302,19 +234,3 @@ def recommend_profile(throughput_rps: int, criticality: str = "medium", latency_
 
     # Default to balanced for most use cases
     return ReliabilityProfile.BALANCED
-
-
-# Convenience functions for common patterns
-def minimal_reliability_decorator(**overrides):
-    """Get minimal reliability decorator configuration."""
-    return create_decorator_config(ReliabilityProfile.MINIMAL, **overrides)
-
-
-def balanced_reliability_decorator(**overrides):
-    """Get balanced reliability decorator configuration."""
-    return create_decorator_config(ReliabilityProfile.BALANCED, **overrides)
-
-
-def full_reliability_decorator(**overrides):
-    """Get full reliability decorator configuration."""
-    return create_decorator_config(ReliabilityProfile.FULL, **overrides)
