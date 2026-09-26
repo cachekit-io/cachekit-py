@@ -64,13 +64,9 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
 | `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`) |
-| `half_open_requests` | `int` | `1` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit) |
+| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Keep it `>= success_threshold`, or a HALF_OPEN cycle cannot close |
 
-> [!WARNING]
-> **Current limitation:** on the `@cache` path, a circuit that opens does not currently leave
-> OPEN on its own; it stays OPEN until the process restarts. So today only `failure_threshold`
-> changes how a decorated function behaves. `success_threshold`, `recovery_timeout` and
-> `half_open_requests` are accepted and reported by `get_health_status()`, but have no effect yet.
+> [!NOTE]
 > The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples
 > on this page so they run anywhere) it is never consulted. The examples show configuration,
 > not protection.
@@ -173,7 +169,7 @@ from cachekit.config.nested import CircuitBreakerConfig
 @cache(ttl=300, circuit_breaker=CircuitBreakerConfig(recovery_timeout=1.0), backend=None)
 def problematic_function():
     # Problem: a 1s cooldown re-probes a still-failing backend every second
-    # (OPEN → HALF_OPEN → OPEN). Not reachable today; see Current limitation above.
+    # (OPEN → HALF_OPEN → OPEN).
     # Solution: Increase cooldown to 30-60 seconds
     return expensive_operation()  # illustrative - not defined
 

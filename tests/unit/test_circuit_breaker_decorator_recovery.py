@@ -37,6 +37,7 @@ import pytest
 import time_machine
 
 from cachekit import cache
+from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators import orchestrator as orchestrator_module
 from cachekit.decorators import wrapper as wrapper_module
@@ -339,6 +340,58 @@ class TestRecovery:
 
         runs = len(executions)
         assert await _call(fn, "probe-0") == "v:probe-0"
+        assert len(executions) == runs  # served from the backend, not recomputed
+
+
+class TestKnobPathRecovery:
+    """``@cache(circuit_breaker=nested CircuitBreakerConfig(...))`` recovers on the configured cooldown.
+
+    Uses an explicit backend and the public ``get_health_status()``. The breaker is
+    tripped by function exceptions, which reach ``record_failure`` with an explicit
+    backend today. Recovery closes only if the nested probe budget reaches
+    ``success_threshold``, so this also pins the nested default.
+    """
+
+    _KNOBS = NestedCircuitBreakerConfig(failure_threshold=2, recovery_timeout=5.0)  # far below the 30s default
+
+    async def test_recovers_after_configured_recovery_timeout(self, is_async, backend, clock):
+        executions: list[str] = []
+
+        def body(x: str) -> str:
+            executions.append(x)
+            if x.startswith("boom"):
+                raise RuntimeError("function failed")
+            return f"v:{x}"
+
+        async def async_body(x: str) -> str:
+            return body(x)
+
+        fn = cache(
+            ttl=300, l1_enabled=False, namespace=f"lab5326-knob-{is_async}", backend=backend, circuit_breaker=self._KNOBS
+        )(async_body if is_async else body)
+
+        def breaker_state() -> str:
+            return fn.get_health_status()["circuit_breaker"]["state"]
+
+        for i in range(self._KNOBS.failure_threshold):
+            with pytest.raises(RuntimeError, match="function failed"):
+                await _call(fn, f"boom-{i}")
+        assert breaker_state() == "open"
+
+        clock.shift(timedelta(seconds=self._KNOBS.recovery_timeout / 2))
+        gets = backend.gets
+        assert await _call(fn, "inside-cooldown") == "v:inside-cooldown"
+        assert backend.gets == gets  # still inside the configured cooldown: rejected
+
+        clock.shift(timedelta(seconds=self._KNOBS.recovery_timeout))  # past recovery_timeout, under the default
+        probes = [f"probe-{i}" for i in range(self._KNOBS.success_threshold)]  # cold keys: misses reach L2
+        for key in probes:
+            assert await _call(fn, key) == f"v:{key}"
+        assert backend.gets == gets + len(probes)  # the backend is called again
+        assert breaker_state() == "closed"
+
+        runs = len(executions)
+        assert await _call(fn, probes[0]) == f"v:{probes[0]}"
         assert len(executions) == runs  # served from the backend, not recomputed
 
 

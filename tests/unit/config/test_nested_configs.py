@@ -74,7 +74,7 @@ class TestCircuitBreakerConfig:
         assert config.success_threshold == 3
         assert config.recovery_timeout == 30.0
         # Matches the live breaker's default (reliability.CircuitBreakerConfig), which these knobs now configure
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
 
     def test_custom_values(self) -> None:
         """Test custom configuration."""

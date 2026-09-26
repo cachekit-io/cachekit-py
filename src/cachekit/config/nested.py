@@ -86,14 +86,13 @@ class CircuitBreakerConfig:
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
             probe; finite and >= 0 (default: 30.0)
         half_open_requests: Total probe requests admitted per HALF_OPEN cycle, not a
-            concurrency limit (default: 1)
+            concurrency limit; keep it >= success_threshold or a cycle cannot close
+            (default: 3)
 
     The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
     ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``
-    reports them. Today only ``failure_threshold`` changes decorator behaviour: an
-    OPEN circuit on the ``@cache`` path does not currently leave OPEN on its own, so
-    the three recovery knobs are reported but have no effect yet. Their defaults
-    equal ``cachekit.reliability.CircuitBreakerConfig()``'s, and a test pins that.
+    reports them. Their defaults equal ``cachekit.reliability.CircuitBreakerConfig()``'s,
+    and a test pins that.
 
     This is the class ``@cache(circuit_breaker=...)`` takes. ``cachekit.CircuitBreakerConfig``
     is a different class that configures a standalone ``CircuitBreaker``.
@@ -126,7 +125,7 @@ class CircuitBreakerConfig:
     failure_threshold: int = 5
     success_threshold: int = 3
     recovery_timeout: float = 30.0
-    half_open_requests: int = 1
+    half_open_requests: int = 3
 
     def validate(self) -> None:
         """Validate circuit breaker configuration.
