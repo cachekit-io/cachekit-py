@@ -8,6 +8,7 @@ Public API:
     - BaseBackend: Core protocol (5 methods: get, set, delete, exists, health_check)
     - TTLInspectableBackend: Optional protocol for TTL inspection/refresh
     - LockableBackend: Optional protocol for distributed locking
+    - KeyTrackableBackend: Optional protocol for server-side key tracking (whole-function invalidation)
     - TimeoutConfigurableBackend: Optional protocol for per-operation timeouts
     - BackendProvider: Dependency injection protocol
     - BackendError: Exception raised by backend operations
@@ -33,6 +34,7 @@ from typing import Protocol
 
 from cachekit.backends.base import (
     BaseBackend,
+    KeyTrackableBackend,
     LockableBackend,
     TimeoutConfigurableBackend,
     TTLInspectableBackend,
@@ -51,6 +53,7 @@ __all__ = [
     "inherit_config",
     "TTLInspectableBackend",
     "LockableBackend",
+    "KeyTrackableBackend",
     "TimeoutConfigurableBackend",
     "BackendProvider",
     "BackendError",

@@ -15,13 +15,14 @@ import asyncio
 import functools
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, Optional, TypeVar
 from urllib.parse import quote as url_encode
 
 import redis
+from redis.commands.core import Script
 from redis.exceptions import LockNotOwnedError
 
 from cachekit.backends.base import BaseBackend
@@ -35,6 +36,33 @@ logger = logging.getLogger(__name__)
 tenant_context: ContextVar[Optional[str]] = ContextVar("tenant_context", default=None)
 
 T = TypeVar("T")
+
+# Key registry (KeyTrackableBackend). A tracking set lives 7 days past its last write.
+_TRACKING_SET_TTL_SECONDS = 604_800
+# Members popped (and keys unlinked) per script call. Bounds each atomic step well under
+# lua-time-limit: a script that has written cannot be SCRIPT KILLed, so unbounded work in
+# one call can leave every other client on this Redis answered with BUSY.
+_DRAIN_CHUNK = 10_000
+# 10M members. Past this a write storm is outrunning the drain; stop and warn.
+_DRAIN_MAX_ROUNDS = 1_000
+_DRAIN_WARN_KEYS = 100_000
+# KEYS[1] = scoped tracking set; ARGV[1] = tenant key prefix; ARGV[2] = chunk size.
+# Members are stored raw and the prefix is applied here, so whatever a member says, the
+# key unlinked is always inside this backend's own tenant prefix. A member leaves the set
+# only after its own UNLINK: Redis does not roll back a script that errors midway, so
+# removing members first (SPOP) would lose every one whose key a failed call never reached.
+# replicate_commands() lets writes follow the random SRANDMEMBER on a 6.x server configured
+# with lua-replicate-commands no; effects replication is the default from 5.0, and 7.0+
+# keeps the call as a no-op.
+_DRAIN_SCRIPT = """
+redis.replicate_commands()
+local members = redis.call('SRANDMEMBER', KEYS[1], ARGV[2])
+for i = 1, #members do
+    redis.call('UNLINK', ARGV[1] .. members[i])
+    redis.call('SREM', KEYS[1], members[i])
+end
+return members
+"""
 
 
 async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
@@ -121,6 +149,9 @@ class PerRequestRedisBackend:
         # Fix #2: URL-encode tenant ID to prevent ':' collision
         self._tenant_id = url_encode(tenant_id, safe="")
         self._original_tenant_id = tenant_id
+
+        # Registered on first drain. Per instance, not module-global: a Script holds its client.
+        self._drain_script: Optional[Script] = None
 
     @property
     def key_prefix(self) -> str:
@@ -469,6 +500,114 @@ class PerRequestRedisBackend:
                     await _release()
         except Exception as exc:
             raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        """Record a written cache key in the registry's tracking set (KeyTrackableBackend protocol).
+
+        One pipelined round-trip: ``SADD`` the key, then ``EXPIRE`` the set to 7 days, so a set
+        lives until seven days after the last write to its function. The set name is
+        tenant-scoped; the member is stored RAW — ``drain_tracked`` applies the tenant prefix
+        itself, so no member can name a key outside this tenant.
+
+        Args:
+            registry_id: Unscoped registry id (``ck:reg:{namespace}:{hash}``)
+            key: Raw cache key, exactly as passed to ``set``
+
+        Raises:
+            BackendError: If the Redis round-trip fails
+        """
+        scoped_reg = self._scoped_key(registry_id)
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.sadd(scoped_reg, key)
+            pipe.expire(scoped_reg, _TRACKING_SET_TTL_SECONDS)
+            pipe.execute()
+        except Exception as exc:
+            raise classify_redis_error(exc, operation="track_key", key=registry_id) from exc
+
+    def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
+        """Delete every tracked key of a registry, then every local key the drain missed
+        (KeyTrackableBackend protocol).
+
+        Each script call atomically pops at most 10 000 members: it ``UNLINK``s
+        ``{tenant prefix}{member}`` for each, then removes the member from the set, so a member
+        is never dropped before its key is. Calls repeat until one pops a short chunk. A
+        write landing during the drain is either popped by a later call or stays in the set
+        for the next drain — never orphaned. Past 1 000 calls the drain stops with a WARNING
+        and the remaining members wait for the next drain.
+
+        Then every key of ``local_keys`` that no call popped is ``UNLINK``ed, up to 10 000
+        keys per command. These are normal: another process's drain already popped keys this
+        process still remembers, a ``track_key`` failed, or the key predates tracking.
+
+        Args:
+            registry_id: Unscoped registry id (``ck:reg:{namespace}:{hash}``)
+            local_keys: The caller's snapshot of the raw keys it knows about
+
+        Returns:
+            Raw keys deleted — decoded popped members plus all of ``local_keys``
+
+        Raises:
+            BackendError: If the script or an ``UNLINK`` batch fails (``NOSCRIPT`` is
+                handled by redis-py re-loading the script). Keys already unlinked stay
+                deleted; members whose keys were not unlinked stay in the set for the next
+                drain.
+
+        Requires a single-instance (or primary/replica) Redis server >= 5.0 and, for
+        restricted ACL users, the ``@scripting`` category. Redis Cluster is unsupported:
+        the script unlinks keys it does not declare, which a cluster rejects.
+        """
+        scoped_reg = self._scoped_key(registry_id)
+        try:
+            if self._drain_script is None:
+                self._drain_script = self._client.register_script(_DRAIN_SCRIPT)
+            out: set[str] = set()
+            undecodable = 0
+            for _ in range(_DRAIN_MAX_ROUNDS):
+                popped = self._drain_script(keys=[scoped_reg], args=[self.key_prefix, _DRAIN_CHUNK])
+                if not isinstance(popped, list):
+                    raise BackendError(
+                        message=f"Redis drain script returned unexpected type: {type(popped).__name__}",
+                        operation="drain_tracked",
+                        key=registry_id,
+                    )
+                for member in popped:
+                    try:
+                        out.add(member.decode("utf-8") if isinstance(member, bytes) else member)
+                    except UnicodeDecodeError:
+                        # Not a key this SDK wrote (keys are str); the script already unlinked it.
+                        undecodable += 1
+                if len(popped) < _DRAIN_CHUNK:
+                    break
+            else:
+                logger.warning(
+                    "Key registry drain for %s stopped after %d rounds; remaining members wait for the next drain",
+                    redact_cache_key(registry_id),
+                    _DRAIN_MAX_ROUNDS,
+                )
+            if undecodable:
+                # One line per drain, never per member, never the member bytes: a set stuffed with
+                # garbage must not become a log flood. Not raised — the members are already
+                # unlinked, and raising would only discard the valid keys' L1 evictions.
+                logger.warning(
+                    "Key registry drain for %s unlinked %d undecodable members; the tracking set was written outside cachekit",
+                    redact_cache_key(registry_id),
+                    undecodable,
+                )
+            stragglers = [k for k in local_keys if k not in out]
+            for i in range(0, len(stragglers), _DRAIN_CHUNK):
+                chunk = stragglers[i : i + _DRAIN_CHUNK]
+                self._client.unlink(*(self._scoped_key(k) for k in chunk))
+                out.update(chunk)
+        except Exception as exc:
+            raise classify_redis_error(exc, operation="drain_tracked", key=registry_id) from exc
+        logger.log(
+            logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
+            "Key registry drained %d keys for %s",
+            len(out),
+            redact_cache_key(registry_id),
+        )
+        return out
 
     @asynccontextmanager
     async def with_timeout(

@@ -2,7 +2,7 @@
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
-> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
+> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). On the env-resolved Redis backend, whole-function invalidation also deletes the L2 entries *other* processes wrote ([key registry](#whole-function-invalidation)). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance L1 invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
 
 > [!IMPORTANT]
 > The within-TTL SWR described on this page runs **only in L1-only mode** (`backend=None`): past the freshness threshold, the SDK serves the cached value and **re-runs your function** in the background. With a backend configured (Redis, File, Memcached), `swr_enabled` has no effect — there is no within-TTL SWR in backed modes. The one backed SWR that exists is `@cache.io`'s past-TTL [`stale_ttl` mode](../configuration.md#stale-while-revalidate-stale_ttl), which uses the CachekitIO backend's read-side freshness signal.
@@ -178,18 +178,33 @@ for uid in [1, 2, 3]:
 
 ### Whole-Function Invalidation
 
-Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry this process has written for that function:
+Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function. How far "every" reaches depends on the backend:
 
 ```python notest
 @cache
 def get_user(user_id: int):
     return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
 
-# Clear all get_user entries written by this process (L1 + L2)
+# Clear all get_user entries (L1 + L2)
 get_user.invalidate_cache()
 ```
 
-**Limitation:** Key tracking is process-local. Entries written to L2 by *other* processes for the same function are not deleted; they remain until their TTL expires.
+| Backend the decorator resolves | L2 entries deleted |
+|--------------------------------|--------------------|
+| Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (the default, no `backend=`) | Every entry **any process** wrote for the function |
+| `RedisBackend` passed as `backend=`, File, Memcached, CachekitIO | Only entries **this process** wrote or read |
+| L1-only (`backend=None`) | No L2; this process's L1 only |
+
+**Key registry (env-resolved Redis).** Every L2 write also adds the key to a server-side set for the function, `t:{tenant}:ck:reg:{namespace}:{hash}`. No-args invalidation drains that set and deletes every key in it, plus any key this process remembers that the set missed. The drain runs in bounded steps of 10 000 keys, so it never blocks Redis for long, and a write that lands during the drain is either deleted or left tracked for the next drain. It adds one pipelined round-trip (`SADD` + `EXPIRE`) to each L2 write — cache hits pay nothing. If that round-trip fails, the write still succeeds and cachekit logs a WARNING `Key tracking failed`: that key is then deleted only by this process's next drain, and other processes' drains miss it until its TTL. The warning fires at most once a minute per function in each process and carries the count of failures since the last one, so a registry outage doesn't flood the logs.
+
+Things to know:
+
+- **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster is not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A key leaves the set only once it has been deleted, so tracked keys a failed drain did not reach wait in the set for the next drain.
+- **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation.
+- **Set lifetime.** A tracking set expires 7 days after the last write to its function. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
+- **Tenants.** The set is tenant-scoped like every other key, and a drain can only delete keys inside its own tenant prefix. A decorated function binds to the tenant in `tenant_context` at its first call, so set the tenant before that call. A process that never sets one drains tenant `default`; the INFO line `Key registry drained N keys` shows how many keys a drain deleted.
+- **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
+- **Same module path everywhere.** The set is named by the function's `module.qualname`, so every process must import the function from the same module path.
 
 ---
 
@@ -198,10 +213,11 @@ get_user.invalidate_cache()
 CacheKit does **not** ship cross-instance L1 invalidation in Python. When running multiple processes or pods against a shared L2 backend:
 
 - `invalidate_cache(args...)` deletes the key from shared L2, so any pod's next **L1 miss** fetches fresh data.
+- `invalidate_cache()` with no arguments does the same for every key of the function on the env-resolved Redis backend ([key registry](#whole-function-invalidation)); on other backends it reaches only the keys the calling process knows.
 - Pods that still hold the entry in L1 keep serving it until their **L1 TTL** expires (L1 expires 1 second before L2 by design).
 - Worst-case staleness after an invalidation is therefore bounded by the entry's remaining TTL. Size TTLs accordingly for data where cross-pod staleness matters.
 
-The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel; an equivalent for Python (paired with server-side key tracking for whole-function invalidation) is a potential future feature. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for current per-SDK support.
+The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel; Python has no equivalent yet. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for current per-SDK support.
 
 ---
 
@@ -309,20 +325,20 @@ In multi-pod deployments, other pods pick up the fresh value on their next L1 mi
 
 ### Pattern 2: Bulk Invalidation per Function
 
-Clear everything this process cached for a function:
+Clear everything cached for a function:
 
 ```python notest
 @cache(namespace="products")
 def get_product(product_id: int):
     return db.get_product(product_id)
 
-# Category discount: drop all product entries written by this process
+# Category discount: drop all product entries
 def apply_category_discount(category_id: int, discount: float):
     db.update_category_discount(category_id, discount)
     get_product.invalidate_cache()
 ```
 
-For bulk updates where cross-process consistency matters, prefer short TTLs over relying on invalidation: whole-function invalidation only tracks keys written by the local process.
+On the env-resolved Redis backend this deletes every process's L2 entries for `get_product`. On other backends it deletes only the entries this process wrote or read, so for bulk updates where cross-process consistency matters there, prefer short TTLs over relying on invalidation. Either way, other processes' L1 copies live until their L1 TTL.
 
 ---
 
