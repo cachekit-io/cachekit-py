@@ -5,7 +5,8 @@ for multi-tenant caching. All Code-Craftsman fixes (#1-#10) are applied.
 
 Architecture:
 - Singleton: Connection pool (expensive, created once in __init__)
-- Per-request: Backend wrapper (cheap ~50ns, tenant-scoped)
+- Backend wrapper (cheap ~50ns): bound to one tenant, or — as RedisBackendProvider hands
+  it out — reading tenant_context at every operation, so it is safe to hold across requests
 - Tenant isolation: Via URL-encoded tenant_id in key prefix (t:{tenant}:{key})
 """
 
@@ -61,6 +62,29 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
     return fut.result()
 
 
+def _encode_tenant(tenant_id: object) -> str:
+    """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
+
+    Apps set int / UUID tenant ids although ``tenant_context`` is typed ``str``, so both are
+    accepted in canonical form. int by exact type: no driver returns an int subclass, and a
+    bool or IntEnum tenant is a caller bug whose ``str()`` is not canonical (``str(True)`` is
+    'True'; an IntEnum's differs between Python versions), so it fails closed. UUID with the
+    subclasses drivers return (asyncpg, uuid6), formatted by the base class's ``__str__``, so a
+    subclass's ``__str__`` override cannot map two UUIDs to one prefix. The accessors that reads
+    (``int``; ``hex`` on 3.14) are trusted on purpose: asyncpg's UUID leaves the stdlib ``int``
+    slot empty and supplies them itself, so never read the slot directly. Anything else except
+    str / bytes raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a
+    default repr embedding ``id()``, can map two tenants to one prefix.
+    """
+    if type(tenant_id) is int:
+        tenant_id = str(tenant_id)
+    elif isinstance(tenant_id, uuid.UUID):
+        tenant_id = uuid.UUID.__str__(tenant_id)
+    if not isinstance(tenant_id, (str, bytes)):
+        raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
+    return url_encode(tenant_id, safe="")
+
+
 class PerRequestRedisBackend:
     """Per-request Redis backend wrapper with tenant isolation.
 
@@ -74,6 +98,13 @@ class PerRequestRedisBackend:
     - Fix #9: Fail-fast validation - raises RuntimeError if tenant_id is None
 
     Tenant scoping format: t:{url_encoded_tenant_id}:{key}
+
+    Constructed directly, the backend is bound to ``tenant_id``. With ``follow_context=True`` —
+    what RedisBackendProvider hands out — each operation is instead scoped to the tenant set in
+    ``tenant_context`` for the calling context, and ``tenant_id`` is used only when that context
+    has none. Such an instance can be held across requests (the decorator keeps its backend for
+    the life of the process) without serving one tenant's requests as another's (LAB-4773); a
+    ContextVar read is per thread and per asyncio task, so sharing is race-free.
 
     Examples:
         Key scoping with URL-encoded tenant ID:
@@ -90,6 +121,17 @@ class PerRequestRedisBackend:
         >>> backend2._scoped_key("key")
         't:tenant%2Fwith%3Aspecial%40chars:key'
 
+        With ``follow_context=True`` the calling context's tenant wins; a direct binding does not
+        follow it:
+
+        >>> shared = PerRequestRedisBackend(Mock(), tenant_id="default", follow_context=True)
+        >>> token = tenant_context.set("org:999")
+        >>> shared.key_prefix, backend.key_prefix
+        ('t:org%3A999:', 't:org%3A123:')
+        >>> tenant_context.reset(token)
+        >>> shared.key_prefix
+        't:default:'
+
         None tenant_id raises RuntimeError (fail-fast):
 
         >>> PerRequestRedisBackend(Mock(), tenant_id=None)  # doctest: +IGNORE_EXCEPTION_DETAIL
@@ -98,12 +140,14 @@ class PerRequestRedisBackend:
         RuntimeError: tenant_id cannot be None...
     """
 
-    def __init__(self, client: redis.Redis, tenant_id: str | None):
+    def __init__(self, client: redis.Redis, tenant_id: str | None, *, follow_context: bool = False):
         """Initialize per-request backend wrapper.
 
         Args:
             client: Shared Redis client (singleton from provider)
-            tenant_id: Tenant identifier for key scoping (None = fail-fast)
+            tenant_id: Tenant for key scoping (None = fail-fast) — with follow_context, only
+                the fallback for a calling context that has no tenant set
+            follow_context: Scope each operation to tenant_context's tenant when one is set
 
         Raises:
             RuntimeError: If tenant_id is None (fail-fast validation - Fix #9)
@@ -119,8 +163,9 @@ class PerRequestRedisBackend:
         self._client = client
 
         # Fix #2: URL-encode tenant ID to prevent ':' collision
-        self._tenant_id = url_encode(tenant_id, safe="")
+        self._tenant_id = _encode_tenant(tenant_id)
         self._original_tenant_id = tenant_id
+        self._follow_context = follow_context
 
     @property
     def key_prefix(self) -> str:
@@ -130,8 +175,11 @@ class PerRequestRedisBackend:
         invisible to other SDKs reading the same Redis, so interop mode MUST
         reject this backend (see cachekit.interop.ensure_interop_backend_compatible).
         Backends that rewrite keys on the wire MUST expose the prefix here.
+
+        With follow_context, resolved per access from ``tenant_context`` (see class docstring).
         """
-        return f"t:{self._tenant_id}:"
+        tenant_id = tenant_context.get() if self._follow_context else None
+        return f"t:{self._tenant_id if tenant_id is None else _encode_tenant(tenant_id)}:"
 
     def _scoped_key(self, key: str) -> str:
         """Generate tenant-scoped key with URL-encoded tenant ID.
@@ -157,7 +205,7 @@ class PerRequestRedisBackend:
             >>> backend._scoped_key("cache:user:profile:settings")
             't:org%3A123:cache:user:profile:settings'
         """
-        return f"t:{self._tenant_id}:{key}"
+        return f"{self.key_prefix}{key}"
 
     def get(self, key: str) -> Optional[bytes]:
         """Retrieve value from Redis storage with tenant scoping.
@@ -403,6 +451,8 @@ class PerRequestRedisBackend:
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
         # (the wrapper no longer pollutes the cache_key passed in).
+        # Resolve it here, in the caller's context: run_in_executor does not carry contextvars,
+        # so the executor callables below must never read tenant_context themselves.
         scoped_key = f"{self._scoped_key(key)}:lock"
         try:
             from redis.lock import Lock
@@ -508,21 +558,23 @@ class PerRequestRedisBackend:
 
 
 class RedisBackendProvider:
-    """Provider for Redis backend with singleton pool + per-request wrapper.
+    """Provider for Redis backend with singleton pool + tenant-scoped wrappers.
 
     Fix #1: Creates connection pool ONCE in __init__ (expensive).
     Creates singleton Redis client from pool.
-    get_backend() returns new PerRequestRedisBackend per call (cheap: ~50ns).
 
-    Implements BackendProvider protocol for dependency injection.
+    Both methods return a PerRequestRedisBackend that reads tenant_context per operation;
+    they differ only in the tenant used when the calling context has none:
 
-    Example:
-        >>> _ = tenant_context.set("org:123")  # doctest: +ELLIPSIS
-        >>> # Usage pattern (requires Redis connection):
-        >>> # provider = RedisBackendProvider(redis_url="redis://localhost")
-        >>> # backend = provider.get_backend()
-        >>> # backend.set("key", b"value")
-        >>> # Stored as: t:org%3A123:key
+    - get_shared_backend(): ``"default"`` — single-tenant mode. What env auto-detection uses;
+      use it for anything held across requests (a decorator's ``backend=``, a custom
+      BackendProvider).
+    - get_backend(): the tenant current at the call, which must be set (raises otherwise) —
+      for a request's own backend, which keeps its tenant when handed to a worker thread.
+      Held across requests, it serves every context with no tenant set as that tenant.
+
+    A thread-pool job that sets tenant_context must reset it: a reused worker thread keeps
+    the last value, and operations follow it.
     """
 
     def __init__(self, redis_url: str, pool_size: int = 50):
@@ -554,9 +606,9 @@ class RedisBackendProvider:
             raise classify_redis_error(exc, operation="init") from exc
 
     def get_backend(self) -> BaseBackend:
-        """Get per-request backend wrapper (cheap: ~50ns).
+        """Get a backend whose fallback tenant is the current one (cheap: ~50ns).
 
-        Extracts tenant_id from ContextVar and creates tenant-scoped wrapper.
+        Extracts tenant_id from ContextVar; operations still follow the calling context.
 
         Returns:
             PerRequestRedisBackend with tenant isolation
@@ -569,7 +621,15 @@ class RedisBackendProvider:
 
         # Create per-request wrapper (cheap: ~50ns)
         # Fix #9: Fail-fast validation happens in PerRequestRedisBackend.__init__
-        return PerRequestRedisBackend(self._client, tenant_id)
+        return PerRequestRedisBackend(self._client, tenant_id, follow_context=True)
+
+    def get_shared_backend(self) -> BaseBackend:
+        """Get one backend for every request: a context with no tenant set is scoped to "default".
+
+        Needs no tenant at the call, so it suits a backend built at startup and held for the
+        life of the process (``@cache(backend=...)``, env auto-detection).
+        """
+        return PerRequestRedisBackend(self._client, "default", follow_context=True)
 
     def close(self) -> None:
         """Close connection pool and cleanup resources."""

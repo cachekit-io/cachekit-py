@@ -66,7 +66,10 @@ class BackendProvider(Protocol):
 
     Enables testability and pluggable backends without hardcoding concrete
     implementations. The provider manages backend lifecycle (singleton,
-    pooling, per-request creation, etc.).
+    pooling, etc.). A decorator calls ``get_backend()`` once and keeps the
+    result for the life of the process, so the backend returned must be safe to
+    share across requests — anything request-scoped (e.g. the tenant) has to be
+    resolved per operation, not captured when the backend is built.
 
     Example:
         >>> from cachekit.backends import BackendProvider, BaseBackend
@@ -85,14 +88,14 @@ class BackendProvider(Protocol):
     def get_backend(self) -> BaseBackend:
         """Return a BaseBackend instance.
 
-        Implementation can manage singleton, pooling, or per-request creation
-        depending on backend requirements.
+        Implementation can manage singleton or pooling depending on backend
+        requirements; the result must be safe to share across requests.
 
         Returns:
             BaseBackend instance ready for cache operations
 
         Example:
-            >>> provider = RedisBackendProvider()  # doctest: +SKIP
+            >>> provider = MyProvider()  # doctest: +SKIP
             >>> backend = provider.get_backend()  # doctest: +SKIP
             >>> backend.set("key", b"value", ttl=60)  # doctest: +SKIP
         """
