@@ -831,12 +831,20 @@ def create_cache_wrapper(
         drains cannot see it, so the failure is a WARNING — throttled to one per
         _TRACK_WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
-        nonlocal _track_warned_at, _track_failures
+        nonlocal _track_warned_at, _track_failures, _track_warn_lock, _track_warn_pid
         if not _is_trackable():
             return
         try:
             _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
         except Exception as e:
+            if _track_warn_pid != os.getpid():
+                # Forked child: the inherited lock may be held by a parent thread that did not
+                # survive the fork, so taking it would hang this write forever, and the count is
+                # the parent's. Replace all of it. Sibling threads racing this swap cost at worst
+                # one extra WARNING, once per fork.
+                _track_warn_lock = threading.Lock()
+                _track_warned_at, _track_failures = float("-inf"), 0
+                _track_warn_pid = os.getpid()
             # Claim the window under the lock, log outside it: concurrent failures then emit
             # one WARNING, and a slow log sink never serializes the failing writers.
             with _track_warn_lock:
@@ -1135,6 +1143,7 @@ def create_cache_wrapper(
     _track_warned_at = float("-inf")
     _track_failures = 0
     _track_warn_lock = threading.Lock()
+    _track_warn_pid = os.getpid()  # owner process — see _l2_swr_try_begin's fork note
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.

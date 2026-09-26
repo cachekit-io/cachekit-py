@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,25 @@ from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import supports_key_tracking
 from cachekit.config.validation import ConfigurationError
 from cachekit.l1_cache import L1Cache
+
+
+def _closure_cell(fn: Any, name: str) -> Any:
+    """The closure cell ``name`` reachable from ``fn`` through nested closures."""
+    seen: set[int] = set()
+    stack = [fn]
+    while stack:
+        f = stack.pop()
+        if id(f) in seen or not hasattr(f, "__code__"):
+            continue
+        seen.add(id(f))
+        for var, cell in zip(f.__code__.co_freevars, f.__closure__ or (), strict=True):
+            if var == name:
+                return cell
+            try:
+                stack.append(cell.cell_contents)
+            except ValueError:  # an empty cell
+                pass
+    raise LookupError(name)
 
 
 class TrackingBackend:
@@ -271,6 +291,35 @@ class TestTrackingSites:
         assert not barrier.broken
         warnings = [r for r in caplog.records if "Key tracking failed" in r.getMessage()]
         assert len(warnings) == 1  # the window is claimed atomically, not after logging returns
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_does_not_inherit_a_held_warning_lock(self) -> None:
+        import multiprocessing
+
+        backend = TrackingBackend()
+        backend.fail_track = True
+
+        @cache(backend=backend, ttl=60, namespace="track_fork")
+        def f(x: int) -> int:
+            return x
+
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+
+        def child(q: Any) -> None:
+            writer = threading.Thread(target=f, args=(1,), daemon=True)
+            writer.start()
+            writer.join(5)
+            q.put(not writer.is_alive())
+
+        with _closure_cell(f, "_track_warn_lock").cell_contents:  # a parent writer is mid-claim at fork
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+        try:
+            returned = queue.get(timeout=30)
+        finally:
+            process.join(timeout=30)
+        assert returned, "a forked child must not block on a warning lock it inherited held"
 
     def test_fallback_to_local_when_not_trackable(self) -> None:
         backend = PlainBackend()
