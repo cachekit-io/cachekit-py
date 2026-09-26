@@ -656,3 +656,30 @@ class TestKeyRegistryControlFlow:
             backend.drain_tracked(REG, ["s1"])
         assert exc_info.value.is_transient
         client.unlink.assert_not_called()
+
+
+@pytest.mark.unit
+class TestClassifyRedisErrorClusterDown:
+    """ClusterDownError subclasses ResponseError, so its TRANSIENT branch must run before PERMANENT."""
+
+    def test_cluster_down_is_transient(self):
+        from redis.exceptions import ClusterDownError
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(ClusterDownError("CLUSTERDOWN The cluster is down"), operation="get")
+
+        assert error.error_type == BackendErrorType.TRANSIENT
+
+    def test_plain_response_error_stays_permanent(self):
+        from redis.exceptions import ResponseError
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(
+            ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value"), operation="get"
+        )
+
+        assert error.error_type == BackendErrorType.PERMANENT
