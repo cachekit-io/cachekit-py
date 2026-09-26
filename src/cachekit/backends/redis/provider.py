@@ -65,13 +65,16 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
 def _encode_tenant(tenant_id: object) -> str:
     """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
 
-    Apps set int / UUID tenant ids despite the annotation, so both are accepted in canonical
-    form. int by exact type, since an int subclass can change ``str()`` (``str(True)`` is
-    'True'; an IntEnum's differs between Python versions). UUID with the subclasses drivers
-    return (asyncpg, uuid6), formatted by value through the base class, so a subclass
-    overriding ``__str__`` cannot map two UUIDs to one prefix. Anything else except str / bytes
-    raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a default repr
-    embedding ``id()``, can map two tenants to one prefix.
+    Apps set int / UUID tenant ids although ``tenant_context`` is typed ``str``, so both are
+    accepted in canonical form. int by exact type: no driver returns an int subclass, and a
+    bool or IntEnum tenant is a caller bug whose ``str()`` is not canonical (``str(True)`` is
+    'True'; an IntEnum's differs between Python versions), so it fails closed. UUID with the
+    subclasses drivers return (asyncpg, uuid6), formatted by the base class's ``__str__``, so a
+    subclass's ``__str__`` override cannot map two UUIDs to one prefix. The accessors that reads
+    (``int``; ``hex`` on 3.14) are trusted on purpose: asyncpg's UUID leaves the stdlib ``int``
+    slot empty and supplies them itself, so never read the slot directly. Anything else except
+    str / bytes raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a
+    default repr embedding ``id()``, can map two tenants to one prefix.
     """
     if type(tenant_id) is int:
         tenant_id = str(tenant_id)

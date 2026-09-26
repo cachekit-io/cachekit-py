@@ -662,28 +662,22 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
             (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"),
             # asyncpg / uuid6 hand out uuid.UUID subclasses
             (type("DriverUUID", (uuid.UUID,), {})(int=1), "00000000-0000-0000-0000-000000000001"),
+            # a subclass's __str__ override is ignored, so it cannot merge two tenants' prefixes
+            (type("OpaqueUUID", (uuid.UUID,), {"__str__": lambda _: "same"})(int=1), "00000000-0000-0000-0000-000000000001"),
         ],
     )
-    def test_tenant_ids_with_a_canonical_str_are_accepted(self, tenant, wire):
+    def test_accepted_tenant_ids_encode_to_their_canonical_form(self, tenant, wire):
         shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
         assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
         assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
-
-    def test_a_uuid_subclass_is_encoded_by_value_not_by_its_str(self):
-        """A subclass overriding __str__ must not put two distinct UUIDs under one prefix."""
-        opaque = type("OpaqueUUID", (uuid.UUID,), {"__str__": lambda self: "same"})
-        shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
-        for n in (1, 2):
-            wire = f"t:{uuid.UUID(int=n)}:"
-            assert PerRequestRedisBackend(Mock(), opaque(int=n)).key_prefix == wire
-            assert self._as_tenant(opaque(int=n), lambda: shared.key_prefix) == wire
 
     @pytest.mark.parametrize(
         "tenant", [object(), True, False, enum.IntEnum("Org", "A").A], ids=["object", "True", "False", "IntEnum"]
     )
     def test_tenant_ids_whose_str_is_not_canonical_are_refused(self, tenant):
-        """str() of an arbitrary object (default repr embeds id()) could merge two tenants; an int
-        subclass can change str() (str(True) is 'True', an IntEnum's varies by Python version)."""
+        """str() of an arbitrary object (default repr embeds id()) could merge two tenants; a bool or
+        IntEnum tenant is a caller bug whose str() is not canonical (str(True) is 'True', an IntEnum's
+        varies by Python version)."""
         client = Mock()
         with pytest.raises(TypeError):
             PerRequestRedisBackend(client, tenant)

@@ -1053,10 +1053,11 @@ def create_cache_wrapper(
         flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
         return generate_interop_key(namespace, interop, flat)
 
-    # Track all cache keys written by this function (for no-args invalidation).
-    # When invalidate_cache() is called with no args on a parameterized function,
-    # we need to clear ALL entries — but key normalization (hashing of long keys)
-    # makes prefix matching unreliable. Tracking actual keys is simple and correct.
+    # Track the cache keys this process wrote for this function (for no-args invalidation).
+    # invalidate_cache() with no args on a parameterized function clears the entries tracked
+    # here; key normalization (hashing of long keys) makes prefix matching unreliable, so
+    # actual keys are tracked. Keys written only by other processes are not seen. The set is
+    # not bounded: an entry is dropped only by invalidation, never on TTL expiry.
     # Each entry is (L2 key prefix, cache key): a tenant-scoped backend holds one L2 entry
     # per tenant under the same cache key, and an invalidation may delete — and stop
     # tracking — only the calling tenant's (LAB-4773).
