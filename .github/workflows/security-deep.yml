@@ -124,9 +124,9 @@ jobs:
     # No uv or Rust cache on this nightly job: the cold `uv sync` (maturin
     # build included) is noise against 30 min of fuzz time, and an unsuffixed
     # uv cache would just restore the cp312 wheel set the PR jobs save.
-    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.17"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         enable-cache: false
 
     # Pin to 3.11: atheris 2.3.0's newest prebuilt wheel is cp311. On a newer
