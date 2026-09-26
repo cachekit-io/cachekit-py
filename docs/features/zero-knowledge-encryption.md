@@ -148,19 +148,12 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 ### Key Rotation
 
-```bash
-# Changed CACHEKIT_MASTER_KEY without retaining the old key
-# Old encrypted data in Redis → Can't decrypt
-# Error: "Decryption failed: authentication tag verification failed"
-# Solution: keep the retiring key decrypt-only for the rotation window
-export CACHEKIT_MASTER_KEY=new_key                 # encrypts + decrypts
-export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separated, max 3)
-# Restart app → old entries stay readable, new writes use the new key.
-# Old-key entries age out via TTL; drop the old key from the list once the
-# window (≥ longest TTL in use) has passed. Rotation is forward-only: never
-# re-promote a retired key to CACHEKIT_MASTER_KEY — a configuration where the
-# current key also appears in the previous-keys list is rejected at load.
-```
+Keeping a retiring key decrypt-only makes its entries readable; it does **not**
+make a one-deploy key swap zero-miss. See [Key Rotation Pattern](#key-rotation-pattern)
+for the keyring configuration, and follow the [key rotation
+runbook](https://docs.cachekit.io/concepts/key-rotation/) — including its
+[Before You Rotate](https://docs.cachekit.io/concepts/key-rotation/#before-you-rotate)
+checks — for the rotation itself.
 
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
@@ -187,8 +180,14 @@ wave — throttle or batch the eviction if the recompute cost is high. Either wa
 eviction to cachekit's keys so unrelated data in the same Redis database survives:
 
 ```bash
-# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
-redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe=""):
+# tenant org:123 is stored as t:org%3A123:...
+# Evict only this function's or namespace's cachekit entries.
+# Namespaced function (@cache.secure(namespace="users", ...)):
+redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
+# No namespace (the default): keys start with func:<module>.<qualname>
+redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
 
 # FLUSHDB is only safe when the database is dedicated to cachekit
 # then deploy with CACHEKIT_MASTER_KEY set
@@ -290,36 +289,54 @@ data_b = get_user_data(123)  # Same user_id, different tenant, different encrypt
 
 ### Key Rotation Pattern
 
-Zero-downtime rotation via the keyring: one **current** master key
+The keyring has one **current** master key
 (`CACHEKIT_MASTER_KEY`, encrypts and decrypts) plus up to **3 decrypt-only**
 previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
-per-key requirements as the master key). Entries carry the fingerprint of
-their HKDF-derived per-tenant encryption key, so reads select the exact
-keyring entry that wrote them — never trial decryption.
+per-key requirements as the master key). CK-framed entries carry the
+fingerprint of their HKDF-derived per-tenant encryption key, so reads select
+the exact keyring entry that wrote them — never trial decryption. The keyring
+alone does not make a single-deploy swap zero-miss: use the [three-phase key
+rotation runbook](https://docs.cachekit.io/concepts/key-rotation/) for scheduled
+rotation, including its [Before You
+Rotate](https://docs.cachekit.io/concepts/key-rotation/#before-you-rotate)
+checks. Entries without a TTL, and entries whose expiry reads extend
+(`refresh_ttl_on_get=True` or `refresh_ttl`), keep the retiring key in use
+indefinitely; the runbook's Phase 3 drain window, not a fixed TTL, decides when
+the old key can be removed.
 
 ```bash
-# 1. Promote the new key; retain the old key decrypt-only
+# Phase 2 state only — <new-key-hex> is the key phase 1 distributed
+# decrypt-only fleet-wide; <old-key-hex> is the master key it replaces.
+# Pseudocode — both placeholders are 64-character hex (32-byte) values.
+# Non-hex or short values are rejected at load.
 export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
-# 2. Old entries still decrypt (selected by key fingerprint); new writes use the new key
-# 3. Old-key entries age out via TTL (or re-encrypt on the next write)
-# 4. After the window (≥ longest TTL in use), drop the old key
-unset CACHEKIT_PREVIOUS_MASTER_KEYS
 ```
 
 Rules enforced at config load — rejected, never truncated or silently fixed:
 
 - **Cap**: at most 3 decrypt-only keys.
 - **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, ≥32 bytes).
-- **Forward-only**: the current master key must not re-appear in the
-  decrypt-only list. A key that has ever encrypted is never re-promoted —
-  that would resume a used AES-GCM nonce budget and risk catastrophic nonce
-  reuse. Backing out a rotation means rotating *forward* to a fresh key.
+- **Current key not in the list**: the current master key must not re-appear in
+  the decrypt-only list — the detectable signature of re-promoting a retired key.
 
-An empty decrypt-only list is legal — that is the hard cut-over used for
-compromise response (old entries become unreadable immediately).
+Operator rule, which no SDK detects: **never re-promote a key that has
+encrypted**, including by rolling back a Phase 2 deploy. Rolling back restores
+the old key as current with the new key decrypt-only — a legal configuration
+that passes load and silently resumes the old key's used AES-GCM nonce budget,
+risking catastrophic nonce reuse. Back out a rotation by rotating *forward* to a
+fresh key.
 
-[Interop-mode](../../README.md) entries store no per-entry key fingerprint
+For a suspected key compromise, do not use the scheduled rotation. Follow the
+runbook's [Compromise
+Response](https://docs.cachekit.io/concepts/key-rotation/#compromise-response):
+deploy a fresh key and unset `CACHEKIT_PREVIOUS_MASTER_KEYS` (code that builds
+an `EncryptionWrapper` directly must pass an explicit `previous_master_keys=[]` —
+omitting it falls back to the environment variable), flush encrypted namespaces at cut-over, and flush again once the last
+instance writing under the old key has stopped. Ciphertext under the compromised
+key stays readable to whoever holds that key until it is deleted.
+
+[Interop-mode](interop-mode.md) entries store no per-entry key fingerprint
 (no CK frame), so rotation there attempts keyring keys sequentially — current
 key first, identical AAD per attempt — instead of fingerprint selection. Same
 environment variables, same rotation window, same fail policy on exhaustion.
@@ -477,7 +494,9 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 > in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise
 > `DecryptionAuthenticationError` on read (the fingerprint matches no keyring entry,
 > decryption is refused, and the entry is retained, not evicted). Follow the keyring
-> rotation pattern above: keep the retiring key decrypt-only for the full window.
+> rotation pattern above: keep the retiring key decrypt-only until the runbook's
+> [Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)
+> drain window has closed.
 > This is the deliberate cost of failing closed; the default fail-open mode treats
 > keyless entries as ordinary misses.
 
@@ -590,8 +609,9 @@ A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
 the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
 current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
-rotation pattern above: keep the retiring key decrypt-only for the full rotation
-window before dropping it.
+rotation pattern above: keep the retiring key decrypt-only until the runbook's
+[Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)
+drain window has closed.
 
 **Q: Performance degraded after enabling encryption**
 A: Expected 100-500μs overhead. Profile to confirm acceptable.

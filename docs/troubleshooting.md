@@ -215,15 +215,16 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 
 **Quick fix**:
 ```bash
-# Generate valid encryption key
+# First-time setup only: generate a valid encryption key
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-
-# Clear cache if key was rotated
-redis-cli FLUSHDB
 
 # Restart application
 python app.py
 ```
+
+If the key was rotated, do not generate a new key or flush: keep the old key
+decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS` and follow the
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 </details>
 
@@ -445,31 +446,54 @@ python -c "import os; print(len(os.getenv('CACHEKIT_MASTER_KEY', '')))"
 
 **Solutions**:
 
-1. **Key was rotated** (most common):
-```bash
-# Clear Redis to remove incompatible cached data
-redis-cli FLUSHDB
+1. **Key was rotated** (most common): keep the old key decrypt-only in
+   `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3) so entries it
+   wrote stay readable, and follow the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/). Do not
+   flush or mint another key: a flush drops unrelated data on a shared
+   database, and a fresh key only repeats the failure.
 
-# Keep new key and restart application
-export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-python app.py
+2. **Wrong key on some instances** (configuration drift): compare a hash of the
+   key across instances — never print the key itself:
+```bash
+python -c "import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ['CACHEKIT_MASTER_KEY'])).hexdigest()[:16])"
+```
+   An instance whose hash differs from the rest is misconfigured. Do not fix it
+   by setting `CACHEKIT_MASTER_KEY` back to a key that has already encrypted
+   and been retired: re-promoting a key resumes its used AES-GCM nonce budget
+   (see [Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)).
+   Move the drifted instance forward to the fleet's current key, and keep the
+   key it wrote with decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS`.
+
+3. **Data corruption**: evict the entry, and the function recomputes and
+   re-caches it with the current key on the next call.
+
+Evict the suspect entry through the decorated function, with the same
+arguments and in the same tenant context as the failing read. It derives the key
+the read used and clears both L1 and L2:
+
+```python notest
+get_data.invalidate_cache(user_id)         # sync function
+await get_data.ainvalidate_cache(user_id)  # async function
 ```
 
-2. **Wrong key still in use**:
+Called with no arguments it evicts only the keys this process has cached, not
+the fleet's. It does not cover a function with a custom `key=`: delete that
+entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
+with `<tenant>` percent-encoded as shown below.
+
+For bulk eviction, delete by prefix:
+
 ```bash
-# Verify current key
-python -c "import os; print(os.getenv('CACHEKIT_MASTER_KEY')[:16] + '...')"
+# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe=""):
+# tenant org:123 is stored as t:org%3A123:...
+# Namespaced function (@cache.secure(namespace="users", ...)):
+redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
+# No namespace (the default): keys start with func:<module>.<qualname>
+redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
 
-# Revert to original key if available
-export CACHEKIT_MASTER_KEY=<original-key>
-```
-
-3. **Data corruption**:
-```bash
-# If data is corrupted, clearing cache is safe
-redis-cli FLUSHDB
-
-# Function will recompute and re-cache with current key
+# Only if this Redis database is dedicated to cachekit:
+# redis-cli FLUSHDB
 ```
 
 </details>
