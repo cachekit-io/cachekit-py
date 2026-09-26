@@ -216,6 +216,29 @@ class TestTrackingSites:
         assert warning.levelno == logging.WARNING
         assert "track_raises" not in warning.getMessage()  # key and registry id are redacted
 
+    def test_track_failure_warning_is_throttled_per_function(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import cachekit.decorators.wrapper as wrapper_module
+
+        backend = TrackingBackend()
+        backend.fail_track = True
+
+        @cache(backend=backend, ttl=60, namespace="track_flood")
+        def f(x: int) -> int:
+            return x
+
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            for i in range(50):
+                assert f(i) == i
+            monkeypatch.setattr(wrapper_module, "_TRACK_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            assert f(50) == 50
+        warnings = [r.getMessage() for r in caplog.records if "Key tracking failed" in r.getMessage()]
+        # A registry outage is one WARNING per window, not one per write, and none is lost from the count.
+        assert len(warnings) == 2
+        assert "since the last warning: 1)" in warnings[0]
+        assert "since the last warning: 50)" in warnings[1]
+
     def test_fallback_to_local_when_not_trackable(self) -> None:
         backend = PlainBackend()
         assert not supports_key_tracking(backend)
