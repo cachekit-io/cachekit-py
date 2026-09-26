@@ -9,6 +9,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -278,6 +279,26 @@ class L1Cache:
         """
         with self._lock:
             self._remove_entry(key)
+
+    def invalidate_many(self, keys: Iterable[str]) -> None:
+        """Invalidate (remove) several entries under one lock acquisition.
+
+        For whole-function invalidation, which can evict thousands of keys at once.
+
+        Args:
+            keys: Keys to invalidate; keys not in the cache are ignored
+
+        Examples:
+            >>> l1 = L1Cache(namespace="docs")
+            >>> l1.put("a", b"1", redis_ttl=60)
+            >>> l1.put("b", b"2", redis_ttl=60)
+            >>> l1.invalidate_many(["a", "b", "never-cached"])
+            >>> l1.get("a")
+            (False, None)
+        """
+        with self._lock:
+            for key in keys:
+                self._remove_entry(key)
 
     def clear(self) -> None:
         """Clear all entries from L1 cache."""

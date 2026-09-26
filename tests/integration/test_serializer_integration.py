@@ -126,7 +126,8 @@ class TestSerializerBackendIntegration:
 
         # Inspect Redis directly to verify Arrow IPC format stored
         # (Arrow IPC format has specific magic bytes: b'ARROW1')
-        keys = redis_isolated.keys("*")
+        # Skip the function's key-registry set (a Redis SET, not an entry)
+        keys = [k for k in redis_isolated.keys("*") if b":ck:reg:" not in k]
         assert len(keys) > 0  # Cache entry exists
 
         # Retrieve raw bytes from Redis
@@ -205,8 +206,8 @@ class TestSerializerGracefulDegradation:
         df1 = get_dataframe()
         assert call_count == 1
 
-        # Corrupt the cached data in Redis
-        keys = redis_isolated.keys("*")
+        # Corrupt the cached data in Redis (the entry, not the function's key-registry set)
+        keys = [k for k in redis_isolated.keys("*") if b":ck:reg:" not in k]
         if keys:
             redis_isolated.set(keys[0], b"corrupted_data_not_valid_arrow")
 

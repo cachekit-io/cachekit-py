@@ -171,10 +171,10 @@ class TestStandardCacheHandlerSetStreaming:
 @pytest.mark.unit
 class TestStoreResultRouting:
     def test_streams_to_file_backend_and_skips_l1(self, df, file_backend) -> None:
-        """Streaming success returns None: the envelope must never be copied into L1
-        (mirrors the mmap read path's L1 exclusion, #171)."""
+        """Streaming success returns no envelope: it must never be copied into L1
+        (mirrors the mmap read path's L1 exclusion, #171) — but it IS a stored write."""
         op = _operation_handler(file_backend)
-        assert op.store_result("k1", df, ttl=60) is None
+        assert op.store_result("k1", df, ttl=60) == (None, True)
         hit = op.get_cached_value("k1")
         assert hit is not None
         pd.testing.assert_frame_equal(hit.value, df)
@@ -189,14 +189,15 @@ class TestStoreResultRouting:
         backend = _PlainBackend()
         op = _operation_handler(backend)
         ret = op.store_result("k1", df, ttl=60)
-        assert ret is not None  # L1 backfill contract unchanged on the buffered path
-        assert backend.store["k1"] == ret
+        assert ret.envelope is not None  # L1 backfill contract unchanged on the buffered path
+        assert ret.stored is True
+        assert backend.store["k1"] == ret.envelope
 
     def test_non_arrow_serializer_stays_buffered(self, file_backend) -> None:
         op = CacheOperationHandler(CacheSerializationHandler(serializer_name="default"), CacheKeyGenerator())
         op.set_cache_handler(StandardCacheHandler(file_backend))
         ret = op.store_result("k2", {"a": 1}, ttl=60)
-        assert ret is not None
+        assert ret.envelope is not None
         assert op.get_cached_value("k2").value == {"a": 1}
 
     def test_stale_ttl_stays_buffered(self, df, file_backend, monkeypatch) -> None:
@@ -209,7 +210,7 @@ class TestStoreResultRouting:
         )
         ret = op.store_result("k3", df, ttl=60, stale_ttl=30)
         assert called["streaming"] is False
-        assert ret is not None  # buffered path returns bytes
+        assert ret.envelope is not None  # buffered path returns bytes
 
     def test_streaming_failure_does_not_retry_buffered(self, df, file_backend, monkeypatch) -> None:
         """A failed stream must NOT re-materialize the payload via set(bytes)."""
@@ -221,14 +222,14 @@ class TestStoreResultRouting:
         monkeypatch.setattr(file_backend, "set_streaming", explode)
         set_spy = MagicMock(wraps=file_backend.set)
         monkeypatch.setattr(file_backend, "set", set_spy)
-        assert op.store_result("k4", df, ttl=60) is None
+        assert op.store_result("k4", df, ttl=60) == (None, False)
         set_spy.assert_not_called()
         assert file_backend.get("k4") is None
 
     @pytest.mark.asyncio
     async def test_async_streams_and_roundtrips(self, df, file_backend) -> None:
         op = _operation_handler(file_backend)
-        assert await op.store_result_async("k5", df, ttl=60) is None
+        assert await op.store_result_async("k5", df, ttl=60) == (None, True)
         hit = await op.get_cached_value_async("k5")
         assert hit is not None
         pd.testing.assert_frame_equal(hit.value, df)

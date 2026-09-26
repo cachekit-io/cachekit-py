@@ -82,6 +82,10 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 - Persistence: Yes (RDB/AOF, server-configured)
 - Distributed locking: Yes
 
+## Whole-Function Invalidation Across Processes
+
+When the decorator resolves Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `backend=` argument), `invalidate_cache()` with no arguments deletes the L2 entries **every** process wrote for the function, through a server-side key registry. A `RedisBackend` passed explicitly as `backend=` does not keep a registry: its no-args invalidation deletes only the keys the calling process knows. The registry needs Redis **5.0+**, single-instance or primary/replica (not Cluster), and `@scripting` for restricted ACL users. See [Whole-Function Invalidation](../features/l1-invalidation.md#whole-function-invalidation).
+
 ## Limitations
 
 1. **Network dependency**: Every L2 operation requires a network round-trip. Use L1 cache to mitigate (enabled by default).

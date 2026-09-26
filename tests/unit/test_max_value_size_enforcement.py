@@ -25,11 +25,13 @@ class RecordingHandler:
     def __init__(self) -> None:
         self.set_calls: list[tuple[str, bytes]] = []
 
-    def set(self, key: str, value: bytes, ttl: Any = None) -> None:
+    def set(self, key: str, value: bytes, ttl: Any = None) -> bool:
         self.set_calls.append((key, value))
+        return True
 
-    async def set_async(self, key: str, value: bytes, ttl: Any = None) -> None:
+    async def set_async(self, key: str, value: bytes, ttl: Any = None) -> bool:
         self.set_calls.append((key, value))
+        return True
 
 
 @pytest.fixture
@@ -67,7 +69,8 @@ class TestMaxValueSizeEnforcement:
 
         result = op.store_result("big:key", os.urandom(4 * 1024), ttl=60)
 
-        assert result is None  # rejected → nothing for L1 either
+        assert result.envelope is None  # rejected → nothing for L1 either
+        assert result.stored is False
         assert backend.set_calls == []  # backend never touched
 
     def test_store_result_stores_normal_value(self, small_limit):
@@ -76,7 +79,8 @@ class TestMaxValueSizeEnforcement:
 
         result = op.store_result("small:key", {"ok": 1}, ttl=60)
 
-        assert isinstance(result, bytes)
+        assert isinstance(result.envelope, bytes)
+        assert result.stored is True
         assert len(backend.set_calls) == 1
 
     @pytest.mark.asyncio
@@ -86,7 +90,8 @@ class TestMaxValueSizeEnforcement:
 
         result = await op.store_result_async("big:key", os.urandom(4 * 1024), ttl=60)
 
-        assert result is None
+        assert result.envelope is None
+        assert result.stored is False
         assert backend.set_calls == []
 
     def test_default_limit_allows_typical_values(self, default_limit):
