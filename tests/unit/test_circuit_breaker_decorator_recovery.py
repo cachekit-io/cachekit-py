@@ -219,6 +219,24 @@ class TestOrchestratorAdmission:
         assert admitted == [True] * budget + [False]  # a fresh cycle with a fresh budget
         assert breaker.state == CircuitState.HALF_OPEN
 
+    def test_old_cycle_with_probe_slots_left_is_not_restarted(self, clock):
+        """Only a spent cycle starts over: an old cycle with slots left keeps its successes."""
+        orch = FeatureOrchestrator(namespace="lab5326-admit-expiry-unspent", backpressure_enabled=False)
+        breaker = self._open(orch)
+
+        clock.shift(_PAST_TIMEOUT)
+        assert orch.should_allow_request() is True
+        breaker.record_success()
+
+        clock.shift(_PAST_TIMEOUT)  # the cycle is now older than timeout_seconds, with slots left
+        assert orch.should_allow_request() is True
+        assert breaker.success_count == 1  # same cycle: the first success still counts
+        breaker.record_success()
+        for _ in range(breaker.config.success_threshold - 2):
+            assert orch.should_allow_request() is True
+            breaker.record_success()
+        assert breaker.state == CircuitState.CLOSED
+
 
 class TestRejectionIsNotAFailure:
     """A call the breaker rejects runs uncached, raises nothing, and is not recorded as a failure."""

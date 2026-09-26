@@ -66,9 +66,10 @@ class CircuitBreakerConfig:
             Lower values make the circuit more sensitive to errors.
         success_threshold: Number of consecutive successes in HALF_OPEN before closing.
             Higher values ensure more stable recovery.
-        timeout_seconds: How long to stay OPEN before testing recovery, and how long
-            a HALF_OPEN cycle whose probes report no outcome waits before starting a
-            fresh one. Balance between giving service time to recover vs detecting
+        timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
+            a HALF_OPEN cycle: once the cycle has admitted all its probes and began
+            more than timeout_seconds ago without closing or reopening, a fresh cycle
+            starts. Balance between giving service time to recover vs detecting
             recovery quickly.
         half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
             not a concurrency limit). Must be >= success_threshold, or a cycle can

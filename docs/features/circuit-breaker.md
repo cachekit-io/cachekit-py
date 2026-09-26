@@ -63,7 +63,7 @@ def operation(x):
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
 | **OPEN** | Skip the backend: the function runs uncached (sync and async), and no failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
-| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further calls run uncached | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If the probes report no outcome (for example, a cancelled async call) for a whole cooldown, a fresh cycle of 3 probes starts |
+| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further calls run uncached | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```
@@ -244,7 +244,7 @@ class CircuitBreaker:
             if self.probes >= half_open_requests:  # probe budget, default 3
                 if time.time() - self.half_open_since <= cooldown:
                     return uncached(func)  # Budget spent: rejected, not a failure
-                self.probes = self.successes = 0  # No outcome for a whole cooldown: fresh cycle
+                self.probes = self.successes = 0  # Spent and undecided a cooldown after it began: fresh cycle
                 self.half_open_since = time.time()
             self.probes += 1
             try:
