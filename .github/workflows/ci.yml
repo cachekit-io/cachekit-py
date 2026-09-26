@@ -30,9 +30,9 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.17"  # pinned: uv runs as step 1 of every job; a floating release is code exec
 
     # `uv sync` builds the Rust extension via maturin into ./target, and clippy
     # below compiles the same workspace — cache the dependency artifacts and the
@@ -108,9 +108,9 @@ jobs:
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
-    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.17"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         cache-suffix: py${{ matrix.python-version }}  # setup-uv keys on lockfile hash only, not job/matrix
 
     # pyo3 is built per interpreter (no abi3), so key the Rust cache per matrix
@@ -304,9 +304,9 @@ jobs:
           redis:7-alpine redis-server --save "" --appendonly no
         until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
 
-    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.17"  # pinned: uv runs as step 1 of every job; a floating release is code exec
         cache-suffix: py3.14t
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -342,9 +342,9 @@ jobs:
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
-        version: "0.12.12"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        version: "0.12.17"  # pinned: uv runs as step 1 of every job; a floating release is code exec
 
     # `uv sync` below builds the Rust extension via maturin — cache its dependencies.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
