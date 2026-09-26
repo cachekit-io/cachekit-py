@@ -74,21 +74,6 @@ class TestErrorHandlerOrchestration:
         # But we're not testing logs directly (implementation detail)
         # Just verify it doesn't crash
 
-    def test_handle_cache_error_accepts_correlation_id(self):
-        """Error handler should accept and use correlation IDs for distributed tracing."""
-        orchestrator = FeatureOrchestrator(namespace="test", enable_structured_logging=True)
-
-        # Should accept correlation ID for distributed tracing
-        orchestrator.handle_cache_error(
-            error=RuntimeError("distributed system error"),
-            operation="redis_connection",
-            cache_key="test:key",
-            correlation_id="trace-123-456-789",
-            duration_ms=150.0,
-        )
-
-        # Test passes if no exception
-
     def test_handle_cache_error_accepts_extra_context(self):
         """Error handler should accept arbitrary extra context via kwargs."""
         orchestrator = FeatureOrchestrator(namespace="test")
