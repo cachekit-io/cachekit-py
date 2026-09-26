@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens and returns stale cache/None instead of failing. Auto-recovers after cooldown.
+Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens: calls skip the backend and run your function uncached instead of failing. Auto-recovers after cooldown.
 
 ```python notest
 @cache(ttl=300, backend=None)  # Circuit breaker enabled by default
@@ -31,8 +31,8 @@ def expensive_operation(x):
 result = expensive_operation(1)  # L1 hit or L2 hit or compute
 
 # Backend down: Circuit breaker catches error
-# Behavior: Returns stale cache or None, app continues
-result = expensive_operation(1)  # Returns stale/None instead of error
+# Behavior: the function runs uncached, app continues
+result = expensive_operation(1)  # Computed directly instead of raising
 ```
 
 **Configuration** (optional):
@@ -62,20 +62,19 @@ def operation(x):
 | State | Behavior | Transition |
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
-| **OPEN** | Return stale/None, don't call Redis | After cooldown → HALF_OPEN |
-| **HALF_OPEN** | Try one Redis call | Success → CLOSED, Failure → OPEN |
+| **OPEN** | Skip the backend: the function runs uncached (sync and async), and no failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
+| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further calls run uncached | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```
 Pod A tries to cache fetch at 12:00:00
 Backend working: CLOSED state, success
 Backend fails at 12:00:05
-Requests 1-5: Errors accumulated
-Request 6: Circuit OPENS → returns None
-Requests 7-34: Circuit OPEN, returns None (no Redis calls)
-Request 35: Circuit tries HALF_OPEN (one Redis call)
-Redis back up: Success → Circuit CLOSES
-Request 36: Normal operation resumes
+Requests 1-5: Errors accumulated; the 5th failure OPENS the circuit
+Requests 6-34: Circuit OPEN, function runs uncached (no backend calls)
+Request 35 (once 30s have passed since the circuit opened): Circuit goes HALF_OPEN, probe 1 of 3
+Requests 35-37: Backend back up, all 3 probes succeed → Circuit CLOSES
+Request 38: Normal operation resumes
 ```
 
 ---
@@ -98,7 +97,7 @@ Cascades to dependent services
 Backend is down
 Circuit breaker catches errors
 After N failures: Circuit OPENS
-Caller gets: None or stale cache (application choice)
+Caller gets: the function's result, computed without the cache
 Service continues working (degraded but up)
 No cascading failures
 ```
@@ -149,14 +148,13 @@ def problematic_function():
     return expensive_operation()  # illustrative - not defined
 ```
 
-### Stale Cache Expires
+### Full Load on Your Data Source While OPEN
 ```python
 @cache(ttl=300)  # 5 minute cache
 def get_data():
-    # Backend down for 6+ minutes
-    # Circuit returns stale cache but TTL expired
-    # Result: Returns None instead of cached data
-    # Solution: Increase TTL or handle None gracefully
+    # Backend down: the circuit opens and never serves stale cache
+    # Result: every call runs this function, so the database takes full load
+    # Solution: size the data source for uncached traffic during an outage
     return fetch_data()
 ```
 
@@ -173,7 +171,7 @@ def get_user(user_id):
     return db.query(User).filter_by(id=user_id).first()  # illustrative - not defined
 
 # App continues working even if backend is down
-user = get_user(123)  # None if backend down AND no stale cache
+user = get_user(123)  # Backend down: the query runs uncached
 ```
 
 ### With Graceful Fallback
@@ -182,13 +180,11 @@ user = get_user(123)  # None if backend down AND no stale cache
 def get_config(key):
     return db.get_config(key)  # illustrative - not defined
 
+# No None check for outages: an OPEN circuit runs get_config uncached.
+# An exception here comes from get_config itself.
 try:
     config = get_config("feature_flag")
-    if config is None:
-        # Backend down or cache miss
-        config = get_default_config("feature_flag")  # illustrative - not defined
 except Exception as e:
-    # Unexpected error
     logger.warning(f"Config fetch failed: {e}")
     config = get_default_config("feature_flag")  # illustrative - not defined
 ```
@@ -223,7 +219,8 @@ import time
 class CircuitBreaker:
     state: Literal["CLOSED", "OPEN", "HALF_OPEN"]
     failure_count: int
-    last_failure_time: float
+    last_failure_time: float  # Failures recorded while OPEN do not move it
+    half_open_since: float
 
     def call(self, func):
         if self.state == "CLOSED":
@@ -231,25 +228,36 @@ class CircuitBreaker:
                 return func()  # Normal operation
             except Exception:
                 self.failure_count += 1
+                self.last_failure_time = time.time()
                 if self.failure_count >= threshold:  # threshold = config value
                     self.state = "OPEN"  # Open circuit
                 raise
 
-        elif self.state == "OPEN":
-            if time.time() - self.last_failure_time > cooldown:  # cooldown = config value
-                self.state = "HALF_OPEN"  # Try recovery
-            else:
-                return None  # Return None without calling
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time <= cooldown:  # cooldown = config value
+                return uncached(func)  # Rejected: no backend call, not counted as a failure
+            self.state = "HALF_OPEN"  # Try recovery
+            self.probes = self.successes = 0
+            self.half_open_since = time.time()
 
-        elif self.state == "HALF_OPEN":
+        if self.state == "HALF_OPEN":
+            if self.probes >= half_open_requests:  # probe budget, default 3
+                if time.time() - self.half_open_since <= cooldown:
+                    return uncached(func)  # Budget spent: rejected, not a failure
+                self.probes = self.successes = 0  # Spent and undecided a cooldown after it began: fresh cycle
+                self.half_open_since = time.time()
+            self.probes += 1
             try:
                 result = func()
-                self.state = "CLOSED"  # Recovered!
-                self.failure_count = 0
-                return result
             except Exception:
                 self.state = "OPEN"  # Recovery failed
+                self.last_failure_time = time.time()
                 raise
+            self.successes += 1
+            if self.successes >= success_threshold:  # default 3
+                self.state = "CLOSED"  # Recovered!
+                self.failure_count = 0
+            return result
 ```
 
 ### Integration with Caching
@@ -277,7 +285,7 @@ def fetch(key):
     # L2 miss → Distributed lock acquired
     # Only one pod calls fetch()
     # If L2 fails → Circuit opens
-    # All pods get None (no cascade)
+    # Each pod runs fetch() uncached (no cascade)
     return db.fetch(key)  # illustrative - not defined
 ```
 
@@ -328,8 +336,8 @@ print(f"Failures: {health['circuit_breaker']['failure_count']}")
 **Q: Circuit breaker keeps opening**
 A: Reduce failure threshold or increase cooldown. Investigate why Redis is failing.
 
-**Q: Getting None when circuit opens**
-A: That's correct behavior. Circuit breaker prevents errors, not cache hits. Handle None gracefully.
+**Q: My function runs on every call while the backend is down**
+A: That's the OPEN state: calls skip the cache and run your function. Once the cooldown has passed, the circuit probes the backend again and closes after 3 successful probes.
 
 **Q: Want to disable circuit breaker for testing**
 A: Pass `circuit_breaker=CircuitBreakerConfig(enabled=False)`.

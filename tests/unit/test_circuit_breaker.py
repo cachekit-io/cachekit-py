@@ -28,7 +28,7 @@ class TestCircuitBreakerConfig:
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
         assert config.timeout_seconds == 30.0
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
         # No error types excluded by default
         assert len(config.excluded_error_types) == 0
 
@@ -396,7 +396,7 @@ class TestCircuitBreaker:
 
     def test_thread_safety_state_transitions(self):
         """Test thread safety during state transitions."""
-        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
         breaker = CircuitBreaker(config, namespace="test")
 
         with time_machine.travel(0, tick=False) as traveller:

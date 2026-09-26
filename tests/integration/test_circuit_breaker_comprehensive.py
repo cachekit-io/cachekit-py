@@ -56,7 +56,7 @@ class TestCircuitBreakerConfiguration:
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
         assert config.timeout_seconds == 30.0
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
         # No error types excluded by default
         assert len(config.excluded_error_types) == 0
 

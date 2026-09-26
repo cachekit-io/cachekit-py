@@ -137,15 +137,19 @@ class FeatureOrchestrator:
             self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
-        """Check if request should be allowed based on circuit breaker state."""
+        """Ask the circuit breaker to admit this request.
+
+        This is the breaker's admission decision, not a state read: it runs the
+        OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
+        HALF_OPEN probe slot when it admits. Call it once per request, and record
+        the outcome of every admitted request (``record_success`` /
+        ``record_failure``). A rejected request is not a failure — do not record it.
+        """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
             return True
 
-        # Use the circuit breaker's call method or check state
-        from ..reliability.circuit_breaker import CircuitState
-
-        return self._circuit_breaker.get_state() != CircuitState.OPEN
+        return self._circuit_breaker.should_attempt_call()
 
     def can_accept_request(self) -> bool:
         """Check if system can accept new request based on load control."""
