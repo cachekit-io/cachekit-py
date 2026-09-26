@@ -47,8 +47,10 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
     waiting on ``fut`` until it is really done, absorbing every cancellation, then re-raise the
     last one: callers read ``fut`` for the real outcome before letting it propagate.
 
-    Pass a plain future (``loop.run_in_executor``), never a Task: ``all_tasks()`` sweeps such as
-    ``asyncio.run`` teardown cancel Tasks out from under the drain, and the outcome is lost again.
+    Prefer a plain future (``loop.run_in_executor``): ``all_tasks()`` sweeps such as ``asyncio.run``
+    teardown cancel Tasks out from under the drain, and the outcome is lost again. A Task
+    (``asyncio.ensure_future``) is the route for native coroutines such as an async HTTP request;
+    it gives up only that sweep, so the caller must treat a cancelled ``fut`` as having no outcome.
     """
     cancelled: Optional[asyncio.CancelledError] = None
     while not fut.done():

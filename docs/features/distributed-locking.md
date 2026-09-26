@@ -162,12 +162,15 @@ Three behavioural edges to design around:
 # the lock itself self-expires after 30 s (lock_timeout) as the safety net.
 ```
 
-On `RedisBackend`, cancelling the task mid-`acquire_lock` does not orphan the
-lock: the in-flight `SET NX` and the release both run to completion — however
-many cancellations land — before the `CancelledError` propagates. Only Redis
-failing the release leaves the key, until the same 30 s TTL as the crash case
-above. `CachekitIOBackend` does not yet drain cancellation this way: a cancel
-mid-request can leave a server-granted lock held until its server-side timeout.
+On `RedisBackend` and `CachekitIOBackend`, cancelling the task mid-`acquire_lock`
+does not orphan the lock: the in-flight acquire (the `SET NX`, or the
+`POST …/lock` request) and the release both run to completion — however many
+cancellations land — before the `CancelledError` propagates. The cancellation
+always wins over an acquire that failed meanwhile; the failure is logged. Only
+the backend failing the release leaves the lock, until the same 30 s timeout as
+the crash case above. One limit on `CachekitIOBackend`: its requests are drained
+as asyncio Tasks, and `asyncio.run()` teardown cancels every Task, so a request
+cut short there falls back on that same server-side timeout.
 
 ### TTL Shorter Than Compute Time
 ```python
