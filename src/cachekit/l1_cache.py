@@ -11,6 +11,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any, Optional
 
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
@@ -19,6 +20,9 @@ from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 # decorator's LAB-557 backfill bound: the server's Fresh-For may only ever
 # SHORTEN the L1 lifetime relative to this default, never extend it.
 DEFAULT_L1_TTL_SECONDS = 300
+
+# Keys removed per lock acquisition in invalidate_many.
+_INVALIDATE_BATCH = 1_000
 
 logger = logging.getLogger(__name__)
 
@@ -281,9 +285,10 @@ class L1Cache:
             self._remove_entry(key)
 
     def invalidate_many(self, keys: Iterable[str]) -> None:
-        """Invalidate (remove) several entries under one lock acquisition.
+        """Invalidate (remove) several entries, taking the lock once per 1 000 keys.
 
-        For whole-function invalidation, which can evict thousands of keys at once.
+        For whole-function invalidation, which can evict millions of keys at once. Every get
+        and put in this namespace waits on the lock, so no single hold covers the whole list.
 
         Args:
             keys: Keys to invalidate; keys not in the cache are ignored
@@ -296,9 +301,11 @@ class L1Cache:
             >>> l1.get("a")
             (False, None)
         """
-        with self._lock:
-            for key in keys:
-                self._remove_entry(key)
+        it = iter(keys)
+        while batch := list(islice(it, _INVALIDATE_BATCH)):
+            with self._lock:
+                for key in batch:
+                    self._remove_entry(key)
 
     def clear(self) -> None:
         """Clear all entries from L1 cache."""

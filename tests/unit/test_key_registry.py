@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import threading
 import time
 from pathlib import Path
@@ -195,7 +196,7 @@ class TestTrackingSites:
         assert writer(1) == 1  # L2 hit + L1 backfill
         assert len(backend.track_calls) == 1
 
-    def test_track_failure_doesnt_break_cache_write(self) -> None:
+    def test_track_failure_doesnt_break_cache_write(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = TrackingBackend()
         backend.fail_track = True
         calls = 0
@@ -206,9 +207,14 @@ class TestTrackingSites:
             calls += 1
             return x
 
-        assert f(1) == 1
-        assert f(1) == 1
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert f(1) == 1
+            assert f(1) == 1
         assert calls == 1  # written to L2/L1 despite the tracking failure
+        # Other processes' drains cannot see the key, so the failure must reach production logs.
+        (warning,) = [r for r in caplog.records if "Key tracking failed" in r.getMessage()]
+        assert warning.levelno == logging.WARNING
+        assert "track_raises" not in warning.getMessage()  # key and registry id are redacted
 
     def test_fallback_to_local_when_not_trackable(self) -> None:
         backend = PlainBackend()
@@ -451,3 +457,23 @@ class TestL1InvalidateMany:
         assert l1.get("b") == (False, None)
         assert l1.get("c") == (True, b"v")
         assert l1._current_memory_bytes == 1
+
+    def test_invalidate_many_releases_the_lock_between_batches(self) -> None:
+        l1 = L1Cache(namespace="inv_many_batches")
+        l1.put("k2499", b"v", redis_ttl=60)
+        real_lock, acquisitions = l1._lock, 0
+
+        class CountingLock:
+            def __enter__(self) -> None:
+                nonlocal acquisitions
+                acquisitions += 1
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+
+        l1._lock = CountingLock()  # type: ignore[assignment]
+        l1.invalidate_many(f"k{i}" for i in range(2_500))  # a one-shot iterable, like a drain result
+        l1._lock = real_lock
+        assert acquisitions == 3  # 1 000-key batches: a large drain never holds every get/put off at once
+        assert l1.get("k2499") == (False, None)

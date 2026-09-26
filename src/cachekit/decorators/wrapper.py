@@ -822,14 +822,20 @@ def create_cache_wrapper(
 
         Call only after the L2 write returned success, and never inline on an event loop
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
-        _cached_keys, and this process's next drain deletes it from there.
+        _cached_keys, and this process's next drain deletes it from there. Other processes'
+        drains cannot see it, so the failure is a WARNING, not a debug line.
         """
         if not _is_trackable():
             return
         try:
             _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
         except Exception as e:
-            _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+            _logger.warning(
+                "Key tracking failed for %s in registry %s; only this process's drain will delete it: %s",
+                redact_cache_key(cache_key),
+                redact_cache_key(_registry_id),
+                redact_error_for_log(e),
+            )
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
