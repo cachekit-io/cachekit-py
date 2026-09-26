@@ -65,15 +65,18 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
 def _encode_tenant(tenant_id: object) -> str:
     """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
 
-    Apps set int / UUID tenant ids despite the annotation; their ``str()`` is canonical, so
-    they are accepted: UUID with the subclasses drivers return (asyncpg, uuid6), int by exact
-    type, since an int subclass can change ``str()`` (``str(True)`` is 'True'; an IntEnum's
-    differs between Python versions). Anything else except str / bytes raises TypeError (fail
-    closed): the ``str()`` of an arbitrary object, e.g. a default repr embedding ``id()``, can
-    map two tenants to one prefix.
+    Apps set int / UUID tenant ids despite the annotation, so both are accepted in canonical
+    form. int by exact type, since an int subclass can change ``str()`` (``str(True)`` is
+    'True'; an IntEnum's differs between Python versions). UUID with the subclasses drivers
+    return (asyncpg, uuid6), formatted by value through the base class, so a subclass
+    overriding ``__str__`` cannot map two UUIDs to one prefix. Anything else except str / bytes
+    raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a default repr
+    embedding ``id()``, can map two tenants to one prefix.
     """
-    if type(tenant_id) is int or isinstance(tenant_id, uuid.UUID):
+    if type(tenant_id) is int:
         tenant_id = str(tenant_id)
+    elif isinstance(tenant_id, uuid.UUID):
+        tenant_id = uuid.UUID.__str__(tenant_id)
     if not isinstance(tenant_id, (str, bytes)):
         raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
     return url_encode(tenant_id, safe="")
