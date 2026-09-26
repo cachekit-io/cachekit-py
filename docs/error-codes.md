@@ -472,7 +472,7 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. For sync functions none raises: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. These failures do not count toward the circuit breaker.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. For sync functions none raises: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. "Uncached" in this section means the value is not served from the cache: a failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
 
 Async functions currently behave differently (a known defect). A 401, 403 or 400 raises `httpx.HTTPStatusError` to the caller without running the function. On a 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
 
