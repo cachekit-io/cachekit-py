@@ -10,14 +10,16 @@ real sink, over sync and async, for an L1 hit, an L2 hit and a miss.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from typing import Any, TypeVar
 
 import pytest
 
 from cachekit import cache
 from cachekit.l1_cache import get_l1_cache_manager
 from cachekit.reliability.async_metrics import AsyncMetricsCollector
+
+T = TypeVar("T")
 
 
 class _ByteStore:
@@ -54,9 +56,11 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return calls
 
 
-async def _call(fn: Any) -> Any:
+async def _call(fn: Callable[[], T | Awaitable[T]]) -> T:
     result = fn()
-    return await result if inspect.isawaitable(result) else result
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 @pytest.mark.unit
