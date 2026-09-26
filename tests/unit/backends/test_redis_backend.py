@@ -615,3 +615,33 @@ class TestClassifyRedisErrorClusterDown:
         )
 
         assert error.error_type == BackendErrorType.PERMANENT
+
+
+@pytest.mark.unit
+class TestClassifyRedisErrorMisfiles:
+    """TryAgainError subclasses ResponseError; InvalidResponse and LockError match no base branch."""
+
+    def test_try_again_is_transient(self):
+        exceptions = pytest.importorskip("redis.exceptions")
+        if not hasattr(exceptions, "TryAgainError"):
+            pytest.skip("redis-py lacks TryAgainError")
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(
+            exceptions.TryAgainError("TRYAGAIN Multiple keys request during rehashing"), operation="get"
+        )
+
+        assert error.error_type == BackendErrorType.TRANSIENT
+
+    @pytest.mark.parametrize("exc_name", ["InvalidResponse", "LockError"])
+    def test_protocol_and_lock_errors_are_permanent(self, exc_name):
+        import redis.exceptions
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(getattr(redis.exceptions, exc_name)("boom"), operation="get")
+
+        assert error.error_type == BackendErrorType.PERMANENT
