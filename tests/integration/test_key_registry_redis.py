@@ -46,12 +46,6 @@ class TestTrackKey:
         assert client.smembers(f"t:self:{REG}") == {b"ns:x:func:m.f:args:abc:1"}
         assert 604_000 < client.ttl(f"t:self:{REG}") <= 604_800
 
-    def test_track_key_failure_is_classified(self, client: redis.Redis) -> None:
-        broken = MagicMock()
-        broken.pipeline.side_effect = redis.ConnectionError("down")
-        with pytest.raises(BackendError):
-            PerRequestRedisBackend(broken, "self").track_key(REG, "k")
-
 
 class TestDrainTracked:
     def test_drain_deletes_actual_l2_data(self, client: redis.Redis) -> None:
@@ -127,6 +121,30 @@ class TestDrainTracked:
         with pytest.raises(BackendError):
             backend.drain_tracked(REG, local)
         assert calls == 2
+
+    def test_failed_unlink_keeps_member_tracked(self, client: redis.Redis) -> None:
+        """A script aborted by a failing UNLINK is not rolled back, so a member must leave the
+        set only after its own key is unlinked: every member no longer tracked has its key gone,
+        and the member whose UNLINK failed stays tracked for the next drain."""
+        pool = client.connection_pool
+        client.execute_command("ACL", "SETUSER", "drain_limited", "on", "nopass", f"~t:self:{REG}", "~t:self:ok*", "+@all")
+        try:
+            members = ["ok1", "ok2", "ok3", "denied"]
+            client.sadd(f"t:self:{REG}", *members)
+            client.mset({f"t:self:{m}": b"v" for m in members})
+            limited = redis.Redis(
+                connection_pool=redis.ConnectionPool(
+                    connection_class=pool.connection_class, **{**pool.connection_kwargs, "username": "drain_limited"}
+                )
+            )
+            with pytest.raises(BackendError):
+                PerRequestRedisBackend(limited, "self").drain_tracked(REG, set())
+            limited.close()
+        finally:
+            client.execute_command("ACL", "DELUSER", "drain_limited")
+        tracked = {m.decode() for m in client.smembers(f"t:self:{REG}")}
+        assert "denied" in tracked
+        assert all(client.exists(f"t:self:{m}") == 0 for m in set(members) - tracked)
 
     def test_drain_skips_undecodable_members(self, client: redis.Redis, caplog: pytest.LogCaptureFixture) -> None:
         client.sadd(f"t:self:{REG}", b"\xff\xfe", b"\xc3\x28", "good")

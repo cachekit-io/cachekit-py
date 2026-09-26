@@ -94,6 +94,17 @@ class TestMaxValueSizeEnforcement:
         assert result.stored is False
         assert backend.set_calls == []
 
+    @pytest.mark.asyncio
+    async def test_store_result_async_stores_normal_value(self, small_limit):
+        backend = RecordingHandler()
+        op = CacheOperationHandler(CacheSerializationHandler(), CacheKeyGenerator(), cache_handler=backend)
+
+        result = await op.store_result_async("small:key", {"ok": 1}, ttl=60)
+
+        assert isinstance(result.envelope, bytes)
+        assert result.stored is True
+        assert len(backend.set_calls) == 1
+
     def test_default_limit_allows_typical_values(self, default_limit):
         """With the 100MB default, ordinary payloads are unaffected."""
         handler = CacheSerializationHandler()

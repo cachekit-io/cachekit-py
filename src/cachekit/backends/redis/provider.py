@@ -48,13 +48,16 @@ _DRAIN_MAX_ROUNDS = 1_000
 _DRAIN_WARN_KEYS = 100_000
 # KEYS[1] = scoped tracking set; ARGV[1] = tenant key prefix; ARGV[2] = chunk size.
 # Members are stored raw and the prefix is applied here, so whatever a member says, the
-# key unlinked is always inside this backend's own tenant prefix.
+# key unlinked is always inside this backend's own tenant prefix. A member leaves the set
+# only after its own UNLINK: Redis does not roll back a script that errors midway, so
+# removing members first (SPOP) would lose every one whose key a failed call never reached.
 _DRAIN_SCRIPT = """
-local popped = redis.call('SPOP', KEYS[1], ARGV[2])
-for i = 1, #popped do
-    redis.call('UNLINK', ARGV[1] .. popped[i])
+local members = redis.call('SRANDMEMBER', KEYS[1], ARGV[2])
+for i = 1, #members do
+    redis.call('UNLINK', ARGV[1] .. members[i])
+    redis.call('SREM', KEYS[1], members[i])
 end
-return popped
+return members
 """
 
 
@@ -522,8 +525,9 @@ class PerRequestRedisBackend:
         """Delete every tracked key of a registry, then every local key the drain missed
         (KeyTrackableBackend protocol).
 
-        Each script call atomically pops at most 10 000 members and ``UNLINK``s
-        ``{tenant prefix}{member}`` for each; calls repeat until one pops a short chunk. A
+        Each script call atomically pops at most 10 000 members: it ``UNLINK``s
+        ``{tenant prefix}{member}`` for each, then removes the member from the set, so a member
+        is never dropped before its key is. Calls repeat until one pops a short chunk. A
         write landing during the drain is either popped by a later call or stays in the set
         for the next drain — never orphaned. Past 1 000 calls the drain stops with a WARNING
         and the remaining members wait for the next drain.
@@ -542,7 +546,8 @@ class PerRequestRedisBackend:
         Raises:
             BackendError: If the script or an ``UNLINK`` batch fails (``NOSCRIPT`` is
                 handled by redis-py re-loading the script). Keys already unlinked stay
-                deleted.
+                deleted; members whose keys were not unlinked stay in the set for the next
+                drain.
 
         Requires a single-instance (or primary/replica) Redis server >= 5.0 and, for
         restricted ACL users, the ``@scripting`` category. Redis Cluster is unsupported:

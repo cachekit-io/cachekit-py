@@ -199,7 +199,7 @@ get_user.invalidate_cache()
 
 Things to know:
 
-- **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster is not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys.
+- **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster is not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A key leaves the set only once it has been deleted, so tracked keys a failed drain did not reach wait in the set for the next drain.
 - **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation.
 - **Set lifetime.** A tracking set expires 7 days after the last write to its function. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
 - **Tenants.** The set is tenant-scoped like every other key, and a drain can only delete keys inside its own tenant prefix. A decorated function binds to the tenant in `tenant_context` at its first call, so set the tenant before that call. A process that never sets one drains tenant `default`; the INFO line `Key registry drained N keys` shows how many keys a drain deleted.
