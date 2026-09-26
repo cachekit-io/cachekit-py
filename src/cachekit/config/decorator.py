@@ -102,7 +102,7 @@ class DecoratorConfig:
             return "value"
 
     Attributes:
-        ttl: Time-to-live in seconds (None = no expiration)
+        ttl: Time-to-live in seconds (None = no expiration; every preset sets its own default — see each classmethod)
         namespace: Optional namespace prefix for cache keys
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
@@ -261,17 +261,23 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, integrity_checking=True to opt-in, etc.)
+                Default ttl=300 (protocol/spec/intent-presets.md); ttl=None = never expire.
 
         Returns:
             DecoratorConfig with minimal protections preset
 
         Example:
-            >>> config = DecoratorConfig.minimal(ttl=300)
+            >>> config = DecoratorConfig.minimal()
+            >>> config.ttl
+            300
             >>> config.circuit_breaker.enabled
             False
             >>> config.integrity_checking
             False
+            >>> DecoratorConfig.minimal(ttl=None).ttl is None  # explicit no-expiry opt-in
+            True
         """
+        kwargs.setdefault("ttl", 300)
         return cls(
             integrity_checking=False,  # Speed-first: no checksum overhead
             l1=L1CacheConfig(
@@ -300,17 +306,21 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, etc.)
+                Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
 
         Returns:
             DecoratorConfig with production-grade protections
 
         Example:
-            >>> config = DecoratorConfig.production(ttl=600)
+            >>> config = DecoratorConfig.production()
+            >>> config.ttl
+            600
             >>> config.circuit_breaker.enabled
             True
             >>> config.integrity_checking
             True
         """
+        kwargs.setdefault("ttl", 600)
         return cls(
             integrity_checking=True,  # Production: integrity guarantee
             l1=L1CacheConfig(
@@ -342,6 +352,7 @@ class DecoratorConfig:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
             tenant_extractor: Optional tenant ID extractor for multi-tenant encryption
             **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking cannot be overridden.
+                     Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
                      (default None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, which defaults to False)
@@ -350,12 +361,15 @@ class DecoratorConfig:
             DecoratorConfig with encryption enabled and full security features
 
         Example:
-            >>> config = DecoratorConfig.secure(master_key="a" * 64, ttl=600)
+            >>> config = DecoratorConfig.secure(master_key="a" * 64)
+            >>> config.ttl
+            600
             >>> config.encryption.enabled
             True
             >>> config.integrity_checking
             True
         """
+        kwargs.setdefault("ttl", 600)
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
         deployment_uuid = kwargs.pop("deployment_uuid", None)
@@ -411,17 +425,21 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, etc.)
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
             DecoratorConfig optimized for development
 
         Example:
-            >>> config = DecoratorConfig.dev(ttl=60)
+            >>> config = DecoratorConfig.dev()
+            >>> config.ttl
+            300
             >>> config.monitoring.enable_prometheus_metrics
             False
             >>> config.integrity_checking
             True
         """
+        kwargs.setdefault("ttl", 300)
         return cls(
             integrity_checking=True,  # Development: catch data corruption early
             l1=L1CacheConfig(
@@ -450,17 +468,21 @@ class DecoratorConfig:
 
         Args:
             **kwargs: Overrides (ttl, namespace, backend, etc.)
+                Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
             DecoratorConfig optimized for testing
 
         Example:
-            >>> config = DecoratorConfig.test(ttl=10)
+            >>> config = DecoratorConfig.test()
+            >>> config.ttl
+            300
             >>> config.circuit_breaker.enabled
             False
             >>> config.integrity_checking
             False
         """
+        kwargs.setdefault("ttl", 300)
         return cls(
             integrity_checking=False,  # Testing: fast deterministic behavior
             l1=L1CacheConfig(
@@ -499,6 +521,8 @@ class DecoratorConfig:
             api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
             **kwargs: Overrides (ttl, namespace, etc.). ``backend`` is not one — io always
                 caches through its own CachekitIOBackend and rejects ``backend=``.
+                Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None = never expire
+                (and disables the stale_ttl SWR window, which needs a positive ttl).
 
         Returns:
             DecoratorConfig with CachekitIOBackend
@@ -509,10 +533,13 @@ class DecoratorConfig:
                 ``backend=`` is passed.
 
         Example:
-            >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)  # pragma: allowlist secret
+            >>> config = DecoratorConfig.io(api_key="ck_test_key")  # pragma: allowlist secret
             >>> config.ttl
+            3600
+            >>> DecoratorConfig.io(api_key="ck_test_key", ttl=300).ttl  # pragma: allowlist secret
             300
         """
+        kwargs.setdefault("ttl", 3600)
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 

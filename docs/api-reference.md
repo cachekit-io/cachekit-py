@@ -86,7 +86,7 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
 - **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
@@ -223,6 +223,7 @@ def get_exchange_rates():
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
+- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` disables both expiry and SWR.
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods
@@ -595,7 +596,6 @@ def get_user_data_v2(user_id):
 Configuration class for backend-agnostic cache settings. Based on `pydantic-settings` for automatic environment variable loading with the `CACHEKIT_` prefix. Redis connection settings (URL, pool size, timeouts) live on `RedisBackendConfig`, not here.
 
 **Key Fields:**
-- **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
@@ -612,7 +612,7 @@ from cachekit.config import get_settings
 config = get_settings()
 ```
 
-**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
+**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
 
 
 ---
@@ -700,7 +700,6 @@ cachekit is configured through environment variables. For detailed setup and tro
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 # Cache Behavior
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 

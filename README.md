@@ -160,11 +160,12 @@ def get_user_profile(user_id: int):
 
 | Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |
 |:--------|:----------------:|:------------:|:-------------:|:-------------------:|:---------------:|
+| Default TTL | 300 s | 300 s | 300 s | 600 s | 600 s |
 | Circuit Breaker | - | ✅ | - | ✅ | ✅ |
 | Backpressure | ✅ | ✅ | - | ✅ | ✅ |
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
-| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | ✅ |
+| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
 | L1 Invalidation | - | - | - | ✅ | ✅ |
 | Prometheus Metrics | - | - | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
@@ -172,6 +173,8 @@ def get_user_profile(user_id: int):
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
 > 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+>
+> **Default TTL** follows the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) (`@cache.io` 3600 s) — the same numbers as cachekit-rs and cachekit-ts. `ttl=` overrides it; `ttl=None` is the explicit never-expire opt-in ([details](docs/configuration.md#intent-presets)).
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
@@ -442,7 +445,6 @@ CACHEKIT_MEMCACHED_TIMEOUT=1.0                            # Default: 1.0 seconds
 CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)
 
 # Optional Configuration
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 ```
