@@ -529,7 +529,9 @@ The `serializer` parameter accepts:
 ```python notest
 # By name (string)
 @cache(serializer="std", backend=None)          # StandardSerializer (alias)
+@cache(serializer="default", backend=None)      # StandardSerializer
 @cache(serializer="auto", backend=None)         # AutoSerializer
+@cache(serializer="pythonic", backend=None)     # AutoSerializer (alias)
 @cache(serializer="orjson", backend=None)       # OrjsonSerializer
 @cache(serializer="arrow", backend=None)        # ArrowSerializer
 
