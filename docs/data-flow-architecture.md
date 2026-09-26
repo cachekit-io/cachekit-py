@@ -725,11 +725,13 @@ def deserialize(data: bytes, metadata) -> Any:
 **Decompression Bomb Protection:**
 - Max uncompressed: 512MB
 - Max compressed: 512MB
-- Max compression ratio: 100x
+- Max compression ratio: 1000x
 
 **Checksum Validation:**
 - xxHash3-64 hash verification
-- Detects data corruption
+- Detects data corruption in the **payload bytes** only. The envelope's own `format` and
+  `original_size` fields sit outside it, as does the plaintext CK header — see E021 in
+  [error-codes.md](error-codes.md) for how the decode path handles that.
 
 **Test Coverage:**
 - ByteStorage module: 82% LLVM coverage (all production paths tested)

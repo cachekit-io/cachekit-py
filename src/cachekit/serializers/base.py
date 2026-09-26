@@ -326,6 +326,24 @@ class SuspiciousCacheEntryError(SerializationError):
     pass
 
 
+class EnvelopeShapeError(SerializationError):
+    """An entry nothing verified decoded to the SHAPE of a ByteStorage envelope —
+    ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused.
+
+    Two populations reach this and the read path cannot tell them apart (LAB-2736): a
+    rotted integrity-on envelope whose checksum can no longer be checked, and a legitimate
+    top-level 4-element list a caller cached that merely looks like one. Refusing both is
+    the chosen corner — returning a rotted envelope hands the caller its compressed payload
+    as their object. Callers treat it as a miss (evict → recompute), but for the second
+    population recompute re-produces the same bytes and the refusal repeats on every read,
+    so telemetry counts it under its own ``envelope_shape`` reason rather than
+    ``corruption``: a steady rate on one key is that value, not storage rot, and must not
+    read as a corruption spike.
+    """
+
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Owned untrusted-decode bounds (LAB-2503; protocol spec/interop-mode.md → Decode bounds)
 # ---------------------------------------------------------------------------
@@ -368,9 +386,12 @@ _LOG_UNSAFE_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7F, *range(0x8
 _LOG_UNSAFE_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
 
 
-def bounded_error(exc: BaseException) -> str:
+def bounded_error(exc: BaseException | str) -> str:
     """``str(exc)`` clipped to :data:`ERROR_ECHO_MAX` and reduced to one terminal-safe line, for
     logging or re-wrapping a failure whose text is influenced by untrusted cache bytes.
+
+    Accepts a bare ``str`` so a boundary whose "cause" is a comparison rather than a raised error
+    (``AutoSerializer._envelope_failure``) bounds through this same helper.
 
     Applied once at each trust-boundary re-raise site (the read-path ``SerializationError``
     wraps in ``cache_handler``) rather than per field: the bound then holds for
