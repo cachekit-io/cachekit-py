@@ -6,9 +6,11 @@ dramatically reducing network latency while maintaining Redis as the source of t
 
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -66,6 +68,7 @@ class L1Cache:
         max_memory_mb: int = 100,
         ttl_buffer_seconds: float = 1.0,
         namespace: str = "default",
+        before_store: Optional[Callable[[], None]] = None,
     ):
         """Initialize L1 cache.
 
@@ -73,10 +76,13 @@ class L1Cache:
             max_memory_mb: Maximum memory usage in MB (default 100MB)
             ttl_buffer_seconds: Buffer time before Redis TTL expiry (default 1s)
             namespace: Cache namespace for isolation
+            before_store: Called before each store. L1CacheManager passes its fork take-over
+                here: decorators capture this cache once and never call the manager again.
         """
         self.max_memory_bytes = max_memory_mb * 1024 * 1024
         self.ttl_buffer_seconds = ttl_buffer_seconds
         self.namespace = namespace
+        self._before_store = before_store
 
         # Thread-safe cache storage
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
@@ -195,6 +201,10 @@ class L1Cache:
             )
             return
 
+        # Before the first _lock use: the take-over replaces a _lock orphaned by fork.
+        if self._before_store is not None:
+            self._before_store()
+
         # Estimate size
         size = self._estimate_size(value)
 
@@ -231,6 +241,29 @@ class L1Cache:
 
             # Move to end (most recently used)
             self._cache.move_to_end(key)
+
+    def _reset_lock_after_fork(self) -> None:
+        """Replace _lock if a parent thread held it at fork; call only from a fork take-over.
+
+        The holder does not exist in the child, so the lock never releases. _is_owned() first:
+        a thread started in the child can reuse the dead holder's ident and so "own" its hold.
+        The timeout waits out a child thread briefly holding the lock legitimately. An orphaned
+        holder may have left the entries half-updated, so they are dropped; L2 still has them.
+        """
+        lock = self._lock
+        if not lock._is_owned() and lock.acquire(timeout=1.0):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            lock.release()
+            return
+        logger.warning(
+            "L1Cache %s: dropped %d entries (%d bytes) after fork; a parent thread held its lock",
+            self.namespace,
+            len(self._cache),
+            self._current_memory_bytes,
+        )
+        # Clear before publishing the new lock: the orphaned one still shuts every other thread out.
+        self._cache.clear()
+        self._current_memory_bytes = 0
+        self._lock = threading.RLock()
 
     def _remove_entry(self, key: str) -> None:
         """Remove entry from cache and update memory tracking.
@@ -365,7 +398,52 @@ class L1CacheManager:
 
         # Background cleanup thread state
         self._cleanup_thread: Optional[threading.Thread] = None
+        self._cleanup_interval = 30.0
         self._stop_cleanup = threading.Event()
+
+        # Process that owns _lock, _stop_cleanup and _cleanup_thread. Every method touching
+        # them calls _take_over_if_forked() first, or a forked child uses parent state.
+        self._owner_pid = os.getpid()
+        self._fork_locks: dict[int, threading.Lock] = {}
+
+    def _take_over_if_forked(self) -> None:
+        """Take over inherited state in a forked child; restart cleanup if the parent ran it.
+
+        Threads don't survive fork(): a prefork child (Gunicorn --preload, Celery prefork)
+        inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache._lock as
+        parent state a parent thread may have held at fork. An owner-PID check rather than an
+        os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
+        thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
+        syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
+        thread. A thread the parent had stopped stays stopped. Known limit: a get() that reaches
+        a cache lock orphaned at fork before any put in the child has run this hangs for the
+        child's life. Decorated functions get() before they put(), so their first call in that
+        namespace is exposed.
+        """
+        pid = os.getpid()
+        if self._owner_pid == pid:
+            return
+        # Keyed by PID so no parent thread can have held it at fork; setdefault is atomic
+        # with or without the GIL, so concurrent first puts in a child take over once.
+        with self._fork_locks.setdefault(pid, threading.Lock()):
+            if self._owner_pid == pid:
+                return
+            self._lock = threading.Lock()
+            self._stop_cleanup = threading.Event()
+            for cache in self._caches.values():  # before the cleanup worker takes their locks
+                cache._reset_lock_after_fork()
+            if self._cleanup_thread is not None:
+                try:
+                    self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
+                except RuntimeError as e:  # how Thread.start() refuses: "can't start new thread" at a pids cap
+                    # Taken over regardless, so puts don't retry. Anything else is a bug: it propagates
+                    # with the take-over uncommitted, and the next put retries it in full.
+                    self._cleanup_thread = None
+                    logger.warning(
+                        "L1 cleanup thread restart after fork failed: %s; expired entries are now evicted only on read",
+                        redact_error_for_log(e),
+                    )
+            self._owner_pid = pid
 
     def get_cache(self, namespace: str = "default", max_size_mb: int | None = None) -> L1Cache:
         """Get or create L1 cache for namespace.
@@ -379,11 +457,12 @@ class L1CacheManager:
         Returns:
             L1Cache instance for namespace
         """
+        self._take_over_if_forked()
         with self._lock:
             cache = self._caches.get(namespace)
             if cache is None:
                 budget = max_size_mb if max_size_mb is not None else self._default_max_memory_mb
-                cache = L1Cache(max_memory_mb=budget, namespace=namespace)
+                cache = L1Cache(max_memory_mb=budget, namespace=namespace, before_store=self._take_over_if_forked)
                 self._caches[namespace] = cache
                 logger.info("Created L1 cache for namespace: %s (max_memory=%dMB)", namespace, budget)
             elif max_size_mb is not None and cache.max_memory_bytes != max_size_mb * 1024 * 1024:
@@ -404,10 +483,13 @@ class L1CacheManager:
         Args:
             interval_seconds: Cleanup interval in seconds
         """
-        if self._cleanup_thread is not None:
+        self._take_over_if_forked()
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             logger.warning("Background cleanup already running")
             return
+        self._spawn_cleanup_thread(interval_seconds)
 
+    def _spawn_cleanup_thread(self, interval_seconds: float) -> None:
         def cleanup_worker():
             logger.info("L1 cache background cleanup started (interval: %.1fs)", interval_seconds)
 
@@ -428,12 +510,16 @@ class L1CacheManager:
 
             logger.info("L1 cache background cleanup stopped")
 
+        self._cleanup_interval = interval_seconds
         self._stop_cleanup.clear()
-        self._cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
-        self._cleanup_thread.start()
+        thread = threading.Thread(target=cleanup_worker, daemon=True)
+        thread.start()
+        # Published only once started: stop_background_cleanup would join() an unstarted thread and raise.
+        self._cleanup_thread = thread
 
     def stop_background_cleanup(self) -> None:
         """Stop background cleanup thread."""
+        self._take_over_if_forked()
         if self._cleanup_thread is None:
             return
 
@@ -447,11 +533,13 @@ class L1CacheManager:
         Returns:
             Dictionary mapping namespace to stats
         """
+        self._take_over_if_forked()
         with self._lock:
             return {namespace: cache.get_stats() for namespace, cache in self._caches.items()}
 
     def clear_all(self) -> None:
         """Clear all L1 caches."""
+        self._take_over_if_forked()
         with self._lock:
             for cache in self._caches.values():
                 cache.clear()
