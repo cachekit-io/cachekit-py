@@ -2,7 +2,7 @@
 # header on main (always under squash_merge_commit_title=PR_TITLE; on a
 # multi-commit PR under COMMIT_OR_PR_TITLE). release-please SILENTLY skips
 # headers it can't parse: no version bump, no changelog entry, no visible
-# failure (LAB-451). This check makes the failure visible at PR time instead of
+# failure. This check makes the failure visible at PR time instead of
 # one release later.
 #
 # Ticket ids go in the branch (lab-123-slug), the body, or a title SUFFIX

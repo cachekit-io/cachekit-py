@@ -32,16 +32,19 @@ def cached_function(x):
 ```python notest
 from cachekit.backends.cachekitio import CachekitIOBackend
 
+# Every argument is optional; anything left out loads from the environment.
 backend = CachekitIOBackend(
-    api_url="https://api.cachekit.io",  # required if not using env
-    api_key="ck_live_...",              # required if not using env
-    timeout=5.0,                        # optional, default: 5.0 seconds
+    api_key="ck_live_...",              # default: CACHEKIT_API_KEY
+    api_url="https://api.cachekit.io",  # default: CACHEKIT_API_URL, then api.cachekit.io
+    timeout=5.0,                        # default: CACHEKIT_TIMEOUT, then 5.0 seconds
 )
 ```
 
 ## Convenience Shorthand via `@cache.io()`
 
 ```python notest
+import os
+
 from cachekit import cache
 
 # Equivalent to: @cache(backend=CachekitIOBackend())
@@ -50,7 +53,21 @@ from cachekit import cache
 @cache.io(ttl=300, namespace="my-app")
 def cached_function(x):
     return expensive_computation(x)
+
+# The key is CACHEKIT_API_KEY by default; pass it explicitly to hold
+# more than one key in a process (multi-tenant services, test suites).
+@cache.io(api_key=os.environ["TENANT_B_CACHEKIT_API_KEY"], namespace="tenant-b")
+def tenant_b_function(x):
+    return expensive_computation(x)
 ```
+
+`@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
+source, if the key contains whitespace (usually a trailing newline from a secrets file), if
+`CACHEKIT_API_URL` fails validation, or if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
+To cache through another backend, use `@cache.production(backend=...)`.
+
+The RORO form `@cache(config=DecoratorConfig.io(api_key=...))` keeps its own key even when
+`set_default_backend()` is set: a backend already in `config=` wins over the module default.
 
 ## Health Check
 
@@ -122,12 +139,12 @@ fast_backend = backend.with_timeout(1.0)  # 1-second timeout variant
 
 ## Security
 
-The API URL is validated on construction — HTTPS required, private/internal IP addresses blocked. The default allowlist restricts connections to `api.cachekit.io` and `api.staging.cachekit.io`. Set `CACHEKIT_ALLOW_CUSTOM_HOST=true` to override (testing only).
+The API URL is validated on construction — HTTPS required, credentials in the URL (`user:password@`) rejected, private/internal IP addresses blocked. The default allowlist restricts connections to `api.cachekit.io` and `api.staging.cachekit.io`. Set `CACHEKIT_ALLOW_CUSTOM_HOST=true` to override (testing only).
 
 ## Environment Variables
 
 ```bash
-CACHEKIT_API_KEY=ck_live_...          # Required — API key for authentication
+CACHEKIT_API_KEY=ck_live_...          # API key — or pass api_key= to CachekitIOBackend / @cache.io
 CACHEKIT_API_URL=https://api.cachekit.io  # Optional — defaults to api.cachekit.io
 CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 ```
@@ -149,8 +166,10 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 - Latency: ~10–50ms L2 (HTTP/2, region-dependent)
 - Sync and async support (hybrid client architecture)
-- Connection pooling built-in (default: 10 connections)
-- Automatic retries on transient errors (default: 3)
+- Connection pooling built-in (default: 10 connections). Backends created on the same thread with the
+  same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
+  when the last one is released; the async pool is not, and Python reclaims its sockets with a
+  `ResourceWarning` each. Create one backend per key and reuse it
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 

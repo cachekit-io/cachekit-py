@@ -67,48 +67,6 @@ def _gil_stays_disabled_on_free_threaded_builds():
 # =============================================================================
 
 
-@pytest.fixture
-def redis_config_factory(monkeypatch):
-    """Factory fixture for creating CachekitConfig instances with custom values.
-
-    This fixture provides a clean way to create config instances in tests
-    without polluting the global environment.
-
-    Usage:
-        def test_something(redis_config_factory):
-            config = redis_config_factory(redis_url="redis://test:6379", default_ttl=7200)
-    """
-    from cachekit.config import CachekitConfig
-
-    def _create_config(**kwargs):
-        """Create a config with the given values by temporarily setting env vars."""
-        if not kwargs:
-            return CachekitConfig()
-
-        # Map config keys to environment variables
-        env_mapping = {
-            "redis_url": "CACHEKIT_REDIS_URL",
-            "connection_pool_size": "CACHEKIT_CONNECTION_POOL_SIZE",
-            "default_ttl": "CACHEKIT_DEFAULT_TTL",
-            "max_retries": "CACHEKIT_MAX_RETRIES",
-            "socket_timeout": "CACHEKIT_SOCKET_TIMEOUT",
-            "socket_connect_timeout": "CACHEKIT_SOCKET_CONNECT_TIMEOUT",
-            "retry_on_timeout": "CACHEKIT_RETRY_ON_TIMEOUT",
-            "retry_delay_ms": "CACHEKIT_RETRY_DELAY_MS",
-            "early_refresh_ratio": "CACHEKIT_EARLY_REFRESH_RATIO",
-            "enable_corruption_detection": "CACHEKIT_ENABLE_CORRUPTION_DETECTION",
-        }
-
-        # Use monkeypatch to set env vars temporarily for this test
-        for key, value in kwargs.items():
-            if key in env_mapping:
-                monkeypatch.setenv(env_mapping[key], str(value))
-
-        return CachekitConfig()
-
-    return _create_config
-
-
 class RedisTestConfig:
     """Configuration manager for Redis test environments."""
 

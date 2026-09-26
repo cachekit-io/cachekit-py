@@ -94,6 +94,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     Security:
         SSRF protection is enabled by default. The api_url is validated to:
         - Require HTTPS protocol
+        - Reject credentials in the URL (user:password@); the API key is the only credential
         - Reject private/internal IP addresses (10.x, 172.16-31.x, 192.168.x, etc.)
         - Only allow known hostnames (api.cachekit.io, api.staging.cachekit.io)
 
@@ -103,6 +104,9 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     model_config = SettingsConfigDict(
         **inherit_config(BaseBackendConfig),
         env_prefix="CACHEKIT_",
+        # This class is public: built directly (or via from_env()), a failed validation would
+        # print the raw api_key in str(ValidationError) — tracebacks, logs (CWE-532).
+        hide_input_in_errors=True,
     )
 
     api_url: str = Field(
@@ -111,6 +115,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     )
     api_key: SecretStr = Field(
         ...,  # Required field
+        min_length=1,  # an empty key would go out as "Bearer " and fail on the first call, not here
         description="API key (ck_live_...) - required for authentication",
     )
     timeout: float = Field(
@@ -133,22 +138,42 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         description="Allow custom API hostnames (disables SSRF hostname allowlist)",
     )
 
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, v: SecretStr) -> SecretStr:
+        # A bearer token never contains whitespace (RFC 6750); a key read from a secrets file
+        # usually carries a trailing newline. Accepted, it fails on the first request with an h11
+        # error that echoes "Bearer <key>". Reject rather than strip: never rewrite a credential.
+        if any(c.isspace() for c in v.get_secret_value()):
+            raise ValueError("contains whitespace (a trailing newline from a secrets file is the usual cause)")
+        return v
+
     @field_validator("api_url")
     @classmethod
     def validate_api_url(cls, v: str) -> str:
         """Validate API URL with SSRF protection.
 
         Raises:
-            ValueError: If URL is invalid, uses non-HTTPS, or targets private IP
+            ValueError: If URL is invalid, carries credentials, uses non-HTTPS, or targets private IP
         """
+        # Never echo the URL: its userinfo may carry credentials (CWE-532). urlparse's own error can
+        # quote the whole netloc, so it is kept off the chain too: raised outside the except block.
         try:
             parsed = urlparse(v)
-        except Exception as e:
-            raise ValueError(f"Invalid API URL: {v}") from e
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            raise ValueError("Invalid API URL: could not be parsed")
+
+        # Userinfo never authenticates here: httpx sends it as Basic auth in place of the Bearer key,
+        # and its INFO log prints the full request URL, password included (CWE-532).
+        if "@" in parsed.netloc:
+            raise ValueError("API URL must not contain credentials (user:password@)")
 
         # Enforce HTTPS protocol
         if parsed.scheme != "https":
-            raise ValueError(f"API URL must use HTTPS protocol, got: {parsed.scheme}://")
+            # No scheme echo: in "user:pw@host" urlparse reads the username as the scheme.
+            raise ValueError("API URL must use HTTPS protocol")
 
         # Reject private/internal IP addresses
         hostname = parsed.hostname or ""

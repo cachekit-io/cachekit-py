@@ -16,7 +16,7 @@ from .load_control import BackpressureController
 from .profiles import (
     ProfileConfig,
     ReliabilityProfile,
-    create_optimized_decorator_config,
+    create_decorator_config,
     get_profile_config,
     recommend_profile,
 )
@@ -31,7 +31,7 @@ __all__ = [
     "CircuitState",
     "ProfileConfig",
     "ReliabilityProfile",
-    "create_optimized_decorator_config",
+    "create_decorator_config",
     "get_async_metrics_collector",
     "get_profile_config",
     "recommend_profile",

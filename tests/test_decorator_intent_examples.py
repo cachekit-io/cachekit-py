@@ -100,17 +100,17 @@ class TestIntentBasedSecure:
 
     def test_secure_config_encryption_enabled(self):
         """Secure preset enables encryption."""
-        config = DecoratorConfig.secure(master_key="a" * 64, backend=None)
+        config = DecoratorConfig.secure(master_key="a" * 64)
         assert config.encryption.enabled is True
 
     def test_secure_config_l1_enabled_for_encrypted_hits(self):
         """Secure preset enables L1 cache (stores encrypted bytes for performance)."""
-        config = DecoratorConfig.secure(master_key="a" * 64, backend=None)
+        config = DecoratorConfig.secure(master_key="a" * 64)
         assert config.l1.enabled is True
 
     def test_secure_config_monitoring_enabled(self):
         """Secure preset enables full monitoring for audit trail."""
-        config = DecoratorConfig.secure(master_key="a" * 64, backend=None)
+        config = DecoratorConfig.secure(master_key="a" * 64)
         assert config.monitoring.collect_stats is True
         assert config.monitoring.enable_tracing is True
 
@@ -124,7 +124,7 @@ class TestIntentBasedSecure:
         try:
             with pytest.raises(ValueError, match="master_key"):
 
-                @cache.secure(backend=None)  # No master_key param, no env var
+                @cache.secure()  # No master_key param, no env var
                 def secure_func():
                     pass
         finally:
@@ -140,7 +140,7 @@ class TestIntentBasedSecure:
 
         try:
 
-            @cache.secure(backend=None, ttl=300)
+            @cache.secure(ttl=300)
             def secure_from_env(x: int) -> int:
                 return x * 2
 
@@ -155,7 +155,7 @@ class TestIntentBasedSecure:
         def extract_tenant(user_id: int) -> str:
             return f"tenant_{user_id}"
 
-        config = DecoratorConfig.secure(master_key="a" * 64, tenant_extractor=extract_tenant, backend=None)
+        config = DecoratorConfig.secure(master_key="a" * 64, tenant_extractor=extract_tenant)
         assert config.encryption.tenant_extractor is extract_tenant
 
 

@@ -530,28 +530,37 @@ class TestInteropEncryption:
             get_user(42)
         assert not backend.store
 
-    def test_machine_local_deployment_uuid_rejected(self, backend: DictBackend, monkeypatch):
-        """Panel MAJ regression: interop encryption must never fall back to the
-        per-machine auto-generated deployment UUID (other hosts/SDKs could never
-        decrypt). Explicit deployment_uuid or CACHEKIT_DEPLOYMENT_UUID required."""
+    # protocol test-vectors/encryption.json → default_tenant.vectors[default_tenant_interop]
+    # (LAB-4666): HKDF-SHA256(master 0x61*32, tenant "default") + AES-256-GCM over the
+    # canonical plain-MessagePack value at the `single_int` interop key, sealed by the
+    # protocol's stdlib+cryptography reference — NOT by this SDK. Pinned inline so a
+    # fixture drift is a conscious change.
+    DEFAULT_TENANT_VECTOR = {
+        "cache_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
+        "ciphertext_hex": "0d0e0f1011121314151617183c29af318238925ee76d081934adce133c0b4a7c5eb5704102b04582dcbf278ffd",  # pragma: allowlist secret
+    }
+
+    def test_default_tenant_decrypts_protocol_vector(self, backend: DictBackend, monkeypatch):
+        """Spec intent-presets.md § Master Key Input rule 5: with no tenant supplied,
+        `@cache.secure` derives under the literal "default" and decrypts the protocol's
+        default-tenant vector — the byte-level cross-SDK claim, through the real
+        decorator read path (hit, not recompute)."""
         pytest.importorskip("cachekit._rust_serializer")
         from cachekit.config.singleton import reset_settings
 
         monkeypatch.delenv("CACHEKIT_DEPLOYMENT_UUID", raising=False)
         reset_settings()
+        vector = self.DEFAULT_TENANT_VECTOR
+        assert vector["cache_key"] == KEY_VECTORS["single_int"]["expected_key"]
+        backend.store[vector["cache_key"]] = bytes.fromhex(vector["ciphertext_hex"])
         try:
-            with pytest.raises(ConfigurationError, match="deployment UUID"):
 
-                @_decorate(
-                    backend,
-                    interop="op",
-                    namespace="ns",
-                    encryption=True,
-                    master_key=self.MASTER_KEY_HEX,
-                    single_tenant_mode=True,
-                )
-                def f(x: int):
-                    return x
+            @cache.secure(interop="get_user", namespace="users", backend=backend, master_key=self.MASTER_KEY_HEX)
+            def get_user(user_id: int):
+                return {"name": "RECOMPUTED", "age": -1}  # must never run — a miss here is the interop bug
+
+            assert get_user(42) == {"name": "alice", "age": 30}
+            assert get_user.cache_info().hits == 1
         finally:
             reset_settings()
 

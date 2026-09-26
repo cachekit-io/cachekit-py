@@ -2,7 +2,7 @@
 
 # L1-Only Mode (`backend=None`)
 
-Use `backend=None` to run cachekit as a pure in-memory cache — no Redis, no Memcached, no external services. This is cachekit's equivalent of `functools.lru_cache`, but with all the decorator features (TTL, namespacing, metrics, encryption).
+Use `backend=None` to run cachekit as a pure in-memory cache — no Redis, no Memcached, no external services. This is cachekit's equivalent of `functools.lru_cache`, but with all the decorator features (TTL, namespacing, metrics). Encryption is the one exception — see below.
 
 ## Basic Usage
 
@@ -50,7 +50,7 @@ No network calls. No serialization to bytes. No backend initialization.
 
 ## With Intent Presets
 
-All presets work with `backend=None`:
+Every preset except `secure` works with `backend=None`:
 
 ```python notest
 from cachekit import cache
@@ -59,12 +59,11 @@ from cachekit import cache
 @cache.minimal(backend=None, ttl=60)
 def fast_lookup(key: str) -> dict:
     return fetch_data(key)
-
-# With encryption, no backend (L1 stores ciphertext)
-@cache.secure(backend=None, ttl=3600)
-def sensitive_data(user_id: int) -> dict:
-    return get_pii(user_id)
 ```
+
+`@cache.secure(backend=None)` is refused at decoration time with `ConfigurationError`:
+L1-only stores raw Python objects, which cannot be ciphertext. The same applies to
+`encryption=True` and to an `EncryptionWrapper` serializer.
 
 ## Upgrade Path
 
@@ -91,7 +90,7 @@ No API changes. No code rewrite. Same decorator, same function signature.
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
-- Encryption: Yes (L1 stores ciphertext)
+- Encryption: No — `@cache.secure` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either.
 - Metrics: Yes (if monitoring configured)
 
 ---

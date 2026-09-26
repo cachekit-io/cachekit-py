@@ -519,7 +519,7 @@ class TestOperationHandlerFreshnessDegradation:
         StandardCacheHandler (tests/unit/backends/test_cachekitio_swr_transport.py)."""
         from unittest import mock
 
-        from cachekit.cache_handler import CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
+        from cachekit.cache_handler import CacheHit, CacheKeyGenerator, CacheOperationHandler, CacheSerializationHandler
 
         serialization = mock.MagicMock(spec=CacheSerializationHandler)
         serialization.deserialize_data.return_value = {"v": 1}
@@ -528,7 +528,7 @@ class TestOperationHandlerFreshnessDegradation:
         cache_handler = mock.MagicMock()
         cache_handler.get_with_freshness.return_value = (b"bytes", False)  # 0.5.x 2-tuple
         op.set_cache_handler(cache_handler)
-        assert op.get_cached_value_with_freshness("k") == ((True, {"v": 1}, b"bytes", 5), False, None)
+        assert op.get_cached_value_with_freshness("k") == (CacheHit({"v": 1}, b"bytes", 5), False, None)
 
     def test_backend_error_reads_as_miss(self) -> None:
         op, cache_handler = self._make_op()

@@ -459,11 +459,10 @@ class TestEndToEndRotation:
     def _pin_deployment_uuid(self, monkeypatch):
         """Pin the tenant identity these tests derive their keys from.
 
-        Unset, `CacheSerializationHandler._get_deterministic_deployment_uuid`
-        falls through to `~/.cachekit/deployment_uuid` and CREATES that file.
-        Two problems: the suite writes to the developer's and the CI runner's
-        home directory, and the derived key then depends on filesystem state
-        outside the test. `TestInteropRotation._handler` already pins it.
+        Unset, single-tenant mode resolves to the protocol literal "default"
+        (LAB-4666); these tests pin an explicit UUID so the rotation assertions
+        exercise the explicit-tenant path too. `TestInteropRotation._handler`
+        already pins it.
         """
         monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
 
