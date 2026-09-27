@@ -18,6 +18,7 @@ from cachekit.backends.base import (
     BufferHandle,
     BufferReadableBackend,
     BufferWritableBackend,
+    KeyTrackableBackend,
     LockableBackend,
     TTLInspectableBackend,
 )
@@ -286,6 +287,21 @@ def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
     every capable backend, not only when stale_ttl is set).
     """
     return callable(getattr(type(backend), "get_with_freshness", None))
+
+
+def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
+    """Type guard: backend keeps a server-side key registry (KeyTrackableBackend).
+
+    Checked on the backend's CLASS, like ``supports_swr``: an instance-level check
+    reads ``unittest.mock.Mock`` and ``__getattr__`` proxies as trackable, and
+    ``isinstance`` against the runtime-checkable Protocol answers differently on
+    3.10/3.11 (``hasattr``) than on 3.12+ (``getattr_static``) for exactly those
+    objects. A false negative only keeps today's process-local invalidation; a false
+    positive would route every whole-function invalidation through a drain that is
+    not there.
+    """
+    cls = type(backend)
+    return callable(getattr(cls, "track_key", None)) and callable(getattr(cls, "drain_tracked", None))
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
@@ -1241,6 +1257,20 @@ class CacheHit(NamedTuple):
     size_bytes: int
 
 
+class StoreOutcome(NamedTuple):
+    """The result of :meth:`CacheOperationHandler.store_result`.
+
+    envelope is the serialized bytes when the buffered path produced them (eligible for L1
+    backfill) and None otherwise — a streamed value never reaches L1, and a failed
+    serialization has no bytes. stored says whether the backend write succeeded, which the
+    envelope cannot say: a buffered write whose backend set failed still has an envelope, and
+    a successful stream has none. Key tracking follows stored, L1 follows envelope.
+    """
+
+    envelope: Optional[bytes]
+    stored: bool
+
+
 class CacheOperationHandler:
     """Handles core cache operations - Single Responsibility.
 
@@ -1585,7 +1615,7 @@ class CacheOperationHandler:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stale_ttl: int | None = None,
-    ) -> Optional[bytes]:
+    ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
         Args:
@@ -1596,11 +1626,11 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes when the buffered path stored the value (eligible for L1
-            backfill), or None when there is nothing for L1: the value was STREAMED to the
-            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
-            failed (logged, never retried buffered), or serialization failed. None is NOT
-            a failure signal.
+            StoreOutcome. envelope: serialized bytes when the buffered path produced them
+            (eligible for L1 backfill), or None when there is nothing for L1 — the value was
+            STREAMED to the backend (L1 intentionally skipped), the streaming attempt
+            failed (logged, never retried buffered), or serialization failed. stored: whether
+            the backend write succeeded; an envelope alone is NOT a success signal.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1629,7 +1659,7 @@ class CacheOperationHandler:
                         # be copied into L1 (mirrors the mmap read path's L1 exclusion, #171).
                         if streamed:
                             get_logger().cache_stored(cache_key, ttl)
-                        return None
+                        return StoreOutcome(envelope=None, stored=streamed)
                     # None: backend can't stream — fall through to the buffered path.
 
             # Pass cache_key for AAD binding (required for encrypted data)
@@ -1637,13 +1667,14 @@ class CacheOperationHandler:
             # Only thread the SWR kwarg when set: strategy implementations without
             # **metadata (tests, custom handlers) must keep working unchanged.
             if stale_ttl is not None:
-                self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
+                stored = self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
             else:
-                self._cache_handler.set(cache_key, serialized_data, ttl)
-            get_logger().cache_stored(cache_key, ttl)
+                stored = self._cache_handler.set(cache_key, serialized_data, ttl)
+            if stored:
+                get_logger().cache_stored(cache_key, ttl)
 
-            # Return serialized string (wrapped envelope) for L1 cache storage
-            return serialized_data
+            # The envelope goes to L1 even when the backend write failed (L1 still serves it)
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored))
         except InteropError:
             # Interop/v1 data-model rejection: fail loud, never "computed but
             # silently never cached" (spec-mandated; matches cachekit-ts).
@@ -1652,7 +1683,7 @@ class CacheOperationHandler:
             get_logger().warning(
                 f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
             )
-            return None
+            return StoreOutcome(envelope=None, stored=False)
 
     async def store_result_async(
         self,
@@ -1661,7 +1692,7 @@ class CacheOperationHandler:
         ttl: int | None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> Optional[bytes]:
+    ) -> StoreOutcome:
         """Store result in backend cache (async version) with optional tenant context for encryption.
 
         Args:
@@ -1672,11 +1703,7 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes when the buffered path stored the value (eligible for L1
-            backfill), or None when there is nothing for L1: the value was STREAMED to the
-            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
-            failed (logged, never retried buffered), or serialization failed. None is NOT
-            a failure signal.
+            StoreOutcome, as for :meth:`store_result`.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1703,15 +1730,15 @@ class CacheOperationHandler:
                         # envelope to L1 on success.
                         if streamed:
                             get_logger().cache_stored(cache_key, ttl)
-                        return None
+                        return StoreOutcome(envelope=None, stored=streamed)
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
-            await self._cache_handler.set_async(cache_key, serialized_data, ttl)
-            get_logger().cache_stored(cache_key, ttl)
+            stored = await self._cache_handler.set_async(cache_key, serialized_data, ttl)
+            if stored:
+                get_logger().cache_stored(cache_key, ttl)
 
-            # Return serialized string (wrapped envelope) for L1 cache storage
-            return serialized_data
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored))
         except InteropError:
             # Interop/v1 data-model rejection: fail loud, never "computed but
             # silently never cached" (spec-mandated; matches cachekit-ts).
@@ -1720,7 +1747,7 @@ class CacheOperationHandler:
             get_logger().warning(
                 f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
             )
-            return None
+            return StoreOutcome(envelope=None, stored=False)
 
     def set_cache_handler(self, handler: CacheHandlerStrategy):
         """Set a specific cache handler strategy.
