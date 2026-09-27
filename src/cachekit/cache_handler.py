@@ -277,8 +277,8 @@ def _warn_encryption_auto_activation() -> None:
         "encryption=True with single_tenant_mode=True (on a preset: "
         "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; or "
         "encryption=False to store plaintext — stale ciphertext is still decrypted on read, except in an interop "
-        "cache (interop=...): move it to a new namespace in every SDK when you switch, or a few stale entries "
-        "come back as wrong values."
+        "cache (interop=...): switch every SDK that binds it to encryption=False and a new namespace together, "
+        "or a few stale entries come back as wrong values."
     )
 
 

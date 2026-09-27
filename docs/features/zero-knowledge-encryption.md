@@ -157,7 +157,13 @@ every SDK that binds the operation must agree on it.
 
 So move the operation to a new `namespace` in the same change, in every SDK that binds it. Old and
 new writers then use different keys, so no reader sees the old ciphertext — on any backend, in L1,
-or mid-rollout. The old keys are never read again; do not `FLUSHDB` a shared database to clear them.
+or mid-rollout.
+
+The old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
+was set) and stay decryptable while the key is. If they hold personal data, delete them once the last
+old writer is gone — on Redis, `SCAN` for `<old-namespace>:<operation>:*` and `UNLINK` the matches;
+the File backend can only clear its whole `cache_dir`; Memcached and CachekitIO retire entries only by
+TTL. Never `FLUSHDB` a shared database.
 
 ## What Can Go Wrong
 
