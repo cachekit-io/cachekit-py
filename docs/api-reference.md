@@ -104,8 +104,8 @@ def your_function(args):
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
   - `failure_threshold` (`int`, default: `5`) - Consecutive failures before opening circuit
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
-  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `>= 0`
-  - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); keep it `>= success_threshold`, or a half-open cycle cannot close
+  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
+  - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests

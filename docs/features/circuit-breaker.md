@@ -63,8 +63,8 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `enabled` | `bool` | `True` | Turn the breaker on or off |
 | `failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
-| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`) |
-| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Keep it `>= success_threshold`, or a HALF_OPEN cycle cannot close |
+| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). Must be finite and `> 0`: it also caps probing at `half_open_requests` per cooldown |
+| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
 
 > [!NOTE]
 > The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples

@@ -178,7 +178,7 @@ class TestDecoratorConfigToDict:
                 failure_threshold=10,
                 success_threshold=5,
                 recovery_timeout=60,
-                half_open_requests=2,
+                half_open_requests=7,
             )
         )
         d = config.to_dict()
@@ -186,7 +186,7 @@ class TestDecoratorConfigToDict:
         assert d["failure_threshold"] == 10
         assert d["success_threshold"] == 5
         assert d["recovery_timeout"] == 60
-        assert d["half_open_requests"] == 2
+        assert d["half_open_requests"] == 7
         assert "excluded_exceptions" not in d
 
     def test_to_dict_flattens_backpressure_config(self) -> None:

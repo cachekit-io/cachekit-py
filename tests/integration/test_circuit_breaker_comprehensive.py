@@ -81,6 +81,10 @@ class TestCircuitBreakerConfiguration:
         with pytest.raises(ValueError):
             CircuitBreakerConfig(timeout_seconds=-1)
 
+        # Zero would restart a spent HALF_OPEN cycle on every clock tick: no probe cap
+        with pytest.raises(ValueError, match="timeout_seconds must be positive"):
+            CircuitBreakerConfig(timeout_seconds=0)
+
 
 class TestCircuitBreakerStates:
     """Test circuit breaker state transitions and logic."""

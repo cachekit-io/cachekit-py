@@ -69,8 +69,9 @@ class CircuitBreakerConfig:
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
-            starts. Balance between giving service time to recover vs detecting
-            recovery quickly.
+            starts. Must be > 0, because that restart caps probing at
+            half_open_requests per timeout_seconds. Balance between giving service
+            time to recover vs detecting recovery quickly.
         half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
             not a concurrency limit). Must be >= success_threshold, or a cycle can
             never collect enough successes to close.
@@ -113,8 +114,10 @@ class CircuitBreakerConfig:
             raise ValueError(f"failure_threshold must be positive, got {self.failure_threshold}")
         if self.success_threshold <= 0:
             raise ValueError(f"success_threshold must be positive, got {self.success_threshold}")
-        if self.timeout_seconds < 0:
-            raise ValueError(f"timeout_seconds cannot be negative, got {self.timeout_seconds}")
+        # Zero would let a spent HALF_OPEN cycle restart on every clock tick,
+        # removing the half_open_requests-per-timeout cap on probes.
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {self.timeout_seconds}")
         if self.half_open_requests <= 0:
             raise ValueError(f"half_open_requests must be positive, got {self.half_open_requests}")
 
