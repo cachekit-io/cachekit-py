@@ -205,6 +205,14 @@ class DecoratorConfig:
         if isinstance(self.encryption, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
             object.__setattr__(self, "encryption", EncryptionConfig(enabled=self.encryption))
 
+        # cachekit.CircuitBreakerConfig (the top-level export) is the reliability class, which
+        # has no .validate(); name the class this field takes instead of an opaque AttributeError.
+        if not isinstance(self.circuit_breaker, CircuitBreakerConfig):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(
+                "circuit_breaker must be a cachekit.config.nested.CircuitBreakerConfig, "
+                f"got {type(self.circuit_breaker).__module__}.{type(self.circuit_breaker).__qualname__}"
+            )
+
         # Validate nested configs
         self.l1.validate()
         self.circuit_breaker.validate()
@@ -238,7 +246,6 @@ class DecoratorConfig:
             "success_threshold": self.circuit_breaker.success_threshold,
             "recovery_timeout": self.circuit_breaker.recovery_timeout,
             "half_open_requests": self.circuit_breaker.half_open_requests,
-            "excluded_exceptions": self.circuit_breaker.excluded_exceptions,
             # Backpressure (flattened)
             "backpressure": self.backpressure.enabled,
             "max_concurrent_requests": self.backpressure.max_concurrent_requests,
