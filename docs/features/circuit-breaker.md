@@ -45,13 +45,41 @@ from cachekit.config.nested import CircuitBreakerConfig
     backend=None,
     circuit_breaker=CircuitBreakerConfig(
         enabled=True,  # Default: True
-        failure_threshold=5,  # Open after 5 failures
-        recovery_timeout=30.0,  # Reset after 30s
+        failure_threshold=3,  # Open after 3 consecutive failures (default: 5)
+        recovery_timeout=10.0,  # Cooldown before a recovery probe (default: 30.0)
     )
 )
 def operation(x):
     return do_expensive_computation()
+
+# The live breaker reports the settings it was built with
+live = operation.get_health_status()["circuit_breaker"]["config"]
+assert live["failure_threshold"] == 3
+assert live["timeout_seconds"] == 10.0  # recovery_timeout
 ```
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | `bool` | `True` | Turn the breaker on or off |
+| `failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
+| `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
+| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`) |
+| `half_open_requests` | `int` | `1` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit) |
+
+> [!WARNING]
+> **Current limitation:** on the `@cache` path, a circuit that opens does not currently leave
+> OPEN on its own; it stays OPEN until the process restarts. So today only `failure_threshold`
+> changes how a decorated function behaves. `success_threshold`, `recovery_timeout` and
+> `half_open_requests` are accepted and reported by `get_health_status()`, but have no effect yet.
+> The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples
+> on this page so they run anywhere) it is never consulted. The examples show configuration,
+> not protection.
+
+> [!IMPORTANT]
+> `circuit_breaker=` takes `cachekit.config.nested.CircuitBreakerConfig`. The top-level
+> `from cachekit import CircuitBreakerConfig` is a different class: it configures a standalone
+> `cachekit.reliability.CircuitBreaker` (fields `timeout_seconds`, `excluded_error_types`), and
+> `@cache` rejects it with a `TypeError` that names the class to use.
 
 ---
 
@@ -128,7 +156,7 @@ def operation(x):
 ## What Can Go Wrong
 
 ### Misconfiguration: Threshold Too Low
-```python notest
+```python
 from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(ttl=300, circuit_breaker=CircuitBreakerConfig(failure_threshold=1), backend=None)
@@ -136,17 +164,21 @@ def operation(x):
     return compute(x)  # illustrative - not defined
 # Problem: Circuit opens after 1 failure
 # Solution: Increase threshold to 5-10
+assert operation.get_health_status()["circuit_breaker"]["config"]["failure_threshold"] == 1
 ```
 
 ### Misconfiguration: Cooldown Too Short
-```python notest
+```python
 from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(ttl=300, circuit_breaker=CircuitBreakerConfig(recovery_timeout=1.0), backend=None)
 def problematic_function():
-    # Problem: Circuit keeps cycling OPEN → HALF_OPEN → OPEN
+    # Problem: a 1s cooldown re-probes a still-failing backend every second
+    # (OPEN → HALF_OPEN → OPEN). Not reachable today; see Current limitation above.
     # Solution: Increase cooldown to 30-60 seconds
     return expensive_operation()  # illustrative - not defined
+
+assert problematic_function.get_health_status()["circuit_breaker"]["config"]["timeout_seconds"] == 1.0
 ```
 
 ### Stale Cache Expires
@@ -194,7 +226,7 @@ except Exception as e:
 ```
 
 ### Tuning for Your Infrastructure
-```python notest
+```python
 from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(
@@ -203,11 +235,15 @@ from cachekit.config.nested import CircuitBreakerConfig
     # Tune these based on your Redis reliability
     circuit_breaker=CircuitBreakerConfig(
         failure_threshold=10,  # Open after 10 failures
-        recovery_timeout=60.0,  # Wait 60s before retry
+        recovery_timeout=60.0,  # Cooldown before a recovery probe
     )
 )
 def fetch_data(key):
     return db.fetch(key)  # illustrative - not defined
+
+# Confirm what the live breaker runs with
+live = fetch_data.get_health_status()["circuit_breaker"]["config"]
+assert (live["failure_threshold"], live["timeout_seconds"]) == (10, 60.0)
 ```
 
 ---
@@ -326,7 +362,7 @@ print(f"Failures: {health['circuit_breaker']['failure_count']}")
 ## Troubleshooting
 
 **Q: Circuit breaker keeps opening**
-A: Reduce failure threshold or increase cooldown. Investigate why Redis is failing.
+A: Raise `failure_threshold` or `recovery_timeout`. Investigate why Redis is failing.
 
 **Q: Getting None when circuit opens**
 A: That's correct behavior. Circuit breaker prevents errors, not cache hits. Handle None gracefully.
