@@ -23,6 +23,7 @@ import pytest
 import cachekit.cache_handler as cache_handler_mod
 from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.config import ConfigurationError
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.base import SerializationMetadata
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -311,6 +312,15 @@ class TestAutoActivationDeprecationWarning:
         with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
             CacheSerializationHandler(serializer_name="default", **kwargs)
         assert self._activation_records(caplog) == []
+
+    def test_rejected_construction_does_not_spend_the_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A constructor that validation rejects must not claim the once-per-process warning."""
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            with pytest.raises(ConfigurationError, match="cross-SDK-compatible serializer"):
+                CacheSerializationHandler(serializer_name="auto")
+            assert self._activation_records(caplog) == []
+            CacheSerializationHandler(serializer_name="default")
+        assert len(self._activation_records(caplog)) == 1
 
     def test_no_key_does_not_warn(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         monkeypatch.delenv("CACHEKIT_MASTER_KEY")

@@ -156,10 +156,11 @@ Encryption is also part of the [shared-entry contract](interop-mode.md#operation
 every SDK that binds the operation must agree on it.
 
 So move the operation to a new `namespace` in the same change, in every SDK that binds it. Old and
-new writers then use different keys, so no reader sees the old ciphertext — on any backend, in L1,
-or mid-rollout.
+new writers then use different keys, so no plaintext reader decodes the old ciphertext — on any
+backend, in L1, or mid-rollout. Old-version processes keep reading and writing the old namespace,
+encrypted, until the rollout drains them.
 
-The old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
+Once the last old-version process is gone, the old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
 was set) and stay decryptable while the key is. If they hold personal data, delete them once the last
 old writer is gone — on Redis, `SCAN` for `<old-namespace>:<operation>:*` and `UNLINK` the matches;
 the File backend can only clear its whole `cache_dir`; Memcached and CachekitIO retire entries only by

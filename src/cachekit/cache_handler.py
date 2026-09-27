@@ -652,6 +652,8 @@ class CacheSerializationHandler:
         #
         # Why: see _warn_encryption_auto_activation above. An explicit False MUST NOT be promoted to
         # True just because CACHEKIT_MASTER_KEY exists (issue #128).
+        # Warned only once construction succeeds: a rejected handler must not spend the process's one warning.
+        auto_activated = False
         if encryption is None:
             encryption = False
             if master_key is None and tenant_extractor is None:
@@ -660,7 +662,7 @@ class CacheSerializationHandler:
                     encryption = True
                     master_key = settings.master_key.get_secret_value()
                     single_tenant_mode = True
-                    _warn_encryption_auto_activation()
+                    auto_activated = True
 
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor
@@ -774,6 +776,9 @@ class CacheSerializationHandler:
         self._encryption_wrapper_cache: OrderedDict[str, Any] = OrderedDict()  # tenant_id -> EncryptionWrapper
         self._encryption_cache_lock = threading.RLock()
         self._encryption_cache_maxsize = 256
+
+        if auto_activated:
+            _warn_encryption_auto_activation()
 
     @property
     def serializer_key_name(self) -> str:
