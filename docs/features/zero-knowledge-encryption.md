@@ -584,7 +584,7 @@ Cached after first use: No additional overhead
 @cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
     # Decrypt or integrity failure on read → cache miss, entry evicted, function runs.
-    # It does NOT count toward the circuit breaker: only backend failures do.
+    # It does NOT count toward the circuit breaker.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
 

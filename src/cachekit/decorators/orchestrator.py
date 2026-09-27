@@ -315,7 +315,7 @@ class FeatureOrchestrator:
             }
         )
 
-    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True):
+    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True) -> None:
         """Record operation failure with automatic context detection.
 
         Automatically uses operation type and duration from set_operation_context()
