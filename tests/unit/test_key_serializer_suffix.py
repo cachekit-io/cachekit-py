@@ -93,7 +93,7 @@ class TestSerializerCodeReachesTheKey:
         assert _suffix(key) == expected
 
     def test_invalidate_deletes_the_key_the_write_path_wrote(self):
-        """CacheInvalidator derives the suffix independently — it must agree, or it deletes nothing."""
+        """invalidate_cache must delete the exact key the write path wrote, serializer suffix included."""
         backend = _RecordingBackend()
         calls = 0
 
@@ -109,7 +109,7 @@ class TestSerializerCodeReachesTheKey:
 
         fn.invalidate_cache(1)
         assert written_key in backend.deleted, (
-            f"invalidator deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
+            f"invalidate_cache deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
         )
         assert backend.store == {}
 

@@ -203,3 +203,82 @@ class TestAsyncInvalidateNonBlocking:
 
         assert backend.async_deleted == [written_key]
         assert not backend.store
+
+
+class FlakyDeleteBackend(RecordingBackend):
+    """The next delete raises once (a transient L2 outage), then deletes recover."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_delete = False
+
+    def delete(self, key: str) -> bool:
+        if self.fail_next_delete:
+            self.fail_next_delete = False
+            raise OSError("transient L2 outage")
+        return super().delete(key)
+
+
+_ALL_MODES = pytest.mark.parametrize(
+    "mode", [{"key": _user_key}, {"fast_mode": True}, {}], ids=["custom_key", "fast_mode", "auto"]
+)
+
+
+@pytest.mark.unit
+class TestFailedDeleteKeepsRetry:
+    """A failed single-key L2 delete must leave the key tracked, so a later
+    whole-function invalidate_cache() still deletes it."""
+
+    @_ALL_MODES
+    def test_sync_whole_function_retry_after_failed_delete(self, mode: dict[str, Any]):
+        backend = FlakyDeleteBackend()
+
+        @_decorate(backend, "lab4387_retry", **mode)
+        def get_user(user_id: int) -> int:
+            return user_id
+
+        get_user(1)
+        (written_key,) = backend.store
+        backend.fail_next_delete = True
+        get_user.invalidate_cache(1)
+        assert written_key in backend.store  # the outage kept the entry
+
+        get_user.invalidate_cache()
+
+        assert backend.deleted == [written_key]
+        assert not backend.store
+
+    @_ALL_MODES
+    @pytest.mark.asyncio
+    async def test_async_whole_function_retry_after_failed_delete(self, mode: dict[str, Any]):
+        backend = FlakyDeleteBackend()
+
+        @_decorate(backend, "lab4387_retry", **mode)
+        async def get_user(user_id: int) -> int:
+            return user_id
+
+        await get_user(1)
+        (written_key,) = backend.store
+        backend.fail_next_delete = True
+        await get_user.ainvalidate_cache(1)
+        assert written_key in backend.store
+
+        await get_user.ainvalidate_cache()
+
+        assert backend.deleted == [written_key]
+        assert not backend.store
+
+    @_ALL_MODES
+    def test_successful_delete_untracks_key(self, mode: dict[str, Any]):
+        """After a successful single-key delete the whole-function form has nothing left to delete."""
+        backend = FlakyDeleteBackend()
+
+        @_decorate(backend, "lab4387_retry", **mode)
+        def get_user(user_id: int) -> int:
+            return user_id
+
+        get_user(1)
+        get_user.invalidate_cache(1)
+        get_user.invalidate_cache()
+
+        assert len(backend.deleted) == 1

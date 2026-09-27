@@ -17,7 +17,6 @@ from cachekit.hash_utils import redact_error_for_log
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
     CacheHit,
-    CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
@@ -649,13 +648,6 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
-    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
-    invalidator = CacheInvalidator(
-        key_generator,
-        integrity_checking=integrity_checking,
-        serializer_type=serialization_handler.serializer_key_name,
-    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
@@ -1148,10 +1140,6 @@ def create_cache_wrapper(
             return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
         # Standard key generation with type-aware handling
         return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-
-    # CacheInvalidator regenerates the AUTO key internally; every other mode must
-    # delete the resolved key directly or the L2 delete misses (LAB-4387).
-    _uses_auto_key = interop is None and custom_key_func is None and not fast_mode
 
     # Track all cache keys written by this function (for no-args invalidation).
     # When invalidate_cache() is called with no args on a parameterized function,
@@ -2261,23 +2249,21 @@ def create_cache_wrapper(
         # Same derivation as the write path — one key, not two (LAB-4387).
         cache_key = _resolve_cache_key(args, kwargs)
 
-        if _object_cache and cache_key:
-            _object_cache.delete(cache_key)
-        elif _l1_cache and cache_key:
-            _l1_cache.invalidate(cache_key)
-        _cached_keys.discard(cache_key)
-
+        # Same order as _local_invalidate_all: L2 delete, then trim, then L1.
+        l2_deleted = True
         if _backend and not _l1_only_mode:
-            if _uses_auto_key:
-                invalidator.set_backend(_backend)
-                invalidator.invalidate_cache(func, args, kwargs, namespace)
-            else:
-                # Log at ERROR (matching CacheInvalidator): a failed delete keeps
-                # serving stale data (for interop, to OTHER SDKs too).
-                try:
-                    _backend.delete(cache_key)
-                except Exception as e:
-                    _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+            try:
+                _backend.delete(cache_key)
+            except Exception as e:
+                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
+                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                l2_deleted = False  # keep key tracked so invalidate_cache() retries it
+        if l2_deleted:
+            _cached_keys.discard(cache_key)
+        if _object_cache:
+            _object_cache.delete(cache_key)
+        elif _l1_cache:
+            _l1_cache.invalidate(cache_key)
 
     async def _delete_l2_async(backend: Any, key: str) -> None:
         """Delete an L2 key without blocking the event loop.
@@ -2315,24 +2301,21 @@ def create_cache_wrapper(
         # Same derivation as the write path — one key, not two (LAB-4387).
         cache_key = _resolve_cache_key(args, kwargs)
 
-        if _object_cache and cache_key:
-            _object_cache.delete(cache_key)
-        elif _l1_cache and cache_key:
-            _l1_cache.invalidate(cache_key)
-        _cached_keys.discard(cache_key)
-
-        # Clear L2 cache via invalidator (skip in L1-only mode)
+        # Same order as _local_invalidate_all: L2 delete, then trim, then L1.
+        l2_deleted = True
         if _backend and not _l1_only_mode:
-            if _uses_auto_key:
-                invalidator.set_backend(_backend)
-                await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
-            else:
-                # Log at ERROR (matching CacheInvalidator): a failed delete keeps
-                # serving stale data (for interop, to OTHER SDKs too).
-                try:
-                    await _delete_l2_async(_backend, cache_key)
-                except Exception as e:
-                    _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+            try:
+                await _delete_l2_async(_backend, cache_key)
+            except Exception as e:
+                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
+                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                l2_deleted = False  # keep key tracked so invalidate_cache() retries it
+        if l2_deleted:
+            _cached_keys.discard(cache_key)
+        if _object_cache:
+            _object_cache.delete(cache_key)
+        elif _l1_cache:
+            _l1_cache.invalidate(cache_key)
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""
