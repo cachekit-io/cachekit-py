@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures in total since the process started (successes do not reset the count): exceptions raised by the decorated function itself, or a failure to create the backend client. Backend read and write failures do not currently count
+- Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, or a failure to create the backend client. Backend read and write failures do not currently count
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's five-failure limit: five in total open the breaker for that function and stop caching it, even with a healthy backend. For some async configurations only a `BackendError` counts.
+Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many in total open the breaker for that function and stop caching it, even with a healthy backend. For some async configurations only a `BackendError` counts.
 
 </details>
 

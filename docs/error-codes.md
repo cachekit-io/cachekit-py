@@ -382,10 +382,10 @@ redis-cli FLUSHDB
 
 **Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Five failures in total since the process started — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), or a failure to create the backend client. Each decorated function has its own breaker, and five such failures open it even when the backend is healthy.
+**Cause**: Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), or a failure to create the backend client. Each decorated function has its own breaker, and that many such failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function has raised five times since the process started, or the backend client could not be created
+- Your function has raised `failure_threshold` times (five by default) since the process started, or the backend client could not be created
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
