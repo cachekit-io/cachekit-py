@@ -72,9 +72,9 @@ class TestCircuitBreakerConfig:
         assert config.enabled is True
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
-        assert config.recovery_timeout == 30
-        assert config.half_open_requests == 3
-        assert config.excluded_exceptions == ()
+        assert config.recovery_timeout == 30.0
+        # Matches the live breaker's default (reliability.CircuitBreakerConfig), which these knobs now configure
+        assert config.half_open_requests == 1
 
     def test_custom_values(self) -> None:
         """Test custom configuration."""
@@ -82,16 +82,19 @@ class TestCircuitBreakerConfig:
             enabled=False,
             failure_threshold=10,
             success_threshold=5,
-            recovery_timeout=60,
-            half_open_requests=1,
-            excluded_exceptions=(ValueError, KeyError),
+            recovery_timeout=60.5,
+            half_open_requests=2,
         )
         assert config.enabled is False
         assert config.failure_threshold == 10
         assert config.success_threshold == 5
-        assert config.recovery_timeout == 60
-        assert config.half_open_requests == 1
-        assert config.excluded_exceptions == (ValueError, KeyError)
+        assert config.recovery_timeout == 60.5
+        assert config.half_open_requests == 2
+
+    def test_excluded_exceptions_removed(self) -> None:
+        """excluded_exceptions was read by nothing (LAB-5340); passing it is now a TypeError."""
+        with pytest.raises(TypeError, match="excluded_exceptions"):
+            CircuitBreakerConfig(excluded_exceptions=(ValueError,))  # type: ignore[call-arg]
 
     def test_frozen_immutability(self) -> None:
         """Test frozen dataclass prevents mutation."""
@@ -120,6 +123,13 @@ class TestCircuitBreakerConfig:
         """Test validation fails when half_open_requests < 1."""
         config = CircuitBreakerConfig(half_open_requests=0)
         with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
+            config.validate()
+
+    @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+    def test_validate_recovery_timeout_rejects_negative_and_non_finite(self, bad: float) -> None:
+        """NaN or inf would reach the live breaker and it could never half-open."""
+        config = CircuitBreakerConfig(recovery_timeout=bad)
+        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number >= 0"):
             config.validate()
 
 
