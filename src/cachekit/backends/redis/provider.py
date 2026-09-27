@@ -554,8 +554,9 @@ class PerRequestRedisBackend:
                 drain.
 
         Requires a single-instance (or primary/replica) Redis server >= 5.0 and, for
-        restricted ACL users, the ``@scripting`` category. Redis Cluster is unsupported:
-        the script unlinks keys it does not declare, which a cluster rejects.
+        restricted ACL users, the ``@scripting`` category. Redis Cluster and sharding proxies
+        (one endpoint in front of several shards) are unsupported: the script unlinks keys it
+        does not declare, which a cluster rejects and a proxy cannot route.
         """
         scoped_reg = self._scoped_key(registry_id)
         try:
