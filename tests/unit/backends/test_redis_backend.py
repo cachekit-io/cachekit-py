@@ -11,6 +11,10 @@ and RedisBackend.get() must return those raw bytes (or None) without coercion.
 Regression coverage for the distributed-lock executor stall: ``acquire_lock`` must
 not hold an executor thread while a waiter polls (see
 ``TestRedisLockWaitersDoNotPinExecutorThreads``).
+
+Key registry control flow (``track_key`` / ``drain_tracked``) against a mocked client:
+see ``TestKeyRegistryControlFlow``. The drain script itself runs on real Redis in
+tests/integration/test_key_registry_redis.py.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 from redis.commands.core import Script
@@ -29,7 +33,9 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
+from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
+from cachekit.backends.redis import provider as provider_module
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 
 
@@ -588,6 +594,68 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
         assert [r.levelno for r in caplog.records if "release" in r.getMessage()] == [level]
+
+
+REG = "ck:reg:ns:0123456789abcdef"
+
+
+def _drain_backend(*replies: list[bytes | str]) -> tuple[PerRequestRedisBackend, Mock, Mock]:
+    """A tenant-``self`` backend on a Mock client whose drain script returns ``replies`` in turn."""
+    client = Mock()
+    script = Mock(side_effect=list(replies))
+    client.register_script.return_value = script
+    return PerRequestRedisBackend(client, "self"), client, script
+
+
+@pytest.mark.unit
+class TestKeyRegistryControlFlow:
+    """What ``drain_tracked`` does with the script's replies: rounds, stragglers, logging."""
+
+    def test_track_key_failure_is_classified(self):
+        client = Mock()
+        client.pipeline.side_effect = RedisConnectionError("down")
+        with pytest.raises(BackendError) as exc_info:
+            PerRequestRedisBackend(client, "self").track_key(REG, "k")
+        assert exc_info.value.is_transient
+
+    def test_rounds_until_short_chunk_then_unlinks_stragglers_in_batches(self, monkeypatch, caplog):
+        monkeypatch.setattr(provider_module, "_DRAIN_CHUNK", 2)
+        backend, client, script = _drain_backend([b"a", b"b"], ["c"], [])
+        with caplog.at_level(logging.INFO, logger=provider_module.__name__):
+            out = backend.drain_tracked(REG, ["a", "s1", "s2", "s3"])
+        assert out == {"a", "b", "c", "s1", "s2", "s3"}  # str replies (decode_responses clients) pass through
+        assert script.call_args_list == [call(keys=[f"t:self:{REG}"], args=["t:self:", 2])] * 2
+        assert client.unlink.call_args_list == [call("t:self:s1", "t:self:s2"), call("t:self:s3")]
+        assert [r.levelno for r in caplog.records if "drained 6 keys" in r.getMessage()] == [logging.INFO]
+
+        assert backend.drain_tracked(REG, []) == set()
+        client.register_script.assert_called_once_with(provider_module._DRAIN_SCRIPT)
+
+    def test_undecodable_members_are_one_warning_without_bytes(self, caplog):
+        backend, _, _ = _drain_backend([b"\xff\xfe", b"\xc3\x28", b"good"])
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            assert backend.drain_tracked(REG, []) == {"good"}
+        (warning,) = [r for r in caplog.records if "undecodable" in r.getMessage()]
+        assert "unlinked 2 undecodable members" in warning.getMessage()
+        assert "\\xff" not in caplog.text and REG not in caplog.text
+
+    def test_round_guard_stops_with_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(provider_module, "_DRAIN_CHUNK", 1)
+        monkeypatch.setattr(provider_module, "_DRAIN_MAX_ROUNDS", 2)
+        monkeypatch.setattr(provider_module, "_DRAIN_WARN_KEYS", 1)
+        backend, _, script = _drain_backend([b"a"], [b"b"])
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            assert backend.drain_tracked(REG, []) == {"a", "b"}
+        assert script.call_count == 2
+        assert "stopped after 2 rounds" in caplog.text
+        assert [r.levelno for r in caplog.records if "drained 2 keys" in r.getMessage()] == [logging.WARNING]
+
+    def test_script_failure_is_classified_and_skips_stragglers(self):
+        backend, client, _ = _drain_backend(RedisConnectionError("lost"))
+        with pytest.raises(BackendError) as exc_info:
+            backend.drain_tracked(REG, ["s1"])
+        assert exc_info.value.is_transient
+        client.unlink.assert_not_called()
 
 
 @pytest.mark.unit
