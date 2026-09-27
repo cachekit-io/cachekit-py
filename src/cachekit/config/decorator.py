@@ -506,7 +506,8 @@ class DecoratorConfig:
         ``CACHEKIT_API_URL`` overrides the endpoint (default: https://api.cachekit.io).
 
         Encryption: opt in explicitly with encryption=EncryptionConfig(enabled=True,
-        single_tenant_mode=True); the key comes from master_key= or CACHEKIT_MASTER_KEY.
+        single_tenant_mode=True); the key comes from EncryptionConfig(master_key=...) or
+        CACHEKIT_MASTER_KEY (io takes no master_key= keyword of its own).
         The env var alone activating encryption is deprecated (warns once this release,
         raises in the next minor) — protocol intent-presets.md § Encryption Activation.
 

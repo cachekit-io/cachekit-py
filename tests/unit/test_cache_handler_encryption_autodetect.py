@@ -297,6 +297,8 @@ class TestAutoActivationDeprecationWarning:
         # Not every no-intent cache encrypts: the line must name both exceptions, not claim every cache encrypts.
         assert "L1-only" in records[0].message
         assert "master_key= or tenant_extractor=" in records[0].message
+        # Legacy-decrypt is CK-frame only: headerless interop entries stay ciphertext after encryption=False.
+        assert "except in an interop cache" in records[0].message
 
     @pytest.mark.parametrize(
         "kwargs",

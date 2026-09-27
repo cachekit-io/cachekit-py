@@ -245,7 +245,8 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
 
 # Release-N migration gate (protocol/spec/intent-presets.md § Encryption Activation):
 # CACHEKIT_MASTER_KEY is a key SOURCE — fallback for .secure / encryption=True, and legacy-decrypt of
-# stale ciphertext on read (EncryptionWrapper resolves it itself) — never an activation SWITCH.
+# stale CK-framed ciphertext on read (EncryptionWrapper resolves it itself; headerless interop entries
+# are never decrypted by a disabled handler) — never an activation SWITCH.
 # Activating encryption from the variable's mere presence is deprecated: this release keeps it and
 # warns once per process; the next minor release raises at construction instead. An L1-only cache
 # (explicit backend=None) is auto-activated too, so it warns and its serializer is checked, yet it stores
@@ -275,7 +276,9 @@ def _warn_encryption_auto_activation() -> None:
         "@cache.secure(...). Declare the intent now — @cache.secure(...) to require encryption; "
         "encryption=True with single_tenant_mode=True (on a preset: "
         "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; or "
-        "encryption=False to store plaintext. Stale ciphertext is still decrypted on read either way."
+        "encryption=False to store plaintext. Stale ciphertext is still decrypted on read either way, except in "
+        "an interop cache (interop=...): its entries carry no header and are not decrypted, so flush it once "
+        "every writer has switched to encryption=False."
     )
 
 
@@ -555,7 +558,8 @@ class CacheSerializationHandler:
                           key is present and encryption is unset. Pass True or False.
                         - True: force encryption ON (requires a master key + explicit tenant mode).
                         - False: explicit hard opt-out. Never encrypts, even when CACHEKIT_MASTER_KEY
-                          is set; stale ciphertext is still decrypted on read (legacy-decrypt).
+                          is set; stale ciphertext is still decrypted on read (legacy-decrypt), except
+                          in interop mode: headerless entries are not decrypted, so flush the cache.
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (tenant_id "default" unless overridden).

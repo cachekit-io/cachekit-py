@@ -110,6 +110,7 @@ Python object (plaintext, in-app only)
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
 **Mitigation**: state `encryption=False` for non-sensitive data:
+
 ```python notest
 @cache(ttl=300, encryption=False, backend=None)  # Explicit plaintext, faster
 def get_public_prices(item_id):
@@ -134,7 +135,7 @@ intent is stated (the deprecated row, with its exceptions) and logs a warning on
 |---|---|---|
 | `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
 | `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
-| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext) |
+| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Exception: an [interop](interop-mode.md) cache (`interop=`) cannot decrypt its stale ciphertext — entries carry no header — so flush it once every writer has switched |
 | No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
 | No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
 
