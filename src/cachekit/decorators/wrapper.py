@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import copy
 import functools
@@ -9,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
@@ -802,23 +803,25 @@ def create_cache_wrapper(
         whole-function invalidation that trims _cached_keys before evicting L1 cannot miss an
         entry. The key is recorded even when there is nothing to put (L1 disabled, a streamed
         value): _cached_keys also drives the L2 deletes of process-local invalidation.
+
+        Every open _watch_records() set is told about the key BEFORE it is recorded, so a
+        concurrent whole-function invalidation cannot drop a record it was not told about.
         """
-        if _l1_cache and cache_key and serialized_data:
+        if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
             _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
+        if _drain_watches:
+            for watch in _drain_watches.copy().values():
+                watch.add(cache_key)
         _cached_keys.add(cache_key)
 
     def _is_trackable() -> bool:
         """Whether the backend as RESOLVED so far keeps a server-side key registry.
 
-        Asked at call time, never cached while the backend is unresolved: provider-backed
-        decorators resolve _backend at first call, and a fresh process whose first act is
-        invalidate_cache() must still drain the registry.
+        Asked at call time: provider-backed decorators resolve _backend at first call, and a
+        fresh process whose first act is invalidate_cache() must still drain the registry.
         """
-        nonlocal _backend_trackable
-        if _backend_trackable is None and _backend is not None:
-            _backend_trackable = supports_key_tracking(_backend)
-        return bool(_backend_trackable)
+        return _backend is not None and supports_key_tracking(_backend)
 
     def _track_and_record(cache_key: str) -> None:
         """Record a SUCCESSFUL L2 write in the backend's key registry. Never raises.
@@ -862,6 +865,11 @@ def create_cache_wrapper(
                 redact_cache_key(cache_key),
                 redact_error_for_log(e),
             )
+
+    async def _track_and_record_async(cache_key: str) -> None:
+        """_track_and_record off the event loop, skipping the thread hop when nothing tracks."""
+        if _is_trackable():
+            await asyncio.to_thread(_track_and_record, cache_key)
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
@@ -1018,8 +1026,8 @@ def create_cache_wrapper(
         )
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
         _put_l1(cache_key, serialized_data, ttl)
-        if stored and _is_trackable():
-            await asyncio.to_thread(_track_and_record, cache_key)
+        if stored:
+            await _track_and_record_async(cache_key)
 
     async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for async functions. Failures are silent by design:
@@ -1135,8 +1143,9 @@ def create_cache_wrapper(
     # we need to clear ALL entries — but key normalization (hashing of long keys)
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
     _cached_keys: set[str] = set()
-    # Resolved by _is_trackable() once _backend exists; None until then.
-    _backend_trackable: bool | None = None
+    # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every key it
+    # records to each, so a whole-function invalidation spares keys re-recorded meanwhile.
+    _drain_watches: dict[tuple[int, object], set[str]] = {}
     # track_key failure WARNING throttle: when it last fired (monotonic), failures since.
     _track_warned_at = float("-inf")
     _track_failures = 0
@@ -2069,8 +2078,8 @@ def create_cache_wrapper(
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
                             _put_l1(cache_key, serialized_data, ttl)
-                            if stored and _is_trackable():
-                                await asyncio.to_thread(_track_and_record, cache_key)
+                            if stored:
+                                await _track_and_record_async(cache_key)
 
                             # Record successful cache set
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2158,8 +2167,8 @@ def create_cache_wrapper(
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
                     _put_l1(cache_key, serialized_data, ttl)
-                    if stored and _is_trackable():
-                        await asyncio.to_thread(_track_and_record, cache_key)
+                    if stored:
+                        await _track_and_record_async(cache_key)
 
                     # Record successful cache set
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2203,29 +2212,52 @@ def create_cache_wrapper(
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
+    @contextlib.contextmanager
+    def _watch_records() -> Iterator[set[str]]:
+        """Yield a set that collects every key _put_l1 records until the block exits.
+
+        A whole-function invalidation trims _cached_keys after its L2 deletes. A concurrent
+        miss can rewrite a key in between, and _put_l1's re-record of an already-present key
+        changes nothing, so without this set the trim drops the only local record of the new
+        value. _put_l1 adds to the set BEFORE it records: re-adding any trimmed key found in
+        the set afterwards therefore covers a record that races the trim itself.
+        """
+        pid = os.getpid()
+        for stale in [o for o in _drain_watches.copy() if o[0] != pid]:
+            _drain_watches.pop(stale, None)  # a forked child's inherited, orphaned watches
+        owner, watch = (pid, object()), set[str]()
+        _drain_watches[owner] = watch
+        try:
+            yield watch
+        finally:
+            _drain_watches.pop(owner, None)
+
     def _local_invalidate_all() -> None:
         """Invalidate every key THIS process knows (_cached_keys): L2 delete, then trim, then L1.
 
         The whole-function path for backends without a key registry, and the fallback when a
         drain fails. Per key, the L2 delete comes first: evicting L1 first would let an L2-hit
-        backfill landing in between re-cache the old value in L1. A key whose delete failed
-        stays in _cached_keys for the next attempt. Keys other processes wrote and this one
-        never saw stay in L2 until their TTL.
+        backfill landing in between re-cache the old value in L1. A key whose delete failed,
+        or that was re-recorded while this runs, stays in _cached_keys for the next attempt.
+        Keys other processes wrote and this one never saw stay in L2 until their TTL.
         """
-        for key in set(_cached_keys):  # snapshot: other threads add while this runs
-            l2_deleted = True
-            if _backend is not None and not _l1_only_mode:
-                try:
-                    _backend.delete(key)
-                except Exception as e:
-                    _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
-                    l2_deleted = False  # keep key tracked for retry
-            if l2_deleted:
-                _cached_keys.discard(key)
-            if _object_cache:
-                _object_cache.delete(key)
-            elif _l1_cache:
-                _l1_cache.invalidate(key)
+        with _watch_records() as watch:
+            for key in set(_cached_keys):  # snapshot: other threads add while this runs
+                l2_deleted = True
+                if _backend is not None and not _l1_only_mode:
+                    try:
+                        _backend.delete(key)
+                    except Exception as e:
+                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
+                        l2_deleted = False  # keep key tracked for retry
+                if l2_deleted:
+                    _cached_keys.discard(key)
+                    if key in watch:  # rewritten meanwhile: its new value may still be in L2
+                        _cached_keys.add(key)
+                if _object_cache:
+                    _object_cache.delete(key)
+                elif _l1_cache:
+                    _l1_cache.invalidate(key)
 
     def _drain_all() -> None:
         """Whole-function invalidation. Sync; ainvalidate_cache runs it via asyncio.to_thread.
@@ -2233,18 +2265,26 @@ def create_cache_wrapper(
         On a KeyTrackableBackend, drain the server-side registry: every key ANY process wrote
         for this function is deleted from L2, plus the keys this process knows that the
         registry missed. Any failure falls back to _local_invalidate_all().
+
+        The trim keeps every key _put_l1 records while the drain is in flight. Such a key may
+        carry a value written after the drain unlinked it, and if that write's track_key
+        failed, this process's record is the only thing left that can reach it: it stays in
+        _cached_keys for the next drain.
         """
         if not _is_trackable():
             _local_invalidate_all()
             return
         try:
-            snap = set(_cached_keys)  # this process's view, taken before the drain
-            deleted = _backend.drain_tracked(_registry_id, snap)  # type: ignore[union-attr]  # superset of snap
-            # Trim BEFORE evicting: _put_l1 puts then records, so a concurrent write can
-            # never leave an L1 entry whose key is no longer in _cached_keys.
-            _cached_keys.difference_update(snap)
-            if _l1_cache:
-                _l1_cache.invalidate_many(deleted)
+            with _watch_records() as watch:  # opened before the snapshot: later records are watched
+                snap = set(_cached_keys)  # this process's view, taken before the drain
+                deleted = _backend.drain_tracked(_registry_id, snap)  # type: ignore[union-attr]  # superset of snap
+                # Trim BEFORE evicting: _put_l1 puts then records, so a concurrent write can
+                # never leave an L1 entry whose key is no longer in _cached_keys.
+                trim = snap - watch
+                _cached_keys.difference_update(trim)
+                _cached_keys.update(trim & watch)  # recorded while the trim ran
+                if _l1_cache:
+                    _l1_cache.invalidate_many(deleted)
         except Exception as e:
             _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
             _local_invalidate_all()
