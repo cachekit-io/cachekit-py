@@ -1,14 +1,15 @@
 """Byte-verification of interop mode against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/interop-mode.json, vendored from
-cachekit-io/protocol @ ef3e6d4dd29c200908a06f3a02dab605193fa32a
-(sha256 a1f24b61e4957e9500a01ce7ed9fbb3ec601847514b481bf54813d9e470226df).
+cachekit-io/protocol test-vectors/interop-mode.json 1.1.0
+(https://github.com/cachekit-io/protocol/pull/78)
+(sha256 9b1855851d888c479e37a8fff9e9bbe5738737a9a408e749d9126c7678b9e7bc).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 Every group is exercised through the SDK's own implementation:
-- 33 key vectors: canonical argument bytes, args hash, and full key
+- 34 key vectors: canonical argument bytes, args hash, and full key
 - 4 value vectors: canonical plain-MessagePack value bytes (and decode round-trip)
-- 9 error vectors: inputs that MUST be rejected
+- 11 error vectors: inputs that MUST be rejected
 - 1 AAD vector: the REAL EncryptionWrapper AAD builder over an interop key
 - 1 encryption vector: HKDF-SHA256 key derivation + AES-256-GCM decrypt through
   the REAL Rust encryption stack (cross-SDK decryption capability, not just
@@ -36,13 +37,13 @@ from cachekit.interop import (
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "interop-mode.json"
-FIXTURE_SHA256 = "a1f24b61e4957e9500a01ce7ed9fbb3ec601847514b481bf54813d9e470226df"
+FIXTURE_SHA256 = "9b1855851d888c479e37a8fff9e9bbe5738737a9a408e749d9126c7678b9e7bc"  # pragma: allowlist secret
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 # The counts below are part of the conformance claim: a fixture update that
 # adds or removes vectors must be a conscious change, not a silent drift.
-EXPECTED_COUNTS = {"key_vectors": 33, "value_vectors": 4, "error_vectors": 9, "aad_vectors": 1, "encryption_vectors": 1}
+EXPECTED_COUNTS = {"key_vectors": 34, "value_vectors": 4, "error_vectors": 11, "aad_vectors": 1, "encryption_vectors": 1}
 
 
 class _TaggedSet:
