@@ -51,8 +51,8 @@ def _raw_response(status_code: int, content: bytes) -> httpx.Response:
 def backend() -> CachekitIOBackend:
     """Build a CachekitIOBackend with mocked HTTP clients."""
     with patch(
-        "cachekit.backends.cachekitio.backend.get_sync_http_client",
-        return_value=MagicMock(spec=httpx.Client),
+        "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+        return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.get_cached_async_http_client",

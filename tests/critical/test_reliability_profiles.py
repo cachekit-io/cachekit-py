@@ -12,7 +12,7 @@ from cachekit.reliability.profiles import (
     PROFILE_CONFIGS,
     ReliabilityProfile,
     balanced_reliability_decorator,
-    create_optimized_decorator_config,
+    create_decorator_config,
     full_reliability_decorator,
     get_decorator_kwargs,
     get_profile_config,
@@ -108,9 +108,9 @@ class TestReliabilityProfiles:
         assert kwargs["max_concurrent_requests"] == 500, "Override should apply"
         assert kwargs["custom_param"] == "test_value", "Custom params should pass through"
 
-    def test_create_optimized_decorator_config_default(self):
-        """CRITICAL: create_optimized_decorator_config creates balanced config by default."""
-        config = create_optimized_decorator_config()
+    def test_create_decorator_config_default(self):
+        """CRITICAL: create_decorator_config creates balanced config by default."""
+        config = create_decorator_config()
 
         # Should use balanced profile by default
         assert config["circuit_breaker"] is True
@@ -121,16 +121,16 @@ class TestReliabilityProfiles:
         assert "_use_lightweight_health" in config
         assert config["_use_lightweight_health"] is True
 
-    def test_create_optimized_decorator_config_with_profile(self):
-        """CRITICAL: create_optimized_decorator_config respects profile selection."""
-        config = create_optimized_decorator_config(profile=ReliabilityProfile.MINIMAL)
+    def test_create_decorator_config_with_profile(self):
+        """CRITICAL: create_decorator_config respects profile selection."""
+        config = create_decorator_config(profile=ReliabilityProfile.MINIMAL)
 
         assert config["circuit_breaker"] is True
         assert config["backpressure"] is False, "Minimal profile disables backpressure"
 
-    def test_create_optimized_decorator_config_with_overrides(self):
-        """CRITICAL: create_optimized_decorator_config applies overrides."""
-        config = create_optimized_decorator_config(
+    def test_create_decorator_config_with_overrides(self):
+        """CRITICAL: create_decorator_config applies overrides."""
+        config = create_decorator_config(
             profile=ReliabilityProfile.BALANCED,
             circuit_breaker=False,
             custom_setting="test",

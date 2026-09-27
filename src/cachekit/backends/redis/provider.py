@@ -11,24 +11,82 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 from urllib.parse import quote as url_encode
 
 import redis
+from redis.commands.core import Script
+from redis.exceptions import LockNotOwnedError
 
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis.error_handler import classify_redis_error
-from cachekit.hash_utils import redact_error_for_log
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
 # Module-level ContextVar for async-safe tenant isolation
 tenant_context: ContextVar[Optional[str]] = ContextVar("tenant_context", default=None)
+
+T = TypeVar("T")
+
+# Key registry (KeyTrackableBackend). A tracking set lives 7 days past its last write.
+_TRACKING_SET_TTL_SECONDS = 604_800
+# Members popped (and keys unlinked) per script call. Bounds each atomic step well under
+# lua-time-limit: a script that has written cannot be SCRIPT KILLed, so unbounded work in
+# one call can leave every other client on this Redis answered with BUSY.
+_DRAIN_CHUNK = 10_000
+# 10M members. Past this a write storm is outrunning the drain; stop and warn.
+_DRAIN_MAX_ROUNDS = 1_000
+_DRAIN_WARN_KEYS = 100_000
+# KEYS[1] = scoped tracking set; ARGV[1] = tenant key prefix; ARGV[2] = chunk size.
+# Members are stored raw and the prefix is applied here, so whatever a member says, the
+# key unlinked is always inside this backend's own tenant prefix. A member leaves the set
+# only after its own UNLINK: Redis does not roll back a script that errors midway, so
+# removing members first (SPOP) would lose every one whose key a failed call never reached.
+# replicate_commands() lets writes follow the random SRANDMEMBER on a 6.x server configured
+# with lua-replicate-commands no; effects replication is the default from 5.0, and 7.0+
+# keeps the call as a no-op.
+_DRAIN_SCRIPT = """
+redis.replicate_commands()
+local members = redis.call('SRANDMEMBER', KEYS[1], ARGV[2])
+for i = 1, #members do
+    redis.call('UNLINK', ARGV[1] .. members[i])
+    redis.call('SREM', KEYS[1], members[i])
+end
+return members
+"""
+
+
+async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
+    """Await ``fut`` to completion even if the current task is cancelled meanwhile.
+
+    ``asyncio.to_thread`` work is uninterruptible once an executor thread picks it up, and a
+    still-queued work item is dropped if its future is cancelled first — so a cancelled awaiter
+    either loses the outcome of a round-trip that still completes, or loses the round-trip
+    itself. ``asyncio.wait`` never cancels its inputs and never unwraps their result, so keep
+    waiting on ``fut`` until it is really done, absorbing every cancellation, then re-raise the
+    last one: callers read ``fut`` for the real outcome before letting it propagate.
+
+    Pass a plain future (``loop.run_in_executor``), never a Task: ``all_tasks()`` sweeps such as
+    ``asyncio.run`` teardown cancel Tasks out from under the drain, and the outcome is lost again.
+    """
+    cancelled: Optional[asyncio.CancelledError] = None
+    while not fut.done():
+        try:
+            await asyncio.wait({fut})
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return fut.result()
 
 
 class PerRequestRedisBackend:
@@ -91,6 +149,9 @@ class PerRequestRedisBackend:
         # Fix #2: URL-encode tenant ID to prevent ':' collision
         self._tenant_id = url_encode(tenant_id, safe="")
         self._original_tenant_id = tenant_id
+
+        # Registered on first drain. Per instance, not module-global: a Script holds its client.
+        self._drain_script: Optional[Script] = None
 
     @property
     def key_prefix(self) -> str:
@@ -354,19 +415,21 @@ class PerRequestRedisBackend:
 
         Note:
             Each acquisition attempt is one non-blocking ``SET NX`` round-trip run via
-            ``asyncio.to_thread()``; the wait between attempts is an ``asyncio.sleep`` on
-            the event loop, never a sleep inside an executor thread. A blocking
-            ``Lock.acquire`` run via ``to_thread`` would pin one executor thread per waiter for
-            up to ``blocking_timeout``. The default executor has only ``min(32, cpu_count + 4)``
-            threads (8 when ``cpu_count`` is 4), so once concurrent misses on one key reach that size
-            the holder's own ``get``/``set``/``release`` — also ``to_thread`` calls — queue behind
-            the waiters, every waiter times out, and all of them recompute.
+            ``loop.run_in_executor()`` and drained through ``_await_uninterrupted`` (so a
+            cancellation cannot drop a round-trip that still completes); the wait between
+            attempts is an ``asyncio.sleep`` on the event loop, never a sleep inside an
+            executor thread. A blocking ``Lock.acquire`` run in the executor would pin one
+            executor thread per waiter for up to ``blocking_timeout``. The default executor
+            has only ``min(32, cpu_count + 4)`` threads (8 when ``cpu_count`` is 4), so once
+            concurrent misses on one key reach that size the holder's own
+            ``get``/``set``/``release`` — also executor calls — queue behind the waiters,
+            every waiter times out, and all of them recompute.
             Sets thread_local=False because attempts and release may run on different
             executor threads.
+            Cancellation is drained, not raced: an in-flight attempt or release round-trip
+            always runs to completion, a lock the attempt wins is released, and only then is
+            the ``CancelledError`` re-raised.
         """
-        import asyncio
-        import uuid
-
         # Derive the on-wire Redis lock name from the bare cache key: ``<scoped_key>:lock``.
         # Keeping this suffix on the wire preserves compatibility with existing Redis
         # deployments — the lock identity didn't change, only the protocol boundary
@@ -385,8 +448,45 @@ class PerRequestRedisBackend:
             loop = asyncio.get_running_loop()
             deadline = None if blocking_timeout is None else loop.time() + blocking_timeout
             token = uuid.uuid4().hex  # one token for the whole acquisition, however many attempts
+
+            def _release_sync() -> None:
+                # Catch inside the executor callable, not around _release(): once a cancellation has
+                # landed, _await_uninterrupted re-raises it and an error left on the future would only
+                # surface as asyncio's "exception was never retrieved" at GC.
+                try:
+                    lock.release()
+                except LockNotOwnedError as e:
+                    logger.debug(
+                        "Redis lock already expired or taken over before release: %s", redact_error_for_log(e)
+                    )  # nothing to orphan
+                except redis.RedisError as e:
+                    logger.warning(
+                        "Redis lock release for %s failed (%s); the key lives until its TTL",
+                        redact_cache_key(key),
+                        redact_error_for_log(e),
+                    )
+
+            async def _release() -> None:
+                # Drained: a cancel landing while this still queues for a thread must not drop the release.
+                await _await_uninterrupted(loop.run_in_executor(None, _release_sync))
+
             while True:
-                acquired = await asyncio.to_thread(lock.acquire, blocking=False, token=token)
+                # Drained: a cancel cannot stop the thread's SET NX from winning, only hide that it did.
+                attempt = loop.run_in_executor(None, functools.partial(lock.acquire, blocking=False, token=token))
+                try:
+                    acquired = await _await_uninterrupted(attempt)
+                except asyncio.CancelledError:
+                    # The attempt has finished. One that failed (e.g. a Redis ConnectionError) cannot
+                    # have won; log it rather than let it mask the cancellation.
+                    if (err := attempt.exception()) is not None:
+                        logger.warning(
+                            "Redis lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                            redact_cache_key(key),
+                            redact_error_for_log(err),
+                        )
+                    elif attempt.result():
+                        await _release()
+                    raise
                 # Same give-up rule as redis-py's Lock.acquire: stop once the next attempt
                 # would land past the deadline. blocking_timeout=None means a single attempt.
                 if acquired or deadline is None or loop.time() + lock.sleep > deadline:
@@ -397,13 +497,117 @@ class PerRequestRedisBackend:
             finally:
                 # Release lock if acquired (also run in thread pool)
                 if acquired:
-                    try:
-                        await asyncio.to_thread(lock.release)
-                    except Exception as e:
-                        # Lock may have expired - log but don't fail
-                        logger.debug("Error releasing Redis lock (may have expired): %s", redact_error_for_log(e))
+                    await _release()
         except Exception as exc:
             raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        """Record a written cache key in the registry's tracking set (KeyTrackableBackend protocol).
+
+        One pipelined round-trip: ``SADD`` the key, then ``EXPIRE`` the set to 7 days, so a set
+        lives until seven days after the last write to its function. The set name is
+        tenant-scoped; the member is stored RAW — ``drain_tracked`` applies the tenant prefix
+        itself, so no member can name a key outside this tenant.
+
+        Args:
+            registry_id: Unscoped registry id (``ck:reg:{namespace}:{hash}``)
+            key: Raw cache key, exactly as passed to ``set``
+
+        Raises:
+            BackendError: If the Redis round-trip fails
+        """
+        scoped_reg = self._scoped_key(registry_id)
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.sadd(scoped_reg, key)
+            pipe.expire(scoped_reg, _TRACKING_SET_TTL_SECONDS)
+            pipe.execute()
+        except Exception as exc:
+            raise classify_redis_error(exc, operation="track_key", key=registry_id) from exc
+
+    def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
+        """Delete every tracked key of a registry, then every local key the drain missed
+        (KeyTrackableBackend protocol).
+
+        Each script call atomically pops at most 10 000 members: it ``UNLINK``s
+        ``{tenant prefix}{member}`` for each, then removes the member from the set, so a member
+        is never dropped before its key is. Calls repeat until one pops a short chunk. A
+        write landing during the drain is either popped by a later call or stays in the set
+        for the next drain — never orphaned. Past 1 000 calls the drain stops with a WARNING
+        and the remaining members wait for the next drain.
+
+        Then every key of ``local_keys`` that no call popped is ``UNLINK``ed, up to 10 000
+        keys per command. These are normal: another process's drain already popped keys this
+        process still remembers, a ``track_key`` failed, or the key predates tracking.
+
+        Args:
+            registry_id: Unscoped registry id (``ck:reg:{namespace}:{hash}``)
+            local_keys: The caller's snapshot of the raw keys it knows about
+
+        Returns:
+            Raw keys deleted — decoded popped members plus all of ``local_keys``
+
+        Raises:
+            BackendError: If the script or an ``UNLINK`` batch fails (``NOSCRIPT`` is
+                handled by redis-py re-loading the script). Keys already unlinked stay
+                deleted; members whose keys were not unlinked stay in the set for the next
+                drain.
+
+        Requires a single-instance (or primary/replica) Redis server >= 5.0 and, for
+        restricted ACL users, the ``@scripting`` category. Redis Cluster is unsupported:
+        the script unlinks keys it does not declare, which a cluster rejects.
+        """
+        scoped_reg = self._scoped_key(registry_id)
+        try:
+            if self._drain_script is None:
+                self._drain_script = self._client.register_script(_DRAIN_SCRIPT)
+            out: set[str] = set()
+            undecodable = 0
+            for _ in range(_DRAIN_MAX_ROUNDS):
+                popped = self._drain_script(keys=[scoped_reg], args=[self.key_prefix, _DRAIN_CHUNK])
+                if not isinstance(popped, list):
+                    raise BackendError(
+                        message=f"Redis drain script returned unexpected type: {type(popped).__name__}",
+                        operation="drain_tracked",
+                        key=registry_id,
+                    )
+                for member in popped:
+                    try:
+                        out.add(member.decode("utf-8") if isinstance(member, bytes) else member)
+                    except UnicodeDecodeError:
+                        # Not a key this SDK wrote (keys are str); the script already unlinked it.
+                        undecodable += 1
+                if len(popped) < _DRAIN_CHUNK:
+                    break
+            else:
+                logger.warning(
+                    "Key registry drain for %s stopped after %d rounds; remaining members wait for the next drain",
+                    redact_cache_key(registry_id),
+                    _DRAIN_MAX_ROUNDS,
+                )
+            if undecodable:
+                # One line per drain, never per member, never the member bytes: a set stuffed with
+                # garbage must not become a log flood. Not raised — the members are already
+                # unlinked, and raising would only discard the valid keys' L1 evictions.
+                logger.warning(
+                    "Key registry drain for %s unlinked %d undecodable members; the tracking set was written outside cachekit",
+                    redact_cache_key(registry_id),
+                    undecodable,
+                )
+            stragglers = [k for k in local_keys if k not in out]
+            for i in range(0, len(stragglers), _DRAIN_CHUNK):
+                chunk = stragglers[i : i + _DRAIN_CHUNK]
+                self._client.unlink(*(self._scoped_key(k) for k in chunk))
+                out.update(chunk)
+        except Exception as exc:
+            raise classify_redis_error(exc, operation="drain_tracked", key=registry_id) from exc
+        logger.log(
+            logging.WARNING if len(out) > _DRAIN_WARN_KEYS else logging.INFO,
+            "Key registry drained %d keys for %s",
+            len(out),
+            redact_cache_key(registry_id),
+        )
+        return out
 
     @asynccontextmanager
     async def with_timeout(

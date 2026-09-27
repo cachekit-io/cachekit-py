@@ -6,7 +6,6 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
@@ -26,9 +25,6 @@ if TYPE_CHECKING:
 
 
 # Backend Resolution Layer
-
-# Sentinel for unset explicit backend parameter
-_UNSET = object()
 
 # Module-level default backend (set via set_default_backend())
 _default_backend: BaseBackend | None = None
@@ -78,62 +74,6 @@ def get_default_backend() -> BaseBackend | None:
         True
     """
     return _default_backend
-
-
-def _resolve_backend(explicit_backend: object = _UNSET) -> BaseBackend | None:
-    """Resolve backend via three-tier lookup.
-
-    Priority order:
-    1. Explicit backend= kwarg (highest priority)
-    2. Module-level default (set_default_backend)
-    3. REDIS_URL environment variable (auto-create RedisBackend)
-
-    Zero-config UX: If REDIS_URL is set, backend is auto-created.
-    Fail-fast: If no backend configured, raise helpful ConfigurationError.
-
-    Args:
-        explicit_backend: Explicit backend from decorator kwarg (use UNSET sentinel for not provided)
-
-    Returns:
-        Resolved backend instance or None for explicit L1-only mode
-
-    Raises:
-        ConfigurationError: If no backend configured and REDIS_URL not set
-    """
-    # Tier 1: Explicit backend parameter (highest priority)
-    if explicit_backend is not _UNSET:
-        return explicit_backend  # type: ignore[return-value]
-
-    # Tier 2: Module-level default
-    if _default_backend is not None:
-        return _default_backend
-
-    # Tier 3: Auto-create from env var (CACHEKIT_REDIS_URL > REDIS_URL)
-    # Check if either env var is set as signal to create Redis backend
-    # Actual URL resolution handled by RedisBackendConfig via AliasChoices
-    if os.environ.get("CACHEKIT_REDIS_URL") or os.environ.get("REDIS_URL"):
-        # Lazy import to avoid circular dependency
-        from cachekit.backends.redis import RedisBackend
-
-        # RedisBackend() resolves its own client provider: a DI-registered
-        # CacheClientProvider when present, else a per-instance pool from env
-        # config. The eager container.get() this used to do crashed the
-        # zero-config path — nothing registers the provider by default (#222).
-        return RedisBackend()
-
-    # No backend configured - fail fast with helpful message
-    raise ConfigurationError(
-        "No backend configured.\n\n"
-        "Quick fix (90% of cases):\n"
-        "  export REDIS_URL=redis://localhost:6379\n\n"
-        "Or explicitly configure:\n"
-        "  from cachekit import set_default_backend\n"
-        "  from cachekit.backends import RedisBackend\n"
-        "  set_default_backend(RedisBackend('redis://localhost:6379'))\n\n"
-        "Or use L1-only mode (no Redis):\n"
-        "  @cache(backend=None)  # In-memory cache only\n\n"
-        "See: https://github.com/cachekit-io/cachekit-py/blob/main/docs/guides/backend-guide.md"
-    )
 
 
 @dataclass(frozen=True)
@@ -258,6 +198,14 @@ class DecoratorConfig:
             # the alias map and the encryption config) — it runs at decoration
             # time on every path, so the error still fires before first use.
 
+        # cachekit.CircuitBreakerConfig (the top-level export) is the reliability class, which
+        # has no .validate(); name the class this field takes instead of an opaque AttributeError.
+        if not isinstance(self.circuit_breaker, CircuitBreakerConfig):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(
+                "circuit_breaker must be a cachekit.config.nested.CircuitBreakerConfig, "
+                f"got {type(self.circuit_breaker).__module__}.{type(self.circuit_breaker).__qualname__}"
+            )
+
         # Validate nested configs
         self.l1.validate()
         self.circuit_breaker.validate()
@@ -291,7 +239,6 @@ class DecoratorConfig:
             "success_threshold": self.circuit_breaker.success_threshold,
             "recovery_timeout": self.circuit_breaker.recovery_timeout,
             "half_open_requests": self.circuit_breaker.half_open_requests,
-            "excluded_exceptions": self.circuit_breaker.excluded_exceptions,
             # Backpressure (flattened)
             "backpressure": self.backpressure.enabled,
             "max_concurrent_requests": self.backpressure.max_concurrent_requests,
@@ -539,51 +486,53 @@ class DecoratorConfig:
         )
 
     @classmethod
-    def io(cls, **kwargs: Any) -> DecoratorConfig:
+    def io(cls, api_key: str | None = None, **kwargs: Any) -> DecoratorConfig:
         """cachekit.io SaaS backend profile: HTTP-based caching via api.cachekit.io.
 
         Use cases: Zero-infrastructure caching, edge caching, multi-region deployments
         Features: Full L1+L2 caching, circuit breaker, production-grade reliability
 
-        Configuration via environment variables:
-            CACHEKIT_API_KEY: API key for authentication (required)
-            CACHEKIT_API_URL: API endpoint (default: https://api.cachekit.io)
+        Credentials: ``api_key`` argument, falling back to the ``CACHEKIT_API_KEY``
+        environment variable. An explicit argument wins, so one process can hold
+        two keys (multi-tenant services, test suites). Neither present is a
+        ConfigurationError here, at construction — never on the first cache call.
+        ``CACHEKIT_API_URL`` overrides the endpoint (default: https://api.cachekit.io).
 
         Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
         AES-256-GCM encryption — no code changes needed. Auto-detection happens in
         CacheSerializationHandler and applies to ALL presets, not just .io().
 
         Args:
-            **kwargs: Overrides (ttl, namespace, etc.)
+            api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
+            **kwargs: Overrides (ttl, namespace, etc.). ``backend`` is not one — io always
+                caches through its own CachekitIOBackend and rejects ``backend=``.
 
         Returns:
             DecoratorConfig with CachekitIOBackend
 
         Raises:
-            ConfigurationError: If CACHEKIT_API_KEY is not set
+            ConfigurationError: If the API key is missing, empty or contains whitespace
+                (argument and CACHEKIT_API_KEY), if CACHEKIT_API_URL fails validation, or if
+                ``backend=`` is passed.
 
         Example:
-            >>> import os
-            >>> os.environ["CACHEKIT_API_KEY"] = "ck_test_key"
-            >>> config = DecoratorConfig.io(ttl=300)
+            >>> config = DecoratorConfig.io(api_key="ck_test_key", ttl=300)  # pragma: allowlist secret
             >>> config.ttl
             300
-            >>> del os.environ["CACHEKIT_API_KEY"]  # cleanup
         """
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 
-        # Check for API key before creating backend
-        if not os.environ.get("CACHEKIT_API_KEY"):
+        if "backend" in kwargs:
             raise ConfigurationError(
-                "CACHEKIT_API_KEY environment variable required for @cache.io\n\n"
-                "Set your API key:\n"
-                "  export CACHEKIT_API_KEY=ck_live_your_key_here\n\n"
-                "Get an API key at: https://cachekit.io"
+                "@cache.io does not accept backend= — it always caches through CachekitIOBackend.\n\n"
+                "To cache through another backend, use a different preset:\n"
+                "  @cache.production(backend=my_backend)"
             )
 
-        # Create backend (loads config from environment)
-        backend = CachekitIOBackend()
+        # io() never reads the env itself: CachekitIOBackendConfig resolves api_key (argument wins,
+        # else CACHEKIT_API_KEY) and raises ConfigurationError on a missing or empty key, at construction.
+        backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend
         # Encryption auto-detected from CACHEKIT_MASTER_KEY in CacheSerializationHandler

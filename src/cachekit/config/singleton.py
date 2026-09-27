@@ -33,10 +33,10 @@ def get_settings() -> CachekitConfig:
 
         >>> reset_settings()
         >>> settings = get_settings()
-        >>> settings.default_ttl
-        3600
         >>> settings.l1_max_size_mb
         100
+        >>> settings.max_value_size
+        104857600
 
     Note:
         This function is thread-safe and uses double-checked locking for performance.

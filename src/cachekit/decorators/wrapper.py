@@ -16,6 +16,7 @@ from cachekit.hash_utils import redact_error_for_log
 
 from ..backends.errors import BackendError, BackendErrorType
 from ..cache_handler import (
+    CacheHit,
     CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -24,11 +25,13 @@ from ..cache_handler import (
     get_logger,
     handle_decrypt_failure,
     redact_cache_key,
+    supports_key_tracking,
     supports_locking,
     supports_swr,
     supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
+from ..config.validation import ConfigurationError
 from ..interop import (
     InteropError,
     bind_flat_args,
@@ -40,8 +43,9 @@ from ..key_generator import CacheKeyGenerator
 from ..l1_cache import DEFAULT_L1_TTL_SECONDS, get_l1_cache
 from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
+from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, KeyringConfigurationError
+from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -73,6 +77,11 @@ _logger = logging.getLogger(__name__)
 # Bounds resource usage when many distinct keys go stale together; at capacity
 # the refresh is skipped (stale keeps being served) and a later hit retries.
 _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
+
+# At most one "Key tracking failed" WARNING per wrapped function per window; failures in
+# between log at DEBUG and are counted into the next WARNING. A registry outage fails every
+# L2 write, and one WARNING per write would turn it into a log flood.
+_TRACK_WARN_INTERVAL_SECONDS = 60.0
 
 # Backed-mode (L2) SWR revalidation pool — deliberately separate from the L1
 # constant above so the two features can be tuned independently (LAB-381 panel).
@@ -409,7 +418,6 @@ def create_cache_wrapper(
     backend: Any = None,
     # Reliability features
     circuit_breaker: bool = True,
-    circuit_breaker_config: CircuitBreakerConfig | None = None,
     backpressure: bool = True,
     max_concurrent_requests: int = 100,
     # Monitoring features
@@ -443,15 +451,17 @@ def create_cache_wrapper(
                      fleet-wide encryption (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
-                         If None: single-tenant mode (uses nil UUID for encryption).
+                         If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
+                         CACHEKIT_DEPLOYMENT_UUID is set).
                          If provided: multi-tenant mode (extracts tenant_id from function args/kwargs).
                          FAIL CLOSED: extraction failure raises ValueError (no fallback to shared key).
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                            Mutually exclusive with tenant_extractor. Prevents accidental shared
                            keys in multi-tenant deployments by requiring explicit configuration.
-        deployment_uuid: Optional deployment-specific UUID for single-tenant mode.
-                        If not provided, uses CACHEKIT_DEPLOYMENT_UUID env var or persistent file.
-                        Must be deterministic (same across restarts) to decrypt cached data.
+        deployment_uuid: Optional explicit tenant_id override for single-tenant mode (validated
+                        UUID). Falls back to CACHEKIT_DEPLOYMENT_UUID, then to the protocol literal
+                        "default" — the cross-SDK default, so a py/rs/ts client on one master key
+                        share ciphertext with no tenant configured at all.
         encryption_fail_closed: Tri-state tamper-failure policy. None (default) defers to
                         CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open). True raises
                         DecryptionAuthenticationError to the caller on AES-GCM authentication
@@ -465,8 +475,8 @@ def create_cache_wrapper(
         backend: Optional backend (BaseBackend implementation). If None, uses default
                  RedisBackendProvider from DI container. Pass explicit backend for testing
                  or alternative storage (HTTP, DynamoDB, etc.).
-        circuit_breaker: Enable circuit breaker for fault tolerance
-        circuit_breaker_config: Circuit breaker configuration
+        circuit_breaker: Enable circuit breaker for fault tolerance. Its settings come from
+                        config.circuit_breaker; without config= the breaker runs its defaults.
         backpressure: Enable backpressure control
         max_concurrent_requests: Max concurrent requests (backpressure)
         collect_stats: Enable statistics collection
@@ -483,6 +493,8 @@ def create_cache_wrapper(
         uses FAIL CLOSED security policy. If extraction fails, ValueError propagates to caller
         (no fallback to shared encryption key). This ensures cryptographic tenant isolation.
     """
+    circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
+
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values
     if config is not None:
@@ -509,8 +521,14 @@ def create_cache_wrapper(
         l1_enabled = config.l1.enabled
         l1_max_size_mb = config.l1.max_size_mb
 
-        # Circuit breaker settings
+        # Circuit breaker settings: the nested knobs configure the live (reliability) breaker
         circuit_breaker = config.circuit_breaker.enabled
+        circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold=config.circuit_breaker.failure_threshold,
+            success_threshold=config.circuit_breaker.success_threshold,
+            timeout_seconds=config.circuit_breaker.recovery_timeout,
+            half_open_requests=config.circuit_breaker.half_open_requests,
+        )
 
         # Backpressure settings
         backpressure = config.backpressure.enabled
@@ -551,17 +569,27 @@ def create_cache_wrapper(
 
     # Initialize handler components
     # Pre-compute function hash at decoration time (50-200μs savings)
-    from ..hash_utils import function_hash
+    from ..hash_utils import blake3_hash, function_hash
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
+
+    # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
+    # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
+    # drain another's keys. namespace=None and namespace="default" write different auto-mode
+    # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
+    # a key written under it could take the ck:reg: shape and overwrite a tracking set.
+    if namespace == "ck" or (namespace or "").startswith("ck:"):
+        raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
+    _registry_id = (
+        f"ck:reg:{namespace if namespace is not None else ''}:"
+        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
+    )
 
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
     # that bypass DecoratorConfig validation.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
-        from ..config.validation import ConfigurationError
-
         try:
             validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
         except InteropError as e:
@@ -580,6 +608,25 @@ def create_cache_wrapper(
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
         _interop_sig = inspect.signature(func)
+
+    # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
+    # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the
+    # L1-only ObjectCache path below never serializes — so @cache.secure(backend=None)
+    # reported encryption.enabled=True while holding plaintext. Refuse at decoration; a
+    # "serialized L1 without L2" mode does not exist and a warning would keep the leak.
+    # `encryption` is the pre-resolution tri-state: None (env auto-detect, live in
+    # cache_handler.py until LAB-4642 removes it) is deliberately NOT refused — the spec
+    # says key presence never activates, so it must not activate a refusal either.
+    _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
+        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
+    )
+    if _l1_only_mode and (encryption or _encrypting_serializer):
+        raise ConfigurationError(
+            "encryption requires a backend: backend=None is L1-only and stores raw Python "
+            "objects, which cannot be ciphertext. Drop backend=None (the backend then "
+            "resolves from CACHEKIT_API_KEY / REDIS_URL / set_default_backend()) or pass "
+            "one explicitly to keep @cache.secure / encryption=True."
+        )
 
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
@@ -602,7 +649,13 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    invalidator = CacheInvalidator(key_generator, integrity_checking=integrity_checking)
+    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
+    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
+    invalidator = CacheInvalidator(
+        key_generator,
+        integrity_checking=integrity_checking,
+        serializer_type=serialization_handler.serializer_key_name,
+    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
@@ -615,19 +668,10 @@ def create_cache_wrapper(
     # This maintains security while enabling sub-microsecond cache hits.
 
     # Initialize feature orchestrator using EXISTING reliability/monitoring modules
-    # Convert CircuitBreakerConfig to dict if provided
-    cb_config_dict: dict[str, Any] | None = None
-    if circuit_breaker_config is not None:
-        cb_config_dict = (
-            circuit_breaker_config.model_dump()  # type: ignore[union-attr]
-            if hasattr(circuit_breaker_config, "model_dump")
-            else circuit_breaker_config
-        )
-
     features = FeatureOrchestrator(
         namespace=namespace or "default",
         circuit_breaker_enabled=use_circuit_breaker,
-        circuit_breaker_config=cb_config_dict or {},  # Use empty dict as default
+        circuit_breaker_config=circuit_breaker_config,
         backpressure_enabled=use_backpressure,
         backpressure_config={"max_concurrent": max_concurrent_requests} if use_backpressure else None,
         collect_stats=use_collect_stats,
@@ -706,8 +750,6 @@ def create_cache_wrapper(
     _l2_swr_capable_at_decoration = _l2_freshness_capable()
     _stale_ttl: int | None = None
     if stale_ttl is not None:
-        from ..config.validation import ConfigurationError
-
         # Type-check BEFORE the zero opt-out test: bool is an int subclass and
         # False == 0 == 0.0, so without this ordering True silently means a
         # 1-second window and False/0.0 silently opt out unvalidated.
@@ -752,11 +794,74 @@ def create_cache_wrapper(
     _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
-    def _put_l1(cache_key: str, serialized_data: Any) -> None:
-        """Backfill L1 with serialized bytes (str payloads encoded) under the fresh TTL."""
-        if _l1_cache and cache_key:
+    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None) -> None:
+        """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
+        then record the key in _cached_keys.
+
+        Recording after the put makes "in L1 => in _cached_keys" hold by construction, so a
+        whole-function invalidation that trims _cached_keys before evicting L1 cannot miss an
+        entry. The key is recorded even when there is nothing to put (L1 disabled, a streamed
+        value): _cached_keys also drives the L2 deletes of process-local invalidation.
+        """
+        if _l1_cache and cache_key and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
-            _l1_cache.put(cache_key, _b, redis_ttl=ttl)
+            _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
+        _cached_keys.add(cache_key)
+
+    def _is_trackable() -> bool:
+        """Whether the backend as RESOLVED so far keeps a server-side key registry.
+
+        Asked at call time, never cached while the backend is unresolved: provider-backed
+        decorators resolve _backend at first call, and a fresh process whose first act is
+        invalidate_cache() must still drain the registry.
+        """
+        nonlocal _backend_trackable
+        if _backend_trackable is None and _backend is not None:
+            _backend_trackable = supports_key_tracking(_backend)
+        return bool(_backend_trackable)
+
+    def _track_and_record(cache_key: str) -> None:
+        """Record a SUCCESSFUL L2 write in the backend's key registry. Never raises.
+
+        Call only after the L2 write returned success, and never inline on an event loop
+        (async callers use asyncio.to_thread). A key whose tracking fails stays in
+        _cached_keys, and this process's next drain deletes it from there. Other processes'
+        drains cannot see it, so the failure is a WARNING — throttled to one per
+        _TRACK_WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
+        """
+        nonlocal _track_warned_at, _track_failures, _track_warn_lock, _track_warn_pid
+        if not _is_trackable():
+            return
+        try:
+            _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
+        except Exception as e:
+            if _track_warn_pid != os.getpid():
+                # Forked child: the inherited lock may be held by a parent thread that did not
+                # survive the fork, so taking it would hang this write forever, and the count is
+                # the parent's. Replace all of it. Sibling threads racing this swap cost at worst
+                # one extra WARNING, once per fork.
+                _track_warn_lock = threading.Lock()
+                _track_warned_at, _track_failures = float("-inf"), 0
+                _track_warn_pid = os.getpid()
+            # Claim the window under the lock, log outside it: concurrent failures then emit
+            # one WARNING, and a slow log sink never serializes the failing writers.
+            with _track_warn_lock:
+                _track_failures += 1
+                now = time.monotonic()
+                failures = 0
+                if now - _track_warned_at >= _TRACK_WARN_INTERVAL_SECONDS:
+                    failures, _track_failures, _track_warned_at = _track_failures, 0, now
+            if not failures:
+                _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                return
+            _logger.warning(
+                "Key tracking failed in registry %s (failures since the last warning: %d); other processes' "
+                "drains miss those keys until their TTL. Latest key %s: %s",
+                redact_cache_key(_registry_id),
+                failures,
+                redact_cache_key(cache_key),
+                redact_error_for_log(e),
+            )
 
     def _l1_backfill_ttl(fresh_for: int | None) -> Any:
         """L1 TTL for a backfill from an L2 read, bounded by the server's remaining
@@ -779,7 +884,7 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[Any, bool, int | None]:
+    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -811,23 +916,21 @@ def create_cache_wrapper(
         """
         if not (_l1_cache and cache_key and cached_data and not is_stale):
             return
-        cached_bytes = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
         try:
-            _l1_cache.put(cache_key, cached_bytes, redis_ttl=_l1_backfill_ttl(fresh_for))
+            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for))
         except TypeError as exc:
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
-            return
-        _cached_keys.add(cache_key)
 
-    def _record_l2_hit_async(cached_data: Any, get_duration_ms: float) -> None:
+    def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
         """Record the telemetry for an async L2 hit — the uncontended read and
         both post-lock double-check hits (LAB-3769) share this so a
         thundering-herd hit is never invisible to cache_operations_total /
         cache_info() just because it arrived via the lock's double-check.
 
-        size_bytes is computed here rather than read from the handler's
-        size_bytes tuple slot (LAB-348), so this label never depends on the
-        handler's tuple shape; the two agree on every in-contract async hit.
+        size_bytes is the length CacheHit already measured (LAB-3757), not a
+        recompute from the envelope. CacheHit.size_bytes is set on every hit
+        including the mmap fast path, where envelope is None and there are no
+        bytes to measure -- so this label never depends on holding the bytes.
 
         Best-effort, for the same reason _l1_backfill_from_l2 is (LAB-348):
         every call site sits inside an `except Exception` that falls through to
@@ -855,16 +958,13 @@ def create_cache_wrapper(
             features.set_operation_context("get", duration_ms=get_duration_ms)
             features.record_success()
             if features.collect_stats:
-                # Defensive encode for an out-of-contract backend: both async readers
-                # annotate this slot `bytes`, so the ternary is a guard, not a live path.
-                envelope = cached_data.encode("utf-8") if isinstance(cached_data, str) else cached_data
                 features.record_cache_operation(
                     operation="get",
                     namespace=namespace or "default",
                     serializer="rust",
                     success=True,
                     duration_ms=get_duration_ms,
-                    size_bytes=len(envelope),
+                    size_bytes=size_bytes,
                     hit=True,
                 )
         except (ValueError, TypeError) as exc:
@@ -913,11 +1013,13 @@ def create_cache_wrapper(
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
-        await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+        stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
             cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
         )
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
-        _put_l1(cache_key, serialized_data)
+        _put_l1(cache_key, serialized_data, ttl)
+        if stored and _is_trackable():
+            await asyncio.to_thread(_track_and_record, cache_key)
 
     async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for async functions. Failures are silent by design:
@@ -949,10 +1051,12 @@ def create_cache_wrapper(
             serialized_data = operation_handler.serialization_handler.serialize_data(
                 result, call_args, call_kwargs, cache_key=cache_key
             )
-            operation_handler.cache_handler.set(  # type: ignore[attr-defined]
+            stored = operation_handler.cache_handler.set(  # type: ignore[attr-defined]
                 cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
             )
-            _put_l1(cache_key, serialized_data)
+            _put_l1(cache_key, serialized_data, ttl)
+            if stored:
+                _track_and_record(cache_key)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
             _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
         finally:
@@ -1031,6 +1135,13 @@ def create_cache_wrapper(
     # we need to clear ALL entries — but key normalization (hashing of long keys)
     # makes prefix matching unreliable. Tracking actual keys is simple and correct.
     _cached_keys: set[str] = set()
+    # Resolved by _is_trackable() once _backend exists; None until then.
+    _backend_trackable: bool | None = None
+    # track_key failure WARNING throttle: when it last fired (monotonic), failures since.
+    _track_warned_at = float("-inf")
+    _track_failures = 0
+    _track_warn_lock = threading.Lock()
+    _track_warn_pid = os.getpid()  # owner process — see _l2_swr_try_begin's fork note
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -1422,8 +1533,8 @@ def create_cache_wrapper(
             duration = time.time() - start_time
 
             if cached_result is not None:
-                # Cache hit: (True, value, envelope [None on the mmap fast path], size_bytes — set on every path)
-                _found, result, cached_data, size_bytes = cached_result
+                # Cache hit: envelope is None on the mmap fast path; size_bytes is set on every path
+                result, cached_data, size_bytes = cached_result.value, cached_result.envelope, cached_result.size_bytes
                 features.set_operation_context("get", duration_ms=duration * 1000)
                 features.record_success()
 
@@ -1514,12 +1625,12 @@ def create_cache_wrapper(
             try:
                 # Store using operation handler (pass args/kwargs for tenant extraction)
                 # Returns serialized bytes for L1 cache storage
-                serialized_bytes = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
+                outcome = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                if _l1_cache and cache_key and serialized_bytes:
-                    _l1_cache.put(cache_key, serialized_bytes, redis_ttl=ttl)
-                _cached_keys.add(cache_key)
+                _put_l1(cache_key, outcome.envelope, ttl)
+                if outcome.stored:
+                    _track_and_record(cache_key)
 
                 # Record successful cache set
                 set_duration_ms = (time.time() - start_time) * 1000
@@ -1809,12 +1920,12 @@ def create_cache_wrapper(
                     cached_result = await operation_handler.get_cached_value_async(cache_key)
 
                 if cached_result is not None:
-                    # Cache hit: (True, value, raw serialized envelope for L1 backfill, envelope size)
-                    _found, result, cached_data, _size_bytes = cached_result
+                    # Cache hit: envelope is the raw serialized bytes for L1 backfill
+                    result, cached_data = cached_result.value, cached_result.envelope
 
                     # Record cache hit (always compute for L2 latency stats)
                     get_duration_ms = (time.perf_counter() - start_time) * 1000
-                    _record_l2_hit_async(cached_data, get_duration_ms)
+                    _record_l2_hit_async(cached_result.size_bytes, get_duration_ms)
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
@@ -1893,9 +2004,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1923,9 +2034,9 @@ def create_cache_wrapper(
                                 cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
-                                    _found, result, cached_data, _size_bytes = cached_result
+                                    result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_data, _dc_duration_ms)
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
                             except DecryptionAuthenticationError:
@@ -1949,7 +2060,7 @@ def create_cache_wrapper(
                             )
 
                             # Store in Redis with TTL
-                            await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
                                 cache_key,
                                 serialized_data,
                                 ttl=ttl,
@@ -1957,8 +2068,9 @@ def create_cache_wrapper(
                             )
 
                             # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                            _put_l1(cache_key, serialized_data)
-                            _cached_keys.add(cache_key)
+                            _put_l1(cache_key, serialized_data, ttl)
+                            if stored and _is_trackable():
+                                await asyncio.to_thread(_track_and_record, cache_key)
 
                             # Record successful cache set
                             set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1971,6 +2083,8 @@ def create_cache_wrapper(
                                     namespace=namespace or "default",
                                     success=True,
                                     duration_ms=set_duration_ms,
+                                    serializer="rust",
+                                    hit=False,  # Was a miss
                                 )
 
                         except InteropError:
@@ -2035,7 +2149,7 @@ def create_cache_wrapper(
                     )
 
                     # Store in Redis with TTL
-                    await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                    stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
                         cache_key,
                         serialized_data,
                         ttl=ttl,
@@ -2043,8 +2157,9 @@ def create_cache_wrapper(
                     )
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    _put_l1(cache_key, serialized_data)
-                    _cached_keys.add(cache_key)
+                    _put_l1(cache_key, serialized_data, ttl)
+                    if stored and _is_trackable():
+                        await asyncio.to_thread(_track_and_record, cache_key)
 
                     # Record successful cache set
                     set_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2057,6 +2172,8 @@ def create_cache_wrapper(
                             namespace=namespace or "default",
                             success=True,
                             duration_ms=set_duration_ms,
+                            serializer="rust",
+                            hit=False,  # Was a miss
                         )
 
                 except InteropError:
@@ -2086,6 +2203,52 @@ def create_cache_wrapper(
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
+    def _local_invalidate_all() -> None:
+        """Invalidate every key THIS process knows (_cached_keys): L2 delete, then trim, then L1.
+
+        The whole-function path for backends without a key registry, and the fallback when a
+        drain fails. Per key, the L2 delete comes first: evicting L1 first would let an L2-hit
+        backfill landing in between re-cache the old value in L1. A key whose delete failed
+        stays in _cached_keys for the next attempt. Keys other processes wrote and this one
+        never saw stay in L2 until their TTL.
+        """
+        for key in set(_cached_keys):  # snapshot: other threads add while this runs
+            l2_deleted = True
+            if _backend is not None and not _l1_only_mode:
+                try:
+                    _backend.delete(key)
+                except Exception as e:
+                    _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
+                    l2_deleted = False  # keep key tracked for retry
+            if l2_deleted:
+                _cached_keys.discard(key)
+            if _object_cache:
+                _object_cache.delete(key)
+            elif _l1_cache:
+                _l1_cache.invalidate(key)
+
+    def _drain_all() -> None:
+        """Whole-function invalidation. Sync; ainvalidate_cache runs it via asyncio.to_thread.
+
+        On a KeyTrackableBackend, drain the server-side registry: every key ANY process wrote
+        for this function is deleted from L2, plus the keys this process knows that the
+        registry missed. Any failure falls back to _local_invalidate_all().
+        """
+        if not _is_trackable():
+            _local_invalidate_all()
+            return
+        try:
+            snap = set(_cached_keys)  # this process's view, taken before the drain
+            deleted = _backend.drain_tracked(_registry_id, snap)  # type: ignore[union-attr]  # superset of snap
+            # Trim BEFORE evicting: _put_l1 puts then records, so a concurrent write can
+            # never leave an L1 entry whose key is no longer in _cached_keys.
+            _cached_keys.difference_update(snap)
+            if _l1_cache:
+                _l1_cache.invalidate_many(deleted)
+        except Exception as e:
+            _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
+            _local_invalidate_all()
+
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
 
@@ -2103,21 +2266,7 @@ def create_cache_wrapper(
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
         if not args and not kwargs and _func_has_params:
-            # Snapshot prevents RuntimeError if another thread adds during iteration
-            keys_snapshot = set(_cached_keys)
-            for key in keys_snapshot:
-                if _object_cache:
-                    _object_cache.delete(key)
-                elif _l1_cache:
-                    _l1_cache.invalidate(key)
-                if _backend and not _l1_only_mode:
-                    invalidator.set_backend(_backend)
-                    try:
-                        _backend.delete(key)
-                    except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
-                        continue  # keep key tracked for retry
-                _cached_keys.discard(key)
+            _drain_all()
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)
@@ -2162,20 +2311,8 @@ def create_cache_wrapper(
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
-            keys_snapshot = set(_cached_keys)
-            for key in keys_snapshot:
-                if _object_cache:
-                    _object_cache.delete(key)
-                elif _l1_cache:
-                    _l1_cache.invalidate(key)
-                if _backend and not _l1_only_mode:
-                    invalidator.set_backend(_backend)
-                    try:
-                        _backend.delete(key)
-                    except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
-                        continue
-                _cached_keys.discard(key)
+            # Off the event loop: every L2 call in here is a sync Redis/backend round-trip.
+            await asyncio.to_thread(_drain_all)
             return
 
         # Single-key invalidation (specific args provided, or zero-param function)

@@ -180,7 +180,7 @@ CACHEKIT_MASTER_KEY=hex-encoded-32-byte-key
 - [Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md): Client-side AES-256-GCM
 - [Prometheus Metrics](docs/features/prometheus-metrics.md): Built-in observability
 - [Interop Mode](docs/features/interop-mode.md): Cross-SDK cache sharing (interop/v1)
-- [L1 Invalidation & SWR](docs/features/l1-invalidation.md): Process-local invalidation, stale-while-revalidate
+- [L1 Invalidation & SWR](docs/features/l1-invalidation.md): Invalidation scope (incl. cross-process whole-function on Redis), stale-while-revalidate
 - [Reference Caching](docs/features/reference-caching.md): @cache.local() for non-serializable objects
 - [Rust Serialization](docs/features/rust-serialization.md): ByteStorage layer (LZ4, xxHash3, AES-256-GCM)
 - [SSRF Protection](docs/features/ssrf-protection.md): CachekitIO URL allowlisting
