@@ -3,14 +3,14 @@
 This module defines the storage backend contract using PEP 544 protocol-based abstraction.
 All L2 backends (Redis, HTTP, etc.) must implement BaseBackend protocol.
 
-Optional capability protocols (TTLInspectableBackend, LockableBackend,
+Optional capability protocols (TTLInspectableBackend, LockableBackend, KeyTrackableBackend,
 TimeoutConfigurableBackend, BufferReadableBackend, BufferWritableBackend)
 enable advanced features with graceful degradation.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
 
@@ -333,6 +333,73 @@ class LockableBackend(Protocol):
 
         Note:
             Lock is automatically released on context exit, even if exception occurs.
+        """
+        ...
+
+
+@runtime_checkable
+class KeyTrackableBackend(Protocol):
+    """Optional protocol for backends supporting server-side key tracking.
+
+    A decorated function's no-argument ``invalidate_cache()`` must delete every key
+    ANY process wrote for it, not only the keys the calling process remembers. A
+    tracking backend keeps one server-side set of written keys per decorated
+    function (the registry id) and drains it on whole-function invalidation.
+
+    Not all backends support this capability:
+    - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and
+      therefore the env-resolved Redis path hand out.
+    - Not supported: ``RedisBackend`` constructed directly and passed as
+      ``backend=``, ``FileBackend``, ``MemcachedBackend``, ``CachekitIOBackend``,
+      L1-only. These keep process-local invalidation: the calling process deletes
+      the keys it wrote or read itself.
+
+    Both methods are sync, like ``BaseBackend.get``/``set``; async callers run
+    them through ``asyncio.to_thread``.
+
+    Example:
+        >>> from cachekit.backends.base import KeyTrackableBackend
+        >>> from cachekit.backends.redis.provider import PerRequestRedisBackend
+        >>> from cachekit.backends.file import FileBackend
+        >>> issubclass(PerRequestRedisBackend, KeyTrackableBackend)
+        True
+        >>> issubclass(FileBackend, KeyTrackableBackend)
+        False
+    """
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        """Add a cache key to the server-side tracking set for ``registry_id``.
+
+        ``key`` is the raw cache key as the caller wrote it and is stored raw.
+        Implementations scope ``registry_id`` (tenant prefix) and apply the same
+        scoping to members only at drain time, so a member can never name a key
+        outside the implementation's own scope. Refreshes the set's TTL on every call.
+
+        Raises:
+            Exception: On any backend failure. Tracking is advisory: callers
+                swallow the error, and a key whose tracking failed is still
+                removed by the caller's next drain through ``local_keys``.
+        """
+        ...
+
+    def drain_tracked(self, registry_id: str, local_keys: Iterable[str]) -> set[str]:
+        """Drain the tracking set in bounded atomic steps, deleting every member's key,
+        then delete every key in ``local_keys`` that no step popped.
+
+        Args:
+            registry_id: Unscoped registry id of the decorated function.
+            local_keys: The caller's snapshot of the keys it knows it wrote or read.
+                Required: these are the keys the tracking set may be missing (a failed
+                ``track_key``, a key written before tracking existed, a lapsed set),
+                and deleting them is what makes the drain complete.
+
+        Returns:
+            The raw keys deleted — decoded popped members plus all of ``local_keys`` —
+            for L1 eviction.
+
+        Raises:
+            Exception: If any command fails. The caller then falls back to deleting
+                its local keys one by one.
         """
         ...
 
