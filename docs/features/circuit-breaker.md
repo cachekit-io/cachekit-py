@@ -323,7 +323,8 @@ def fetch(key):
 def fetch_sensitive(key):
     # Encryption happens before L2 write
     # If L2 fails → Circuit opens
-    # Encryption/decryption code not involved
+    # A decrypt/integrity failure on read is a cache miss, not a backend failure:
+    # it never counts toward the breaker
     return db.fetch(key)  # illustrative - not defined
 ```
 
