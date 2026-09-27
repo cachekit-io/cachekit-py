@@ -206,6 +206,8 @@ Things to know:
 - **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
 - **Same module path everywhere.** The set is named by the function's `module.qualname`, so every process must import the function from the same module path.
 
+**Custom `key=` functions.** Both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. No-args `invalidate_cache()` reaches what the table above says for the resolved backend — the registry tracks the key the write path actually wrote, custom or not. On the backends limited to "this process", tracked keys do not survive a restart, so after a deploy use the exact-args form.
+
 ---
 
 ## Multi-Instance Semantics
