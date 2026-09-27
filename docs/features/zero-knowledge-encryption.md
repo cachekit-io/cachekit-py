@@ -128,14 +128,14 @@ def get_user_ssn(user_id):
 From the next minor release encryption turns on only where the code says so —
 `@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
 below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
-ciphertext on read; in this release its presence can still auto-activate encryption where no
-intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+ciphertext on read (not in an interop cache — see the `encryption=False` row); in this
+release its presence can still auto-activate encryption where no intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
 
 | Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
 |---|---|---|
 | `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
 | `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
-| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Exception: an [interop](interop-mode.md) cache (`interop=`) cannot decrypt its stale ciphertext — entries carry no header — so flush it once every writer has switched |
+| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Not in an [interop cache](#turning-encryption-off-in-an-interop-cache): its stale entries are never decrypted |
 | No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
 | No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
 
@@ -146,6 +146,18 @@ with no error (issue #128). Migrate by writing the intent. Both explicit spellin
 on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
 every other row can store plaintext, and the compliance argument below holds only on an
 explicit path.
+
+### Turning Encryption Off in an Interop Cache
+
+An interop cache (`interop=`) never decrypts stale ciphertext after `encryption=False`. Its entries
+carry no header, so the reader decodes the ciphertext as MessagePack. Most stale entries fail to
+decode and are recomputed, but a rare small one decodes cleanly and is served as a wrong value.
+Encryption is also part of the [shared-entry contract](interop-mode.md#operation-names-are-a-contract-shared-entries):
+every SDK that binds the operation must agree on it.
+
+So move the operation to a new `namespace` in the same change, in every SDK that binds it. Old and
+new writers then use different keys, so no reader sees the old ciphertext — on any backend, in L1,
+or mid-rollout. The old keys are never read again; do not `FLUSHDB` a shared database to clear them.
 
 ## What Can Go Wrong
 

@@ -276,9 +276,9 @@ def _warn_encryption_auto_activation() -> None:
         "@cache.secure(...). Declare the intent now — @cache.secure(...) to require encryption; "
         "encryption=True with single_tenant_mode=True (on a preset: "
         "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; or "
-        "encryption=False to store plaintext. Stale ciphertext is still decrypted on read either way, except in "
-        "an interop cache (interop=...): its entries carry no header and are not decrypted, so flush it once "
-        "every writer has switched to encryption=False."
+        "encryption=False to store plaintext — stale ciphertext is still decrypted on read, except in an interop "
+        "cache (interop=...): move it to a new namespace in every SDK when you switch, or a few stale entries "
+        "come back as wrong values."
     )
 
 
@@ -559,7 +559,7 @@ class CacheSerializationHandler:
                         - True: force encryption ON (requires a master key + explicit tenant mode).
                         - False: explicit hard opt-out. Never encrypts, even when CACHEKIT_MASTER_KEY
                           is set; stale ciphertext is still decrypted on read (legacy-decrypt), except
-                          in interop mode: headerless entries are not decrypted, so flush the cache.
+                          in interop mode, where stored bytes are plain-decoded and never decrypted.
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (tenant_id "default" unless overridden).
