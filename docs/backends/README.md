@@ -236,6 +236,13 @@ the `cachekit.decorators.orchestrator` logger, and runs the function uncached.
 The Redis prefix scopes L2 only. L1 is shared by every tenant in the process; see
 [Whole-Function Invalidation → Tenant scope](../features/l1-invalidation.md#whole-function-invalidation).
 
+Set the tenant with `tenant_context` from `cachekit.backends.redis.provider`, to a `str`,
+`bytes`, `int` or `UUID`. The prefix is the id's text, `str()` for an `int` or `UUID`: `1`,
+`"1"` and `b"1"` are one tenant (`t:1:`), as are a `UUID` and `str(uuid)`, but `"01"` or an
+upper-case UUID string is another. With env auto-detection, a call with no tenant set uses
+`default`. If two kinds of tenant can share an id, namespace them before setting
+`tenant_context`: `"org:1"`, `"team:1"`.
+
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
 2. Module-level default via `set_default_backend()` (checked at decoration, and

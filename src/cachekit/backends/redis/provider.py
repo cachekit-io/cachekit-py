@@ -103,6 +103,11 @@ def _encode_tenant(tenant_id: object) -> str:
     slot empty and supplies them itself, so never read the slot directly. Anything else except
     str / bytes raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a
     default repr embedding ``id()``, can map two tenants to one prefix.
+
+    The encoding is by text, not by type: ``1``, ``"1"`` and ``b"1"`` share one prefix, as do a
+    UUID and ``str(uuid)``, so one tenant read as int in one place and str in another stays one
+    tenant. A type-tagged encoding would split such a tenant and move the released str / bytes
+    prefixes.
     """
     if type(tenant_id) is int:
         tenant_id = str(tenant_id)

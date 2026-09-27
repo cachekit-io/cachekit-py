@@ -486,7 +486,8 @@ For bulk eviction, delete by prefix:
 
 ```bash
 # The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe=""):
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
+# (an int or UUID tenant as its str() first):
 # tenant org:123 is stored as t:org%3A123:...
 # Namespaced function (@cache.secure(namespace="users", ...)):
 redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
