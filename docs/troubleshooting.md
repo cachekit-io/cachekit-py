@@ -195,15 +195,16 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 
 **Quick fix**:
 ```bash
-# Generate valid encryption key
+# First-time setup only: generate a valid encryption key
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
-
-# Clear cache if key was rotated
-redis-cli FLUSHDB
 
 # Restart application
 python app.py
 ```
+
+If the key was rotated, do not generate a new key or flush: keep the old key
+decrypt-only in `CACHEKIT_PREVIOUS_MASTER_KEYS` and follow the
+[key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 </details>
 
