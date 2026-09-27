@@ -828,8 +828,8 @@ def create_cache_wrapper(
 
         Call only after the L2 write returned success, and never inline on an event loop
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
-        _cached_keys, and this process's next drain deletes it from there. Other processes'
-        drains cannot see it, so the failure is a WARNING — throttled to one per
+        _cached_keys, and this process's next drain by the same tenant deletes it from there.
+        Other processes' drains cannot see it, so the failure is a WARNING — throttled to one per
         _TRACK_WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
         nonlocal _track_warned_at, _track_failures, _track_warn_lock, _track_warn_pid
@@ -1134,10 +1134,10 @@ def create_cache_wrapper(
         return generate_interop_key(namespace, interop, flat)
 
     # Track the cache keys this process wrote or read for this function (for no-args
-    # invalidation). invalidate_cache() with no args on a parameterized function clears the
-    # entries tracked here; key normalization (hashing of long keys) makes prefix matching
+    # invalidation). Key normalization (hashing of long keys) makes prefix matching
     # unreliable, so actual keys are tracked. Keys written only by other processes are not in
-    # this set; on a KeyTrackableBackend the server-side registry reaches them (_drain_all).
+    # this set; on a KeyTrackableBackend the calling tenant's server-side registry reaches
+    # them (_drain_all).
     # The set is not bounded: an entry is dropped only by invalidation, never on TTL expiry.
     # Each entry is (L2 key prefix, cache key): a tenant-scoped backend holds one L2 entry
     # per tenant under the same cache key, and an invalidation may delete — and stop
@@ -2230,15 +2230,14 @@ def create_cache_wrapper(
         for entry in set(_cached_keys):  # snapshot: other threads add while this runs
             entry_scope, key = entry
             l2_deleted = True
-            if _backend is not None and not _l1_only_mode:
-                if entry_scope != scope:
-                    l2_deleted = False  # another tenant's L2 entry: not the caller's to delete, stays tracked
-                else:
-                    try:
-                        _backend.delete(key)
-                    except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
-                        l2_deleted = False  # keep key tracked for retry
+            if entry_scope != scope:
+                l2_deleted = False  # another tenant's L2 entry: not the caller's to delete, stays tracked
+            elif _backend is not None and not _l1_only_mode:
+                try:
+                    _backend.delete(key)
+                except Exception as e:
+                    _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
+                    l2_deleted = False  # keep key tracked for retry
             if l2_deleted:
                 _cached_keys.discard(entry)
             if _object_cache:

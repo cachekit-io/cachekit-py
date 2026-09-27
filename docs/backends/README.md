@@ -106,7 +106,8 @@ class BaseBackend(Protocol):
 `refresh_ttl_on_get` does not apply to it (see [Memcached](memcached.md#ttl-inspection--refresh)).
 
 **Cross-process whole-function invalidation** (a server-side key registry, via the
-`KeyTrackableBackend` protocol): supported by the env-resolved **Redis** backend only. Every
+`KeyTrackableBackend` protocol): supported only by the tenant-scoped **Redis** backend that env
+auto-detection and `RedisBackendProvider` hand out. Every
 other backend — including a `RedisBackend` passed as `backend=` — deletes only the keys the
 calling process knows (see [Whole-Function Invalidation](../features/l1-invalidation.md#whole-function-invalidation)).
 

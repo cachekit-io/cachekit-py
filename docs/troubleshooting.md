@@ -476,8 +476,9 @@ get_data.invalidate_cache(user_id)         # sync function
 await get_data.ainvalidate_cache(user_id)  # async function
 ```
 
-Called with no arguments it evicts only the keys this process has cached, not
-the fleet's. It does not cover a function with a custom `key=`: delete that
+Called with no arguments on the tenant-scoped Redis backend it deletes every
+process's L2 entries for the calling tenant; on other backends it evicts only the
+keys this process has cached, not the fleet's. It does not cover a function with a custom `key=`: delete that
 entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
 with `<tenant>` percent-encoded as shown below.
 

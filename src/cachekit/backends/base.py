@@ -344,7 +344,8 @@ class KeyTrackableBackend(Protocol):
     A decorated function's no-argument ``invalidate_cache()`` must delete every key
     ANY process wrote for it, not only the keys the calling process remembers. A
     tracking backend keeps one server-side set of written keys per decorated
-    function (the registry id) and drains it on whole-function invalidation.
+    function (the registry id) — per tenant on a tenant-scoped backend — and drains
+    the calling tenant's set on whole-function invalidation.
 
     Not all backends support this capability:
     - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and

@@ -311,8 +311,21 @@ def env_resolved_redis(redis_isolated, monkeypatch):
     return redis_isolated
 
 
+def _cache_entries(client, tenant: str = "*") -> list[bytes]:
+    """L2 cache entries under a tenant prefix, without the key registry's tracking sets."""
+    return [key for key in client.keys(f"t:{tenant}:*") if b":ck:reg:" not in key]
+
+
 def _tenant_prefixes(client) -> set[str]:
-    return {key.decode().split(":", 2)[1] for key in client.keys("t:*")}
+    return {key.decode().split(":", 2)[1] for key in _cache_entries(client)}
+
+
+def as_tenant(tenant, fn, *args):
+    token = tenant_context.set(tenant)
+    try:
+        return fn(*args)
+    finally:
+        tenant_context.reset(token)
 
 
 @pytest.mark.integration
@@ -373,16 +386,18 @@ class TestTenantScopedPerOperation:
             await asyncio.sleep(0)
             return x
 
-        async def as_tenant(tenant):
+        async def run_as(tenant):
             tenant_context.set(tenant)  # each task runs in its own copy of the context
             for x in range(3):
                 await lookup(x)
 
-        await asyncio.gather(*(as_tenant(t) for t in ("tenant-a", "tenant-b", "tenant-c")))
+        await asyncio.gather(*(run_as(t) for t in ("tenant-a", "tenant-b", "tenant-c")))
 
         assert _tenant_prefixes(env_resolved_redis) == {"tenant-a", "tenant-b", "tenant-c"}
         for tenant in ("tenant-a", "tenant-b", "tenant-c"):
-            assert len(env_resolved_redis.keys(f"t:{tenant}:*")) == 3
+            assert len(_cache_entries(env_resolved_redis, tenant)) == 3
+            (registry,) = env_resolved_redis.keys(f"t:{tenant}:ck:reg:*")  # tracked under the caller too
+            assert env_resolved_redis.scard(registry) == 3
 
     def test_invalidate_deletes_only_the_calling_tenants_entry(self, env_resolved_redis):
         from cachekit import cache
@@ -429,29 +444,45 @@ class TestTenantScopedPerOperation:
         assert sorted(redis_isolated.keys("t:*")) == [b"t:org%3Ab:k", b"t:tenant-a:k"]
 
     def test_whole_function_invalidate_keeps_other_tenants_tracked(self, env_resolved_redis):
-        """A no-args invalidate by one tenant must not untrack another tenant's entries."""
+        """A no-args invalidate by one tenant must not untrack another tenant's entries.
+
+        Tenant-b's registry set is dropped first (a lapsed set or failed track_key looks the
+        same), so only this process's tracking can still reach tenant-b's entries."""
         from cachekit import cache
 
         @cache(ttl=60, l1_enabled=False)
         def lookup(x):
             return x
 
-        def as_tenant(tenant, fn, *args):
-            token = tenant_context.set(tenant)
-            try:
-                return fn(*args)
-            finally:
-                tenant_context.reset(token)
-
         as_tenant("tenant-a", lookup, 1)
         as_tenant("tenant-b", lookup, 1)
         as_tenant("tenant-b", lookup, 2)
+        env_resolved_redis.delete(*env_resolved_redis.keys("t:tenant-b:ck:reg:*"))
 
         as_tenant("tenant-a", lookup.invalidate_cache)
         assert _tenant_prefixes(env_resolved_redis) == {"tenant-b"}
 
         as_tenant("tenant-b", lookup.invalidate_cache)
         assert env_resolved_redis.keys("t:*") == []
+
+    def test_whole_function_invalidate_evicts_l1_for_every_tenant(self, env_resolved_redis):
+        """L1 is shared by all tenants (see docs/features/l1-invalidation.md): a no-args invalidate
+        evicts the L1 entry of every key this process tracks, not only the drained ones, so the
+        caller is never served a pre-invalidation value from L1."""
+        from cachekit import cache
+
+        calls = []
+
+        @cache(ttl=60)
+        def lookup(x):
+            calls.append(tenant_context.get())
+            return x
+
+        as_tenant("tenant-b", lookup, 1)
+        as_tenant("tenant-a", lookup.invalidate_cache)
+        as_tenant("tenant-a", lookup, 1)
+
+        assert calls == ["tenant-b", "tenant-a"]
 
     async def test_non_str_tenant_id_is_scoped_not_raised(self, env_resolved_redis):
         """Apps set UUID / int tenant ids; the async miss path must cache, not raise."""
