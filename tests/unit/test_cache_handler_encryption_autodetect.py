@@ -322,6 +322,15 @@ class TestAutoActivationDeprecationWarning:
             CacheSerializationHandler(serializer_name="default")
         assert len(self._activation_records(caplog)) == 1
 
+    def test_rejected_decorator_does_not_spend_the_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A decorator rejected after its handler would be built must not claim the warning either."""
+        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
+            with pytest.raises(ConfigurationError, match="stale_ttl must be a non-negative integer"):
+                cache(ttl=60, stale_ttl=-1)(lambda: None)
+            assert self._activation_records(caplog) == []
+            cache(ttl=60)(lambda: None)
+        assert len(self._activation_records(caplog)) == 1
+
     def test_no_key_does_not_warn(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         monkeypatch.delenv("CACHEKIT_MASTER_KEY")
         reset_settings()
