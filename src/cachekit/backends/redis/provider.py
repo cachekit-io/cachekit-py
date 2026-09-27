@@ -33,7 +33,7 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 logger = logging.getLogger(__name__)
 
 # Module-level ContextVar for async-safe tenant isolation
-tenant_context: ContextVar[Optional[str]] = ContextVar("tenant_context", default=None)
+tenant_context: ContextVar[str | bytes | int | uuid.UUID | None] = ContextVar("tenant_context", default=None)
 
 T = TypeVar("T")
 
@@ -65,8 +65,8 @@ async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
 def _encode_tenant(tenant_id: object) -> str:
     """URL-encode a tenant id for the key prefix (Fix #2: no ':' collision).
 
-    Apps set int / UUID tenant ids although ``tenant_context`` is typed ``str``, so both are
-    accepted in canonical form. int by exact type: no driver returns an int subclass, and a
+    Apps set int / UUID tenant ids, so both are accepted in canonical form (and typed so on
+    ``tenant_context`` and the constructor). int by exact type: no driver returns an int subclass, and a
     bool or IntEnum tenant is a caller bug whose ``str()`` is not canonical (``str(True)`` is
     'True'; an IntEnum's differs between Python versions), so it fails closed. UUID with the
     subclasses drivers return (asyncpg, uuid6), formatted by the base class's ``__str__``, so a
@@ -140,7 +140,13 @@ class PerRequestRedisBackend:
         RuntimeError: tenant_id cannot be None...
     """
 
-    def __init__(self, client: redis.Redis, tenant_id: str | None, *, follow_context: bool = False):
+    def __init__(
+        self,
+        client: redis.Redis,
+        tenant_id: str | bytes | int | uuid.UUID | None,
+        *,
+        follow_context: bool = False,
+    ):
         """Initialize per-request backend wrapper.
 
         Args:
