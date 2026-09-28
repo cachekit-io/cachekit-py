@@ -520,10 +520,8 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # AAD build sits OUTSIDE the tag-verification try: a header value that cannot be
-        # built into the AAD fails here as corruption (evict), never tamper (retained under
-        # fail_closed). A value that builds into different AAD bytes fails the tag below — see
-        # _create_aad.
+        # AAD build sits OUTSIDE the tag-verification try: an original_type that cannot be built
+        # into the AAD is corruption, not tamper (see _create_aad).
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -628,7 +626,8 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # AAD build stays outside the try — header corruption is not tamper (see deserialize).
+        # AAD build sits OUTSIDE the tag-verification try: an original_type that cannot be built
+        # into the AAD is corruption, not tamper (see _create_aad).
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:

@@ -174,10 +174,10 @@ read plaintext entry → SerializationError (fail closed) → evict → recomput
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
-plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
-an attacker with backend write access is indistinguishable from a legacy one — any
-"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
-fail-closed read path exists to prevent. If you need to read plaintext entries, use a
+plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
+plaintext entry forged by an attacker with backend write access is indistinguishable
+from a legacy one — any "accept plaintext" escape hatch would reintroduce the
+encryption-downgrade attack the fail-closed read path exists to prevent. If you need to read plaintext entries, use a
 handler with `encryption=False` (which never had keys to protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
@@ -378,9 +378,9 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext and is **not** covered by the AES-GCM
-authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
-into the tag, but the header itself stays outside that boundary so a reader can parse
-it before it has a key.
+authentication tag. AAD v0x03 binds tenant, cache key, wire format, compression and
+(when set) the original type into the tag, but the header itself stays outside that
+boundary so a reader can parse it before it has a key.
 
 An attacker with backend write access (the threat actor in the protocol's threat
 model) could exploit that gap by planting a frame whose header claims
@@ -425,12 +425,10 @@ them (cachekit-py#170):
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
   between cache keys), or the entry claims a different tenant. The plaintext frame
-  header fields bound into the AAD (`tenant_id`, `format`, `compressed`,
-  `original_type`) are unencrypted, but the AAD built from them is authenticated by the
-  tag: a header change that produces different AAD bytes also fails here. (What is
-  authenticated is the constructed AAD, not the header's JSON bytes — a re-encoding that
-  yields identical AAD, such as `compressed` stored as `"True"` instead of `true`, reads
-  successfully.) Raised as
+  header fields built into the AAD (`format`, `compressed`, `original_type`) are
+  unencrypted, but the AAD built from them is authenticated by the tag: a header change
+  that produces different AAD bytes also fails here. (The tag authenticates the
+  constructed AAD, not the header's JSON bytes.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
