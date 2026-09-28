@@ -363,16 +363,7 @@ def get_json_data():
 
 **What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, cachekit attempts to evict the poisoned entry (best effort), and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see *Decryption failed* above.)
 
-**Solution**:
-```bash
-# Clear corrupted cache entry
-redis-cli DEL <cache-key>
-
-# Or clear entire cache
-redis-cli FLUSHDB
-
-# Function will recompute and cache correctly
-```
+**Solution**: If the automatic eviction failed (`Failed to evict poisoned L2 entry ...` is logged), evict the entry yourself as in *Option 3: Data corruption* under *Decryption failed* above: call the decorated function's `invalidate_cache(...)` with the failing read's arguments, or delete by the `t:<tenant>:...` prefix. Flush the database (`redis-cli FLUSHDB`) only if it is dedicated to cachekit. The function recomputes and re-caches on the next call.
 
 ---
 
