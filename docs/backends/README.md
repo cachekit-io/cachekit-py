@@ -284,20 +284,40 @@ registry recorded them.
 
 1. Wait until the last process running an earlier release has stopped.
 2. Delete every `t:*` key in each database cachekit uses. Run `FLUSHDB` instead only if the
-   database is dedicated to cachekit.
+   database is dedicated to cachekit. Use the Python client that cachekit installs, not a
+   `redis-cli --scan` pipeline: a key set through `key=` can contain a newline, which a
+   line-based pipeline splits into names that match nothing, so the key survives and the
+   pipeline still exits 0. `scan_iter` returns each key whole, as bytes.
 
-   ```bash
-   redis-cli -u <redis-url> --scan --pattern 't:*' | tr '\n' '\0' | xargs -0 -r redis-cli -u <redis-url> DEL
+   ```python notest
+   # Needs a live Redis: set the URL, then run once per database cachekit uses.
+   import redis
+
+   r = redis.Redis.from_url("redis://localhost:6379/0")
+   pattern = "t:*"
+
+   batch = []
+   for key in r.scan_iter(match=pattern, count=1000):
+       batch.append(key)
+       if len(batch) == 1000:
+           r.unlink(*batch)
+           batch.clear()
+   if batch:
+       r.unlink(*batch)
+
+   left = sum(1 for _ in r.scan_iter(match=pattern, count=1000))
+   print(f"{left} keys left matching {pattern}")  # expect 0
    ```
 
 3. Restart every process. L1 keeps any entry a process read before the purge for up to the
    function's `ttl` (300 s with `ttl=None`). Expect a cold cache.
 
 On a database other applications share, `t:*` also matches their keys that start with `t:`.
-Run the same command once per tenant instead, with `--pattern 't:<tenant>:*'`, for `default`
+Run the same script once per tenant instead, with `pattern = "t:<tenant>:*"`, for `default`
 and for each tenant you have set. Percent-encode the tenant with
 `urllib.parse.quote(tenant, safe='')`, converting an `int` or `UUID` tenant with `str()` first:
-tenant `org:123` is `--pattern 't:org%3A123:*'`.
+tenant `org:123` is `pattern = "t:org%3A123:*"`. The encoding also escapes `*`, `?` and `[`,
+so a tenant id cannot widen the pattern.
 
 Other changes you may notice:
 
