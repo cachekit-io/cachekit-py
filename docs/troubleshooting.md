@@ -364,7 +364,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
 
 ## Error Reference
 
-Every exception and log line cachekit produces, with whether it reaches your code, is in the [Error Reference](error-codes.md).
+The errors cachekit raises or logs, with whether each reaches your code, are in the [Error Reference](error-codes.md).
 
 ---
 
