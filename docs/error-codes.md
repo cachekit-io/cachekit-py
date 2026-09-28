@@ -92,7 +92,7 @@ else:
 
 **Exception**: `DecryptionAuthenticationError` (`from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError`, a `SerializationError` subclass)
 
-**What it means**: By default a `@cache.secure` read does not raise. It logs `... cache decrypt/integrity failure (auth_tamper) for ...`, evicts the entry and recomputes. The exception reaches your code only with fail-closed on: `CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`, or `@cache.secure(fail_closed=True)` on the decorator.
+**What it means**: By default a `@cache.secure` read does not raise. It logs `... cache decrypt/integrity failure (auth_tamper) for ...`, attempts to evict the entry (best effort) and recomputes. The exception reaches your code only with fail-closed on: `CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`, or `@cache.secure(fail_closed=True)` on the decorator. Fail-closed keeps the entry as evidence.
 
 **Cause**:
 - Master key was changed (old encrypted data can't be decrypted)
@@ -357,11 +357,11 @@ def get_json_data():
 
 **Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`
 
-**Exception**: none under `@cache` — the entry is evicted and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
+**Exception**: none under `@cache` — cachekit attempts to evict the entry (best effort; a failed delete is logged and the entry stays) and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
 
 **Cause**: Cached data is corrupted, or was written by an incompatible serializer/config. This is corruption *detection*, not tamper detection: the plaintext checksum is unkeyed xxHash3-64, which anyone with backend write access can recompute. Tamper detection requires encryption — see *Decryption failed* above.
 
-**What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, the poisoned entry is evicted, and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see *Decryption failed* above.)
+**What it means**: A normal `@cache`-decorated call usually does not surface this to your code — `SerializationError` on a plaintext read is caught internally, cachekit attempts to evict the poisoned entry (best effort), and the function recomputes. You would typically only see it directly by calling a serializer's `deserialize()` method yourself, outside the cache decorator. (A tampered *encrypted* entry is a different code path — see *Decryption failed* above.)
 
 **Solution**:
 ```bash
@@ -384,10 +384,10 @@ redis-cli FLUSHDB
 
 **Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
 
-**Cause**: Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), a failure to create the backend client, or a cached entry that fails to deserialize or decrypt (see *Deserialization failed* and *Decryption failed*). Such an entry is evicted and the call recomputes normally, but the failure still counts, so a backend that keeps returning corrupted or undecryptable entries opens the breaker. Each decorated function has its own breaker, and that many such failures open it even when the backend is healthy.
+**Cause**: Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), a failure to create the backend client, or a cached entry that fails to deserialize or decrypt when fail-closed is off (see *Deserialization failed* and *Decryption failed*). For such an entry cachekit attempts to evict it (best effort: a failed delete is only logged as `Failed to evict poisoned L2 entry ...`, and the entry stays) and the call recomputes normally, but the failure still counts, so a backend that keeps returning corrupted or undecryptable entries opens the breaker. With fail-closed on, an authentication failure raises `DecryptionAuthenticationError` instead, keeps the entry as evidence, and does not count. Each decorated function has its own breaker, and that many such failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function has raised, cached entries have failed to deserialize or decrypt, or the backend client could not be created — `failure_threshold` times in total (five by default) since the process started
+- Your function has raised, cached entries have failed to deserialize or decrypt (fail-closed off), or the backend client could not be created — `failure_threshold` times in total (five by default) since the process started
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
