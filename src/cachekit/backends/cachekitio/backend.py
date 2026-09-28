@@ -218,8 +218,7 @@ class CachekitIOBackend:
         everything else still comes from the environment.
 
         Raises:
-            ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token (whitespace,
-                byte-order mark, control character), or an API URL that fails
+            ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token, or an API URL that fails
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}

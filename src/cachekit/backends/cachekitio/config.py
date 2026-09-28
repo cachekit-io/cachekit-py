@@ -119,7 +119,7 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     )
     api_key: SecretStr = Field(
         ...,  # Required field
-        min_length=1,  # an empty key would go out as "Bearer " and fail on the first call, not here
+        min_length=1,  # fullmatch rejects "" too, but only too_short makes the backend add its missing-key hint
         description="API key (ck_live_...) - required for authentication",
     )
     timeout: float = Field(
@@ -151,9 +151,9 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         # Reject rather than strip: never rewrite a credential. Never echo it: the message is static.
         if not _BEARER_TOKEN.fullmatch(v.get_secret_value()):
             raise ValueError(
-                "is not a valid bearer token (RFC 6750 allows only A-Z a-z 0-9 - . _ ~ + / and trailing =); "
+                "is not a valid bearer token (RFC 6750 allows only A-Z a-z 0-9 - . _ ~ + / and any number of trailing =); "
                 "the usual cause is a trailing newline or other whitespace, a byte-order mark from a file saved "
-                "on Windows, or a control character"
+                "on Windows, a control character, or a non-ASCII letter"
             )
         return v
 

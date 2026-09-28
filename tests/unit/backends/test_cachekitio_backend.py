@@ -136,10 +136,10 @@ class TestInit:
             "   ",
             "ck_live_SECRET_XYZ\n",  # pragma: allowlist secret
             "ck_live_SECRET XYZ",  # pragma: allowlist secret
-            "﻿ck_live_SECRET_XYZ",  # pragma: allowlist secret
+            "\ufeffck_live_SECRET_XYZ",  # pragma: allowlist secret
             "ck_live_SECRET\x00XYZ",  # pragma: allowlist secret
             "ck_live_SECRET\x7fXYZ",  # pragma: allowlist secret
-            "ck_live_SECRETéXYZ",  # pragma: allowlist secret
+            "ck_live_SECRET\u00e9XYZ",  # pragma: allowlist secret
         ],
         ids=["blank", "newline", "inner-space", "bom", "nul", "del", "non-ascii-letter"],
     )
@@ -173,7 +173,7 @@ class TestInit:
         "kwargs",
         [
             {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
-            {"api_key": "﻿ck_live_SECRET_XYZ"},  # pragma: allowlist secret
+            {"api_key": "\ufeffck_live_SECRET_XYZ"},  # pragma: allowlist secret
             {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
         ],
         ids=["whitespace", "bom", "allowlist"],

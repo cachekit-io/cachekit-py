@@ -288,7 +288,7 @@ echo $CACHEKIT_API_KEY
 export CACHEKIT_API_KEY=new_key_here
 ```
 
-3. **Stray characters are not the cause of a 401.** cachekit accepts only the RFC 6750 bearer-token characters (`A-Z a-z 0-9 - . _ ~ + /`, then optional trailing `=`). A key with a trailing newline or other whitespace, a byte-order mark (from a secrets file saved on Windows) or a control character raises `ConfigurationError: ... is not a valid bearer token` when the backend is built, before any request is sent. cachekit never strips the key for you: re-save the source without the stray character.
+3. **Check the key for a bad copy.** A key with a character outside the RFC 6750 bearer-token set cannot cause a 401: cachekit raises `ConfigurationError: ... is not a valid bearer token` when the backend is built, before any request is sent (see [the rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)). A key with extra, missing or altered characters from inside the set (`A-Z a-z 0-9 - . _ ~ + /`, then any number of trailing `=`) still passes that check and returns 401 — for example a trailing `.` copied from a sentence, an extra `=`, or a truncated or doubled paste. Copy the key again from the dashboard.
 
 </details>
 

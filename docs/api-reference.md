@@ -216,7 +216,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains a character outside the RFC 6750 bearer-token set (whitespace, a byte-order mark, a control character, a non-ASCII letter), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 
