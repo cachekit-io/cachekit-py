@@ -326,7 +326,7 @@ class TestSWRForkIsolation:
         backend = FakeSWRBackend()
         gate = threading.Event()
         calls: list[int] = []
-        parent = os.getpid()
+        parent_pid = os.getpid()
 
         @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
         def compute(x: int) -> int:
@@ -334,7 +334,7 @@ class TestSWRForkIsolation:
             # Only the parent parks. The child must never touch the gate: the parent's revalidation thread
             # can be forked while it holds the gate's lock on its way into wait(), and the child inherits
             # that lock held, with no thread left to release it.
-            if len(calls) > 1 and os.getpid() == parent:
+            if len(calls) > 1 and os.getpid() == parent_pid:
                 gate.wait(timeout=30)  # hold the parent's revalidation in flight
             return x + 1
 

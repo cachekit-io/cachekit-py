@@ -221,7 +221,8 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
         real_close(self)
 
     # The releaser takes its own reference to the lease, then drops it only after this thread has dropped
-    # every one of its own, so the release (and the close it triggers) runs on the releaser on every build.
+    # every one of its own, so the release (and the close it triggers) runs on the releaser, on GIL and
+    # free-threaded builds alike.
     # Handing it the last reference instead is not enough: on a free-threaded build, an object whose count
     # a non-owner thread takes to zero is queued back to its owner, and freed on this thread once it wakes.
     def release() -> None:
