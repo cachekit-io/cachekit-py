@@ -418,7 +418,7 @@ info = expensive_func.cache_info()
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
 | [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
-| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on env-resolved Redis), stale-while-revalidate |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis), stale-while-revalidate |
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
