@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.errors import BackendError, BackendErrorType
+from ..backends.errors import BackendError, BackendErrorType, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
     CacheInvalidator,
@@ -1380,6 +1380,19 @@ def create_cache_wrapper(
 
         # L1+L2 MODE: Original behavior with backend initialization
 
+        # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+        # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
+        # caller before the function runs, whatever the breaker state, and never counts a failure
+        # on the breaker every tenant of this function shares. "" until the backend is resolved;
+        # the first call checks right after resolving it, below. Sits outside the main
+        # try/finally, so the raise path restores the context itself.
+        try:
+            _l2_scope()
+        except Exception:
+            features.clear_correlation_id()
+            reset_current_function_stats(token)
+            raise
+
         with features.create_span("redis_cache", span_attributes) as span:
             try:
                 # Add cache key to span attributes
@@ -1404,6 +1417,7 @@ def create_cache_wrapper(
                 nonlocal _backend
                 if _backend is None:
                     _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1412,6 +1426,13 @@ def create_cache_wrapper(
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                features.clear_correlation_id()
+                reset_current_function_stats(token)
+                raise
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -1518,18 +1539,6 @@ def create_cache_wrapper(
                         f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
                     )
                     _l1_cache.invalidate(cache_key)
-
-        # Tenant scope, resolved outside every degrade try below (LAB-5713): an unsupported tenant
-        # id type is a caller bug, so its TypeError reaches the caller before the function runs,
-        # as on the async path. Resolved inside one, it was swallowed into an uncached call that
-        # counted a failure on the breaker every tenant of this function shares. Sits outside
-        # the main try/finally, so the raise path restores the context itself.
-        try:
-            _l2_scope()
-        except Exception:
-            features.clear_correlation_id()
-            reset_current_function_stats(token)
-            raise
 
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
@@ -1803,6 +1812,11 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
+            # Tenant scope, before the breaker check (LAB-5713): see sync_wrapper. "" until the
+            # backend is resolved; the first call checks right after resolving it, below. The
+            # outer finally clears correlation ID / stats context.
+            _l2_scope()
+
             # Guard clause: Circuit breaker check - fail fast if circuit is open
             # This prevents cascading failures
             if not features.should_allow_request():
@@ -1825,6 +1839,8 @@ def create_cache_wrapper(
                 if _backend is None:
                     try:
                         _backend = _resolve_lazy_backend()
+                    except UnsupportedTenantError:
+                        raise  # a caller bug, not a client failure: see sync_wrapper
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1836,7 +1852,7 @@ def create_cache_wrapper(
                             duration_ms=0.0,
                         )
                         return await func(*args, **kwargs)
-                ensure_interop_backend_compatible(_backend)
+                ensure_interop_backend_compatible(_backend)  # reads key_prefix, so runs the tenant check too
 
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
@@ -1899,6 +1915,8 @@ def create_cache_wrapper(
             if _backend is None:
                 try:
                     _backend = _resolve_lazy_backend()
+                except UnsupportedTenantError:
+                    raise  # a caller bug, not a client failure: see sync_wrapper
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1910,6 +1928,7 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
+                _l2_scope()  # first call: the tenant check above ran before the backend existed
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
@@ -1918,10 +1937,6 @@ def create_cache_wrapper(
                 ttl_refresh_threshold=ttl_refresh_threshold,
             )
             operation_handler.set_cache_handler(handler)
-
-            # Tenant scope, resolved before any degrade try (LAB-5713): an unsupported tenant id
-            # type raises TypeError here, before the function runs — see sync_wrapper.
-            _l2_scope()
 
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()

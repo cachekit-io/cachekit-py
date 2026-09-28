@@ -4,8 +4,6 @@ Tests the optional protocol implementations (TTL, locking, timeouts)
 with a real Redis instance.
 """
 
-import inspect
-import logging
 import time
 
 import pytest
@@ -16,7 +14,6 @@ from cachekit.backends.redis.provider import (
     RedisBackendProvider,
     tenant_context,
 )
-from tests.fixtures.tenant import as_tenant as tenant_scope
 
 
 @pytest.mark.integration
@@ -565,71 +562,3 @@ class TestTenantScopedPerOperation:
             tenant_context.reset(token)
 
         assert redis_isolated.keys("t:*") == [b"t:tenant-x:k"]
-
-
-def _decorate(is_async: bool, calls: list):
-    """One @cache function per test, sync or async, recording each real execution in ``calls``."""
-    from cachekit import cache
-
-    if is_async:
-
-        @cache(ttl=60, l1_enabled=False)
-        async def lookup(x):
-            calls.append(x)
-            return x
-
-    else:
-
-        @cache(ttl=60, l1_enabled=False)
-        def lookup(x):
-            calls.append(x)
-            return x
-
-    return lookup
-
-
-async def _call(fn, *args):
-    result = fn(*args)
-    return await result if inspect.isawaitable(result) else result
-
-
-_BOTH_PATHS = pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-
-
-@pytest.mark.integration
-class TestUnsupportedTenantIdRaises:
-    """LAB-5713: a tenant id of a type _encode_tenant rejects is a caller bug, not a cache fault.
-
-    Both wrappers must raise it before the function runs. Swallowed by the sync degrade path it
-    ran uncached AND counted a failure on the per-function breaker every tenant shares, so one
-    bad caller turned caching off for all of them."""
-
-    @_BOTH_PATHS
-    @pytest.mark.parametrize("tenant", [1.5, True, object()], ids=["float", "bool", "object"])
-    async def test_raises_type_error_before_the_function_runs(self, env_resolved_redis, caplog, is_async, tenant):
-        calls: list = []
-        lookup = _decorate(is_async, calls)
-
-        with tenant_scope(tenant), pytest.raises(TypeError, match=f"not {type(tenant).__name__}$"):
-            await _call(lookup, 1)
-
-        assert calls == []
-        assert env_resolved_redis.keys("t:*") == []
-        # Raised before any cache operation, so none is logged as a failed get / set.
-        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
-
-    @_BOTH_PATHS
-    async def test_breaker_other_tenants_share_stays_closed(self, env_resolved_redis, is_async):
-        calls: list = []
-        lookup = _decorate(is_async, calls)
-
-        for _ in range(6):  # one past the default failure threshold
-            with tenant_scope(1.5), pytest.raises(TypeError):
-                await _call(lookup, 1)
-
-        breaker = lookup.get_health_status()["circuit_breaker"]
-        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
-        with tenant_scope("tenant-b"):
-            assert await _call(lookup, 1) == 1
-        assert calls == [1]
-        assert _tenant_prefixes(env_resolved_redis) == {"tenant-b"}

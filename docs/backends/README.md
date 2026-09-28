@@ -244,12 +244,16 @@ upper-case UUID string is another. With env auto-detection, a call with no tenan
 `tenant_context`: `"org:1"`, `"team:1"`.
 
 Any other type, such as a `float`, a `bool`, an `IntEnum` or an arbitrary object, is a bug in
-the caller. On an L1 miss the decorated call raises `TypeError` before the function runs, sync
-and async alike. It is not treated as a cache fault: the call does not fall back to running
-uncached, and it does not count against the function's circuit breaker, which every tenant
-of that function shares. L1 is shared by every tenant (see above), so a call whose arguments
-another tenant already cached in this process's L1 returns that entry without raising. Do
-not rely on the `TypeError` to keep tenants apart.
+the caller. The decorated call raises `TypeError` before the function runs, sync and async
+alike. It raises on an L1 hit too, and while the circuit breaker is open. It is not treated as
+a cache fault: the call does not fall back to running uncached, and it does not count against
+the function's circuit breaker, which every tenant of that function shares.
+
+The check needs the function's backend. A function whose backend is resolved at its first call
+(see the resolution order below) skips the check until then. That covers a call the circuit
+breaker turns away before the backend was ever resolved, and an L1 hit on an async function
+before its first L1 miss. The check is on the id's type only. L1 is shared by every tenant (see
+above), so do not rely on the `TypeError` to keep tenants apart.
 
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`

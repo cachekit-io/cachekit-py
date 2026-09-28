@@ -18,6 +18,10 @@ tests/integration/test_key_registry_redis.py.
 
 Regression coverage for LAB-4773: a provider-issued backend scopes each operation to the
 calling context's tenant (see ``TestProviderIssuedBackendFollowsTheCallingTenant``).
+
+Regression coverage for LAB-5713: an unsupported tenant id type raises through ``@cache`` on both
+paths, never degraded or counted by the circuit breaker
+(see ``TestUnsupportedTenantIdRaisesThroughTheDecorator``).
 """
 
 from __future__ import annotations
@@ -25,11 +29,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import enum
+import inspect
 import logging
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -44,6 +50,7 @@ from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis import provider as provider_module
 from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider, tenant_context
+from tests.fixtures.tenant import as_tenant
 
 
 @pytest.mark.unit
@@ -837,3 +844,167 @@ class TestClassifyRedisErrorMisfiles:
         error = classify_redis_error(getattr(redis.exceptions, exc_name)("boom"), operation="get")
 
         assert error.error_type == BackendErrorType.PERMANENT
+
+
+def _decorate(is_async: bool, calls: list, **options):
+    """One @cache function per test, sync or async, recording each real execution in ``calls``."""
+    from cachekit import cache
+
+    if is_async:
+
+        @cache(ttl=60, **options)
+        async def lookup(x):
+            calls.append(x)
+            return x
+
+    else:
+
+        @cache(ttl=60, **options)
+        def lookup(x):
+            calls.append(x)
+            return x
+
+    return lookup
+
+
+async def _call(fn, *args):
+    result = fn(*args)
+    return await result if inspect.isawaitable(result) else result
+
+
+_BOTH_PATHS = pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+
+
+@pytest.fixture(params=["backend=", "shared-provider", "call-time-provider"])
+def tenant_backend(request, monkeypatch):
+    """How the function gets its tenant-scoped backend, a _FakeRedis behind each: ``backend=`` at
+    decoration, or at its first call from a provider handing out RedisBackendProvider's
+    get_shared_backend() (as env auto-detection does; the tenant is checked after resolving it) or
+    get_backend() (which checks the tenant while building it). Yields (decorator options, client).
+
+    tests/unit's conftest resets neither L1 nor the DI container, so this does both itself."""
+    from cachekit.backends.provider import BackendProviderInterface
+    from cachekit.config import decorator as decorator_config
+    from cachekit.di import DIContainer
+    from cachekit.l1_cache import get_l1_cache_manager
+
+    monkeypatch.setattr(Lock, "lua_release", None)  # async misses take the lock: bind its script to this fake
+    fake = _FakeRedis()
+    options = {}
+    if request.param == "backend=":
+        options["backend"] = PerRequestRedisBackend(fake, "default", follow_context=True)
+    else:
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379")
+        provider._client = fake
+        get_backend = provider.get_shared_backend if request.param == "shared-provider" else provider.get_backend
+        monkeypatch.setattr(decorator_config, "_default_backend", None)
+        monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, SimpleNamespace(get_backend=get_backend))
+    get_l1_cache_manager().clear_all()
+    yield options, fake
+    get_l1_cache_manager().clear_all()
+
+
+@pytest.fixture
+def live_breakers(monkeypatch):
+    """Every circuit breaker a decorator builds from here on, so a test can open it."""
+    from cachekit.decorators import orchestrator
+
+    built = []
+
+    class Recorded(orchestrator.CircuitBreaker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(orchestrator, "CircuitBreaker", Recorded)
+    return built
+
+
+@pytest.mark.unit
+class TestUnsupportedTenantIdRaisesThroughTheDecorator:
+    """LAB-5713: a tenant id of a type _encode_tenant rejects is a caller bug, not a cache fault.
+
+    Both wrappers must raise it before the function runs, however the function got its backend and
+    whatever the breaker state. Degraded to an uncached call it counted a failure on the
+    per-function breaker every tenant shares, so one bad caller turned caching off for all of them."""
+
+    @_BOTH_PATHS
+    @pytest.mark.parametrize("tenant", [1.5, True, object()], ids=["float", "bool", "object"])
+    async def test_raises_before_the_function_runs(self, tenant_backend, caplog, is_async, tenant):
+        options, fake = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+
+        with as_tenant(tenant), pytest.raises(TypeError, match=f"not {type(tenant).__name__}$"):
+            await _call(lookup, 1)
+
+        assert calls == []
+        assert fake._store == {}
+        # Raised before any cache operation, so none is logged as a failed get / set.
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @_BOTH_PATHS
+    async def test_breaker_other_tenants_share_stays_closed(self, tenant_backend, is_async):
+        options, fake = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+
+        for _ in range(6):  # one past the default failure threshold
+            with as_tenant(1.5), pytest.raises(TypeError):
+                await _call(lookup, 1)
+
+        breaker = lookup.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+        with as_tenant("tenant-b"):
+            assert await _call(lookup, 1) == 1
+        assert calls == [1]
+        assert {key.split(":", 2)[1] for key in fake._store} == {"tenant-b"}
+
+    @_BOTH_PATHS
+    async def test_raises_while_the_breaker_is_open(self, tenant_backend, live_breakers, is_async):
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+        with as_tenant("tenant-b"):
+            await _call(lookup, 1)  # the function has its backend from here on
+        (breaker,) = live_breakers
+        for _ in range(breaker.config.failure_threshold):
+            breaker.record_failure()
+        assert lookup.get_health_status()["circuit_breaker"]["state"] == "open"
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 2)
+
+        assert calls == [1]
+
+    @_BOTH_PATHS
+    async def test_raises_on_an_l1_hit(self, tenant_backend, is_async):
+        """L1 is shared by every tenant, so an entry tenant-b cached is there for any caller: the
+        check runs before the L1 lookup once the function has its backend."""
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, **options)
+        with as_tenant("tenant-b"):
+            await _call(lookup, 1)
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 1)
+
+        assert calls == [1]
+
+    @pytest.mark.parametrize("tenant_backend", ["shared-provider", "call-time-provider"], indirect=True)
+    async def test_async_interop_call_raises_rather_than_degrading(self, tenant_backend):
+        """The async interop path resolves the backend on a branch of its own. A tenant-scoped backend
+        is refused under interop anyway (at decoration, given as ``backend=``); an unsupported tenant
+        must not turn that into an uncached call."""
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(True, calls, l1_enabled=False, interop="lookup", namespace="users", **options)
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 1)
+
+        assert calls == []
+        breaker = lookup.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
