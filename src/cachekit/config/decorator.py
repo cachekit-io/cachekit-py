@@ -198,6 +198,13 @@ class DecoratorConfig:
             # the alias map and the encryption config) — it runs at decoration
             # time on every path, so the error still fires before first use.
 
+        # `encryption=True/False` is the explicit spelling on every preset (protocol intent-presets.md
+        # § Encryption Activation), but the field is an EncryptionConfig and dataclasses do not coerce:
+        # without this, `@cache.production(encryption=False)` dies in `.validate()` with AttributeError.
+        # Bare `@cache` flattens the bool earlier (decorators/intent.py); presets reach here with it raw.
+        if isinstance(self.encryption, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
+            object.__setattr__(self, "encryption", EncryptionConfig(enabled=self.encryption))
+
         # cachekit.CircuitBreakerConfig (the top-level export) is the reliability class, which
         # has no .validate(); name the class this field takes instead of an opaque AttributeError.
         if not isinstance(self.circuit_breaker, CircuitBreakerConfig):  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -498,9 +505,10 @@ class DecoratorConfig:
         ConfigurationError here, at construction — never on the first cache call.
         ``CACHEKIT_API_URL`` overrides the endpoint (default: https://api.cachekit.io).
 
-        Encryption: Set CACHEKIT_MASTER_KEY env var to enable automatic client-side
-        AES-256-GCM encryption — no code changes needed. Auto-detection happens in
-        CacheSerializationHandler and applies to ALL presets, not just .io().
+        Encryption: opt in explicitly with encryption=EncryptionConfig(enabled=True,
+        single_tenant_mode=True, master_key=...); omit master_key to use CACHEKIT_MASTER_KEY.
+        The env var alone activating encryption is deprecated (warns once this release,
+        raises in the next minor) — protocol intent-presets.md § Encryption Activation.
 
         Args:
             api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
@@ -535,7 +543,7 @@ class DecoratorConfig:
         backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend
-        # Encryption auto-detected from CACHEKIT_MASTER_KEY in CacheSerializationHandler
+        # Encryption is opt-in via encryption=EncryptionConfig(...); env-key auto-activation is deprecated
         return cls(
             backend=backend,
             integrity_checking=True,
