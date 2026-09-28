@@ -171,7 +171,7 @@ def get_user_profile(user_id: int):
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
-> 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+> 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`.
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >

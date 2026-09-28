@@ -208,6 +208,13 @@ def cache(
         if config is not None:
             # DecoratorConfig instance provided (type checked above) - use it with overrides
             resolved_config = config
+            # An encrypted config= (DecoratorConfig.secure(), or hand-built) keeps integrity on: the
+            # override would reopen the integrity_checking=False that DecoratorConfig.secure() rejects.
+            if config.encryption.enabled is True and not manual_overrides.get("integrity_checking", True):
+                raise ConfigurationError(
+                    "integrity_checking=False cannot override an encrypted config= "
+                    "(e.g. DecoratorConfig.secure()) — integrity checking stays on. Omit integrity_checking."
+                )
             if manual_overrides or backend is not None:
                 # Apply overrides by creating new DecoratorConfig with merged settings
                 override_dict = manual_overrides.copy()

@@ -350,18 +350,23 @@ class DecoratorConfig:
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
         Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
-        Note: integrity_checking is forced to True (non-negotiable for security)
+        Note: integrity_checking is forced to True (non-negotiable for security). Passing
+              integrity_checking=False raises ConfigurationError — here and as an override
+              next to @cache(config=DecoratorConfig.secure(...)).
 
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
             tenant_extractor: Optional tenant ID extractor for multi-tenant encryption
-            **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking cannot be overridden.
+            **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking=False is rejected.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
                      (default None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, which defaults to False)
 
         Returns:
             DecoratorConfig with encryption enabled and full security features
+
+        Raises:
+            ConfigurationError: If ``integrity_checking=False`` is passed.
 
         Example:
             >>> config = DecoratorConfig.secure(master_key="a" * 64, ttl=600)
@@ -376,9 +381,13 @@ class DecoratorConfig:
         # Tri-state: None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open)
         fail_closed = kwargs.pop("fail_closed", None)
 
-        # SECURITY INVARIANT: Force integrity_checking=True (non-negotiable for encryption)
-        # Remove any explicit integrity_checking override (if user tried to disable it)
-        kwargs.pop("integrity_checking", None)
+        # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
+        # rejected, never silently dropped (protocol intent-presets.md § Explicit Configuration).
+        if not kwargs.pop("integrity_checking", True):
+            raise ConfigurationError(
+                "@cache.secure does not accept integrity_checking=False — the secure preset forces "
+                "integrity checking on. Omit integrity_checking."
+            )
 
         # Normalize empty string to None (security: empty string treated as single-tenant)
         tenant_extractor = tenant_extractor or None

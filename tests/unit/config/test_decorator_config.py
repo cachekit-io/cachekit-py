@@ -386,3 +386,70 @@ class TestIoPreset:
             @cache.io(api_key="ck_arg", backend=backend)  # pragma: allowlist secret
             def fn() -> int:
                 return 1
+
+
+_SECURE_KEY = "a" * 64
+
+
+@pytest.mark.unit
+class TestSecureIntegrityChecking:
+    """.secure forces integrity_checking on. Asking to turn it off is a ConfigurationError on every
+    path, never a silent drop or a silent pass (protocol intent-presets.md § Explicit Configuration)."""
+
+    # Each form hands integrity_checking to .secure a different way; the config= forms share one branch.
+    FORMS = {
+        "config": lambda v: cache(config=DecoratorConfig.secure(master_key=_SECURE_KEY), integrity_checking=v),
+        "secure-config": lambda v: cache.secure(config=DecoratorConfig.secure(master_key=_SECURE_KEY), integrity_checking=v),
+        "secure-kwarg": lambda v: cache.secure(master_key=_SECURE_KEY, integrity_checking=v),
+    }
+
+    @pytest.fixture
+    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
+        seen: list[DecoratorConfig] = []
+
+        def spy(f, config, **_kwargs):
+            seen.append(config)
+            return f
+
+        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        return seen
+
+    @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
+    @pytest.mark.parametrize("value", [False, None], ids=["false", "none"])
+    def test_disable_rejected_at_decoration(self, resolved: list[DecoratorConfig], form: str, value: object) -> None:
+        decorator = self.FORMS[form](value)
+        with pytest.raises(ConfigurationError, match="integrity_checking"):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    def test_classmethod_disable_rejected(self) -> None:
+        with pytest.raises(ConfigurationError, match="integrity_checking"):
+            DecoratorConfig.secure(master_key=_SECURE_KEY, integrity_checking=False)
+
+    @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
+    def test_explicit_true_accepted(self, resolved: list[DecoratorConfig], form: str) -> None:
+        @self.FORMS[form](True)
+        def fn() -> int:
+            return 1
+
+        assert resolved[0].integrity_checking is True
+        assert resolved[0].encryption.enabled is True
+
+    def test_classmethod_explicit_true_accepted(self) -> None:
+        config = DecoratorConfig.secure(master_key=_SECURE_KEY, integrity_checking=True)
+        assert config.integrity_checking is True
+        assert config.encryption.enabled is True
+
+    def test_non_secure_config_override_unchanged(self, resolved: list[DecoratorConfig]) -> None:
+        """The config= guard keys on encryption, so an unencrypted preset keeps its RORO override."""
+
+        @cache(config=DecoratorConfig.production(backend=None), integrity_checking=False)
+        def fn() -> int:
+            return 1
+
+        assert resolved[0].integrity_checking is False
