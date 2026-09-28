@@ -16,9 +16,10 @@ paths that:
    (the exact FFI call every serializer's deserialize path makes) and through
    the full decorator retrieve path.
 2. **Bin-emit**: fresh writes carry ``bin``-encoded envelopes (marker
-   ``0xc4``/``0xc5``/``0xc6`` on element[0]) inside the CK v3 frame, observed
-   through the real decorator store path — including the bin32 width tier
-   the protocol pins deliberately leave uncovered (spec/wire-format.md).
+   ``0xc4``/``0xc5``/``0xc6`` on element[0]), observed inside the CK v3 frame
+   through the real decorator store path and at every width tier through the
+   real serializer path — including bin32, which the protocol pins
+   deliberately leave uncovered (spec/wire-format.md).
 3. **Re-encode identity**: the 0.4.0 writer reproduces every ``*_bin`` pin
    byte-identically from the vector inputs.
 4. **Round-trip identity** through the full stack (store → retrieve) for
