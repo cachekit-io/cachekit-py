@@ -393,7 +393,7 @@ jobs:
       # No continue-on-error: a security product must not ship wheels without a
       # verified SBOM. If this (or the sbom job) fails, publish is gated below.
       - name: Attest SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4
         with:
           subject-path: dist/*
           sbom-path: sbom.cdx.json
