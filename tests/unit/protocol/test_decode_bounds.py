@@ -15,6 +15,7 @@ Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import json
@@ -84,13 +85,12 @@ DECODE_PATHS: dict[str, Callable[[bytes], Any]] = {
 }
 
 
-def _peak_of(fn: Callable[..., Any], *args: Any) -> tuple[Any, BaseException | None, int]:
+def _peak_of(fn: Callable[..., Any], *args: Any) -> int:
     tracemalloc.start()
     try:
-        return fn(*args), None, tracemalloc.get_traced_memory()[1]
-    except (ValueError, SerializationError) as e:
-        # The only rejections the read path maps to a controlled miss; any other type propagates.
-        return None, e, tracemalloc.get_traced_memory()[1]
+        with contextlib.suppress(ValueError, SerializationError):  # the tests assert the rejection in-process
+            fn(*args)
+        return tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
 
@@ -102,7 +102,7 @@ def _measure_peaks() -> dict[str, int]:
     for structured in ck_logging._logger_instances.values():
         structured.writer.stop()
         structured.writer.join()
-    assert threading.active_count() == 1, "tracemalloc must not start or stop while another thread allocates"
+    assert threading.active_count() == 1, f"tracemalloc must not start or stop beside {threading.enumerate()}"
     cases = {
         f"{path}:{v['name']}": (fn, bytes.fromhex(v["input_hex"]))
         for path, fn in DECODE_PATHS.items()
@@ -112,8 +112,8 @@ def _measure_peaks() -> dict[str, int]:
         AutoSerializer(enable_integrity_checking=False).validate_data,
         _reject_vector("nested_array32_input_len_depth_1100"),
     )
-    peaks = {case: _peak_of(fn, data)[2] for case, (fn, data) in cases.items()}
-    assert threading.active_count() == 1, "a thread started while peaks were being measured"
+    peaks = {case: _peak_of(fn, data) for case, (fn, data) in cases.items()}
+    assert threading.active_count() == 1, f"a thread started while peaks were measured: {threading.enumerate()}"
     return peaks
 
 
