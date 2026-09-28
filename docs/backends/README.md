@@ -282,7 +282,10 @@ hold another tenant's value. Entries written with `ttl=None`, or kept alive by
 entries the calling tenant has read in that process since it started, because no key
 registry recorded them.
 
-1. Wait until the last process running an earlier release has stopped.
+1. Stop every process that reads or writes the cache, whatever release it runs. Stopping only
+   the earlier releases is not enough: `SCAN` does not block reads, so a 0.20.0 process serving
+   requests during the purge can read an entry still under the wrong tenant's prefix and
+   return another tenant's value.
 2. Delete every `t:*` key in each database cachekit uses. Run `FLUSHDB` instead only if the
    database is dedicated to cachekit. Use the Python client that cachekit installs, not a
    `redis-cli --scan` pipeline: a key set through `key=` can contain a newline, which a
@@ -309,8 +312,8 @@ registry recorded them.
    print(f"{left} keys left matching {pattern}")  # expect 0
    ```
 
-3. Restart every process. L1 keeps any entry a process read before the purge for up to the
-   function's `ttl` (300 s with `ttl=None`). Expect a cold cache.
+3. Start processes on 0.20.0 only after the script reports 0 keys left in every database.
+   Expect a cold cache.
 
 On a database other applications share, `t:*` also matches their keys that start with `t:`.
 Run the same script once per tenant instead, with `pattern = "t:<tenant>:*"`, for `default`
