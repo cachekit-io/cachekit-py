@@ -6,6 +6,7 @@ Async methods mirror the same logic and are not duplicated here.
 
 from __future__ import annotations
 
+import string
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -129,24 +130,53 @@ class TestInit:
         with pytest.raises(ConfigurationError, match="api_key"):
             CachekitIOBackend(api_key="")
 
-    @pytest.mark.parametrize("key", ["   ", "ck_live_SECRET_XYZ\n", "ck_live_SECRET XYZ"], ids=["blank", "newline", "inner"])
-    def test_whitespace_key_raises_at_construction(
-        self, mock_sync_client: MagicMock, monkeypatch: pytest.MonkeyPatch, key: str
-    ) -> None:
-        """min_length=1 passes these; the first request then fails with an h11 error echoing the key."""
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "   ",
+            "ck_live_SECRET_XYZ\n",  # pragma: allowlist secret
+            "ck_live_SECRET XYZ",  # pragma: allowlist secret
+            "﻿ck_live_SECRET_XYZ",  # pragma: allowlist secret
+            "ck_live_SECRET\x00XYZ",  # pragma: allowlist secret
+            "ck_live_SECRET\x7fXYZ",  # pragma: allowlist secret
+            "ck_live_SECRETéXYZ",  # pragma: allowlist secret
+        ],
+        ids=["blank", "newline", "inner-space", "bom", "nul", "del", "non-ascii-letter"],
+    )
+    def test_non_token_key_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+        """Outside the RFC 6750 charset a key fails later with the key in the error: a newline as an h11 error on the
+        first request, a BOM or non-ASCII letter as a UnicodeEncodeError from the client build (real, not mocked here)
+        whose repr holds "Bearer <key>". Reject at validation, and echo none of it."""
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
-        with pytest.raises(ConfigurationError, match="whitespace") as info:
+        with pytest.raises(ConfigurationError, match="not a valid bearer token") as info:
             CachekitIOBackend(api_key=key)
         assert "SECRET" not in str(info.value)
+        assert "SECRET" not in repr(info.value)
         assert "requires an API key" not in str(info.value)  # a key WAS given
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "ck_live_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
+            "ck_sdk_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
+            "ck_api_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
+            _TEST_API_KEY,
+            "AZaz09-._~+/==",  # pragma: allowlist secret
+        ],
+        ids=["live", "sdk", "api", "test", "every-b64token-char"],
+    )
+    def test_bearer_token_key_validates(self, key: str) -> None:
+        """Issued keys are an ASCII prefix plus letters and digits; the charset must not narrow below RFC 6750."""
+        assert CachekitIOBackendConfig(api_key=key).api_key.get_secret_value() == key
 
     @pytest.mark.parametrize(
         "kwargs",
         [
             {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
+            {"api_key": "﻿ck_live_SECRET_XYZ"},  # pragma: allowlist secret
             {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
         ],
-        ids=["whitespace", "allowlist"],
+        ids=["whitespace", "bom", "allowlist"],
     )
     def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
         """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
@@ -156,6 +186,7 @@ class TestInit:
         with pytest.raises(ValidationError) as info:
             CachekitIOBackendConfig(**kwargs)
         assert "SECRET" not in str(info.value)
+        assert "SECRET" not in repr(info.value)
 
     def test_unparseable_url_error_carries_no_credentials(self) -> None:
         """CWE-532: the message once held the whole URL, and urlparse's own error (NFKC-invalid netloc)

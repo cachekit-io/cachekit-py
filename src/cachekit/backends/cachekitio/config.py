@@ -16,6 +16,10 @@ from cachekit.backends.base_config import BaseBackendConfig, inherit_config
 # Allowed hostnames for API URL (SSRF protection)
 ALLOWED_HOSTS: tuple[str, ...] = ("api.cachekit.io", "api.staging.cachekit.io")
 
+# RFC 6750 §2.1 b64token: every character a bearer token may carry. Issued keys (ASCII letters, digits and
+# underscores) sit inside it. Explicit ASCII ranges, not \w, so no non-ASCII letter matches.
+_BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
 
 def is_private_ip(hostname: str) -> bool:
     """Check if hostname is a private/internal IP address (SSRF protection).
@@ -141,11 +145,16 @@ class CachekitIOBackendConfig(BaseBackendConfig):
     @field_validator("api_key")
     @classmethod
     def validate_api_key(cls, v: SecretStr) -> SecretStr:
-        # A bearer token never contains whitespace (RFC 6750); a key read from a secrets file
-        # usually carries a trailing newline. Accepted, it fails on the first request with an h11
-        # error that echoes "Bearer <key>". Reject rather than strip: never rewrite a credential.
-        if any(c.isspace() for c in v.get_secret_value()):
-            raise ValueError("contains whitespace (a trailing newline from a secrets file is the usual cause)")
+        # A key outside the RFC 6750 b64token charset never authenticates, and it fails later with the key
+        # in the error: a trailing newline on the first request (an h11 error echoing "Bearer <key>"), a
+        # UTF-8 BOM or non-ASCII letter at client build (a UnicodeEncodeError whose repr holds it).
+        # Reject rather than strip: never rewrite a credential. Never echo it: the message is static.
+        if not _BEARER_TOKEN.fullmatch(v.get_secret_value()):
+            raise ValueError(
+                "is not a valid bearer token (RFC 6750 allows only A-Z a-z 0-9 - . _ ~ + / and trailing =); "
+                "the usual cause is a trailing newline or other whitespace, a byte-order mark from a file saved "
+                "on Windows, or a control character"
+            )
         return v
 
     @field_validator("api_url")

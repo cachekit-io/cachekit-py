@@ -62,9 +62,13 @@ def tenant_b_function(x):
 ```
 
 `@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
-source, if the key contains whitespace (usually a trailing newline from a secrets file), if
-`CACHEKIT_API_URL` fails validation, or if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
+source, if the key is not an RFC 6750 bearer token, if `CACHEKIT_API_URL` fails validation, or if
+you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
 To cache through another backend, use `@cache.production(backend=...)`.
+
+A bearer token carries only `A-Z a-z 0-9 - . _ ~ + /`, then optional trailing `=`. The usual
+offender is a key read from a secrets file: a trailing newline, or a byte-order mark if the file was
+saved on Windows. cachekit rejects such a key rather than stripping it, and the error never quotes it.
 
 The RORO form `@cache(config=DecoratorConfig.io(api_key=...))` keeps its own key even when
 `set_default_backend()` is set: a backend already in `config=` wins over the module default.

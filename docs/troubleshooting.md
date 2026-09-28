@@ -288,11 +288,7 @@ echo $CACHEKIT_API_KEY
 export CACHEKIT_API_KEY=new_key_here
 ```
 
-3. **Check for trailing whitespace or newlines** if the key was copy-pasted:
-```bash
-python -c "import os; k=os.getenv('CACHEKIT_API_KEY',''); print(repr(k))"
-# Key must not start/end with spaces or \n
-```
+3. **Stray characters are not the cause of a 401.** cachekit accepts only the RFC 6750 bearer-token characters (`A-Z a-z 0-9 - . _ ~ + /`, then optional trailing `=`). A key with a trailing newline or other whitespace, a byte-order mark (from a secrets file saved on Windows) or a control character raises `ConfigurationError: ... is not a valid bearer token` when the backend is built, before any request is sent. cachekit never strips the key for you: re-save the source without the stray character.
 
 </details>
 

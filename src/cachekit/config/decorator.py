@@ -511,8 +511,9 @@ class DecoratorConfig:
             DecoratorConfig with CachekitIOBackend
 
         Raises:
-            ConfigurationError: If the API key is missing, empty or contains whitespace
-                (argument and CACHEKIT_API_KEY), if CACHEKIT_API_URL fails validation, or if
+            ConfigurationError: If the API key is missing, empty or not an RFC 6750 bearer token
+                (whitespace, byte-order mark, control character; argument and CACHEKIT_API_KEY),
+                if CACHEKIT_API_URL fails validation, or if
                 ``backend=`` is passed.
 
         Example:
