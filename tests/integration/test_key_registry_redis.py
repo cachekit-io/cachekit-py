@@ -306,27 +306,25 @@ class TestDecoratorOnRedis:
         assert _cache_keys(client, "default") <= tracked
 
     def test_multi_tenant_drain_is_tenant_scoped(self, client: redis.Redis) -> None:
-        """Tenant is pinned at the wrapper's first call (pre-existing), so each tenant's
-        wrapper sets tenant_context before its first call."""
+        """One wrapper serves every tenant: each call writes and tracks under the tenant of its
+        own context, and a drain deletes only the calling tenant's keys and tracking set."""
 
+        @cache(ttl=300, namespace="key_registry_tenants")
         def f(x: int) -> int:
             return x
 
-        token = tenant_context.set("tenant-a")
-        try:
-            a = cache(ttl=300, namespace="key_registry_tenants")(f)
-            a(1)
-            a(2)
-        finally:
-            tenant_context.reset(token)
-        token = tenant_context.set("tenant-b")
-        try:
-            b = cache(ttl=300, namespace="key_registry_tenants")(f)
-            b(3)  # not b(1): L1 is tenant-blind (pre-existing), so b(1) would hit a's L1 entry
-        finally:
-            tenant_context.reset(token)
+        def as_tenant(tenant, fn, *args):
+            token = tenant_context.set(tenant)
+            try:
+                return fn(*args)
+            finally:
+                tenant_context.reset(token)
 
-        a.invalidate_cache()
+        as_tenant("tenant-a", f, 1)
+        as_tenant("tenant-a", f, 2)
+        as_tenant("tenant-b", f, 3)  # not f(1): L1 is tenant-blind, so f(1) would hit a's L1 entry
+
+        as_tenant("tenant-a", f.invalidate_cache)
         assert _cache_keys(client, "tenant-a") == set()
         assert not client.keys("t:tenant-a:ck:reg:*")
         assert len(_cache_keys(client, "tenant-b")) == 1

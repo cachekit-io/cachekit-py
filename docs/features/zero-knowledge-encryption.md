@@ -181,7 +181,8 @@ eviction to cachekit's keys so unrelated data in the same Redis database survive
 
 ```bash
 # The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe=""):
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
+# (an int or UUID tenant as its str() first):
 # tenant org:123 is stored as t:org%3A123:...
 # Evict only this function's or namespace's cachekit entries.
 # Namespaced function (@cache.secure(namespace="users", ...)):
