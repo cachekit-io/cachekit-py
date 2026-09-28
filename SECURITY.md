@@ -214,15 +214,15 @@ import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 ```
 
-**The one logger cachekit does quiet: `hpack` (API key and lock token).** `hpack`, the HTTP/2 header encoder under httpx, logs every header block it encodes at `DEBUG`. It masks the `Authorization` value in one line, but the encoded block it logs next decodes straight back to the `Authorization: Bearer` API key and to the `X-CacheKit-Lock-Id` lock token, and it logs the lock token in clear as well. A root logger at `DEBUG` (`logging.basicConfig(level=logging.DEBUG)`) would therefore hand every reader of your logs a working API key. So building a CachekitIO client sets the `hpack` logger to `INFO` while its level is unset (`NOTSET`). The setting is process-wide: it also quiets hpack for any other HTTP/2 client in the process. A level you set yourself wins, whether you set it before or after importing cachekit or building a client. Setting it to `DEBUG` opts back in, and puts the API key and lock tokens back in your logs in recoverable form; do that only where everyone who can read those logs may hold the key, such as a development project with a throwaway key:
+The same applies to any HTTP-layer capture between the SDK and `api.cachekit.io` — see the lock-token paragraph below for why path/query content is treated as logged.
+
+**The one logger cachekit does quiet: `hpack` (API key and lock token).** `hpack`, the HTTP/2 header encoder under httpx, logs every header block it encodes at `DEBUG`. It masks the `Authorization` value in one line, but the encoded block it logs next decodes straight back to the `Authorization: Bearer` API key and to the `X-CacheKit-Lock-Id` lock token, and it logs the lock token in clear as well. A root logger at `DEBUG` (`logging.basicConfig(level=logging.DEBUG)`) would therefore hand every reader of your logs a working API key. So building a CachekitIO client sets the `hpack` logger to `INFO` while its level is unset (`NOTSET`). The setting is process-wide: it also quiets hpack for any other HTTP/2 client in the process. A level you set yourself wins, whether you set it before or after importing cachekit or building a client. Setting it, or its `hpack.hpack` child, to `DEBUG` opts back in, and puts the API key and lock tokens back in your logs in recoverable form; do that only where everyone who can read those logs may hold the key, such as a development project with a throwaway key:
 
 ```python
 import logging
 
 logging.getLogger("hpack").setLevel(logging.DEBUG)  # exposes the API key and lock tokens
 ```
-
-The same applies to any HTTP-layer capture between the SDK and `api.cachekit.io` — see the lock-token paragraph below for why path/query content is treated as logged.
 
 **Digest strength.** The redaction digest is *unkeyed* blake2b, so it is exactly as hard to reverse as the key material is to guess — and the key material is deterministic from the call: `[ns:{ns}:]func:{mod.fn}:args:{blake2b(args)}` for generated keys, or whatever you return from `@cache(key=...)`. Namespace and function name are static application config, so a cache on `get_user(user_id)` is enumerable from its digest by iterating plausible IDs, whether the key was generated (hash the candidate args) or hand-built (`default:user:1234`). A per-installation secret was considered and rejected for a public library (unset it is theatre; set it breaks cross-process log correlation, the property the digest exists for). Treat the digest as a correlation ID, never as a secret: if a log reader must not be able to confirm *which* user an entry belongs to, do not grant that reader the logs.
 

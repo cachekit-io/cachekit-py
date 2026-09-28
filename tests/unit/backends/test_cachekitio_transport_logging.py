@@ -145,6 +145,7 @@ class TestHpackDebugLogging:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         backend = make_backend()
+        assert hpack_logger.level == logging.INFO  # the pin ran at construction, so DEBUG below overrides it
         hpack_logger.setLevel(logging.DEBUG)
         records = await _lock_cycle_records(backend, caplog)
         assert _recoverable(records) == _SECRETS
