@@ -1519,6 +1519,18 @@ def create_cache_wrapper(
                     )
                     _l1_cache.invalidate(cache_key)
 
+        # Tenant scope, resolved outside every degrade try below (LAB-5713): an unsupported tenant
+        # id type is a caller bug, so its TypeError reaches the caller before the function runs,
+        # as on the async path. Resolved inside one, it was swallowed into an uncached call that
+        # counted a failure on the breaker every tenant of this function shares. Sits outside
+        # the main try/finally, so the raise path restores the context itself.
+        try:
+            _l2_scope()
+        except Exception:
+            features.clear_correlation_id()
+            reset_current_function_stats(token)
+            raise
+
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
         start_time = time.time()
@@ -1906,6 +1918,10 @@ def create_cache_wrapper(
                 ttl_refresh_threshold=ttl_refresh_threshold,
             )
             operation_handler.set_cache_handler(handler)
+
+            # Tenant scope, resolved before any degrade try (LAB-5713): an unsupported tenant id
+            # type raises TypeError here, before the function runs — see sync_wrapper.
+            _l2_scope()
 
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()

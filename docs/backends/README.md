@@ -243,11 +243,51 @@ upper-case UUID string is another. With env auto-detection, a call with no tenan
 `default`. If two kinds of tenant can share an id, namespace them before setting
 `tenant_context`: `"org:1"`, `"team:1"`.
 
+Any other type, such as a `float`, a `bool`, an `IntEnum` or an arbitrary object, is a bug in
+the caller, and the decorated call raises `TypeError` before the function runs, sync and
+async alike. It is not treated as a cache fault: the call does not fall back to running
+uncached, and it does not count against the function's circuit breaker, which every tenant
+of that function shares.
+
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
 2. Module-level default via `set_default_backend()` (checked at decoration, and
    again at first call if still unset)
 3. Environment auto-detection per the table above
+
+#### Upgrading to 0.20.0
+
+Before 0.20.0, a process that set `tenant_context` to more than one tenant wrote every L2
+entry under the prefix of the first tenant to call. That applies to the env-resolved Redis
+backend, and to a `RedisBackendProvider.get_backend()` backend held across calls, as the
+decorator holds the one a custom backend provider returns. A deployment that never set a
+tenant, or only ever set one, is unaffected.
+
+If you are affected, purge the pre-upgrade entries on upgrade. They may hold another
+tenant's value under the first caller's prefix, entries written with `ttl=None` never
+expire, and `invalidate_cache()` cannot reach them, because nothing tracked them before
+0.20.0. Delete every `t:*` key, the prefix scan from
+[bulk eviction](../error-codes.md#e003-decryption-failed---authentication-tag-mismatch)
+with a wider pattern:
+
+```bash
+redis-cli --scan --pattern 't:*' | xargs -r redis-cli DEL
+```
+
+On a Redis database other applications share, `t:*` also matches their keys that start
+with `t:`, so scan `'t:<tenant>:*'` once per tenant instead. `FLUSHDB` is an option only if
+the database is dedicated to cachekit.
+
+Other changes you may notice:
+
+- `RedisBackendProvider.get_backend()` no longer binds its backend to the tenant set when
+  it was called. The backend follows `tenant_context` on every operation, and falls back
+  to that tenant only in a context with none set. For a backend bound to one tenant,
+  construct `PerRequestRedisBackend(client, tenant)` directly.
+- A no-argument `invalidate_cache()` on the Redis backend deletes only the calling
+  tenant's entries.
+- `int` and `UUID` tenant ids are now accepted. A tenant id of any type other than `str`,
+  `bytes`, `int` and `UUID` raises `TypeError`, as above.
 
 ## Performance Considerations
 
