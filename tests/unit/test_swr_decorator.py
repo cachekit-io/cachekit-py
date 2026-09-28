@@ -326,11 +326,15 @@ class TestSWRForkIsolation:
         backend = FakeSWRBackend()
         gate = threading.Event()
         calls: list[int] = []
+        parent = os.getpid()
 
         @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
         def compute(x: int) -> int:
             calls.append(os.getpid())
-            if len(calls) > 1 and not gate.is_set():
+            # Only the parent parks. The child must never touch the gate: the parent's revalidation thread
+            # can be forked while it holds the gate's lock on its way into wait(), and the child inherits
+            # that lock held, with no thread left to release it.
+            if len(calls) > 1 and os.getpid() == parent:
                 gate.wait(timeout=30)  # hold the parent's revalidation in flight
             return x + 1
 
@@ -346,18 +350,22 @@ class TestSWRForkIsolation:
             queue = ctx.Queue()
 
             def child(q) -> None:
-                gate.set()  # child's own revalidation must not block
                 before = len(calls)
                 result = compute(1)  # stale hit; key is stuck in the INHERITED in-flight set
                 revalidated = _wait_for(lambda: len(calls) > before, timeout=5.0)
                 q.put({"result": result, "revalidated": revalidated})
 
-            process = ctx.Process(target=child, args=(queue,))
+            # daemon, and killed if still alive: a stuck child fails this test instead of outliving it
+            # (a live non-daemon child is joined with no timeout at interpreter exit).
+            process = ctx.Process(target=child, args=(queue,), daemon=True)
             process.start()
             try:
                 outcome = queue.get(timeout=30)
             finally:
                 process.join(timeout=30)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
 
             assert process.exitcode == 0
             assert outcome["result"] == 2
