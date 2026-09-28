@@ -63,6 +63,12 @@ class TestCircuitBreakerConfig:
         # Empty tuple is valid
         assert len(config.excluded_error_types) == 0
 
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+    def test_timeout_that_never_recovers_or_never_caps_probes_is_rejected(self, timeout):
+        """NaN or inf never leaves OPEN (NaN compares False, inf never elapses); <= 0 removes the probe cap."""
+        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+            CircuitBreakerConfig(timeout_seconds=timeout)
+
 
 class TestCacheOperationMetrics:
     """Test cache operation metrics calculations."""
