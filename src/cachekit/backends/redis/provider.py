@@ -34,7 +34,7 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 logger = logging.getLogger(__name__)
 
 # Module-level ContextVar for async-safe tenant isolation. Any other type raises TypeError
-# (see _encode_tenant); through @cache it reaches the caller before the function runs.
+# (see _encode_tenant); through @cache, on an L1 miss, before the function runs.
 tenant_context: ContextVar[str | bytes | int | uuid.UUID | None] = ContextVar("tenant_context", default=None)
 
 T = TypeVar("T")
@@ -106,7 +106,9 @@ def _encode_tenant(tenant_id: object) -> str:
     default repr embedding ``id()``, can map two tenants to one prefix. Through ``@cache`` the
     TypeError reaches the caller before the decorated function runs, sync and async alike: a
     caller bug, so it is never degraded to an uncached call or counted against the circuit
-    breaker every tenant of the function shares.
+    breaker every tenant of the function shares. It fires on an L1 miss only: L1 is not
+    tenant-scoped, so an L1 entry another tenant cached for the same arguments is returned
+    without reaching here.
 
     The encoding is by text, not by type: ``1``, ``"1"`` and ``b"1"`` share one prefix, as do a
     UUID and ``str(uuid)``, so one tenant read as int in one place and str in another stays one
