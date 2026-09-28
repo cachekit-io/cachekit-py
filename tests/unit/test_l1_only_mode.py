@@ -17,6 +17,10 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from cachekit.config.validation import ConfigurationError
+
 
 class TestL1OnlyModeBug:
     """Tests for L1-only mode (backend=None) behavior.
@@ -195,7 +199,7 @@ class TestL1OnlyModeBug:
         This tests the edge case where backend=None is passed to intent presets like:
         - @cache.minimal(backend=None)
         - @cache.production(backend=None)
-        - @cache.secure(master_key="...", backend=None)
+        (@cache.secure(backend=None) is refused — see TestEncryptionRefusesL1Only.)
         """
         from cachekit.decorators import cache
 
@@ -227,21 +231,6 @@ class TestL1OnlyModeBug:
             assert production_func() == "production"
             assert production_func() == "production"
             assert production_call_count == 1, f"@cache.production L1 miss - called {production_call_count} times"
-
-            # Test @cache.secure(master_key="...", backend=None)
-            # validate_encryption_config() checks CACHEKIT_MASTER_KEY env var
-            # independently of the inline master_key param, so we must set it.
-            secure_call_count = 0
-
-            @cache.secure(master_key="a" * 64, backend=None)
-            def secure_func() -> str:
-                nonlocal secure_call_count
-                secure_call_count += 1
-                return "secure"
-
-            assert secure_func() == "secure"
-            assert secure_func() == "secure"
-            assert secure_call_count == 1, f"@cache.secure L1 miss - called {secure_call_count} times"
 
             # Backend provider should NEVER have been called for any preset
             mock_provider.return_value.get_backend.assert_not_called()
@@ -562,3 +551,95 @@ class TestL1OnlyModeNoRedisWarnings:
             # No Redis-related warnings should appear
             redis_warnings = [r for r in caplog.records if "Redis" in r.message or "Connection refused" in r.message]
             assert len(redis_warnings) == 0, f"Unexpected Redis warnings: {[r.message for r in redis_warnings]}"
+
+
+class TestEncryptionRefusesL1Only:
+    """LAB-4665 / protocol spec/intent-presets.md § L1 Posture rule 3.
+
+    Encryption is a serializer layer; the L1-only ObjectCache path never serializes.
+    So `secure` (or any encrypting configuration) with backend=None used to report
+    encryption.enabled=True while holding plaintext. It must refuse at decoration.
+    """
+
+    MATCH = "backend=None is L1-only"
+
+    def test_secure_preset_raises(self):
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError, match=self.MATCH):
+
+            @cache.secure(master_key="a" * 64, backend=None)
+            def leaks() -> str:
+                return "pii"
+
+    def test_secure_roro_config_raises(self):
+        from cachekit import DecoratorConfig
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError, match=self.MATCH):
+
+            @cache(backend=None, config=DecoratorConfig.secure(master_key="a" * 64))
+            def leaks() -> str:
+                return "pii"
+
+    def test_explicit_encryption_flag_raises(self):
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError, match=self.MATCH):
+
+            @cache(backend=None, encryption=True, master_key="a" * 64, single_tenant_mode=True)
+            def leaks() -> str:
+                return "pii"
+
+    def test_encryption_wrapper_serializer_raises(self):
+        from cachekit.decorators import cache
+        from cachekit.serializers import EncryptionWrapper
+
+        with pytest.raises(ConfigurationError, match=self.MATCH):
+
+            @cache(backend=None, serializer=EncryptionWrapper(master_key=bytes.fromhex("a" * 64)))
+            def leaks() -> str:
+                return "pii"
+
+    def test_encrypted_serializer_alias_raises(self):
+        """The registry alias resolves to EncryptionWrapper in backed mode; L1-only must refuse it too."""
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError, match=self.MATCH):
+
+            @cache(backend=None, serializer="encrypted", encryption=False)
+            def leaks() -> str:
+                return "pii"
+
+    def test_secure_with_backend_still_decorates(self):
+        """The guard is about backend=None, not about secure: with a backend it stays valid."""
+        from cachekit.decorators import cache
+
+        @cache.secure(master_key="a" * 64, backend=MagicMock())
+        def fine() -> str:
+            return "pii"
+
+        assert callable(fine)
+
+    def test_master_key_env_alone_keeps_zero_config_l1_only(self, monkeypatch):
+        """Deliberately NOT guarded: key presence is not an explicit request to encrypt.
+
+        Today cache_handler.py still auto-activates encryption in backed mode when the
+        env key is set (issue #128); L1-only never reaches the handler, so this path
+        holds plaintext. The spec says presence must never activate, so it must not
+        activate a refusal either — LAB-4642 removes the auto-activation at its root.
+        Zero-config @cache(backend=None) must keep working with the key set."""
+        from cachekit.config.singleton import reset_settings
+        from cachekit.decorators import cache
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        reset_settings()
+        try:
+
+            @cache(backend=None)
+            def plain() -> int:
+                return 1
+
+            assert plain() == 1
+        finally:
+            reset_settings()

@@ -63,6 +63,23 @@ def my_function():
 
 There is no global registration required — serializer instances are passed per decorator.
 
+> [!IMPORTANT]
+> **Your serializer gets its own cache-key code, derived from its class name.** The built-ins
+> named as strings use a single character (`s`, `a`, `o`, `w`, `l`); every serializer passed
+> as an *instance* — yours and the built-ins alike — encodes as `x` followed by four hex
+> digits derived from its class name, which separates distinct classes in all but the rare
+> case that two class names hash to the same four digits. Those four digits are a two-byte
+> digest, so there are 65,536 codes and a collision is possible rather than impossible. It
+> cannot mis-deserialize: the envelope records the serializer name and the mismatch guard
+> rejects the entry. It does cost the isolation — two colliding classes share a key and miss
+> on each other's entries. Give either one a distinct `namespace=` if you hit it.
+>
+> **Two instances of the same class do share one**, constructor arguments included. A
+> `PydanticSerializer(model=User)` and a `PydanticSerializer(model=Order)` over the same
+> function produce the same key *and* the same envelope name, so the serializer-mismatch
+> guard cannot separate them either and one will deserialize the other's bytes. Give
+> per-configuration serializers distinct `namespace=` values.
+
 If you want to use a string alias (like `"custom"`) instead of passing an instance, you can register it in the serializer registry at import time:
 
 ```python notest

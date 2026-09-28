@@ -81,8 +81,8 @@ def classify_redis_error(
         - ConnectionError, BusyLoadingError: TRANSIENT (retry with backoff)
         - TimeoutError: TIMEOUT (configurable retry)
         - AuthenticationError, NoPermissionError: AUTHENTICATION (alert ops)
-        - ResponseError, DataError: PERMANENT (don't retry)
-        - ReadOnlyError, ClusterDownError: TRANSIENT (temporary cluster state)
+        - ResponseError, DataError, InvalidResponse, LockError: PERMANENT (don't retry)
+        - ReadOnlyError, ClusterDownError, TryAgainError: TRANSIENT (temporary cluster state)
         - All others: UNKNOWN (log and investigate)
     """
     # Every branch below puts only type(exc).__name__ in the message, never the raw
@@ -96,6 +96,8 @@ def classify_redis_error(
             AuthenticationError,
             BusyLoadingError,
             DataError,
+            InvalidResponse,
+            LockError,
             NoPermissionError,
             ReadOnlyError,
             ResponseError,
@@ -146,23 +148,15 @@ def classify_redis_error(
             key=key,
         )
 
-    # PERMANENT: Unfixable errors (data format, protocol errors)
-    if isinstance(exc, (ResponseError, DataError)):
-        return BackendError(
-            f"Permanent Redis error: {type(exc).__name__}",
-            error_type=BackendErrorType.PERMANENT,
-            original_exception=exc,
-            operation=operation,
-            key=key,
-        )
-
-    # Handle ClusterDownError if available (redis-py 4.0+)
+    # TRANSIENT: Cluster failover / resharding. Checked before PERMANENT because redis-py
+    # declares ClusterDownError(ClusterError, ResponseError) and TryAgainError(ResponseError);
+    # both are absent from older redis-py releases.
     try:
-        from redis.exceptions import ClusterDownError
+        from redis.exceptions import ClusterDownError, TryAgainError
 
-        if isinstance(exc, ClusterDownError):
+        if isinstance(exc, (ClusterDownError, TryAgainError)):
             return BackendError(
-                f"Redis cluster down: {type(exc).__name__}",
+                f"Transient Redis cluster error: {type(exc).__name__}",
                 error_type=BackendErrorType.TRANSIENT,
                 original_exception=exc,
                 operation=operation,
@@ -170,6 +164,16 @@ def classify_redis_error(
             )
     except ImportError:
         pass  # Older redis-py version, skip cluster-specific handling
+
+    # PERMANENT: Unfixable errors (data format, protocol errors)
+    if isinstance(exc, (ResponseError, DataError, InvalidResponse, LockError)):
+        return BackendError(
+            f"Permanent Redis error: {type(exc).__name__}",
+            error_type=BackendErrorType.PERMANENT,
+            original_exception=exc,
+            operation=operation,
+            key=key,
+        )
 
     # UNKNOWN: Unclassified error - log for investigation
     return BackendError(

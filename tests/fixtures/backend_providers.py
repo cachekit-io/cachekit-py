@@ -66,7 +66,7 @@ class TestBackendProvider(BackendProviderInterface):
     """Test backend provider for isolated testing with pytest-redis.
 
     Accepts a pre-existing Redis client (from pytest-redis fixture) and
-    wraps it with per-request backend pattern for tenant isolation.
+    wraps it in the same tenant-scoped backend production uses.
     """
 
     def __init__(self, redis_client):
@@ -78,20 +78,15 @@ class TestBackendProvider(BackendProviderInterface):
         self._client = redis_client
 
     def get_backend(self):
-        """Get per-request backend wrapper with tenant isolation.
+        """Get the shared tenant-scoped backend, as DefaultBackendProvider hands out.
 
         Returns:
-            PerRequestRedisBackend wrapping the test client
+            PerRequestRedisBackend wrapping the test client (tenant read per operation,
+            "default" when none is set)
         """
-        from cachekit.backends.redis.provider import PerRequestRedisBackend, tenant_context
+        from cachekit.backends.redis.provider import PerRequestRedisBackend
 
-        # Get tenant from ContextVar (defaults to "default" for single-tenant)
-        tenant_id = tenant_context.get()
-        if tenant_id is None:
-            tenant_context.set("default")
-            tenant_id = "default"
-
-        return PerRequestRedisBackend(self._client, tenant_id)
+        return PerRequestRedisBackend(self._client, "default", follow_context=True)
 
 
 __all__ = ["TestCacheClientProvider", "TestBackendProvider"]

@@ -1,6 +1,5 @@
 """Unit tests for structured logging module."""
 
-import json
 import logging
 import threading
 import time
@@ -8,21 +7,19 @@ from unittest.mock import patch
 
 import pytest
 
-from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.logging import (
-    JsonFormatter,
-    StructuredRedisLogger,
+    StructuredLogger,
     get_structured_logger,
 )
 
 
-class TestStructuredRedisLogger:
-    """Test StructuredRedisLogger functionality."""
+class TestStructuredLogger:
+    """Test StructuredLogger functionality."""
 
     @pytest.fixture
     def logger(self):
         """Create a test logger instance."""
-        return StructuredRedisLogger("test_logger")
+        return StructuredLogger("test_logger")
 
     def test_logger_initialization(self, logger):
         """Test logger initialization."""
@@ -116,61 +113,6 @@ class TestStructuredRedisLogger:
         assert extra["error"] == "Connection timeout"
         assert extra["error_type"] == "TimeoutError"
 
-    @pytest.mark.parametrize(
-        ("error", "rendered", "error_type"),
-        [
-            (ValueError("Test error"), "ValueError", "ValueError"),
-            (BackendError("Redis timeout", error_type=BackendErrorType.TIMEOUT), "BackendError(timeout)", "BackendError"),
-        ],
-        ids=["provider_exception", "backend_error"],
-    )
-    @patch("cachekit.logging.logging.Logger.log")
-    def test_redis_operation_failed_override(self, mock_log, logger, error, rendered, error_type):
-        """redis_operation_failed emits a key-free error representation (CWE-532).
-
-        A non-BackendError's str() has unknown provenance and may echo the raw cache
-        key, so only its type name reaches the log; a BackendError renders as
-        ``TypeName(error_type)``. error_type still carries the Python type.
-        """
-        logger.redis_operation_failed("get", "test_key", error)
-
-        mock_log.assert_called_once()
-        extra = mock_log.call_args[1]["extra"]["structured"]
-        assert extra["operation"] == "get"
-        assert extra["error"] == rendered  # never the raw message
-        assert extra["error_type"] == error_type
-
-    @patch("cachekit.logging.logging.Logger.log")
-    def test_cache_hit_override(self, mock_log, logger):
-        """Test cache_hit override."""
-        logger.cache_hit("test_key", source="memory")
-
-        mock_log.assert_called_once()
-        extra = mock_log.call_args[1]["extra"]["structured"]
-        assert extra["operation"] == "get"
-        assert extra["hit"] is True
-        assert extra["source"] == "memory"
-
-    @patch("cachekit.logging.logging.Logger.log")
-    def test_cache_miss_override(self, mock_log, logger):
-        """Test cache_miss override."""
-        logger.cache_miss("test_key")
-
-        mock_log.assert_called_once()
-        extra = mock_log.call_args[1]["extra"]["structured"]
-        assert extra["operation"] == "get"
-        assert extra["hit"] is False
-
-    @patch("cachekit.logging.logging.Logger.log")
-    def test_cache_stored_override(self, mock_log, logger):
-        """Test cache_stored override."""
-        logger.cache_stored("test_key", ttl=300)
-
-        mock_log.assert_called_once()
-        extra = mock_log.call_args[1]["extra"]["structured"]
-        assert extra["operation"] == "set"
-        assert extra["ttl"] == 300
-
     def test_thread_safety(self, logger):
         """Test thread-local context isolation."""
         results = {}
@@ -195,91 +137,13 @@ class TestStructuredRedisLogger:
         assert results["thread2"] == "trace-2"
 
 
-class TestJsonFormatter:
-    """Test JSON formatter functionality."""
-
-    def test_format_basic_record(self):
-        """Test formatting basic log record."""
-        formatter = JsonFormatter()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=10,
-            msg="Test message",
-            args=(),
-            exc_info=None,
-        )
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert data["level"] == "INFO"
-        assert data["logger"] == "test.logger"
-        assert data["message"] == "Test message"
-        assert "timestamp" in data
-        assert "thread_id" in data
-
-    def test_format_with_structured_context(self):
-        """Test formatting with structured context."""
-        formatter = JsonFormatter()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=10,
-            msg="Cache operation",
-            args=(),
-            exc_info=None,
-        )
-
-        # Add structured context
-        record.structured = {"operation": "get", "cache_key": "test_key", "hit": True}
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert data["operation"] == "get"
-        assert data["cache_key"] == "test_key"
-        assert data["hit"] is True
-
-    def test_format_with_exception(self):
-        """Test formatting with exception info."""
-        formatter = JsonFormatter()
-
-        try:
-            raise ValueError("Test exception")
-        except ValueError:
-            import sys
-
-            exc_info = sys.exc_info()
-
-        record = logging.LogRecord(
-            name="test.logger",
-            level=logging.ERROR,
-            pathname="test.py",
-            lineno=10,
-            msg="Error occurred",
-            args=(),
-            exc_info=exc_info,
-        )
-
-        output = formatter.format(record)
-        data = json.loads(output)
-
-        assert "exception" in data
-        assert "ValueError: Test exception" in data["exception"]
-
-
 class TestFactoryFunction:
     """Test factory function."""
 
     def test_get_structured_logger(self):
         """Test get_structured_logger factory returns one cached instance per name."""
         logger1 = get_structured_logger("test1")
-        assert isinstance(logger1, StructuredRedisLogger)
+        assert isinstance(logger1, StructuredLogger)
 
         logger1_again = get_structured_logger("test1")
         assert logger1_again is logger1

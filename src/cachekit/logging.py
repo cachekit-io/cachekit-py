@@ -1,7 +1,7 @@
-"""Ultra-optimized structured logging with minimal overhead.
+"""Structured logging with minimal overhead.
 
 This module provides lock-free, sampling-based structured logging
-that reduces overhead from 570% to <5% while maintaining functionality.
+with asynchronous batch writes.
 """
 
 import json
@@ -21,24 +21,13 @@ from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 logger = logging.getLogger(__name__)
 
 
-# Global configuration - loaded from settings singleton
-def _get_logging_config():
-    """Get logging configuration from settings."""
-    settings = get_settings()
-    return {
-        "sampling_rate": settings.log_sampling_rate,
-        "ring_buffer_size": settings.log_buffer_size,
-        "batch_size": settings.log_batch_size,
-        "flush_interval": settings.log_flush_interval,
-    }
-
-
-# Load configuration once at module import
-_logging_config = _get_logging_config()
-SAMPLING_RATE = _logging_config["sampling_rate"]
-RING_BUFFER_SIZE = _logging_config["ring_buffer_size"]
-BATCH_SIZE = _logging_config["batch_size"]
-FLUSH_INTERVAL = _logging_config["flush_interval"]
+# Global configuration - loaded once at module import from the settings singleton
+_settings = get_settings()
+SAMPLING_RATE = _settings.log_sampling_rate
+RING_BUFFER_SIZE = _settings.log_buffer_size
+BATCH_SIZE = _settings.log_batch_size
+FLUSH_INTERVAL = _settings.log_flush_interval
+del _settings  # keep only the four scalars; don't pin a stale config past reset_settings()
 
 # Performance and health thresholds
 HIGH_UTILIZATION_THRESHOLD = 0.9  # When to warn about high utilization
@@ -113,7 +102,7 @@ class AsyncLogWriter(threading.Thread):
     """Background thread for async log writing."""
 
     def __init__(self, buffer: LockFreeRingBuffer):
-        super().__init__(daemon=True, name="RedisCache-LogWriter")
+        super().__init__(daemon=True, name="cachekit-LogWriter")
         self.buffer = buffer
         self.running = True
         self._stop_event = threading.Event()
@@ -151,15 +140,14 @@ class AsyncLogWriter(threading.Thread):
                 pass
 
 
-class UltraOptimizedStructuredLogger:
-    """Ultra-optimized structured logger with <5% overhead.
+class StructuredLogger:
+    """Structured logger.
 
     Features:
     - Lock-free ring buffer
     - Sampling (10% default)
     - Async batch writes
     - PII key-name masking (password/token/secret/key/auth kwargs)
-    - Near-zero overhead when not sampled
     """
 
     def __init__(self, name: str):
@@ -183,7 +171,7 @@ class UltraOptimizedStructuredLogger:
         self.logger = logging.getLogger(name)
 
     def _should_sample(self) -> bool:
-        """Fast sampling decision (~5ns)."""
+        """Fast sampling decision."""
         # Using random for non-cryptographic sampling - performance critical
         return random.randint(0, 99) < self._sampling_threshold  # noqa: S311
 
@@ -196,7 +184,7 @@ class UltraOptimizedStructuredLogger:
 
     def log(self, level: str, message: str, **kwargs):
         """Main logging method with sampling."""
-        # Fast path - skip if not sampled (~0.5μs overhead)
+        # Fast path - skip if not sampled
         if not self._should_sample():
             return
 
@@ -343,48 +331,11 @@ class UltraOptimizedStructuredLogger:
 
         self.log("INFO", "pool_utilization", utilization=round(utilization, 3), **kwargs)
 
-    def circuit_breaker_state_change(self, from_state: str, to_state: str, reason: Optional[str] = None, **kwargs):
-        """Log circuit breaker state changes - always sampled."""
-        # Update Prometheus metrics if available
-        try:
-            from cachekit.reliability.metrics_collection import circuit_breaker_state
-
-            # Map state names to numeric values
-            state_map = {"CLOSED": 0, "OPEN": 2, "HALF_OPEN": 1}
-            if to_state.upper() in state_map:
-                circuit_breaker_state.set(state_map[to_state.upper()])
-            else:
-                # Invalid state maps to -1
-                circuit_breaker_state.set(-1)
-        except (ImportError, Exception):
-            pass
-
-        # State changes are important - bypass sampling
-        entry = LogEntry(
-            timestamp=time.time(),
-            level="WARNING",
-            message="circuit_breaker_state_change",
-            extra={
-                "logger": self.name,
-                "from_state": from_state,
-                "to_state": to_state,
-                "reason": reason,
-                **kwargs,
-            },
-        )
-        self.buffer.append(entry)
-
     def set_trace_id(self, trace_id: str):
         """Set trace ID for correlation."""
         if not hasattr(self._context, "trace_id"):
             self._context.trace_id = None
         self._context.trace_id = trace_id
-
-    def set_correlation_id(self, correlation_id: str):
-        """Set correlation ID."""
-        if not hasattr(self._context, "correlation_id"):
-            self._context.correlation_id = None
-        self._context.correlation_id = correlation_id
 
     def clear_trace_id(self):
         """Clear trace ID."""
@@ -398,54 +349,10 @@ class UltraOptimizedStructuredLogger:
             "thread_id": threading.get_ident(),
         }
 
-        # Try to get trace_id from multiple sources
-        trace_id = None
-
-        # 1. Check manually set trace_id first (highest priority)
-        if hasattr(self._context, "trace_id") and self._context.trace_id:
-            trace_id = self._context.trace_id
-
-        # Only include trace_id if we found one
+        trace_id = getattr(self._context, "trace_id", None)
         if trace_id:
             context["trace_id"] = trace_id
-
-        # Include correlation_id if set
-        if hasattr(self._context, "correlation_id") and self._context.correlation_id:
-            context["correlation_id"] = self._context.correlation_id
         return context
-
-    # Compatibility methods for tests
-    def redis_operation_failed(self, operation: str, key: str, error: Exception, **kwargs):
-        """Log Redis operation failure. ``cache_operation`` renders the error key-free (CWE-532)."""
-        self.cache_operation(operation, key, error=error, error_type=type(error).__name__, **kwargs)
-
-    def cache_hit(self, key: str, **kwargs):
-        """Log cache hit."""
-        self.cache_operation("get", key, hit=True, **kwargs)
-
-    def cache_miss(self, key: str, **kwargs):
-        """Log cache miss."""
-        self.cache_operation("get", key, hit=False, **kwargs)
-
-    def cache_stored(self, key: str, **kwargs):
-        """Log cache store operation."""
-        self.cache_operation("set", key, **kwargs)
-
-    def serialization_fallback(self, from_serializer: str, to_serializer: str, reason: str, **kwargs):
-        """Log serialization fallback event."""
-
-        # Log the fallback
-        self.warning(
-            f"Serialization fallback: {from_serializer} -> {to_serializer}",
-            from_serializer=from_serializer,
-            to_serializer=to_serializer,
-            reason=reason,
-            **kwargs,
-        )
-
-    def create_span(self, name: str, **kwargs):
-        """Create a simple tracing span context manager."""
-        return SimpleSpan(self, name, **kwargs)
 
     def __del__(self):
         """Cleanup on deletion."""
@@ -453,44 +360,19 @@ class UltraOptimizedStructuredLogger:
             self.writer.stop()
 
 
-class SimpleSpan:
-    """Simple span implementation for tracing integration."""
-
-    def __init__(self, logger: UltraOptimizedStructuredLogger, name: str, **kwargs):
-        self.logger = logger
-        self.name = name
-        self.kwargs = kwargs
-        self.start_time = None
-
-    def __enter__(self):
-        """Start the span."""
-        self.start_time = time.time()
-        # Generate a simple trace ID if not set
-        if not hasattr(self.logger._context, "trace_id") or not self.logger._context.trace_id:
-            trace_id = f"span-{int(time.time() * 1000000)}"
-            self.logger.set_trace_id(trace_id)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """End the span."""
-        if self.start_time:
-            duration = time.time() - self.start_time
-            self.logger.debug(f"Span completed: {self.name}", span_name=self.name, duration_ms=duration * 1000, **self.kwargs)
-
-
 # Global logger instances cache
-_logger_instances: dict[str, UltraOptimizedStructuredLogger] = {}
+_logger_instances: dict[str, StructuredLogger] = {}
 _logger_lock = threading.Lock()
 
 
-def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
+def get_structured_logger(name: str) -> StructuredLogger:
     """Get or create a structured logger instance.
 
     Args:
         name: Logger name (usually __name__)
 
     Returns:
-        Ultra-optimized structured logger instance
+        Structured logger instance
     """
     # Fast path - check if already exists
     if name in _logger_instances:
@@ -500,35 +382,5 @@ def get_structured_logger(name: str) -> UltraOptimizedStructuredLogger:
     with _logger_lock:
         # Double-check pattern
         if name not in _logger_instances:
-            _logger_instances[name] = UltraOptimizedStructuredLogger(name)
+            _logger_instances[name] = StructuredLogger(name)
         return _logger_instances[name]
-
-
-# Alias
-StructuredRedisLogger = UltraOptimizedStructuredLogger
-
-
-class JsonFormatter(logging.Formatter):
-    """JSON formatter for log records."""
-
-    def format(self, record):
-        """Format log record as JSON."""
-        log_data = {
-            "timestamp": time.time(),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "logger": record.name,
-            "thread_id": threading.get_ident(),
-        }
-
-        # Include structured context if present
-        if hasattr(record, "structured"):
-            log_data.update(record.structured)  # type: ignore[attr-defined]
-
-        # Include exception info if present
-        if record.exc_info:
-            import traceback
-
-            log_data["exception"] = "".join(traceback.format_exception(*record.exc_info))
-
-        return json.dumps(log_data, separators=(",", ":"))

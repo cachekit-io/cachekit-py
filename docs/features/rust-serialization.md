@@ -69,7 +69,8 @@ Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On ret
 2. Stored checksum is compared
 3. Mismatch → `SerializationError` at the serializer layer (corrupted data, never returned to caller); a normal `@cache`-decorated read catches it, evicts the entry, and recomputes rather than propagating it to your code
 
-This protects against Redis memory corruption, storage bugs, and bit rot.
+This protects against Redis memory corruption, storage bugs, and bit rot. A corrupt frame header
+(truncated, bad version/length, unparseable JSON) takes the same path: `SerializationError`, evict, recompute.
 
 > **Non-cryptographic — corruption detection only.** xxHash3-64 is not a cryptographic
 > hash and the comparison is a plain equality check: an attacker with backend write

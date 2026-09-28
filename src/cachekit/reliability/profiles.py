@@ -192,28 +192,24 @@ def get_decorator_kwargs(profile: ReliabilityProfile, overrides: Optional[dict[s
     return kwargs
 
 
-def create_optimized_decorator_config(profile: ReliabilityProfile = ReliabilityProfile.BALANCED, **overrides) -> dict[str, Any]:
-    """Create optimized decorator configuration.
-
-    This function creates a decorator configuration that uses the optimized
-    reliability components (async metrics, lightweight health checks, etc.)
+def create_decorator_config(profile: ReliabilityProfile = ReliabilityProfile.BALANCED, **overrides: Any) -> dict[str, Any]:
+    """Create a decorator configuration dict for a reliability profile.
 
     Args:
         profile: Base reliability profile
         **overrides: Parameter overrides
 
     Returns:
-        Optimized decorator configuration
+        The profile's settings plus ``_``-prefixed tuning keys
     """
     config = get_profile_config(profile)
 
-    # Build configuration with optimized components
     decorator_config = {
-        # Core reliability (already optimized)
+        # Core reliability
         "circuit_breaker": config.circuit_breaker,
         "backpressure": config.backpressure,
         "max_concurrent_requests": config.max_concurrent_requests,
-        # Use optimized monitoring
+        # Monitoring
         "collect_stats": config.collect_stats,
         "enable_tracing": config.async_metrics,
         "enable_structured_logging": config.enable_structured_logging,
@@ -311,14 +307,14 @@ def recommend_profile(throughput_rps: int, criticality: str = "medium", latency_
 # Convenience functions for common patterns
 def minimal_reliability_decorator(**overrides):
     """Get minimal reliability decorator configuration."""
-    return create_optimized_decorator_config(ReliabilityProfile.MINIMAL, **overrides)
+    return create_decorator_config(ReliabilityProfile.MINIMAL, **overrides)
 
 
 def balanced_reliability_decorator(**overrides):
     """Get balanced reliability decorator configuration."""
-    return create_optimized_decorator_config(ReliabilityProfile.BALANCED, **overrides)
+    return create_decorator_config(ReliabilityProfile.BALANCED, **overrides)
 
 
 def full_reliability_decorator(**overrides):
     """Get full reliability decorator configuration."""
-    return create_optimized_decorator_config(ReliabilityProfile.FULL, **overrides)
+    return create_decorator_config(ReliabilityProfile.FULL, **overrides)
