@@ -106,7 +106,8 @@ class BaseBackend(Protocol):
 `refresh_ttl_on_get` does not apply to it (see [Memcached](memcached.md#ttl-inspection--refresh)).
 
 **Cross-process whole-function invalidation** (a server-side key registry, via the
-`KeyTrackableBackend` protocol): supported by the env-resolved **Redis** backend only. Every
+`KeyTrackableBackend` protocol): supported only by the tenant-scoped **Redis** backend that env
+auto-detection and `RedisBackendProvider` hand out. Every
 other backend — including a `RedisBackend` passed as `backend=` — deletes only the keys the
 calling process knows (see [Whole-Function Invalidation](../features/l1-invalidation.md#whole-function-invalidation)).
 
@@ -222,15 +223,25 @@ picks a backend from exactly one environment selector, in this order:
 | Priority | Environment variable        | Backend            |
 |----------|-----------------------------|--------------------|
 | 1        | `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
-| 2        | `CACHEKIT_REDIS_URL`        | `RedisBackend`     |
+| 2        | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
 | 3        | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
 | 4        | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
-| 5        | `REDIS_URL`, or nothing set | `RedisBackend` (localhost fallback) |
+| 5        | `REDIS_URL`, or nothing set | Redis, as 2 (localhost fallback) |
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
 the `cachekit.decorators.orchestrator` logger, and runs the function uncached.
 `REDIS_URL` is a 12-factor fallback and never counts as a conflict.
+
+The Redis prefix scopes L2 only. L1 is shared by every tenant in the process; see
+[Whole-Function Invalidation → Tenant scope](../features/l1-invalidation.md#whole-function-invalidation).
+
+Set the tenant with `tenant_context` from `cachekit.backends.redis.provider`, to a `str`,
+`bytes`, `int` or `UUID`. The prefix is the id's text, `str()` for an `int` or `UUID`: `1`,
+`"1"` and `b"1"` are one tenant (`t:1:`), as are a `UUID` and `str(uuid)`, but `"01"` or an
+upper-case UUID string is another. With env auto-detection, a call with no tenant set uses
+`default`. If two kinds of tenant can share an id, namespace them before setting
+`tenant_context`: `"org:1"`, `"team:1"`.
 
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`

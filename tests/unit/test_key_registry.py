@@ -432,7 +432,7 @@ class TestDrain:
         assert not drainer.is_alive()
 
         assert key in backend.store and backend.sets == {}  # the rewrite is in no registry
-        assert key in _closure_cell(f, "_cached_keys").cell_contents
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
         backend.drain_tracked = real_drain  # type: ignore[method-assign]
         f.invalidate_cache()
         assert backend.store == {}
@@ -467,7 +467,7 @@ class TestDrain:
         assert not invalidator.is_alive()
 
         assert key in backend.store
-        assert key in _closure_cell(f, "_cached_keys").cell_contents
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
         backend.delete = real_delete  # type: ignore[method-assign]
         f.invalidate_cache()
         assert backend.store == {}
@@ -483,7 +483,7 @@ class TestDrain:
 
         f(1)
         watches = _closure_cell(f, "_drain_watches").cell_contents
-        watches[(-1, object())] = {"orphan"}  # another pid's drain, in flight at fork
+        watches[(-1, object())] = {("", "orphan")}  # another pid's drain, in flight at fork
         f.invalidate_cache()
         assert watches == {}
         backend.fail_drain = True
