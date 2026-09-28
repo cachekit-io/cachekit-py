@@ -8,6 +8,7 @@ backends still hold.
 
 from __future__ import annotations
 
+import logging
 import threading
 import weakref
 from contextlib import AsyncExitStack, ExitStack
@@ -82,7 +83,19 @@ def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
     return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
 
 
+def _pin_hpack_logger() -> None:
+    # hpack (httpx's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
+    # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
+    # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
+    # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
+    hpack_logger = logging.getLogger("hpack")
+    if hpack_logger.level == logging.NOTSET:
+        hpack_logger.setLevel(logging.INFO)
+
+
 def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
+    # Every client carries the bearer key, so no client is built before the pin.
+    _pin_hpack_logger()
     return {
         "base_url": config.api_url,
         "timeout": config.timeout,
