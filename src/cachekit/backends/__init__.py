@@ -8,6 +8,7 @@ Public API:
     - BaseBackend: Core protocol (5 methods: get, set, delete, exists, health_check)
     - TTLInspectableBackend: Optional protocol for TTL inspection/refresh
     - LockableBackend: Optional protocol for distributed locking
+    - KeyTrackableBackend: Optional protocol for server-side key tracking (whole-function invalidation)
     - TimeoutConfigurableBackend: Optional protocol for per-operation timeouts
     - BackendProvider: Dependency injection protocol
     - BackendError: Exception raised by backend operations
@@ -33,6 +34,7 @@ from typing import Protocol
 
 from cachekit.backends.base import (
     BaseBackend,
+    KeyTrackableBackend,
     LockableBackend,
     TimeoutConfigurableBackend,
     TTLInspectableBackend,
@@ -51,6 +53,7 @@ __all__ = [
     "inherit_config",
     "TTLInspectableBackend",
     "LockableBackend",
+    "KeyTrackableBackend",
     "TimeoutConfigurableBackend",
     "BackendProvider",
     "BackendError",
@@ -66,7 +69,10 @@ class BackendProvider(Protocol):
 
     Enables testability and pluggable backends without hardcoding concrete
     implementations. The provider manages backend lifecycle (singleton,
-    pooling, per-request creation, etc.).
+    pooling, etc.). A decorator calls ``get_backend()`` once and keeps the
+    result for the life of the process, so the backend returned must be safe to
+    share across requests — anything request-scoped (e.g. the tenant) has to be
+    resolved per operation, not captured when the backend is built.
 
     Example:
         >>> from cachekit.backends import BackendProvider, BaseBackend
@@ -85,14 +91,14 @@ class BackendProvider(Protocol):
     def get_backend(self) -> BaseBackend:
         """Return a BaseBackend instance.
 
-        Implementation can manage singleton, pooling, or per-request creation
-        depending on backend requirements.
+        Implementation can manage singleton or pooling depending on backend
+        requirements; the result must be safe to share across requests.
 
         Returns:
             BaseBackend instance ready for cache operations
 
         Example:
-            >>> provider = RedisBackendProvider()  # doctest: +SKIP
+            >>> provider = MyProvider()  # doctest: +SKIP
             >>> backend = provider.get_backend()  # doctest: +SKIP
             >>> backend.set("key", b"value", ttl=60)  # doctest: +SKIP
         """
