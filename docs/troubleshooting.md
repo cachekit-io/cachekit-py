@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, or a failure to create the backend client. Backend read and write failures do not currently count
+- Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, cached entries that fail to deserialize or decrypt (each is evicted and the call recomputes, but it still counts), or a failure to create the backend client. Backend read and write failures do not currently count
 - Caching is disabled for this function until the process restarts
 
 **Solutions**:
