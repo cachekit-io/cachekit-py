@@ -259,37 +259,55 @@ not rely on the `TypeError` to keep tenants apart.
 
 #### Upgrading to 0.20.0
 
-Before 0.20.0, a process that set `tenant_context` to more than one tenant wrote every L2
-entry under the prefix of the first tenant to call. That applies to the env-resolved Redis
-backend, and to a `RedisBackendProvider.get_backend()` backend held across calls, as the
-decorator holds the one a custom backend provider returns. A deployment that never set a
-tenant, or only ever set one, is unaffected.
+If your deployment used cachekit under more than one tenant, purge the Redis entries that
+earlier releases wrote. A call with no tenant set counts as the tenant `default`. A deployment
+that only ever used one tenant is unaffected.
 
-If you are affected, purge the pre-upgrade entries on upgrade. They may hold another
-tenant's value under the first caller's prefix, entries written with `ttl=None` never
-expire, and `invalidate_cache()` cannot reach them, because nothing tracked them before
-0.20.0. Delete every `t:*` key, the prefix scan from
-[bulk eviction](../error-codes.md#e003-decryption-failed---authentication-tag-mismatch)
-with a wider pattern:
+In earlier releases, a decorated function that resolved Redis from the environment
+(`CACHEKIT_REDIS_URL`, `REDIS_URL` or the localhost default), or a backend taken from
+`RedisBackendProvider.get_backend()`, stayed bound to the tenant that was current when the
+backend was first obtained. Every tenant's L2 writes through it then landed under that one
+tenant's `t:<tenant>:` prefix. The binding was per function, so a process serving one tenant
+can still have left residue: for example, if an `invalidate_cache()` under another tenant
+bound the function first, or if the process called `tenant_context.set("default")` before
+`get_backend()`, as the earlier distributed-locking example did.
 
-```bash
-redis-cli --scan --pattern 't:*' | xargs -r redis-cli DEL
-```
+After the upgrade, the bound tenant keeps reading those entries as its own, and some of them
+hold another tenant's value. Entries written with `ttl=None`, or kept alive by
+`refresh_ttl_on_get=True`, never expire. A no-argument `invalidate_cache()` reaches only the
+entries the calling tenant has read in that process since it started, because no key
+registry recorded them.
 
-On a Redis database other applications share, `t:*` also matches their keys that start
-with `t:`, so scan `'t:<tenant>:*'` once per tenant instead. `FLUSHDB` is an option only if
-the database is dedicated to cachekit.
+1. Wait until the last process running an earlier release has stopped.
+2. Delete every `t:*` key in each database cachekit uses. Run `FLUSHDB` instead only if the
+   database is dedicated to cachekit.
+
+   ```bash
+   redis-cli -u <redis-url> --scan --pattern 't:*' | tr '\n' '\0' | xargs -0 -r redis-cli -u <redis-url> DEL
+   ```
+
+3. Restart every process. L1 keeps any entry a process read before the purge for up to the
+   function's `ttl` (300 s with `ttl=None`). Expect a cold cache.
+
+On a database other applications share, `t:*` also matches their keys that start with `t:`.
+Run the same command once per tenant instead, with `--pattern 't:<tenant>:*'`, for `default`
+and for each tenant you have set. Percent-encode the tenant with
+`urllib.parse.quote(tenant, safe='')`, converting an `int` or `UUID` tenant with `str()` first:
+tenant `org:123` is `--pattern 't:org%3A123:*'`.
 
 Other changes you may notice:
 
-- `RedisBackendProvider.get_backend()` no longer binds its backend to the tenant set when
-  it was called. The backend follows `tenant_context` on every operation, and falls back
-  to that tenant only in a context with none set. For a backend bound to one tenant,
-  construct `PerRequestRedisBackend(client, tenant)` directly.
-- A no-argument `invalidate_cache()` on the Redis backend deletes only the calling
-  tenant's entries.
-- `int` and `UUID` tenant ids are now accepted. A tenant id of any type other than `str`,
-  `bytes`, `int` and `UUID` raises `TypeError`, as above.
+- `RedisBackendProvider.get_backend()` no longer binds its backend to one tenant. The backend
+  follows `tenant_context` on every operation, and falls back to the tenant that was current at
+  the `get_backend()` call only when the calling context has none. For a backend bound to one
+  tenant, construct `cachekit.backends.redis.provider.PerRequestRedisBackend(client, tenant)`
+  directly, with `client` a `redis.Redis`.
+- A no-argument `invalidate_cache()` on the Redis backend now deletes only the calling tenant's
+  L2 entries.
+- `int` and `UUID` tenants now work, keyed by their `str()` form (`42` and `"42"` share
+  `t:42:`). No earlier release supported them. Any type other than `str`, `bytes`, `int` and
+  `uuid.UUID` raises `TypeError`, as above; this includes a `bool`, an `IntEnum` member and a
+  `bytearray`. Convert an `IntEnum` member with `int()` and a `bytearray` with `bytes()` first.
 
 ## Performance Considerations
 
