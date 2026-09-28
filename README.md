@@ -291,11 +291,14 @@ def get_patient_data(hospital_id: int):
 > [!CAUTION]
 > When handling PII, medical, or financial data, always use `@cache.secure` to enforce encryption.
 
-**Zero-downtime key rotation**: promote a new `CACHEKIT_MASTER_KEY` and keep the
-retiring key readable via `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex,
-max 3 decrypt-only keys). Entries are selected by exact key fingerprint — never
-trial decryption — and old entries age out via TTL, no cache flush required. See
-[Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md#key-rotation-pattern).
+**Key rotation**: keep a retiring key readable with
+`CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3 decrypt-only keys)
+while new writes use `CACHEKIT_MASTER_KEY`. A one-deploy key swap is not
+zero-miss; follow the [key rotation
+runbook](https://docs.cachekit.io/concepts/key-rotation/), including its Before
+You Rotate checks. CK-framed entries are selected by exact key fingerprint —
+never trial decryption; Interop-mode entries carry no CK frame and attempt
+keyring keys sequentially instead.
 
 cachekit employs comprehensive security tooling:
 
@@ -415,7 +418,7 @@ info = expensive_func.cache_info()
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
 | [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
-| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on Redis), stale-while-revalidate |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), stale-while-revalidate |
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
