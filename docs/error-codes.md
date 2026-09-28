@@ -147,8 +147,9 @@ get_data.invalidate_cache(user_id)         # sync function
 await get_data.ainvalidate_cache(user_id)  # async function
 ```
 
-Called with no arguments it evicts only the keys this process has cached, not
-the fleet's. It does not cover a function with a custom `key=`: delete that
+Called with no arguments on the tenant-scoped Redis backend it deletes every
+process's L2 entries for the calling tenant; on other backends it evicts only the
+keys this process has cached, not the fleet's. It does not cover a function with a custom `key=`: delete that
 entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
 with `<tenant>` percent-encoded as shown below.
 
@@ -156,7 +157,8 @@ For bulk eviction, delete by prefix:
 
 ```bash
 # The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe=""):
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
+# (an int or UUID tenant as its str() first):
 # tenant org:123 is stored as t:org%3A123:...
 # Namespaced function (@cache.secure(namespace="users", ...)):
 redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL

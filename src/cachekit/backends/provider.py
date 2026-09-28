@@ -156,20 +156,21 @@ class DefaultBackendProvider(BackendProviderInterface):
 
     Selection is by a single, unambiguous environment signal. Priority order:
         1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL          → RedisBackend
+        2. CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
         3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
         4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
-        5. REDIS_URL, or nothing set   → RedisBackend (12-factor / localhost default)
+        5. REDIS_URL, or nothing set   → Redis, as 2 (12-factor / localhost default)
 
     Setting more than one of the four prefixed selectors (1-4) raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
     ``backend=`` explicitly to override. The non-prefixed ``REDIS_URL`` is only a
     fallback and never counts as a conflict (12-factor convention).
 
-    CachekitIO/Memcached/File backends are stateless singletons (cached). Redis
-    backends are per-request tenant-scoped wrappers (not cached —
-    RedisBackendProvider.get_backend() reads the tenant_context ContextVar). For
-    single-tenant deployments (default), tenant_context is set to "default".
+    Every backend is a singleton (cached) — the decorator holds whatever this returns
+    for the life of the process. The Redis one is tenant-scoped per OPERATION: it reads
+    the tenant_context ContextVar each time it touches Redis, so each Redis operation is
+    scoped to the calling context's tenant, and a context with no tenant set
+    (single-tenant mode) is scoped to "default" (LAB-4773).
     """
 
     # Prefixed selectors in priority order. REDIS_URL is the implicit fallback
@@ -183,7 +184,7 @@ class DefaultBackendProvider(BackendProviderInterface):
 
     def __init__(self):
         self._cachekitio_backend = None
-        self._redis_provider = None
+        self._redis_backend = None
         self._memcached_backend = None
         self._file_backend = None
 
@@ -232,19 +233,14 @@ class DefaultBackendProvider(BackendProviderInterface):
             return self._file_backend
 
         # choice == "redis" (explicit CACHEKIT_REDIS_URL) or None (REDIS_URL / localhost fallback).
-        # Tenant-scoped: call the provider each time so it re-reads tenant_context.
-        if self._redis_provider is None:
+        # Shared backend: it resolves the tenant per operation, so caching it cannot pin a tenant.
+        if self._redis_backend is None:
             from cachekit.backends.redis.config import RedisBackendConfig
-            from cachekit.backends.redis.provider import RedisBackendProvider, tenant_context
+            from cachekit.backends.redis.provider import RedisBackendProvider
 
             redis_config = RedisBackendConfig.from_env()
-            self._redis_provider = RedisBackendProvider(redis_url=redis_config.redis_url)
-
-            # Set default tenant for single-tenant mode (if not already set)
-            if tenant_context.get() is None:
-                tenant_context.set("default")
-
-        return self._redis_provider.get_backend()
+            self._redis_backend = RedisBackendProvider(redis_url=redis_config.redis_url).get_shared_backend()
+        return self._redis_backend
 
 
 __all__ = [
