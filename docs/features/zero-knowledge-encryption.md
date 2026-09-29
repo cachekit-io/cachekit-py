@@ -177,8 +177,9 @@ There is deliberately **no opt-in flag** to let an encryption-enabled reader acc
 plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
 plaintext entry forged by an attacker with backend write access is indistinguishable
 from a legacy one — any "accept plaintext" escape hatch would reintroduce the
-encryption-downgrade attack the fail-closed read path exists to prevent. If you need to read plaintext entries, use a
-handler with `encryption=False` (which never had keys to protect).
+encryption-downgrade attack the fail-closed read path exists to prevent. If you need to
+read plaintext entries, use a handler with `encryption=False` (which never had keys to
+protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
 workload: lazy migration spreads recomputation over reads (each legacy entry pays one
@@ -377,13 +378,15 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 ### Fail-Closed Read Path (Encryption Downgrade Protection)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
-and the serializer name — is plaintext and is **not** covered by the AES-GCM
-authentication tag. AAD v0x03 binds tenant, cache key, wire format, compression and
-(when set) the original type into the tag, but the header itself stays outside that
-boundary so a reader can parse it before it has a key.
+and the serializer name — is plaintext, so a reader can parse it before it has a key.
+Its JSON bytes are not what the AES-GCM tag covers; the tag covers the AAD. AAD v0x03
+is built from the reader's tenant, the cache key, and the header's wire format,
+compression flag and (when set) original type, so a change to one of those header
+values that alters the AAD fails authentication. The `encrypted` flag is **not** an
+AAD input: nothing authenticates it.
 
 An attacker with backend write access (the threat actor in the protocol's threat
-model) could exploit that gap by planting a frame whose header claims
+model) could exploit that unauthenticated flag by planting a frame whose header claims
 `encrypted: false` plus an arbitrary plaintext payload — a classic encryption
 downgrade (CWE-757). cachekit therefore never lets header metadata select the read
 path when encryption is configured:
@@ -406,8 +409,9 @@ accepted:
 
 - **`tenant_id`** — required *before* decryption to derive the per-tenant key
   (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
-  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
-  binds it into the GCM tag, so a modified header fails authentication.
+  opaque identifier, not secret material, and it *is* tamper-protected: the reader
+  rejects a header `tenant_id` that differs from its own configured tenant before it
+  decrypts (`auth_tamper`), and AAD v0x03 binds the reader's tenant into the GCM tag.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
