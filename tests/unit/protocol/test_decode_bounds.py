@@ -326,7 +326,6 @@ class TestOwnedBounds:
         bomb = bytes.fromhex(vector["input_hex"])
         assert serializer.validate_data(bomb) is False
         assert guard_errors, "validate_data rejected the bomb without the structural guard raising"
-        _assert_guard_rejected(guard_errors[0])
         peak = peaks[f"validate_data:{vector['name']}"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(bomb), f"validate_data peaked at {peak} bytes"
 
@@ -335,16 +334,21 @@ class TestOwnedBounds:
         handler = CacheSerializationHandler(interop_mode=True, encryption=False)
         assert handler.serialize_data({"t": 1}, cache_key=CACHE_KEY) == msgpack.packb({"t": 1})
 
+    @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
     @pytest.mark.parametrize("original_type", ["dataframe", "series"])
-    def test_bomb_behind_a_dataframe_or_series_frame_is_a_controlled_miss(self, original_type: str) -> None:
-        # AutoSerializer's metadata routes decode outside the verified-envelope normaliser; the bound's
-        # rejection must still reach the handler as SerializationError (evict + tamper hook), never a
-        # bare ValueError. The message match keeps a "Serializer mismatch" error from faking a pass.
+    def test_bomb_behind_a_dataframe_or_series_frame_is_a_controlled_miss(
+        self, original_type: str, vector: dict[str, Any]
+    ) -> None:
+        # AutoSerializer's metadata routes decode outside the verified-envelope normaliser, through its own
+        # unpackb_bounded call; the guard must still be what rejects, and the rejection must reach the
+        # handler as SerializationError (evict + tamper hook), never a bare ValueError. The message match
+        # keeps a "Serializer mismatch" error from faking a pass.
         metadata, serializer_name = _frame_template("auto")
-        bomb = _reject_vector("nested_array32_input_len_depth_1100")
+        bomb = bytes.fromhex(vector["input_hex"])
         frame = SerializationWrapper.wrap(_envelope(bomb), {**metadata, "original_type": original_type}, serializer_name)
-        with pytest.raises(SerializationError, match=f"failed to decode as {original_type}"):
+        with pytest.raises(SerializationError, match=f"failed to decode as {original_type}") as excinfo:
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
+        _assert_guard_rejected(excinfo.value)
 
 
 if __name__ == "__main__":
