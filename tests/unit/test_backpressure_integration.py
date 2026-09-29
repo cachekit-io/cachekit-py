@@ -1,7 +1,6 @@
 """Test backpressure controller integration with cache decorator."""
 
 import threading
-import time
 from unittest.mock import Mock
 
 import pytest
@@ -113,53 +112,53 @@ class TestBackpressureIntegration:
         assert mock_backend.delete.called
 
     def test_backpressure_limits_concurrent_requests(self, mock_backend):
-        """Test that backpressure controller actually limits concurrent requests."""
+        """Test that backpressure controller actually limits concurrent requests.
 
-        # Setup mock backend that takes time to respond
-        def slow_operation(key):
-            time.sleep(0.1)  # Simulate slow backend operation
+        Saturation is driven by events, not sleeps: a sleeping backend only overlaps requests
+        if every thread starts within the sleep, which scheduler load breaks (LAB-6381).
+        """
+        entered = threading.Semaphore(0)  # one release per request inside the backend
+        release = threading.Event()
+
+        def blocking_get(key):
+            entered.release()
+            release.wait(timeout=5)
             return b"value"
 
-        mock_backend.get = Mock(side_effect=slow_operation)
+        mock_backend.get = Mock(side_effect=blocking_get)
 
-        # Create backpressure controller with very low limits
+        # 2 permits, 1 queue slot, 0.05s permit wait
         backpressure_controller = BackpressureController(max_concurrent=2, queue_size=1, timeout=0.05)
-
-        # Create handler with backpressure controller
         handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
-        # Track results and exceptions
-        results = []
-        exceptions = []
+        results = {}
 
         def worker(worker_id):
-            try:
-                result = handler.get(f"key_{worker_id}")
-                if result is None:
-                    # Cache handler caught a backpressure exception and returned None
-                    exceptions.append((worker_id, "backpressure_rejection"))
-                else:
-                    results.append((worker_id, result))
-            except Exception as e:
-                exceptions.append((worker_id, e))
+            # handler.get swallows BackendError and returns None, so None is a rejection
+            results[worker_id] = handler.get(f"key_{worker_id}")
 
-        # Start multiple threads to overwhelm the backpressure controller
-        threads = []
-        for i in range(5):  # 5 threads, but max_concurrent=2, queue_size=1
-            thread = threading.Thread(target=worker, args=(i,))
-            threads.append(thread)
-            thread.start()
+        holders = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        overflow = [threading.Thread(target=worker, args=(i,)) for i in range(2, 5)]
+        try:
+            for thread in holders:
+                thread.start()
+            # Both permits are held once both holders are inside the backend
+            assert entered.acquire(timeout=5) and entered.acquire(timeout=5), "holders never reached the backend"
 
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
+            # Permits stay held, so each overflow request is rejected: queue full, or permit timeout
+            for thread in overflow:
+                thread.start()
+            for thread in overflow:
+                thread.join(timeout=5)
+        finally:
+            release.set()
+            for thread in holders + overflow:
+                thread.join(timeout=5)
 
-        # Some requests should have been rejected due to backpressure
-        assert len(exceptions) > 0, "Expected some requests to be rejected due to backpressure"
-
-        # Verify we got some backpressure rejections (manifested as None results)
-        backpressure_rejections = [e for e in exceptions if e[1] == "backpressure_rejection"]
-        assert len(backpressure_rejections) > 0, f"Expected backpressure rejections, got exceptions: {exceptions}"
+        assert results == {0: b"value", 1: b"value", 2: None, 3: None, 4: None}
+        assert mock_backend.get.call_count == 2, "rejected requests must not reach the backend"
+        assert backpressure_controller.rejected_count == 3
+        assert backpressure_controller.queue_depth == 0
 
     @pytest.mark.asyncio
     async def test_async_backpressure_integration(self, mock_backend):
