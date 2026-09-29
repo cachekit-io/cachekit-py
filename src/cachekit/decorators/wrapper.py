@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.errors import BackendError
+from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
@@ -742,6 +742,10 @@ def create_cache_wrapper(
 
     # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
     # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    # The entry is a miss, not a backend failure, so it must not count toward the
+    # circuit breaker: a refused plaintext entry during a plaintext→encrypted migration,
+    # or a handful planted by a backend writer, would otherwise open it and switch off
+    # caching for this function.
     def _on_l2_deserialize_error(error: Exception, key: str) -> None:
         features.handle_cache_error(
             error=error,
@@ -749,6 +753,7 @@ def create_cache_wrapper(
             cache_key=key,
             namespace=namespace or "default",
             duration_ms=0.0,
+            count_toward_breaker=False,
         )
 
     operation_handler.on_deserialize_error = _on_l2_deserialize_error
@@ -1393,6 +1398,19 @@ def create_cache_wrapper(
 
         # L1+L2 MODE: Original behavior with backend initialization
 
+        # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+        # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
+        # caller before the function runs, whatever the breaker state, and never counts a failure
+        # on the breaker every tenant of this function shares. "" until the backend is resolved;
+        # the first call checks right after resolving it, below. Sits outside the main
+        # try/finally, so the raise path restores the context itself.
+        try:
+            _l2_scope()
+        except Exception:
+            features.clear_correlation_id()
+            reset_current_function_stats(token)
+            raise
+
         # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
         # with its probe budget spent) - run the function uncached. This sits
         # outside the try below on purpose: that except records a failure, and a
@@ -1420,6 +1438,7 @@ def create_cache_wrapper(
                 nonlocal _backend
                 if _backend is None:
                     _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1428,6 +1447,13 @@ def create_cache_wrapper(
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                features.clear_correlation_id()
+                reset_current_function_stats(token)
+                raise
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -1789,6 +1815,11 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
+            # Tenant scope, before the breaker check (LAB-5713): see sync_wrapper. "" until the
+            # backend is resolved; the first call checks right after resolving it, below. The
+            # outer finally clears correlation ID / stats context.
+            _l2_scope()
+
             # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
@@ -1818,6 +1849,8 @@ def create_cache_wrapper(
                 if _backend is None:
                     try:
                         _backend = _resolve_lazy_backend()
+                    except UnsupportedTenantError:
+                        raise  # a caller bug, not a client failure: see sync_wrapper
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1829,7 +1862,7 @@ def create_cache_wrapper(
                             duration_ms=0.0,
                         )
                         return await func(*args, **kwargs)
-                ensure_interop_backend_compatible(_backend)
+                ensure_interop_backend_compatible(_backend)  # reads key_prefix, so runs the tenant check too
 
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
@@ -1892,6 +1925,8 @@ def create_cache_wrapper(
             if _backend is None:
                 try:
                     _backend = _resolve_lazy_backend()
+                except UnsupportedTenantError:
+                    raise  # a caller bug, not a client failure: see sync_wrapper
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1903,6 +1938,7 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
+                _l2_scope()  # first call: the tenant check above ran before the backend existed
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
