@@ -2255,6 +2255,28 @@ def create_cache_wrapper(
             _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
             _local_invalidate_all()
 
+    def _invalidate_key(cache_key: str) -> None:
+        """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
+        via asyncio.to_thread, like _drain_all.
+
+        Untrack BEFORE the delete: a concurrent write landing after the delete re-tracks its key
+        (_put_l1 records after the put), so it can never be left in L2 untracked. A failed delete
+        re-tracks the key, so a later no-args invalidate_cache() retries it.
+        """
+        entry = (_l2_scope(), cache_key)
+        _cached_keys.discard(entry)
+        if _backend and not _l1_only_mode:
+            try:
+                _backend.delete(cache_key)
+            except Exception as e:
+                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
+                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                _cached_keys.add(entry)
+        if _object_cache:
+            _object_cache.delete(cache_key)
+        elif _l1_cache:
+            _l1_cache.invalidate(cache_key)
+
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
 
@@ -2277,35 +2299,7 @@ def create_cache_wrapper(
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path — one key, not two (LAB-4387).
-        cache_key = _resolve_cache_key(args, kwargs)
-
-        # Same order as _local_invalidate_all: L2 delete, then trim, then L1.
-        l2_deleted = True
-        if _backend and not _l1_only_mode:
-            try:
-                _backend.delete(cache_key)
-            except Exception as e:
-                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
-                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-                l2_deleted = False  # keep key tracked so invalidate_cache() retries it
-        if l2_deleted:
-            _cached_keys.discard((_l2_scope(), cache_key))
-        if _object_cache:
-            _object_cache.delete(cache_key)
-        elif _l1_cache:
-            _l1_cache.invalidate(cache_key)
-
-    async def _delete_l2_async(backend: Any, key: str) -> None:
-        """Delete an L2 key without blocking the event loop.
-
-        Prefers the backend's native ``delete_async`` coroutine; otherwise runs the
-        sync ``delete`` in a worker thread (as the cache handler does). Errors propagate.
-        """
-        delete_async = getattr(backend, "delete_async", None)
-        if inspect.iscoroutinefunction(delete_async):
-            await delete_async(key)
-        else:
-            await asyncio.to_thread(backend.delete, key)
+        _invalidate_key(_resolve_cache_key(args, kwargs))
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -2328,24 +2322,10 @@ def create_cache_wrapper(
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
-        # Same derivation as the write path — one key, not two (LAB-4387).
-        cache_key = _resolve_cache_key(args, kwargs)
-
-        # Same order as _local_invalidate_all: L2 delete, then trim, then L1.
-        l2_deleted = True
-        if _backend and not _l1_only_mode:
-            try:
-                await _delete_l2_async(_backend, cache_key)
-            except Exception as e:
-                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
-                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-                l2_deleted = False  # keep key tracked so invalidate_cache() retries it
-        if l2_deleted:
-            _cached_keys.discard((_l2_scope(), cache_key))
-        if _object_cache:
-            _object_cache.delete(cache_key)
-        elif _l1_cache:
-            _l1_cache.invalidate(cache_key)
+        # Same derivation as the write path — one key, not two (LAB-4387). The sync delete runs
+        # off the loop; never a backend's delete_async, whose pooled client may be bound to an
+        # earlier event loop (asyncio.run per job).
+        await asyncio.to_thread(_invalidate_key, _resolve_cache_key(args, kwargs))
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""

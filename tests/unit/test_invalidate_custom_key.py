@@ -71,9 +71,13 @@ def _decorate(
     return apply
 
 
+_MODES = pytest.mark.parametrize("mode", [{"key": _user_key}, {"fast_mode": True}], ids=["custom_key", "fast_mode"])
+_NO_ARGS = pytest.mark.parametrize("no_args", [False, True], ids=["args", "no_args"])
+
+
 @pytest.mark.unit
 class TestInvalidateCustomKey:
-    @pytest.mark.parametrize("mode", [{"key": _user_key}, {"fast_mode": True}], ids=["custom_key", "fast_mode"])
+    @_MODES
     def test_sync_invalidate_args_deletes_written_entry(self, mode: dict[str, Any]):
         backend = RecordingBackend()
         calls = 0
@@ -94,7 +98,7 @@ class TestInvalidateCustomKey:
         assert not backend.store
         assert get_user(1) == 2, "stale value still served after invalidate_cache(args)"
 
-    @pytest.mark.parametrize("mode", [{"key": _user_key}, {"fast_mode": True}], ids=["custom_key", "fast_mode"])
+    @_MODES
     @pytest.mark.asyncio
     async def test_async_invalidate_args_deletes_written_entry(self, mode: dict[str, Any]):
         backend = RecordingBackend()
@@ -144,25 +148,6 @@ class ThreadRecordingBackend(RecordingBackend):
         return super().delete(key)
 
 
-class AsyncDeleteBackend(RecordingBackend):
-    """Offers a native delete_async; the sync delete must not be called from async code."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.async_deleted: list[str] = []
-
-    def delete(self, key: str) -> bool:
-        raise AssertionError("sync delete called from ainvalidate_cache")
-
-    async def delete_async(self, key: str) -> bool:
-        self.async_deleted.append(key)
-        return self.store.pop(key, None) is not None
-
-
-_MODES = pytest.mark.parametrize("mode", [{"key": _user_key}, {"fast_mode": True}], ids=["custom_key", "fast_mode"])
-_NO_ARGS = pytest.mark.parametrize("no_args", [False, True], ids=["args", "no_args"])
-
-
 @pytest.mark.unit
 class TestAsyncInvalidateNonBlocking:
     """ainvalidate_cache must never run a blocking L2 delete on the event loop."""
@@ -185,24 +170,6 @@ class TestAsyncInvalidateNonBlocking:
         assert backend.deleted == [written_key]
         assert backend.delete_threads
         assert threading.get_ident() not in backend.delete_threads, "sync delete ran on the event loop thread"
-
-    @_MODES
-    @pytest.mark.asyncio
-    async def test_native_delete_async_preferred(self, mode: dict[str, Any]):
-        """Single-key only: the no-args path runs the sync drain in a worker thread (covered above)."""
-        backend = AsyncDeleteBackend()
-
-        @_decorate(backend, "nonblocking_native", **mode)
-        async def get_user(user_id: int) -> int:
-            return user_id
-
-        await get_user(1)
-        (written_key,) = backend.store
-
-        await get_user.ainvalidate_cache(1)
-
-        assert backend.async_deleted == [written_key]
-        assert not backend.store
 
 
 class FlakyDeleteBackend(RecordingBackend):
@@ -271,7 +238,7 @@ class TestFailedDeleteKeepsRetry:
     @_ALL_MODES
     def test_successful_delete_untracks_key(self, mode: dict[str, Any]):
         """After a successful single-key delete the whole-function form has nothing left to delete."""
-        backend = FlakyDeleteBackend()
+        backend = RecordingBackend()
 
         @_decorate(backend, "lab4387_retry", **mode)
         def get_user(user_id: int) -> int:
@@ -282,3 +249,31 @@ class TestFailedDeleteKeepsRetry:
         get_user.invalidate_cache()
 
         assert len(backend.deleted) == 1
+
+    @_ALL_MODES
+    def test_write_racing_the_delete_stays_tracked(self, mode: dict[str, Any]):
+        """A write that lands right after the L2 delete must stay tracked for the no-args form."""
+        rewrite: list[Callable[[], Any]] = []
+
+        class RacingBackend(RecordingBackend):
+            def delete(self, key: str) -> bool:
+                result = super().delete(key)
+                if rewrite:
+                    rewrite.pop()()  # a concurrent miss re-writes the entry mid-invalidation
+                return result
+
+        backend = RacingBackend()
+
+        @_decorate(backend, "lab4387_race", **mode)
+        def get_user(user_id: int) -> int:
+            return user_id
+
+        get_user(1)
+        (written_key,) = backend.store
+        rewrite.append(lambda: get_user(1))
+        get_user.invalidate_cache(1)
+        assert written_key in backend.store  # the racing write landed after the delete
+
+        get_user.invalidate_cache()
+
+        assert not backend.store, "racing write left in L2 untracked"

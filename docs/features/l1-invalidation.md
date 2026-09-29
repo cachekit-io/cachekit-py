@@ -174,7 +174,7 @@ for uid in [1, 2, 3]:
 - User data refresh
 - Post cache invalidation
 
-**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local. If the L2 delete fails, cachekit logs an ERROR `Failed to delete L2 key` and keeps the key tracked, so a later no-args `invalidate_cache()` retries it.
+**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local. If the L2 delete fails, cachekit logs an ERROR `Failed to delete L2 key` and tracks the key in this process, so a later no-args `invalidate_cache()` from the same process retries it. Tracking is process-local: another process, or this one after a restart, does not retry it.
 
 ### Whole-Function Invalidation
 
