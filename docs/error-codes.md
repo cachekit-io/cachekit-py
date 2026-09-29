@@ -493,7 +493,7 @@ Async functions currently behave differently (a known defect). A 401, 403 or 400
 **Exception**: none — logged as `BackendError` (`BackendErrorType.AUTHENTICATION`)
 
 **Cause**:
-- API key is missing, invalid, or revoked
+- API key is wrong or revoked, for example a truncated or doubled paste or a stray `.` or `=`. A missing key, or one with a character outside the [bearer-token set](backends/cachekitio.md#convenience-shorthand-via-cacheio), never gets this far: it raises `ConfigurationError` when the backend is built
 - API key does not have permission for the requested operation
 
 **Behavior**: Alert ops: every call runs uncached until the key is fixed.
