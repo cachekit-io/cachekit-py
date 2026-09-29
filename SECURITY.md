@@ -162,6 +162,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 |:------------|:---------------|
 | Key size | Minimum 32 bytes (256 bits) |
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
+| Activation | `@cache.secure`, or an explicit encryption option (`encryption=True` + tenant mode). Deprecated in 0.20.0: the env var's presence can also auto-enable encryption on a cache that states no `encryption=` (warns once per process), but not on every such cache, so never rely on it ([rules](docs/features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)); the next minor release raises at construction instead, leaving the env var a key source only, never a switch |
 | Logging | Never exposed in logs/errors |
 | Derivation | HKDF with unique tenant salts |
 | Single-tenant `tenant_id` | Literal `"default"` (protocol cross-SDK default) unless `deployment_uuid` / `CACHEKIT_DEPLOYMENT_UUID` is set; the same value binds HKDF and AAD |
@@ -173,7 +174,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 
 | Mode | L1 Storage | L2 Storage | Performance |
 |:-----|:-----------|:-----------|:------------|
-| `@cache` | Plaintext | Plaintext | ~50ns L1 / ~2-7ms L2 |
+| `@cache`, encryption off | Plaintext | Plaintext | ~50ns L1 / ~2-7ms L2 |
 | `@cache.secure` | **Encrypted** | **Encrypted** | ~50ns L1 / ~2-7ms L2 |
 
 Both tiers store encrypted bytes when encryption is enabled (encrypt-at-rest everywhere). Decryption happens at read time only, minimizing plaintext exposure.
@@ -206,7 +207,7 @@ See [SSRF Protection](docs/features/ssrf-protection.md) for full details, includ
 
 Cache keys can embed caller-supplied tenant/user identifiers, so **the SDK's own loggers** (`cachekit.*`) never emit them verbatim ([CWE-532][cwe-532]). Every cachekit log path — decorator error handling (structured and backwards-compat), cache-operation logs, and SWR/TTL-refresh debug logs — replaces the key with a fixed-length blake2b digest (`<redacted:…>`), keeping log lines correlatable without leaking the key. Error paths are covered centrally at the shared error sink (`FeatureOrchestrator.handle_cache_error` / `log_cache_operation`), so new call sites are redacted by construction. Both structured cache-operation sinks (`FeatureOrchestrator.log_cache_operation`, `StructuredLogger.cache_operation`) also sanitise an exception passed as `error=` themselves — pass the exception object, never `str(e)`, which is emitted as-is. `BackendError` redacts the key in its formatted text (`str(e)` carries `key=<redacted:…>`), while the `.key` attribute keeps the raw caller-supplied key for programmatic use — never log `e.key`. Its free-form `message` is caller-supplied and third-party exception text (a redis `ResponseError` naming the key, a pymemcache illegal-input error echoing it) has unknown provenance — so **no cachekit log line renders `str(e)`**. Every logging call that mentions an exception goes through `redact_error_for_log`, which emits only the exception type plus, for `BackendError`, its `BackendErrorType` classification; the full exception stays on the object (`original_exception`, `.message`) for programmatic access. Operators lose the provider's message text in the log line and keep it on the exception. An architecture test (`tests/unit/test_log_redaction_architecture.py`) walks every logging call in the package — `logger.*()`, `get_logger().*()`, `getattr(logger, level)()` — and fails CI if a key-shaped value reaches one unredacted in the message, `%s` arguments, or `extra=`; if an exception — any name bound by `except ... as`, a conventional name (`e`, `exc`, `err`, `error`, `*_err`), or an attribute of one — reaches one outside `redact_error_for_log`; or if a call emits a traceback (`logger.exception`, `exc_info=`). The guarantee does not depend on the next contributor remembering it. It is flow-insensitive: build log lines inline, not via a pre-formatted variable, and bind exceptions with `except ... as` or a conventional name (an `Exception`-typed parameter called `failure` is invisible to it), or the guard cannot see them.
 
-**Scope — transport logs are not covered.** The CachekitIO backend addresses entries by key in the request path (`GET /v1/cache/{key}`), and `httpx` logs every request line — method, full URL, status — at `INFO` on its own `httpx` logger. An application that enables `INFO` globally (`logging.basicConfig(level=logging.INFO)`) will therefore see raw keys in *httpx's* output on every operation, exactly as it would see any REST resource path. That line never carries a password: an API URL with credentials (`user:password@`) is rejected at construction. cachekit does not mute a third-party logger on your behalf; if your keys carry identifiers, silence or raise the level of that logger in your logging config:
+**Scope — transport logs are not covered, with one exception below.** The CachekitIO backend addresses entries by key in the request path (`GET /v1/cache/{key}`), and `httpx` logs every request line — method, full URL, status — at `INFO` on its own `httpx` logger. An application that enables `INFO` globally (`logging.basicConfig(level=logging.INFO)`) will therefore see raw keys in *httpx's* output on every operation, exactly as it would see any REST resource path. That line never carries a password: an API URL with credentials (`user:password@`) is rejected at construction. cachekit leaves the `httpx` logger to you, because that line carries identifiers, not credentials. If your keys carry identifiers, silence or raise the level of that logger in your logging config:
 
 ```python
 import logging
@@ -215,6 +216,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 ```
 
 The same applies to any HTTP-layer capture between the SDK and `api.cachekit.io` — see the lock-token paragraph below for why path/query content is treated as logged.
+
+**The one logger cachekit does quiet: `hpack` (API key and lock token).** `hpack`, the HTTP/2 header encoder under httpx, logs every header block it encodes at `DEBUG`. It masks the `Authorization` value in one line, but the encoded block it logs next decodes straight back to the `Authorization: Bearer` API key and to the `X-CacheKit-Lock-Id` lock token, and it logs the lock token in clear as well. A root logger at `DEBUG` (`logging.basicConfig(level=logging.DEBUG)`) would therefore hand every reader of your logs a working API key. So building a CachekitIO client sets the `hpack` logger to `INFO` while its level is unset (`NOTSET`). The setting is process-wide: it also quiets hpack for any other HTTP/2 client in the process. A level you set yourself wins, whether you set it before or after importing cachekit or building a client. Setting it, or its `hpack.hpack` child, to `DEBUG` opts back in, and puts the API key and lock tokens back in your logs in recoverable form; do that only where everyone who can read those logs may hold the key, such as a development project with a throwaway key:
+
+```python
+import logging
+
+logging.getLogger("hpack").setLevel(logging.DEBUG)  # exposes the API key and lock tokens
+```
 
 **Digest strength.** The redaction digest is *unkeyed* blake2b, so it is exactly as hard to reverse as the key material is to guess — and the key material is deterministic from the call: `[ns:{ns}:]func:{mod.fn}:args:{blake2b(args)}` for generated keys, or whatever you return from `@cache(key=...)`. Namespace and function name are static application config, so a cache on `get_user(user_id)` is enumerable from its digest by iterating plausible IDs, whether the key was generated (hash the candidate args) or hand-built (`default:user:1234`). A per-installation secret was considered and rejected for a public library (unset it is theatre; set it breaks cross-process log correlation, the property the digest exists for). Treat the digest as a correlation ID, never as a secret: if a log reader must not be able to confirm *which* user an entry belongs to, do not grant that reader the logs.
 

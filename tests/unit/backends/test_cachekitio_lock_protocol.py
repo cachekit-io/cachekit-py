@@ -16,14 +16,17 @@ header (CWE-532) rather than a ?lock_id= query param.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from cachekit.backends.cachekitio.backend import CachekitIOBackend
+from cachekit import cache
+from cachekit.backends.cachekitio.backend import LOCK_ID_HEADER, CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
 _TEST_API_URL = "https://api.cachekit.io"
 _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, not a real key
@@ -378,3 +381,215 @@ class TestCancellation:
 
         # DELETE must have been issued even though the body was cancelled mid-flight.
         assert _method_calls(request_mock) == ["POST", "DELETE"]
+
+
+class _GatedRequests:
+    """Fake ``_request_async`` that can hold a POST / DELETE in flight and records completion.
+
+    A held request waits on an ``asyncio.Event`` gate, so a test can cancel while it is in flight.
+    Completion (``posts_done`` / ``deleted``) is recorded only after the gate opens: a cancel thrown
+    into the request at its gate — what a bare await does to a real in-flight request — never
+    completes it. ``AsyncMock`` would record the call on entry and could not tell the two apart.
+    """
+
+    def __init__(self, *posts: Any, held_posts: frozenset[int] = frozenset({0}), hold_delete: bool = False) -> None:
+        self.posts = list(posts)  # one outcome per POST: a response to return or an exception to raise
+        self.held_posts = held_posts
+        self.hold_delete = hold_delete
+        self.calls: list[str] = []
+        self.post_entered, self.post_gate = asyncio.Event(), asyncio.Event()
+        self.delete_entered, self.delete_gate = asyncio.Event(), asyncio.Event()
+        self.posts_done = 0
+        self.deleted: list[str] = []  # lock ids of DELETEs that ran to completion
+
+    async def __call__(self, method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+        index = self.calls.count(method)
+        self.calls.append(method)
+        if method == "POST":
+            if index in self.held_posts:
+                self.post_entered.set()
+                await self.post_gate.wait()
+            self.posts_done += 1
+            outcome = self.posts[index]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        assert method == "DELETE", method
+        if self.hold_delete:
+            self.delete_entered.set()
+            await self.delete_gate.wait()
+        self.deleted.append(kwargs["headers"][LOCK_ID_HEADER])
+        return _json_response(200, {})
+
+
+async def _hold_lock(
+    backend: CachekitIOBackend, blocking_timeout: float | None = None, entered: asyncio.Event | None = None
+) -> None:
+    async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=blocking_timeout):
+        if entered is not None:
+            entered.set()
+        await asyncio.sleep(10)  # cancelled
+
+
+async def _reached(event: asyncio.Event) -> None:
+    """Wait for a handshake, bounded: a request that is never sent must fail the test, not hang it."""
+    await asyncio.wait_for(event.wait(), timeout=2.0)
+
+
+async def _cancel_twice(task: asyncio.Task[None]) -> None:
+    for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.unit
+class TestCancellationMidRequest:
+    """A cancel landing while a lock POST / DELETE is in flight must not orphan a server-granted lock."""
+
+    async def test_cancel_during_acquire_post_releases_the_lock_it_goes_on_to_win(self, backend: CachekitIOBackend) -> None:
+        fake = _GatedRequests(_json_response(200, {"lock_id": "won"}))
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        task = asyncio.create_task(_hold_lock(backend))
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()  # the server grants the lock after the cancel
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Checked with no further yield: a release left to a done-callback would not have run yet.
+        assert fake.posts_done == 1
+        assert fake.deleted == ["won"]
+
+    async def test_second_cancel_during_acquire_post_still_releases_the_lock(self, backend: CachekitIOBackend) -> None:
+        """A drain that absorbs one cancel per await lets the second one escape while the POST is in flight."""
+        fake = _GatedRequests(_json_response(200, {"lock_id": "won"}))
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        task = asyncio.create_task(_hold_lock(backend))
+        await _reached(fake.post_entered)
+        await _cancel_twice(task)
+        fake.post_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 1
+        assert fake.deleted == ["won"]
+
+    async def test_two_cancels_during_release_after_a_drained_acquire(self, backend: CachekitIOBackend) -> None:
+        fake = _GatedRequests(_json_response(200, {"lock_id": "won"}), hold_delete=True)
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        task = asyncio.create_task(_hold_lock(backend))
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()
+        await _reached(fake.delete_entered)
+        await _cancel_twice(task)
+        fake.delete_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 1
+        assert fake.deleted == ["won"]
+
+    async def test_two_cancels_during_release_from_the_context_exit(self, backend: CachekitIOBackend) -> None:
+        fake = _GatedRequests(_json_response(200, {"lock_id": "held"}), held_posts=frozenset(), hold_delete=True)
+        backend._request_async = fake  # type: ignore[method-assign]
+        entered = asyncio.Event()
+
+        task = asyncio.create_task(_hold_lock(backend, entered=entered))
+        await _reached(entered)
+        task.cancel()  # inside the async-with body: the finally starts the release
+        await _reached(fake.delete_entered)
+        await _cancel_twice(task)
+        fake.delete_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.deleted == ["held"]
+
+    async def test_cancel_during_a_retry_post_releases_the_lock_it_goes_on_to_win(self, backend: CachekitIOBackend) -> None:
+        fake = _GatedRequests(_json_response(200, _HELD), _json_response(200, {"lock_id": "won"}), held_posts=frozenset({1}))
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        task = asyncio.create_task(_hold_lock(backend, blocking_timeout=5.0))
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 2
+        assert fake.deleted == ["won"]
+
+    @pytest.mark.parametrize("error_type", [BackendErrorType.AUTHENTICATION, BackendErrorType.PERMANENT])
+    async def test_cancel_wins_over_a_drained_acquire_error(
+        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture, error_type: BackendErrorType
+    ) -> None:
+        """Raising the drained error instead would let the cancelled task degrade to a no-lock call."""
+        key = "ns:app:func:mod.fn:args:tenant-42-secret:0"
+        err = BackendError("rejected", error_type=error_type)
+        fake = _GatedRequests(err)
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        async def acquire() -> None:
+            async with backend.acquire_lock(key, timeout=30.0, blocking_timeout=None):
+                pytest.fail("should never enter context body")
+
+        caplog.set_level(logging.WARNING, logger="cachekit.backends.cachekitio.backend")
+        task = asyncio.create_task(acquire())
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 1
+        assert "DELETE" not in fake.calls
+        warnings = [
+            r for r in caplog.records if r.name == "cachekit.backends.cachekitio.backend" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert redact_cache_key(key) in message
+        assert redact_error_for_log(err) in message
+        assert "tenant-42-secret" not in message
+
+    async def test_cancel_during_a_retry_post_that_is_held_stops_polling(self, backend: CachekitIOBackend) -> None:
+        fake = _GatedRequests(_json_response(200, _HELD), _json_response(200, _HELD), held_posts=frozenset({1}))
+        backend._request_async = fake  # type: ignore[method-assign]
+
+        task = asyncio.create_task(_hold_lock(backend, blocking_timeout=5.0))
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 2
+        assert fake.calls == ["POST", "POST"]
+
+    async def test_cancel_through_the_decorator_wins_over_a_drained_lock_error(self, backend: CachekitIOBackend) -> None:
+        """End to end: the cancelled caller sees CancelledError and never runs the function without the lock."""
+        fake = _GatedRequests(BackendError("bad key", error_type=BackendErrorType.AUTHENTICATION))
+        backend._request_async = fake  # type: ignore[method-assign]
+        backend.get = MagicMock(return_value=None)  # type: ignore[method-assign]  # L2 miss: the lock path runs
+        calls = 0
+
+        @cache(backend=backend, ttl=300, l1_enabled=False)
+        async def compute(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x * 2
+
+        task = asyncio.create_task(compute(1))
+        await _reached(fake.post_entered)
+        task.cancel()
+        fake.post_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake.posts_done == 1
+        assert fake.calls == ["POST"]
+        assert calls == 0

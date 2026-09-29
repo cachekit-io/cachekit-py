@@ -42,6 +42,11 @@ from .serializers.base import SerializationError, unpackb_bounded
 # trailing newline. Pinned by the reject_trailing_newline error vector.
 SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
+# Exact-match, namespace-only: the CachekitIO server parses a key starting
+# ns: or nsapi: as namespace-prefixed (protocol spec/cache-key-format.md
+# "Server-Side Requirements"). Operations may still be ns / nsapi.
+RESERVED_NAMESPACES = frozenset({"ns", "nsapi"})
+
 UINT64_MAX = 2**64 - 1
 INT64_MIN = -(2**63)
 # Exact float64 bounds for the integral-collapse range check. Both are powers
@@ -282,11 +287,17 @@ def validate_segment(name: str, segment: object) -> str:
 
     Full-string match against ``^[a-z0-9][a-z0-9._-]{0,63}$`` — never silently
     normalized. re.fullmatch, not re.match: $ accepts a trailing newline.
+    A namespace must additionally not be one of :data:`RESERVED_NAMESPACES`.
     """
     if not isinstance(segment, str) or not SEGMENT_RE.fullmatch(segment):
         raise InteropError(
             f"invalid interop {name} {segment!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
             f"(lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
+        )
+    if name == "namespace" and segment in RESERVED_NAMESPACES:
+        raise InteropError(
+            f"invalid interop namespace {segment!r}: reserved, because the CachekitIO server parses a key "
+            f"starting '{segment}:' as namespace-prefixed"
         )
     return segment
 
@@ -481,6 +492,7 @@ def ensure_interop_backend_compatible(backend: Any) -> None:
 __all__ = [
     "InteropDecodeError",
     "InteropError",
+    "RESERVED_NAMESPACES",
     "SEGMENT_RE",
     "args_hash",
     "bind_flat_args",
