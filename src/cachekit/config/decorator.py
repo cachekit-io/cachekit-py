@@ -350,9 +350,7 @@ class DecoratorConfig:
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
         Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
-        Note: integrity_checking is forced to True (non-negotiable for security). Passing
-              integrity_checking=False raises ConfigurationError — here and as an override
-              next to @cache(config=DecoratorConfig.secure(...)).
+        Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
@@ -366,7 +364,7 @@ class DecoratorConfig:
             DecoratorConfig with encryption enabled and full security features
 
         Raises:
-            ConfigurationError: If ``integrity_checking=False`` is passed.
+            ConfigurationError: If a falsy ``integrity_checking`` is passed.
 
         Example:
             >>> config = DecoratorConfig.secure(master_key="a" * 64, ttl=600)
@@ -383,9 +381,10 @@ class DecoratorConfig:
 
         # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
         # rejected, never silently dropped (protocol intent-presets.md § Explicit Configuration).
-        if not kwargs.pop("integrity_checking", True):
+        integrity_checking = kwargs.pop("integrity_checking", True)
+        if not integrity_checking:
             raise ConfigurationError(
-                "@cache.secure does not accept integrity_checking=False — the secure preset forces "
+                f"The secure preset does not accept integrity_checking={integrity_checking!r} — it forces "
                 "integrity checking on. Omit integrity_checking."
             )
 

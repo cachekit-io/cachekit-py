@@ -398,10 +398,9 @@ class TestSecureIntegrityChecking:
     """.secure forces integrity_checking on. Asking to turn it off is a ConfigurationError on every
     path, never a silent drop or a silent pass (protocol intent-presets.md § Explicit Configuration)."""
 
-    # Each form hands integrity_checking to .secure a different way; the config= forms share one branch.
+    # Each form hands integrity_checking to .secure a different way.
     FORMS = {
         "config": lambda v: cache(config=DecoratorConfig.secure(master_key=_SECURE_KEY), integrity_checking=v),
-        "secure-config": lambda v: cache.secure(config=DecoratorConfig.secure(master_key=_SECURE_KEY), integrity_checking=v),
         "secure-kwarg": lambda v: cache.secure(master_key=_SECURE_KEY, integrity_checking=v),
     }
 
@@ -429,9 +428,28 @@ class TestSecureIntegrityChecking:
 
         assert resolved == []
 
-    def test_classmethod_disable_rejected(self) -> None:
+    @pytest.mark.parametrize("value", [False, None], ids=["false", "none"])
+    def test_classmethod_disable_rejected(self, value: object) -> None:
         with pytest.raises(ConfigurationError, match="integrity_checking"):
-            DecoratorConfig.secure(master_key=_SECURE_KEY, integrity_checking=False)
+            DecoratorConfig.secure(master_key=_SECURE_KEY, integrity_checking=value)
+
+    @pytest.mark.parametrize("overrides", [{}, {"integrity_checking": False}], ids=["bare", "integrity-off"])
+    @pytest.mark.parametrize(
+        "config",
+        [DecoratorConfig.minimal(backend=None), DecoratorConfig.secure(master_key=_SECURE_KEY)],
+        ids=["unencrypted", "secure"],
+    )
+    def test_secure_config_rejected(
+        self, resolved: list[DecoratorConfig], config: DecoratorConfig, overrides: dict[str, object]
+    ) -> None:
+        """config= would replace the secure preset wholesale (an unencrypted one caches plaintext), as with .io."""
+        with pytest.raises(ConfigurationError, match="does not accept config="):
+
+            @cache.secure(config=config, **overrides)
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
 
     @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
     def test_explicit_true_accepted(self, resolved: list[DecoratorConfig], form: str) -> None:
