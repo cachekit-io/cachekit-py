@@ -17,7 +17,6 @@ from cachekit.hash_utils import redact_error_for_log
 from ..backends.errors import BackendError
 from ..cache_handler import (
     CacheHit,
-    CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
@@ -716,13 +715,6 @@ def create_cache_wrapper(
     cache_handler_strategy = None
 
     operation_handler = CacheOperationHandler(serialization_handler, key_generator, cache_handler=cache_handler_strategy)
-    # serializer_type comes from the serialization handler (not the raw `serializer` arg) so the
-    # invalidator's key is byte-identical to the one the read/write path writes (LAB-4351).
-    invalidator = CacheInvalidator(
-        key_generator,
-        integrity_checking=integrity_checking,
-        serializer_type=serialization_handler.serializer_key_name,
-    )
 
     # Configuration validation (no CacheConfig object needed - using direct variables)
     # Validate encryption configuration if encryption is enabled
@@ -1140,6 +1132,25 @@ def create_cache_wrapper(
         flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
         return generate_interop_key(namespace, interop, flat)
 
+    def _resolve_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
+        """Single key derivation shared by the read/write and invalidate paths (LAB-4387)."""
+        # Interop mode takes priority (mutually exclusive with key= and fast_mode)
+        if interop is not None:
+            return _interop_cache_key(call_args, call_kwargs)
+        # Custom key function (escape hatch for complex types)
+        if custom_key_func is not None:
+            custom_key = custom_key_func(*call_args, **call_kwargs)
+            if not isinstance(custom_key, str):
+                raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
+            return f"{namespace or 'default'}:{custom_key}"
+        if fast_mode:
+            # Minimal key generation - no string formatting overhead (10-50μs savings)
+            from ..hash_utils import cache_key_hash
+
+            return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
+        # Standard key generation with type-aware handling
+        return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
+
     # Track the cache keys this process wrote or read for this function (for no-args
     # invalidation). Key normalization (hashing of long keys) makes prefix matching
     # unreliable, so actual keys are tracked. Keys written only by other processes are not in
@@ -1299,24 +1310,7 @@ def create_cache_wrapper(
 
         # Key generation - needed for both L1-only and L1+L2 modes
         try:
-            # Interop mode takes priority (mutually exclusive with key= and fast_mode)
-            if interop is not None:
-                cache_key = _interop_cache_key(args, kwargs)
-            # Custom key function takes priority (escape hatch for complex types)
-            elif custom_key_func is not None:
-                custom_key = custom_key_func(*args, **kwargs)
-                if not isinstance(custom_key, str):
-                    raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
-                cache_key = f"{namespace or 'default'}:{custom_key}"
-            elif fast_mode:
-                # Minimal key generation - no string formatting overhead
-                from ..hash_utils import cache_key_hash
-
-                cache_namespace = namespace or "default"
-                args_kwargs_str = str(args) + str(kwargs)
-                cache_key = cache_namespace + ":" + func_hash + ":" + cache_key_hash(args_kwargs_str)
-            else:
-                cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
+            cache_key = _resolve_cache_key(args, kwargs)
         except Exception as e:
             if interop is not None:
                 # Interop/v1: out-of-model arguments MUST be rejected with an
@@ -1730,25 +1724,7 @@ def create_cache_wrapper(
             # Get cache key early for consistent usage - note this may fail for complex types
             cache_key = None
             try:
-                # Interop mode takes priority (mutually exclusive with key= and fast_mode)
-                if interop is not None:
-                    cache_key = _interop_cache_key(args, kwargs)
-                # Custom key function takes priority (escape hatch for complex types)
-                elif custom_key_func is not None:
-                    custom_key = custom_key_func(*args, **kwargs)
-                    if not isinstance(custom_key, str):
-                        raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
-                    cache_key = f"{namespace or 'default'}:{custom_key}"
-                elif fast_mode:
-                    # Fast-path key generation (10-50μs savings)
-                    from ..hash_utils import cache_key_hash
-
-                    cache_namespace = namespace or "default"
-                    args_kwargs_str = str(args) + str(kwargs)
-                    cache_key = cache_namespace + ":" + func_hash + ":" + cache_key_hash(args_kwargs_str)
-                else:
-                    # Standard key generation with type-aware handling
-                    cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
+                cache_key = _resolve_cache_key(args, kwargs)
             except Exception as e:
                 if interop is not None:
                     # Interop/v1: out-of-model arguments MUST be rejected with an
@@ -2287,6 +2263,28 @@ def create_cache_wrapper(
             _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
             _local_invalidate_all()
 
+    def _invalidate_key(cache_key: str) -> None:
+        """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
+        via asyncio.to_thread, like _drain_all.
+
+        Untrack BEFORE the delete: a concurrent write landing after the delete re-tracks its key
+        (_put_l1 records after the put), so it can never be left in L2 untracked. A failed delete
+        re-tracks the key, so a later no-args invalidate_cache() retries it.
+        """
+        entry = (_l2_scope(), cache_key)
+        _cached_keys.discard(entry)
+        if _backend and not _l1_only_mode:
+            try:
+                _backend.delete(cache_key)
+            except Exception as e:
+                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
+                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                _cached_keys.add(entry)
+        if _object_cache:
+            _object_cache.delete(cache_key)
+        elif _l1_cache:
+            _l1_cache.invalidate(cache_key)
+
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
 
@@ -2300,6 +2298,11 @@ def create_cache_wrapper(
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
 
+        # Same interop guard as reads and writes: a key-prefixing backend would delete
+        # {prefix}{key} and leave the bare entry other SDKs read in place.
+        if interop is not None:
+            ensure_interop_backend_compatible(_backend)
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
@@ -2307,31 +2310,9 @@ def create_cache_wrapper(
             _drain_all()
             return
 
-        # Single-key invalidation (specific args provided, or zero-param function)
-        if interop is not None:
-            cache_key = _interop_cache_key(args, kwargs)
-        else:
-            cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
-
-        if _object_cache and cache_key:
-            _object_cache.delete(cache_key)
-        elif _l1_cache and cache_key:
-            _l1_cache.invalidate(cache_key)
-        _cached_keys.discard((_l2_scope(), cache_key))
-
-        if _backend and not _l1_only_mode:
-            invalidator.set_backend(_backend)
-            if interop is not None:
-                # CacheInvalidator regenerates auto-mode keys internally, which
-                # would miss the interop entry — delete the interop key directly.
-                # Log at ERROR (matching CacheInvalidator): a failed interop
-                # delete means OTHER SDKs keep serving the stale entry.
-                try:
-                    _backend.delete(cache_key)
-                except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-            else:
-                invalidator.invalidate_cache(func, args, kwargs, namespace)
+        # Single-key invalidation (specific args provided, or zero-param function).
+        # Same derivation as the write path — one key, not two (LAB-4387).
+        _invalidate_key(_resolve_cache_key(args, kwargs))
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -2346,6 +2327,9 @@ def create_cache_wrapper(
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
 
+        if interop is not None:  # interop guard, as in invalidate_cache
+            ensure_interop_backend_compatible(_backend)
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         if not args and not kwargs and _func_has_params:
@@ -2353,32 +2337,11 @@ def create_cache_wrapper(
             await asyncio.to_thread(_drain_all)
             return
 
-        # Single-key invalidation (specific args provided, or zero-param function)
-        if interop is not None:
-            cache_key = _interop_cache_key(args, kwargs)
-        else:
-            cache_key = operation_handler.get_cache_key(func, args, kwargs, namespace, integrity_checking)
-
-        if _object_cache and cache_key:
-            _object_cache.delete(cache_key)
-        elif _l1_cache and cache_key:
-            _l1_cache.invalidate(cache_key)
-        _cached_keys.discard((_l2_scope(), cache_key))
-
-        # Clear L2 cache via invalidator (skip in L1-only mode)
-        if _backend and not _l1_only_mode:
-            invalidator.set_backend(_backend)
-            if interop is not None:
-                # CacheInvalidator regenerates auto-mode keys internally, which
-                # would miss the interop entry — delete the interop key directly.
-                # Log at ERROR (matching CacheInvalidator): a failed interop
-                # delete means OTHER SDKs keep serving the stale entry.
-                try:
-                    _backend.delete(cache_key)
-                except Exception as e:
-                    _logger.error("Failed to delete L2 interop key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-            else:
-                await invalidator.invalidate_cache_async(func, args, kwargs, namespace)
+        # Single-key invalidation (specific args provided, or zero-param function).
+        # Same derivation as the write path — one key, not two (LAB-4387). The sync delete runs
+        # off the loop; never a backend's delete_async, whose pooled client may be bound to an
+        # earlier event loop (asyncio.run per job).
+        await asyncio.to_thread(_invalidate_key, _resolve_cache_key(args, kwargs))
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""

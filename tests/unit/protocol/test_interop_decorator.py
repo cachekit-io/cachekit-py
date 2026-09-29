@@ -415,6 +415,52 @@ class TestInteropRejections:
                 await wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
 
+    @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
+    def test_invalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
+        """Invalidation runs the same guard as reads and writes. Without it, an invalidate-only
+        caller on a key-prefixing backend deletes {prefix}{key} and returns normally, while the
+        bare interop entry other SDKs read stays cached."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        key = KEY_VECTORS["single_int"]["expected_key"]
+        prefixed = DictBackend(key_prefix="t:default:")
+        prefixed.store[key] = b"written by another SDK"
+
+        def get_user(user_id: int):
+            return user_id
+
+        wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
+        provider = Mock()
+        provider.get_backend.return_value = prefixed
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                wrapped.invalidate_cache(*call_args)
+        assert key in prefixed.store
+
+    @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
+    async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
+        """Async mirror of test_invalidate_on_lazy_prefixing_backend_fails_closed."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        key = KEY_VECTORS["single_int"]["expected_key"]
+        prefixed = DictBackend(key_prefix="t:default:")
+        prefixed.store[key] = b"written by another SDK"
+
+        async def get_user(user_id: int):
+            return user_id
+
+        wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
+        provider = Mock()
+        provider.get_backend.return_value = prefixed
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                await wrapped.ainvalidate_cache(*call_args)
+        assert key in prefixed.store
+
     async def test_async_lazy_provider_failure_falls_back_uncached(self):
         """Backend-creation failure degrades to uncached execution (same
         contract as the sync interop path) — loud failure is reserved for
