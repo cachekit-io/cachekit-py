@@ -180,7 +180,8 @@ assert problematic_function.get_health_status()["circuit_breaker"]["config"]["ti
 ```python
 @cache(ttl=300)  # 5 minute cache
 def get_data():
-    # Backend down: the circuit opens and never serves stale cache
+    # Circuit OPEN: L1 and L2 are skipped, so no cache, stale or fresh, is served
+    # (backend errors do not currently count toward the breaker, so an outage alone does not open it)
     # Result: every call runs this function, so the database takes full load
     # Solution: size the data source for uncached traffic during an outage
     return fetch_data()
@@ -294,11 +295,9 @@ class CircuitBreaker:
 
 ### Integration with Caching
 ```
-L1 cache hit → Use immediately (circuit breaker doesn't matter)
-L1 miss, L2 hit → Return from L2 (circuit breaker doesn't matter)
-L1 miss, L2 miss → Call function (circuit breaker matters)
-Function call → Circuit breaker wraps Redis storage
-Redis error → Circuit opens after N failures
+Circuit CLOSED → L1, then L2, then the function, as usual
+Circuit OPEN → L1 and L2 are both skipped: the function runs uncached
+Redis error → Logged: a failed read is a miss, a failed write skips L2 only, and L1 still stores the result (backend errors do not currently count toward the breaker)
 ```
 
 ### Performance Impact
@@ -312,12 +311,12 @@ Redis error → Circuit opens after N failures
 
 **Circuit Breaker + Distributed Locking**:
 ```python notest
-@cache(ttl=300, backend=None)  # Both features enabled
+@cache(ttl=300)  # Both features enabled (they need an L2 backend)
 def fetch(key):
     # L2 miss → Distributed lock acquired
     # Only one pod calls fetch()
-    # If L2 fails → Circuit opens
-    # Each pod runs fetch() uncached (no cascade)
+    # If L2 fails → logged; backend errors do not currently count toward the breaker
+    # Each pod runs fetch() on its own L1 miss and keeps the result in its L1
     return db.fetch(key)  # illustrative - not defined
 ```
 
@@ -326,7 +325,7 @@ def fetch(key):
 @cache.secure(master_key=secret_key, ttl=300)  # Both features enabled
 def fetch_sensitive(key):
     # Encryption happens before L2 write
-    # If L2 fails → Circuit opens
+    # If L2 fails → logged; the result still goes to L1; backend errors do not currently count toward the breaker
     # A decrypt/integrity failure on read never counts toward the breaker.
     # Fail-open (default): it is a cache miss and the function runs.
     # fail_closed=True: an authentication failure raises DecryptionAuthenticationError

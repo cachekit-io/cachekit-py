@@ -70,7 +70,7 @@ Python object (plaintext, in-app only)
 - **AES-256-GCM**: Authenticated encryption, 256-bit key
 - **Client-side**: Encryption happens in Python, before Redis
 - **Master key**: CACHEKIT_MASTER_KEY environment variable
-- **Per-tenant isolation**: Optional key derivation for multi-tenant
+- **Per-tenant key derivation**: Optional, and *not* a tenancy boundary on its own (see Multi-Tenant Isolation)
 - **Nonce uniqueness**: Counter-based, prevents nonce reuse
 - **Authentication**: GCM mode prevents tampering
 
@@ -358,29 +358,19 @@ df = get_patient_records(42)
 ```
 
 ### Multi-Tenant Isolation
-```python notest
-from cachekit import cache
-from contextvars import ContextVar
 
-tenant_context = ContextVar("tenant_id")
-
-@cache.secure(
-    ttl=3600,
-    master_key=secret_key,
-    tenant_extractor=lambda user_id: tenant_context.get(),
-)
-def get_user_data(user_id):
-    tenant_id = tenant_context.get()
-    return db.get_user_data(tenant_id, user_id)  # illustrative - db not defined
-
-# Each tenant gets separate encryption key
-# Tenant A can't decrypt Tenant B's data
-tenant_context.set("tenant_1")
-data_a = get_user_data(123)
-
-tenant_context.set("tenant_2")
-data_b = get_user_data(123)  # Same user_id, different tenant, different encryption
-```
+> [!CAUTION]
+> **`tenant_extractor` is not a tenancy boundary.** Cache keys carry no tenant
+> component — the key is `ns:{ns}:func:{mod.fn}:args:{hash}:{flags}` — so tenants
+> calling with identical arguments address the same entry. Give each tenant its own
+> `namespace` or its own deployment, or make the tenant id a keyword argument of the
+> cached function so it is part of the args hash.
+>
+> `tenant_extractor` requires an object implementing `.extract(args, kwargs)`, such as
+> `ArgumentNameExtractor` or `ContextVarExtractor`, and tenant ids must be valid UUIDs.
+> `ContextVarExtractor.set_tenant_id()` rejects a non-UUID id with `ValueError`. With
+> `ArgumentNameExtractor` a non-UUID id fails at store time, and a bare `lambda` fails on
+> every call; either way the failure is logged and the result is not written to the cache.
 
 ### Key Rotation Pattern
 
@@ -458,7 +448,7 @@ Decryption:
 ### Per-Tenant Key Derivation
 ```
 Master key: CACHEKIT_MASTER_KEY
-Tenant ID: tenant_context.get()
+Tenant ID: tenant_extractor.extract(args, kwargs)  (or the single-tenant id below)
 
 Per-tenant key = HKDF(master_key, tenant_id)
                  [Key Derivation Function, cryptographically secure]
@@ -469,11 +459,13 @@ Single-tenant mode (no tenant_extractor):
   § Master Key Input, rule 5), used identically for HKDF and AAD — one master
   key is enough for py, rs and ts to share ciphertext.
 
-Properties:
+Properties of the derivation itself:
 - Tenant A's key ≠ Tenant B's key
 - Derived keys are unique per tenant
-- Tenant A can't decrypt Tenant B's data
-- Enables secure multi-tenant with single master key
+
+This is not a tenancy boundary: the cache key carries no tenant component, so
+tenants calling with identical arguments address the same entry. See Multi-Tenant
+Isolation above.
 ```
 
 ### Nonce Generation (Uniqueness)
@@ -558,11 +550,11 @@ them (cachekit-py#170):
 
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or the entry claims a different tenant. The plaintext frame
-  header fields built into the AAD (`format`, `compressed`, `original_type`) are
-  unencrypted, but the AAD built from them is authenticated by the tag: a header change
-  that produces different AAD bytes also fails here. (The tag authenticates the
-  constructed AAD, not the header's JSON bytes.) Raised as
+  between cache keys). The plaintext frame header fields built into the AAD
+  (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
+  them is authenticated by the tag: a header change that produces different AAD bytes
+  also fails here. (The tag authenticates the constructed AAD, not the header's JSON
+  bytes.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
@@ -741,11 +733,12 @@ def get_data():
 ```
 
 A decrypt or integrity failure says nothing about backend health, so the breaker ignores it. For
-fail-open reads, the `cache_get_deserialize` failure metric and warning log still fire. This keeps a
+fail-open reads, the warning log and the failure metric,
+`cache_operations_total{operation="cache_get_deserialize", success="False"}`, still fire. This keeps a
 lazy plaintext→encrypted migration, where every pre-encryption entry is refused once, from opening
 the breaker. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError`
 to the caller instead of recomputing. It emits `cachekit_decrypt_failures_total` and the
-authentication error log, but not the `cache_get_deserialize` metric or warning log. It does not
+authentication error log, but not the `operation="cache_get_deserialize"` sample or warning log. It does not
 count toward the breaker either.
 
 **Encryption + L1 Cache**:
@@ -822,7 +815,6 @@ export default {
 
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
-- ✅ Multi-tenant isolation (per-tenant encryption keys)
 - ✅ Supports a compliance scope-reduction argument on an explicit path (see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
@@ -832,7 +824,7 @@ export default {
 
 - [Comparison Guide](../comparison.md) - Only cachekit has zero-knowledge encryption
 - [Security Policy](../../SECURITY.md)
-- [Multi-Tenant Encryption](../getting-started.md#multi-tenant)
+- [Multi-Tenant Isolation](#multi-tenant-isolation) - why per-tenant keys are not a tenancy boundary
 - [Serializer Guide](../serializers/README.md) - Encryption with custom serializers
 - [Performance Benchmarks](../../tests/performance/test_encryption_overhead.py) - Evidence-based overhead measurements
 

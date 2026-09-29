@@ -431,7 +431,6 @@ def create_cache_wrapper(
     interop: str | None = None,
     # L1-only mode flag
     _l1_only_mode: bool = False,
-    **kwargs: Any,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -461,7 +460,8 @@ def create_cache_wrapper(
                          If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
                          CACHEKIT_DEPLOYMENT_UUID is set).
                          If provided: multi-tenant mode (extracts tenant_id from function args/kwargs).
-                         FAIL CLOSED: extraction failure raises ValueError (no fallback to shared key).
+                         A failed extraction is logged and the result is not written to the cache
+                         (no fallback to a shared key).
         single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                            Mutually exclusive with tenant_extractor. Prevents accidental shared
                            keys in multi-tenant deployments by requiring explicit configuration.
@@ -496,9 +496,12 @@ def create_cache_wrapper(
                 exclusive with key= and fast_mode. None (default) = auto mode.
 
     Security Note:
-        When encryption=True and tenant_extractor is provided, tenant ID extraction
-        uses FAIL CLOSED security policy. If extraction fails, ValueError propagates to caller
-        (no fallback to shared encryption key). This ensures cryptographic tenant isolation.
+        When encryption=True and tenant_extractor is provided: a failed extraction is logged
+        and the result is not written to the cache. There is no fallback to a shared key.
+        tenant_extractor is NOT a tenancy boundary — cache keys carry no tenant component, so
+        two tenants calling with identical arguments address the same entry. Give each tenant
+        its own namespace or deployment, or make the tenant id a keyword argument of the cached
+        function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
 
