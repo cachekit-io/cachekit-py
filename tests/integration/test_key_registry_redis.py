@@ -7,7 +7,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -275,35 +274,42 @@ class TestDecoratorOnRedis:
         assert calls == 2
         assert _cache_keys(client, "default") == set()
 
-    def test_writes_during_drain_are_never_orphaned(self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With set-then-track ordering, every key left in L2 after concurrent
-        writes and a multi-round drain is still in the tracking set for the next drain."""
+    def test_writes_between_drain_rounds_are_popped_or_left_tracked(
+        self, client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Writes another wrapper lands between drain rounds: those after a full round are
+        popped by a later round, those after the final short round stay in the set."""
         monkeypatch.setattr(provider_module, "_DRAIN_CHUNK", 25)
         writer_fn = cache(backend=PerRequestRedisBackend(client, "default"), ttl=300, namespace="key_registry_race")(
             worker.lookup
         )
-        drainer = cache(backend=PerRequestRedisBackend(client, "default"), ttl=300, namespace="key_registry_race")(worker.lookup)
+        drain_backend = PerRequestRedisBackend(client, "default")
+        drainer = cache(backend=drain_backend, ttl=300, namespace="key_registry_race")(worker.lookup)
         for x in range(200):
             writer_fn(x)
 
-        stop = threading.Event()
+        real_script = client.register_script(provider_module._DRAIN_SCRIPT)
+        rounds: list[int] = []
 
-        def write_more() -> None:
-            x = 1_000
-            while not stop.is_set() and x < 3_000:
-                writer_fn(x)
-                x += 1
+        def script_then_write(*args: object, **kwargs: object) -> list[bytes]:
+            popped = real_script(*args, **kwargs)
+            rounds.append(len(popped))
+            if len(rounds) == 1:
+                for x in range(1_000, 1_010):  # mid-drain: a later round must pop these
+                    writer_fn(x)
+            elif len(popped) < 25:
+                for x in range(2_000, 2_010):  # after the last round: left for the next drain
+                    writer_fn(x)
+            return popped
 
-        t = threading.Thread(target=write_more)
-        t.start()
-        for _ in range(5):
-            drainer.invalidate_cache()
-        stop.set()
-        t.join()
+        monkeypatch.setattr(drain_backend, "_drain_script", script_then_write)
+        drainer.invalidate_cache()
+        assert rounds == [25] * 8 + [10]  # 200 + 10 members, then the short final round
 
-        (reg,) = _registry_sets(client) or [None]
-        tracked = {b"t:default:" + m for m in client.smembers(reg)} if reg else set()
-        assert _cache_keys(client, "default") <= tracked
+        (reg,) = _registry_sets(client)
+        tracked = {b"t:default:" + m for m in client.smembers(reg)}
+        left = _cache_keys(client, "default")
+        assert len(left) == 10 and left == tracked
 
     def test_multi_tenant_drain_is_tenant_scoped(self, client: redis.Redis) -> None:
         """One wrapper serves every tenant: each call writes and tracks under the tenant of its
