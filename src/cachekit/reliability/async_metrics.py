@@ -74,19 +74,19 @@ class _NoopMetric:
 # Every collector (one per decorated function) must record into the same documented
 # series; registering per instance collides on the second collector.
 _metrics_cache: dict[str, Any] = {}
-_metrics_lock = threading.Lock()
-_metrics_lock_pid = os.getpid()  # owner process — a C-level fork skips the at-fork hooks below
+# One lock per process, keyed by pid: a C-level fork skips the at-fork hooks below, so a
+# child must never take a lock it inherited, possibly held by a thread that is gone.
+_metrics_locks: dict[int, threading.Lock] = {}
 
 
 def _metrics_cache_lock() -> threading.Lock:
-    """Return the metric-cache lock, replacing one inherited through a hookless fork."""
-    global _metrics_lock, _metrics_lock_pid
-    if _metrics_lock_pid != os.getpid():
-        # Forked child whose at-fork hooks never ran: the inherited lock may be held by
-        # a thread that does not exist here. Same recovery as the wrapper's SWR state.
-        _metrics_lock = threading.Lock()
-        _metrics_lock_pid = os.getpid()
-    return _metrics_lock
+    """Return this process's metric-cache lock, creating it on first use."""
+    pid = os.getpid()
+    lock = _metrics_locks.get(pid)
+    if lock is None:
+        # setdefault is atomic, so threads racing here in a new child all get one lock.
+        lock = _metrics_locks.setdefault(pid, threading.Lock())
+    return lock
 
 
 def _acquire_metrics_lock() -> None:
@@ -94,22 +94,16 @@ def _acquire_metrics_lock() -> None:
 
 
 def _release_metrics_lock() -> None:
-    _metrics_lock.release()
-
-
-def _release_metrics_lock_in_child() -> None:
-    global _metrics_lock_pid
-    _metrics_lock_pid = os.getpid()
-    _metrics_lock.release()
+    _metrics_cache_lock().release()
 
 
 if hasattr(os, "register_at_fork"):
-    # Hold the lock across fork (as the logging module does): a child must never inherit it
-    # held by a thread that no longer exists, nor a metric registered but not yet cached.
+    # Hold the lock across fork (as the logging module does) so no thread is between
+    # registering a metric and caching it. The child drops its copy, still held.
     os.register_at_fork(
         before=_acquire_metrics_lock,
         after_in_parent=_release_metrics_lock,
-        after_in_child=_release_metrics_lock_in_child,
+        after_in_child=_metrics_locks.clear,
     )
 
 

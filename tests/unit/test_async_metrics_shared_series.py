@@ -198,3 +198,37 @@ def test_hookless_fork_while_sibling_holds_metric_lock_does_not_hang_child() -> 
     release.set()
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
+
+
+def test_threads_of_a_new_process_share_one_metric_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every thread of a freshly forked child must serialise on the same lock, even when they race to create it."""
+    from types import SimpleNamespace
+
+    import cachekit.reliability.async_metrics as am
+
+    first_inside, second_done = threading.Event(), threading.Event()
+    created: list[object] = []
+
+    def first_creation_waits_for_second_thread() -> object:
+        lock = threading.Lock()
+        created.append(lock)
+        if len(created) == 1:
+            first_inside.set()
+            second_done.wait(5)
+        return lock
+
+    monkeypatch.setattr(am, "_metrics_locks", {})  # this process has not created its lock yet
+    monkeypatch.setattr(am, "threading", SimpleNamespace(Lock=first_creation_waits_for_second_thread))
+    got: dict[str, object] = {}
+
+    def second() -> None:
+        got["second"] = am._metrics_cache_lock()
+        second_done.set()
+
+    first = threading.Thread(target=lambda: got.update(first=am._metrics_cache_lock()))
+    first.start()
+    assert first_inside.wait(5)
+    threading.Thread(target=second).start()
+    first.join(5)
+
+    assert got["first"] is got["second"]
