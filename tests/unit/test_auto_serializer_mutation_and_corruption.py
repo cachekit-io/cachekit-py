@@ -85,8 +85,9 @@ class _Label(enum.IntEnum):
 
 # Values that score >= 3 on ``_looks_like_envelope`` AS THE READER DECODES THEM — one population,
 # pinned on both sides: the reader refuses these, so an integrity-off writer must not write them.
-# The last two only score after the round trip: bytearray packs as bin and decodes as bytes, and
-# an IntEnum packs and decodes as a plain int.
+# The last three only score after the round trip: bytearray and memoryview pack as bin and decode as
+# bytes, and an IntEnum packs and decodes as a plain int. The memoryview row's other slots score only
+# 2, so a pre-screen on the raw object that knows bytes and bytearray but not memoryview skips it.
 ENVELOPE_SHAPED = [
     pytest.param([b"blob", list(range(1, 9)), 42, "label"], id="3of4-label"),
     pytest.param([b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"], id="4of4-png-series"),
@@ -96,6 +97,7 @@ ENVELOPE_SHAPED = [
     pytest.param(["s", [1, 2, 3, 4, 5, 6, 7, 8], 5, "msgpack"], id="3of4-bytes-slot-irrelevant"),
     pytest.param([bytearray(b"blob"), list(range(1, 9)), 42, "label"], id="bytearray-decodes-as-bytes"),
     pytest.param([b"blob", list(range(1, 9)), _Label.ANSWER, "label"], id="intenum-decodes-as-int"),
+    pytest.param([memoryview(b"blob"), list(range(1, 9)), 42, 7], id="memoryview-decodes-as-bytes"),
 ]
 
 
