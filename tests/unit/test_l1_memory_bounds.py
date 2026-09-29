@@ -272,7 +272,8 @@ class TestCleanupThreadAfterFork:
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     @pytest.mark.parametrize("put_from_new_thread", [False, True], ids=["forking-thread", "reused-ident"])
-    def test_forked_child_survives_cache_lock_held_at_fork(self, put_from_new_thread):
+    @pytest.mark.parametrize("get_first", [False, True], ids=["put-first", "get-first"])
+    def test_forked_child_survives_cache_lock_held_at_fork(self, put_from_new_thread, get_first):
         import multiprocessing
         import queue as queue_mod
 
@@ -296,6 +297,8 @@ class TestCleanupThreadAfterFork:
 
             def child(q) -> None:
                 def put() -> None:
+                    if get_first:  # a decorator's first call: get() before any put() runs the take-over
+                        assert cache.get("pre-fork") == (False, None)  # dropped: the holder may have torn it
                     cache.put("live", b"v")
                     cache.put("short", b"v", redis_ttl=1.2)  # minus the 1s ttl buffer: expires in ~0.2s
 

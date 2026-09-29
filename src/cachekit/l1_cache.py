@@ -9,6 +9,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -246,16 +247,17 @@ class L1Cache:
             # Move to end (most recently used)
             self._cache.move_to_end(key)
 
-    def _reset_lock_after_fork(self) -> None:
-        """Replace _lock if a parent thread held it at fork; call only from a fork take-over.
+    def _reset_lock_after_fork(self, timeout: float = 1.0) -> None:
+        """Replace _lock if a parent thread held it at fork; call only from a fork take-over or hook.
 
         The holder does not exist in the child, so the lock never releases. _is_owned() first:
         a thread started in the child can reuse the dead holder's ident and so "own" its hold.
-        The timeout waits out a child thread briefly holding the lock legitimately. An orphaned
-        holder may have left the entries half-updated, so they are dropped; L2 still has them.
+        The timeout waits out a child thread briefly holding the lock legitimately; the at-fork
+        hook passes 0, as no other child thread exists yet. An orphaned holder may have left the
+        entries half-updated, so they are dropped; L2 still has them.
         """
         lock = self._lock
-        if not lock._is_owned() and lock.acquire(timeout=1.0):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        if not lock._is_owned() and lock.acquire(timeout=timeout):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
             lock.release()
             return
         logger.warning(
@@ -432,6 +434,7 @@ class L1CacheManager:
         # them calls _take_over_if_forked() first, or a forked child uses parent state.
         self._owner_pid = os.getpid()
         self._fork_locks: dict[int, threading.Lock] = {}
+        _managers.add(self)
 
     def _take_over_if_forked(self) -> None:
         """Take over inherited state in a forked child; restart cleanup if the parent ran it.
@@ -442,10 +445,10 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread. A thread the parent had stopped stays stopped. Known limit: a get() that reaches
-        a cache lock orphaned at fork before any put in the child has run this hangs for the
-        child's life. Decorated functions get() before they put(), so their first call in that
-        namespace is exposed.
+        thread. A thread the parent had stopped stays stopped. Decorated functions get() before
+        they put(), so _reset_cache_locks_after_fork repairs orphaned cache locks before that
+        first get() on os.fork() servers; without at-fork hooks (uWSGI unless
+        --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -571,6 +574,27 @@ class L1CacheManager:
             for cache in self._caches.values():
                 cache.clear()
             logger.info("Cleared all L1 caches")
+
+
+# Every live manager, for the at-fork hook. Weak: tests and callers may create and drop managers.
+_managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
+
+
+def _reset_cache_locks_after_fork() -> None:
+    """Replace every L1Cache lock a parent thread held at fork, before the child's first get().
+
+    Decorators get() before they put(), so the put-path take-over comes too late for a lock a
+    parent thread (say the cleanup sweep) held at fork: that first get() would hang for the
+    child's life. The child is single-threaded here, so the probe needs no timeout. Only the
+    locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
+    """
+    for manager in list(_managers):
+        for cache in list(manager._caches.values()):
+            cache._reset_lock_after_fork(timeout=0)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_cache_locks_after_fork)
 
 
 # Global L1 cache manager instance
