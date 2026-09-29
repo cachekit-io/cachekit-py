@@ -232,12 +232,16 @@ set exactly one.
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
-the `cachekit.decorators.orchestrator` logger, and runs the function uncached. The
-error recurs, so this happens on every call, and the log line is the only signal:
+the `cachekit.decorators.orchestrator` logger, and runs the function uncached:
 
 ```text
 Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
 ```
+
+The misconfiguration never heals on its own. After 5 consecutive failures (the default) the
+function's circuit breaker opens and logs one `transitioned to OPEN` WARNING on
+`cachekit.reliability.circuit_breaker`; from then on calls still run uncached but no longer log
+each failure. Those WARNINGs are the only signal.
 
 `REDIS_URL` is a 12-factor fallback and never counts as a conflict.
 

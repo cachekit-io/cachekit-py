@@ -206,7 +206,7 @@ def get_user_profile(user_id: str) -> dict:
       serialize(result) -> encrypt(HKDF-derived key) -> PUT /v1/cache/{key}
       GET /v1/cache/{key} -> decrypt() -> deserialize() -> return result
 
-    The cachekit.io API sees only encrypted bytes. Zero-knowledge.
+    The cachekit.io API sees only encrypted values; the cache key in the URL path is cleartext.
     """
     return fetch_user_from_db(user_id)
 ```
@@ -215,7 +215,7 @@ def get_user_profile(user_id: str) -> dict:
 - `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
 - Per-tenant key derivation via HKDF — cryptographic isolation between namespaces
 - The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
-- With `@cache.secure`: the SaaS holds only ciphertext values, which supports a HIPAA/PCI DSS scope-*reduction* argument — not a guarantee; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
+- With `@cache.secure`: the SaaS holds only ciphertext values, which supports a HIPAA/PCI DSS scope-*reduction* argument — not a guarantee, and the cache key stays cleartext; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
 - Without encryption: SaaS stores plaintext, may be in compliance scope
 - Pass `backend=` explicitly, as above: `@cache.secure` does not pin the SaaS on its own ([why](../features/zero-knowledge-encryption.md#cachesecure-does-not-pin-a-backend))
 

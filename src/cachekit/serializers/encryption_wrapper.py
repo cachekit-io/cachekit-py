@@ -61,7 +61,7 @@ class EncryptionWrapper:
     Features:
     - Client-side AES-256-GCM encryption (zero-knowledge)
     - Hardware-accelerated via ring library
-    - Per-tenant key derivation (not a tenancy boundary on its own)
+    - Per-tenant key derivation (not a tenancy boundary)
     - Domain separation for security
     - Works with ANY serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
 

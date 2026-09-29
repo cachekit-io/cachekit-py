@@ -21,6 +21,7 @@ from .validation import ConfigurationError
 
 if TYPE_CHECKING:
     from cachekit.backends.base import BaseBackend
+    from cachekit.decorators.tenant_context import TenantContextExtractor
     from cachekit.serializers.base import SerializerProtocol
 
 
@@ -353,19 +354,17 @@ class DecoratorConfig:
         )
 
     @classmethod
-    def secure(cls, master_key: str, tenant_extractor: Callable[..., str] | None = None, **kwargs: Any) -> DecoratorConfig:
+    def secure(cls, master_key: str, tenant_extractor: TenantContextExtractor | None = None, **kwargs: Any) -> DecoratorConfig:
         """Security profile: Encryption REQUIRED, encrypted-at-rest everywhere, full audit trail, integrity NON-NEGOTIABLE.
 
         Use cases: PII, medical data, financial records and other regulated data (encryption can support
                    a compliance scope-reduction argument; it is not a compliance guarantee)
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: .secure does not pin a backend. It resolves like every preset: an explicit backend
-              (backend= on the decorator, or one passed here and used via @cache(config=...)), then
-              set_default_backend() (honoured until the first call, which pins the backend), then
-              environment auto-detection at first call. With REDIS_URL set and CACHEKIT_API_KEY
-              unset, the encrypted values go to Redis. Pass backend= when a particular backend is
-              required. Here backend=None is the unset default; the L1-only refusal applies to
+        Note: .secure does not pin a backend; it resolves like every preset (docs/backends/README.md,
+              "Backend Resolution Priority"). With REDIS_URL set and CACHEKIT_API_KEY unset, the
+              encrypted values go to Redis. Pass backend= when a particular backend is required.
+              Here backend=None is the unset default; the L1-only refusal applies to
               @cache.secure(backend=None) and @cache(config=..., backend=None).
         Note: integrity_checking is forced to True (non-negotiable for security)
 

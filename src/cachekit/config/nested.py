@@ -8,10 +8,13 @@ timeout, backpressure, monitoring, encryption).
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .validation import ConfigurationError
+
+if TYPE_CHECKING:
+    from cachekit.decorators.tenant_context import TenantContextExtractor
 
 
 @dataclass(frozen=True)
@@ -340,7 +343,7 @@ class EncryptionConfig:
 
     enabled: bool | None = None
     master_key: str | None = field(default=None, repr=False)
-    tenant_extractor: Callable[..., str] | None = None
+    tenant_extractor: TenantContextExtractor | None = None
     single_tenant_mode: bool = False
     deployment_uuid: str | None = None
     fail_closed: bool | None = None

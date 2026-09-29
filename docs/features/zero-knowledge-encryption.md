@@ -156,11 +156,11 @@ plaintext. It works the other way too: unsetting the variable later does not tur
 that define cached functions are imported.
 
 > [!IMPORTANT]
-> **Failing closed on a missing key is not failing closed on a bad entry.** Both explicit
-> spellings refuse to run without a key. A decrypt failure at read time — an AES-GCM tag
-> mismatch from a tampered entry or the wrong key — is a separate setting, `fail_closed`. It
-> defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`, which defaults to off, so even under
-> `@cache.secure` such an entry is evicted and the function recomputes unless you opt in. See
+> **Failing closed on a missing key is not failing closed on a bad entry.** A decrypt
+> failure at read time — an AES-GCM tag mismatch from a tampered entry or the wrong key — is
+> governed by a separate setting, `fail_closed`. It defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`,
+> which defaults to off, so even under `@cache.secure` such an entry is evicted and the function
+> recomputes unless you opt in. See
 > [Corruption vs Tamper](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
 
 ### Turning Encryption Off in an Interop Cache
@@ -210,23 +210,16 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 `@cache.secure` resolves its backend the way every preset does: an explicit backend first
 (`backend=`, or one inside `config=`), then `set_default_backend()`, then environment
-auto-detection at the function's first call. Only the explicit backend is order-independent.
-`set_default_backend()` is honoured until the first call, and the first call pins the backend,
-so a later `set_default_backend()` does not re-point the function.
+auto-detection at the function's first call. Only the explicit backend is order-independent: a
+default already set when the decorator is applied is pinned then, one set later is picked up at
+the first call, which pins it, and no later `set_default_backend()` re-points the function.
 
-Auto-detection uses whichever single prefixed selector is set — `CACHEKIT_API_KEY` for
-cachekit.io, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR` —
-and falls back to `REDIS_URL`, then localhost Redis, when none is. So with `REDIS_URL` set and
+Auto-detection uses whichever one prefixed `CACHEKIT_*` selector is set (`CACHEKIT_API_KEY` means
+cachekit.io) and falls back to `REDIS_URL`, then localhost Redis. So with `REDIS_URL` set and
 `CACHEKIT_API_KEY` unset, `@cache.secure` encrypts to Redis, not to the SaaS. The values are
-still ciphertext; what changes is which system holds them.
-
-The selectors are mutually exclusive, with no precedence. Set two and the first call raises
-`ConfigurationError`. The decorator logs it at WARNING on the `cachekit.decorators.orchestrator`
-logger and runs the function uncached — on every call, because the error recurs:
-
-```text
-Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
-```
+still ciphertext; what changes is which system holds them. Two selectors set at once leave the
+function uncached; see [Environment Variable
+Auto-Detection](../backends/README.md#3-environment-variable-auto-detection-lowest-priority).
 
 When a particular backend is a requirement, pass it explicitly:
 
@@ -254,12 +247,17 @@ checks — for the rotation itself.
 When you turn encryption on over a cache that already holds plaintext entries, those
 entries are **rejected, never read**: the entry raises a `SerializationError` internally, the
 caller treats it as a miss, evicts the stale entry, recomputes, and re-stores the value
-encrypted. The rejection is unconditional. The `fail_closed` setting governs authenticated
-decrypt failures and does not change it. Migration is therefore lazy and self-healing:
+encrypted, whatever `fail_closed` says. Migration is therefore lazy and self-healing:
 
 ```text
 read plaintext entry → SerializationError (rejected, never deserialized) → evict → recompute → re-store encrypted
 ```
+
+That holds for CK-framed entries. An [interop cache](interop-mode.md) stores no header, so a
+plaintext entry there reaches the decrypt step and fails authentication: a miss that recomputes
+by default, but with `fail_closed=True` every read of it raises `DecryptionAuthenticationError`
+until it expires. Turn encryption on in an interop cache by moving the operation to a new
+`namespace`, as in [Turning Encryption Off in an Interop Cache](#turning-encryption-off-in-an-interop-cache).
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
 plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
@@ -535,16 +533,23 @@ Relocating these fields would be a cross-SDK wire-format change owned by the
 [protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
 exposure rather than diverging from the shared frame format.
 
-The cache key is cleartext too. It carries the namespace, the function's `module.qualname` and
-an unkeyed, unsalted blake2b-256 hash of the arguments (`ns:{ns}:func:{mod.fn}:args:{64-hex}:{flags}`),
-so over a small or guessable argument space the hash can be enumerated offline. Whoever operates
-the backend can therefore learn which record was read or written, when and how often, without
-decrypting anything. On the CachekitIO backend the key travels percent-encoded in the URL path
-(`/v1/cache/{key}`), so it also lands in access logs along the request path and stays there for
-their retention period, not the cache TTL. Ciphertext length also reveals the approximate
-plaintext size. Encryption protects values, not access patterns: keep secrets out of namespaces
-and function names, and count argument-identifiable access as metadata exposure in your threat
-model.
+### Cleartext Cache Key (Accepted Exposure)
+
+The cache key is cleartext too. By default it carries the namespace (when set), the function's
+`module.qualname` and an unkeyed, unsalted blake2b-256 hash of the arguments
+(`[ns:{ns}:]func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or guessable argument space the
+hash can be enumerated offline. A custom `key=` function is not hashed: its return value becomes
+the key verbatim, after the namespace (`{namespace}:{value}`, with `default` when none is set), so
+never return raw identifiers or personal data from it — hash them first.
+
+Whoever operates the backend can therefore learn which record was read or written, when and how
+often, without decrypting anything. On the CachekitIO backend the key travels percent-encoded in
+the URL path (`/v1/cache/{key}`), so it also lands in access logs along the request path and stays
+there for their retention period, not the cache TTL. Ciphertext length reveals the approximate
+plaintext size, and because the default serializer compresses before encrypting, it also tracks
+how compressible the content is. Encryption protects values, not access patterns: keep secrets
+out of namespaces, function names and `key=` return values, and count argument-identifiable
+access as metadata exposure in your threat model.
 
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
@@ -665,7 +670,7 @@ didn't recently disable encryption for that function, investigate.
 > table can store plaintext. Even on an explicit path, client-side encryption may *reduce*
 > GDPR, HIPAA or PCI DSS scope, subject to assessment and your other controls; it is not a
 > compliance guarantee. Encryption covers values only: the cache key is cleartext and lands in
-> backend access logs (see [Accepted Exposure](#cleartext-frame-header-fields-accepted-exposure)).
+> backend access logs (see [Cleartext Cache Key](#cleartext-cache-key-accepted-exposure)).
 
 ### GDPR
 - ✅ Encryption supports the "processing security" requirement

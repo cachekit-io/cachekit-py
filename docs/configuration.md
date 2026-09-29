@@ -395,7 +395,11 @@ export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 | `@cache`, `@cache.production()`, etc. | `CachekitConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
 | `@cache.io()` | `CachekitIOBackendConfig` | `CACHEKIT_API_KEY` |
 
-Setting `REDIS_URL` has no effect on `@cache.io()`, and setting `CACHEKIT_API_KEY` has no effect on Redis-backed decorators.
+Setting `REDIS_URL` has no effect on `@cache.io()`. `CACHEKIT_API_KEY` is different: it is also
+one of the backend selectors, so a decorator without `backend=` resolves to cachekit.io from it,
+and with `CACHEKIT_REDIS_URL` also set it hits a selector conflict and runs uncached. To keep
+Redis-backed decorators beside `@cache.io()`, pass `backend=` to them, or give `@cache.io()` its
+key as `api_key=` instead of setting `CACHEKIT_API_KEY`.
 
 ## Common Configuration Patterns
 

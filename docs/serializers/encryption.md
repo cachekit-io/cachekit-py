@@ -20,7 +20,8 @@ The backend stores opaque ciphertext only. The master key never leaves the clien
 ## Basic Usage
 
 On a decorated function, `@cache.secure` applies `EncryptionWrapper` for you: pass the inner
-serializer as `serializer=`.
+serializer as `serializer=`. Passing an `EncryptionWrapper` instance to `@cache(serializer=...)`
+is not supported: that decorator never stores an entry.
 
 ```python fixture:master_key_env
 import os
