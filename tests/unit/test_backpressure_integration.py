@@ -116,13 +116,17 @@ class TestBackpressureIntegration:
 
         Saturation is driven by events, not sleeps: a sleeping backend only overlaps requests
         if every thread starts within the sleep, which scheduler load breaks (LAB-6381).
+        No wait races the test's own clock: the holders block until the finally releases
+        them, and an overflow request that slips past backpressure returns at once.
         """
-        entered = threading.Semaphore(0)  # one release per request inside the backend
+        holder_keys = {"key_0", "key_1"}
+        entered = threading.Semaphore(0)  # one release per holder inside the backend
         release = threading.Event()
 
         def blocking_get(key):
-            entered.release()
-            release.wait(timeout=5)
+            if key in holder_keys:
+                entered.release()
+                release.wait()
             return b"value"
 
         mock_backend.get = Mock(side_effect=blocking_get)
@@ -137,19 +141,24 @@ class TestBackpressureIntegration:
             # handler.get swallows BackendError and returns None, so None is a rejection
             results[worker_id] = handler.get(f"key_{worker_id}")
 
-        holders = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
-        overflow = [threading.Thread(target=worker, args=(i,)) for i in range(2, 5)]
+        # daemon: a failed test never leaves a thread that blocks interpreter exit
+        holders = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(2)]
+        overflow = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(2, 5)]
         try:
+            # One holder at a time: with queue_size=1, two holders racing for the queue slot could
+            # reject each other. A holder that exits before entering the backend was rejected;
+            # fail rather than wait on a signal that cannot come.
             for thread in holders:
                 thread.start()
-            # Both permits are held once both holders are inside the backend
-            assert entered.acquire(timeout=5) and entered.acquire(timeout=5), "holders never reached the backend"
+                while not entered.acquire(timeout=0.1):
+                    assert thread.is_alive(), f"holder never reached the backend: {results}"
 
-            # Permits stay held, so each overflow request is rejected: queue full, or permit timeout
+            # Permits stay held, so each overflow request is rejected: queue full, or permit timeout.
+            # Unbounded joins are safe: every overflow path ends in the 0.05s permit wait or a non-blocking get.
             for thread in overflow:
                 thread.start()
             for thread in overflow:
-                thread.join(timeout=5)
+                thread.join()
         finally:
             release.set()
             for thread in holders + overflow:
