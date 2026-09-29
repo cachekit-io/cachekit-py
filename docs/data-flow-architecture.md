@@ -730,7 +730,7 @@ def deserialize(data: bytes, metadata) -> Any:
 **Checksum Validation:**
 - xxHash3-64 hash verification
 - Detects data corruption in the **payload bytes** only. The envelope's own `format` and
-  `original_size` fields sit outside it, as does the plaintext CK header — see E021 in
+  `original_size` fields sit outside it, as does the plaintext CK header — see *Deserialization failed* in
   [error-codes.md](error-codes.md) for how the decode path handles that.
 
 **Test Coverage:**

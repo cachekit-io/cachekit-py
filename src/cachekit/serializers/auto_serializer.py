@@ -712,7 +712,7 @@ class AutoSerializer:
 
                 This is corruption and bit-rot containment, NOT an anti-tamper control: the
                 checksum is unkeyed, so anyone who can rewrite one field can rewrite both and
-                recompute it. Tamper detection needs encryption (E003). See ``E021`` in
+                recompute it. Tamper detection needs encryption. See *Deserialization failed* in
                 ``docs/error-codes.md``.
 
                 With integrity checking OFF the reader builds no ByteStorage, so no envelope is
@@ -867,7 +867,7 @@ class AutoSerializer:
                 ) from envelope_error
             raise EnvelopeShapeError(
                 "Cache entry failed envelope verification: decoded to a ByteStorage envelope shape that no reader "
-                "verified — a rotted envelope, or a value shaped like one; this read cannot tell which (E021)"
+                "verified — a rotted envelope, or a value shaped like one; this read cannot tell which"
             )
         return value
 

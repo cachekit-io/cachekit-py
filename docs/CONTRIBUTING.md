@@ -101,18 +101,20 @@ Before submitting documentation changes, test your examples:
 
 ### Quick Test (Quiet Mode)
 ```bash
-pytest --markdown-docs docs/ -q
+pytest --markdown-docs README.md docs/ -q
 ```
 
 ### Verbose Test (Detailed Output)
 ```bash
-pytest --markdown-docs docs/ -v
+pytest --markdown-docs README.md docs/ -v
 ```
 
 ### Test Specific File
 ```bash
 pytest --markdown-docs docs/getting-started.md -v
 ```
+
+`README.md` fences get their globals (`cache`, `secret_key`, stubs) from `docs/conftest.py`, so run the README together with `docs/` as above — on its own it fails with `NameError`s.
 
 ### Using Make Targets
 ```bash

@@ -100,7 +100,7 @@ from .health import (
 )
 
 # Interop mode (interop/v1): cross-SDK key generation and value codec.
-# The decorator API is @cache(interop="op", namespace="ns"); these helpers are
+# The decorator API is @cache(interop="op", namespace="users"); these helpers are
 # for manual key/value handling (debugging, out-of-band writers, migrations).
 from .interop import (
     InteropError,

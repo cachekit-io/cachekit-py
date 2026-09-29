@@ -2,7 +2,7 @@
   "checksum": "xxHash3-64, 8 bytes big-endian, computed on uncompressed input",
   "compression": "LZ4 block format (NOT frame)",
   "envelope_format": "MessagePack positional array (rmp_serde::to_vec): [compressed_data, checksum, original_size, format]. Vectors without an 'envelope_encoding' field use the legacy array-of-integers encoding for compressed_data and are retained forever as legacy-read proof; their '*_bin' twins use msgpack bin (canonical for protocol 1.1+ writers). checksum always encodes as an array of 8 integers. Normative rules: spec/wire-format.md, 'Byte Layout' / 'Encoding compatibility'.",
-  "generator": "legacy vectors: cachekit-core v0.2.0 (unchanged since); *_bin vectors: tools/wire-format-reference.py generate - deterministic re-encode of the legacy fields, byte-verified against rmp-serde 1.3.1 + serde_bytes 0.11.19 output (LAB-783)",
+  "generator": "six original legacy vectors: cachekit-core v0.2.0; width_boundary_bin16 legacy vector: cachekit-core v0.5.0 real writer; *_bin vectors: tools/wire-format-reference.py generate - deterministic re-encode of the legacy fields, byte-verified against rmp-serde 1.3.1 + serde_bytes 0.11.19 output (LAB-783)",
   "limits": {
     "max_compressed_size": 536870912,
     "max_compression_ratio": 1000,
@@ -62,6 +62,15 @@
       "input_hex": "ff",
       "input_size": 1,
       "name": "single_byte"
+    },
+    {
+      "description": "300-byte deterministic xorshift64* incompressible payload (seed 0x9e3779b97f4a7c15, multiplier 0x2545f4914f6cdd1d; little-endian u64 output truncated to 300 bytes; real writer bin16 width boundary)",
+      "envelope_hex": "94dc012fccf0ccff1ecc9925cc9acc8ccca2ccd103745ecccbcc8eccab39ccf370ccdd1ecca10e523348cc977d244dcc80cca41841cc8f54ccbc38cc97142004ccd6ccfbccb5ccf12e5acc91cc9c5528733454ccc2ccc652cce2ccfbcc82cccccce2ccebccff51ccd6ccadccbfcca8cc8d011a0627cca416cc9fcca54a5ecc9a66ccdf61cc82cce87571ccbd25ccf7571a68cc8e1221ccd257cca97230cc906acca41ccca1cce6ccf76dcca7cce1ccfc0ecc9ecc83cc96324bcc8720ccef20cce3ccd6ccd77a713bcc951eccd8ccfa38ccfc6bccf8ccf6ccca4177102dcca9211f26ccf3ccba2c20cca2ccf0ccd1ccaaccd5095b302838192b5922226acca7027c3c13cce03268cc90ccd1ccaaccecccf2ccce1c442445cc916a26cc8c72cce4cced381a3b69cc9accc8ccb0cca9cc935614ccd4ccdccc83ccd6ccde44ccb1462747ccf7ccf8711fcc9a27234fcca6cc9c3c5f5ccc8319ccc6ccb239cc9d2dccde6a290831cc86cca46b3accb03b1ecca8ccdbccb4cc98ccdecce5ccc1cc97ccbe39ccfdccb8ccf1cccb324b542bcca01a6131ccbcccd67540273accc90fccd9164941ccd42669404a5dcc85ccefccc6cc9f2f2fccde1c78ccd2ccef404accf205ccefccd96f98cc8ecccfccde50524bcc886dcd012ca76d73677061636b",
+      "envelope_size": 478,
+      "format": "msgpack",
+      "input_hex": "99259a8ca2d103745ecb8eab39f370dd1ea10e523348977d244d80a418418f54bc3897142004d6fbb5f12e5a919c5528733454c2c652e2fb82cce2ebff51d6adbfa88d011a0627a4169fa54a5e9a66df6182e87571bd25f7571a688e1221d257a97230906aa41ca1e6f76da7e1fc0e9e8396324b8720ef20e3d6d77a713b951ed8fa38fc6bf8f6ca4177102da9211f26f3ba2c20a2f0d1aad5095b302838192b5922226aa7027c3c13e0326890d1aaecf2ce1c442445916a268c72e4ed381a3b699ac8b0a9935614d4dc83d6de44b1462747f7f8711f9a27234fa69c3c5f5c8319c6b2399d2dde6a29083186a46b3ab03b1ea8dbb498dee5c197be39fdb8f1cb324b542ba01a6131bcd67540273ac90fd9164941d42669404a5d85efc69f2f2fde1c78d2ef404af205efd96f",
+      "input_size": 300,
+      "name": "width_boundary_bin16"
     },
     {
       "description": "bin-encoded twin of 'empty': identical fields, compressed_data as msgpack bin (canonical writer encoding, protocol 1.1+)",
@@ -128,7 +137,18 @@
       "name": "single_byte_bin",
       "envelope_encoding": "bin",
       "derived_from": "single_byte"
+    },
+    {
+      "description": "bin-encoded twin of 'width_boundary_bin16': identical fields, compressed_data as msgpack bin (canonical writer encoding, protocol 1.1+)",
+      "envelope_hex": "94c5012ff0ff1e99259a8ca2d103745ecb8eab39f370dd1ea10e523348977d244d80a418418f54bc3897142004d6fbb5f12e5a919c5528733454c2c652e2fb82cce2ebff51d6adbfa88d011a0627a4169fa54a5e9a66df6182e87571bd25f7571a688e1221d257a97230906aa41ca1e6f76da7e1fc0e9e8396324b8720ef20e3d6d77a713b951ed8fa38fc6bf8f6ca4177102da9211f26f3ba2c20a2f0d1aad5095b302838192b5922226aa7027c3c13e0326890d1aaecf2ce1c442445916a268c72e4ed381a3b699ac8b0a9935614d4dc83d6de44b1462747f7f8711f9a27234fa69c3c5f5c8319c6b2399d2dde6a29083186a46b3ab03b1ea8dbb498dee5c197be39fdb8f1cb324b542ba01a6131bcd67540273ac90fd9164941d42669404a5d85efc69f2f2fde1c78d2ef404af205efd96f98cc8ecccfccde50524bcc886dcd012ca76d73677061636b",
+      "envelope_size": 331,
+      "format": "msgpack",
+      "input_hex": "99259a8ca2d103745ecb8eab39f370dd1ea10e523348977d244d80a418418f54bc3897142004d6fbb5f12e5a919c5528733454c2c652e2fb82cce2ebff51d6adbfa88d011a0627a4169fa54a5e9a66df6182e87571bd25f7571a688e1221d257a97230906aa41ca1e6f76da7e1fc0e9e8396324b8720ef20e3d6d77a713b951ed8fa38fc6bf8f6ca4177102da9211f26f3ba2c20a2f0d1aad5095b302838192b5922226aa7027c3c13e0326890d1aaecf2ce1c442445916a268c72e4ed381a3b699ac8b0a9935614d4dc83d6de44b1462747f7f8711f9a27234fa69c3c5f5c8319c6b2399d2dde6a29083186a46b3ab03b1ea8dbb498dee5c197be39fdb8f1cb324b542ba01a6131bcd67540273ac90fd9164941d42669404a5d85efc69f2f2fde1c78d2ef404af205efd96f",
+      "input_size": 300,
+      "name": "width_boundary_bin16_bin",
+      "envelope_encoding": "bin",
+      "derived_from": "width_boundary_bin16"
     }
   ],
-  "version": "1.1.0"
+  "version": "1.1.1"
 }

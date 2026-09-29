@@ -498,7 +498,7 @@ them (cachekit-py#170):
   4-element list that merely looks like one; the read path cannot tell them apart, so this
   is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
   A steady rate on one key is the second case — that value recomputes on every read (see
-  E021 in [error-codes.md](../error-codes.md)).
+  *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
   rotted field in the plaintext frame header (e.g. a non-string `original_type`). The

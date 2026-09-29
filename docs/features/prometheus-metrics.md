@@ -96,7 +96,7 @@ redis_cache_operations_total{operation="backpressure",status="rejected",serializ
 #         migration, suspect otherwise), "envelope_shape" (an unverified entry decoded
 #         to the shape of a ByteStorage envelope — a rotted envelope or a legitimate
 #         4-element list, indistinguishable; a steady rate on ONE key is the latter,
-#         recomputing on every read — see E021), "corruption" (checksum/format
+#         recomputing on every read — see docs/error-codes.md), "corruption" (checksum/format
 #         failure — storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}

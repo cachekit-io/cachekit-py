@@ -47,9 +47,6 @@ class CachekitConfig(BaseSettings):
 
     Attributes:
         enable_prometheus_metrics: Whether to enable Prometheus metrics collection
-        default_ttl: Default time-to-live for cache entries in seconds
-        ttl_min: Minimum allowed TTL in seconds
-        ttl_max: Maximum allowed TTL in seconds
         max_value_size: Maximum cache value size in bytes
         l1_enabled: Enable L1 in-memory cache for performance
         l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
@@ -70,13 +67,6 @@ class CachekitConfig(BaseSettings):
         >>> custom = CachekitConfig(l1_max_size_mb=256)
         >>> custom.l1_max_size_mb
         256
-
-        TTL validation (default_ttl must be within ttl_min/ttl_max bounds):
-
-        >>> CachekitConfig(default_ttl=30, ttl_min=60)  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        pydantic_core._pydantic_core.ValidationError: ... default_ttl (30) cannot be less than ttl_min (60)...
 
         Master key is masked in repr for security:
 
@@ -128,7 +118,7 @@ class CachekitConfig(BaseSettings):
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
         # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
-        # Without this, any validation failure on this model (bad TTL bounds,
+        # Without this, any validation failure on this model (an out-of-range size limit,
         # keyring misconfig, ...) embeds the full raw input — including
         # env-sourced master_key and previous_master_keys hex — in startup
         # logs. errors()/json() ignore this flag; __init__ below sanitizes
@@ -186,23 +176,6 @@ class CachekitConfig(BaseSettings):
     enable_prometheus_metrics: bool = Field(
         default=True,
         description="Whether to enable Prometheus metrics collection",
-    )
-
-    # TTL configuration
-    default_ttl: int = Field(
-        default=3600,
-        gt=0,
-        description="Default time-to-live for cache entries in seconds",
-    )
-    ttl_min: int = Field(
-        default=60,
-        gt=0,
-        description="Minimum allowed TTL in seconds",
-    )
-    ttl_max: int = Field(
-        default=86400,  # 24 hours
-        gt=0,
-        description="Maximum allowed TTL in seconds",
     )
 
     # Size limits
@@ -356,25 +329,6 @@ class CachekitConfig(BaseSettings):
                     "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
                     "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
                 )
-
-        return self
-
-    @model_validator(mode="after")
-    def validate_interdependent_fields(self) -> CachekitConfig:
-        """Validate interdependent field relationships.
-
-        Returns:
-            The validated configuration instance
-
-        Raises:
-            ValueError: If field combinations are invalid
-        """
-        # Check TTL bounds
-        if self.default_ttl < self.ttl_min:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be less than ttl_min ({self.ttl_min})")
-
-        if self.default_ttl > self.ttl_max:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be greater than ttl_max ({self.ttl_max})")
 
         return self
 
