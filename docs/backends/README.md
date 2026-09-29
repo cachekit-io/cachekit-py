@@ -240,8 +240,10 @@ Cache operation 'client_creation' failed for key '<redacted:...>': Configuration
 
 The misconfiguration never heals on its own. After 5 consecutive failures (the default) the
 function's circuit breaker opens and logs one `transitioned to OPEN` WARNING on
-`cachekit.reliability.circuit_breaker`; from then on calls still run uncached but no longer log
-each failure. Those WARNINGs are the only signal.
+`cachekit.reliability.circuit_breaker`. Calls keep running uncached, but no longer log each
+failure: the breaker re-probes every `recovery_timeout` (30 s by default), and each probe logs one
+more `client_creation` failure and one more OPEN WARNING. The `circuit_breaker_state` gauge shows
+OPEN throughout.
 
 `REDIS_URL` is a 12-factor fallback and never counts as a conflict.
 

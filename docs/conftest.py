@@ -32,7 +32,6 @@ def master_key_env(monkeypatch):
     monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
     reset_settings()
     yield
-    monkeypatch.undo()
     reset_settings()
 
 

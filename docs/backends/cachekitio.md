@@ -189,7 +189,7 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 > *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
-Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over managed SaaS storage. The backend stores opaque ciphertext — it never sees plaintext data or your master key.
+Compose `@cache.secure` with `CachekitIOBackend` for end-to-end zero-knowledge encryption over managed SaaS storage. The backend stores opaque ciphertext values — it never sees plaintext values or your master key. The cache key stays cleartext ([details](../features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure)).
 
 ```python notest
 from cachekit import cache

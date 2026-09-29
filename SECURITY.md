@@ -145,12 +145,12 @@ downstream of that bound.
 
 ### Zero-Knowledge Encryption
 
-When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the server never sees plaintext:
+When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the server never sees plaintext values. The cache key is not encrypted ([details](docs/features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure)):
 
 | Property | Guarantee |
 |:---------|:----------|
 | Encryption timing | **Before** data touches Redis |
-| Server visibility | Opaque ciphertext only |
+| Server visibility | Opaque ciphertext values; the cache key stays cleartext |
 | Key derivation | HKDF with per-tenant salts |
 | Authentication | GCM tags prevent tampering |
 | Compliance | May *reduce* GDPR/HIPAA/PCI DSS scope, subject to assessment — not a compliance guarantee ([details](docs/features/zero-knowledge-encryption.md#compliance-implications)) |

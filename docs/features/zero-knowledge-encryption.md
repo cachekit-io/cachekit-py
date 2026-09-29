@@ -53,7 +53,7 @@ AES-256-GCM encryption
     ↓
 Derive per-tenant key (optional)
     ↓
-Storage backend (ciphertext only - Redis/HTTP/Custom)
+Storage backend (ciphertext values; the key stays cleartext - Redis/HTTP/Custom)
     ↓
 On cache hit:
     ↓
@@ -93,9 +93,9 @@ Python object (plaintext, in-app only)
 # Network intercept → attacker reads plaintext credentials
 
 # With @cache.secure:
-# Redis memory dump → attacker sees ciphertext only
-# Redis backup → attacker sees ciphertext only
-# Network intercept → attacker sees ciphertext only
+# Redis memory dump → attacker sees ciphertext values (cache keys stay cleartext)
+# Redis backup → attacker sees ciphertext values (cache keys stay cleartext)
+# Network intercept → attacker sees ciphertext values (cache keys stay cleartext)
 # Encryption key in environment → separate from data
 ```
 
@@ -208,18 +208,11 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 ### `@cache.secure` Does Not Pin a Backend
 
-`@cache.secure` resolves its backend the way every preset does: an explicit backend first
-(`backend=`, or one inside `config=`), then `set_default_backend()`, then environment
-auto-detection at the function's first call. Only the explicit backend is order-independent: a
-default already set when the decorator is applied is pinned then, one set later is picked up at
-the first call, which pins it, and no later `set_default_backend()` re-points the function.
-
-Auto-detection uses whichever one prefixed `CACHEKIT_*` selector is set (`CACHEKIT_API_KEY` means
-cachekit.io) and falls back to `REDIS_URL`, then localhost Redis. So with `REDIS_URL` set and
-`CACHEKIT_API_KEY` unset, `@cache.secure` encrypts to Redis, not to the SaaS. The values are
-still ciphertext; what changes is which system holds them. Two selectors set at once leave the
-function uncached; see [Environment Variable
-Auto-Detection](../backends/README.md#3-environment-variable-auto-detection-lowest-priority).
+`@cache.secure` resolves its backend the way every preset does ([Backend Resolution
+Priority](../backends/README.md#backend-resolution-priority)), so without `backend=` the
+environment decides where the ciphertext goes. With `REDIS_URL` set and `CACHEKIT_API_KEY` unset,
+`@cache.secure` encrypts to Redis, not to the SaaS. The values are still ciphertext; what changes
+is which system holds them.
 
 When a particular backend is a requirement, pass it explicitly:
 
@@ -334,7 +327,7 @@ def get_api_keys(tenant_id: str):
     }
 
 keys = get_api_keys("customer-123")
-# JSON encrypted client-side, backend never sees plaintext (illustrative)
+# JSON encrypted client-side, backend never sees plaintext values (illustrative)
 ```
 
 ### Encrypted DataFrames (Zero-Knowledge ML Caching)
@@ -532,7 +525,8 @@ The cache key is cleartext too. By default it carries the namespace (when set), 
 (`[ns:{ns}:]func:{mod.fn}:args:{64-hex}:{flags}`), so over a small or guessable argument space the
 hash can be enumerated offline. A custom `key=` function is not hashed: its return value becomes
 the key verbatim, after the namespace (`{namespace}:{value}`, with `default` when none is set), so
-never return raw identifiers or personal data from it — hash them first.
+never return raw identifiers or personal data from it — derive them with an HMAC whose key never
+reaches the backend.
 
 Whoever operates the backend can therefore learn which record was read or written, when and how
 often, without decrypting anything. On the CachekitIO backend the key travels percent-encoded in
@@ -656,13 +650,11 @@ didn't recently disable encryption for that function, investigate.
 ## Compliance Implications
 
 > [!IMPORTANT]
-> These arguments hold only on an explicit path (`@cache.secure`, or an explicit encryption
-> option), which fails closed on a missing key — see
-> [Activation](#activation-the-master-key-is-a-source-not-a-switch). Every other row of that
-> table can store plaintext. Even on an explicit path, client-side encryption may *reduce*
-> GDPR, HIPAA or PCI DSS scope, subject to assessment and your other controls; it is not a
-> compliance guarantee. Encryption covers values only: the cache key is cleartext and lands in
-> backend access logs (see [Cleartext Cache Key](#cleartext-cache-key-accepted-exposure)).
+> Client-side encryption may *reduce* GDPR, HIPAA or PCI DSS scope, subject to assessment and
+> your other controls, and only on an explicit path (see
+> [Activation](#activation-the-master-key-is-a-source-not-a-switch)); it is not a compliance
+> guarantee. Encryption covers values only: the cache key is cleartext (and, on CachekitIO, lands
+> in access logs; see [Cleartext Cache Key](#cleartext-cache-key-accepted-exposure)).
 
 ### GDPR
 - ✅ Encryption supports the "processing security" requirement
@@ -773,7 +765,7 @@ A: Expected 100-500μs overhead. Profile to confirm acceptable.
 
 ## Zero-Knowledge Architecture
 
-**Use case**: Building a caching system where the backend never sees user data.
+**Use case**: Building a caching system where the backend never sees plaintext values.
 
 ### Client-Side Encryption Flow
 ```python notest
@@ -804,7 +796,7 @@ export default {
     const { key, value } = await request.json();
 
     // Backend receives encrypted blob
-    // NEVER sees plaintext (no decryption key)
+    // NEVER sees plaintext values (no decryption key); the key is cleartext
     await KV.put(key, value);
 
     // Backend cannot read user data even if compromised

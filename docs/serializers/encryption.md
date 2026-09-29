@@ -15,7 +15,7 @@ serialize(data) → inner.serialize(data) → encrypt(bytes) → stored bytes
 retrieve(bytes) → decrypt(bytes) → inner.deserialize(bytes) → data
 ```
 
-The backend stores opaque ciphertext only. The master key never leaves the client.
+The backend stores opaque ciphertext values only; the cache key stays cleartext (see [Cleartext Cache Key](../features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure)). The master key never leaves the client.
 
 ## Basic Usage
 

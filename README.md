@@ -452,16 +452,23 @@ info = expensive_func.cache_info()
 ### Environment Variables
 
 ```bash
+# Backend selection: set exactly ONE of CACHEKIT_REDIS_URL, CACHEKIT_API_KEY,
+# CACHEKIT_MEMCACHED_SERVERS, CACHEKIT_FILE_CACHE_DIR. Two or more is a ConfigurationError at
+# first call, and every decorator without backend= runs uncached (docs/backends/README.md).
+# REDIS_URL is only a fallback and never conflicts.
+
 # Redis Connection (priority: CACHEKIT_REDIS_URL > REDIS_URL)
 CACHEKIT_REDIS_URL="redis://localhost:6379"  # Primary (preferred)
 REDIS_URL="redis://localhost:6379"           # Fallback
 
 # CachekitIO SaaS Backend (closed beta — request access at cachekit.io)
-CACHEKIT_API_KEY="your-api-key"             # For @cache.io() — or pass api_key= directly  # pragma: allowlist secret
+# CACHEKIT_API_KEY is also a backend selector: set it INSTEAD of CACHEKIT_REDIS_URL, not beside it.
+# For @cache.io() next to Redis, pass api_key= from your secret store instead.
+# CACHEKIT_API_KEY="your-api-key"  # pragma: allowlist secret
 CACHEKIT_API_URL="https://api.cachekit.io"  # Default SaaS endpoint
 
-# Memcached Backend (optional: pip install cachekit[memcached])
-CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'  # Default: 127.0.0.1:11211
+# Memcached Backend (optional: pip install cachekit[memcached]) — also a selector, set it instead
+# CACHEKIT_MEMCACHED_SERVERS='["mc1:11211", "mc2:11211"]'  # Default: 127.0.0.1:11211
 CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0                   # Default: 2.0 seconds
 CACHEKIT_MEMCACHED_TIMEOUT=1.0                            # Default: 1.0 seconds
 CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)

@@ -664,13 +664,7 @@ For comprehensive backend guide with examples and implementation patterns, see *
 
 ### Backend Resolution Priority
 
-When `@cache` is used without an explicit `backend` parameter, resolution follows this priority:
-
-1. **Explicit backend** — `@cache(backend=...)`, then a backend inside `config=`
-2. **Module-level default** — `set_default_backend(...)`
-3. **Environment auto-detection** — exactly one `CACHEKIT_*` selector (no precedence between them), with `REDIS_URL` as a fallback
-
-Examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
+Resolution order, examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
 
 ### L1-Only Mode (No Backend)
 

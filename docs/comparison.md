@@ -105,7 +105,7 @@ def expensive_computation(x: int) -> dict:
 > - **L1+L2 caching**: L1 hits ~50ns (local memory), L1 miss → L2 Redis (~2-7ms)
 > - **Circuit breaker**: Redis down? Cache gracefully, don't cascade failures
 > - **Distributed locking**: Prevents cache stampedes across pods
-> - **Encryption**: Client-side AES-256-GCM, Redis never sees plaintext
+> - **Encryption**: Client-side AES-256-GCM, Redis never sees plaintext values
 > - **Metrics**: Prometheus counters for hits/misses/errors
 
 ```python
