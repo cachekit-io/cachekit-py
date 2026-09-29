@@ -257,6 +257,13 @@ class AsyncMetricsCollector:
                 batch = []
                 last_flush = time.time()
 
+        # Stopping ends the loop with records still queued; drain them so shutdown() loses nothing.
+        while True:
+            try:
+                batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+
         # Final flush on shutdown
         if batch:
             self._flush_batch(batch)
