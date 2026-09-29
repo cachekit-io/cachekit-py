@@ -109,9 +109,10 @@ Python object (plaintext, in-app only)
 2. **High-volume, low-margin**: Encryption adds 100-500μs
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
-**Mitigation**: Use standard @cache for non-sensitive data:
+**Mitigation**: state `encryption=False` for non-sensitive data:
+
 ```python notest
-@cache(ttl=300, backend=None)  # No encryption, faster
+@cache(ttl=300, encryption=False, backend=None)  # Explicit plaintext, faster
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
@@ -121,6 +122,49 @@ def get_user_ssn(user_id):
 ```
 
 ---
+
+## Activation: the Master Key Is a Source, Not a Switch
+
+From the next minor release encryption turns on only where the code says so —
+`@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
+below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
+ciphertext on read (not in an interop cache — see the `encryption=False` row); in this
+release its presence can still auto-activate encryption where no intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+
+| Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
+|---|---|---|
+| `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
+| `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
+| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Not in an [interop cache](#turning-encryption-off-in-an-interop-cache): its stale entries are never decrypted |
+| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
+| No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
+
+The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
+call site's encryption state was unreadable from the code — it depended on which pod
+carried which variable — and a pod *missing* the variable wrote plaintext to the backend
+with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
+on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
+every other row can store plaintext, and the compliance argument below holds only on an
+explicit path.
+
+### Turning Encryption Off in an Interop Cache
+
+An interop cache (`interop=`) never decrypts stale ciphertext after `encryption=False`. Its entries
+carry no header, so the reader decodes the ciphertext as MessagePack. Most stale entries fail to
+decode and are recomputed, but a rare small one decodes cleanly and is served as a wrong value.
+Encryption is also part of the [shared-entry contract](interop-mode.md#operation-names-are-a-contract-shared-entries):
+every SDK that binds the operation must agree on it.
+
+So move the operation to a new `namespace` in the same change, in every SDK that binds it. Old and
+new writers then use different keys, so no plaintext reader decodes the old ciphertext — on any
+backend, in L1, or mid-rollout. Old-version processes keep reading and writing the old namespace,
+encrypted, until the rollout drains them.
+
+Once the last old-version process is gone, the old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
+was set) and stay decryptable while the key is. If they hold personal data, delete them once the last
+old writer is gone — on Redis, `SCAN` for `<old-namespace>:<operation>:*` and `UNLINK` the matches;
+the File backend can only clear its whole `cache_dir`; Memcached and CachekitIO retire entries only by
+TTL. Never `FLUSHDB` a shared database.
 
 ## What Can Go Wrong
 

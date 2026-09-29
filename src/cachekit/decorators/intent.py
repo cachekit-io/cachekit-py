@@ -173,18 +173,15 @@ def cache(
 
             backend = get_default_backend()
 
-        # Backward compatibility: map flattened l1_enabled to nested l1.enabled
-        if "l1_enabled" in manual_overrides:
-            from cachekit.config.nested import L1CacheConfig
-
-            l1_enabled = manual_overrides.pop("l1_enabled")
-            # Merge with existing l1 config if provided
-            existing_l1 = manual_overrides.pop("l1", L1CacheConfig())
-            manual_overrides["l1"] = replace(existing_l1, enabled=l1_enabled)
+        # Flattened l1_enabled flips only l1.enabled, applied AFTER resolution (LAB-4828): every
+        # preset factory already passes its own l1=, so forwarding it collides, and building it here
+        # from L1CacheConfig() would drop the preset's / config='s L1 tuning (minimal swr_enabled=False).
+        _has_l1_enabled = "l1_enabled" in manual_overrides
+        l1_enabled = manual_overrides.pop("l1_enabled", None)
 
         # Map flattened tri-state encryption flag + related kwargs to nested EncryptionConfig.
         # Tri-state (issue #128): @cache(encryption=False) is a DELIBERATE opt-out that must
-        # survive fleet-wide CACHEKIT_MASTER_KEY auto-detection. None=auto, True=force, False=off.
+        # survive a present CACHEKIT_MASTER_KEY. None=unset, True=force, False=off.
         #
         # Scope: ONLY the bare/default decorator path (no config=, no _intent). Intent presets
         # (.secure, .io, ...) own their encryption-param handling, and config= is the RORO form.
@@ -249,6 +246,9 @@ def cache(
         else:
             # No intent specified - use default DecoratorConfig with overrides
             resolved_config = DecoratorConfig(backend=backend, **manual_overrides)
+
+        if _has_l1_enabled:
+            resolved_config = replace(resolved_config, l1=replace(resolved_config.l1, enabled=l1_enabled))
 
         # Delegate to wrapper factory with L1-only mode flag
         # Note: _explicit_l1_only is ONLY set when backend=None was explicitly passed

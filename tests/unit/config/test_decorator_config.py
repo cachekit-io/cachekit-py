@@ -10,6 +10,8 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from cachekit import cache
@@ -136,6 +138,27 @@ class TestDecoratorConfigValidation:
         """Test validation delegates to EncryptionConfig."""
         with pytest.raises(ConfigurationError, match="encryption.enabled=True requires encryption.master_key"):
             DecoratorConfig(encryption=EncryptionConfig(enabled=True, single_tenant_mode=True))
+
+
+@pytest.mark.unit
+class TestDecoratorConfigBoolEncryptionKwarg:
+    """`encryption=True/False` is the explicit encryption spelling on every preset.
+
+    Presets forward kwargs raw to the dataclass, so the bool must be coerced to an
+    EncryptionConfig before validate() — previously it died with AttributeError.
+    """
+
+    def test_false_constructs_as_explicit_opt_out(self) -> None:
+        off = DecoratorConfig.production(backend=None, encryption=False)
+        assert off.encryption == EncryptionConfig(enabled=False)
+
+    def test_true_is_rejected_with_a_configuration_error_not_attribute_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+        with pytest.raises(ConfigurationError):
+            DecoratorConfig.production(backend=None, encryption=True)
 
 
 @pytest.mark.unit
@@ -365,3 +388,57 @@ class TestIoPreset:
             @cache.io(api_key="ck_arg", backend=backend)  # pragma: allowlist secret
             def fn() -> int:
                 return 1
+
+
+# Dummy credentials, as the secure()/io() doctests use.
+_PRESET_KWARGS: dict[str, dict[str, str]] = {
+    "minimal": {},
+    "production": {},
+    "secure": {"master_key": "a" * 64},  # pragma: allowlist secret
+    "dev": {},
+    "test": {},
+    "io": {"api_key": "ck_test_key"},  # pragma: allowlist secret
+}
+
+
+@pytest.mark.unit
+class TestL1EnabledFlag:
+    """``l1_enabled=`` flips only ``l1.enabled`` on the config each decorator form would use (LAB-4828).
+
+    Disabling L1 is the tenant-safety escape hatch while L1 is tenant-blind, so every form must
+    accept it — and must keep the rest of the preset's L1 tuning (minimal/test ``swr_enabled=False``).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
+        seen: list[DecoratorConfig] = []
+
+        def spy(f, config, **_kwargs):
+            seen.append(config)
+            return f
+
+        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        return seen
+
+    @staticmethod
+    def _decorate(decorator, **kwargs) -> None:
+        @decorator(ttl=60, **kwargs)
+        def fn() -> int:
+            return 1
+
+    @pytest.mark.parametrize("l1_enabled", [False, True])
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
+    def test_preset_flips_only_enabled(self, _resolved: list[DecoratorConfig], preset: str, l1_enabled: bool) -> None:
+        creds = _PRESET_KWARGS[preset]
+        self._decorate(getattr(cache, preset), l1_enabled=l1_enabled, **creds)
+        assert _resolved[0].l1 == replace(getattr(DecoratorConfig, preset)(**creds).l1, enabled=l1_enabled)
+
+    def test_config_form_keeps_config_l1(self, _resolved: list[DecoratorConfig]) -> None:
+        self._decorate(cache, config=DecoratorConfig.minimal(), l1_enabled=False)
+        assert _resolved[0].l1.enabled is False
+        assert _resolved[0].l1.swr_enabled is False
+
+    def test_bare_form_uses_l1_defaults(self, _resolved: list[DecoratorConfig]) -> None:
+        self._decorate(cache, l1_enabled=False)
+        assert _resolved[0].l1 == L1CacheConfig(enabled=False)

@@ -446,11 +446,15 @@ def create_cache_wrapper(
                    - SerializerProtocol instance: Custom serializer implementing the protocol
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
-                   - None (default): auto-detect from CACHEKIT_MASTER_KEY (fleet-wide opt-in).
-                   - True: force encryption ON.
+                   - None (default): no intent stated. DEPRECATED activation path: with
+                     CACHEKIT_MASTER_KEY set this release can still auto-enable encryption and
+                     warn once, though not every cache ends up encrypted (see the activation
+                     table in docs/features/zero-knowledge-encryption.md). The next minor
+                     release raises at construction whenever a master key is present and
+                     encryption is unset.
+                   - True: force encryption ON (key inline or from CACHEKIT_MASTER_KEY).
                    - False: explicit per-function opt-out — never encrypts, even when
-                     CACHEKIT_MASTER_KEY is set. Use to exclude a single function from
-                     fleet-wide encryption (issue #128).
+                     CACHEKIT_MASTER_KEY is set (issue #128).
         tenant_extractor: Optional tenant ID extractor for multi-tenant encryption.
                          Only used if encryption=True.
                          If None: single-tenant mode (tenant_id "default" unless deployment_uuid /
@@ -630,6 +634,66 @@ def create_cache_wrapper(
             "one explicitly to keep @cache.secure / encryption=True."
         )
 
+    # Store backend and handler type for consistent access
+    # If explicit backend provided, use it; otherwise get from provider on first use
+    _backend = backend if backend is not None else None
+
+    # Decoration-time stale_ttl validation runs BEFORE the serialization handler is
+    # built: the handler spends the once-per-process encryption auto-activation
+    # warning on success, so a decorator rejected after it would consume the warning.
+    # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
+    # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
+    # its fresh TTL and labels the read stale; we return the stale value immediately
+    # and re-run the wrapped function in the background. Requires an SWR-capable
+    # backend (CachekitIO — the server signals freshness on read).
+    _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
+
+    def _l2_freshness_capable() -> bool:
+        """Freshness capability of the backend as RESOLVED so far. The read paths
+        call this at call time because provider-backed decorators (no backend=
+        argument, e.g. @cache.production with CACHEKIT_API_KEY set) resolve
+        _backend on first call (LAB-557). Class-level check: an instance-level
+        hasattr reads Mock/proxy objects as capable."""
+        return _backend is not None and supports_swr(_backend)
+
+    # Decoration-time snapshot for SWR activation (explicit stale_ttl validation,
+    # io()'s swr_by_default): a stale window fails at decoration as documented, so
+    # provider-backed decorators get the read-side bound but cannot enable SWR.
+    _l2_swr_capable_at_decoration = _l2_freshness_capable()
+    _stale_ttl: int | None = None
+    if stale_ttl is not None:
+        # Type-check BEFORE the zero opt-out test: bool is an int subclass and
+        # False == 0 == 0.0, so without this ordering True silently means a
+        # 1-second window and False/0.0 silently opt out unvalidated.
+        if isinstance(stale_ttl, bool) or not isinstance(stale_ttl, int) or stale_ttl < 0:
+            raise ConfigurationError(f"stale_ttl must be a non-negative integer, got {stale_ttl!r}")
+        if stale_ttl != 0:  # integer 0 = explicit SWR opt-out
+            if ttl is None or ttl <= 0:
+                raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
+            if ttl + stale_ttl > _max_total_ttl:
+                raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
+            if not _l2_swr_capable_at_decoration:
+                raise ConfigurationError(
+                    "stale_ttl requires an SWR-capable backend (CachekitIO) known at decoration time. "
+                    "Other backends have no read-side freshness signal — remove stale_ttl, switch to "
+                    "@cache.io, or pass backend=CachekitIOBackend() explicitly."
+                )
+            _stale_ttl = stale_ttl
+    elif (
+        config is not None
+        and getattr(config, "swr_by_default", False)
+        and ttl is not None
+        and ttl > 0
+        and _l2_swr_capable_at_decoration
+    ):
+        # Preset default (io()): stale window = ttl, capped so the total stays
+        # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
+        # above the cap leaves no window headroom -> no default (never negative).
+        _default_window = min(ttl, _max_total_ttl - ttl)
+        _stale_ttl = _default_window if _default_window > 0 else None
+
+    _l2_swr_active = _stale_ttl is not None
+
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
 
@@ -686,10 +750,6 @@ def create_cache_wrapper(
 
     operation_handler.on_deserialize_error = _on_l2_deserialize_error
 
-    # Store backend and handler type for consistent access
-    # If explicit backend provided, use it; otherwise get from provider on first use
-    _backend = backend if backend is not None else None
-
     # Initialize L1 cache if enabled. The per-decorator budget (config.l1.max_size_mb)
     # applies only when this namespace's cache is first created — namespaces share one
     # L1Cache, so give functions with distinct budgets distinct namespaces (issue #163).
@@ -723,59 +783,6 @@ def create_cache_wrapper(
     # SWR needs a TTL: freshness is measured against ttl * swr_threshold_ratio.
     # With ttl=None entries never go stale, so there is nothing to revalidate.
     _l1_swr_active = _object_cache is not None and _l1_config.swr_enabled and ttl is not None and ttl > 0
-
-    # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
-    # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
-    # its fresh TTL and labels the read stale; we return the stale value immediately
-    # and re-run the wrapped function in the background. Requires an SWR-capable
-    # backend (CachekitIO — the server signals freshness on read).
-    _max_total_ttl = 2_592_000  # 30-day storage cap, shared with the stale window (spec)
-
-    def _l2_freshness_capable() -> bool:
-        """Freshness capability of the backend as RESOLVED so far. The read paths
-        call this at call time because provider-backed decorators (no backend=
-        argument, e.g. @cache.production with CACHEKIT_API_KEY set) resolve
-        _backend on first call (LAB-557). Class-level check: an instance-level
-        hasattr reads Mock/proxy objects as capable."""
-        return _backend is not None and supports_swr(_backend)
-
-    # Decoration-time snapshot for SWR activation (explicit stale_ttl validation,
-    # io()'s swr_by_default): a stale window fails at decoration as documented, so
-    # provider-backed decorators get the read-side bound but cannot enable SWR.
-    _l2_swr_capable_at_decoration = _l2_freshness_capable()
-    _stale_ttl: int | None = None
-    if stale_ttl is not None:
-        # Type-check BEFORE the zero opt-out test: bool is an int subclass and
-        # False == 0 == 0.0, so without this ordering True silently means a
-        # 1-second window and False/0.0 silently opt out unvalidated.
-        if isinstance(stale_ttl, bool) or not isinstance(stale_ttl, int) or stale_ttl < 0:
-            raise ConfigurationError(f"stale_ttl must be a non-negative integer, got {stale_ttl!r}")
-        if stale_ttl != 0:  # integer 0 = explicit SWR opt-out
-            if ttl is None or ttl <= 0:
-                raise ConfigurationError("stale_ttl requires a positive ttl (the stale window starts where freshness ends)")
-            if ttl + stale_ttl > _max_total_ttl:
-                raise ConfigurationError(f"ttl + stale_ttl must not exceed {_max_total_ttl} seconds (30-day storage cap)")
-            if not _l2_swr_capable_at_decoration:
-                raise ConfigurationError(
-                    "stale_ttl requires an SWR-capable backend (CachekitIO) known at decoration time. "
-                    "Other backends have no read-side freshness signal — remove stale_ttl, switch to "
-                    "@cache.io, or pass backend=CachekitIOBackend() explicitly."
-                )
-            _stale_ttl = stale_ttl
-    elif (
-        config is not None
-        and getattr(config, "swr_by_default", False)
-        and ttl is not None
-        and ttl > 0
-        and _l2_swr_capable_at_decoration
-    ):
-        # Preset default (io()): stale window = ttl, capped so the total stays
-        # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
-        # above the cap leaves no window headroom -> no default (never negative).
-        _default_window = min(ttl, _max_total_ttl - ttl)
-        _stale_ttl = _default_window if _default_window > 0 else None
-
-    _l2_swr_active = _stale_ttl is not None
 
     # Background revalidation machinery — mirrors the L1-only SWR shapes below:
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
