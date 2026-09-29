@@ -272,12 +272,17 @@ class TestCleanupThreadAfterFork:
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     @pytest.mark.parametrize("put_from_new_thread", [False, True], ids=["forking-thread", "reused-ident"])
-    @pytest.mark.parametrize("get_first", [False, True], ids=["put-first", "get-first"])
-    def test_forked_child_survives_cache_lock_held_at_fork(self, put_from_new_thread, get_first):
+    @pytest.mark.parametrize("get_first", [False, True], ids=["take-over-put-first", "hook-get-first"])
+    def test_forked_child_survives_cache_lock_held_at_fork(self, monkeypatch, put_from_new_thread, get_first):
         import multiprocessing
         import queue as queue_mod
+        import weakref
+
+        from cachekit import l1_cache
 
         manager = L1CacheManager(default_max_memory_mb=10)
+        if not get_first:  # hide the manager from the at-fork hook, as a fork without hooks (uWSGI) does
+            monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet())
         cache = manager.get_cache("held-ns")
         cache.put("pre-fork", b"v")
         manager.start_background_cleanup(interval_seconds=0.05)
@@ -328,6 +333,50 @@ class TestCleanupThreadAfterFork:
         finally:
             release.set()
             holder.join(5)
+            manager.stop_background_cleanup()
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_take_over_leaves_a_child_threads_cache_lock_alone(self):
+        import multiprocessing
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        busy = manager.get_cache("busy-ns")
+        other = manager.get_cache("other-ns")
+        busy.put("pre-fork", b"v")
+        manager.start_background_cleanup(interval_seconds=30)
+        try:
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q) -> None:
+                lock = busy._lock  # the hook found it free at fork and kept it
+                held, release = threading.Event(), threading.Event()
+
+                def hold() -> None:
+                    with busy._lock:
+                        held.set()
+                        release.wait(10)
+
+                holder = threading.Thread(target=hold)
+                holder.start()
+                held.wait(5)
+                other.put("k", b"v")  # first put runs the take-over while a live child thread holds busy-ns
+                release.set()
+                holder.join(5)
+                q.put({"same_lock": busy._lock is lock, "found": busy.get("pre-fork")[0]})
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=20)
+            finally:
+                process.join(timeout=10)
+                if process.is_alive():  # a hung child would otherwise block pytest's exit
+                    process.kill()
+
+            assert outcome == {"same_lock": True, "found": True}  # not cleared under its holder
+            assert process.exitcode == 0
+        finally:
             manager.stop_background_cleanup()
 
     def test_cleanup_stopped_in_parent_stays_stopped(self):

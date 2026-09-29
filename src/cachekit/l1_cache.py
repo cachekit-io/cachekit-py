@@ -253,15 +253,15 @@ class L1Cache:
         The holder does not exist in the child, so the lock never releases. _is_owned() first:
         a thread started in the child can reuse the dead holder's ident and so "own" its hold.
         The timeout waits out a child thread briefly holding the lock legitimately; the at-fork
-        hook passes 0, as no other child thread exists yet. An orphaned holder may have left the
-        entries half-updated, so they are dropped; L2 still has them.
+        hook passes 0 for a non-blocking probe, as no other child thread exists yet. An orphaned
+        holder may have left the entries half-updated, so they are dropped; L2 still has them.
         """
         lock = self._lock
         if not lock._is_owned() and lock.acquire(timeout=timeout):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
             lock.release()
             return
         logger.warning(
-            "L1Cache %s: dropped %d entries (%d bytes) after fork; a parent thread held its lock",
+            "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
             self.namespace,
             len(self._cache),
             self._current_memory_bytes,
@@ -434,6 +434,8 @@ class L1CacheManager:
         # them calls _take_over_if_forked() first, or a forked child uses parent state.
         self._owner_pid = os.getpid()
         self._fork_locks: dict[int, threading.Lock] = {}
+        # PID in which _reset_cache_locks_after_fork already repaired the cache locks.
+        self._locks_reset_pid: Optional[int] = None
         _managers.add(self)
 
     def _take_over_if_forked(self) -> None:
@@ -460,8 +462,11 @@ class L1CacheManager:
                 return
             self._lock = threading.Lock()
             self._stop_cleanup = threading.Event()
-            for cache in self._caches.values():  # before the cleanup worker takes their locks
-                cache._reset_lock_after_fork()
+            # Only where no at-fork hook ran (uWSGI): after the hook, a held cache lock belongs to a
+            # live child thread, and resetting it would clear the cache under that thread.
+            if self._locks_reset_pid != pid:
+                for cache in self._caches.values():  # before the cleanup worker takes their locks
+                    cache._reset_lock_after_fork()
             if self._cleanup_thread is not None:
                 try:
                     self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
@@ -585,12 +590,14 @@ def _reset_cache_locks_after_fork() -> None:
 
     Decorators get() before they put(), so the put-path take-over comes too late for a lock a
     parent thread (say the cleanup sweep) held at fork: that first get() would hang for the
-    child's life. The child is single-threaded here, so the probe needs no timeout. Only the
-    locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
+    child's life. The child is single-threaded here, so a non-blocking probe (timeout=0) is exact.
+    Only the locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
     """
+    pid = os.getpid()
     for manager in list(_managers):
         for cache in list(manager._caches.values()):
             cache._reset_lock_after_fork(timeout=0)
+        manager._locks_reset_pid = pid
 
 
 if hasattr(os, "register_at_fork"):
