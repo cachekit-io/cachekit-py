@@ -193,7 +193,7 @@ test-doctest-quiet: setup-logs ## Run doctest validation (minimal output)
 test-docs-examples: setup-logs ## Run markdown documentation examples (verbose)
 	@echo "$(BLUE)Running markdown documentation examples...$(RESET)"
 	@echo "$(YELLOW)Logging to $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log$(RESET)"
-	@if ! uv run pytest --markdown-docs docs/ -v 2>&1 | tee $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log; then \
+	@if ! uv run pytest --markdown-docs README.md docs/ -v 2>&1 | tee $(LOG_DOCS_EXAMPLES_DIR)/verbose_$(TIMESTAMP).log; then \
 		echo "$(YELLOW)❌ Markdown docs validation failed$(RESET)"; \
 		exit 1; \
 	fi
@@ -201,7 +201,7 @@ test-docs-examples: setup-logs ## Run markdown documentation examples (verbose)
 
 test-docs-quick: setup-logs ## Run markdown documentation examples (quiet)
 	@printf "$(BLUE)markdown docs...$(RESET) "
-	@if ! uv run pytest --markdown-docs docs/ -q --tb=line -p no:warnings > $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log 2>&1; then \
+	@if ! uv run pytest --markdown-docs README.md docs/ -q --tb=line -p no:warnings > $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log 2>&1; then \
 		echo "$(YELLOW)❌ FAILED$(RESET)"; \
 		echo "$(YELLOW)See $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log$(RESET)"; \
 		tail -20 $(LOG_DOCS_EXAMPLES_DIR)/quiet_$(TIMESTAMP).log; \

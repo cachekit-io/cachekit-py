@@ -69,7 +69,7 @@ Choose how data is stored:
 | [Data Flow Architecture](data-flow-architecture.md) | L1+L2 dual-layer caching internals |
 | [Performance](performance.md) | Benchmarks and optimization |
 | [Comparison](comparison.md) | vs. lru\_cache, aiocache, cachetools |
-| [Error Codes](error-codes.md) | Error reference |
+| [Error Reference](error-codes.md) | Exceptions cachekit raises or logs |
 | [Free-Threaded CPython](free-threading.md) | Support status, concurrency audit, CI safety net |
 
 ---

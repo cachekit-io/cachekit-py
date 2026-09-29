@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from cachekit import cache
-from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, CacheSerializationHandler
+from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
 
 
@@ -93,7 +93,7 @@ class TestSerializerCodeReachesTheKey:
         assert _suffix(key) == expected
 
     def test_invalidate_deletes_the_key_the_write_path_wrote(self):
-        """CacheInvalidator derives the suffix independently — it must agree, or it deletes nothing."""
+        """invalidate_cache must delete the exact key the write path wrote, serializer suffix included."""
         backend = _RecordingBackend()
         calls = 0
 
@@ -109,21 +109,9 @@ class TestSerializerCodeReachesTheKey:
 
         fn.invalidate_cache(1)
         assert written_key in backend.deleted, (
-            f"invalidator deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
+            f"invalidate_cache deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
         )
         assert backend.store == {}
-
-    def test_invalidator_without_a_serializer_identity_deletes_nothing(self):
-        """A missing identity must fail loud, not compute a key nothing wrote and 'succeed'."""
-        backend = _RecordingBackend()
-
-        def fn(x: int) -> int:
-            return x
-
-        invalidator = CacheInvalidator(CacheKeyGenerator(), backend, serializer_type="")
-        with pytest.raises(ValueError, match="serializer_type"):
-            invalidator.invalidate_cache(fn, (1,), {}, None)
-        assert backend.deleted == []
 
     def test_integrity_flag_still_independent_of_serializer_code(self):
         """The ic half of the suffix was correct before this fix and must stay so."""

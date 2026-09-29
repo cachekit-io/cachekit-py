@@ -74,7 +74,7 @@ class TestCircuitBreakerConfig:
         assert config.success_threshold == 3
         assert config.recovery_timeout == 30.0
         # Matches the live breaker's default (reliability.CircuitBreakerConfig), which these knobs now configure
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
 
     def test_custom_values(self) -> None:
         """Test custom configuration."""
@@ -83,13 +83,14 @@ class TestCircuitBreakerConfig:
             failure_threshold=10,
             success_threshold=5,
             recovery_timeout=60.5,
-            half_open_requests=2,
+            half_open_requests=6,
         )
+        config.validate()
         assert config.enabled is False
         assert config.failure_threshold == 10
         assert config.success_threshold == 5
         assert config.recovery_timeout == 60.5
-        assert config.half_open_requests == 2
+        assert config.half_open_requests == 6
 
     def test_excluded_exceptions_removed(self) -> None:
         """excluded_exceptions was read by nothing (LAB-5340); passing it is now a TypeError."""
@@ -125,12 +126,21 @@ class TestCircuitBreakerConfig:
         with pytest.raises(ConfigurationError, match="half_open_requests must be >= 1, got 0"):
             config.validate()
 
-    @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
-    def test_validate_recovery_timeout_rejects_negative_and_non_finite(self, bad: float) -> None:
-        """NaN or inf would reach the live breaker and it could never half-open."""
+    @pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
+    def test_validate_recovery_timeout_rejects_zero_negative_and_non_finite(self, bad: float) -> None:
+        """NaN or inf could never half-open; 0 would restart spent probe cycles on every clock tick."""
         config = CircuitBreakerConfig(recovery_timeout=bad)
-        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number >= 0"):
+        with pytest.raises(ConfigurationError, match="recovery_timeout must be a finite number > 0"):
             config.validate()
+
+    def test_validate_half_open_requests_below_success_threshold(self) -> None:
+        """A cycle admits at most half_open_requests probes, so fewer than success_threshold can never close."""
+        config = CircuitBreakerConfig(success_threshold=3, half_open_requests=2)
+        with pytest.raises(ConfigurationError, match=r"half_open_requests \(2\) must be >= success_threshold \(3\)"):
+            config.validate()
+
+    def test_validate_half_open_requests_equal_to_success_threshold(self) -> None:
+        CircuitBreakerConfig(success_threshold=4, half_open_requests=4).validate()
 
 
 @pytest.mark.unit

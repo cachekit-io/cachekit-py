@@ -114,7 +114,8 @@ def cache(
             ``api_key`` (``@cache.io`` only) — the cachekit.io API key; falls back
             to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
             own CachekitIOBackend and rejects ``backend=`` and ``config=`` with
-            ConfigurationError.
+            ConfigurationError. ``@cache.secure`` rejects ``config=`` too; its RORO
+            form is ``@cache(config=DecoratorConfig.secure(...))``.
 
     Returns:
         Decorated function with intelligent caching
@@ -136,12 +137,12 @@ def cache(
 
             return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
 
-        # config= would replace the io preset wholesale (any backend, silently), which the
-        # io docstring promises cannot happen. DecoratorConfig.io() already IS the config.
-        if _intent == "io" and config is not None:
+        # config= would replace the io/secure preset wholesale, silently: io would take any backend,
+        # secure would take an unencrypted config and cache plaintext. The factory already IS the config.
+        if _intent in ("io", "secure") and config is not None:
             raise ConfigurationError(
-                "@cache.io() does not accept config= — DecoratorConfig.io() already is the io "
-                "config. For the RORO form use @cache(config=DecoratorConfig.io(...))."
+                f"@cache.{_intent}() does not accept config= — DecoratorConfig.{_intent}() already is the "
+                f"{_intent} config. For the RORO form use @cache(config=DecoratorConfig.{_intent}(...))."
             )
 
         # Resolve backend at decorator application time
@@ -173,14 +174,11 @@ def cache(
 
             backend = get_default_backend()
 
-        # Backward compatibility: map flattened l1_enabled to nested l1.enabled
-        if "l1_enabled" in manual_overrides:
-            from cachekit.config.nested import L1CacheConfig
-
-            l1_enabled = manual_overrides.pop("l1_enabled")
-            # Merge with existing l1 config if provided
-            existing_l1 = manual_overrides.pop("l1", L1CacheConfig())
-            manual_overrides["l1"] = replace(existing_l1, enabled=l1_enabled)
+        # Flattened l1_enabled flips only l1.enabled, applied AFTER resolution (LAB-4828): every
+        # preset factory already passes its own l1=, so forwarding it collides, and building it here
+        # from L1CacheConfig() would drop the preset's / config='s L1 tuning (minimal swr_enabled=False).
+        _has_l1_enabled = "l1_enabled" in manual_overrides
+        l1_enabled = manual_overrides.pop("l1_enabled", None)
 
         # Map flattened tri-state encryption flag + related kwargs to nested EncryptionConfig.
         # Tri-state (issue #128): @cache(encryption=False) is a DELIBERATE opt-out that must
@@ -208,6 +206,14 @@ def cache(
         if config is not None:
             # DecoratorConfig instance provided (type checked above) - use it with overrides
             resolved_config = config
+            # An override may not disable integrity on an encrypted config= — the rule
+            # DecoratorConfig.secure() enforces on its own kwargs.
+            integrity_override = manual_overrides.get("integrity_checking", True)
+            if config.encryption.enabled is True and not integrity_override:
+                raise ConfigurationError(
+                    f"integrity_checking={integrity_override!r} cannot override an encrypted config= "
+                    "(e.g. DecoratorConfig.secure()). Omit integrity_checking."
+                )
             if manual_overrides or backend is not None:
                 # Apply overrides by creating new DecoratorConfig with merged settings
                 override_dict = manual_overrides.copy()
@@ -249,6 +255,9 @@ def cache(
         else:
             # No intent specified - use default DecoratorConfig with overrides
             resolved_config = DecoratorConfig(backend=backend, **manual_overrides)
+
+        if _has_l1_enabled:
+            resolved_config = replace(resolved_config, l1=replace(resolved_config.l1, enabled=l1_enabled))
 
         # Delegate to wrapper factory with L1-only mode flag
         # Note: _explicit_l1_only is ONLY set when backend=None was explicitly passed

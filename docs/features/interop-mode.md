@@ -79,7 +79,7 @@ Treat operation names like queue names or topic names: a **cross-team contract**
 
 The contract for one operation is the operation name **plus** the effective argument list (arity, order, types):
 
-- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized).
+- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized). `ns` and `nsapi` are reserved as namespaces (operations, and namespaces such as `nsx`, are unaffected), because the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed ([cache-key-format.md → Server-Side Requirements](https://github.com/cachekit-io/protocol/blob/main/spec/cache-key-format.md#server-side-requirements)).
 - Named arguments bind to their declared positions and **introspectable defaults are applied**: `get_user(42)`, `get_user(user_id=42)` and `get_user(42, include_profile=False)` all produce the same key.
 - Arguments must fit the closed interop data model (int in `[-2^63, 2^64-1]`, float, str, bytes, bool, None, list/tuple, dict with str keys, set, tz-aware datetime, UUID; Python conveniences: Enum → value, Path → POSIX string, Decimal → string). Anything else raises `InteropError` **at call time** — interop mode never silently degrades to uncached execution.
 - Values are plain MessagePack: None, bool, int, float, str, bytes, list/tuple, dict with str keys, plus datetime/date/time as portable sentinel maps. Python-specific values (sets, custom classes, NumPy/pandas) raise `InteropError` at store time — they would not round-trip cross-SDK.
@@ -114,10 +114,10 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 
 | Situation | Behavior |
 | :--- | :--- |
-| Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
+| Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
@@ -140,6 +140,6 @@ assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 33 key vectors, 4 value vectors, 9 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 34 key vectors, 4 value vectors, 11 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
 > **CachekitIO note**: the deployed api.cachekit.io cache-key validator predates interop keys and rejects them until the saas#91 validator shrink is live in production. Redis and other self-hosted backends are unaffected.
