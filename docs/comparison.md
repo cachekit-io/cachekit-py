@@ -265,7 +265,7 @@ def get_user(id):
 
 **Why cachekit wins**:
 - **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
-- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext, never your data
+- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never your plaintext data
 - **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
 
 ```python notest

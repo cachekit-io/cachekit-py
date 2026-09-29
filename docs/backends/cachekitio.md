@@ -214,7 +214,7 @@ def get_user_profile(user_id: str) -> dict:
 **Why this matters**:
 - `@cache.secure` applies AES-256-GCM client-side encryption before any data leaves the process
 - Per-tenant key derivation via HKDF — not a tenancy boundary; see [Multi-Tenant Isolation](../features/zero-knowledge-encryption.md#multi-tenant-isolation)
-- The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
+- The SaaS backend stores whatever bytes arrive and never holds a key to decrypt the values
 - With `@cache.secure`: the SaaS holds only ciphertext values, which supports a HIPAA/PCI DSS scope-*reduction* argument — not a guarantee, and the cache key stays cleartext; see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)
 - Without encryption: SaaS stores plaintext, may be in compliance scope
 - Pass `backend=` explicitly, as above: `@cache.secure` does not pin the SaaS on its own ([why](../features/zero-knowledge-encryption.md#cachesecure-does-not-pin-a-backend))

@@ -7,7 +7,7 @@ Architectural Note:
     EncryptionWrapper is a Decorator pattern implementation, not a serialization format.
     It wraps any SerializerProtocol (StandardSerializer, OrjsonSerializer, ArrowSerializer)
     and adds an encryption layer. This enables zero-knowledge caching where the backend
-    never sees plaintext, regardless of data type (JSON, DataFrames, MessagePack, etc.).
+    never sees plaintext values, regardless of data type (JSON, DataFrames, MessagePack, etc.).
 """
 
 import logging
@@ -66,7 +66,7 @@ class EncryptionWrapper:
     - Works with ANY serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
 
     Security Model:
-    - Storage backend never sees plaintext
+    - Storage backend never sees plaintext values
     - Each tenant gets different derived keys
     - Domain separation prevents key confusion attacks
     - Authentication tags prevent tampering

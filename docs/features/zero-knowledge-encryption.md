@@ -93,9 +93,10 @@ Python object (plaintext, in-app only)
 # Network intercept → attacker reads plaintext credentials
 
 # With @cache.secure:
-# Redis memory dump → attacker sees ciphertext values (cache keys stay cleartext)
-# Redis backup → attacker sees ciphertext values (cache keys stay cleartext)
-# Network intercept → attacker sees ciphertext values (cache keys stay cleartext)
+# Redis memory dump → attacker sees ciphertext values
+# Redis backup → attacker sees ciphertext values
+# Network intercept → attacker sees ciphertext values
+# (cache keys stay cleartext in all three)
 # Encryption key in environment → separate from data
 ```
 
@@ -209,8 +210,8 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ### `@cache.secure` Does Not Pin a Backend
 
 `@cache.secure` resolves its backend the way every preset does ([Backend Resolution
-Priority](../backends/README.md#backend-resolution-priority)), so without `backend=` the
-environment decides where the ciphertext goes. With `REDIS_URL` set and `CACHEKIT_API_KEY` unset,
+Priority](../backends/README.md#backend-resolution-priority)), so without an explicit backend or a
+`set_default_backend()` default, the environment decides where the ciphertext goes. With `REDIS_URL` set and `CACHEKIT_API_KEY` unset,
 `@cache.secure` encrypts to Redis, not to the SaaS. The values are still ciphertext; what changes
 is which system holds them.
 
@@ -799,14 +800,13 @@ export default {
     // NEVER sees plaintext values (no decryption key); the key is cleartext
     await KV.put(key, value);
 
-    // Backend cannot read user data even if compromised
     return new Response("OK");
   }
 }
 ```
 
 **Benefits**:
-- ✅ Backend compromise doesn't expose user data
+- ✅ Backend compromise doesn't expose cached values
 - ✅ Supports a compliance scope-reduction argument on an explicit path (see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
