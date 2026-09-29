@@ -211,11 +211,12 @@ read plaintext entry → SerializationError (fail closed) → evict → recomput
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
-plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
-an attacker with backend write access is indistinguishable from a legacy one — any
-"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
-fail-closed read path exists to prevent. If you need to read plaintext entries, use a
-handler with `encryption=False` (which never had keys to protect).
+plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
+plaintext entry forged by an attacker with backend write access is indistinguishable
+from a legacy one — any "accept plaintext" escape hatch would reintroduce the
+encryption-downgrade attack the fail-closed read path exists to prevent. If you need to
+read plaintext entries, use a handler with `encryption=False` (which never had keys to
+protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
 workload: lazy migration spreads recomputation over reads (each legacy entry pays one
@@ -439,13 +440,15 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 ### Fail-Closed Read Path (Encryption Downgrade Protection)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
-and the serializer name — is plaintext and is **not** covered by the AES-GCM
-authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
-into the tag, but the header itself stays outside that boundary so a reader can parse
-it before it has a key.
+and the serializer name — is plaintext, so a reader can parse it before it has a key.
+Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
+the AAD. AAD v0x03 is built from the tenant, the cache key, and the header's wire format,
+compression flag and (when set) original type, so a change to one of those header
+values that alters the AAD fails authentication. The `encrypted` flag is **not** an
+AAD input: nothing authenticates it.
 
 An attacker with backend write access (the threat actor in the protocol's threat
-model) could exploit that gap by planting a frame whose header claims
+model) could exploit that unauthenticated flag by planting a frame whose header claims
 `encrypted: false` plus an arbitrary plaintext payload — a classic encryption
 downgrade (CWE-757). cachekit therefore never lets header metadata select the read
 path when encryption is configured:
@@ -468,8 +471,10 @@ accepted:
 
 - **`tenant_id`** — required *before* decryption to derive the per-tenant key
   (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
-  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
-  binds it into the GCM tag, so a modified header fails authentication.
+  opaque identifier, not secret material, and it *is* tamper-protected: the reader
+  derives the per-tenant key from the header's `tenant_id`, so a modified value selects
+  a different key and the read fails authentication (`auth_tamper`) — a key-fingerprint
+  mismatch under fail-closed, a GCM tag failure otherwise.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
@@ -481,30 +486,40 @@ exposure rather than diverging from the shared frame format.
 
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
-Three failure classes surface on the decrypt read path, and cachekit distinguishes
+Four failure classes surface on the decrypt read path, and cachekit distinguishes
 them (cachekit-py#170):
 
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or the entry claims a different tenant. Raised as
+  between cache keys), or the entry claims a different tenant. The plaintext frame
+  header fields built into the AAD (`format`, `compressed`, `original_type`) are
+  unencrypted, but the AAD built from them is authenticated by the tag: a header change
+  that produces different AAD bytes also fails here. (The tag authenticates the
+  constructed AAD, not the header's JSON bytes.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
   CWE-757 downgrade guard) or a missing `tenant_id`. Benign during a lazy
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
+- **`envelope_shape`** — an entry nothing verified decoded to the *shape* of a ByteStorage
+  envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
+  4-element list that merely looks like one; the read path cannot tell them apart, so this
+  is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
+  The same redacted key repeating in the WARNING log is the second case — that value recomputes on every read (see
+  *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
-  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
-  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
-  AAD construction before any tag check runs — it is corruption, not tamper, and the
-  entry is evicted and recomputed even in fail-closed mode.
+  non-string or non-UTF-8-encodable `original_type` in the frame header. Such a value
+  cannot be built into the AAD at all, so no tag check runs — the read is
+  corruption-class, and the entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter
 `cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
 `reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
-noise. Baseline `suspicious_envelope` around migration windows.
+noise. Baseline `suspicious_envelope` around migration windows; a flat, steady
+`envelope_shape` rate is one cached value the shape rule refuses on every read, not rot.
 
 **Default (fail open):** a decrypt failure of any class logs a warning, evicts the
 poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
@@ -533,6 +548,22 @@ from cachekit.config.nested import EncryptionConfig
 config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
+
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+shorter than 32 bytes, more than three previous keys, or the current key repeated among
+them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+settings load, so this surfaces only when keys bypass that check: passed to
+`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
+environment's previous keys. Outside config-drift reads (below), the fault never
+evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
+`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
+decorators an L2 read logs it as a cache error and runs the call uncached. Two cases take
+other paths: a missing or short *current* master key raises `EncryptionError`, and an
+encryption-disabled handler reading an entry that claims encryption treats the fault as
+corruption (miss + evict), because only the unauthenticated header sent it down the
+decrypt path.
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key

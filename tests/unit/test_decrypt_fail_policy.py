@@ -31,7 +31,7 @@ from cachekit.cache_handler import (
     handle_decrypt_failure,
 )
 from cachekit.key_generator import CacheKeyGenerator
-from cachekit.serializers.base import SerializationError, SuspiciousCacheEntryError
+from cachekit.serializers.base import EnvelopeShapeError, SerializationError, SuspiciousCacheEntryError
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
@@ -68,8 +68,8 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
 
     def test_non_string_original_type_is_corruption_not_tamper(self):
-        """LAB-4350: the header is an AAD *input*, not authenticated content —
-        a rotted ``original_type`` is corruption, not tamper."""
+        """LAB-4350: a non-string ``original_type`` cannot be built into the AAD,
+        so no tag check runs — it is corruption, not tamper."""
         wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
         enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
         meta.original_type = ["rotted"]
@@ -187,6 +187,12 @@ class TestHandleDecryptFailure:
         err = SuspiciousCacheEntryError("x")
         assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "suspicious_envelope"
 
+    def test_classifies_envelope_shape(self):
+        # Kept out of "corruption": the read path cannot prove it is corrupt, and for a legitimate
+        # envelope-shaped value it fires on every read forever (LAB-2736).
+        err = EnvelopeShapeError("x")
+        assert handle_decrypt_failure(err, tier="l2", cache_key="k", fail_closed=False) == "envelope_shape"
+
     def test_classifies_corruption(self):
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=False) == "corruption"
         assert handle_decrypt_failure(EncryptionError("x"), tier="l1", cache_key="k", fail_closed=False) == "corruption"
@@ -200,6 +206,7 @@ class TestHandleDecryptFailure:
             == "suspicious_envelope"
         )
         assert handle_decrypt_failure(SerializationError("x"), tier="l2", cache_key="k", fail_closed=True) == "corruption"
+        assert handle_decrypt_failure(EnvelopeShapeError("x"), tier="l2", cache_key="k", fail_closed=True) == "envelope_shape"
 
     def test_records_counter_with_reason_and_tier_labels(self, monkeypatch):
         recorded: list[tuple[str, dict[str, Any]]] = []

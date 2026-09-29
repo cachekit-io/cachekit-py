@@ -203,7 +203,6 @@ class AsyncMetricsCollector:
         duration_ms: float,
         serializer: str = "unknown",
         size_bytes: int = 0,
-        hit: Optional[bool] = None,
     ):
         """Record cache operation metric.
 
@@ -216,9 +215,9 @@ class AsyncMetricsCollector:
             self._maybe_switch_mode()
 
         if self._sync_mode:
-            self._record_cache_operation_sync(operation, namespace, success, duration_ms, serializer, size_bytes, hit)
+            self._record_cache_operation_sync(operation, namespace, success, duration_ms, serializer, size_bytes)
         else:
-            self._record_cache_operation_async(operation, namespace, success, duration_ms, serializer, size_bytes, hit)
+            self._record_cache_operation_async(operation, namespace, success, duration_ms, serializer, size_bytes)
 
     def record_circuit_breaker_state(self, namespace: str, state: str, transitions: int = 0):
         """Record circuit breaker state change."""
@@ -533,7 +532,6 @@ class AsyncMetricsCollector:
         duration_ms: float,
         serializer: str,
         size_bytes: int,
-        hit: Optional[bool],
     ):
         """Record cache operation directly to Prometheus (sync mode)."""
         if not PROMETHEUS_AVAILABLE:
@@ -590,7 +588,6 @@ class AsyncMetricsCollector:
         duration_ms: float,
         serializer: str,
         size_bytes: int,
-        hit: Optional[bool],
     ):
         """Record cache operation to queue for async processing."""
         assert self._queue is not None, "Async metrics not initialized"
@@ -605,7 +602,6 @@ class AsyncMetricsCollector:
                 "duration_ms": duration_ms,
                 "serializer": serializer,
                 "size_bytes": size_bytes,
-                "hit": hit,
                 "timestamp": time.time(),
             }
         )

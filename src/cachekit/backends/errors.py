@@ -186,3 +186,13 @@ class CapabilityNotAvailableError(BackendError):
             message: Human-readable error message explaining missing capability
         """
         super().__init__(message, error_type=BackendErrorType.PERMANENT)
+
+
+class UnsupportedTenantError(TypeError):
+    """A tenant id of a type a tenant-scoped backend cannot key by: a bug in the caller.
+
+    Deliberately not a ``BackendError``: nothing is wrong with the cache, so ``@cache`` never
+    degrades it to an uncached call or counts it against the circuit breaker, which every tenant
+    of the function shares. It reaches the caller before the decorated function runs. A
+    ``TypeError``, so ``except TypeError`` still catches it.
+    """

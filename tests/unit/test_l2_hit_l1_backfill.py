@@ -69,10 +69,10 @@ def _force_l2_only(backend: _CountingBackend, l2_snapshot: dict[str, bytes]) -> 
 
 def _assert_parity(backend: _CountingBackend, recorded: list[dict[str, Any]], info: Any) -> None:
     envelope = next(iter(backend.store.values()))
-    get_hits = [c for c in recorded if c["operation"] == "get" and c.get("hit")]
-    assert len(get_hits) == 2  # one L2 hit, one L1 hit
-    assert [c["serializer"] for c in get_hits] == ["rust", "l1_memory"]
-    assert [c["size_bytes"] for c in get_hits] == [len(envelope)] * 2
+    assert len(recorded) == 2  # one L2 hit, one L1 hit — one record each, nothing else
+    assert [c["operation"] for c in recorded] == ["get", "get"]
+    assert [c["serializer"] for c in recorded] == ["rust", "l1_memory"]
+    assert [c["size_bytes"] for c in recorded] == [len(envelope)] * 2
     assert len(envelope) != len(str(VALUE).encode("utf-8"))  # the old str(value) accounting would differ
     assert backend.gets == 1  # second read never reached L2
     assert (info.l1_hits, info.l2_hits) == (1, 1)

@@ -113,53 +113,71 @@ class TestBackpressureIntegration:
         assert mock_backend.delete.called
 
     def test_backpressure_limits_concurrent_requests(self, mock_backend):
-        """Test that backpressure controller actually limits concurrent requests."""
+        """Test that backpressure controller actually limits concurrent requests.
 
-        # Setup mock backend that takes time to respond
-        def slow_operation(key):
-            time.sleep(0.1)  # Simulate slow backend operation
+        Saturation is driven by events, not sleeps: a sleeping backend only overlaps requests
+        if every thread starts within the sleep, which scheduler load breaks (LAB-6381).
+        No worker wait races the test's clock: the holders block until the finally releases
+        them, and an overflow request that slips past backpressure returns at once. Only the
+        test thread has a deadline, and expiry fails the test; it never frees a permit.
+        """
+        holder_keys = {"key_0", "key_1"}
+        entered = threading.Semaphore(0)  # one release per holder inside the backend
+        release = threading.Event()
+
+        def blocking_get(key):
+            if key in holder_keys:
+                entered.release()
+                release.wait()
             return b"value"
 
-        mock_backend.get = Mock(side_effect=slow_operation)
+        mock_backend.get = Mock(side_effect=blocking_get)
 
-        # Create backpressure controller with very low limits
+        # 2 permits, 1 queue slot, 0.05s permit wait
         backpressure_controller = BackpressureController(max_concurrent=2, queue_size=1, timeout=0.05)
-
-        # Create handler with backpressure controller
         handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
-        # Track results and exceptions
-        results = []
-        exceptions = []
+        results = {}
+        stall_limit = 30  # hang guard per phase, far above the ~0.1s a healthy run takes
 
         def worker(worker_id):
-            try:
-                result = handler.get(f"key_{worker_id}")
-                if result is None:
-                    # Cache handler caught a backpressure exception and returned None
-                    exceptions.append((worker_id, "backpressure_rejection"))
-                else:
-                    results.append((worker_id, result))
-            except Exception as e:
-                exceptions.append((worker_id, e))
+            # handler.get swallows BackendError and returns None, so None is a rejection
+            results[worker_id] = handler.get(f"key_{worker_id}")
 
-        # Start multiple threads to overwhelm the backpressure controller
-        threads = []
-        for i in range(5):  # 5 threads, but max_concurrent=2, queue_size=1
-            thread = threading.Thread(target=worker, args=(i,))
-            threads.append(thread)
-            thread.start()
+        # daemon: a failed test never leaves a thread that blocks interpreter exit
+        holders = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(2)]
+        overflow = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(2, 5)]
+        try:
+            # One holder at a time: with queue_size=1, two holders racing for the queue slot could
+            # reject each other. A holder that exits before entering the backend was rejected;
+            # fail rather than wait on a signal that cannot come.
+            for thread in holders:
+                thread.start()
+                deadline = time.monotonic() + stall_limit
+                while not entered.acquire(timeout=0.1):
+                    assert thread.is_alive(), f"holder never reached the backend: {results}"
+                    assert time.monotonic() < deadline, "holder stalled before reaching the backend"
 
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
+            # Permits stay held, so each overflow request is rejected: queue full, or permit timeout.
+            # Every overflow path ends in the 0.05s permit wait or a non-blocking get, so one that
+            # outlives the deadline means that wait stalled.
+            for thread in overflow:
+                thread.start()
+            deadline = time.monotonic() + stall_limit
+            for thread in overflow:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not any(t.is_alive() for t in overflow), f"overflow request stalled: {results}"
+        finally:
+            release.set()
+            cleanup_deadline = time.monotonic() + 5
+            for thread in holders + overflow:
+                if thread.ident is not None:  # unstarted when an earlier phase failed
+                    thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
-        # Some requests should have been rejected due to backpressure
-        assert len(exceptions) > 0, "Expected some requests to be rejected due to backpressure"
-
-        # Verify we got some backpressure rejections (manifested as None results)
-        backpressure_rejections = [e for e in exceptions if e[1] == "backpressure_rejection"]
-        assert len(backpressure_rejections) > 0, f"Expected backpressure rejections, got exceptions: {exceptions}"
+        assert results == {0: b"value", 1: b"value", 2: None, 3: None, 4: None}
+        assert mock_backend.get.call_count == 2, "rejected requests must not reach the backend"
+        assert backpressure_controller.rejected_count == 3
+        assert backpressure_controller.queue_depth == 0
 
     @pytest.mark.asyncio
     async def test_async_backpressure_integration(self, mock_backend):

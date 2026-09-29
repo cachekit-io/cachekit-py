@@ -243,11 +243,98 @@ upper-case UUID string is another. With env auto-detection, a call with no tenan
 `default`. If two kinds of tenant can share an id, namespace them before setting
 `tenant_context`: `"org:1"`, `"team:1"`.
 
+Any other type, such as a `float`, a `bool`, an `IntEnum` or an arbitrary object, is a bug in
+the caller. The decorated call raises `TypeError` before the function runs, sync and async
+alike. It raises on an L1 hit too, and while the circuit breaker is open. It is not treated as
+a cache fault: the call does not fall back to running uncached, and it does not count against
+the function's circuit breaker, which every tenant of that function shares.
+
+The check needs the function's backend. A function whose backend is resolved at its first call
+(see the resolution order below) skips the check until then. That covers a call made while the
+circuit breaker is open before the backend was ever resolved, which runs the function uncached,
+and an L1 hit on an async function before its first L1 miss. The check is on the id's type only. L1 is shared by every tenant (see
+above), so do not rely on the `TypeError` to keep tenants apart.
+
 **Resolution order**:
 1. Explicit `backend` parameter in `@cache(backend=...)`, then a backend inside `config=`
 2. Module-level default via `set_default_backend()` (checked at decoration, and
    again at first call if still unset)
 3. Environment auto-detection per the table above
+
+#### Upgrading to 0.20.0
+
+If your deployment used cachekit under more than one tenant, purge the Redis entries that
+earlier releases wrote. A call with no tenant set counts as the tenant `default`. A deployment
+that only ever used one tenant is unaffected.
+
+In earlier releases, a decorated function that resolved Redis from the environment
+(`CACHEKIT_REDIS_URL`, `REDIS_URL` or the localhost default), or a backend taken from
+`RedisBackendProvider.get_backend()`, stayed bound to the tenant that was current when the
+backend was first obtained. Every tenant's L2 writes through it then landed under that one
+tenant's `t:<tenant>:` prefix. The binding was per function, so a process serving one tenant
+can still have left residue: for example, if an `invalidate_cache()` under another tenant
+bound the function first, or if the process called `tenant_context.set("default")` before
+`get_backend()`, as the earlier distributed-locking example did.
+
+After the upgrade, the bound tenant keeps reading those entries as its own, and some of them
+hold another tenant's value. Entries written with `ttl=None`, or kept alive by
+`refresh_ttl_on_get=True`, never expire. A no-argument `invalidate_cache()` reaches only the
+entries the calling tenant has read in that process since it started, because no key
+registry recorded them.
+
+1. Stop every process that reads or writes the cache, whatever release it runs. Stopping only
+   the earlier releases is not enough: `SCAN` does not block reads, so a 0.20.0 process serving
+   requests during the purge can read an entry still under the wrong tenant's prefix and
+   return another tenant's value.
+2. Delete every `t:*` key in each database cachekit uses. Run `FLUSHDB` instead only if the
+   database is dedicated to cachekit. Use the Python client that cachekit installs, not a
+   `redis-cli --scan` pipeline: a key set through `key=` can contain a newline, which a
+   line-based pipeline splits into names that match nothing, so the key survives and the
+   pipeline still exits 0. `scan_iter` returns each key whole, as bytes.
+
+   ```python notest
+   # Needs a live Redis: set the URL, then run once per database cachekit uses.
+   import redis
+
+   r = redis.Redis.from_url("redis://localhost:6379/0")
+   pattern = "t:*"
+
+   batch = []
+   for key in r.scan_iter(match=pattern, count=1000):
+       batch.append(key)
+       if len(batch) == 1000:
+           r.unlink(*batch)
+           batch.clear()
+   if batch:
+       r.unlink(*batch)
+
+   left = sum(1 for _ in r.scan_iter(match=pattern, count=1000))
+   print(f"{left} keys left matching {pattern}")  # expect 0
+   ```
+
+3. Start processes on 0.20.0 only after the script reports 0 keys left in every database.
+   Expect a cold cache.
+
+On a database other applications share, `t:*` also matches their keys that start with `t:`.
+Run the same script once per tenant instead, with `pattern = "t:<tenant>:*"`, for `default`
+and for each tenant you have set. Percent-encode the tenant with
+`urllib.parse.quote(tenant, safe='')`, converting an `int` or `UUID` tenant with `str()` first:
+tenant `org:123` is `pattern = "t:org%3A123:*"`. The encoding also escapes `*`, `?` and `[`,
+so a tenant id cannot widen the pattern.
+
+Other changes you may notice:
+
+- `RedisBackendProvider.get_backend()` no longer binds its backend to one tenant. The backend
+  follows `tenant_context` on every operation, and falls back to the tenant that was current at
+  the `get_backend()` call only when the calling context has none. For a backend bound to one
+  tenant, construct `cachekit.backends.redis.provider.PerRequestRedisBackend(client, tenant)`
+  directly, with `client` a `redis.Redis`.
+- A no-argument `invalidate_cache()` on the Redis backend now deletes only the calling tenant's
+  L2 entries.
+- `int` and `UUID` tenants now work, keyed by their `str()` form (`42` and `"42"` share
+  `t:42:`). No earlier release supported them. Any type other than `str`, `bytes`, `int` and
+  `uuid.UUID` raises `TypeError`, as above; this includes a `bool`, an `IntEnum` member and a
+  `bytearray`. Convert an `IntEnum` member with `int()` and a `bytearray` with `bytes()` first.
 
 ## Performance Considerations
 

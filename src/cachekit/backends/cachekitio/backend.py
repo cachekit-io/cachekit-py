@@ -58,6 +58,9 @@ STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
+# Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
+_RESERVED_KEY_SEGMENTS = frozenset({".", "..", "health", "ttl", "lock"})
+
 _API_KEY_HINT = (
     "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
 )
@@ -222,7 +225,7 @@ class CachekitIOBackend:
         everything else still comes from the environment.
 
         Raises:
-            ConfigurationError: missing, empty or whitespace-containing API key, or an API URL that fails
+            ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token, or an API URL that fails
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
@@ -258,18 +261,36 @@ class CachekitIOBackend:
         canonical key round-trips byte-for-byte. See ``SECURITY.md`` for the cross-SDK
         wire-parity contract (cachekit-rs / cachekit-ts).
 
-        Dot-segment guard: ``quote`` leaves RFC-3986 *unreserved* ``.`` untouched, so a key
-        of exactly ``.`` or ``..`` survives as a live dot-segment that httpx collapses
-        client-side *before the request leaves the process* — ``..`` -> ``/v1``,
-        ``../ttl`` -> ``/v1/ttl``, ``../lock`` -> ``/v1/lock`` — re-opening the endpoint
-        escape on a *different* route carrying the bearer token, never reaching the SaaS
-        key validator. Percent-encode the dots so the segment is inert; the SaaS decodes
-        ``%2E`` -> ``.`` once and rejects ``..`` anyway. Only an all-dot segment collapses
-        (``a:..`` does not), so nothing else is touched and wire-parity is unaffected.
+        Reserved segments: ``.``, ``..``, ``health``, ``ttl`` and ``lock`` encode to
+        themselves and cannot be sent at all (protocol ``spec/saas-api.md`` § Cache-Key Path
+        Encoding, rule 2). The dots are dot-segments that a URL parser removes before routing
+        (``..`` -> ``/v1``, ``../ttl`` -> ``/v1/ttl``), and percent-encoding them does not
+        help: the SaaS parses the URL under WHATWG, which collapses ``%2E`` / ``%2E%2E`` too.
+        The words are route tokens (``/v1/cache/health`` is the health endpoint). Either way
+        the request would reach a different route with the bearer token, so these keys are
+        rejected before any request is made. Only an exact match is reserved: ``a:..`` and
+        ``..a`` are sent as-is, and canonical keys (which always contain ``:``) never match.
+
+        Raises:
+            BackendError: ``PERMANENT`` (never retried) — the key is reserved. Raised from every
+                public method, including ``get_ttl`` / ``refresh_ttl``, which otherwise swallow a
+                SaaS 400 as ``None`` / ``False``.
+
+        Examples:
+            >>> CachekitIOBackend._encode_key("ns:app:func:mod.fn:args:ab:1s")
+            'ns%3Aapp%3Afunc%3Amod.fn%3Aargs%3Aab%3A1s'
+            >>> CachekitIOBackend._encode_key("..")
+            Traceback (most recent call last):
+            ...
+            cachekit.backends.errors.BackendError: ...
         """
         encoded = quote(key, safe="")
-        if encoded in (".", ".."):
-            return encoded.replace(".", "%2E")
+        if encoded in _RESERVED_KEY_SEGMENTS:
+            raise BackendError(
+                f"Cache key {encoded!r} is a reserved URL path segment and cannot be stored in "
+                "cachekit.io; choose a different key",
+                error_type=BackendErrorType.PERMANENT,
+            )
         return encoded
 
     def _request_sync(
@@ -833,9 +854,14 @@ class CachekitIOBackend:
 
         Returns:
             TTL in seconds, None if key doesn't exist or has no expiry
+
+        Raises:
+            BackendError: If the key is reserved (see ``_encode_key``); encoded outside the
+                ``try`` so the rejection is not mistaken for a missing key.
         """
+        encoded_key = self._encode_key(key)
         try:
-            response = await self._request_async("GET", f"{self._encode_key(key)}/ttl")
+            response = await self._request_async("GET", f"{encoded_key}/ttl")
             data = response.json()
             return data.get("ttl")
         except BackendError:
@@ -850,12 +876,16 @@ class CachekitIOBackend:
 
         Returns:
             True if updated, False otherwise
+
+        Raises:
+            BackendError: If the key is reserved (see ``_encode_key``).
         """
+        encoded_key = self._encode_key(key)
         try:
             payload = json.dumps({"ttl": ttl})
             await self._request_async(
                 "PATCH",
-                f"{self._encode_key(key)}/ttl",
+                f"{encoded_key}/ttl",
                 content=payload.encode(),
                 headers={"Content-Type": "application/json"},
             )
