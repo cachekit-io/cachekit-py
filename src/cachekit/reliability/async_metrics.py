@@ -5,6 +5,7 @@ synchronous Prometheus updates from the hot path.
 """
 
 import logging
+import numbers
 import os
 import queue
 import threading
@@ -15,6 +16,17 @@ from typing import Any, Optional, Union
 from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
+
+# Suffixes prometheus_client appends to a metric's base name to form its series names.
+_SERIES_SUFFIXES = ("", "_total", "_created", "_bucket", "_count", "_sum")
+
+# Every series name the collector's own metrics register. A caller-supplied metric whose series would include
+# one of these could claim it: the built-in metric would then register under a renamed series, or break every
+# later cache-operation update.
+_BUILTIN_SERIES = frozenset(
+    {"cache_operations", "cache_operations_total", "cache_operations_created", "circuit_breaker_state"}
+    | {f"{h}{s}" for h in ("cache_operation_duration_ms", "cache_operation_size_bytes") for s in _SERIES_SUFFIXES}
+)
 
 try:
     from prometheus_client import Counter, Gauge, Histogram  # type: ignore[assignment]
@@ -238,6 +250,16 @@ class AsyncMetricsCollector:
             metric_name: Name of the counter metric
             labels: Dictionary of labels for the metric
             value: Value to increment by (default: 1.0)
+
+        In sync mode the errors below reach the caller. In batched mode the same checks run in the worker,
+        which logs the rejected record and skips it, so the call itself never raises.
+
+        Raises:
+            TypeError: If ``metric_name`` or a label name is not a str, or ``value`` is not a real number.
+            ValueError: If ``metric_name`` would register a series the collector records itself (such as
+                ``cache_operations_total``), if it is already registered as another metric kind, or if the
+                label names differ from those the metric was first recorded with.
+            OverflowError: If ``value`` is too large for a float.
         """
         self._operation_count += 1
 
@@ -256,6 +278,16 @@ class AsyncMetricsCollector:
             metric_name: Name of the histogram metric
             value: Value to observe
             labels: Dictionary of labels for the metric
+
+        In sync mode the errors below reach the caller. In batched mode the same checks run in the worker,
+        which logs the rejected record and skips it, so the call itself never raises.
+
+        Raises:
+            TypeError: If ``metric_name`` or a label name is not a str, or ``value`` is not a real number.
+            ValueError: If ``metric_name`` would register a series the collector records itself (such as
+                ``cache_operations_total``), if it is already registered as another metric kind, or if the
+                label names differ from those the metric was first recorded with.
+            OverflowError: If ``value`` is too large for a float.
         """
         self._operation_count += 1
 
@@ -303,6 +335,16 @@ class AsyncMetricsCollector:
                 batch = []
                 last_flush = time.time()
 
+        # Stopping ends the loop with records still queued; drain them so shutdown() loses nothing.
+        # Bounded by a snapshot so producers still recording cannot keep the worker alive, and
+        # flushed in batch_size chunks so the backlog keeps normal batch granularity. This worker is
+        # the queue's only consumer, so the snapshot never exceeds the records available.
+        for _ in range(self._queue.qsize()):
+            batch.append(self._queue.get_nowait())
+            if len(batch) >= self.batch_size:
+                self._flush_batch(batch)
+                batch = []
+
         # Final flush on shutdown
         if batch:
             self._flush_batch(batch)
@@ -334,14 +376,16 @@ class AsyncMetricsCollector:
                     circuit_states[key] += 1
 
                 elif metric["type"] == "counter":
+                    value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
-                    counters[name][labels_key] += metric["value"]
+                    counters[name][labels_key] += value
 
                 elif metric["type"] == "histogram":
+                    value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
-                    histograms[name].append((metric["value"], labels_key))
+                    histograms[name].append((value, labels_key))
 
             except Exception as e:
                 logger.error(f"Error processing metric: {redact_error_for_log(e)}")
@@ -349,8 +393,37 @@ class AsyncMetricsCollector:
                 # Return metric data to pool for reuse
                 self._return_to_pool(metric)
 
-        # Batch update Prometheus metrics
-        self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+        # Batch update Prometheus metrics. Bad caller input is rejected per record above, and the per-metric
+        # handlers skip what prometheus_client rejects with ValueError. This is the thread boundary for anything
+        # unforeseen: most worker call sites (the shutdown drain among them) have no handler above them, so an
+        # escaping exception would end the worker and strand every record still queued.
+        try:
+            self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+        except Exception as e:
+            logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
+
+    @staticmethod
+    def _check_generic_metric(name: Any, labels: dict[Any, Any], value: Any) -> float:
+        """Validate a caller-supplied counter or histogram and return its value as a float.
+
+        Rejects input that would make the batch update fail with an error other than ValueError, which is
+        all the update step isolates per metric. In async mode a rejected record is logged and skipped on
+        its own; in sync mode the error reaches the caller.
+
+        Raises:
+            TypeError: If the name or a label name is not a str, or the value is not a number.
+            ValueError: If the name is reserved for a metric the collector records itself.
+            OverflowError: If the value is too large for a float.
+        """
+        if not isinstance(name, str) or not all(isinstance(k, str) for k in labels):
+            raise TypeError("metric name and label names must be str")
+        # A counter's base drops "_total"; checking both forms against every suffix covers both metric kinds.
+        bases = (name, name.removesuffix("_total"))
+        if any(f"{b}{s}" in _BUILTIN_SERIES for b in bases for s in _SERIES_SUFFIXES):
+            raise ValueError(f"metric name {name} is reserved")
+        if not isinstance(value, numbers.Real):
+            raise TypeError("metric value must be a number")
+        return float(value)
 
     def _update_prometheus_metrics(
         self,
@@ -402,10 +475,23 @@ class AsyncMetricsCollector:
                 first_labels_key = next(iter(label_values.keys()))
                 label_names = [k for k, v in first_labels_key] if first_labels_key else []
 
-                counter_metric = self._get_metric(name, Counter, f"Counter metric {name}", label_names)
+                # Prometheus rejects caller-supplied names and labels with ValueError (reserved label
+                # names, label names that differ from the first-seen schema). Skip the bad series and
+                # log once per metric, so one bad record neither discards the batch nor floods the log.
+                try:
+                    counter_metric = self._get_metric(name, Counter, f"Counter metric {name}", label_names)
+                except ValueError as e:
+                    logger.error(f"Failed to create counter {name}: {redact_error_for_log(e)}")
+                    continue
+                failures, last_error = 0, None
                 for labels_key, value in label_values.items():
                     labels_dict = dict(labels_key)  # type: ignore[arg-type]
-                    counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                    try:
+                        counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                    except ValueError as e:
+                        failures, last_error = failures + 1, e
+                if last_error is not None:
+                    logger.error(f"Failed to update counter {name} ({failures} series): {redact_error_for_log(last_error)}")
 
         # Update generic histograms
         for name, observations in histograms.items():
@@ -414,13 +500,31 @@ class AsyncMetricsCollector:
                 first_value, first_labels_key = observations[0]
                 label_names = [k for k, v in first_labels_key] if first_labels_key else []
 
-                histogram_metric = self._get_metric(name, Histogram, f"Histogram metric {name}", label_names)
+                try:
+                    histogram_metric = self._get_metric(name, Histogram, f"Histogram metric {name}", label_names)
+                except ValueError as e:
+                    logger.error(f"Failed to create histogram {name}: {redact_error_for_log(e)}")
+                    continue
+                failures, last_error = 0, None
                 for value, labels_key in observations:
                     labels_dict = dict(labels_key)
-                    histogram_metric.labels(**labels_dict).observe(value)
+                    try:
+                        histogram_metric.labels(**labels_dict).observe(value)
+                    except ValueError as e:
+                        failures, last_error = failures + 1, e
+                if last_error is not None:
+                    logger.error(
+                        f"Failed to update histogram {name} ({failures} observations): {redact_error_for_log(last_error)}"
+                    )
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
-        """Get or create the process-wide metric instance for ``name``."""
+        """Get or create the process-wide metric instance for ``name``.
+
+        Raises:
+            ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
+                does for a name registered twice. Otherwise the caller would call a method the cached
+                metric lacks.
+        """
         metric = _metrics_cache.get(name)
         if metric is None:
             with _metrics_cache_lock():
@@ -437,6 +541,8 @@ class AsyncMetricsCollector:
                         logger.warning(f"Metric {name!r} is already registered outside cachekit; not recording it")
                         metric = _NoopMetric()
                     _metrics_cache[name] = metric
+        if not isinstance(metric, (metric_class, _NoopMetric)):
+            raise ValueError(f"metric {name} is already a {type(metric).__name__}, not a {metric_class.__name__}")
         return metric
 
     def get_dropped_metrics_count(self) -> int:
@@ -568,6 +674,7 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
+        value = self._check_generic_metric(metric_name, labels, value)
         counter = self._get_metric(metric_name, Counter, f"Counter metric {metric_name}", list(labels.keys()))
         counter.labels(**labels).inc(value)
 
@@ -576,6 +683,7 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
+        value = self._check_generic_metric(metric_name, labels, value)
         histogram = self._get_metric(metric_name, Histogram, f"Histogram metric {metric_name}", list(labels.keys()))
         histogram.labels(**labels).observe(value)
 
