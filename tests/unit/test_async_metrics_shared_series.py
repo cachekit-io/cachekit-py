@@ -8,7 +8,9 @@ which the documented PromQL never reads.
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 import uuid
 from typing import Any
 
@@ -101,3 +103,21 @@ def test_name_owned_by_host_app_is_dropped_not_renamed(caplog: pytest.LogCapture
     assert "already registered outside cachekit" in caplog.text
     renamed = re.compile(rf"^{name}_[0-9a-f]{{8}}")
     assert not [s.name for m in REGISTRY.collect() for s in m.samples if renamed.match(s.name)]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_while_metric_lock_held_does_not_hang_child() -> None:
+    import cachekit.reliability.async_metrics as am
+
+    with am._metrics_cache_lock:  # stands in for another thread mid-registration at fork time
+        pid = os.fork()
+        if pid == 0:  # child: registering a fresh metric must not block on the inherited lock
+            done = threading.Event()
+            name = f"after_fork_{uuid.uuid4().hex}"
+            threading.Thread(
+                target=lambda: (AsyncMetricsCollector(sync_mode=True).record_counter(name, {"k": "v"}), done.set()), daemon=True
+            ).start()
+            os._exit(0 if done.wait(5) else 1)
+
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0

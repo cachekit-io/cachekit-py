@@ -5,6 +5,7 @@ synchronous Prometheus updates from the hot path.
 """
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -78,6 +79,16 @@ class _NoopMetric:
 # series; registering per instance collides on the second collector.
 _metrics_cache: dict[str, Any] = {}
 _metrics_cache_lock = threading.Lock()
+
+
+def _reset_metrics_cache_lock() -> None:
+    # A fork while another thread holds the lock leaves the child a lock nobody will release.
+    global _metrics_cache_lock
+    _metrics_cache_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_metrics_cache_lock)
 
 
 class AsyncMetricsCollector:
