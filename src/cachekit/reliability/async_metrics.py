@@ -298,11 +298,13 @@ class AsyncMetricsCollector:
                     circuit_states[key] += 1
 
                 elif metric["type"] == "counter":
+                    self._check_generic_metric(metric)
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
                     counters[name][labels_key] += metric["value"]
 
                 elif metric["type"] == "histogram":
+                    self._check_generic_metric(metric)
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
                     histograms[name].append((metric["value"], labels_key))
@@ -315,6 +317,18 @@ class AsyncMetricsCollector:
 
         # Batch update Prometheus metrics
         self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _check_generic_metric(metric: dict[str, Any]) -> None:
+        """Reject a caller-supplied record whose types would make Prometheus fail with an error other than ValueError.
+
+        The update step only isolates ValueError, so a record breaking this contract must be dropped here,
+        where one bad record is logged and skipped, rather than abort the whole batch.
+        """
+        if not isinstance(metric["name"], str) or not all(isinstance(k, str) for k in metric["labels"]):
+            raise TypeError("metric name and label names must be str")
+        if not isinstance(metric["value"], (int, float)):
+            raise TypeError("metric value must be a number")
 
     def _update_prometheus_metrics(
         self,

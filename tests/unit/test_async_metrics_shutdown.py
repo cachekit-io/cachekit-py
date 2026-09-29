@@ -104,3 +104,24 @@ def test_shutdown_flush_survives_failing_series(caplog):
     assert sum(bad_histogram_name in m for m in messages) == 1
     assert sum(counter_name in m for m in messages) == 1
     assert sum("Failed to create" in m for m in messages) == 2
+
+
+def test_shutdown_flush_skips_records_that_break_the_type_contract(caplog):
+    n = 1_000
+    histogram_name = f"shutdown_drain_typed_histogram_{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(batch_size=100, sync_mode=False, auto_detect_mode=False)
+
+    # prometheus_client fails on these with AttributeError or TypeError, not ValueError.
+    collector.record_counter(f"shutdown_drain_int_label_{uuid.uuid4().hex}", {1: "one"})  # type: ignore[dict-item]
+    collector.record_counter(123, {"a": "one"})  # type: ignore[arg-type]
+    collector.record_histogram(f"shutdown_drain_str_value_{uuid.uuid4().hex}", "x", {"a": "one"})  # type: ignore[arg-type]
+    for _ in range(n):
+        collector.record_histogram(histogram_name, 1.0, {"op": "get"})
+
+    with caplog.at_level(logging.ERROR, logger="cachekit.reliability.async_metrics"):
+        collector.shutdown()
+
+    assert collector._worker_thread is not None and not collector._worker_thread.is_alive()
+    assert collector._queue is not None and collector._queue.qsize() == 0
+    assert collector._metrics_cache[histogram_name].labels(op="get")._sum.get() == n
+    assert sum("Error processing metric" in r.getMessage() for r in caplog.records) == 3
