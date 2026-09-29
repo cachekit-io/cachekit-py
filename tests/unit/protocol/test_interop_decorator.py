@@ -18,6 +18,7 @@ from cachekit import cache
 from cachekit.config.validation import ConfigurationError
 from cachekit.interop import InteropError
 from cachekit.serializers.wrapper import SerializationWrapper
+from tests.unit.protocol.test_interop_model import NS, OP, FormatsAsNsapi, UnhashableAsReserved
 
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "interop-mode.json").read_text(encoding="utf-8"))
 KEY_VECTORS = {v["name"]: v for v in VECTORS["key_vectors"]}
@@ -273,6 +274,42 @@ class TestInteropRejections:
 
         f(*vector["args"])
         assert list(backend.store) == [vector["expected_key"]]
+
+    def test_str_enum_segments_write_the_plain_key(self, backend: DictBackend):
+        """A (str, Enum) member is keyed by its value, not its NS.USERS format."""
+
+        @_decorate(backend, interop=OP.GET_USER, namespace=NS.USERS)
+        def get_user(user_id: int):
+            return user_id
+
+        get_user(42)
+        assert list(backend.store) == [KEY_VECTORS["single_int"]["expected_key"]]
+
+    def test_overridden_format_never_writes_a_reserved_prefix(self, backend: DictBackend):
+        @_decorate(backend, interop="get_user", namespace=FormatsAsNsapi("users"))
+        def get_user(user_id: int):
+            return user_id
+
+        get_user(42)
+        assert list(backend.store) == [KEY_VECTORS["single_int"]["expected_key"]]
+
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_overridden_hash_rejected_at_decoration(self, backend: DictBackend, reserved: str):
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @_decorate(backend, interop="get_user", namespace=UnhashableAsReserved(reserved))
+            def f(x: int):
+                return x
+
+    def test_wrapper_uses_the_validated_namespace_after_validation(self, backend: DictBackend):
+        """create_cache_wrapper rebinds namespace to the exact str it validated,
+        so later checks such as the key-registry 'ck' reservation cannot be
+        dodged by a subclass whose __eq__ lies."""
+        with pytest.raises(ConfigurationError, match="key registry"):
+
+            @_decorate(backend, interop="get_user", namespace=UnhashableAsReserved("ck"))
+            def f(x: int):
+                return x
 
     def test_custom_key_function_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="key"):

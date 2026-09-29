@@ -580,25 +580,15 @@ def create_cache_wrapper(
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
 
-    # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
-    # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
-    # drain another's keys. namespace=None and namespace="default" write different auto-mode
-    # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
-    # a key written under it could take the ck:reg: shape and overwrite a tracking set.
-    if namespace == "ck" or (namespace or "").startswith("ck:"):
-        raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
-    _registry_id = (
-        f"ck:reg:{namespace if namespace is not None else ''}:"
-        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
-    )
-
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
-    # that bypass DecoratorConfig validation.
+    # that bypass DecoratorConfig validation. Runs before any other use of namespace
+    # and rebinds both segments to the exact str values it checked, so a str subclass
+    # (e.g. a (str, Enum) member) cannot render differently in a key.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
         try:
-            validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
+            interop, namespace = validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
         except InteropError as e:
             raise ConfigurationError(str(e)) from e
         if fast_mode:
@@ -615,6 +605,18 @@ def create_cache_wrapper(
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
         _interop_sig = inspect.signature(func)
+
+    # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
+    # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
+    # drain another's keys. namespace=None and namespace="default" write different auto-mode
+    # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
+    # a key written under it could take the ck:reg: shape and overwrite a tracking set.
+    if namespace == "ck" or (namespace or "").startswith("ck:"):
+        raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
+    _registry_id = (
+        f"ck:reg:{namespace if namespace is not None else ''}:"
+        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
+    )
 
     # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
     # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the

@@ -283,23 +283,33 @@ def args_hash(args: list | tuple) -> str:
 
 
 def validate_segment(name: str, segment: object) -> str:
-    """Validate an interop namespace/operation segment. Returns the segment.
+    """Validate an interop namespace/operation segment. Returns it as an exact ``str``.
 
     Full-string match against ``^[a-z0-9][a-z0-9._-]{0,63}$`` — never silently
     normalized. re.fullmatch, not re.match: $ accepts a trailing newline.
     A namespace must additionally not be one of :data:`RESERVED_NAMESPACES`.
+
+    A ``str`` subclass is checked and returned as its exact ``str`` value, so
+    callers must render the returned value, not the argument. The subclass's own
+    ``__format__`` could otherwise render a key that was never checked (a
+    ``(str, Enum)`` member formats as ``NS.USERS`` since Python 3.11), and its
+    ``__hash__``/``__eq__`` could make the reserved-namespace lookup miss.
     """
-    if not isinstance(segment, str) or not SEGMENT_RE.fullmatch(segment):
+    # str.__str__, not str(): it copies the underlying characters and ignores
+    # an overridden __str__. The characters are unchanged, so this is not a
+    # normalization in the spec's sense.
+    value = str.__str__(segment) if isinstance(segment, str) else segment
+    if not isinstance(value, str) or not SEGMENT_RE.fullmatch(value):
         raise InteropError(
-            f"invalid interop {name} {segment!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
+            f"invalid interop {name} {value!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
             f"(lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
         )
-    if name == "namespace" and segment in RESERVED_NAMESPACES:
+    if name == "namespace" and value in RESERVED_NAMESPACES:
         raise InteropError(
-            f"invalid interop namespace {segment!r}: reserved, because the CachekitIO server parses a key "
-            f"starting '{segment}:' as namespace-prefixed"
+            f"invalid interop namespace {value!r}: reserved, because the CachekitIO server parses a key "
+            f"starting '{value}:' as namespace-prefixed"
         )
-    return segment
+    return value
 
 
 def validate_interop_config(operation: object, namespace: object, *, has_custom_key: bool = False) -> tuple[str, str]:
@@ -310,6 +320,8 @@ def validate_interop_config(operation: object, namespace: object, *, has_custom_
     Covers: operation/namespace segment charset, mandatory namespace,
     ``key=`` mutual exclusion. Raises InteropError; callers keep their own
     error wrapping and site-specific checks (fast_mode, L1-only, backend).
+    Returns ``(operation, namespace)`` as exact ``str`` values; a caller that
+    builds keys must use these, not its arguments (see :func:`validate_segment`).
     """
     op = validate_segment("operation", operation)
     if namespace is None:
@@ -333,9 +345,9 @@ def generate_interop_key(namespace: str, operation: str, args: list | tuple) -> 
     Max possible key length is 64+1+64+1+64 = 194 chars — under every
     backend limit, so key truncation never applies to interop keys.
     """
-    validate_segment("namespace", namespace)
-    validate_segment("operation", operation)
-    return f"{namespace}:{operation}:{args_hash(args)}"
+    ns = validate_segment("namespace", namespace)
+    op = validate_segment("operation", operation)
+    return f"{ns}:{op}:{args_hash(args)}"
 
 
 def bind_flat_args(sig: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
