@@ -149,15 +149,16 @@ def get_data():
 
 **The serializer-mismatch guard still exists**, and still raises
 `SerializationError: Serializer mismatch: cached data uses 'X', but decorator configured with 'Y'`.
-An entry that records no serializer name at all counts as a mismatch too: every writer
-records one, so a nameless entry is malformed or tampered, and it is evicted and recomputed
-rather than decoded. It is the fallback for the cases where the key cannot separate the
-serializers:
+It is the fallback for the cases where the key cannot separate the serializers:
 
 - a custom `key=` function (custom keys carry no serializer code).
 
 And it cannot help at all where the envelope name is identical too — two instances of one
 class, as in the caution above.
+
+An entry that records no serializer name at all is rejected before it is decoded. Every
+cachekit-py writer records one, so a nameless entry is treated as a corrupt envelope
+(`Corrupt cache envelope: …`): a miss, with the entry evicted and the value recomputed.
 
 **For zero-downtime migrations**, use namespace versioning:
 

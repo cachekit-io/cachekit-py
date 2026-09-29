@@ -42,7 +42,7 @@ _PREFIX_LEN = len(_MAGIC) + 1 + _HEADER_LEN_BYTES  # magic(2) + version(1) + hdr
 def _require_serializer_name(name: Any) -> str:
     """Reject an entry that records no serializer name (protocol: a nameless value is a mismatch).
 
-    Every writer records a name, so its absence means a malformed or tampered entry. Rejecting
+    Every cachekit-py writer records a name, so its absence means a malformed or tampered entry. Rejecting
     here, in the one parser, keeps it away from every serializer's decode (LAB-4432).
     """
     if not isinstance(name, str) or not name:
