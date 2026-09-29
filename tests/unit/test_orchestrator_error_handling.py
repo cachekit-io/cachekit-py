@@ -208,10 +208,12 @@ class TestErrorHandlerContract:
                 duration_ms=float(i),
             )
 
-        # Should handle all without crashing or memory leaks
-        # Circuit breaker should have recorded all failures
+        # Should handle all without crashing or memory leaks. The first
+        # failure_threshold errors open the breaker; the rest arrive while it is
+        # OPEN, where they are not counted (they would push the timeout forward).
         stats = orchestrator.circuit_breaker.get_stats()
-        assert stats.get("failure_count", 0) >= 10
+        assert stats["state"] == "OPEN"
+        assert stats["failure_count"] == stats["config"]["failure_threshold"]
 
 
 @pytest.mark.unit
