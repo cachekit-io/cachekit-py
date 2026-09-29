@@ -174,7 +174,7 @@ for uid in [1, 2, 3]:
 - User data refresh
 - Post cache invalidation
 
-**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local.
+**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local. If the L2 delete fails, cachekit logs an ERROR `Failed to delete L2 key` and tracks the key in this process, so a later no-args `invalidate_cache()` from the same process retries it. Tracking is process-local: another process, or this one after a restart, does not retry it.
 
 ### Whole-Function Invalidation
 
@@ -206,7 +206,9 @@ Things to know:
 - **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
 - **Same module path everywhere.** The set is named by the function's `module.qualname`, so every process must import the function from the same module path.
 
-**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked. L1 is not tenant-scoped: within a process, all tenants share one L1 entry per cache key, so a tenant can be served the value another tenant cached, and `invalidate_cache()` evicts that entry for every tenant. Disable L1 on functions whose results differ by tenant: `@cache(..., l1_enabled=False)`, or with a preset `@cache(config=DecoratorConfig.production(), l1_enabled=False)`.
+**Custom `key=` functions.** Both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. No-args `invalidate_cache()` reaches what the table above says for the resolved backend — the registry tracks the key the write path actually wrote, custom or not. On the backends limited to "this process", tracked keys do not survive a restart, so after a deploy use the exact-args form.
+
+**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked. L1 is not tenant-scoped: within a process, all tenants share one L1 entry per cache key, so a tenant can be served the value another tenant cached, and `invalidate_cache()` evicts that entry for every tenant. Disable L1 on functions whose results differ by tenant: `@cache(..., l1_enabled=False)`, or with a preset `@cache.production(..., l1_enabled=False)`, which keeps the preset's other L1 settings.
 
 ---
 
@@ -290,11 +292,12 @@ def test_function():
 | `test()` | ❌ |
 | `dev()` | L1-only¹ |
 | `production()` | L1-only¹ |
-| `secure()` | L1-only¹ |
+| `secure()` | ❌³ |
 | `io()` | ✓² |
 
 ¹ Within-TTL SWR runs only in L1-only mode (`backend=None`) — with a backend configured, `swr_enabled` has no effect (see the callout at the top of this page).
 ² `@cache.io` ships past-TTL SWR via [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) (default-on), using the CachekitIO backend's freshness signal — a different mechanism from the L1-only within-TTL refresh described here.
+³ `@cache.secure` raises `ConfigurationError` with `backend=None` (L1-only stores raw objects, which cannot be ciphertext), so the L1-only SWR never runs for it.
 
 ---
 

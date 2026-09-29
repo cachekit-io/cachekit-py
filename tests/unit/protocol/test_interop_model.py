@@ -3,8 +3,8 @@
 The protocol vectors (test_interop_vectors.py) byte-pin the canonical forms;
 these tests pin the SDK-local model edges around them: msgpack 32-bit length
 tiers, argument normalization of Python-idiomatic types (Enum/Path/Decimal),
-``*args``/``**kwargs`` flattening, temporal value sentinels, and strict
-single-document decoding.
+``*args``/``**kwargs`` flattening, temporal value sentinels, strict
+single-document decoding, and the reserved-namespace boundary.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from cachekit.interop import (
     decode_interop_value,
     encode_interop_value,
     ensure_interop_backend_compatible,
+    generate_interop_key,
+    validate_interop_config,
 )
 
 
@@ -134,3 +136,27 @@ class TestBackendGuard:
     def test_none_backend_is_compatible(self):
         # lazily-resolved backends are re-checked per call after resolution
         ensure_interop_backend_compatible(None)
+
+
+class TestReservedNamespaces:
+    """``ns`` and ``nsapi`` are reserved as namespaces: the server parses a key
+    starting ``ns:`` / ``nsapi:`` as namespace-prefixed. The reservation is
+    exact-match and namespace-only."""
+
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_reserved_namespace_rejected_by_keygen(self, reserved: str):
+        with pytest.raises(InteropError, match="reserved"):
+            generate_interop_key(reserved, "get_user", [1])
+
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_reserved_namespace_rejected_by_config(self, reserved: str):
+        with pytest.raises(InteropError, match="reserved"):
+            validate_interop_config("get_user", reserved)
+
+    @pytest.mark.parametrize(
+        ("operation", "namespace"),
+        [("ns", "users"), ("nsapi", "users"), ("get_user", "nsx"), ("get_user", "nsfw"), ("get_user", "nsapi2")],
+    )
+    def test_reservation_is_exact_match_and_namespace_only(self, operation: str, namespace: str):
+        assert validate_interop_config(operation, namespace) == (operation, namespace)
+        assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
