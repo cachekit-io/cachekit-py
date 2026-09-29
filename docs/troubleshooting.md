@@ -34,7 +34,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 3. **Let the breaker recover** — no restart is needed:
 - After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
-- While open, sync and async functions run without caching — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
+- While open, sync and async functions with an L2 backend run without caching (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
 ```bash
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many in total open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, only a `BackendError` counts.
+Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many in total open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count, except that a `BackendError` reruns it without the lock, and a failure of that rerun counts.
 
 </details>
 

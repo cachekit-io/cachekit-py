@@ -311,7 +311,7 @@ Redis error → Logged: a failed read is a miss, a failed write skips L2 only, a
 
 **Circuit Breaker + Distributed Locking**:
 ```python notest
-@cache(ttl=300, backend=None)  # Both features enabled
+@cache(ttl=300)  # Both features enabled (they need an L2 backend)
 def fetch(key):
     # L2 miss → Distributed lock acquired
     # Only one pod calls fetch()
