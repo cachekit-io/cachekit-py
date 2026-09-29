@@ -180,8 +180,8 @@ assert problematic_function.get_health_status()["circuit_breaker"]["config"]["ti
 ```python
 @cache(ttl=300)  # 5 minute cache
 def get_data():
-    # Circuit OPEN, or backend down: never serves stale cache
-    # (backend errors do not currently count toward the breaker; each call runs uncached)
+    # Circuit OPEN: L1 and L2 are skipped, so no cache, stale or fresh, is served
+    # (backend errors do not currently count toward the breaker, so an outage alone does not open it)
     # Result: every call runs this function, so the database takes full load
     # Solution: size the data source for uncached traffic during an outage
     return fetch_data()
@@ -297,7 +297,7 @@ class CircuitBreaker:
 ```
 Circuit CLOSED → L1, then L2, then the function, as usual
 Circuit OPEN → L1 and L2 are both skipped: the function runs uncached
-Redis error → Logged, the call runs uncached (backend errors do not currently count toward the breaker)
+Redis error → Logged: a failed read is a miss, a failed write skips L2 only, and L1 still stores the result (backend errors do not currently count toward the breaker)
 ```
 
 ### Performance Impact
@@ -316,7 +316,7 @@ def fetch(key):
     # L2 miss → Distributed lock acquired
     # Only one pod calls fetch()
     # If L2 fails → logged; backend errors do not currently count toward the breaker
-    # Each pod runs fetch() uncached (no cascade)
+    # Each pod runs fetch() on its own L1 miss and keeps the result in its L1
     return db.fetch(key)  # illustrative - not defined
 ```
 
@@ -325,7 +325,7 @@ def fetch(key):
 @cache.secure(master_key=secret_key, ttl=300)  # Both features enabled
 def fetch_sensitive(key):
     # Encryption happens before L2 write
-    # If L2 fails → logged, runs uncached; backend errors do not currently count toward the breaker
+    # If L2 fails → logged; the result still goes to L1; backend errors do not currently count toward the breaker
     # A decrypt/integrity failure on read never counts toward the breaker.
     # Fail-open (default): it is a cache miss and the function runs.
     # fail_closed=True: an authentication failure raises DecryptionAuthenticationError
