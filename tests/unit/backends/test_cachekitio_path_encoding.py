@@ -13,12 +13,15 @@ token:
     ..       ->  GET /v1              (dot-segment collapse)
     ../ttl   ->  GET /v1/ttl          (collapse onto a *different* route)
 
-The last case is the nastiest: ``quote(key, safe="")`` leaves RFC-3986 unreserved
-``.`` raw, so a key of exactly ``.`` or ``..`` still collapses even after
-encoding — ``_encode_key`` special-cases an all-dot segment to ``%2E`` so it
-can't. See ``SECURITY.md`` for the full mechanism and the cross-SDK wire-parity
-contract (cachekit-ts ``encodeURIComponent``, cachekit-rs ``urlencoding::encode``,
-SaaS single decode + ``..`` reject).
+The last two cases cannot be fixed by encoding. ``quote(key, safe="")`` leaves
+RFC-3986 unreserved ``.`` raw, and ``%2E`` does not help either: httpx sends it
+intact, but the SaaS parses the URL under WHATWG, which collapses ``%2E`` /
+``%2E%2E`` as dot segments server-side. ``health``, ``ttl`` and ``lock`` are route
+tokens at the same level. So ``_encode_key`` rejects those five keys before any
+request is made (protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2;
+LAB-2880). See ``SECURITY.md`` for the full mechanism and the cross-SDK
+wire-parity contract (cachekit-ts ``encodeURIComponent``, cachekit-rs
+``urlencoding::encode``, SaaS single decode + ``..`` reject).
 
 These tests drive the real backend methods through a real ``httpx`` client backed
 by a ``MockTransport`` and assert on ``request.url.raw_path`` — the actual bytes
@@ -38,6 +41,7 @@ import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
+from cachekit.backends.errors import BackendError, BackendErrorType
 
 _TEST_API_URL = "https://api.cachekit.io"
 _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, not a real key
@@ -46,13 +50,17 @@ _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, n
 # plus the benign shapes that must still round-trip unchanged.
 _TRAVERSAL_KEYS = [
     "default:../../admin",  # `/`-bearing traversal (every `/` → %2F, so no collapse)
-    "..",  # bare dot-segment: collapses to /v1 (or /v1/ttl on suffix routes) unless encoded
-    ".",  # single dot-segment: collapses to the collection endpoint unless encoded
     "a:..",  # trailing dots but NOT an all-dot segment → must stay raw dots, must not collapse
+    "..a",  # leading dots, not an all-dot segment → sent verbatim, not rejected
     "k?x=1#f",  # query + fragment injection
     "a b",  # space (must not become a raw space / '+' in the path)
     "ns:articles:func:mod.fn:args:" + ("a" * 64) + ":1s",  # canonical 7-seg key (`:` → %3A)
 ]
+
+# Rule 2 reserved segments: no wire form reaches the SaaS key validator, so the
+# client must raise before building the URL (dot segments collapse client- or
+# server-side; the words are route tokens under /v1/cache/).
+_RESERVED_KEYS = [".", "..", "health", "ttl", "lock"]
 
 
 def _recording_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:
@@ -106,13 +114,9 @@ def _assert_contained(request: httpx.Request, key: str, *, suffix: str = "") -> 
 
     # The encoded key segment carries no separator/delimiter that httpx (or the
     # SaaS router) could act on: every ``/`` is ``%2F``, so no *embedded* ``../``
-    # can exist. A segment that is *entirely* dots (``.`` / ``..``) IS still a live
-    # dot-segment even without an embedded ``/`` — httpx collapses it against the
-    # ``/v1/cache/`` prefix (and the ``/ttl`` / ``/lock`` suffix supplies the trailing
-    # boundary), so ``_encode_key`` must encode those dots too. The ``startswith``
-    # check above is what catches a collapse: a bare ``..`` that leaked would show up
-    # as ``/v1`` or ``/v1/ttl``, failing the prefix assertion. The SaaS validator
-    # additionally rejects ``..`` in the decoded key as defence in depth.
+    # can exist. A segment that is *entirely* dots never gets here — it is rejected
+    # (see the reserved-key tests below). The ``startswith`` check above is what
+    # catches a collapse: a leaked ``..`` would show up as ``/v1`` or ``/v1/ttl``.
     for bad in ("/", "?", "#"):
         assert bad not in encoded_key, f"unencoded {bad!r} survived in key segment: {encoded_key!r}"
 
@@ -199,3 +203,62 @@ def test_health_endpoint_untouched() -> None:
     backend, seen = _make_backend()
     backend.health_check()
     assert seen[0].url.raw_path == b"/v1/cache/health"
+
+
+# ---- reserved segments: rejected before any request is made (LAB-2880) -----
+
+
+def _assert_rejected(exc: BackendError, seen: list[httpx.Request]) -> None:
+    assert exc.error_type is BackendErrorType.PERMANENT, "reserved key must fail fast, not be retried"
+    assert seen == [], f"a request left the process for a reserved key: {[r.url.raw_path for r in seen]}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", _RESERVED_KEYS)
+@pytest.mark.parametrize(("op_name", "op"), _SYNC_OPS, ids=[o[0] for o in _SYNC_OPS])
+def test_sync_reserved_key_rejected(key: str, op_name: str, op: Callable[[CachekitIOBackend, str], object]) -> None:
+    backend, seen = _make_backend()
+    with pytest.raises(BackendError) as excinfo:
+        op(backend, key)
+    _assert_rejected(excinfo.value, seen)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", _RESERVED_KEYS)
+@pytest.mark.parametrize(("op_name", "op"), _ASYNC_OPS, ids=[o[0] for o in _ASYNC_OPS])
+async def test_async_reserved_key_rejected(key: str, op_name: str, op: Callable[[CachekitIOBackend, str], object]) -> None:
+    backend, seen = _make_backend()
+    with pytest.raises(BackendError) as excinfo:
+        await op(backend, key)  # type: ignore[misc]
+    _assert_rejected(excinfo.value, seen)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", _RESERVED_KEYS)
+async def test_get_ttl_reserved_key_rejected(key: str) -> None:
+    """Raises rather than returning None: a reserved key is not a missing key."""
+    backend, seen = _make_backend()
+    with pytest.raises(BackendError) as excinfo:
+        await backend.get_ttl(key)
+    _assert_rejected(excinfo.value, seen)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", _RESERVED_KEYS)
+async def test_refresh_ttl_reserved_key_rejected(key: str) -> None:
+    """Raises rather than returning False: nothing was attempted."""
+    backend, seen = _make_backend()
+    with pytest.raises(BackendError) as excinfo:
+        await backend.refresh_ttl(key, ttl=99)
+    _assert_rejected(excinfo.value, seen)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", _RESERVED_KEYS)
+async def test_acquire_lock_reserved_key_rejected(key: str) -> None:
+    """PERMANENT propagates out of acquire_lock, so the wrapper degrades to no-lock once."""
+    backend, seen = _make_backend()
+    with pytest.raises(BackendError) as excinfo:
+        async with backend.acquire_lock(key, timeout=5.0, blocking_timeout=1.0):
+            pytest.fail("lock body must not run for a reserved key")
+    _assert_rejected(excinfo.value, seen)
