@@ -149,7 +149,10 @@ def get_data():
 
 **The serializer-mismatch guard still exists**, and still raises
 `SerializationError: Serializer mismatch: cached data uses 'X', but decorator configured with 'Y'`.
-It is the fallback for the cases where the key cannot separate the serializers:
+An entry that records no serializer name at all counts as a mismatch too: every writer
+records one, so a nameless entry is malformed or tampered, and it is evicted and recomputed
+rather than decoded. It is the fallback for the cases where the key cannot separate the
+serializers:
 
 - a custom `key=` function (custom keys carry no serializer code).
 

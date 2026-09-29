@@ -39,6 +39,17 @@ _HEADER_LEN_BYTES = 4  # u32 big-endian header length
 _PREFIX_LEN = len(_MAGIC) + 1 + _HEADER_LEN_BYTES  # magic(2) + version(1) + hdrlen(4) = 7
 
 
+def _require_serializer_name(name: Any) -> str:
+    """Reject an entry that records no serializer name (protocol: a nameless value is a mismatch).
+
+    Every writer records a name, so its absence means a malformed or tampered entry. Rejecting
+    here, in the one parser, keeps it away from every serializer's decode (LAB-4432).
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("Cache envelope records no serializer name")
+    return name
+
+
 class SerializationWrapper:
     """Frame/unframe serialized bytes with a metadata header for cache storage.
 
@@ -120,6 +131,9 @@ class SerializationWrapper:
         Returns:
             tuple: (payload, metadata_dict, serializer_name). For a v3 frame the payload is a
             zero-copy ``memoryview`` aliasing ``wrapped_data``; the legacy path returns ``bytes``.
+
+        Raises:
+            ValueError: malformed envelope, including one that records no serializer name.
         """
         # v3 binary frame: only bytes-like can be a frame (str is always legacy JSON).
         if isinstance(wrapped_data, (bytes, bytearray, memoryview)):
@@ -140,15 +154,15 @@ class SerializationWrapper:
                 # mmap read path without materializing. The view keeps `wrapped_data` alive, so
                 # it never dangles; consumers needing owned bytes coerce at their own boundary.
                 payload = mv[header_end:]
-                return payload, header.get("m", {}), header.get("s", "unknown")
+                return payload, header.get("m", {}), _require_serializer_name(header.get("s"))
 
         # Legacy base64+JSON envelope (pre-v3 entries; backward compatible read path).
         if isinstance(wrapped_data, (bytes, bytearray, memoryview)):
             wrapped_data = bytes(wrapped_data).decode("utf-8")
         wrapper = json.loads(wrapped_data)
+        serializer_name = _require_serializer_name(wrapper.get("serializer"))
         data = base64.b64decode(wrapper["data"].encode("ascii"))
         metadata = wrapper.get("metadata", {})
-        serializer_name = wrapper.get("serializer", "unknown")
         return data, metadata, serializer_name
 
 
