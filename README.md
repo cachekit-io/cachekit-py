@@ -366,8 +366,8 @@ exposition setup.
 free-threaded 3.14 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
 (`gil_used = false`). Free-threaded wheels are **not yet published** and
-free-threaded builds are not officially supported — blocked on upstream
-wheels (orjson, hiredis; numpy/pandas/pyarrow for `[data]`). See
+free-threaded builds are not officially supported — blocked upstream on
+orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import). See
 [measured performance results](docs/free-threading.md#measured-performance) and the
 full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 
