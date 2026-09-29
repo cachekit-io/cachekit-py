@@ -212,7 +212,7 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
 
     from cachekit.backends.cachekitio.backend import CachekitIOBackend
 
-    closing, resume = threading.Event(), threading.Event()
+    taken, dropped, closing, resume = threading.Event(), threading.Event(), threading.Event(), threading.Event()
     real_close = httpx.Client.close
 
     def slow_close(self: httpx.Client) -> None:
@@ -220,14 +220,29 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
         resume.wait(5)
         real_close(self)
 
+    # The releaser takes its own reference to the lease, then drops it only after this thread has dropped
+    # every one of its own, so the release (and the close it triggers) runs on the releaser, on GIL and
+    # free-threaded builds alike.
+    # Handing it the last reference instead is not enough: on a free-threaded build, an object whose count
+    # a non-owner thread takes to zero is queued back to its owner, and freed on this thread once it wakes.
+    def release() -> None:
+        lease = holder[0]._sync_lease
+        taken.set()
+        dropped.wait(5)
+        del lease
+
     monkeypatch.setattr(httpx.Client, "close", slow_close)
     holder = [CachekitIOBackend(api_key="ck_test_race")]  # pragma: allowlist secret
-    releaser = threading.Thread(target=holder.clear)  # the last backend is released on another thread
+    releaser = threading.Thread(target=release)
     releaser.start()
+    assert taken.wait(5)
+    holder.clear()
+    dropped.set()
     assert closing.wait(5)
     rebuilt = CachekitIOBackend(api_key="ck_test_race")  # pragma: allowlist secret
     resume.set()
     releaser.join(5)
+    assert not releaser.is_alive()
     assert not rebuilt._sync_client.is_closed
 
 
