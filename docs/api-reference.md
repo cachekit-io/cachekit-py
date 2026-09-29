@@ -668,7 +668,7 @@ When `@cache` is used without an explicit `backend` parameter, resolution follow
 
 1. **Explicit backend** — `@cache(backend=...)`, then a backend inside `config=`
 2. **Module-level default** — `set_default_backend(...)`
-3. **Environment auto-detection** — `CACHEKIT_API_KEY`, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR`, with `REDIS_URL` as a fallback
+3. **Environment auto-detection** — exactly one of `CACHEKIT_API_KEY`, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR` (they are mutually exclusive, with no precedence), with `REDIS_URL` as a fallback
 
 Examples and the auto-detection table: **[Backend Resolution Priority](backends/README.md#backend-resolution-priority)**.
 

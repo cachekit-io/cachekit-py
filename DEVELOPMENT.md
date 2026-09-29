@@ -314,7 +314,7 @@ Used for security properties in `tests/unit/test_security_properties.py`:
 |:---------|:----------|
 | Encryption roundtrip | `decrypt(encrypt(data)) == data` |
 | Compression integrity | `decompress(compress(data)) == data` |
-| Tenant isolation | Different keys for different tenants |
+| Per-tenant key derivation | Different derived keys for different tenants |
 
 ```python
 from hypothesis import given, strategies as st

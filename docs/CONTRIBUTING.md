@@ -65,6 +65,9 @@ These functions are provided for documentation examples and return mock data:
   `CACHEKIT_MASTER_KEY` in the environment because an ambient key can still auto-activate
   encryption (deprecated) and breaks plain `@cache` fences that use `serializer="auto"` or custom
   serializers.
+- `master_key_env` - opt-in pytest fixture for a fence that binds its own key the way an
+  application does (`secret_key = os.environ["CACHEKIT_MASTER_KEY"]`). Request it in the info
+  string, `` ```python fixture:master_key_env ``; it sets `CACHEKIT_MASTER_KEY` for that fence only.
 
 ## Skipping Examples with `notest`
 

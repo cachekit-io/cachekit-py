@@ -369,6 +369,8 @@ def secure_function():
 
 > [!IMPORTANT]
 > When multiple environment variables could apply, cachekit follows this priority order.
+> The four backend selectors are the exception: they have no order, so set exactly one
+> ([details](backends/README.md#3-environment-variable-auto-detection-lowest-priority)).
 
 ### Redis URL Priority
 

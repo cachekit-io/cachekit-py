@@ -266,7 +266,8 @@ class EncryptionConfig:
     L1 can be enabled with encryption (stores encrypted bytes, not plaintext).
 
     Tenant mode is required: set single_tenant_mode=True for single-tenant or provide
-    a tenant_extractor callable for multi-tenant key isolation. @cache.secure() sets
+    a tenant_extractor (an object with .extract(args, kwargs)) for per-tenant key derivation,
+    which is not a tenancy boundary (docs/features/zero-knowledge-encryption.md). @cache.secure() sets
     single_tenant_mode automatically; if using EncryptionConfig directly (e.g. with
     @cache.io), you must set it explicitly.
 
@@ -289,7 +290,7 @@ class EncryptionConfig:
         enabled: Tri-state encryption flag (default: None = unset).
                  True = force-on, False = explicit opt-out.
         master_key: Hex-encoded master key for key derivation (required if enabled=True)
-        tenant_extractor: Optional callable for per-tenant key derivation (default: None)
+        tenant_extractor: Optional extractor with .extract(args, kwargs) for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
         deployment_uuid: Optional explicit tenant_id override for single-tenant mode (default: None →
                  CACHEKIT_DEPLOYMENT_UUID, else the protocol literal "default")

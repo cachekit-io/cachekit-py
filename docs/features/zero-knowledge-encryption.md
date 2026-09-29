@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. Redis never sees plaintext. Perfect for sensitive data (PII, credentials, health info).
+Zero-knowledge encryption (AES-256-GCM) encrypts cached data client-side. The backend never sees plaintext values. Perfect for sensitive data (PII, credentials, health info).
 
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # AES-256-GCM encryption
@@ -147,6 +147,22 @@ on a missing key (`.secure` → `ValueError`, the encryption option → `Configu
 every other row can store plaintext, and the compliance argument below holds only on an
 explicit path.
 
+**The key is read when the decorator is applied** — at import, for a module-level function —
+not at call time. A key that arrives later (`load_dotenv()` in `main()`, a startup hook that
+fetches it from a vault) is never seen by a function decorated before it: `@cache.secure`
+without `master_key=` has already raised `ValueError`, and a cache with no `encryption=` stays
+plaintext. It works the other way too: unsetting the variable later does not turn a
+`@cache.secure` cache off, because it keeps the key it read. Load the key before the modules
+that define cached functions are imported.
+
+> [!IMPORTANT]
+> **Failing closed on a missing key is not failing closed on a bad entry.** Both explicit
+> spellings refuse to run without a key. A decrypt failure at read time — an AES-GCM tag
+> mismatch from a tampered entry or the wrong key — is a separate setting, `fail_closed`. It
+> defers to `CACHEKIT_ENCRYPTION_FAIL_CLOSED`, which defaults to off, so even under
+> `@cache.secure` such an entry is evicted and the function recomputes unless you opt in. See
+> [Corruption vs Tamper](#corruption-vs-tamper-telemetry-and-fail-closed-mode).
+
 ### Turning Encryption Off in an Interop Cache
 
 An interop cache (`interop=`) never decrypts stale ciphertext after `encryption=False`. Its entries
@@ -190,6 +206,40 @@ export CACHEKIT_MASTER_KEY="not_hex"  # Invalid
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
+### `@cache.secure` Does Not Pin a Backend
+
+`@cache.secure` resolves its backend the way every preset does: an explicit backend first
+(`backend=`, or one inside `config=`), then `set_default_backend()`, then environment
+auto-detection at the function's first call. Only the explicit backend is order-independent.
+`set_default_backend()` is honoured until the first call, and the first call pins the backend,
+so a later `set_default_backend()` does not re-point the function.
+
+Auto-detection uses whichever single prefixed selector is set — `CACHEKIT_API_KEY` for
+cachekit.io, `CACHEKIT_REDIS_URL`, `CACHEKIT_MEMCACHED_SERVERS` or `CACHEKIT_FILE_CACHE_DIR` —
+and falls back to `REDIS_URL`, then localhost Redis, when none is. So with `REDIS_URL` set and
+`CACHEKIT_API_KEY` unset, `@cache.secure` encrypts to Redis, not to the SaaS. The values are
+still ciphertext; what changes is which system holds them.
+
+The selectors are mutually exclusive, with no precedence. Set two and the first call raises
+`ConfigurationError`. The decorator logs it at WARNING on the `cachekit.decorators.orchestrator`
+logger and runs the function uncached — on every call, because the error recurs:
+
+```text
+Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
+```
+
+When a particular backend is a requirement, pass it explicitly:
+
+```python notest
+# notest: CachekitIOBackend needs the network and CACHEKIT_API_KEY
+from cachekit import cache
+from cachekit.backends.cachekitio import CachekitIOBackend
+
+@cache.secure(master_key=secret_key, backend=CachekitIOBackend(), ttl=3600)
+def get_patient_record(patient_id: str):
+    return fetch_phi(patient_id)  # illustrative - fetch_phi not defined
+```
+
 ### Key Rotation
 
 Keeping a retiring key decrypt-only makes its entries readable; it does **not**
@@ -202,19 +252,20 @@ checks — for the rotation itself.
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
 When you turn encryption on over a cache that already holds plaintext entries, those
-entries are **rejected, never read**. The read path fails closed: the entry raises a
-`SerializationError`, the caller treats it as a miss, evicts the stale entry, recomputes,
-and re-stores the value encrypted. Migration is therefore lazy and self-healing:
+entries are **rejected, never read**: the entry raises a `SerializationError` internally, the
+caller treats it as a miss, evicts the stale entry, recomputes, and re-stores the value
+encrypted. The rejection is unconditional. The `fail_closed` setting governs authenticated
+decrypt failures and does not change it. Migration is therefore lazy and self-healing:
 
 ```text
-read plaintext entry → SerializationError (fail closed) → evict → recompute → re-store encrypted
+read plaintext entry → SerializationError (rejected, never deserialized) → evict → recompute → re-store encrypted
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
 plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
 plaintext entry forged by an attacker with backend write access is indistinguishable
 from a legacy one — any "accept plaintext" escape hatch would reintroduce the
-encryption-downgrade attack the fail-closed read path exists to prevent. If you need to
+encryption-downgrade attack the downgrade-protected read path exists to prevent. If you need to
 read plaintext entries, use a handler with `encryption=False` (which never had keys to
 protect).
 
@@ -273,10 +324,10 @@ profile = get_user_profile(123)
 ### Encrypted JSON (Zero-Knowledge API Caching)
 ```python notest
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.serializers import OrjsonSerializer
 
 # Encrypt JSON API responses (webhooks, sessions, API keys)
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer()))
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer())
 def get_api_keys(tenant_id: str):
     return {
         "api_key": "sk_live_abcdef123456",
@@ -291,11 +342,11 @@ keys = get_api_keys("customer-123")
 ### Encrypted DataFrames (Zero-Knowledge ML Caching)
 ```python notest
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+from cachekit.serializers import ArrowSerializer
 import pandas as pd
 
 # Encrypt DataFrames with patient data, ML features, analytics
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
+@cache.secure(master_key=secret_key, serializer=ArrowSerializer())
 def get_patient_records(hospital_id: int):
     # illustrative - conn not defined
     return pd.read_sql(
@@ -305,7 +356,7 @@ def get_patient_records(hospital_id: int):
     )
 
 df = get_patient_records(42)
-# DataFrame encrypted client-side, HIPAA-compliant zero-knowledge storage
+# DataFrame encrypted client-side, zero-knowledge storage
 ```
 
 ### Multi-Tenant Isolation
@@ -437,7 +488,7 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
            Prevents nonce reuse even across reboots
 ```
 
-### Fail-Closed Read Path (Encryption Downgrade Protection)
+### Encryption Downgrade Protection (Read Path)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext, so a reader can parse it before it has a key.
@@ -456,7 +507,7 @@ path when encryption is configured:
 ```text
 Handler configured with encryption:
   entry header claims encrypted  → authenticated decrypt (AAD + GCM tag verified)
-  entry header claims plaintext  → SerializationError (fail closed, entry evicted)
+  entry header claims plaintext  → SerializationError (plaintext never returned; miss + evict, whatever `fail_closed` says)
 ```
 
 The plaintext deserializer is unreachable on an encryption-enabled handler, regardless
@@ -483,6 +534,17 @@ accepted:
 Relocating these fields would be a cross-SDK wire-format change owned by the
 [protocol spec](https://github.com/cachekit-io/protocol); the Python SDK documents the
 exposure rather than diverging from the shared frame format.
+
+The cache key is cleartext too. It carries the namespace, the function's `module.qualname` and
+an unkeyed, unsalted blake2b-256 hash of the arguments (`ns:{ns}:func:{mod.fn}:args:{64-hex}:{flags}`),
+so over a small or guessable argument space the hash can be enumerated offline. Whoever operates
+the backend can therefore learn which record was read or written, when and how often, without
+decrypting anything. On the CachekitIO backend the key travels percent-encoded in the URL path
+(`/v1/cache/{key}`), so it also lands in access logs along the request path and stays there for
+their retention period, not the cache TTL. Ciphertext length also reveals the approximate
+plaintext size. Encryption protects values, not access patterns: keep secrets out of namespaces
+and function names, and count argument-identifiable access as metadata exposure in your threat
+model.
 
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
@@ -596,18 +658,27 @@ didn't recently disable encryption for that function, investigate.
 
 ## Compliance Implications
 
+> [!IMPORTANT]
+> These arguments hold only on an explicit path (`@cache.secure`, or an explicit encryption
+> option), which fails closed on a missing key — see
+> [Activation](#activation-the-master-key-is-a-source-not-a-switch). Every other row of that
+> table can store plaintext. Even on an explicit path, client-side encryption may *reduce*
+> GDPR, HIPAA or PCI DSS scope, subject to assessment and your other controls; it is not a
+> compliance guarantee. Encryption covers values only: the cache key is cleartext and lands in
+> backend access logs (see [Accepted Exposure](#cleartext-frame-header-fields-accepted-exposure)).
+
 ### GDPR
-- ✅ Encryption satisfies "processing security" requirement
-- ✅ Client-side encryption satisfies "technical measures"
+- ✅ Encryption supports the "processing security" requirement
+- ✅ Client-side encryption supports the "technical measures" requirement
 - ⚠️  Key management still required (rotation, access control)
 
 ### HIPAA
-- ✅ AES-256-GCM satisfies encryption requirement
+- ✅ AES-256-GCM supports the encryption requirement
 - ⚠️  Audit logging required (access to decrypted data)
 - ⚠️  Key management plan required
 
 ### PCI-DSS
-- ✅ Encryption satisfies "encryption at rest" requirement
+- ✅ Encryption supports the "encryption at rest" requirement
 - ⚠️  Key management plan required
 - ⚠️  Regular key rotation required
 
@@ -710,13 +781,11 @@ A: Expected 100-500μs overhead. Profile to confirm acceptable.
 ```python notest
 # Client application (user's infrastructure)
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.serializers import OrjsonSerializer
 
-# Configure for HTTP API backend
-@cache(
-    backend="https://cache.example.com/api",
-    serializer=EncryptionWrapper(serializer=OrjsonSerializer())
-)
+# An HTTP API backend: CachekitIOBackend talks to cachekit.io over HTTPS
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer(), backend=CachekitIOBackend())
 def get_api_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}  # illustrative
 
@@ -740,7 +809,6 @@ export default {
     // NEVER sees plaintext (no decryption key)
     await KV.put(key, value);
 
-    // Compliance: GDPR, HIPAA, PCI-DSS satisfied
     // Backend cannot read user data even if compromised
     return new Response("OK");
   }
@@ -750,7 +818,7 @@ export default {
 **Benefits**:
 - ✅ Backend compromise doesn't expose user data
 - ✅ Multi-tenant isolation (per-tenant encryption keys)
-- ✅ GDPR/HIPAA/PCI-DSS compliance out of the box
+- ✅ Supports a compliance scope-reduction argument on an explicit path (see [Compliance Implications](#compliance-implications))
 - ✅ Works with any data type (JSON, MessagePack, DataFrames)
 
 ---

@@ -514,7 +514,7 @@ class CacheSerializationHandler:
     Architecture:
     - Serializer: Defines HOW to serialize (default/msgpack, future: pickle, json)
     - Encryption: Defines WHETHER to encrypt (security layer on top, orthogonal)
-    - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
+    - Tenant extraction: selects the per-tenant derived key (not a tenancy boundary; no shared-key fallback)
 
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
     - encryption=None: no intent stated — plaintext. DEPRECATED: while CACHEKIT_MASTER_KEY is set and neither
@@ -523,7 +523,7 @@ class CacheSerializationHandler:
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
       unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
-    - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
+    - encryption=True, tenant_extractor provided: Multi-tenant encrypted (no shared-key fallback)
 
     Examples:
         Basic usage without encryption:
@@ -867,7 +867,7 @@ class CacheSerializationHandler:
         instances (which internally cache derived keys).
 
         Args:
-            tenant_id: Tenant identifier for key isolation
+            tenant_id: Tenant identifier for per-tenant key derivation
 
         Returns:
             Cached or newly created EncryptionWrapper instance
@@ -984,7 +984,8 @@ class CacheSerializationHandler:
                 # Extract tenant_id based on configuration (FAIL CLOSED)
                 if self.tenant_extractor:
                     # Multi-tenant mode: MUST extract tenant_id
-                    # If extraction fails, ValueError bubbles up (FAIL CLOSED - no fallback)
+                    # A failed extraction raises out of serialize_data (no shared-key fallback); the
+                    # decorator's store path catches it, logs it and skips the write
                     tenant_id = self.tenant_extractor.extract(args, kwargs)
                 else:
                     # Single-tenant mode: tenant_id resolved once in __init__

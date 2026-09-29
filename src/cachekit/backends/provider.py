@@ -154,14 +154,16 @@ class PooledClientProvider(CacheClientProvider):
 class DefaultBackendProvider(BackendProviderInterface):
     """Default backend provider with env-based auto-detection.
 
-    Selection is by a single, unambiguous environment signal. Priority order:
-        1. CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
-        2. CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
-        3. CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
-        4. CACHEKIT_FILE_CACHE_DIR     → FileBackend
-        5. REDIS_URL, or nothing set   → Redis, as 2 (12-factor / localhost default)
+    Selection is by a single, unambiguous environment signal. The prefixed selectors
+    are mutually exclusive, not a precedence chain — set exactly one:
+        - CACHEKIT_API_KEY            → CachekitIOBackend (SaaS)
+        - CACHEKIT_REDIS_URL          → Redis (tenant-scoped PerRequestRedisBackend)
+        - CACHEKIT_MEMCACHED_SERVERS  → MemcachedBackend
+        - CACHEKIT_FILE_CACHE_DIR     → FileBackend
+    With none of them set: REDIS_URL, or nothing → Redis, as above (12-factor /
+    localhost default).
 
-    Setting more than one of the four prefixed selectors (1-4) raises
+    Setting more than one of the four prefixed selectors raises
     ``ConfigurationError`` — auto-detection must be unambiguous; pass
     ``backend=`` explicitly to override. The non-prefixed ``REDIS_URL`` is only a
     fallback and never counts as a conflict (12-factor convention).
@@ -173,8 +175,9 @@ class DefaultBackendProvider(BackendProviderInterface):
     (single-tenant mode) is scoped to "default" (LAB-4773).
     """
 
-    # Prefixed selectors in priority order. REDIS_URL is the implicit fallback
-    # and intentionally excluded so it never triggers a conflict.
+    # Prefixed selectors. Tuple order is not precedence: two or more set raises, so
+    # order never picks a winner. REDIS_URL is the implicit fallback and intentionally
+    # excluded so it never triggers a conflict.
     _SELECTORS = (
         ("CACHEKIT_API_KEY", "cachekitio"),
         ("CACHEKIT_REDIS_URL", "redis"),

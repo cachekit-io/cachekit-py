@@ -19,23 +19,43 @@ The backend stores opaque ciphertext only. The master key never leaves the clien
 
 ## Basic Usage
 
-```python
+On a decorated function, `@cache.secure` applies `EncryptionWrapper` for you: pass the inner
+serializer as `serializer=`.
+
+```python fixture:master_key_env
+import os
+import tempfile
+
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.backends.file import FileBackend, FileBackendConfig
+from cachekit.serializers import OrjsonSerializer
+
+# 64 hex chars from your secret store, e.g. generated once with: openssl rand -hex 32
+secret_key = os.environ["CACHEKIT_MASTER_KEY"]
+
+# A file backend keeps this example self-contained; production uses Redis or cachekit.io.
+# Encryption needs a backend: backend=None (L1-only) stores raw objects and is refused.
+backend = FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp()))
+
+calls = 0
 
 # Encrypted JSON (API responses, webhooks, session data)
-# Note: EncryptionWrapper requires CACHEKIT_MASTER_KEY env var or master_key param.
-# Encrypting serializers need a backend: backend=None (L1-only) stores raw objects and is refused.
-@cache(serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(secret_key)))
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer(), backend=backend)
 def get_api_keys(tenant_id: str):
+    global calls
+    calls += 1
     return {
         "api_key": "sk_live_...",
         "webhook_secret": "whsec_...",
         "tenant_id": tenant_id
     }
 
-# Encrypted MessagePack (default - use @cache.secure preset)
-@cache.secure(master_key=secret_key)
+get_api_keys("acme")
+get_api_keys("acme")  # second call is served from the encrypted cache
+assert calls == 1
+
+# Encrypted MessagePack (the @cache.secure default serializer)
+@cache.secure(master_key=secret_key, backend=backend)
 def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
@@ -44,10 +64,10 @@ Encryption works with any serializer — including DataFrames:
 
 ```python notest
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, ArrowSerializer
+from cachekit.serializers import ArrowSerializer
 
 # Encrypted DataFrames (patient data, ML features)
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer(), master_key=bytes.fromhex(secret_key)))
+@cache.secure(master_key=secret_key, serializer=ArrowSerializer())
 def get_patient_records(hospital_id: int):
     return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
 ```
@@ -68,22 +88,20 @@ EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cro
 ## Zero-Knowledge Caching
 
 ```python notest
+# notest: CachekitIOBackend needs the network and CACHEKIT_API_KEY
 from cachekit import cache
-from cachekit.serializers import EncryptionWrapper, OrjsonSerializer
+from cachekit.backends.cachekitio import CachekitIOBackend
+from cachekit.serializers import OrjsonSerializer
 
-# Client-side: Encrypt before sending to remote backend
-@cache(
-    backend="https://cache.example.com/api",
-    serializer=EncryptionWrapper(serializer=OrjsonSerializer(), master_key=bytes.fromhex(secret_key))
-)
+# Client-side: encrypted before it is sent to the remote backend
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer(), backend=CachekitIOBackend())
 def get_secrets(tenant_id: str):
     return {"api_key": "sk_live_...", "secret": "..."}
 
-# Backend receives encrypted blob, never sees plaintext
-# GDPR/HIPAA/PCI-DSS compliant out of the box
+# Backend receives encrypted blob, never sees plaintext values
 ```
 
-When using `EncryptionWrapper` with a remote backend (e.g., cachekit.io), the SaaS backend stores only opaque ciphertext. It has no access to keys and cannot decrypt data. This makes the backend out-of-scope for HIPAA/PCI-DSS compliance requirements.
+With a remote backend such as cachekit.io, the backend stores only opaque ciphertext. It has no access to keys and cannot decrypt values. That supports a HIPAA/PCI DSS scope-*reduction* argument, subject to assessment and your other controls. It does not take regulated data out of scope on its own, and the cache key still travels in cleartext (see [Compliance Implications](../features/zero-knowledge-encryption.md#compliance-implications)).
 
 ## Performance
 

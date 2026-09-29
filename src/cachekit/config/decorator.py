@@ -356,15 +356,23 @@ class DecoratorConfig:
     def secure(cls, master_key: str, tenant_extractor: Callable[..., str] | None = None, **kwargs: Any) -> DecoratorConfig:
         """Security profile: Encryption REQUIRED, encrypted-at-rest everywhere, full audit trail, integrity NON-NEGOTIABLE.
 
-        Use cases: PII, medical data, financial records, GDPR compliance
+        Use cases: PII, medical data, financial records and other regulated data (encryption can support
+                   a compliance scope-reduction argument; it is not a compliance guarantee)
         Architecture: Both L1 and L2 store encrypted bytes (encrypt-at-rest everywhere)
 
-        Note: Backend resolved from CACHEKIT_API_KEY, REDIS_URL, set_default_backend(), or explicit backend= kwarg
+        Note: .secure does not pin a backend. It resolves like every preset: an explicit backend
+              (backend= on the decorator, or one passed here and used via @cache(config=...)), then
+              set_default_backend() (honoured until the first call, which pins the backend), then
+              environment auto-detection at first call. With REDIS_URL set and CACHEKIT_API_KEY
+              unset, the encrypted values go to Redis. Pass backend= when a particular backend is
+              required. Here backend=None is the unset default; the L1-only refusal applies to
+              @cache.secure(backend=None) and @cache(config=..., backend=None).
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
-            tenant_extractor: Optional tenant ID extractor for multi-tenant encryption
+            tenant_extractor: Optional tenant ID extractor (an object with .extract(args, kwargs)) for
+                per-tenant key derivation. Not a tenancy boundary: see docs/features/zero-knowledge-encryption.md
             **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking=False is rejected.
                      Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM

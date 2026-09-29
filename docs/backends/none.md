@@ -50,7 +50,7 @@ No network calls. No serialization to bytes. No backend initialization.
 
 ## With Intent Presets
 
-Every preset except `secure` works with `backend=None`:
+`@cache.minimal`, `@cache.production`, `@cache.dev` and `@cache.test` accept `backend=None`:
 
 ```python notest
 from cachekit import cache
@@ -61,9 +61,11 @@ def fast_lookup(key: str) -> dict:
     return fetch_data(key)
 ```
 
-`@cache.secure(backend=None)` is refused at decoration time with `ConfigurationError`:
-L1-only stores raw Python objects, which cannot be ciphertext. The same applies to
-`encryption=True` and to an `EncryptionWrapper` serializer.
+Three presets do not. `@cache.secure(master_key=…, backend=None)` is refused at decoration
+time with `ConfigurationError`: L1-only stores raw Python objects, which cannot be ciphertext.
+The same applies to `encryption=True` and to an `EncryptionWrapper` serializer. `@cache.io`
+builds its own backend and raises `ConfigurationError` on any `backend=`, `None` included.
+`@cache.local` is always in-process and raises `TypeError` on a `backend=` argument.
 
 ## Upgrade Path
 
@@ -90,7 +92,7 @@ No API changes. No code rewrite. Same decorator, same function signature.
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
-- Encryption: No — `@cache.secure` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either.
+- Encryption: No — `@cache.secure(master_key=…)` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either.
 - Metrics: Yes (if monitoring configured)
 
 ---

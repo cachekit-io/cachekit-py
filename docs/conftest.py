@@ -15,8 +15,25 @@ except ImportError:
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from cachekit import cache
+from cachekit.config.singleton import reset_settings
+
+
+@pytest.fixture
+def master_key_env(monkeypatch):
+    """Set CACHEKIT_MASTER_KEY for one fence that reads its key from the environment.
+
+    Opt-in per fence (```python fixture:master_key_env) so the fence can bind the key the
+    way an application does instead of relying on the injected secret_key. Not global:
+    an ambient key still auto-activates encryption (deprecated) — see secret_key below.
+    """
+    monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+    reset_settings()
+    yield
+    monkeypatch.undo()
+    reset_settings()
 
 
 def pytest_markdown_docs_globals():
