@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import os
 import threading
@@ -103,6 +104,33 @@ class PlainBackend(TrackingBackend):
 
     track_key = None  # type: ignore[assignment]
     drain_tracked = None  # type: ignore[assignment]
+
+
+_tenant: contextvars.ContextVar[str] = contextvars.ContextVar("_tenant", default="a")
+
+
+class ScopedBackend(TrackingBackend):
+    """TrackingBackend under a per-context tenant prefix, like the tenant-scoped Redis backend."""
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def get(self, key: str) -> Optional[bytes]:
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self.key_prefix + key)
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        super().track_key(self.key_prefix + registry_id, self.key_prefix + key)
+
+    def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+        out = super().drain_tracked(self.key_prefix + registry_id, {self.key_prefix + k for k in local_keys})
+        return {k.removeprefix(self.key_prefix) for k in out}
 
 
 def _registry_ids(backend: TrackingBackend) -> set[str]:
@@ -413,6 +441,135 @@ class TestDrain:
         assert backend.store == {}
         f(1)
         assert calls == 2  # L1 was evicted too
+
+    def test_same_key_rewrite_during_drain_stays_recorded(self) -> None:
+        """A key re-recorded while a drain is in flight survives that drain's trim.
+
+        The drain snapshots k and unlinks its old value; a concurrent miss then rewrites k
+        and its track_key fails. The new L2 value is in no registry, so the local record is
+        the only thing that can reach it: the next drain must still delete it."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)  # k recorded and tracked
+        (key,) = backend.store
+        backend.fail_track = True
+        unlinked, rewritten = threading.Event(), threading.Event()
+        real_drain = backend.drain_tracked
+
+        def drain_then_wait(registry_id: str, local_keys: Any) -> set[str]:
+            out = real_drain(registry_id, local_keys)  # old value of k unlinked
+            unlinked.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.drain_tracked = drain_then_wait  # type: ignore[method-assign]
+        drainer = threading.Thread(target=f.invalidate_cache)
+        drainer.start()
+        assert unlinked.wait(5)
+        f(1)  # concurrent miss: L2 set succeeds, track_key fails
+        rewritten.set()
+        drainer.join(5)
+        assert not drainer.is_alive()
+
+        assert key in backend.store and backend.sets == {}  # the rewrite is in no registry
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        backend.drain_tracked = real_drain  # type: ignore[method-assign]
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    def test_same_key_rewrite_during_local_invalidate_stays_recorded(self) -> None:
+        """The per-key loop (no registry, or a failed drain) has the same race between a
+        key's L2 delete and its discard: a rewrite landing there must stay recorded."""
+        backend = PlainBackend()
+
+        @cache(backend=backend, ttl=60, namespace="local_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (key,) = backend.store
+        deleted, rewritten = threading.Event(), threading.Event()
+        real_delete = backend.delete
+
+        def delete_then_wait(k: str) -> bool:
+            out = real_delete(k)
+            deleted.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.delete = delete_then_wait  # type: ignore[method-assign]
+        invalidator = threading.Thread(target=f.invalidate_cache)
+        invalidator.start()
+        assert deleted.wait(5)
+        f(1)  # concurrent miss rewrites k after its delete
+        rewritten.set()
+        invalidator.join(5)
+        assert not invalidator.is_alive()
+
+        assert key in backend.store
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        backend.delete = real_delete  # type: ignore[method-assign]
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    def test_other_tenant_rewrite_during_drain_keeps_only_its_own_entry(self) -> None:
+        """Watches hold (scope, key): tenant b rewriting the same key during tenant a's drain
+        keeps b's entry recorded and does not keep a's drained entry alive."""
+        backend = ScopedBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_tenants", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)  # tenant a
+        (a_key,) = backend.store
+        key = a_key.removeprefix("t:a:")
+        unlinked, rewritten = threading.Event(), threading.Event()
+        real_drain = backend.drain_tracked
+
+        def drain_then_wait(registry_id: str, local_keys: Any) -> set[str]:
+            out = real_drain(registry_id, local_keys)
+            unlinked.set()
+            assert rewritten.wait(5)
+            return out
+
+        backend.drain_tracked = drain_then_wait  # type: ignore[method-assign]
+        drainer = threading.Thread(target=contextvars.copy_context().run, args=(f.invalidate_cache,))
+        drainer.start()
+        assert unlinked.wait(5)
+        token = _tenant.set("b")
+        try:
+            f(1)  # tenant b writes the same cache key under its own prefix
+        finally:
+            _tenant.reset(token)
+        rewritten.set()
+        drainer.join(5)
+        assert not drainer.is_alive()
+
+        assert set(backend.store) == {f"t:b:{key}"}
+        assert _closure_cell(f, "_cached_keys").cell_contents == {("t:b:", key)}
+
+    def test_drain_leaves_no_watch_behind(self) -> None:
+        """A drain unregisters its watch whether it succeeds or fails, and drops watches a
+        forked child inherited from a parent drain that never finished there."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="drain_watches")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        watches = _closure_cell(f, "_drain_watches").cell_contents
+        watches[(-1, object())] = {("", "orphan")}  # another pid's drain, in flight at fork
+        f.invalidate_cache()
+        assert watches == {}
+        backend.fail_drain = True
+        f.invalidate_cache()
+        assert watches == {}
 
     def test_drain_failure_falls_back_to_local_with_l2_delete(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = TrackingBackend()

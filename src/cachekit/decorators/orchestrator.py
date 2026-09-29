@@ -319,7 +319,7 @@ class FeatureOrchestrator:
             }
         )
 
-    def record_failure(self, error: Exception):
+    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True) -> None:
         """Record operation failure with automatic context detection.
 
         Automatically uses operation type and duration from set_operation_context()
@@ -327,13 +327,16 @@ class FeatureOrchestrator:
 
         Args:
             error: The exception that caused the failure
+            count_toward_breaker: False records the metric only. For failures that
+                say nothing about backend health, such as an L2 entry that fails
+                decryption or integrity checks.
         """
         # Get operation context (async-safe)
         ctx = _operation_context.get() or {}
         operation = ctx.get("operation", "cache_operation")
         duration_ms = ctx.get("duration_ms", 0.0)
 
-        if self._circuit_breaker:
+        if self._circuit_breaker and count_toward_breaker:
             self._circuit_breaker._on_failure(error)
         if self._metrics_collector:
             self._metrics_collector.record_cache_operation(
@@ -414,6 +417,7 @@ class FeatureOrchestrator:
         span: Optional[Any] = None,
         duration_ms: float = 0.0,
         correlation_id: Optional[str] = None,
+        count_toward_breaker: bool = True,
         **extra_context: Any,
     ) -> None:
         """Centralized error handler for all cache operations.
@@ -430,6 +434,8 @@ class FeatureOrchestrator:
             span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
             correlation_id: Optional correlation ID for distributed tracing
+            count_toward_breaker: Passed to record_failure(). False keeps the metric
+                and logs but leaves the circuit breaker untouched.
             **extra_context: Additional context to include in logs
 
         Example:
@@ -456,7 +462,7 @@ class FeatureOrchestrator:
         self.set_operation_context(operation, duration_ms)
 
         # 3. Record failure in circuit breaker and metrics collector
-        self.record_failure(error)
+        self.record_failure(error, count_toward_breaker=count_toward_breaker)
 
         # 4. Structured logging with full context
         self.log_cache_operation(
