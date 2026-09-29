@@ -15,9 +15,14 @@ Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import threading
 import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +31,7 @@ from typing import Any
 import msgpack
 import pytest
 
+from cachekit import logging as ck_logging
 from cachekit._rust_serializer import ByteStorage, check_msgpack_structure
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
@@ -79,15 +85,55 @@ DECODE_PATHS: dict[str, Callable[[bytes], Any]] = {
 }
 
 
-def _peak_of(fn: Callable[..., Any], *args: Any) -> tuple[Any, BaseException | None, int]:
+def _peak_of(fn: Callable[..., Any], *args: Any) -> int:
     tracemalloc.start()
     try:
-        return fn(*args), None, tracemalloc.get_traced_memory()[1]
-    except (ValueError, SerializationError) as e:
-        # The only rejections the read path maps to a controlled miss; any other type propagates.
-        return None, e, tracemalloc.get_traced_memory()[1]
+        with contextlib.suppress(ValueError, SerializationError):  # the tests assert the rejection in-process
+            fn(*args)
+        return tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
+
+
+def _measure_peaks() -> dict[str, int]:
+    """Every heap peak this file asserts on, keyed by case. Runs only in a fresh interpreter."""
+    # cachekit's structured logger flushes from a background thread: stop it, so no other thread
+    # can be allocating while tracemalloc starts or stops.
+    for structured in ck_logging._logger_instances.values():
+        structured.writer.stop()
+        structured.writer.join()
+    assert threading.active_count() == 1, f"tracemalloc must not start or stop beside {threading.enumerate()}"
+    cases = {
+        f"{path}:{v['name']}": (fn, bytes.fromhex(v["input_hex"]))
+        for path, fn in DECODE_PATHS.items()
+        for v in VECTORS["reject_vectors"]
+    }
+    cases["validate_data"] = (
+        AutoSerializer(enable_integrity_checking=False).validate_data,
+        _reject_vector("nested_array32_input_len_depth_1100"),
+    )
+    peaks = {case: _peak_of(fn, data) for case, (fn, data) in cases.items()}
+    assert threading.active_count() == 1, f"a thread started while peaks were measured: {threading.enumerate()}"
+    return peaks
+
+
+@pytest.fixture(scope="module")
+def peaks() -> dict[str, int]:
+    # tracemalloc.start()/stop() swap the process-wide allocator hooks without synchronising
+    # with threads that are allocating at that moment, so on a free-threaded build a concurrent
+    # allocation (pytest-xdist's I/O thread, for one) can crash the process:
+    # https://github.com/python/cpython/issues/143143. Peaks are measured in a fresh,
+    # single-threaded interpreter running this file, importing the same modules as this one.
+    proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + this file)
+        [sys.executable, __file__],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"peak measurement subprocess exited {proc.returncode}:\n{proc.stderr}")
+    return json.loads(proc.stdout)
 
 
 def _vector_ids(group: str) -> list[str]:
@@ -108,10 +154,12 @@ class TestFixtureIsTheVendoredProtocolFile:
 @pytest.mark.parametrize("path", DECODE_PATHS)
 class TestProtocolVectors:
     @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
-    def test_reject_vector_is_rejected_with_bounded_peak(self, path: str, vector: dict[str, Any]) -> None:
+    def test_reject_vector_is_rejected_with_bounded_peak(self, path: str, vector: dict[str, Any], peaks: dict[str, int]) -> None:
         data = bytes.fromhex(vector["input_hex"])
-        _, err, peak = _peak_of(DECODE_PATHS[path], data)
-        assert err is not None, f"{vector['name']}: {path} decoded a reject vector"
+        # The only rejections the read path maps to a controlled miss; any other type propagates.
+        with pytest.raises((ValueError, SerializationError)):
+            DECODE_PATHS[path](data)
+        peak = peaks[f"{path}:{vector['name']}"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(data), f"{vector['name']}: {path} peaked at {peak} bytes"
 
     @pytest.mark.parametrize("vector", VECTORS["accept_vectors"], ids=_vector_ids("accept_vectors"))
@@ -228,14 +276,14 @@ class TestOwnedBounds:
         with pytest.raises(SerializationError, match="not a decodable MessagePack payload"):
             AutoSerializer(enable_integrity_checking=False).deserialize(_reject_vector("bin32_overclaim"))
 
-    def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self) -> None:
+    def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self, peaks: dict[str, int]) -> None:
         # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),
         # and the walk must have stopped it before the decoder pre-allocated ~8000x the input.
         serializer = AutoSerializer(enable_integrity_checking=False)
         assert serializer.validate_data(msgpack.packb({"t": 1})) is True
         bomb = _reject_vector("nested_array32_input_len_depth_1100")
-        valid, err, peak = _peak_of(serializer.validate_data, bomb)
-        assert (valid, err) == (False, None)
+        assert serializer.validate_data(bomb) is False
+        peak = peaks["validate_data"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(bomb), f"validate_data peaked at {peak} bytes"
 
     @pytest.mark.parametrize("original_type", ["dataframe", "series"])
@@ -264,3 +312,7 @@ class TestOwnedBounds:
         )
         with pytest.raises(SerializationError, match="disagrees with header format"):
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
+
+
+if __name__ == "__main__":
+    json.dump(_measure_peaks(), sys.stdout)
