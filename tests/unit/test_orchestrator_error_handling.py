@@ -155,36 +155,19 @@ class TestErrorHandlerOrchestration:
 class TestErrorHandlerContract:
     """Test error handler contract guarantees."""
 
-    def test_error_handler_records_failure_in_circuit_breaker(self):
-        """Error handler must record failures in circuit breaker when enabled."""
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("test error"), BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT)],
+        ids=["plain-exception", "non-excluded-backend-error"],
+    )
+    def test_error_handler_records_failure_in_circuit_breaker(self, error):
+        """Error handler must record failures in circuit breaker when enabled.
+
+        A BackendError takes the breaker's excluded_error_types check, which excludes nothing by default.
+        """
         orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True)
 
-        # Get initial failure count
-        initial_stats = orchestrator.circuit_breaker.get_stats()
-        initial_failures = initial_stats.get("failure_count", 0)
-
-        # Trigger error
-        orchestrator.handle_cache_error(
-            error=ValueError("test error"),
-            operation="cache_get",
-            cache_key="test:key",
-        )
-
-        # Verify failure was recorded
-        updated_stats = orchestrator.circuit_breaker.get_stats()
-        updated_failures = updated_stats.get("failure_count", 0)
-
-        assert updated_failures > initial_failures, "Error handler must record failures in circuit breaker"
-
-    def test_backend_error_counts_toward_circuit_breaker(self):
-        """A backend failure that is not an excluded error type trips the breaker."""
-        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True)
-
-        orchestrator.handle_cache_error(
-            error=BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT),
-            operation="cache_get",
-            cache_key="test:key",
-        )
+        orchestrator.handle_cache_error(error=error, operation="cache_get", cache_key="test:key")
 
         assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 1
 

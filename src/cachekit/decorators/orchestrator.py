@@ -404,6 +404,7 @@ class FeatureOrchestrator:
         span: Optional[Any] = None,
         duration_ms: float = 0.0,
         correlation_id: Optional[str] = None,
+        *,
         count_toward_breaker: bool = True,
         **extra_context: Any,
     ) -> None:
