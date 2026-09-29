@@ -328,17 +328,20 @@ class SuspiciousCacheEntryError(SerializationError):
 
 class EnvelopeShapeError(SerializationError):
     """An entry nothing verified decoded to the SHAPE of a ByteStorage envelope —
-    ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused.
+    ``[bytes, [8 ints], int, format]`` with at least three slots intact — and was refused;
+    or, at write, a value that would decode to one.
 
     Two populations reach this and the read path cannot tell them apart (LAB-2736): a
     rotted integrity-on envelope whose checksum can no longer be checked, and a legitimate
     top-level 4-element list a caller cached that merely looks like one. Refusing both is
     the chosen corner — returning a rotted envelope hands the caller its compressed payload
-    as their object. Callers treat it as a miss (evict → recompute), but for the second
-    population recompute re-produces the same bytes and the refusal repeats on every read,
-    so telemetry counts it under its own ``envelope_shape`` reason rather than
-    ``corruption``: the same redacted key repeating in the WARNING log is that value, not
-    storage rot, and must not read as a corruption spike.
+    as their object. Callers treat it as a miss (evict → recompute). For the second
+    population recompute re-produces the same bytes, so an integrity-off
+    ``AutoSerializer.serialize`` raises this too and never writes the value: a plain miss,
+    not an eviction and a rewrite on every call. Telemetry counts the read-side refusal under
+    its own ``envelope_shape`` reason rather than ``corruption``: the same redacted key
+    repeating in the WARNING log is a value another writer is still storing, not storage
+    rot, and must not read as a corruption spike.
     """
 
     pass

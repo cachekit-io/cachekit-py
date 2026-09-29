@@ -21,6 +21,7 @@ already forces the columnar path.
 from __future__ import annotations
 
 import copy
+import enum
 import functools
 import logging
 from collections.abc import Callable
@@ -30,7 +31,11 @@ import msgpack
 import pytest
 import xxhash
 
+import cachekit.reliability.async_metrics as am
+from cachekit import cache
 from cachekit._rust_serializer import ByteStorage
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler, handle_decrypt_failure
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers import AutoSerializer
@@ -72,6 +77,26 @@ def _assert_equal(out: pd.DataFrame | pd.Series, expected: pd.DataFrame | pd.Ser
 
 FRAME = pd.DataFrame({"x": np.arange(5, dtype=np.float64), "n": np.arange(5, dtype=np.int64)})
 SERIES = pd.Series(np.arange(8, dtype=np.float64), name="v")
+
+
+class _Label(enum.IntEnum):
+    ANSWER = 42
+
+
+# Values that score >= 3 on ``_looks_like_envelope`` AS THE READER DECODES THEM — one population,
+# pinned on both sides: the reader refuses these, so an integrity-off writer must not write them.
+# The last two only score after the round trip: bytearray packs as bin and decodes as bytes, and
+# an IntEnum packs and decodes as a plain int.
+ENVELOPE_SHAPED = [
+    pytest.param([b"blob", list(range(1, 9)), 42, "label"], id="3of4-label"),
+    pytest.param([b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"], id="4of4-png-series"),
+    pytest.param([b"payload", [10] * 8, 7, "not-a-format"], id="3of4-unknown-format"),
+    pytest.param([b"x", [1] * 8, 0, "msgpack"], id="4of4-minimal-msgpack"),
+    pytest.param([b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"], id="3of4-format-slot-irrelevant"),
+    pytest.param(["s", [1, 2, 3, 4, 5, 6, 7, 8], 5, "msgpack"], id="3of4-bytes-slot-irrelevant"),
+    pytest.param([bytearray(b"blob"), list(range(1, 9)), 42, "label"], id="bytearray-decodes-as-bytes"),
+    pytest.param([b"blob", list(range(1, 9)), _Label.ANSWER, "label"], id="intenum-decodes-as-int"),
+]
 
 
 @pytest.mark.unit
@@ -457,25 +482,7 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(SerializationError):
             reader.deserialize(data, make_metadata(meta))
 
-    @pytest.mark.parametrize(
-        "value",
-        [
-            [b"blob", list(range(1, 9)), 42, "label"],
-            [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"],
-            [b"payload", [10] * 8, 7, "not-a-format"],
-            [b"x", [1] * 8, 0, "msgpack"],
-            [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"],
-            ["s", [1, 2, 3, 4, 5, 6, 7, 8], 5, "msgpack"],
-        ],
-        ids=[
-            "3of4-label",
-            "4of4-png-series",
-            "3of4-unknown-format",
-            "4of4-minimal-msgpack",
-            "3of4-format-slot-irrelevant",
-            "3of4-bytes-slot-irrelevant",
-        ],
-    )
+    @pytest.mark.parametrize("value", ENVELOPE_SHAPED)
     def test_a_value_shaped_exactly_like_an_envelope_is_deliberately_refused(self, value: list) -> None:
         """**This refusal is a chosen cost, not a bug — do not "fix" it without reading Raises:.**
 
@@ -490,15 +497,102 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         their object. An earlier round asserted the opposite here — ``== value`` — which pinned a
         94% rot-escape rate as intent. If this test starts failing, the rot leak is back.
 
-        The last two rows are the two 3/4 doors: neither the bytes slot nor the format slot is
-        required, so "envelope-shaped" is wider than an envelope-looking value. The type is
-        asserted, not just the class: it carries its own telemetry reason, so this permanent
-        benign refusal never counts as ``corruption``."""
+        The entry is planted as plain msgpack because this serializer no longer writes one (the
+        writer-side test below): it stands for an entry written before that refusal, or by another
+        writer. Neither the bytes slot nor the format slot is required, so "envelope-shaped" is
+        wider than an envelope-looking value. The type is asserted, not just the class: it carries
+        its own telemetry reason, so this benign refusal never counts as ``corruption``."""
         s = _no_arrow(enable_integrity_checking=False)
-        data, meta = s.serialize(value)
+        data = msgpack.packb(value, use_bin_type=True)
+        _, meta = s.serialize([])  # the header an integrity-off writer puts on every generic entry
         for metadata in (meta, None):
             with pytest.raises(EnvelopeShapeError, match="envelope verification"):
                 s.deserialize(data, metadata)
+
+    @pytest.mark.parametrize("value", ENVELOPE_SHAPED)
+    def test_an_integrity_off_writer_refuses_what_its_own_reader_refuses(self, value: list) -> None:
+        """Writing these was the costly half of the refusal above: every read refused the entry,
+        evicted it, recomputed, and wrote the same bytes back — a backend write per call for a
+        value that can never hit. Refused at write it is a plain miss. The rows are the READER's
+        population, bytearray and IntEnum included, so a check on the raw object misses them."""
+        with pytest.raises(EnvelopeShapeError, match=r'cannot be cached.*\{"v": value\}'):
+            AutoSerializer(enable_integrity_checking=False).serialize(value)
+
+    @pytest.mark.parametrize("value", ENVELOPE_SHAPED)
+    def test_an_integrity_on_writer_still_caches_envelope_shaped_values(self, value: list) -> None:
+        """The checksum identifies an integrity-on entry, so its reader never asks the shape question."""
+        s = AutoSerializer(enable_integrity_checking=True)
+        data, meta = s.serialize(value)
+        for metadata in (meta, None):
+            assert s.deserialize(data, metadata) == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [1, 2, 3, "msgpack"],
+            ["a", "b", "c", "series"],
+            ["x", [1, 2, 3, 4, 5, 6, 7, 8], 0, "anything"],
+            [1, 2, 3, ["a"]],
+            [b"blob", tuple(range(1, 9)), 42, "label"],
+            (b"x", [1] * 8, 0, "msgpack"),
+            [b"x", [1] * 8, 0],
+            [b"x", [1] * 8, 0, "msgpack", 1],
+            [[b"x", [1] * 8, 0, "msgpack"]],
+            {"v": [b"x", [1] * 8, 0, "msgpack"]},
+        ],
+        ids=[
+            "2of4-ints-msgpack",
+            "1of4-strs-series",
+            "2of4-str-payload",
+            "unhashable-format-slot",
+            "tuple-slot-stays-a-tuple",
+            "tuple",
+            "3-element",
+            "5-element",
+            "nested",
+            "the-documented-wrap",
+        ],
+    )
+    def test_the_writer_refusal_leaves_every_other_value_round_tripping(self, value: object) -> None:
+        """The writer refuses exactly the reader's population, decided on the value as decoded: a
+        tuple in slot 1 comes back as a tuple, so that row scores 2 where the same value with a list
+        there is refused. The last row is the workaround the refusal message gives."""
+        s = AutoSerializer(enable_integrity_checking=False)
+        data, meta = s.serialize(value)
+        for metadata in (meta, None):
+            assert s.deserialize(data, metadata) == value
+
+    def test_minimal_auto_serves_an_envelope_shaped_value_without_touching_the_backend(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end, where the cost was: each call used to read the entry, refuse it, evict it and
+        write it back, counting a refusal on L1 and on L2. Now each call is a plain miss. The control
+        proves this harness sees writes and hits, so the zeroes are not vacuous."""
+        recorded: list[dict[str, str]] = []
+
+        class _Collector:
+            def record_counter(self, name, labels=None, value=1.0):
+                if name == "cachekit_decrypt_failures_total":
+                    recorded.append(labels or {})
+
+        monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path, max_size_mb=64, max_value_mb=32))
+        writes: list[str] = []
+        real_set = backend.set
+        monkeypatch.setattr(backend, "set", lambda key, value, ttl=None: writes.append(key) or real_set(key, value, ttl))
+        shaped = [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"]
+        calls = {"shaped": 0, "control": 0}
+
+        @cache.minimal(serializer="auto", backend=backend, namespace="envelope-shaped")
+        def compute(kind: str) -> object:
+            calls[kind] += 1
+            return list(shaped) if kind == "shaped" else {"v": list(shaped)}
+
+        assert [compute("shaped") for _ in range(5)] == [shaped] * 5
+        assert (calls["shaped"], writes, recorded) == (5, [], [])
+
+        assert [compute("control") for _ in range(5)] == [{"v": shaped}] * 5
+        assert (calls["control"], len(writes), recorded) == (1, 1, [])
 
     def test_single_byte_rot_sweep_on_an_integrity_off_reader_escapes_exactly_the_known_marker_set(self) -> None:
         """A full sweep — ALL 255 substitutions per byte — because a parametrised row list cannot

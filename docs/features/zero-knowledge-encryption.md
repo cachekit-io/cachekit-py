@@ -506,8 +506,8 @@ them (cachekit-py#170):
   envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
   4-element list that merely looks like one; the read path cannot tell them apart, so this
   is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
-  The same redacted key repeating in the WARNING log is the second case — that value recomputes on every read (see
-  *Deserialization failed* in [error-codes.md](../error-codes.md)).
+  An integrity-off `AutoSerializer` refuses to write the second case, so the same redacted key repeating in the
+  WARNING log is another writer still storing it (see *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
   non-string or non-UTF-8-encodable `original_type` in the frame header. Such a value
@@ -519,7 +519,7 @@ All are counted on the Prometheus counter
 `cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
 `reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
 noise. Baseline `suspicious_envelope` around migration windows; a flat, steady
-`envelope_shape` rate is one cached value the shape rule refuses on every read, not rot.
+`envelope_shape` rate is a writer still storing a value the shape rule refuses, not rot.
 
 **Default (fail open):** a decrypt failure of any class logs a warning, evicts the
 poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
