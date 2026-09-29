@@ -35,6 +35,7 @@ REQUIRED_MODEL_CONFIG_KEYS = {
     "case_sensitive": False,
     "extra": "forbid",
     "populate_by_name": True,
+    "hide_input_in_errors": True,
 }
 
 

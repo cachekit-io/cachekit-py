@@ -141,21 +141,46 @@ class TestInit:
         assert "requires an API key" not in str(info.value)  # a key WAS given
 
     @pytest.mark.parametrize(
-        "kwargs",
+        ("env", "kwargs", "loc"),
         [
-            {"api_key": "ck_live_SECRET_XYZ\n"},  # pragma: allowlist secret
-            {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"},  # pragma: allowlist secret
+            ({}, {"api_key": "ck_live_SECRET_XYZ\n"}, ("api_key",)),  # pragma: allowlist secret
+            ({}, {"api_key": "ck_live_SECRET_XYZ", "api_url": "https://evil.example.com"}, ()),  # pragma: allowlist secret
+            (
+                {
+                    "CACHEKIT_API_KEY": "ck_live_SECRET_XYZ",  # pragma: allowlist secret
+                    "CACHEKIT_API_URL": "https://staging.internal.example",
+                },
+                None,
+                (),
+            ),
+            (
+                {},
+                {"api_key": _TEST_API_KEY, "api_url": "https://user:SECRET_PW@api.cachekit.io"},  # pragma: allowlist secret
+                ("api_url",),
+            ),
         ],
-        ids=["whitespace", "allowlist"],
+        ids=["whitespace", "allowlist", "from-env-allowlist", "userinfo"],
     )
-    def test_public_config_class_never_prints_the_key(self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]) -> None:
-        """CWE-532: CachekitIOBackendConfig is public; built directly, its ValidationError must not print the key."""
+    def test_public_config_class_never_prints_the_key(
+        self, monkeypatch: pytest.MonkeyPatch, env: dict[str, str], kwargs: dict[str, str] | None, loc: tuple[str, ...]
+    ) -> None:
+        """CWE-532: CachekitIOBackendConfig is public; built directly, no surface of its ValidationError may carry the
+        key or URL credentials. hide_input_in_errors covers str()/repr() only; errors()/json() are what error trackers
+        and API error handlers serialize, and the chain would still hold the original error."""
         from pydantic import ValidationError
 
         monkeypatch.delenv("CACHEKIT_ALLOW_CUSTOM_HOST", raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
         with pytest.raises(ValidationError) as info:
-            CachekitIOBackendConfig(**kwargs)
-        assert "SECRET" not in str(info.value)
+            CachekitIOBackendConfig.from_env() if kwargs is None else CachekitIOBackendConfig(**kwargs)
+        exc = info.value
+        for rendered in (str(exc), repr(exc), exc.json(), repr(exc.errors())):
+            assert "SECRET" not in rendered
+        assert [err["input"] for err in exc.errors()] == ["[REDACTED]"]
+        assert exc.errors()[0]["loc"] == loc  # unchanged: CachekitIOBackend's api_key hint keys on it
+        assert exc.__context__ is None
+        assert exc.__cause__ is None
 
     def test_unparseable_url_error_carries_no_credentials(self) -> None:
         """CWE-532: the message once held the whole URL, and urlparse's own error (NFKC-invalid netloc)
