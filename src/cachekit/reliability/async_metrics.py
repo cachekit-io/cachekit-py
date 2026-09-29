@@ -258,11 +258,14 @@ class AsyncMetricsCollector:
                 last_flush = time.time()
 
         # Stopping ends the loop with records still queued; drain them so shutdown() loses nothing.
-        while True:
-            try:
-                batch.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
+        # Bounded by a snapshot so producers still recording cannot keep the worker alive, and
+        # flushed in batch_size chunks so the backlog keeps normal batch granularity. This worker is
+        # the queue's only consumer, so the snapshot never exceeds the records available.
+        for _ in range(self._queue.qsize()):
+            batch.append(self._queue.get_nowait())
+            if len(batch) >= self.batch_size:
+                self._flush_batch(batch)
+                batch = []
 
         # Final flush on shutdown
         if batch:
@@ -363,19 +366,23 @@ class AsyncMetricsCollector:
                 first_labels_key = next(iter(label_values.keys()))
                 label_names = [k for k, v in first_labels_key] if first_labels_key else []
 
+                # Prometheus rejects caller-supplied names and labels with ValueError (reserved label
+                # names, label names that differ from the first-seen schema). Skip the bad series and
+                # log once per metric, so one bad record neither discards the batch nor floods the log.
                 try:
                     counter_metric = self._get_metric(name, Counter, f"Counter metric {name}", label_names)
-                except Exception as e:
-                    # Caller-supplied names can be invalid for Prometheus; skip that metric, not the batch.
+                except ValueError as e:
                     logger.error(f"Failed to create counter {name}: {redact_error_for_log(e)}")
                     continue
+                failures, last_error = 0, None
                 for labels_key, value in label_values.items():
                     labels_dict = dict(labels_key)  # type: ignore[arg-type]
                     try:
                         counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
-                    except Exception as e:
-                        # Caller-supplied labels can mismatch the metric's schema; skip that series, not the batch.
-                        logger.error(f"Failed to update counter {name}: {redact_error_for_log(e)}")
+                    except ValueError as e:
+                        failures, last_error = failures + 1, e
+                if last_error is not None:
+                    logger.error(f"Failed to update counter {name} ({failures} series): {redact_error_for_log(last_error)}")
 
         # Update generic histograms
         for name, observations in histograms.items():
@@ -386,15 +393,20 @@ class AsyncMetricsCollector:
 
                 try:
                     histogram_metric = self._get_metric(name, Histogram, f"Histogram metric {name}", label_names)
-                except Exception as e:
+                except ValueError as e:
                     logger.error(f"Failed to create histogram {name}: {redact_error_for_log(e)}")
                     continue
+                failures, last_error = 0, None
                 for value, labels_key in observations:
                     labels_dict = dict(labels_key)
                     try:
                         histogram_metric.labels(**labels_dict).observe(value)
-                    except Exception as e:
-                        logger.error(f"Failed to update histogram {name}: {redact_error_for_log(e)}")
+                    except ValueError as e:
+                        failures, last_error = failures + 1, e
+                if last_error is not None:
+                    logger.error(
+                        f"Failed to update histogram {name} ({failures} observations): {redact_error_for_log(last_error)}"
+                    )
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
         """Get or create a cached metric instance."""
