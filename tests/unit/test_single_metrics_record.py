@@ -17,7 +17,7 @@ import pytest
 
 from cachekit import cache
 from cachekit.l1_cache import get_l1_cache_manager
-from cachekit.reliability.async_metrics import AsyncMetricsCollector
+from cachekit.reliability.async_metrics import AsyncMetricsCollector, _metrics_cache
 
 T = TypeVar("T")
 
@@ -118,5 +118,5 @@ def test_collector_counts_one_record_once(sync_mode: bool) -> None:
         assert "hit" not in batch[0]
         collector._flush_batch(batch)
 
-    counter = collector._metrics_cache["cache_operations_total"]
+    counter = _metrics_cache["cache_operations_total"]  # process-wide: shared by every collector
     assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 1

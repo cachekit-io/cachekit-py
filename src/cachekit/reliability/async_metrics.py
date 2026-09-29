@@ -5,6 +5,7 @@ synchronous Prometheus updates from the hot path.
 """
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -55,6 +56,55 @@ except ImportError:
         def set(self, value):
             """Set gauge value (no-op)."""
             pass
+
+
+class _NoopMetric:
+    """Stand-in for a metric whose name another library already registered."""
+
+    def labels(self, **kwargs):
+        return self
+
+    def _ignore(self, amount=1):
+        pass
+
+    inc = observe = set = _ignore
+
+
+# Metric objects are process-wide because prometheus_client's default registry is.
+# Every collector (one per decorated function) must record into the same documented
+# series; registering per instance collides on the second collector.
+_metrics_cache: dict[str, Any] = {}
+# One lock per process, keyed by pid: a C-level fork skips the at-fork hooks below, so a
+# child must never take a lock it inherited, possibly held by a thread that is gone.
+_metrics_locks: dict[int, threading.Lock] = {}
+
+
+def _metrics_cache_lock() -> threading.Lock:
+    """Return this process's metric-cache lock, creating it on first use."""
+    pid = os.getpid()
+    lock = _metrics_locks.get(pid)
+    if lock is None:
+        # setdefault is atomic, so threads racing here in a new child all get one lock.
+        lock = _metrics_locks.setdefault(pid, threading.Lock())
+    return lock
+
+
+def _acquire_metrics_lock() -> None:
+    _metrics_cache_lock().acquire()
+
+
+def _release_metrics_lock() -> None:
+    _metrics_cache_lock().release()
+
+
+if hasattr(os, "register_at_fork"):
+    # Hold the lock across fork (as the logging module does) so no thread is between
+    # registering a metric and caching it. The child drops its copy, still held.
+    os.register_at_fork(
+        before=_acquire_metrics_lock,
+        after_in_parent=_release_metrics_lock,
+        after_in_child=_metrics_locks.clear,
+    )
 
 
 class AsyncMetricsCollector:
@@ -130,9 +180,6 @@ class AsyncMetricsCollector:
             self._sync_mode = True
         else:
             self._sync_mode = sync_mode if sync_mode is not None else False
-
-        # Cached metric instances (shared between modes)
-        self._metrics_cache: dict[str, Any] = {}
 
         # Async mode components (lazy initialization)
         self._queue = None
@@ -373,20 +420,24 @@ class AsyncMetricsCollector:
                     histogram_metric.labels(**labels_dict).observe(value)
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
-        """Get or create a cached metric instance."""
-        if name not in self._metrics_cache:
-            try:
-                self._metrics_cache[name] = metric_class(name, description, labels)
-            except ValueError as e:
-                if "Duplicated timeseries" in str(e):
-                    # Use a unique name for this instance to avoid conflicts
-                    import uuid
-
-                    unique_name = f"{name}_{uuid.uuid4().hex[:8]}"
-                    self._metrics_cache[name] = metric_class(unique_name, description, labels)
-                else:
-                    raise
-        return self._metrics_cache[name]
+        """Get or create the process-wide metric instance for ``name``."""
+        metric = _metrics_cache.get(name)
+        if metric is None:
+            with _metrics_cache_lock():
+                metric = _metrics_cache.get(name)
+                if metric is None:
+                    try:
+                        metric = metric_class(name, description, labels)
+                    except ValueError as e:
+                        if "Duplicated timeseries" not in str(e):
+                            raise
+                        # The host application owns this name. Telemetry must not break cache
+                        # calls, and a renamed series would be invisible to the documented
+                        # queries, so drop this metric loudly instead.
+                        logger.warning(f"Metric {name!r} is already registered outside cachekit; not recording it")
+                        metric = _NoopMetric()
+                    _metrics_cache[name] = metric
+        return metric
 
     def get_dropped_metrics_count(self) -> int:
         """Get count of dropped metrics due to queue overflow."""
