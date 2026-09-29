@@ -2290,6 +2290,11 @@ def create_cache_wrapper(
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for invalidation: %s", redact_error_for_log(e))
 
+        # Same interop guard as reads and writes: a key-prefixing backend would delete
+        # {prefix}{key} and leave the bare entry other SDKs read in place.
+        if interop is not None:
+            ensure_interop_backend_compatible(_backend)
+
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.
         # Without this, it generates a key for zero-arg call (never cached) → no-op.
@@ -2313,6 +2318,9 @@ def create_cache_wrapper(
             except Exception as e:
                 # If backend creation fails, can't invalidate L2
                 _logger.debug("Failed to get backend for async invalidation: %s", redact_error_for_log(e))
+
+        if interop is not None:  # interop guard, as in invalidate_cache
+            ensure_interop_backend_compatible(_backend)
 
         # Fix #59: When called with no args on a parameterized function,
         # invalidate ALL cached entries for this function.

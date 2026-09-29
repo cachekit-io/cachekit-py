@@ -117,7 +117,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 | Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
