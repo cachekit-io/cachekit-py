@@ -97,8 +97,8 @@ What happens when the reader's `integrity_checking` (see [API Reference](../api-
 
 | Value | Path | Mismatch in either direction |
 |---|---|---|
-| dict, list, str, set, datetime, … | MessagePack (+ envelope when integrity checking is on) | Raises `SerializationError` (E021) |
-| `pandas.Series`; `pandas.DataFrame` without pyarrow | Columnar MessagePack (+ envelope when on) | Raises `SerializationError` (E021) |
+| dict, list, str, set, datetime, … | MessagePack (+ envelope when integrity checking is on) | Raises `SerializationError` |
+| `pandas.Series`; `pandas.DataFrame` without pyarrow | Columnar MessagePack (+ envelope when on) | Raises `SerializationError` |
 | `pandas.DataFrame` with pyarrow | [ArrowSerializer](arrow.md) — always checksummed | Decodes; corruption always detected |
 | `numpy.ndarray` | Raw buffer, checksummed only when the **writer** had it on | Decodes; corruption detected only if the writer had it on |
 
@@ -108,9 +108,9 @@ What happens when the reader's `integrity_checking` (see [API Reference](../api-
 
 **NumPy arrays** are the exception to watch. The checksum is a prefix the *writer* adds when its flag is on; the reader verifies it if present and otherwise decodes the raw buffer. An array written with `integrity_checking=False` is therefore never verified — a flipped byte decodes into wrong values even for a reader with the flag on. The reader's setting buys it nothing here; protection depends entirely on the writer's.
 
-In every case the checksum is unkeyed xxHash3-64: it detects corruption, not tampering. Anyone who can write to the backend can recompute it — see [E003](../error-codes.md#e003-decryption-failed---authentication-tag-mismatch) for the encrypted path that does resist tampering.
+In every case the checksum is unkeyed xxHash3-64: it detects corruption, not tampering. Anyone who can write to the backend can recompute it — see [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch) for the encrypted path that does resist tampering.
 
-See [E021](../error-codes.md#e021-deserialization-failed) for the exact error messages.
+See [Deserialization failed](../error-codes.md#deserialization-failed) for the exact error messages.
 
 ## Unsupported Types
 
