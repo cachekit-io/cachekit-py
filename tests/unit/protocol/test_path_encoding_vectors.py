@@ -28,10 +28,6 @@ FIXTURE_SHA256 = "7df23f90af9da4198a1344049273d120f4ac944f55b2945765973068d6f270
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["vectors"]
 
-# A fixture update that adds or removes rows must be a conscious change.
-EXPECTED_VECTOR_COUNT = 15
-EXPECTED_REJECT_COUNT = 5
-
 _TRANSMITTABLE = [v for v in VECTORS if not v.get("reject")]
 _REJECT = [v for v in VECTORS if v.get("reject")]
 
@@ -41,13 +37,8 @@ def test_fixture_integrity() -> None:
     digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
     assert digest == FIXTURE_SHA256, (
         f"fixtures/path-encoding.json sha256 {digest} != pinned {FIXTURE_SHA256}. "
-        "If the protocol vectors were intentionally updated, refresh the pin AND the counts."
+        "If the protocol vectors were intentionally updated, refresh the pin."
     )
-
-
-def test_vector_counts() -> None:
-    assert len(VECTORS) == EXPECTED_VECTOR_COUNT
-    assert len(_REJECT) == EXPECTED_REJECT_COUNT
 
 
 @pytest.mark.parametrize("vector", _TRANSMITTABLE, ids=lambda v: v["key"])

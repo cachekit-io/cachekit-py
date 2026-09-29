@@ -13,15 +13,9 @@ token:
     ..       ->  GET /v1              (dot-segment collapse)
     ../ttl   ->  GET /v1/ttl          (collapse onto a *different* route)
 
-The last two cases cannot be fixed by encoding. ``quote(key, safe="")`` leaves
-RFC-3986 unreserved ``.`` raw, and ``%2E`` does not help either: httpx sends it
-intact, but the SaaS parses the URL under WHATWG, which collapses ``%2E`` /
-``%2E%2E`` as dot segments server-side. ``health``, ``ttl`` and ``lock`` are route
-tokens at the same level. So ``_encode_key`` rejects those five keys before any
-request is made (protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2;
-LAB-2880). See ``SECURITY.md`` for the full mechanism and the cross-SDK
-wire-parity contract (cachekit-ts ``encodeURIComponent``, cachekit-rs
-``urlencoding::encode``, SaaS single decode + ``..`` reject).
+A bare ``.`` / ``..`` key has no safe wire form (percent-encoded dots are collapsed
+server-side), and neither do the route tokens ``health`` / ``ttl`` / ``lock``: those
+five are rejected before any request (protocol rule 2, LAB-2880). See ``SECURITY.md``.
 
 These tests drive the real backend methods through a real ``httpx`` client backed
 by a ``MockTransport`` and assert on ``request.url.raw_path`` — the actual bytes

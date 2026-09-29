@@ -58,10 +58,7 @@ STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
-# Keys that no wire form can carry to the SaaS key validator (protocol spec/saas-api.md
-# § Cache-Key Path Encoding, rule 2). `.` / `..` are dot segments — and the server parses
-# the URL under WHATWG, which also collapses `%2E` / `%2E%2E` — while `health`, `ttl` and
-# `lock` are route tokens at the `/v1/cache/` level. Rejected before any URL is built.
+# Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
 _RESERVED_KEY_SEGMENTS = frozenset({".", "..", "health", "ttl", "lock"})
 
 _API_KEY_HINT = (
@@ -275,8 +272,9 @@ class CachekitIOBackend:
         ``..a`` are sent as-is, and canonical keys (which always contain ``:``) never match.
 
         Raises:
-            BackendError: ``PERMANENT`` — the key is reserved. Same classification as a
-                SaaS 400 for an invalid key, so every caller already handles it (never retried).
+            BackendError: ``PERMANENT`` (never retried) — the key is reserved. Raised from every
+                public method, including ``get_ttl`` / ``refresh_ttl``, which otherwise swallow a
+                SaaS 400 as ``None`` / ``False``.
 
         Examples:
             >>> CachekitIOBackend._encode_key("ns:app:func:mod.fn:args:ab:1s")
