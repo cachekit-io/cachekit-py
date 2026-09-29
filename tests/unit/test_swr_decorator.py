@@ -11,7 +11,9 @@ Spec: protocol spec/saas-api.md#stale-while-revalidate.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import os
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -350,6 +352,9 @@ class TestSWRForkIsolation:
             queue = ctx.Queue()
 
             def child(q) -> None:
+                # A child stuck past 20 s dumps every thread's stack to stderr while the parent still
+                # waits, so a hang fails with its own diagnosis instead of a bare queue.Empty.
+                faulthandler.dump_traceback_later(20, exit=False, file=sys.__stderr__)
                 before = len(calls)
                 result = compute(1)  # stale hit; key is stuck in the INHERITED in-flight set
                 revalidated = _wait_for(lambda: len(calls) > before, timeout=5.0)
