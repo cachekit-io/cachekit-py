@@ -8,14 +8,49 @@ and multi-language compatibility.
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, datetime, time
 
+import msgpack
 import pytest
 
-from cachekit.serializers.base import SerializationError, SerializationFormat, SerializerProtocol
+from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata, SerializerProtocol
 from cachekit.serializers.standard_serializer import (
     StandardSerializer,
 )
+
+CROSS_CONFIG_MESSAGE = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
+
+# Legitimate values shaped like a ByteStorage envelope ``[bytes, [8 ints], int, format]``. The first
+# two score a perfect 4/4 on AutoSerializer._looks_like_envelope, so their round-trip proves shape
+# does not decide anything in StandardSerializer. The three bytes-first values pass its lead-byte
+# pre-filter (``\x94\xc4``, pinned below), so retrieve() is what clears them.
+ENVELOPE_LOOKALIKES = [
+    pytest.param([b"x", [1] * 8, 0, "msgpack"], id="4of4-minimal"),
+    pytest.param([b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"], id="4of4-png"),
+    pytest.param([b"blob", [1, 2, 3, 4, 5, 6, 7, 8], 42, "label"], id="3of4"),
+    pytest.param([1, 2, 3, "msgpack"], id="plain-4-list"),
+]
+
+INTEGRITY_OFF_GOLDEN_WRITES = [
+    pytest.param(
+        [b"x", [1] * 8, 0, "msgpack"],
+        b"\x94\xc4\x01x\x98\x01\x01\x01\x01\x01\x01\x01\x01\x00\xa7msgpack",
+        id="4of4-minimal",
+    ),
+    pytest.param(
+        [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"],
+        b"\x94\xc4\x04\x89PNG\x98\xcc\xff\x00\x00\xcc\xff\x00\xcc\xff\x00\xcc\xff\xcd\x10\x00\xa6series",
+        id="4of4-png",
+    ),
+    pytest.param(
+        [b"blob", [1, 2, 3, 4, 5, 6, 7, 8], 42, "label"],
+        b"\x94\xc4\x04blob\x98\x01\x02\x03\x04\x05\x06\x07\x08*\xa5label",
+        id="3of4",
+    ),
+    pytest.param([1, 2, 3, "msgpack"], b"\x94\x01\x02\x03\xa7msgpack", id="plain-4-list"),
+    pytest.param({"admin": False, "user": "alice"}, b"\x82\xa5admin\xc2\xa4user\xa5alice", id="dict"),
+]
 
 
 @pytest.mark.unit
@@ -459,17 +494,75 @@ class TestStandardSerializerIntegrityChecking:
         deserialized = serializer.deserialize(serialized)
         assert deserialized == data
 
-    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
-        """Writer on, reader off: the ByteStorage envelope cannot be verified or unwrapped
-        without ByteStorage. Before the gate unpackb ran on the envelope bytes and silently
-        returned its positional fields — ``[payload, checksum, size, format]`` — as the value."""
-        on = StandardSerializer(enable_integrity_checking=True)
-        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+    @pytest.mark.parametrize(
+        "header",
+        [
+            pytest.param(lambda meta: meta, id="compressed-true"),
+            pytest.param(
+                lambda meta: SerializationMetadata.from_dict({k: v for k, v in meta.to_dict().items() if k != "compressed"}),
+                id="compressed-absent",
+            ),
+            pytest.param(lambda meta: None, id="no-metadata"),
+        ],
+    )
+    @pytest.mark.parametrize("wrap", [bytes, memoryview])
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self, header, wrap) -> None:
+        """Writer on, reader off: the envelope is refused whatever the header says. Before the
+        verified-retrieve gate, a header lacking ``compressed`` and a metadata-less read both ran
+        unpackb on the envelope bytes and returned its positional fields — ``[payload, checksum,
+        size, format]`` — as the value."""
+        data, meta = StandardSerializer(enable_integrity_checking=True).serialize({"admin": False, "user": "alice"})
         assert meta.compressed is True
 
         off = StandardSerializer(enable_integrity_checking=False)
-        with pytest.raises(SerializationError, match="integrity checking disabled"):
-            off.deserialize(data, meta)
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$") as excinfo:
+            off.deserialize(wrap(data), header(meta))
+        assert type(excinfo.value) is SerializationError  # no subclass: shape decides nothing here
+
+    def test_legacy_encoded_envelope_is_refused_with_integrity_off(self) -> None:
+        """Older writers stored the envelope payload as an int array rather than ``bin``, and
+        retrieve() still verifies that form, so the pre-filter must not demand a bin marker."""
+        data, _ = StandardSerializer(enable_integrity_checking=True).serialize({"a": 1})
+        payload, checksum, original_size, fmt = msgpack.unpackb(data)
+        legacy = msgpack.packb([list(payload), checksum, original_size, fmt], use_bin_type=True)
+        assert legacy[1] not in (0xC4, 0xC5, 0xC6)  # int array, not bin
+
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            StandardSerializer(enable_integrity_checking=False).deserialize(legacy)
+
+    @pytest.mark.parametrize("value", ENVELOPE_LOOKALIKES)
+    @pytest.mark.parametrize("with_metadata", [True, False])
+    def test_envelope_shaped_value_round_trips_with_integrity_off(self, value, with_metadata) -> None:
+        """Only an envelope that VERIFIES is refused, so a legitimate value shaped exactly like
+        one still round-trips — with its own metadata and without."""
+        off = StandardSerializer(enable_integrity_checking=False)
+        data, meta = off.serialize(value)
+        assert off.deserialize(data, meta if with_metadata else None) == value
+
+    @pytest.mark.parametrize(
+        ("slot", "rot"),
+        [
+            pytest.param(1, lambda checksum: [checksum[0] ^ 1, *checksum[1:]], id="checksum"),
+            pytest.param(2, lambda original_size: original_size + 1, id="original_size"),
+        ],
+    )
+    def test_unverified_envelope_is_decoded_as_a_value_with_integrity_off(self, slot, rot) -> None:
+        """A retrieve() failure of any kind means "not verified", so the plain decode stands. This
+        pins the documented residual: a rotted envelope reaching an integrity-off reader is
+        returned, as rot in that reader's own entries is."""
+        data, _ = StandardSerializer(enable_integrity_checking=True).serialize({"a": 1})
+        fields = msgpack.unpackb(data)
+        fields[slot] = rot(fields[slot])
+        rotted = msgpack.packb(fields, use_bin_type=True)
+
+        assert StandardSerializer(enable_integrity_checking=False).deserialize(rotted) == fields
+
+    @pytest.mark.parametrize(("value", "golden"), INTEGRITY_OFF_GOLDEN_WRITES)
+    def test_integrity_off_write_bytes_are_pinned(self, value, golden) -> None:
+        """Integrity-off writes are plain MessagePack; the read-side gate must not move them."""
+        data, meta = StandardSerializer(enable_integrity_checking=False).serialize(value)
+        assert data == golden
+        assert meta.compressed is False
 
     def test_metadata_format_msgpack(self) -> None:
         """Test that metadata always reports SerializationFormat.MSGPACK."""

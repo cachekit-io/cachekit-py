@@ -79,7 +79,9 @@ StandardSerializer automatically handles:
 - **LZ4 compression** — fast compression reducing storage footprint (~30% smaller than raw msgpack)
 - **xxHash3-64 checksums** — integrity verification on deserialization
 
-Both are handled by the Rust ByteStorage layer. No configuration required — it's always on.
+Both are handled by the Rust ByteStorage layer and are on by default. With `integrity_checking=False` (as `@cache.minimal` sets) the serializer writes plain MessagePack instead: no compression, no checksum.
+
+**Cross-config reads.** A reader with integrity checking off does not unwrap envelopes. Handed an entry written with integrity checking on, it raises `SerializationError` (`Cache entry was written with integrity checking on but this reader has integrity checking disabled`) instead of returning the envelope's internal fields as your value, with or without metadata. Under default key generation this never happens through `@cache`, because the integrity flag is part of the key. A custom `key=`, `fast_mode` or the direct serializer API can cross the two configs. The reader decides by verifying the envelope's checksum, not by the value's shape, so a cached value that merely looks like an envelope, such as `[b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "rgb"]`, still round-trips.
 
 > **Corruption detection, not tamper resistance.** xxHash3-64 is non-cryptographic: an
 > attacker with backend write access can forge a valid checksum for arbitrary bytes. The

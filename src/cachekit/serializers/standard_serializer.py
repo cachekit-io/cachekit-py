@@ -29,6 +29,10 @@ from cachekit._rust_serializer import ByteStorage
 
 from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
 
+# Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
+# marker: bin8/16/32 in the current encoding, an int array (fixarray, array16, array32) in the legacy one.
+_ENVELOPE_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6, *range(0x90, 0xA0), 0xDC, 0xDD))
+
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
     "StandardSerializer does not support NumPy arrays (Python-specific type). "
@@ -243,8 +247,9 @@ class StandardSerializer:
         """
         self.enable_integrity_checking = enable_integrity_checking
 
-        if self.enable_integrity_checking:
-            self._byte_storage = ByteStorage("msgpack")
+        # Built with integrity off too: that reader verifies a would-be envelope before refusing
+        # it (see deserialize Raises:). Writes still gate on the flag.
+        self._byte_storage = ByteStorage("msgpack")
 
         # MessagePack configuration for cross-language compatibility
         self._msgpack_pack_opts = {
@@ -314,17 +319,27 @@ class StandardSerializer:
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
             metadata: Optional metadata. Only ``compressed`` is read: with integrity checking
-                off, an entry the writer enveloped (``compressed=True``) is rejected rather
-                than decoded as plain MessagePack (see Raises).
+                off, ``compressed=True`` rejects the entry outright (see Raises).
 
         Returns:
             Deserialized Python object
 
         Raises:
             SerializationError: If data is malformed, not valid MessagePack, or integrity check
-                fails; also, with integrity checking off, if ``metadata.compressed`` says the
-                writer enveloped the entry — this reader has no ByteStorage to verify or unwrap
-                it, and unpackb on the envelope bytes would return its fields as the value.
+                fails. Also, with integrity checking off, if the entry is a ByteStorage envelope:
+                ``metadata.compressed`` says so, or the bytes pass ``ByteStorage.retrieve()``,
+                which covers a header without that key and a call with no metadata. This reader
+                does not unwrap envelopes, and unpackb on one returns its four fields as the value.
+
+                A verified ``retrieve()`` decides, never shape, which is a deliberate difference
+                from :class:`AutoSerializer`'s envelope-shape refusal. Three reasons. The docs
+                send users who hit that refusal here, on the promise that every value
+                round-trips. The 64-bit checksum is the one thing a look-alike value cannot
+                match by chance, so no legitimate value is refused; the cost is that a *rotted*
+                envelope reaching this reader is returned, which is what integrity off already
+                means for rot. And this is the cross-SDK serializer: the TypeScript SDK's
+                compression-off reader also tells an envelope from a value by verifying it. The
+                two-byte test in front of ``retrieve()`` only keeps it off ordinary reads.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -340,8 +355,8 @@ class StandardSerializer:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
             else:
-                # No ByteStorage — an enveloped entry cannot be verified or unwrapped here (see Raises).
-                if metadata is not None and metadata.compressed:
+                # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
+                if (metadata is not None and metadata.compressed) or self._is_verified_envelope(data):
                     raise SerializationError(
                         "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
                     )
@@ -354,6 +369,17 @@ class StandardSerializer:
             raise
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
+
+    def _is_verified_envelope(self, data: bytes | memoryview) -> bool:
+        """True only when ``data`` is a ByteStorage envelope that passes ``retrieve()``."""
+        # A necessary condition, never a verdict: it only spares ordinary reads the retrieve() attempt.
+        if len(data) < 2 or data[0] != 0x94 or data[1] not in _ENVELOPE_PAYLOAD_MARKERS:
+            return False
+        try:
+            self._byte_storage.retrieve(data)
+        except Exception:  # any failure (not an envelope, checksum, size) means "not verified"
+            return False
+        return True
 
 
 # Default instance for convenience
