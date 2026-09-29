@@ -74,24 +74,42 @@ class _NoopMetric:
 # Every collector (one per decorated function) must record into the same documented
 # series; registering per instance collides on the second collector.
 _metrics_cache: dict[str, Any] = {}
-_metrics_cache_lock = threading.Lock()
+_metrics_lock = threading.Lock()
+_metrics_lock_pid = os.getpid()  # owner process — a C-level fork skips the at-fork hooks below
 
 
-def _acquire_metrics_cache_lock() -> None:
-    _metrics_cache_lock.acquire()
+def _metrics_cache_lock() -> threading.Lock:
+    """Return the metric-cache lock, replacing one inherited through a hookless fork."""
+    global _metrics_lock, _metrics_lock_pid
+    if _metrics_lock_pid != os.getpid():
+        # Forked child whose at-fork hooks never ran: the inherited lock may be held by
+        # a thread that does not exist here. Same recovery as the wrapper's SWR state.
+        _metrics_lock = threading.Lock()
+        _metrics_lock_pid = os.getpid()
+    return _metrics_lock
 
 
-def _release_metrics_cache_lock() -> None:
-    _metrics_cache_lock.release()
+def _acquire_metrics_lock() -> None:
+    _metrics_cache_lock().acquire()
+
+
+def _release_metrics_lock() -> None:
+    _metrics_lock.release()
+
+
+def _release_metrics_lock_in_child() -> None:
+    global _metrics_lock_pid
+    _metrics_lock_pid = os.getpid()
+    _metrics_lock.release()
 
 
 if hasattr(os, "register_at_fork"):
     # Hold the lock across fork (as the logging module does): a child must never inherit it
     # held by a thread that no longer exists, nor a metric registered but not yet cached.
     os.register_at_fork(
-        before=_acquire_metrics_cache_lock,
-        after_in_parent=_release_metrics_cache_lock,
-        after_in_child=_release_metrics_cache_lock,
+        before=_acquire_metrics_lock,
+        after_in_parent=_release_metrics_lock,
+        after_in_child=_release_metrics_lock_in_child,
     )
 
 
@@ -412,7 +430,7 @@ class AsyncMetricsCollector:
         """Get or create the process-wide metric instance for ``name``."""
         metric = _metrics_cache.get(name)
         if metric is None:
-            with _metrics_cache_lock:
+            with _metrics_cache_lock():
                 metric = _metrics_cache.get(name)
                 if metric is None:
                     try:

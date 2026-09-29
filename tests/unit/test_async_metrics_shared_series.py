@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import sys
 import threading
 import uuid
 from typing import Any
@@ -130,7 +132,7 @@ def test_fork_while_another_thread_holds_metric_lock_does_not_hang_child() -> No
     held, release = threading.Event(), threading.Event()
 
     def holder() -> None:
-        with am._metrics_cache_lock:
+        with am._metrics_cache_lock():
             held.set()
             release.wait(5)
 
@@ -169,3 +171,30 @@ def test_fork_mid_registration_child_keeps_the_real_metric() -> None:
         return not isinstance(collector._get_metric(name, prometheus_client.Counter, "d", ["k"]), am._NoopMetric)
 
     assert _child_exit_code(child_sees_real_metric) == 0
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+def test_hookless_fork_while_sibling_holds_metric_lock_does_not_hang_child() -> None:
+    """A C-level fork skips os.register_at_fork callbacks; the child must still not inherit a dead lock."""
+    import ctypes
+
+    import cachekit.reliability.async_metrics as am
+
+    libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with am._metrics_cache_lock():
+            held.set()
+            release.wait(5)
+
+    threading.Thread(target=holder, daemon=True).start()
+    held.wait(5)
+    pid = libc_fork()
+    if pid == 0:  # child: SIGALRM kills it if registration blocks on the orphaned lock
+        signal.alarm(5)
+        AsyncMetricsCollector(sync_mode=True).record_counter(f"hookless_{uuid.uuid4().hex}", {"k": "v"})
+        os._exit(0)
+    release.set()
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
