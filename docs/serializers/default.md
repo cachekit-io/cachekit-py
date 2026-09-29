@@ -4,7 +4,7 @@
 
 The **StandardSerializer** is cachekit's general-purpose serializer. It is used automatically when no serializer is specified on a `@cache` decorator. It combines MessagePack encoding with optional LZ4 compression and xxHash3-64 integrity checksums via cachekit's Rust ByteStorage layer.
 
-The registry alias for this serializer is `"default"` (and `"auto"`). The class name is `StandardSerializer`.
+The registry aliases for this serializer are `"default"` and `"std"` (`"auto"` is [AutoSerializer](./auto.md)). The class name is `StandardSerializer`.
 
 ## Overview
 
@@ -66,9 +66,9 @@ StandardSerializer can be referenced by alias when configuring serializers:
 | `None` | ✅ | |
 | `bytes` | ✅ | Binary data — only serializer that handles raw bytes |
 | `datetime` | ✅ | Via MessagePack extension |
-| `numpy.ndarray` | ✅ | Auto-detected, binary format |
-| `pandas.DataFrame` | ✅ | Auto-detected, column-wise |
-| `pandas.Series` | ✅ | Auto-detected |
+| `numpy.ndarray` | ❌ | Raises `TypeError`; use [AutoSerializer](./auto.md) (`serializer="auto"`) |
+| `pandas.DataFrame` | ❌ | Raises `TypeError`; use [ArrowSerializer](./arrow.md) or [AutoSerializer](./auto.md) |
+| `pandas.Series` | ❌ | Raises `TypeError`; use [AutoSerializer](./auto.md) |
 | Pydantic models | ❌ | See [Caching Pydantic Models](./pydantic.md) |
 | `set` / `frozenset` | ❌ | Convert to `list` first |
 | Custom classes | ❌ | Implement `__dict__` or use custom serializer |
@@ -105,7 +105,7 @@ def get_large_dict():
        return expensive_computation()
    ```
 
-3. **For DataFrames with 10K+ rows**, consider switching to [ArrowSerializer](./arrow.md) for significant speedups.
+3. **For DataFrames**, use [ArrowSerializer](./arrow.md): StandardSerializer rejects them.
 
 ---
 
