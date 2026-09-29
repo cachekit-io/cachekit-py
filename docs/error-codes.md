@@ -355,7 +355,7 @@ def get_json_data():
 
 **Error text**: `Cache entry failed envelope verification (corrupted cache entry): ...`, `Cache entry failed envelope verification: decoded to a ByteStorage envelope shape ...`, `Cache entry was written with integrity checking on but this reader has integrity checking disabled ...`, `Cache entry is not a decodable MessagePack payload ...`, `NumPy payload disagrees with header format '...'`, or `Cache entry header claims a <type> format, not a string`
 
-**Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`
+**Message** (logged): `L2 cache decrypt/integrity failure (corruption) for ...: ...`, or `(envelope_shape)` in place of `(corruption)` for the envelope-shape refusal described below
 
 **Exception**: none under `@cache` — cachekit attempts to evict the entry (best effort; a failed delete is logged and the entry stays) and the function recomputes. Calling a serializer's `deserialize()` directly raises `SerializationError` (there is no separate `DeserializationError` class).
 

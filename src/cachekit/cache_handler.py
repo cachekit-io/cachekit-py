@@ -136,8 +136,8 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
       the shape of a ByteStorage envelope and was refused (LAB-2736). Either a rotted
       integrity-on envelope or a legitimate top-level 4-element list; the read path
       cannot tell them apart, so this is NOT reliable corruption evidence and is kept
-      out of ``corruption``. Always fails open. A steady rate on one key is the second
-      case: that value recomputes on every read, forever.
+      out of ``corruption``. Always fails open. The same redacted key repeating in the
+      WARNING log is the second case: that value recomputes on every read, forever.
     - ``corruption``: any other SerializationError — checksum mismatch, malformed
       frame, serializer mismatch, deserialize failure on authenticated
       plaintext. Not tamper evidence; always fails open.

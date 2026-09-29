@@ -337,8 +337,8 @@ class EnvelopeShapeError(SerializationError):
     as their object. Callers treat it as a miss (evict → recompute), but for the second
     population recompute re-produces the same bytes and the refusal repeats on every read,
     so telemetry counts it under its own ``envelope_shape`` reason rather than
-    ``corruption``: a steady rate on one key is that value, not storage rot, and must not
-    read as a corruption spike.
+    ``corruption``: the same redacted key repeating in the WARNING log is that value, not
+    storage rot, and must not read as a corruption spike.
     """
 
     pass

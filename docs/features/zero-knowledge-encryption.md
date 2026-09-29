@@ -497,7 +497,7 @@ them (cachekit-py#170):
   envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
   4-element list that merely looks like one; the read path cannot tell them apart, so this
   is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
-  A steady rate on one key is the second case — that value recomputes on every read (see
+  The same redacted key repeating in the WARNING log is the second case — that value recomputes on every read (see
   *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a

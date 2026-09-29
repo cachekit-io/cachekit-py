@@ -672,14 +672,14 @@ class AutoSerializer:
 
                 **Metadata-free reads assume the writer's configuration.** A read with no metadata
                 cannot identify the writer, so it is defined only when reader and writer agree on
-                ``enable_integrity_checking``. Nothing has to enforce that on the normal path:
-                :meth:`CacheKeyGenerator.generate_key` puts that flag in the key suffix, so a
-                reconfigured reader misses rather than crossing. It is the
-                direct serializer API and a hand-reused raw key that can cross, and there one arm
+                ``enable_integrity_checking``. Under default key generation nothing has to enforce
+                that: :meth:`CacheKeyGenerator.generate_key` puts that flag in the key suffix, so a
+                reconfigured reader misses rather than crossing. It is the direct serializer API,
+                a custom ``key=``, fast-mode keys and a hand-reused raw key that can cross, and there one arm
                 has no parse to appeal to — when ``retrieve()`` already failed, a re-parse fails the
                 same way, so shape DECIDES and a value shaped >=3/4 like an envelope is refused.
                 That residual is the price of not adding a wire discriminator to tell an envelope
-                from a list, which would be a format change (LAB-2736), not a read-path fix.
+                from a list, which would be a format change (LAB-4304), not a read-path fix.
 
                 **Format.** The stored format is recorded twice — in the envelope's ``format``
                 field and in the header's ``original_type`` — and the xxHash3-64 covers the
@@ -721,7 +721,7 @@ class AutoSerializer:
                 retrieve()" vouches for a decode no more than "retrieve() failed" does; without
                 it a HEALTHY envelope came back as its four fields. It is not a blanket "nothing
                 is verified": :class:`ArrowSerializer` is constructed regardless of this flag and
-                always writes and checks its own checksum, which is why an intact Arrow entry
+                checks its checksum whenever the prefix is present, which is why an intact Arrow entry
                 whose header lost ``original_type`` still decodes on an integrity-off reader
                 rather than failing closed.
         """
