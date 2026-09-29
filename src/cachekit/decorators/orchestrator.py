@@ -1,10 +1,8 @@
 import contextvars
 import logging
-import uuid
 from typing import Any, Optional, Union
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
-from ..monitoring.correlation_tracking import CorrelationTracker
 from ..monitoring.pool_monitor import PoolMonitor
 
 # Import EXISTING modules - no duplication
@@ -47,13 +45,6 @@ class FeatureOrchestrator:
         'test'
         >>> status["overall_healthy"]
         True
-
-        Generate correlation ID:
-
-        >>> import uuid
-        >>> corr_id = orch.generate_correlation_id()
-        >>> uuid.UUID(corr_id)  # doctest: +ELLIPSIS
-        UUID('...')
     """
 
     def __init__(
@@ -76,7 +67,6 @@ class FeatureOrchestrator:
         self._circuit_breaker = None
         self._load_control = None
         self._metrics_collector = None
-        self._correlation_tracker = None
         self._pool_monitor = None
 
         if circuit_breaker_enabled:
@@ -99,9 +89,6 @@ class FeatureOrchestrator:
         if collect_stats:
             self._metrics_collector = AsyncMetricsCollector()
 
-        if enable_structured_logging:
-            self._correlation_tracker = CorrelationTracker()
-
         # Pool monitoring - initialized when pool manager is available
         self._pool_monitor = None
 
@@ -119,11 +106,6 @@ class FeatureOrchestrator:
     def metrics_collector(self) -> Optional[AsyncMetricsCollector]:
         """Get metrics collector if enabled."""
         return self._metrics_collector
-
-    @property
-    def correlation_tracker(self) -> Optional[CorrelationTracker]:
-        """Get correlation tracker if enabled."""
-        return self._correlation_tracker
 
     @property
     def pool_monitor(self) -> Optional[PoolMonitor]:
@@ -159,26 +141,6 @@ class FeatureOrchestrator:
         # BackpressureController uses context manager (acquire), not can_accept_request
         # For now, always return True and let acquire handle backpressure
         return True
-
-    def start_request(self) -> Optional[str]:
-        """Start request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not start_request()
-        # Load control is handled via acquire() in the wrapper
-
-        if self._correlation_tracker:
-            correlation_id = self._correlation_tracker.generate_correlation_id()
-            self._correlation_tracker.set_correlation_id(correlation_id)
-            return correlation_id
-
-        return None
-
-    def end_request(self, correlation_id: Optional[str] = None) -> None:
-        """End request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not end_request()
-        # Load control cleanup is automatic via context manager
-
-        if self._correlation_tracker:
-            self._correlation_tracker.clear_correlation_id()
 
     def log_structured(self, level: str, message: str, **kwargs) -> None:
         """Log with structured format if enabled."""
@@ -238,24 +200,6 @@ class FeatureOrchestrator:
             components["metrics"] = metrics_status
 
         return status
-
-    def generate_correlation_id(self) -> str:
-        """Generate a unique correlation ID for request tracking."""
-        return str(uuid.uuid4())
-
-    def create_correlation_id(self) -> str:
-        """Alias for generate_correlation_id."""
-        return self.generate_correlation_id()
-
-    def set_correlation_id(self, correlation_id: str) -> None:
-        """Set correlation ID for structured logging."""
-        # Implementation depends on correlation tracker
-        pass
-
-    def clear_correlation_id(self) -> None:
-        """Clear correlation ID."""
-        # Implementation depends on correlation tracker
-        pass
 
     def create_span(self, name: str, attributes: Optional[dict[str, Any]] = None):
         """Create a tracing span (no-op if tracing not available)."""
@@ -403,7 +347,6 @@ class FeatureOrchestrator:
         namespace: Optional[str] = None,
         span: Optional[Any] = None,
         duration_ms: float = 0.0,
-        correlation_id: Optional[str] = None,
         *,
         count_toward_breaker: bool = True,
         **extra_context: Any,
@@ -421,7 +364,6 @@ class FeatureOrchestrator:
             namespace: Cache namespace (defaults to orchestrator namespace)
             span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
-            correlation_id: Optional correlation ID for distributed tracing
             count_toward_breaker: Passed to record_failure(). False keeps the metric
                 and logs but leaves the circuit breaker untouched.
             **extra_context: Additional context to include in logs
@@ -462,7 +404,6 @@ class FeatureOrchestrator:
             error=redact_error_for_log(error),
             error_type=type(error).__name__,
             duration_ms=duration_ms,
-            correlation_id=correlation_id,
             **extra_context,
         )
 

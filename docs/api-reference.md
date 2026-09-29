@@ -833,7 +833,6 @@ query examples, and alerting rules.
 ### Structured Logging
 
 All operations include structured logging with:
-- Correlation IDs for request tracking
 - Operation context (namespace, cache key, serializer)
 - Performance metrics (duration, cache hit/miss)
 - Error classification and recovery actions
