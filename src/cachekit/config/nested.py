@@ -7,6 +7,7 @@ timeout, backpressure, monitoring, encryption).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -82,9 +83,20 @@ class CircuitBreakerConfig:
         enabled: Enable circuit breaker protection (default: True)
         failure_threshold: Consecutive failures before opening circuit (default: 5)
         success_threshold: Consecutive successes in HALF_OPEN to close circuit (default: 3)
-        recovery_timeout: Seconds to wait before attempting recovery (default: 30)
-        half_open_requests: Max concurrent requests during HALF_OPEN state (default: 3)
-        excluded_exceptions: Exception types that don't trigger circuit breaker (default: ())
+        recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
+            probe; finite and > 0 (default: 30.0). It also caps probing at
+            half_open_requests per cooldown, so 0 would remove that cap.
+        half_open_requests: Total probe requests admitted per HALF_OPEN cycle, not a
+            concurrency limit; must be >= success_threshold, or a cycle could never
+            close (default: 3)
+
+    The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
+    ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``
+    reports them. Their defaults equal ``cachekit.reliability.CircuitBreakerConfig()``'s,
+    and a test pins that.
+
+    This is the class ``@cache(circuit_breaker=...)`` takes. ``cachekit.CircuitBreakerConfig``
+    is a different class that configures a standalone ``CircuitBreaker``.
 
     Examples:
         Create with defaults:
@@ -93,14 +105,21 @@ class CircuitBreakerConfig:
         >>> config.failure_threshold
         5
         >>> config.recovery_timeout
-        30
+        30.0
 
         Custom thresholds:
 
-        >>> strict = CircuitBreakerConfig(failure_threshold=3, success_threshold=5)
+        >>> strict = CircuitBreakerConfig(failure_threshold=3, success_threshold=5, half_open_requests=5)
         >>> strict.validate()  # No error = valid
         >>> strict.failure_threshold
         3
+
+        A probe budget below success_threshold could never close, so it is rejected:
+
+        >>> CircuitBreakerConfig(success_threshold=5).validate()  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        cachekit.config.validation.ConfigurationError: half_open_requests (3) must be >= success_threshold (5)
 
         Invalid threshold raises ConfigurationError:
 
@@ -113,9 +132,8 @@ class CircuitBreakerConfig:
     enabled: bool = True
     failure_threshold: int = 5
     success_threshold: int = 3
-    recovery_timeout: int = 30
+    recovery_timeout: float = 30.0
     half_open_requests: int = 3
-    excluded_exceptions: tuple[type[Exception], ...] = ()
 
     def validate(self) -> None:
         """Validate circuit breaker configuration.
@@ -129,6 +147,18 @@ class CircuitBreakerConfig:
             raise ConfigurationError(f"success_threshold must be >= 1, got {self.success_threshold}")
         if self.half_open_requests < 1:
             raise ConfigurationError(f"half_open_requests must be >= 1, got {self.half_open_requests}")
+        # A HALF_OPEN cycle admits at most half_open_requests probes; fewer than
+        # success_threshold can never close it, and each cycle restart discards the
+        # successes collected so far.
+        if self.half_open_requests < self.success_threshold:
+            raise ConfigurationError(
+                f"half_open_requests ({self.half_open_requests}) must be >= success_threshold "
+                f"({self.success_threshold}): a half-open cycle could never close"
+            )
+        # The cooldown also bounds probing to half_open_requests per cooldown; at 0 a
+        # spent cycle restarts on every clock tick and probes are unbounded.
+        if not math.isfinite(self.recovery_timeout) or self.recovery_timeout <= 0:
+            raise ConfigurationError(f"recovery_timeout must be a finite number > 0, got {self.recovery_timeout!r}")
 
 
 @dataclass(frozen=True)
@@ -241,14 +271,22 @@ class EncryptionConfig:
     @cache.io), you must set it explicitly.
 
     Tri-state ``enabled`` (issue #128): a plain bool cannot tell "user left it unset"
-    from "user explicitly disabled", so a deliberate opt-out was silently overridden by
-    fleet-wide CACHEKIT_MASTER_KEY auto-detection. ``enabled`` is therefore None/True/False:
-        - None (default): unset — defer to CACHEKIT_MASTER_KEY auto-detection downstream.
+    from "user explicitly disabled". ``enabled`` is therefore None/True/False:
+        - None (default): unset — no encryption intent stated. DEPRECATED activation path:
+          with CACHEKIT_MASTER_KEY set and neither master_key nor tenant_extractor given here,
+          the handler still auto-enables encryption this release and warns once, though not
+          every such cache ends up encrypted (see the activation table in
+          docs/features/zero-knowledge-encryption.md). The next minor release raises at
+          construction whenever a master key is present and enabled is unset.
         - True: force client-side encryption ON (requires master_key + tenant mode).
         - False: explicit hard opt-out — never encrypt, even when a master key is present.
 
+    ``CACHEKIT_MASTER_KEY`` is a key *source* (the fallback for ``enabled=True`` and
+    ``@cache.secure``), not an activation *switch* — protocol ``intent-presets.md``
+    § Encryption Activation.
+
     Attributes:
-        enabled: Tri-state encryption flag (default: None = unset/auto-detect).
+        enabled: Tri-state encryption flag (default: None = unset).
                  True = force-on, False = explicit opt-out.
         master_key: Hex-encoded master key for key derivation (required if enabled=True)
         tenant_extractor: Optional callable for per-tenant key derivation (default: None)
@@ -264,7 +302,7 @@ class EncryptionConfig:
                  cachekit_decrypt_failures_total metric, recompute).
 
     Examples:
-        Unset by default (defers to auto-detection, no encryption forced):
+        Unset by default (no intent stated, no encryption forced):
 
         >>> config = EncryptionConfig()
         >>> config.enabled is None
@@ -311,11 +349,11 @@ class EncryptionConfig:
 
         Only the explicit force-on state (enabled=True) requires a master key. The
         unset (None) and explicit opt-out (False) states are both falsy and skip
-        validation — None defers to downstream auto-detection, False never encrypts.
+        validation — neither requires a key; False never encrypts.
 
         The master key may be supplied inline or via the CACHEKIT_MASTER_KEY env var
-        (resolved here so force-on works fleet-wide without inlining the key, matching
-        the handler's own resolution).
+        (resolved here so force-on works without inlining the key, matching the
+        handler's own resolution).
 
         Raises:
             ConfigurationError: If encryption enabled but no master_key (inline or env)

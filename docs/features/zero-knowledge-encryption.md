@@ -109,9 +109,10 @@ Python object (plaintext, in-app only)
 2. **High-volume, low-margin**: Encryption adds 100-500μs
 3. **Already encrypted at transport**: TLS + encryption is redundant
 
-**Mitigation**: Use standard @cache for non-sensitive data:
+**Mitigation**: state `encryption=False` for non-sensitive data:
+
 ```python notest
-@cache(ttl=300, backend=None)  # No encryption, faster
+@cache(ttl=300, encryption=False, backend=None)  # Explicit plaintext, faster
 def get_public_prices(item_id):
     return db.get_price(item_id)  # illustrative - db not defined
 
@@ -121,6 +122,49 @@ def get_user_ssn(user_id):
 ```
 
 ---
+
+## Activation: the Master Key Is a Source, Not a Switch
+
+From the next minor release encryption turns on only where the code says so —
+`@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
+below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
+ciphertext on read (not in an interop cache — see the `encryption=False` row); in this
+release its presence can still auto-activate encryption where no intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+
+| Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
+|---|---|---|
+| `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
+| `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
+| `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Not in an [interop cache](#turning-encryption-off-in-an-interop-cache): its stale entries are never decrypted |
+| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
+| No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
+
+The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
+call site's encryption state was unreadable from the code — it depended on which pod
+carried which variable — and a pod *missing* the variable wrote plaintext to the backend
+with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
+on a missing key (`.secure` → `ValueError`, the encryption option → `ConfigurationError`);
+every other row can store plaintext, and the compliance argument below holds only on an
+explicit path.
+
+### Turning Encryption Off in an Interop Cache
+
+An interop cache (`interop=`) never decrypts stale ciphertext after `encryption=False`. Its entries
+carry no header, so the reader decodes the ciphertext as MessagePack. Most stale entries fail to
+decode and are recomputed, but a rare small one decodes cleanly and is served as a wrong value.
+Encryption is also part of the [shared-entry contract](interop-mode.md#operation-names-are-a-contract-shared-entries):
+every SDK that binds the operation must agree on it.
+
+So move the operation to a new `namespace` in the same change, in every SDK that binds it. Old and
+new writers then use different keys, so no plaintext reader decodes the old ciphertext — on any
+backend, in L1, or mid-rollout. Old-version processes keep reading and writing the old namespace,
+encrypted, until the rollout drains them.
+
+Once the last old-version process is gone, the old keys are never read again, but they are not deleted: they retire only by TTL (never, if none
+was set) and stay decryptable while the key is. If they hold personal data, delete them once the last
+old writer is gone — on Redis, `SCAN` for `<old-namespace>:<operation>:*` and `UNLINK` the matches;
+the File backend can only clear its whole `cache_dir`; Memcached and CachekitIO retire entries only by
+TTL. Never `FLUSHDB` a shared database.
 
 ## What Can Go Wrong
 
@@ -148,19 +192,12 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 
 ### Key Rotation
 
-```bash
-# Changed CACHEKIT_MASTER_KEY without retaining the old key
-# Old encrypted data in Redis → Can't decrypt
-# Error: "Decryption failed: authentication tag verification failed"
-# Solution: keep the retiring key decrypt-only for the rotation window
-export CACHEKIT_MASTER_KEY=new_key                 # encrypts + decrypts
-export CACHEKIT_PREVIOUS_MASTER_KEYS=old_key       # decrypt-only (comma-separated, max 3)
-# Restart app → old entries stay readable, new writes use the new key.
-# Old-key entries age out via TTL; drop the old key from the list once the
-# window (≥ longest TTL in use) has passed. Rotation is forward-only: never
-# re-promote a retired key to CACHEKIT_MASTER_KEY — a configuration where the
-# current key also appears in the previous-keys list is rejected at load.
-```
+Keeping a retiring key decrypt-only makes its entries readable; it does **not**
+make a one-deploy key swap zero-miss. See [Key Rotation Pattern](#key-rotation-pattern)
+for the keyring configuration, and follow the [key rotation
+runbook](https://docs.cachekit.io/concepts/key-rotation/) — including its
+[Before You Rotate](https://docs.cachekit.io/concepts/key-rotation/#before-you-rotate)
+checks — for the rotation itself.
 
 ### Enabling Encryption on an Existing (Plaintext) Cache
 
@@ -174,11 +211,12 @@ read plaintext entry → SerializationError (fail closed) → evict → recomput
 ```
 
 There is deliberately **no opt-in flag** to let an encryption-enabled reader accept
-plaintext entries. The frame header is not authenticated, so a plaintext entry forged by
-an attacker with backend write access is indistinguishable from a legacy one — any
-"accept plaintext" escape hatch would reintroduce the encryption-downgrade attack the
-fail-closed read path exists to prevent. If you need to read plaintext entries, use a
-handler with `encryption=False` (which never had keys to protect).
+plaintext entries. The frame header's `encrypted` flag is not authenticated, so a
+plaintext entry forged by an attacker with backend write access is indistinguishable
+from a legacy one — any "accept plaintext" escape hatch would reintroduce the
+encryption-downgrade attack the fail-closed read path exists to prevent. If you need to
+read plaintext entries, use a handler with `encryption=False` (which never had keys to
+protect).
 
 For large caches, choose between lazy migration and eager eviction based on your
 workload: lazy migration spreads recomputation over reads (each legacy entry pays one
@@ -187,8 +225,15 @@ wave — throttle or batch the eviction if the recompute cost is high. Either wa
 eviction to cachekit's keys so unrelated data in the same Redis database survives:
 
 ```bash
-# Evict only this namespace's cachekit entries (keys are prefixed ns:<namespace>:)
-redis-cli --scan --pattern 'ns:<your-namespace>:*' | xargs -r redis-cli DEL
+# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
+# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
+# (an int or UUID tenant as its str() first):
+# tenant org:123 is stored as t:org%3A123:...
+# Evict only this function's or namespace's cachekit entries.
+# Namespaced function (@cache.secure(namespace="users", ...)):
+redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
+# No namespace (the default): keys start with func:<module>.<qualname>
+redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
 
 # FLUSHDB is only safe when the database is dedicated to cachekit
 # then deploy with CACHEKIT_MASTER_KEY set
@@ -280,36 +325,54 @@ df = get_patient_records(42)
 
 ### Key Rotation Pattern
 
-Zero-downtime rotation via the keyring: one **current** master key
+The keyring has one **current** master key
 (`CACHEKIT_MASTER_KEY`, encrypts and decrypts) plus up to **3 decrypt-only**
 previous keys (`CACHEKIT_PREVIOUS_MASTER_KEYS`, comma-separated hex, same
-per-key requirements as the master key). Entries carry the fingerprint of
-their HKDF-derived per-tenant encryption key, so reads select the exact
-keyring entry that wrote them — never trial decryption.
+per-key requirements as the master key). CK-framed entries carry the
+fingerprint of their HKDF-derived per-tenant encryption key, so reads select
+the exact keyring entry that wrote them — never trial decryption. The keyring
+alone does not make a single-deploy swap zero-miss: use the [three-phase key
+rotation runbook](https://docs.cachekit.io/concepts/key-rotation/) for scheduled
+rotation, including its [Before You
+Rotate](https://docs.cachekit.io/concepts/key-rotation/#before-you-rotate)
+checks. Entries without a TTL, and entries whose expiry reads extend
+(`refresh_ttl_on_get=True` or `refresh_ttl`), keep the retiring key in use
+indefinitely; the runbook's Phase 3 drain window, not a fixed TTL, decides when
+the old key can be removed.
 
 ```bash
-# 1. Promote the new key; retain the old key decrypt-only
+# Phase 2 state only — <new-key-hex> is the key phase 1 distributed
+# decrypt-only fleet-wide; <old-key-hex> is the master key it replaces.
+# Pseudocode — both placeholders are 64-character hex (32-byte) values.
+# Non-hex or short values are rejected at load.
 export CACHEKIT_MASTER_KEY=<new-key-hex>
 export CACHEKIT_PREVIOUS_MASTER_KEYS=<old-key-hex>
-# 2. Old entries still decrypt (selected by key fingerprint); new writes use the new key
-# 3. Old-key entries age out via TTL (or re-encrypt on the next write)
-# 4. After the window (≥ longest TTL in use), drop the old key
-unset CACHEKIT_PREVIOUS_MASTER_KEYS
 ```
 
 Rules enforced at config load — rejected, never truncated or silently fixed:
 
 - **Cap**: at most 3 decrypt-only keys.
 - **Per-key validation**: identical to `CACHEKIT_MASTER_KEY` (hex-encoded, ≥32 bytes).
-- **Forward-only**: the current master key must not re-appear in the
-  decrypt-only list. A key that has ever encrypted is never re-promoted —
-  that would resume a used AES-GCM nonce budget and risk catastrophic nonce
-  reuse. Backing out a rotation means rotating *forward* to a fresh key.
+- **Current key not in the list**: the current master key must not re-appear in
+  the decrypt-only list — the detectable signature of re-promoting a retired key.
 
-An empty decrypt-only list is legal — that is the hard cut-over used for
-compromise response (old entries become unreadable immediately).
+Operator rule, which no SDK detects: **never re-promote a key that has
+encrypted**, including by rolling back a Phase 2 deploy. Rolling back restores
+the old key as current with the new key decrypt-only — a legal configuration
+that passes load and silently resumes the old key's used AES-GCM nonce budget,
+risking catastrophic nonce reuse. Back out a rotation by rotating *forward* to a
+fresh key.
 
-[Interop-mode](../../README.md) entries store no per-entry key fingerprint
+For a suspected key compromise, do not use the scheduled rotation. Follow the
+runbook's [Compromise
+Response](https://docs.cachekit.io/concepts/key-rotation/#compromise-response):
+deploy a fresh key and unset `CACHEKIT_PREVIOUS_MASTER_KEYS` (code that builds
+an `EncryptionWrapper` directly must pass an explicit `previous_master_keys=[]` —
+omitting it falls back to the environment variable), flush encrypted namespaces at cut-over, and flush again once the last
+instance writing under the old key has stopped. Ciphertext under the compromised
+key stays readable to whoever holds that key until it is deleted.
+
+[Interop-mode](interop-mode.md) entries store no per-entry key fingerprint
 (no CK frame), so rotation there attempts keyring keys sequentially — current
 key first, identical AAD per attempt — instead of fingerprint selection. Same
 environment variables, same rotation window, same fail policy on exhaustion.
@@ -369,13 +432,15 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 ### Fail-Closed Read Path (Encryption Downgrade Protection)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
-and the serializer name — is plaintext and is **not** covered by the AES-GCM
-authentication tag. AAD v0x03 binds tenant, cache key, wire format, and compression
-into the tag, but the header itself stays outside that boundary so a reader can parse
-it before it has a key.
+and the serializer name — is plaintext, so a reader can parse it before it has a key.
+Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
+the AAD. AAD v0x03 is built from the tenant, the cache key, and the header's wire format,
+compression flag and (when set) original type, so a change to one of those header
+values that alters the AAD fails authentication. The `encrypted` flag is **not** an
+AAD input: nothing authenticates it.
 
 An attacker with backend write access (the threat actor in the protocol's threat
-model) could exploit that gap by planting a frame whose header claims
+model) could exploit that unauthenticated flag by planting a frame whose header claims
 `encrypted: false` plus an arbitrary plaintext payload — a classic encryption
 downgrade (CWE-757). cachekit therefore never lets header metadata select the read
 path when encryption is configured:
@@ -398,8 +463,10 @@ accepted:
 
 - **`tenant_id`** — required *before* decryption to derive the per-tenant key
   (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
-  opaque identifier, not secret material, and it *is* tamper-protected: AAD v0x03
-  binds it into the GCM tag, so a modified header fails authentication.
+  opaque identifier, not secret material, and it *is* tamper-protected: the reader
+  derives the per-tenant key from the header's `tenant_id`, so a modified value selects
+  a different key and the read fails authentication (`auth_tamper`) — a key-fingerprint
+  mismatch under fail-closed, a GCM tag failure otherwise.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
@@ -411,30 +478,40 @@ exposure rather than diverging from the shared frame format.
 
 ### Corruption vs Tamper: Telemetry and Fail-Closed Mode
 
-Three failure classes surface on the decrypt read path, and cachekit distinguishes
+Four failure classes surface on the decrypt read path, and cachekit distinguishes
 them (cachekit-py#170):
 
 - **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys). Raised as
+  between cache keys). The plaintext frame header fields built into the AAD
+  (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
+  them is authenticated by the tag: a header change that produces different AAD bytes
+  also fails here. (The tag authenticates the constructed AAD, not the header's JSON
+  bytes.) Raised as
   `DecryptionAuthenticationError`. This is the signal an active attack would produce.
 - **`suspicious_envelope`** — the unauthenticated envelope is inconsistent with the
   handler's configuration: a plaintext claim under an encryption-enabled handler (the
   CWE-757 downgrade guard) or a missing `tenant_id`. Benign during a lazy
   plaintext→encrypted migration; a spike outside a migration window is suspect. Always
   fails open (miss + evict) so migration keeps working — even in fail-closed mode.
+- **`envelope_shape`** — an entry nothing verified decoded to the *shape* of a ByteStorage
+  envelope and was refused. Either a rotted integrity-on envelope or a legitimate top-level
+  4-element list that merely looks like one; the read path cannot tell them apart, so this
+  is not reliable corruption evidence and is kept out of `corruption`. Always fails open.
+  The same redacted key repeating in the WARNING log is the second case — that value recomputes on every read (see
+  *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
-  rotted field in the plaintext frame header (e.g. a non-string `original_type`). The
-  header is an AAD *input*, not AEAD-authenticated content, so a bad byte there breaks
-  AAD construction before any tag check runs — it is corruption, not tamper, and the
-  entry is evicted and recomputed even in fail-closed mode.
+  non-string or non-UTF-8-encodable `original_type` in the frame header. Such a value
+  cannot be built into the AAD at all, so no tag check runs — the read is
+  corruption-class, and the entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
 
 All are counted on the Prometheus counter
 `cachekit_decrypt_failures_total{reason, tier="l1"|"l2"}` — alert on
 `reason="auth_tamper"` specifically; a nonzero rate there is a security event, not
-noise. Baseline `suspicious_envelope` around migration windows.
+noise. Baseline `suspicious_envelope` around migration windows; a flat, steady
+`envelope_shape` rate is one cached value the shape rule refuses on every read, not rot.
 
 **Default (fail open):** a decrypt failure of any class logs a warning, evicts the
 poisoned entry, and recomputes the value. Availability-first — a tampered cache entry
@@ -464,12 +541,30 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+shorter than 32 bytes, more than three previous keys, or the current key repeated among
+them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+settings load, so this surfaces only when keys bypass that check: passed to
+`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
+environment's previous keys. Outside config-drift reads (below), the fault never
+evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
+`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
+decorators an L2 read logs it as a cache error and runs the call uncached. Two cases take
+other paths: a missing or short *current* master key raises `EncryptionError`, and an
+encryption-disabled handler reading an entry that claims encryption treats the fault as
+corruption (miss + evict), because only the unauthenticated header sent it down the
+decrypt path.
+
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
 > in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise
 > `DecryptionAuthenticationError` on read (the fingerprint matches no keyring entry,
 > decryption is refused, and the entry is retained, not evicted). Follow the keyring
-> rotation pattern above: keep the retiring key decrypt-only for the full window.
+> rotation pattern above: keep the retiring key decrypt-only until the runbook's
+> [Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)
+> drain window has closed.
 > This is the deliberate cost of failing closed; the default fail-open mode treats
 > keyless entries as ordinary misses.
 
@@ -556,10 +651,18 @@ Cached after first use: No additional overhead
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
-    # Decryption error → Circuit breaker catches
-    # Encryption happens before circuit breaker (at write time)
+    # Decrypt or integrity failure on read → cache miss, entry evicted, function runs.
+    # It does NOT count toward the circuit breaker.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
+
+A decrypt or integrity failure says nothing about backend health, so the breaker ignores it. For
+fail-open reads, the `cache_get_deserialize` failure metric and warning log still fire. This keeps a
+lazy plaintext→encrypted migration, where every pre-encryption entry is refused once, from opening
+the breaker. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError`
+to the caller instead of recomputing. It emits `cachekit_decrypt_failures_total` and the
+authentication error log, but not the `cache_get_deserialize` metric or warning log. It does not
+count toward the breaker either.
 
 **Encryption + L1 Cache**:
 ```python notest
@@ -582,8 +685,9 @@ A: Key mismatch or data corruption. Check CACHEKIT_MASTER_KEY hasn't changed.
 A: Check `CACHEKIT_PREVIOUS_MASTER_KEYS` — comma-separated hex, each key subject to
 the same rules as `CACHEKIT_MASTER_KEY` (≥32 bytes), at most 3 entries, and the
 current `CACHEKIT_MASTER_KEY` must **not** appear in the list. Follow the keyring
-rotation pattern above: keep the retiring key decrypt-only for the full rotation
-window before dropping it.
+rotation pattern above: keep the retiring key decrypt-only until the runbook's
+[Phase 3](https://docs.cachekit.io/concepts/key-rotation/#scheduled-rotation-three-phases)
+drain window has closed.
 
 **Q: Performance degraded after enabling encryption**
 A: Expected 100-500μs overhead. Profile to confirm acceptable.

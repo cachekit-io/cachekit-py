@@ -1,10 +1,8 @@
 import contextvars
 import logging
-import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
-from ..monitoring.correlation_tracking import CorrelationTracker
 from ..monitoring.pool_monitor import PoolMonitor
 
 # Import EXISTING modules - no duplication
@@ -12,6 +10,7 @@ from ..reliability import (
     AsyncMetricsCollector,
     BackpressureController,
     CircuitBreaker,
+    CircuitBreakerConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,13 +45,6 @@ class FeatureOrchestrator:
         'test'
         >>> status["overall_healthy"]
         True
-
-        Generate correlation ID:
-
-        >>> import uuid
-        >>> corr_id = orch.generate_correlation_id()
-        >>> uuid.UUID(corr_id)  # doctest: +ELLIPSIS
-        UUID('...')
     """
 
     def __init__(
@@ -62,7 +54,7 @@ class FeatureOrchestrator:
         backpressure_enabled: bool = True,
         collect_stats: bool = True,
         enable_structured_logging: bool = True,
-        circuit_breaker_config: Optional[dict[str, Any]] = None,
+        circuit_breaker_config: Optional[Union[dict[str, Any], CircuitBreakerConfig]] = None,
         backpressure_config: Optional[dict[str, Any]] = None,
     ):
         self.namespace = namespace
@@ -75,12 +67,9 @@ class FeatureOrchestrator:
         self._circuit_breaker = None
         self._load_control = None
         self._metrics_collector = None
-        self._correlation_tracker = None
         self._pool_monitor = None
 
         if circuit_breaker_enabled:
-            from ..reliability.circuit_breaker import CircuitBreakerConfig
-
             # Handle both dict and CircuitBreakerConfig objects
             if circuit_breaker_config is None:
                 # Create default config
@@ -99,9 +88,6 @@ class FeatureOrchestrator:
 
         if collect_stats:
             self._metrics_collector = AsyncMetricsCollector()
-
-        if enable_structured_logging:
-            self._correlation_tracker = CorrelationTracker()
 
         # Pool monitoring - initialized when pool manager is available
         self._pool_monitor = None
@@ -122,11 +108,6 @@ class FeatureOrchestrator:
         return self._metrics_collector
 
     @property
-    def correlation_tracker(self) -> Optional[CorrelationTracker]:
-        """Get correlation tracker if enabled."""
-        return self._correlation_tracker
-
-    @property
     def pool_monitor(self) -> Optional[PoolMonitor]:
         """Get pool monitor."""
         return self._pool_monitor
@@ -137,15 +118,19 @@ class FeatureOrchestrator:
             self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
-        """Check if request should be allowed based on circuit breaker state."""
+        """Ask the circuit breaker to admit this request.
+
+        This is the breaker's admission decision, not a state read: it runs the
+        OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
+        HALF_OPEN probe slot when it admits. Call it once per request, and record
+        the outcome of every admitted request (``record_success`` /
+        ``record_failure``). A rejected request is not a failure — do not record it.
+        """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
             return True
 
-        # Use the circuit breaker's call method or check state
-        from ..reliability.circuit_breaker import CircuitState
-
-        return self._circuit_breaker.get_state() != CircuitState.OPEN
+        return self._circuit_breaker.should_attempt_call()
 
     def can_accept_request(self) -> bool:
         """Check if system can accept new request based on load control."""
@@ -156,26 +141,6 @@ class FeatureOrchestrator:
         # BackpressureController uses context manager (acquire), not can_accept_request
         # For now, always return True and let acquire handle backpressure
         return True
-
-    def start_request(self) -> Optional[str]:
-        """Start request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not start_request()
-        # Load control is handled via acquire() in the wrapper
-
-        if self._correlation_tracker:
-            correlation_id = self._correlation_tracker.generate_correlation_id()
-            self._correlation_tracker.set_correlation_id(correlation_id)
-            return correlation_id
-
-        return None
-
-    def end_request(self, correlation_id: Optional[str] = None) -> None:
-        """End request tracking."""
-        # Note: BackpressureController uses acquire() context manager, not end_request()
-        # Load control cleanup is automatic via context manager
-
-        if self._correlation_tracker:
-            self._correlation_tracker.clear_correlation_id()
 
     def log_structured(self, level: str, message: str, **kwargs) -> None:
         """Log with structured format if enabled."""
@@ -236,24 +201,6 @@ class FeatureOrchestrator:
 
         return status
 
-    def generate_correlation_id(self) -> str:
-        """Generate a unique correlation ID for request tracking."""
-        return str(uuid.uuid4())
-
-    def create_correlation_id(self) -> str:
-        """Alias for generate_correlation_id."""
-        return self.generate_correlation_id()
-
-    def set_correlation_id(self, correlation_id: str) -> None:
-        """Set correlation ID for structured logging."""
-        # Implementation depends on correlation tracker
-        pass
-
-    def clear_correlation_id(self) -> None:
-        """Clear correlation ID."""
-        # Implementation depends on correlation tracker
-        pass
-
     def create_span(self, name: str, attributes: Optional[dict[str, Any]] = None):
         """Create a tracing span (no-op if tracing not available)."""
 
@@ -295,19 +242,19 @@ class FeatureOrchestrator:
             )
 
     def set_operation_context(self, operation: str, duration_ms: float = 0.0):
-        """Set operation context for automatic tracking in record_success/failure.
+        """Set operation context for automatic tracking in record_failure.
 
         Args:
             operation: Operation type (e.g., "get", "set", "delete")
             duration_ms: Operation duration in milliseconds (optional)
 
         This method sets thread-local context that will be automatically used by
-        subsequent record_success() or record_failure() calls. Works across async
-        boundaries thanks to contextvars.
+        a subsequent record_failure() call. Works across async boundaries thanks
+        to contextvars.
 
         Example:
             features.set_operation_context("get", duration_ms=1.5)
-            features.record_success()  # Automatically uses "get" and 1.5ms
+            features.record_failure(error)  # Automatically uses "get" and 1.5ms
         """
         _operation_context.set(
             {
@@ -316,7 +263,7 @@ class FeatureOrchestrator:
             }
         )
 
-    def record_failure(self, error: Exception):
+    def record_failure(self, error: Exception, *, count_toward_breaker: bool = True) -> None:
         """Record operation failure with automatic context detection.
 
         Automatically uses operation type and duration from set_operation_context()
@@ -324,13 +271,16 @@ class FeatureOrchestrator:
 
         Args:
             error: The exception that caused the failure
+            count_toward_breaker: False records the metric only. For failures that
+                say nothing about backend health, such as an L2 entry that fails
+                decryption or integrity checks.
         """
         # Get operation context (async-safe)
         ctx = _operation_context.get() or {}
         operation = ctx.get("operation", "cache_operation")
         duration_ms = ctx.get("duration_ms", 0.0)
 
-        if self._circuit_breaker:
+        if self._circuit_breaker and count_toward_breaker:
             self._circuit_breaker._on_failure(error)
         if self._metrics_collector:
             self._metrics_collector.record_cache_operation(
@@ -341,25 +291,14 @@ class FeatureOrchestrator:
             )
 
     def record_success(self):
-        """Record operation success with automatic context detection.
+        """Record operation success with the circuit breaker.
 
-        Automatically uses operation type and duration from set_operation_context()
-        if available, otherwise falls back to defaults.
+        Emits no metrics: every success site also calls record_cache_operation() with the
+        full label set (serializer, size), and a second, unlabelled record here would count
+        each operation twice in cache_operations_total, once under serializer="unknown".
         """
-        # Get operation context (async-safe)
-        ctx = _operation_context.get() or {}
-        operation = ctx.get("operation", "cache_operation")
-        duration_ms = ctx.get("duration_ms", 0.0)
-
         if self._circuit_breaker:
             self._circuit_breaker._on_success()
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation=operation,
-                namespace=self.namespace,
-                success=True,
-                duration_ms=duration_ms,
-            )
 
     def record_cache_operation(
         self,
@@ -369,7 +308,6 @@ class FeatureOrchestrator:
         duration_ms: float,
         serializer: str = "unknown",
         size_bytes: int = 0,
-        hit: Optional[bool] = None,
     ):
         """Record cache operation metrics."""
         if self._metrics_collector:
@@ -380,7 +318,6 @@ class FeatureOrchestrator:
                 duration_ms=duration_ms,
                 serializer=serializer,
                 size_bytes=size_bytes,
-                hit=hit,
             )
 
     def check_health(self) -> dict[str, Any]:
@@ -410,7 +347,7 @@ class FeatureOrchestrator:
         namespace: Optional[str] = None,
         span: Optional[Any] = None,
         duration_ms: float = 0.0,
-        correlation_id: Optional[str] = None,
+        count_toward_breaker: bool = True,
         **extra_context: Any,
     ) -> None:
         """Centralized error handler for all cache operations.
@@ -426,7 +363,8 @@ class FeatureOrchestrator:
             namespace: Cache namespace (defaults to orchestrator namespace)
             span: Optional tracing span for recording
             duration_ms: Operation duration in milliseconds
-            correlation_id: Optional correlation ID for distributed tracing
+            count_toward_breaker: Passed to record_failure(). False keeps the metric
+                and logs but leaves the circuit breaker untouched.
             **extra_context: Additional context to include in logs
 
         Example:
@@ -453,7 +391,7 @@ class FeatureOrchestrator:
         self.set_operation_context(operation, duration_ms)
 
         # 3. Record failure in circuit breaker and metrics collector
-        self.record_failure(error)
+        self.record_failure(error, count_toward_breaker=count_toward_breaker)
 
         # 4. Structured logging with full context
         self.log_cache_operation(
@@ -465,7 +403,6 @@ class FeatureOrchestrator:
             error=redact_error_for_log(error),
             error_type=type(error).__name__,
             duration_ms=duration_ms,
-            correlation_id=correlation_id,
             **extra_context,
         )
 

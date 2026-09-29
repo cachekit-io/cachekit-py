@@ -56,6 +56,7 @@ the ticket, plus what the free-threaded CI lane surfaced:
 | `backends/cachekitio/session.py` header cache | `threading.local` | Safe — per-thread state; its only cross-thread hazard was the session-identity publication above |
 | `decorators/stats_context.py` | `contextvars.ContextVar` | Safe by construction |
 | `decorators/wrapper.py` L1/SWR + L2/SWR single-flight (`_l1_swr_*`, `_l2_swr_*`) | `BoundedSemaphore` slots + in-flight `set` + PID-owner swap | Safe. The check-then-add on the in-flight set was already documented as benign (worst case one duplicate refresh, absorbed by last-write-wins / the backend lease); builtin `set`/`dict` single ops are atomic under free-threading's per-object locking. The fork-detection wholesale swap races are the same documented-benign shape |
+| `l1_cache.py` `L1CacheManager._take_over_if_forked` + `_reset_cache_locks_after_fork` (LAB-4772) | Owner-PID fast path; on a PID change one thread takes over under a lock fetched by `dict.setdefault(pid, Lock())`. An `os.register_at_fork` hook repairs cache locks orphaned at fork before the child's first `get()`; fork mechanics and the uWSGI limit are in the `_take_over_if_forked` docstring | Safe. `setdefault` is atomic under per-object locking, so every thread in a new child gets the same fresh lock, which no parent thread can have held at fork; the rest block on it and re-check. The fast path gates on `_owner_pid` alone, so a weak-memory reader may still see the inherited manager lock once: the same benign fork-swap race as the SWR row, since that lock is unheld unless a parent thread held it at fork. The hook runs while the child is single-threaded, so its non-blocking probe (`timeout=0`) is exact, and it starts no thread. Once it has run, the take-over skips its own timed cache-lock probe, which could otherwise clear a cache under a live child thread |
 | `decorators/wrapper.py` `_cached_keys` | Builtin `set`, snapshot-copied before iteration in invalidation | Safe — single ops atomic; a copy racing an add can only miss a concurrently-written key, which invalidate-all semantics tolerate |
 | `object_cache.py` `ObjectCache` | `RLock` on every public method | Safe |
 | `reliability/metrics_collection.py` `get_async_metrics_collector` | Double-checked module-global singleton | Safe — single-assignment publication of a fully-constructed object; worst case a benign duplicate worker-restart check |
@@ -72,10 +73,11 @@ the ticket, plus what the free-threaded CI lane surfaced:
    uv sync --python 3.14t --no-default-groups --group test --no-install-package hiredis
    ```
 
-   The `test` dependency group is the core test toolchain; the extras that
-   lack free-threaded wheels (orjson, numpy, pandas, pyarrow) live only in
-   the `dev` group and the `[data]`/`[json]` extras, and their tests skip
-   via `pytest.importorskip`.
+   The `test` dependency group is the core test toolchain. orjson, numpy,
+   pandas and pyarrow live only in the `dev` group and the `[data]`/`[json]`
+   extras, so this lane does not install them and their tests skip via
+   `pytest.importorskip`: orjson publishes no free-threaded wheels, and the
+   `[data]` extra is not exercised in this lane yet.
 2. Asserts the interpreter is a free-threaded build **and** that
    `sys._is_gil_enabled()` is still `False` after importing `cachekit`,
    `cachekit._rust_serializer`, and `redis` — a dependency that fails to
@@ -105,13 +107,13 @@ A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, C
 - **Threaded throughput confirmed.** no-GIL reaches 2.57x one→four-thread scaling (64.2% efficiency) and is 2.63x faster than the GIL arm at four threads.
 - **Single-thread cost confirmed.** no-GIL is 12.6% slower at the single-thread median; however, the ranges overlap (GIL max 3.3807 vs no-GIL min 2.7822).
 
-**Cross-library comparison:** The benchmark measures cachekit operations only. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run — these packages do not publish free-threaded (`cp314t`) wheels as of 2026-08. When upstream wheels ship, cross-stack performance will be measured then (tracked internally as LAB-3038).
+**Cross-library comparison:** The benchmark measures cachekit operations only. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run. It waits on orjson, which does not publish free-threaded (`cp314t`) wheels as of 2026-09-29; cross-stack performance will be measured once it does.
 
 ## Deferred: declared support + free-threaded wheels
 
 Publishing `cp314t` wheels and declaring official free-threaded support is
 **explicitly deferred** (per the LAB-511 acceptance criteria) until the
-dependency chain allows it. Blocking as of 2026-08:
+dependency chain allows it. Blocking as of 2026-09-29:
 
 - **orjson** — no free-threaded wheels through 3.12.0, and its build script
   rejects free-threaded interpreters ("does not support free-threaded
@@ -119,8 +121,10 @@ dependency chain allows it. Blocking as of 2026-08:
   the moment a user adds `cachekit[json]` is not a declaration worth making.
 - **hiredis** — no `Py_mod_gil` declaration; importing it re-enables the GIL.
   Pulled in unconditionally via the required `redis[hiredis]` dependency.
-- **numpy / pandas / pyarrow** — the `[data]` extra; free-threaded wheel
-  coverage across all three is not yet complete enough to declare.
+
+numpy, pandas and pyarrow (the `[data]` extra) now publish `cp314t` wheels,
+but the free-threaded CI lane does not install `[data]` yet, so `[data]` on
+3.14t is untested.
 
 When those clear: add `-i python3.14t` targets to the `build-wheels` matrix in
 `.github/workflows/release-please.yml`, revisit `redis[hiredis]` (marker or

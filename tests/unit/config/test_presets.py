@@ -17,6 +17,74 @@ from cachekit.config.decorator import DecoratorConfig
 
 
 @pytest.mark.unit
+class TestPresetDefaultTTL:
+    """protocol/spec/intent-presets.md § Default TTL (LAB-4641).
+
+    Rule 1: every preset applies a finite default TTL when the caller supplies none.
+    Rule 2: an explicit ttl= overrides it. Rule 4: never-expire is an explicit opt-in —
+    here spelled ``ttl=None`` — and never a preset default.
+    """
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            (lambda **kw: DecoratorConfig.minimal(**kw), 300),
+            (lambda **kw: DecoratorConfig.production(**kw), 600),
+            (lambda **kw: DecoratorConfig.secure(master_key="a" * 64, **kw), 600),
+            (lambda **kw: DecoratorConfig.io(**kw), 3600),
+            # SDK-local presets: outside the spec's four, but rule 4 still forbids never-expire as a default.
+            (lambda **kw: DecoratorConfig.dev(**kw), 300),
+            (lambda **kw: DecoratorConfig.test(**kw), 300),
+        ],
+        ids=["minimal", "production", "secure", "io", "dev", "test"],
+    )
+    def test_canonical_default_and_overrides(self, build, expected, monkeypatch) -> None:
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_key")
+        assert build().ttl == expected
+        assert build(ttl=42).ttl == 42
+        assert build(ttl=None).ttl is None  # explicit no-expiry opt-in
+
+    def test_decorator_path_sends_preset_default_to_backend(self) -> None:
+        """End to end: the wrapper hands the preset default to backend.set(); ttl=None opts out."""
+        from cachekit import cache
+
+        class RecordingBackend:
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+                self.ttls: list[int | None] = []
+
+            def get(self, key: str) -> bytes | None:
+                return self.store.get(key)
+
+            def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+                self.store[key] = value
+                self.ttls.append(ttl)
+
+            def delete(self, key: str) -> bool:
+                return self.store.pop(key, None) is not None
+
+            def exists(self, key: str) -> bool:
+                return key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, object]]:
+                return True, {}
+
+        defaulted, opted_out = RecordingBackend(), RecordingBackend()
+
+        @cache.production(backend=defaulted)
+        def f() -> int:
+            return 1
+
+        @cache.production(backend=opted_out, ttl=None)
+        def g() -> int:
+            return 1
+
+        assert f() == 1 and g() == 1
+        assert defaulted.ttls == [600]
+        assert opted_out.ttls == [None]
+
+
+@pytest.mark.unit
 class TestMinimalPreset:
     """Test .minimal() preset for maximum throughput."""
 
@@ -38,12 +106,6 @@ class TestMinimalPreset:
         assert config.monitoring.enable_tracing is False
         assert config.monitoring.enable_structured_logging is False
         assert config.monitoring.enable_prometheus_metrics is False
-
-    def test_minimal_with_ttl_override(self) -> None:
-        """Test minimal preset with TTL override."""
-        config = DecoratorConfig.minimal(ttl=300)
-        assert config.ttl == 300
-        assert config.circuit_breaker.enabled is False
 
     def test_minimal_with_namespace_override(self) -> None:
         """Test minimal preset with namespace override."""
@@ -78,12 +140,6 @@ class TestProductionPreset:
         assert config.monitoring.enable_tracing is True
         assert config.monitoring.enable_structured_logging is True
         assert config.monitoring.enable_prometheus_metrics is True
-
-    def test_production_with_ttl_override(self) -> None:
-        """Test production preset with TTL override."""
-        config = DecoratorConfig.production(ttl=600)
-        assert config.ttl == 600
-        assert config.circuit_breaker.enabled is True
 
 
 @pytest.mark.unit
@@ -133,12 +189,6 @@ class TestSecurePreset:
         config = DecoratorConfig.secure(master_key="a" * 64, deployment_uuid="uuid-123")
         assert config.encryption.deployment_uuid == "uuid-123"
         assert config.encryption.single_tenant_mode is True
-
-    def test_secure_with_ttl_override(self) -> None:
-        """Test secure preset with TTL override."""
-        config = DecoratorConfig.secure(master_key="a" * 64, ttl=600)
-        assert config.ttl == 600
-        assert config.encryption.enabled is True
 
     def test_secure_explicit_single_tenant_mode(self) -> None:
         """Test secure preset with explicit single_tenant_mode parameter."""
@@ -216,11 +266,11 @@ class TestPresetKwargsOverrides:
     def test_minimal_multiple_overrides(self) -> None:
         """Test minimal preset with multiple kwargs overrides."""
         config = DecoratorConfig.minimal(
-            ttl=300,
+            ttl=120,
             namespace="test",
             serializer="msgpack",
         )
-        assert config.ttl == 300
+        assert config.ttl == 120
         assert config.namespace == "test"
         assert config.serializer == "msgpack"
         assert config.circuit_breaker.enabled is False  # Preset behavior preserved
@@ -228,11 +278,11 @@ class TestPresetKwargsOverrides:
     def test_production_multiple_overrides(self) -> None:
         """Test production preset with multiple kwargs overrides."""
         config = DecoratorConfig.production(
-            ttl=600,
+            ttl=1200,
             refresh_ttl_on_get=True,
             ttl_refresh_threshold=0.8,
         )
-        assert config.ttl == 600
+        assert config.ttl == 1200
         assert config.refresh_ttl_on_get is True
         assert config.ttl_refresh_threshold == 0.8
         assert config.circuit_breaker.enabled is True  # Preset behavior preserved
@@ -241,10 +291,10 @@ class TestPresetKwargsOverrides:
         """Test secure preset with multiple kwargs overrides."""
         config = DecoratorConfig.secure(
             master_key="a" * 64,
-            ttl=600,
+            ttl=900,
             namespace="secure",
         )
-        assert config.ttl == 600
+        assert config.ttl == 900
         assert config.namespace == "secure"
         assert config.encryption.enabled is True  # Preset behavior preserved
 

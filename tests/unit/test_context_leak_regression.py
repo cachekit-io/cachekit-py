@@ -6,7 +6,6 @@ These tests verify that stats context is properly reset in ALL code paths:
 3. Function raises exception
 4. Multiple sequential calls don't pollute context
 5. Async wrapper exception handling
-6. Async correlation ID cleanup
 
 Critical for preventing context leaks that cause cross-function stats pollution.
 
@@ -15,12 +14,6 @@ Historical Context:
 - Symptom: Inner function stats leaked into outer function stats
 - Root cause: Exception paths didn't reset context
 - Fix: Always reset token in finally block, even on exception
-
-Async Context (added 2025-12):
-- Bug: Async wrapper missing clear_correlation_id() in finally block
-- Symptom: Correlation IDs leaked across async requests
-- Root cause: Async wrapper (line 1247) didn't match sync wrapper cleanup (line 841)
-- Fix: Add features.clear_correlation_id() to async finally block
 """
 
 from __future__ import annotations
@@ -33,7 +26,6 @@ import pytest
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.monitoring.correlation_tracking import get_correlation_id
 
 
 @pytest.mark.unit
@@ -426,50 +418,9 @@ def async_mock_backend():
 class TestAsyncContextLeaks:
     """Test that async wrapper properly cleans up context in all code paths.
 
-    These tests verify the fix for async wrapper missing clear_correlation_id()
-    which existed in sync wrapper but was absent from async wrapper.
-
     Note: Uses async_mock_backend fixture (defined above) to test the non-locking
     code path with proper sync mock methods.
     """
-
-    @pytest.mark.asyncio
-    async def test_async_clears_correlation_id_on_success(self, async_mock_backend):
-        """Async wrapper should clear correlation ID after successful execution.
-
-        Bug: Line 1247 was missing features.clear_correlation_id() which exists
-        in sync wrapper at line 841.
-
-        Fix: Add features.clear_correlation_id() to async finally block.
-        """
-
-        @cache(backend=async_mock_backend)
-        async def async_func(x):
-            return x * 2
-
-        # Execute async function
-        result = await async_func(5)
-        assert result == 10
-
-        # Correlation ID should be cleared (not leaked)
-        assert get_correlation_id() is None
-
-    @pytest.mark.asyncio
-    async def test_async_clears_correlation_id_on_exception(self, async_mock_backend):
-        """Async wrapper should clear correlation ID even when function raises."""
-
-        @cache(backend=async_mock_backend)
-        async def failing_async_func(x):
-            if x < 0:
-                raise ValueError("Negative not allowed")
-            return x * 2
-
-        # Execute failing async function
-        with pytest.raises(ValueError):
-            await failing_async_func(-1)
-
-        # Correlation ID should be cleared even after exception
-        assert get_correlation_id() is None
 
     @pytest.mark.asyncio
     async def test_async_clears_context_on_key_generation_failure(self, async_mock_backend):
@@ -496,41 +447,6 @@ class TestAsyncContextLeaks:
 
             # Context should be clean
             assert get_current_function_stats() is None
-
-    @pytest.mark.asyncio
-    async def test_async_context_reset_matches_sync(self, async_mock_backend):
-        """Async wrapper finally block should match sync wrapper cleanup.
-
-        Sync wrapper (lines 839-843):
-            finally:
-                features.clear_correlation_id()
-                reset_current_function_stats(token)
-
-        Async wrapper (lines 1245-1247) should have SAME cleanup:
-            finally:
-                features.clear_correlation_id()  # Was missing - fixed
-                reset_current_function_stats(token)
-        """
-
-        @cache(backend=async_mock_backend)
-        def sync_func(x):
-            return x * 2
-
-        @cache(backend=async_mock_backend)
-        async def async_func(x):
-            return x * 2
-
-        # Call sync function
-        sync_func(5)
-        sync_correlation = get_correlation_id()
-
-        # Call async function
-        await async_func(5)
-        async_correlation = get_correlation_id()
-
-        # Both should have cleared correlation ID
-        assert sync_correlation is None, "Sync wrapper should clear correlation ID"
-        assert async_correlation is None, "Async wrapper should clear correlation ID"
 
     @pytest.mark.asyncio
     async def test_async_stats_context_reset_after_exception(self, async_mock_backend):
@@ -569,7 +485,6 @@ class TestAsyncContextLeaksIntegration:
 
         # No context leaks
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None
 
     @pytest.mark.asyncio
     async def test_mixed_success_and_failure_no_leaks(self, async_mock_backend):
@@ -590,7 +505,6 @@ class TestAsyncContextLeaksIntegration:
 
         # No leaks after all operations
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None
 
 
 # =============================================================================
@@ -935,4 +849,3 @@ class TestAsyncWrapperCacheSetError:
 
         # Context should be clean
         assert get_current_function_stats() is None
-        assert get_correlation_id() is None

@@ -152,26 +152,29 @@ def get_price(symbol: str):
 def process_payment(amount):
     return payment_gateway.charge(amount)
 
-# Security-critical: PII, medical, financial
-@cache.secure
+# Security-critical: PII, medical, financial (needs a key: master_key= or CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)
 def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
 | Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |
 |:--------|:----------------:|:------------:|:-------------:|:-------------------:|:---------------:|
+| Default TTL | 300 s | 300 s | 300 s | 600 s | 600 s |
 | Circuit Breaker | - | ✅ | - | ✅ | ✅ |
 | Backpressure | ✅ | ✅ | - | ✅ | ✅ |
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
-| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | ✅ |
+| L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
 | L1 Invalidation | - | - | - | ✅ | ✅ |
 | Prometheus Metrics | - | - | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
-> 🔒 `@cache.secure` forces `integrity_checking=True` — it cannot be overridden.
+> 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
+>
+> **Default TTL** follows the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) (`@cache.io` 3600 s) — the same numbers as cachekit-rs and cachekit-ts. `ttl=` overrides it; `ttl=None` is the explicit never-expire opt-in ([details](docs/configuration.md#intent-presets)).
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
@@ -235,7 +238,7 @@ def test_cached_function():
 - Connection pooling with thread affinity (+28% throughput)
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
-- Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/2d56cce231e193141f09df9316f9afac17a1538e/test-vectors/decode-bounds.json) vectors
+- Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/2736a81f2f853cf08c5563c0fe7c8361331fa3ad/test-vectors/decode-bounds.json) vectors
 
 > [!NOTE]
 > All reliability features are **enabled by default** with `@cache.production`. Use `@cache.minimal` to disable them for maximum throughput.
@@ -253,7 +256,7 @@ def test_cached_function():
 <summary><strong>Serializer Examples</strong></summary>
 
 ```python
-from cachekit.serializers import OrjsonSerializer, ArrowSerializer, EncryptionWrapper
+from cachekit.serializers import OrjsonSerializer, ArrowSerializer
 
 # Fast JSON for API responses
 @cache.production(serializer=OrjsonSerializer())
@@ -264,11 +267,30 @@ def get_api_response(endpoint: str):
 @cache(serializer=ArrowSerializer())
 def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
+```
 
-# Encrypted DataFrames for sensitive data
-@cache(serializer=EncryptionWrapper(serializer=ArrowSerializer()))
+Encrypted DataFrames go through `@cache.secure`, which takes any serializer. A file backend keeps this example self-contained; production uses Redis or cachekit.io:
+
+```python
+import tempfile
+from cachekit.backends.file import FileBackend, FileBackendConfig
+from cachekit.serializers import ArrowSerializer
+
+calls = 0
+
+@cache.secure(
+    master_key=secret_key,
+    serializer=ArrowSerializer(),
+    backend=FileBackend(FileBackendConfig(cache_dir=tempfile.mkdtemp())),
+)
 def get_patient_data(hospital_id: int):
-    return pd.read_sql("SELECT * FROM patients WHERE hospital_id = ?", conn, params=[hospital_id])
+    global calls
+    calls += 1
+    return pd.DataFrame({"hospital_id": [hospital_id], "patients": [42]})
+
+get_patient_data(7)
+get_patient_data(7)  # second call is served from the encrypted cache
+assert calls == 1
 ```
 
 </details>
@@ -291,11 +313,14 @@ def get_patient_data(hospital_id: int):
 > [!CAUTION]
 > When handling PII, medical, or financial data, always use `@cache.secure` to enforce encryption.
 
-**Zero-downtime key rotation**: promote a new `CACHEKIT_MASTER_KEY` and keep the
-retiring key readable via `CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex,
-max 3 decrypt-only keys). Entries are selected by exact key fingerprint — never
-trial decryption — and old entries age out via TTL, no cache flush required. See
-[Zero-Knowledge Encryption](docs/features/zero-knowledge-encryption.md#key-rotation-pattern).
+**Key rotation**: keep a retiring key readable with
+`CACHEKIT_PREVIOUS_MASTER_KEYS` (comma-separated hex, max 3 decrypt-only keys)
+while new writes use `CACHEKIT_MASTER_KEY`. A one-deploy key swap is not
+zero-miss; follow the [key rotation
+runbook](https://docs.cachekit.io/concepts/key-rotation/), including its Before
+You Rotate checks. CK-framed entries are selected by exact key fingerprint —
+never trial decryption; Interop-mode entries carry no CK frame and attempt
+keyring keys sequentially instead.
 
 cachekit employs comprehensive security tooling:
 
@@ -329,7 +354,7 @@ See [SECURITY.md][security-url] for vulnerability reporting and detailed documen
 
 - **Per-function statistics** - `cache_info()` on every decorated function, modelled on `functools.lru_cache`
 - **Prometheus metrics** - Recorded by default (your app owns exposition)
-- **Structured logging** - Context-aware with correlation IDs
+- **Structured logging** - Context-aware, per-operation fields
 - **Health checks** - Comprehensive status endpoints
 
 Every decorated function exposes `cache_info()`, returning a `CacheInfo` named tuple with
@@ -363,8 +388,8 @@ exposition setup.
 free-threaded 3.14 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
 (`gil_used = false`). Free-threaded wheels are **not yet published** and
-free-threaded builds are not officially supported — blocked on upstream
-wheels (orjson, hiredis; numpy/pandas/pyarrow for `[data]`). See
+free-threaded builds are not officially supported — blocked upstream on
+orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import). See
 [measured performance results](docs/free-threading.md#measured-performance) and the
 full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 
@@ -415,7 +440,7 @@ info = expensive_func.cache_info()
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
 | [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
-| [L1 Invalidation & SWR][l1-invalidation-url] | Process-local invalidation, stale-while-revalidate |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), stale-while-revalidate |
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |
@@ -442,7 +467,6 @@ CACHEKIT_MEMCACHED_TIMEOUT=1.0                            # Default: 1.0 seconds
 CACHEKIT_MEMCACHED_KEY_PREFIX="myapp:"                    # Default: "" (none)
 
 # Optional Configuration
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 ```

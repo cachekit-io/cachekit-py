@@ -8,6 +8,9 @@ import pytest
 import redis
 import time_machine
 
+from cachekit import cache
+from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
+from cachekit.config.validation import ConfigurationError
 from cachekit.reliability.circuit_breaker import (
     CacheOperationMetrics,
     CircuitBreaker,
@@ -28,7 +31,7 @@ class TestCircuitBreakerConfig:
         assert config.failure_threshold == 5
         assert config.success_threshold == 3
         assert config.timeout_seconds == 30.0
-        assert config.half_open_requests == 1
+        assert config.half_open_requests == 3
         # No error types excluded by default
         assert len(config.excluded_error_types) == 0
 
@@ -59,6 +62,12 @@ class TestCircuitBreakerConfig:
 
         # Empty tuple is valid
         assert len(config.excluded_error_types) == 0
+
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+    def test_timeout_that_never_recovers_or_never_caps_probes_is_rejected(self, timeout):
+        """NaN or inf never leaves OPEN (NaN compares False, inf never elapses); <= 0 removes the probe cap."""
+        with pytest.raises(ValueError, match="timeout_seconds must be a finite number > 0"):
+            CircuitBreakerConfig(timeout_seconds=timeout)
 
 
 class TestCacheOperationMetrics:
@@ -396,7 +405,7 @@ class TestCircuitBreaker:
 
     def test_thread_safety_state_transitions(self):
         """Test thread safety during state transitions."""
-        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1)
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
         breaker = CircuitBreaker(config, namespace="test")
 
         with time_machine.travel(0, tick=False) as traveller:
@@ -501,3 +510,96 @@ class TestCircuitBreaker:
 
         # Should not raise any exceptions or cause deadlocks
         assert breaker.state == CircuitState.CLOSED
+
+
+# The reliability class's defaults, in the shape get_health_status() reports. Derived, not literal:
+# the decorator's nested defaults must track this class, so a change to either side goes red here.
+_LIVE_BREAKER_DEFAULTS = CircuitBreaker(CircuitBreakerConfig()).get_stats()["config"]
+
+
+def _decorate(is_async: bool, **decorator_kwargs):
+    """Decorate a trivial sync or async function with @cache(**decorator_kwargs)."""
+    if is_async:
+
+        async def fn():
+            return 1
+
+    else:
+
+        def fn():
+            return 1
+
+    return cache(**decorator_kwargs)(fn)
+
+
+def _live_breaker_config(wrapped) -> dict:
+    return wrapped.get_health_status()["circuit_breaker"]["config"]
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+class TestDecoratorConfiguresLiveBreaker:
+    """@cache(circuit_breaker=CircuitBreakerConfig(...)) reaches the breaker the wrapper runs (LAB-5340)."""
+
+    @pytest.mark.parametrize(
+        ("knob", "value", "live_key"),
+        [
+            ("failure_threshold", 1, "failure_threshold"),
+            ("success_threshold", 2, "success_threshold"),
+            ("recovery_timeout", 1.5, "timeout_seconds"),
+            ("half_open_requests", 7, "half_open_requests"),
+        ],
+    )
+    def test_knob_reaches_live_breaker(self, is_async, knob, value, live_key):
+        wrapped = _decorate(is_async, ttl=300, backend=None, circuit_breaker=NestedCircuitBreakerConfig(**{knob: value}))
+
+        # Whole-dict equality: the knob moved and nothing else did.
+        assert _live_breaker_config(wrapped) == {**_LIVE_BREAKER_DEFAULTS, live_key: value}
+
+    @pytest.mark.parametrize(
+        ("knobs", "match"),
+        [
+            ({"success_threshold": 3, "half_open_requests": 1}, r"half_open_requests \(1\) must be >= success_threshold \(3\)"),
+            ({"success_threshold": 5}, r"half_open_requests \(3\) must be >= success_threshold \(5\)"),
+            ({"recovery_timeout": 0}, "recovery_timeout must be a finite number > 0"),
+        ],
+    )
+    def test_breaker_that_cannot_recover_is_rejected_at_decoration(self, is_async, knobs, match):
+        """Settings the live breaker could never close with, or probe without a cap, fail before first use."""
+        with pytest.raises(ConfigurationError, match=match):
+            _decorate(is_async, ttl=300, backend=None, circuit_breaker=NestedCircuitBreakerConfig(**knobs))
+
+    def test_no_breaker_argument_keeps_live_defaults(self, is_async):
+        assert _live_breaker_config(_decorate(is_async, ttl=300, backend=None)) == _LIVE_BREAKER_DEFAULTS
+
+    def test_nested_defaults_map_to_reliability_defaults(self, is_async):
+        """nested.CircuitBreakerConfig() through the wrapper's mapping equals reliability.CircuitBreakerConfig()."""
+        wrapped = _decorate(is_async, ttl=300, backend=None, circuit_breaker=NestedCircuitBreakerConfig())
+
+        assert _live_breaker_config(wrapped) == _LIVE_BREAKER_DEFAULTS
+
+
+class TestIntentPresetsKeepLiveBreakerDefaults:
+    """Wiring the knobs must not move any preset's live breaker (LAB-5340 AC-2).
+
+    @cache.local is not covered: it is an in-process reference cache with no breaker.
+    """
+
+    @pytest.mark.parametrize(
+        ("preset", "kwargs"),
+        [
+            ("production", {"backend": None}),
+            ("dev", {"backend": None}),
+            ("secure", {"master_key": "a" * 64, "backend": MagicMock()}),
+            ("io", {"api_key": "ck_test_key"}),  # pragma: allowlist secret
+        ],
+    )
+    def test_breaker_presets_run_live_defaults(self, preset, kwargs):
+        wrapped = getattr(cache, preset)(ttl=300, **kwargs)(lambda: 1)
+
+        assert _live_breaker_config(wrapped) == _LIVE_BREAKER_DEFAULTS
+
+    @pytest.mark.parametrize("preset", ["minimal", "test"])
+    def test_breaker_off_presets_build_no_breaker(self, preset):
+        wrapped = getattr(cache, preset)(ttl=300, backend=None)(lambda: 1)
+
+        assert wrapped.get_health_status()["circuit_breaker"] is None

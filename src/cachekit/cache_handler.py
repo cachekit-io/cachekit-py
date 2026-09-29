@@ -7,6 +7,7 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import warnings
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from cachekit.backends.base import (
     BufferHandle,
     BufferReadableBackend,
     BufferWritableBackend,
+    KeyTrackableBackend,
     LockableBackend,
     TTLInspectableBackend,
 )
@@ -36,6 +38,7 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import (
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -44,6 +47,7 @@ from cachekit.serializers.base import (
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
+    EncryptionError,
     KeyringConfigurationError,
 )
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -129,6 +133,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
       encryption, missing tenant_id). Benign during lazy plaintext→encrypted
       migration, so it ALWAYS fails open (miss + evict, LAB-241) — but spikes
       outside a migration window warrant investigation.
+    - ``envelope_shape``: EnvelopeShapeError — an entry nothing verified decoded to
+      the shape of a ByteStorage envelope and was refused (LAB-2736). Either a rotted
+      integrity-on envelope or a legitimate top-level 4-element list; the read path
+      cannot tell them apart, so this is NOT reliable corruption evidence and is kept
+      out of ``corruption``. Always fails open. The same redacted key repeating in the
+      WARNING log is the second case: that value recomputes on every read, forever.
     - ``corruption``: any other SerializationError — checksum mismatch, malformed
       frame, serializer mismatch, deserialize failure on authenticated
       plaintext. Not tamper evidence; always fails open.
@@ -155,6 +165,8 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
         reason = "auth_tamper"
     elif isinstance(error, SuspiciousCacheEntryError):
         reason = "suspicious_envelope"
+    elif isinstance(error, EnvelopeShapeError):
+        reason = "envelope_shape"
     else:
         reason = "corruption"
 
@@ -242,6 +254,45 @@ def warn_ttl_refresh_unsupported(backend: BaseBackend) -> None:
     )
 
 
+# Release-N migration gate (protocol/spec/intent-presets.md § Encryption Activation):
+# CACHEKIT_MASTER_KEY is a key SOURCE — fallback for .secure / encryption=True, and legacy-decrypt of
+# stale CK-framed ciphertext on read (EncryptionWrapper resolves it itself; headerless interop entries
+# are never decrypted by a disabled handler) — never an activation SWITCH.
+# Activating encryption from the variable's mere presence is deprecated: this release keeps it and
+# warns once per process; the next minor release raises at construction instead. An L1-only cache
+# (explicit backend=None) is auto-activated too, so it warns and its serializer is checked, yet it stores
+# raw objects: the message says so rather than skipping it, as the next release raises for it as well.
+# logger.warning, not
+# DeprecationWarning: Python silences DeprecationWarning outside __main__, so under
+# uvicorn/gunicorn/celery the notice would never surface. Keyed by PID rather than a bool so a forked
+# worker, a new process, warns for itself instead of inheriting the parent's fired flag. One
+# dict.setdefault claims the PID atomically (int key, GIL or free-threaded), so exactly one of any
+# concurrent constructors logs. No lock: a child forked while it is held inherits it held, and uWSGI's
+# default fork never runs an at-fork reset. Tests reset it.
+_AUTO_ACTIVATION_WARNED_PIDS: dict[int, object] = {}
+
+
+def _warn_encryption_auto_activation() -> None:
+    """Warn ONCE per process that encryption was activated by CACHEKIT_MASTER_KEY's presence."""
+    claim = object()
+    if _AUTO_ACTIVATION_WARNED_PIDS.setdefault(os.getpid(), claim) is not claim:
+        return
+    get_logger().warning(
+        "CACHEKIT_MASTER_KEY is set and a cache with no explicit encryption= was constructed (first occurrence in "
+        "this process), so encryption was auto-enabled (single-tenant). Audit every preset that states no "
+        "encryption=: not every such cache is encrypted — an L1-only cache (explicit backend=None) is auto-enabled "
+        "too but stores raw, unencrypted objects, and a cache given master_key= or tenant_extractor= stays "
+        "plaintext. Presence-based activation is deprecated: the next minor release raises at construction, "
+        "L1-only caches included, when the key is present with neither an explicit encryption= nor "
+        "@cache.secure(...). Declare the intent now — @cache.secure(...) to require encryption; "
+        "encryption=True with single_tenant_mode=True (on a preset: "
+        "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; or "
+        "encryption=False to store plaintext — stale ciphertext is still decrypted on read, except in an interop "
+        "cache (interop=...): switch every SDK that binds it to encryption=False and a new namespace together, "
+        "or a few stale entries come back as wrong values."
+    )
+
+
 def supports_buffer_read(backend: BaseBackend) -> TypeGuard[BufferReadableBackend]:
     """Type guard: backend can return a zero-copy buffer via get_buffer (#171, File/POSIX only).
 
@@ -286,6 +337,21 @@ def supports_swr(backend: BaseBackend) -> TypeGuard[SWRCapableBackend]:
     every capable backend, not only when stale_ttl is set).
     """
     return callable(getattr(type(backend), "get_with_freshness", None))
+
+
+def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
+    """Type guard: backend keeps a server-side key registry (KeyTrackableBackend).
+
+    Checked on the backend's CLASS, like ``supports_swr``: an instance-level check
+    reads ``unittest.mock.Mock`` and ``__getattr__`` proxies as trackable, and
+    ``isinstance`` against the runtime-checkable Protocol answers differently on
+    3.10/3.11 (``hasattr``) than on 3.12+ (``getattr_static``) for exactly those
+    objects. A false negative only keeps today's process-local invalidation; a false
+    positive would route every whole-function invalidation through a drain that is
+    not there.
+    """
+    cls = type(backend)
+    return callable(getattr(cls, "track_key", None)) and callable(getattr(cls, "drain_tracked", None))
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
@@ -451,7 +517,9 @@ class CacheSerializationHandler:
     - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
 
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
-    - encryption=None: Auto-detect from CACHEKIT_MASTER_KEY (single-tenant if a key is present)
+    - encryption=None: no intent stated — plaintext. DEPRECATED: while CACHEKIT_MASTER_KEY is set and neither
+      master_key nor tenant_extractor is passed, this release still auto-enables single-tenant encryption
+      and warns once. The next minor release raises whenever a master key is present and encryption is unset
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
       unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
@@ -509,11 +577,15 @@ class CacheSerializationHandler:
                             - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy), "orjson" (JSON)
                             - SerializerProtocol instance: Custom serializer implementing the protocol
             encryption: Tri-state encryption control (wraps serializer with EncryptionWrapper):
-                        - None (default): auto-detect from CACHEKIT_MASTER_KEY. Single-tenant mode
-                          is auto-enabled when a master key is present.
+                        - None (default): no intent stated. DEPRECATED activation path: with
+                          CACHEKIT_MASTER_KEY set and no master_key or tenant_extractor passed, this
+                          release still auto-enables single-tenant encryption and warns once per
+                          process. The next minor release raises at construction whenever a master
+                          key is present and encryption is unset. Pass True or False.
                         - True: force encryption ON (requires a master key + explicit tenant mode).
                         - False: explicit hard opt-out. Never encrypts, even when CACHEKIT_MASTER_KEY
-                          is set fleet-wide. This is the deliberate per-function escape hatch.
+                          is set; stale ciphertext is still decrypted on read (legacy-decrypt), except
+                          in interop mode, where stored bytes are plain-decoded and never decrypted.
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (tenant_id "default" unless overridden).
@@ -582,13 +654,16 @@ class CacheSerializationHandler:
                 )
 
         # Tri-state encryption resolution. `encryption` is None/True/False:
-        #   None  -> auto-detect from CACHEKIT_MASTER_KEY (fleet-wide convergence point)
+        #   None  -> no intent stated. DEPRECATED activation: with CACHEKIT_MASTER_KEY set and no
+        #            master_key/tenant_extractor (the guard below), this release auto-enables encryption
+        #            (warns once); the next minor release raises whenever a key is present.
         #   True  -> explicit force-on (validated below)
         #   False -> explicit hard opt-out; honored even when a master key is present
         #
-        # Auto-detection is the ONLY path that may flip encryption on and auto-set
-        # single_tenant_mode. An explicit False MUST NOT be promoted to True just
-        # because CACHEKIT_MASTER_KEY exists (issue #128).
+        # Why: see _warn_encryption_auto_activation above. An explicit False MUST NOT be promoted to
+        # True just because CACHEKIT_MASTER_KEY exists (issue #128).
+        # Warned only once construction succeeds: a rejected handler must not spend the process's one warning.
+        auto_activated = False
         if encryption is None:
             encryption = False
             if master_key is None and tenant_extractor is None:
@@ -597,6 +672,7 @@ class CacheSerializationHandler:
                     encryption = True
                     master_key = settings.master_key.get_secret_value()
                     single_tenant_mode = True
+                    auto_activated = True
 
         self.encryption = encryption
         self.tenant_extractor = tenant_extractor
@@ -710,6 +786,9 @@ class CacheSerializationHandler:
         self._encryption_wrapper_cache: OrderedDict[str, Any] = OrderedDict()  # tenant_id -> EncryptionWrapper
         self._encryption_cache_lock = threading.RLock()
         self._encryption_cache_maxsize = 256
+
+        if auto_activated:
+            _warn_encryption_auto_activation()
 
     @property
     def serializer_key_name(self) -> str:
@@ -1105,8 +1184,8 @@ class CacheSerializationHandler:
 
             # SECURITY (LAB-241 / CWE-757): the CK frame header is plaintext and NOT
             # covered by the AES-GCM tag (AAD v0x03 binds tenant/cache_key/format/
-            # compressed — not the header itself). A backend-write attacker can plant
-            # a frame claiming `encrypted: false` with an arbitrary plaintext payload;
+            # compressed/original_type — not the header itself). A backend-write attacker
+            # can plant a frame claiming `encrypted: false` with an arbitrary plaintext payload;
             # an encryption-enabled reader must never let that header downgrade it to
             # the unauthenticated plaintext path. Fail closed — callers treat
             # SerializationError as a miss and evict, so legacy plaintext entries
@@ -1161,16 +1240,25 @@ class CacheSerializationHandler:
                         "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
                     )
                 tenant_id = metadata.tenant_id
-                serializer = self._get_cached_encryption_wrapper(tenant_id)
-
-                # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
-                return serializer.deserialize(serialized_data, metadata, cache_key)
+                try:
+                    serializer = self._get_cached_encryption_wrapper(tenant_id)
+                    # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
+                    return serializer.deserialize(serialized_data, metadata, cache_key)
+                except KeyringConfigurationError as e:
+                    if self.encryption:
+                        raise
+                    # Drift read: only the unauthenticated header's encrypted flag brought
+                    # us here, so a keyring fault must heal as miss + evict (corruption),
+                    # never fail loud — a raise would let a planted frame block recompute
+                    # and overwrite of its key until TTL.
+                    raise EncryptionError(f"Config-drift read hit a keyring fault: {e}") from e
             else:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)
         except (ValueError, SerializationError):
-            # ValueError: cache_key missing for encrypted data — FAIL CLOSED
-            # SerializationError/EncryptionError: let the outer handler log and handle
+            # Re-raised unwrapped for the read sites to classify: only
+            # KeyringConfigurationError fails loud there; a plain ValueError is a miss,
+            # and SerializationError goes through handle_decrypt_failure.
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
@@ -1218,6 +1306,8 @@ class CacheSerializationHandler:
                 return wrapper.deserialize_without_key_identity(data, metadata, cache_key)
             return self._base_serializer.deserialize(data)
         except (ValueError, SerializationError):
+            # Same contract as deserialize_data: only KeyringConfigurationError
+            # fails loud at the read sites; a plain ValueError there is a miss.
             raise
         except Exception as e:
             get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
@@ -1239,6 +1329,20 @@ class CacheHit(NamedTuple):
     value: Any
     envelope: Optional[bytes]
     size_bytes: int
+
+
+class StoreOutcome(NamedTuple):
+    """The result of :meth:`CacheOperationHandler.store_result`.
+
+    envelope is the serialized bytes when the buffered path produced them (eligible for L1
+    backfill) and None otherwise — a streamed value never reaches L1, and a failed
+    serialization has no bytes. stored says whether the backend write succeeded, which the
+    envelope cannot say: a buffered write whose backend set failed still has an envelope, and
+    a successful stream has none. Key tracking follows stored, L1 follows envelope.
+    """
+
+    envelope: Optional[bytes]
+    stored: bool
 
 
 class CacheOperationHandler:
@@ -1431,8 +1535,8 @@ class CacheOperationHandler:
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1477,8 +1581,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1516,8 +1620,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1561,8 +1665,8 @@ class CacheOperationHandler:
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1585,7 +1689,7 @@ class CacheOperationHandler:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stale_ttl: int | None = None,
-    ) -> Optional[bytes]:
+    ) -> StoreOutcome:
         """Store result in backend cache with optional tenant context for encryption.
 
         Args:
@@ -1596,11 +1700,11 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes when the buffered path stored the value (eligible for L1
-            backfill), or None when there is nothing for L1: the value was STREAMED to the
-            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
-            failed (logged, never retried buffered), or serialization failed. None is NOT
-            a failure signal.
+            StoreOutcome. envelope: serialized bytes when the buffered path produced them
+            (eligible for L1 backfill), or None when there is nothing for L1 — the value was
+            STREAMED to the backend (L1 intentionally skipped), the streaming attempt
+            failed (logged, never retried buffered), or serialization failed. stored: whether
+            the backend write succeeded; an envelope alone is NOT a success signal.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1629,7 +1733,7 @@ class CacheOperationHandler:
                         # be copied into L1 (mirrors the mmap read path's L1 exclusion, #171).
                         if streamed:
                             get_logger().cache_stored(cache_key, ttl)
-                        return None
+                        return StoreOutcome(envelope=None, stored=streamed)
                     # None: backend can't stream — fall through to the buffered path.
 
             # Pass cache_key for AAD binding (required for encrypted data)
@@ -1637,13 +1741,14 @@ class CacheOperationHandler:
             # Only thread the SWR kwarg when set: strategy implementations without
             # **metadata (tests, custom handlers) must keep working unchanged.
             if stale_ttl is not None:
-                self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
+                stored = self._cache_handler.set(cache_key, serialized_data, ttl, stale_ttl=stale_ttl)
             else:
-                self._cache_handler.set(cache_key, serialized_data, ttl)
-            get_logger().cache_stored(cache_key, ttl)
+                stored = self._cache_handler.set(cache_key, serialized_data, ttl)
+            if stored:
+                get_logger().cache_stored(cache_key, ttl)
 
-            # Return serialized string (wrapped envelope) for L1 cache storage
-            return serialized_data
+            # The envelope goes to L1 even when the backend write failed (L1 still serves it)
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored))
         except InteropError:
             # Interop/v1 data-model rejection: fail loud, never "computed but
             # silently never cached" (spec-mandated; matches cachekit-ts).
@@ -1652,7 +1757,7 @@ class CacheOperationHandler:
             get_logger().warning(
                 f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
             )
-            return None
+            return StoreOutcome(envelope=None, stored=False)
 
     async def store_result_async(
         self,
@@ -1661,7 +1766,7 @@ class CacheOperationHandler:
         ttl: int | None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> Optional[bytes]:
+    ) -> StoreOutcome:
         """Store result in backend cache (async version) with optional tenant context for encryption.
 
         Args:
@@ -1672,11 +1777,7 @@ class CacheOperationHandler:
             kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
-            Serialized bytes when the buffered path stored the value (eligible for L1
-            backfill), or None when there is nothing for L1: the value was STREAMED to the
-            backend (success — L1 intentionally skipped, LAB-766), the streaming attempt
-            failed (logged, never retried buffered), or serialization failed. None is NOT
-            a failure signal.
+            StoreOutcome, as for :meth:`store_result`.
 
         Note:
             Requires cache_handler to be set via set_cache_handler() before calling.
@@ -1703,15 +1804,15 @@ class CacheOperationHandler:
                         # envelope to L1 on success.
                         if streamed:
                             get_logger().cache_stored(cache_key, ttl)
-                        return None
+                        return StoreOutcome(envelope=None, stored=streamed)
 
             # Pass cache_key for AAD binding (required for encrypted data)
             serialized_data = self.serialization_handler.serialize_data(result, args, kwargs, cache_key)
-            await self._cache_handler.set_async(cache_key, serialized_data, ttl)
-            get_logger().cache_stored(cache_key, ttl)
+            stored = await self._cache_handler.set_async(cache_key, serialized_data, ttl)
+            if stored:
+                get_logger().cache_stored(cache_key, ttl)
 
-            # Return serialized string (wrapped envelope) for L1 cache storage
-            return serialized_data
+            return StoreOutcome(envelope=serialized_data, stored=bool(stored))
         except InteropError:
             # Interop/v1 data-model rejection: fail loud, never "computed but
             # silently never cached" (spec-mandated; matches cachekit-ts).
@@ -1720,7 +1821,7 @@ class CacheOperationHandler:
             get_logger().warning(
                 f"Failed to store in backend cache for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
             )
-            return None
+            return StoreOutcome(envelope=None, stored=False)
 
     def set_cache_handler(self, handler: CacheHandlerStrategy):
         """Set a specific cache handler strategy.
@@ -1734,112 +1835,6 @@ class CacheOperationHandler:
     def cache_handler(self) -> Optional[CacheHandlerStrategy]:
         """Get the current cache handler."""
         return self._cache_handler
-
-
-class CacheInvalidator:
-    """Handles cache invalidation - Single Responsibility."""
-
-    def __init__(
-        self,
-        key_generator: CacheKeyGenerator,
-        backend: Optional[BaseBackend] = None,
-        integrity_checking: bool = True,
-        *,
-        serializer_type: str,
-    ) -> None:
-        """Initialize with key generator and optional backend.
-
-        Args:
-            key_generator: Key generator instance
-            backend: Optional backend instance (can be set later via set_backend)
-            integrity_checking: Whether integrity checking is enabled (affects cache key generation)
-            serializer_type: Serializer name of the decorator this invalidator serves. MUST be
-                the same value CacheOperationHandler.get_cache_key derives (i.e. the serialization
-                handler's ``serializer_type``) - it is half of the key's metadata suffix, so a
-                mismatch would delete a key nothing ever wrote.
-        """
-        self.key_generator = key_generator
-        self._backend = backend
-        self.integrity_checking = integrity_checking
-        self.serializer_type = serializer_type
-
-    def set_backend(self, backend: BaseBackend):
-        """Set the backend instance.
-
-        Args:
-            backend: Backend instance implementing BaseBackend protocol
-        """
-        self._backend = backend
-
-    def invalidate_cache(
-        self,
-        func: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        namespace: str | None,
-    ) -> None:
-        """Invalidate cache entry.
-
-        Args:
-            func: Cached function
-            args: Function arguments
-            kwargs: Function keyword arguments
-            namespace: Optional namespace
-
-        Note:
-            Requires backend to be set via set_backend() or constructor before calling.
-        """
-        if self._backend is None:
-            raise RuntimeError("Backend must be set before calling invalidate_cache")
-        cache_key = self.key_generator.generate_key(
-            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
-        )
-
-        try:
-            self._backend.delete(cache_key)
-            get_logger().cache_invalidated(cache_key, "Backend")
-        except BackendError as e:
-            get_logger().error(
-                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
-            )
-        except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
-
-    async def invalidate_cache_async(
-        self,
-        func: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        namespace: str | None,
-    ) -> None:
-        """Invalidate cache entry (async version).
-
-        Args:
-            func: Cached function
-            args: Function arguments
-            kwargs: Function keyword arguments
-            namespace: Optional namespace
-
-        Note:
-            Requires backend to be set via set_backend() or constructor before calling.
-        """
-        if self._backend is None:
-            raise RuntimeError("Backend must be set before calling invalidate_cache_async")
-        cache_key = self.key_generator.generate_key(
-            func, args, kwargs, namespace, self.integrity_checking, serializer_type=self.serializer_type
-        )
-
-        try:
-            # Note: BaseBackend methods are sync (not async)
-            # We call sync method from async context (will be wrapped in executor by caller if needed)
-            self._backend.delete(cache_key)
-            get_logger().cache_invalidated(cache_key, "Backend")
-        except BackendError as e:
-            get_logger().error(
-                f"Backend operation failed for invalidation on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
-            )
-        except Exception as e:
-            get_logger().error(f"Unexpected error invalidating {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
 
 
 @runtime_checkable

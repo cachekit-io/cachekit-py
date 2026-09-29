@@ -71,8 +71,9 @@ cachekit emits the following metrics on the default `prometheus_client` registry
 below are the **actual** series names — none carry a `cachekit_` prefix.
 
 > The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
-> preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
-> emitted without the label (an instrumentation gap, not a tier).
+> preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` is the value
+> recorded when the emitting call site passes no serializer (an instrumentation gap, not a
+> tier).
 
 ### Counters (always increasing)
 
@@ -92,8 +93,11 @@ redis_cache_operations_total{operation="backpressure",status="rejected",serializ
 #         key-fingerprint mismatch under fail-closed: possible tampering or wrong key),
 #         "suspicious_envelope" (unauthenticated envelope inconsistent with config:
 #         plaintext claim under encryption / missing tenant_id — benign during lazy
-#         migration, suspect otherwise), "corruption" (checksum/format failure —
-#         storage rot or bugs); tier ("l1" or "l2").
+#         migration, suspect otherwise), "envelope_shape" (an unverified entry decoded
+#         to the shape of a ByteStorage envelope — a rotted envelope or a legitimate
+#         4-element list, indistinguishable; the same redacted key repeating in the WARNING log is the latter,
+#         recomputing on every read — see docs/error-codes.md), "corruption" (checksum/format
+#         failure — storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}
 
@@ -146,8 +150,8 @@ other operations, so this is an operation-success rate, not a hit rate.
 ```
 
 For a miss-rate proxy, watch cache writes: `operation="set"` is recorded when a miss
-writes back, but it is a write proxy — it can double-count when stats collection is on
-and records nothing for a failed write — so treat it as a proxy, not an exact miss count.
+writes back, but it is a write proxy — it records nothing for a failed write — so treat it
+as a proxy, not an exact miss count.
 
 ```promql
 # Cache-write rate as a miss-rate proxy (see caveats above)

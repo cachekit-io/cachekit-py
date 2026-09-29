@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import random
 import time
@@ -19,9 +20,10 @@ from cachekit.backends.cachekitio.client import get_cached_async_http_client, le
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.backends.redis.provider import _await_uninterrupted
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators.stats_context import get_current_function_stats
-from cachekit.hash_utils import redact_error_for_log
+from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
 
 # Module-level logger
 _logger = get_structured_logger(__name__)
+# Unsampled stdlib logger for one-off lock warnings that _logger's sampling could drop.
+logger = logging.getLogger(__name__)
 
 # Lock capability token travels in this request header, never the query string:
 # a ?lock_id= query leaks the token into access/proxy logs and OpenTelemetry
@@ -53,6 +57,9 @@ LEGACY_TTL_HEADER = "X-TTL"
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
+
+# Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
+_RESERVED_KEY_SEGMENTS = frozenset({".", "..", "health", "ttl", "lock"})
 
 _API_KEY_HINT = (
     "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
@@ -218,7 +225,7 @@ class CachekitIOBackend:
         everything else still comes from the environment.
 
         Raises:
-            ConfigurationError: missing, empty or whitespace-containing API key, or an API URL that fails
+            ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token, or an API URL that fails
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
@@ -227,8 +234,8 @@ class CachekitIOBackend:
             self._config = CachekitIOBackendConfig(**{k: v for k, v in overrides.items() if v is not None})
         except ValidationError as exc:
             errors = exc.errors(include_input=False)
-        # Raised OUTSIDE the except block (CWE-532): the ValidationError's own .errors() keep the
-        # raw api_key, and `raise ... from None` only hides it — it would still hang off __context__.
+        # Raised OUTSIDE the except block (CWE-532): the ValidationError's traceback holds the config's
+        # raw kwargs, and `raise ... from None` only hides it — it would still hang off __context__.
         if errors is not None:
             problems = "; ".join(f"{'.'.join(str(part) for part in err['loc']) or 'config'}: {err['msg']}" for err in errors)
             key_absent = any(err["loc"] == ("api_key",) and err["type"] in ("missing", "too_short") for err in errors)
@@ -254,18 +261,36 @@ class CachekitIOBackend:
         canonical key round-trips byte-for-byte. See ``SECURITY.md`` for the cross-SDK
         wire-parity contract (cachekit-rs / cachekit-ts).
 
-        Dot-segment guard: ``quote`` leaves RFC-3986 *unreserved* ``.`` untouched, so a key
-        of exactly ``.`` or ``..`` survives as a live dot-segment that httpx collapses
-        client-side *before the request leaves the process* — ``..`` -> ``/v1``,
-        ``../ttl`` -> ``/v1/ttl``, ``../lock`` -> ``/v1/lock`` — re-opening the endpoint
-        escape on a *different* route carrying the bearer token, never reaching the SaaS
-        key validator. Percent-encode the dots so the segment is inert; the SaaS decodes
-        ``%2E`` -> ``.`` once and rejects ``..`` anyway. Only an all-dot segment collapses
-        (``a:..`` does not), so nothing else is touched and wire-parity is unaffected.
+        Reserved segments: ``.``, ``..``, ``health``, ``ttl`` and ``lock`` encode to
+        themselves and cannot be sent at all (protocol ``spec/saas-api.md`` § Cache-Key Path
+        Encoding, rule 2). The dots are dot-segments that a URL parser removes before routing
+        (``..`` -> ``/v1``, ``../ttl`` -> ``/v1/ttl``), and percent-encoding them does not
+        help: the SaaS parses the URL under WHATWG, which collapses ``%2E`` / ``%2E%2E`` too.
+        The words are route tokens (``/v1/cache/health`` is the health endpoint). Either way
+        the request would reach a different route with the bearer token, so these keys are
+        rejected before any request is made. Only an exact match is reserved: ``a:..`` and
+        ``..a`` are sent as-is, and canonical keys (which always contain ``:``) never match.
+
+        Raises:
+            BackendError: ``PERMANENT`` (never retried) — the key is reserved. Raised from every
+                public method, including ``get_ttl`` / ``refresh_ttl``, which otherwise swallow a
+                SaaS 400 as ``None`` / ``False``.
+
+        Examples:
+            >>> CachekitIOBackend._encode_key("ns:app:func:mod.fn:args:ab:1s")
+            'ns%3Aapp%3Afunc%3Amod.fn%3Aargs%3Aab%3A1s'
+            >>> CachekitIOBackend._encode_key("..")
+            Traceback (most recent call last):
+            ...
+            cachekit.backends.errors.BackendError: ...
         """
         encoded = quote(key, safe="")
-        if encoded in (".", ".."):
-            return encoded.replace(".", "%2E")
+        if encoded in _RESERVED_KEY_SEGMENTS:
+            raise BackendError(
+                f"Cache key {encoded!r} is a reserved URL path segment and cannot be stored in "
+                "cachekit.io; choose a different key",
+                error_type=BackendErrorType.PERMANENT,
+            )
         return encoded
 
     def _request_sync(
@@ -725,6 +750,30 @@ class CachekitIOBackend:
 
         return lock_id if isinstance(lock_id, str) else None
 
+    async def _try_acquire_lock_drained(self, lock_key: str, timeout: float) -> str | None:
+        """``_try_acquire_lock``, run to completion even if the caller is cancelled meanwhile.
+
+        A cancel thrown into the in-flight POST loses the server's answer, not the grant, so the
+        attempt runs as its own Task and is drained. If the caller was cancelled, a won lock is
+        released before the cancel propagates, and a failed attempt is logged: the cancel always
+        wins, otherwise the wrapper would carry on (or retry) in a task that was cancelled.
+        """
+        attempt = asyncio.ensure_future(self._try_acquire_lock(lock_key, timeout))
+        try:
+            return await _await_uninterrupted(attempt)
+        except asyncio.CancelledError:
+            if attempt.cancelled():
+                raise  # the attempt itself was cancelled (e.g. asyncio.run teardown): no outcome to read
+            if (err := attempt.exception()) is not None:
+                logger.warning(
+                    "CachekitIO lock attempt for %s failed (%s) while acquire_lock was being cancelled",
+                    redact_cache_key(lock_key),
+                    redact_error_for_log(err),
+                )
+            elif (won := attempt.result()) is not None:
+                await self._release_lock(lock_key, won)
+            raise
+
     @asynccontextmanager
     async def acquire_lock(
         self,
@@ -749,7 +798,7 @@ class CachekitIOBackend:
         """
         lock_id: str | None = None
         try:
-            lock_id = await self._try_acquire_lock(key, timeout)
+            lock_id = await self._try_acquire_lock_drained(key, timeout)
 
             if lock_id is None and blocking_timeout is not None:
                 deadline = time.monotonic() + blocking_timeout
@@ -761,7 +810,7 @@ class CachekitIOBackend:
                     # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
                     jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
                     await asyncio.sleep(min(delay, remaining) * jitter)
-                    lock_id = await self._try_acquire_lock(key, timeout)
+                    lock_id = await self._try_acquire_lock_drained(key, timeout)
                     delay = min(delay * 2, 0.5)
 
             yield lock_id is not None
@@ -775,7 +824,13 @@ class CachekitIOBackend:
         Best-effort: swallows ``BackendError`` and returns False so a release failure
         inside ``__aexit__`` cannot mask the user's exception. The server-side ``timeout``
         on the lock is the safety net if the DELETE never lands.
+
+        Drained: the DELETE runs as its own Task to completion however many cancels land
+        meanwhile; a cancel thrown into it would otherwise leave the lock held.
         """
+        return await _await_uninterrupted(asyncio.ensure_future(self._delete_lock(lock_key, lock_id)))
+
+    async def _delete_lock(self, lock_key: str, lock_id: str) -> bool:
         # lock_key is caller-controlled → percent-encode it into the path. lock_id is a
         # capability token and travels in the X-CacheKit-Lock-Id header, NOT the query
         # string (CWE-532): a ?lock_id= query leaks it into access/proxy logs and OTel
@@ -785,6 +840,8 @@ class CachekitIOBackend:
             await self._request_async("DELETE", f"{encoded_key}/lock", headers={LOCK_ID_HEADER: lock_id})
             return True
         except BackendError:
+            # Swallowed inside the drained Task, not around the drain: once a cancel has landed the
+            # drain re-raises it, and an error left on the Task surfaces only at GC as "never retrieved".
             return False
 
     # ==================== TTLInspectableBackend Protocol ====================
@@ -797,9 +854,14 @@ class CachekitIOBackend:
 
         Returns:
             TTL in seconds, None if key doesn't exist or has no expiry
+
+        Raises:
+            BackendError: If the key is reserved (see ``_encode_key``); encoded outside the
+                ``try`` so the rejection is not mistaken for a missing key.
         """
+        encoded_key = self._encode_key(key)
         try:
-            response = await self._request_async("GET", f"{self._encode_key(key)}/ttl")
+            response = await self._request_async("GET", f"{encoded_key}/ttl")
             data = response.json()
             return data.get("ttl")
         except BackendError:
@@ -814,12 +876,16 @@ class CachekitIOBackend:
 
         Returns:
             True if updated, False otherwise
+
+        Raises:
+            BackendError: If the key is reserved (see ``_encode_key``).
         """
+        encoded_key = self._encode_key(key)
         try:
             payload = json.dumps({"ttl": ttl})
             await self._request_async(
                 "PATCH",
-                f"{self._encode_key(key)}/ttl",
+                f"{encoded_key}/ttl",
                 content=payload.encode(),
                 headers={"Content-Type": "application/json"},
             )

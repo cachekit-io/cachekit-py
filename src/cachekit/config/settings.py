@@ -22,12 +22,12 @@ from typing import Annotated, Any, Literal, Optional
 from pydantic import (
     Field,
     SecretStr,
-    ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic_core import InitErrorDetails
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import NoDecode, SettingsConfigDict
+
+from .validation import RedactingSettings
 
 # Keyring cap from the protocol spec (spec/encryption.md → "Key Rotation (Keyring)"):
 # at most 3 decrypt-only previous keys. Exceeding the cap is a configuration error,
@@ -36,7 +36,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 MAX_PREVIOUS_MASTER_KEYS = 3
 
 
-class CachekitConfig(BaseSettings):
+class CachekitConfig(RedactingSettings):
     """Backend-agnostic cache configuration.
 
     This configuration class provides validation for generic cache parameters
@@ -47,9 +47,6 @@ class CachekitConfig(BaseSettings):
 
     Attributes:
         enable_prometheus_metrics: Whether to enable Prometheus metrics collection
-        default_ttl: Default time-to-live for cache entries in seconds
-        ttl_min: Minimum allowed TTL in seconds
-        ttl_max: Maximum allowed TTL in seconds
         max_value_size: Maximum cache value size in bytes
         l1_enabled: Enable L1 in-memory cache for performance
         l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
@@ -70,13 +67,6 @@ class CachekitConfig(BaseSettings):
         >>> custom = CachekitConfig(l1_max_size_mb=256)
         >>> custom.l1_max_size_mb
         256
-
-        TTL validation (default_ttl must be within ttl_min/ttl_max bounds):
-
-        >>> CachekitConfig(default_ttl=30, ttl_min=60)  # doctest: +IGNORE_EXCEPTION_DETAIL
-        Traceback (most recent call last):
-            ...
-        pydantic_core._pydantic_core.ValidationError: ... default_ttl (30) cannot be less than ttl_min (60)...
 
         Master key is masked in repr for security:
 
@@ -128,47 +118,13 @@ class CachekitConfig(BaseSettings):
         extra="forbid",
         populate_by_name=True,  # Allow using field names in addition to validation aliases
         # SECURITY (CWE-532): never echo raw inputs in str(ValidationError).
-        # Without this, any validation failure on this model (bad TTL bounds,
+        # Without this, any validation failure on this model (an out-of-range size limit,
         # keyring misconfig, ...) embeds the full raw input — including
         # env-sourced master_key and previous_master_keys hex — in startup
-        # logs. errors()/json() ignore this flag; __init__ below sanitizes
+        # logs. errors()/json() ignore this flag; RedactingSettings sanitizes
         # those surfaces.
         hide_input_in_errors=True,
     )
-
-    def __init__(self, **kwargs: Any) -> None:
-        """Construct settings, sanitizing validation errors (CWE-532).
-
-        hide_input_in_errors only affects __str__; ValidationError.errors() and
-        .json() still snapshot the raw input — for env-sourced settings that is
-        the cleartext master_key and previous_master_keys hex, which error
-        trackers serialize. Rebuild the error with every input redacted and
-        drop the original from the exception chain (it holds the raw values).
-        The re-raised error is still a ValidationError (a ValueError), so
-        fail-loud propagation paths are unchanged.
-        """
-        sanitized_error: ValidationError | None = None
-        try:
-            super().__init__(**kwargs)
-        except ValidationError as e:
-            sanitized: list[InitErrorDetails] = []
-            for err in e.errors(include_url=False):
-                detail: InitErrorDetails = {
-                    "type": err["type"],
-                    "loc": err["loc"],
-                    "input": "[REDACTED]",
-                }
-                ctx = err.get("ctx")
-                if ctx:
-                    detail["ctx"] = ctx
-                sanitized.append(detail)
-            sanitized_error = ValidationError.from_exception_data(e.title, sanitized, hide_input=True)
-        # Raised OUTSIDE the except block so __context__/__cause__ stay None —
-        # `raise ... from None` only suppresses display; the original (with raw
-        # inputs recoverable via .errors()) would still hang off __context__
-        # for anything that walks exception chains.
-        if sanitized_error is not None:
-            raise sanitized_error
 
     # Generic cache configuration (backend-agnostic)
     arrow_compression: Literal["zstd", "lz4", "none"] = Field(
@@ -186,23 +142,6 @@ class CachekitConfig(BaseSettings):
     enable_prometheus_metrics: bool = Field(
         default=True,
         description="Whether to enable Prometheus metrics collection",
-    )
-
-    # TTL configuration
-    default_ttl: int = Field(
-        default=3600,
-        gt=0,
-        description="Default time-to-live for cache entries in seconds",
-    )
-    ttl_min: int = Field(
-        default=60,
-        gt=0,
-        description="Minimum allowed TTL in seconds",
-    )
-    ttl_max: int = Field(
-        default=86400,  # 24 hours
-        gt=0,
-        description="Maximum allowed TTL in seconds",
     )
 
     # Size limits
@@ -356,25 +295,6 @@ class CachekitConfig(BaseSettings):
                     "slot, which resumes a used AES-GCM nonce budget and risks catastrophic nonce "
                     "reuse. Rotate forward to a fresh key instead (protocol decisions/key-rotation.md)."
                 )
-
-        return self
-
-    @model_validator(mode="after")
-    def validate_interdependent_fields(self) -> CachekitConfig:
-        """Validate interdependent field relationships.
-
-        Returns:
-            The validated configuration instance
-
-        Raises:
-            ValueError: If field combinations are invalid
-        """
-        # Check TTL bounds
-        if self.default_ttl < self.ttl_min:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be less than ttl_min ({self.ttl_min})")
-
-        if self.default_ttl > self.ttl_max:
-            raise ValueError(f"default_ttl ({self.default_ttl}) cannot be greater than ttl_max ({self.ttl_max})")
 
         return self
 

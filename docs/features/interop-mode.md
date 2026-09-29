@@ -73,13 +73,14 @@ The flip side: two *differently decorated* Python functions that declare the sam
 
 Treat operation names like queue names or topic names: a **cross-team contract**, not a local variable. Two teams binding `users:get_user` had better agree on the argument list and the meaning of the cached value — the cache will not referee. If two functions must not share entries, give them different operation names.
 
-**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and tenant (the implicit `"default"`, or the same explicit `deployment_uuid` everywhere). The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee while both sides evict each other's entries on every read.
+**Encryption settings are part of that contract.** Every function — and every SDK — binding one `(namespace, operation)` must agree on encryption on/off, master key, and tenant (the implicit `"default"`, or the same explicit `deployment_uuid` everywhere). The failure mode is quiet: an encrypted-config reader treats a plaintext entry as an authentication failure — a miss, unless `fail_closed=True` — and overwrites it with ciphertext; a plaintext-config reader usually can't decode the ciphertext, recomputes, and **re-stores the value unencrypted at the same shared key**, silently defeating the zero-knowledge guarantee — and on those decode failures both sides evict each other's entries on every read. A rare small ciphertext instead parses as valid MessagePack and is served as a wrong value, with no rewrite.
 
 ## The Cross-SDK Contract
 
 The contract for one operation is the operation name **plus** the effective argument list (arity, order, types):
 
-- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized).
+- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized). `ns` and `nsapi` are reserved as namespaces (operations, and namespaces such as `nsx`, are unaffected), because the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed ([cache-key-format.md → Server-Side Requirements](https://github.com/cachekit-io/protocol/blob/main/spec/cache-key-format.md#server-side-requirements)).
+- A `str` subclass is checked and keyed as its plain `str` value, so a `StrEnum` or `(str, Enum)` member `USERS = "users"` is the namespace `users`. Earlier releases put a `(str, Enum)` member's formatted name into the key on Python 3.11 and later (`NS.USERS:get_user:…`, a key no other SDK derives). Upgrading moves those functions to the correct key. The old entries are not deleted: they retire only by TTL (never, if none was set). To erase them on Redis, `SCAN` for the old prefix (here `NS.USERS:get_user:*`) and `UNLINK` the matches.
 - Named arguments bind to their declared positions and **introspectable defaults are applied**: `get_user(42)`, `get_user(user_id=42)` and `get_user(42, include_profile=False)` all produce the same key.
 - Arguments must fit the closed interop data model (int in `[-2^63, 2^64-1]`, float, str, bytes, bool, None, list/tuple, dict with str keys, set, tz-aware datetime, UUID; Python conveniences: Enum → value, Path → POSIX string, Decimal → string). Anything else raises `InteropError` **at call time** — interop mode never silently degrades to uncached execution.
 - Values are plain MessagePack: None, bool, int, float, str, bytes, list/tuple, dict with str keys, plus datetime/date/time as portable sentinel maps. Python-specific values (sets, custom classes, NumPy/pandas) raise `InteropError` at store time — they would not round-trip cross-SDK.
@@ -114,10 +115,10 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 
 | Situation | Behavior |
 | :--- | :--- |
-| Missing/invalid `namespace` or `operation` | `ConfigurationError` at decoration time |
+| Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call** (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
@@ -140,6 +141,6 @@ assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 33 key vectors, 4 value vectors, 9 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 34 key vectors, 4 value vectors, 11 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
 > **CachekitIO note**: the deployed api.cachekit.io cache-key validator predates interop keys and rejects them until the saas#91 validator shrink is live in production. Redis and other self-hosted backends are unaffected.

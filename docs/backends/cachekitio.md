@@ -62,9 +62,14 @@ def tenant_b_function(x):
 ```
 
 `@cache.io()` raises `ConfigurationError` at decoration time if it has no key from either
-source, if the key contains whitespace (usually a trailing newline from a secrets file), if
-`CACHEKIT_API_URL` fails validation, or if you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
+source, if the key is not an RFC 6750 bearer token, if `CACHEKIT_API_URL` fails validation, or if
+you pass `backend=` or `config=` — it always caches through its own `CachekitIOBackend`.
 To cache through another backend, use `@cache.production(backend=...)`.
+
+A bearer token carries only `A-Z a-z 0-9 - . _ ~ + /`, then any number of trailing `=`. So cachekit
+rejects a key with whitespace (usually a trailing newline from a secrets file), a byte-order mark (from
+a file saved on Windows), a control character or a non-ASCII letter. It never strips the key, and the
+error never quotes it.
 
 The RORO form `@cache(config=DecoratorConfig.io(api_key=...))` keeps its own key even when
 `set_default_backend()` is set: a backend already in `config=` wins over the module default.
@@ -98,6 +103,11 @@ async def async_cached_function(x):
 # await backend.exists_async(key)
 # is_healthy, details = await backend.health_check_async()
 ```
+
+Direct calls reject five reserved keys, `.`, `..`, `health`, `ttl` and `lock`, with a
+`PERMANENT` `BackendError` before any request is sent: no URL can carry them to the
+cache (see [SECURITY.md](../../SECURITY.md#cache-key-path-encoding-cwe-22)). Decorator keys
+always contain `:`, so they never hit this.
 
 ## Distributed Locking (async only)
 
@@ -206,7 +216,7 @@ def get_user_profile(user_id: str) -> dict:
 - Per-tenant key derivation via HKDF — not a tenancy boundary; see [Multi-Tenant Isolation](../features/zero-knowledge-encryption.md#multi-tenant-isolation)
 - The SaaS backend is a zero-knowledge conduit: it stores whatever bytes arrive
 - With `@cache.secure`: SaaS is out of scope for HIPAA/PCI (stores only ciphertext)
-- Without `@cache.secure`: SaaS stores plaintext, may be in compliance scope
+- Without encryption: SaaS stores plaintext, may be in compliance scope
 
 **Requirements**:
 

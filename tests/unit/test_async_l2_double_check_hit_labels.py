@@ -1,6 +1,6 @@
 """Async lock double-check L2 hit-record parity (LAB-3769).
 
-The uncontended async L2 hit site records get/serializer="rust"/hit=True telemetry
+The uncontended async L2 hit site records get/serializer="rust" telemetry
 (LAB-3765); the two post-lock ``_l2_double_check`` hit returns did not — so a
 thundering-herd hit, filled by another worker while this one waited on the
 distributed lock, was invisible to ``cache_operations_total`` and ``cache_info()``
@@ -28,6 +28,7 @@ import pytest
 
 from cachekit import cache
 from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.reliability.async_metrics import AsyncMetricsCollector
 
 
 class _LockableByteStore:
@@ -63,14 +64,9 @@ class _LockableByteStore:
 
 @pytest.fixture
 def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Capture the wrapper's explicit features.record_cache_operation(...) calls.
-
-    Patched at the orchestrator, not the collector: record_success() also forwards
-    an operation-context record to the collector, which would shadow the labels
-    under test (same rationale as test_async_get_record_labels.py).
-    """
+    """Capture every cache-operation metric record at the collector, the metrics sink."""
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(FeatureOrchestrator, "record_cache_operation", lambda self, **kw: calls.append(kw))
+    monkeypatch.setattr(AsyncMetricsCollector, "record_cache_operation", lambda self, **kw: calls.append(kw))
     return calls
 
 
@@ -104,14 +100,13 @@ async def test_async_l2_double_check_hit_records_get(recorded: list[dict[str, An
     assert await compute() == {"answer": 42}
     assert call_count >= 2  # pre-lock miss, then the double-check hit
 
-    gets = [c for c in recorded if c["operation"] == "get"]
-    assert len(gets) == 1
-    assert (gets[0].get("serializer"), gets[0].get("hit")) == ("rust", True)
-    assert gets[0].get("size_bytes") == expected_size
+    assert len(recorded) == 1  # one contended hit, one record
+    assert (recorded[0]["operation"], recorded[0].get("serializer")) == ("get", "rust")
+    assert recorded[0].get("size_bytes") == expected_size
     # The double-check read is timed on its own window, so a duration is always
     # recorded — a regression that drops it would still pass the label asserts.
-    assert isinstance(gets[0].get("duration_ms"), float)
-    assert gets[0]["duration_ms"] >= 0.0
+    assert isinstance(recorded[0].get("duration_ms"), float)
+    assert recorded[0]["duration_ms"] >= 0.0
 
 
 @pytest.mark.unit

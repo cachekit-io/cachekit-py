@@ -86,10 +86,10 @@ def your_function(args):
 
 #### Core Parameters
 
-- **`ttl`** (`int | None`, default: `None`) - Cache time-to-live in seconds (`None` = no expiration)
+- **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
-- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
+- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
 - **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
 
 #### Performance Parameters
@@ -100,13 +100,12 @@ def your_function(args):
 
 #### Reliability Parameters
 
-- **`circuit_breaker`** (`CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration:
+- **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`:
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
-  - `failure_threshold` (`int`, default: `5`) - Failures before opening circuit
-  - `success_threshold` (`int`, default: `3`) - Successes before closing circuit
-  - `recovery_timeout` (`int`, default: `30`) - Seconds before attempting recovery
-  - `half_open_requests` (`int`, default: `3`) - Test requests allowed in half-open state
-  - `excluded_exceptions` (`tuple[type[Exception], ...]`, default: `()`) - Exceptions that don't trigger circuit breaker
+  - `failure_threshold` (`int`, default: `5`) - Consecutive failures before opening circuit
+  - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
+  - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
+  - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
@@ -217,12 +216,13 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 
 - Inherits all production-grade reliability features: circuit breaker, backpressure, full monitoring
 - L1 in-memory cache is enabled — hot data is served at ~50ns without an HTTP round-trip
+- Default `ttl=3600`; with that default the stale-while-revalidate window is also 3600 s. `ttl=None` disables both expiry and SWR.
 - Standard `ttl`, `namespace`, `serializer`, and other `@cache(...)` kwargs are all supported as overrides
 
 ### Health Check Methods
@@ -529,7 +529,9 @@ The `serializer` parameter accepts:
 ```python notest
 # By name (string)
 @cache(serializer="std", backend=None)          # StandardSerializer (alias)
+@cache(serializer="default", backend=None)      # StandardSerializer
 @cache(serializer="auto", backend=None)         # AutoSerializer
+@cache(serializer="pythonic", backend=None)     # AutoSerializer (alias)
 @cache(serializer="orjson", backend=None)       # OrjsonSerializer
 @cache(serializer="arrow", backend=None)        # ArrowSerializer
 
@@ -593,7 +595,6 @@ def get_user_data_v2(user_id):
 Configuration class for backend-agnostic cache settings. Based on `pydantic-settings` for automatic environment variable loading with the `CACHEKIT_` prefix. Redis connection settings (URL, pool size, timeouts) live on `RedisBackendConfig`, not here.
 
 **Key Fields:**
-- **`default_ttl`** (`int`, default: `3600`) - Default cache TTL in seconds (env: `CACHEKIT_DEFAULT_TTL`)
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
@@ -610,7 +611,7 @@ from cachekit.config import get_settings
 config = get_settings()
 ```
 
-**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed.
+**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
 
 
 ---
@@ -698,7 +699,6 @@ cachekit is configured through environment variables. For detailed setup and tro
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 # Cache Behavior
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
@@ -833,7 +833,6 @@ query examples, and alerting rules.
 ### Structured Logging
 
 All operations include structured logging with:
-- Correlation IDs for request tracking
 - Operation context (namespace, cache key, serializer)
 - Performance metrics (duration, cache hit/miss)
 - Error classification and recovery actions

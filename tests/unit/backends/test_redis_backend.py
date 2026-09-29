@@ -11,26 +11,46 @@ and RedisBackend.get() must return those raw bytes (or None) without coercion.
 Regression coverage for the distributed-lock executor stall: ``acquire_lock`` must
 not hold an executor thread while a waiter polls (see
 ``TestRedisLockWaitersDoNotPinExecutorThreads``).
+
+Key registry control flow (``track_key`` / ``drain_tracked``) against a mocked client:
+see ``TestKeyRegistryControlFlow``. The drain script itself runs on real Redis in
+tests/integration/test_key_registry_redis.py.
+
+Regression coverage for LAB-4773: a provider-issued backend scopes each operation to the
+calling context's tenant (see ``TestProviderIssuedBackendFollowsTheCallingTenant``).
+
+Regression coverage for LAB-5713: an unsupported tenant id type raises through ``@cache`` on both
+paths, never degraded or counted by the circuit breaker
+(see ``TestUnsupportedTenantIdRaisesThroughTheDecorator``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import enum
+import inspect
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import pytest
+import redis
 from redis.commands.core import Script
 from redis.connection import Encoder
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
+from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
-from cachekit.backends.redis.provider import PerRequestRedisBackend
+from cachekit.backends.redis import provider as provider_module
+from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider, tenant_context
+from tests.fixtures.tenant import as_tenant
 
 
 @pytest.mark.unit
@@ -268,7 +288,8 @@ class TestRedisBackendGetContract:
 
 
 class _FakeRedis:
-    """Just enough of ``redis.Redis`` for ``redis.lock.Lock``: SET NX PX plus the release script.
+    """Just enough of ``redis.Redis`` for ``redis.lock.Lock`` (SET NX PX plus the release
+    script) and for a decorator's reads, writes and deletes (TTLs are not modelled).
 
     Guarded by a mutex because ``acquire_lock`` runs each attempt on an executor thread.
     """
@@ -311,6 +332,17 @@ class _FakeRedis:
         if nx and self.nx_done is not None:
             self.nx_done.set()
         return result
+
+    def setex(self, name: str, _ttl: int, value: bytes) -> bool:
+        return bool(self.set(name, value))
+
+    def get(self, name: str) -> bytes | None:
+        with self._mutex:
+            return self._store.get(name)
+
+    def delete(self, name: str) -> int:
+        with self._mutex:
+            return int(self._store.pop(name, None) is not None)
 
     def evalsha(self, _sha: str, _numkeys: int, name: str, token: bytes) -> int:
         """The only script ``Lock`` runs here is LUA_RELEASE: delete iff the token still matches."""
@@ -588,3 +620,391 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
         assert [r.levelno for r in caplog.records if "release" in r.getMessage()] == [level]
+
+
+REG = "ck:reg:ns:0123456789abcdef"
+
+
+def _drain_backend(*replies: list[bytes | str]) -> tuple[PerRequestRedisBackend, Mock, Mock]:
+    """A tenant-``self`` backend on a Mock client whose drain script returns ``replies`` in turn."""
+    client = Mock()
+    script = Mock(side_effect=list(replies))
+    client.register_script.return_value = script
+    return PerRequestRedisBackend(client, "self"), client, script
+
+
+@pytest.mark.unit
+class TestKeyRegistryControlFlow:
+    """What ``drain_tracked`` does with the script's replies: rounds, stragglers, logging."""
+
+    def test_track_key_failure_is_classified(self):
+        client = Mock()
+        client.pipeline.side_effect = RedisConnectionError("down")
+        with pytest.raises(BackendError) as exc_info:
+            PerRequestRedisBackend(client, "self").track_key(REG, "k")
+        assert exc_info.value.is_transient
+
+    def test_rounds_until_short_chunk_then_unlinks_stragglers_in_batches(self, monkeypatch, caplog):
+        monkeypatch.setattr(provider_module, "_DRAIN_CHUNK", 2)
+        backend, client, script = _drain_backend([b"a", b"b"], ["c"], [])
+        with caplog.at_level(logging.INFO, logger=provider_module.__name__):
+            out = backend.drain_tracked(REG, ["a", "s1", "s2", "s3"])
+        assert out == {"a", "b", "c", "s1", "s2", "s3"}  # str replies (decode_responses clients) pass through
+        assert script.call_args_list == [call(keys=[f"t:self:{REG}"], args=["t:self:", 2])] * 2
+        assert client.unlink.call_args_list == [call("t:self:s1", "t:self:s2"), call("t:self:s3")]
+        assert [r.levelno for r in caplog.records if "drained 6 keys" in r.getMessage()] == [logging.INFO]
+
+        assert backend.drain_tracked(REG, []) == set()
+        client.register_script.assert_called_once_with(provider_module._DRAIN_SCRIPT)
+
+    def test_undecodable_members_are_one_warning_without_bytes(self, caplog):
+        backend, _, _ = _drain_backend([b"\xff\xfe", b"\xc3\x28", b"good"])
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            assert backend.drain_tracked(REG, []) == {"good"}
+        (warning,) = [r for r in caplog.records if "undecodable" in r.getMessage()]
+        assert "unlinked 2 undecodable members" in warning.getMessage()
+        assert "\\xff" not in caplog.text and REG not in caplog.text
+
+    def test_round_guard_stops_with_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(provider_module, "_DRAIN_CHUNK", 1)
+        monkeypatch.setattr(provider_module, "_DRAIN_MAX_ROUNDS", 2)
+        monkeypatch.setattr(provider_module, "_DRAIN_WARN_KEYS", 1)
+        backend, _, script = _drain_backend([b"a"], [b"b"])
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            assert backend.drain_tracked(REG, []) == {"a", "b"}
+        assert script.call_count == 2
+        assert "stopped after 2 rounds" in caplog.text
+        assert [r.levelno for r in caplog.records if "drained 2 keys" in r.getMessage()] == [logging.WARNING]
+
+    def test_script_failure_is_classified_and_skips_stragglers(self):
+        backend, client, _ = _drain_backend(RedisConnectionError("lost"))
+        with pytest.raises(BackendError) as exc_info:
+            backend.drain_tracked(REG, ["s1"])
+        assert exc_info.value.is_transient
+        client.unlink.assert_not_called()
+
+
+@pytest.mark.unit
+class TestClassifyRedisErrorClusterDown:
+    """ClusterDownError subclasses ResponseError, so its TRANSIENT branch must run before PERMANENT."""
+
+    def test_cluster_down_is_transient(self):
+        from redis.exceptions import ClusterDownError
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(ClusterDownError("CLUSTERDOWN The cluster is down"), operation="get")
+
+        assert error.error_type == BackendErrorType.TRANSIENT
+
+    def test_plain_response_error_stays_permanent(self):
+        from redis.exceptions import ResponseError
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(
+            ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value"), operation="get"
+        )
+
+        assert error.error_type == BackendErrorType.PERMANENT
+
+
+@pytest.mark.unit
+class TestProviderIssuedBackendFollowsTheCallingTenant:
+    """LAB-4773: the decorator keeps one backend for the life of the process, so a
+    provider-issued backend must scope each operation to the calling context's tenant."""
+
+    @staticmethod
+    def _as_tenant(tenant, fn, *args):
+        token = tenant_context.set(tenant)
+        try:
+            return fn(*args)
+        finally:
+            tenant_context.reset(token)
+
+    @staticmethod
+    def _tenants(fake: _FakeRedis) -> set[str]:
+        return {key.split(":", 2)[1] for key in fake._store}
+
+    @pytest.mark.parametrize(
+        ("tenant", "wire"),
+        [
+            ("org:1", "org%3A1"),
+            (b"acme", "acme"),
+            (7, "7"),
+            (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"),
+            # asyncpg / uuid6 hand out uuid.UUID subclasses
+            (type("DriverUUID", (uuid.UUID,), {})(int=1), "00000000-0000-0000-0000-000000000001"),
+            # a subclass's __str__ override is ignored, so it cannot merge two tenants' prefixes
+            (type("OpaqueUUID", (uuid.UUID,), {"__str__": lambda _: "same"})(int=1), "00000000-0000-0000-0000-000000000001"),
+        ],
+    )
+    def test_accepted_tenant_ids_encode_to_their_canonical_form(self, tenant, wire):
+        shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
+        assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
+        assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
+
+    @pytest.mark.parametrize(
+        "tenant", [object(), True, False, enum.IntEnum("Org", "A").A], ids=["object", "True", "False", "IntEnum"]
+    )
+    def test_tenant_ids_whose_str_is_not_canonical_are_refused(self, tenant):
+        """str() of an arbitrary object (default repr embeds id()) could merge two tenants; a bool or
+        IntEnum tenant is a caller bug whose str() is not canonical (str(True) is 'True', an IntEnum's
+        varies by Python version)."""
+        client = Mock()
+        with pytest.raises(TypeError):
+            PerRequestRedisBackend(client, tenant)
+        shared = PerRequestRedisBackend(client, "default", follow_context=True)
+        with pytest.raises(TypeError):
+            self._as_tenant(tenant, shared.get, "k")
+        client.get.assert_not_called()
+
+    def test_a_context_without_a_tenant_falls_back_to_default_or_the_call_time_tenant(self):
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379")
+        try:
+            # An empty context (e.g. a thread that inherited none) has no tenant: get_shared_backend()
+            # falls back to "default", get_backend() to the tenant current at the call.
+            shared = self._as_tenant("tenant-x", provider.get_shared_backend)
+            assert contextvars.Context().run(lambda: shared.key_prefix) == "t:default:"
+            assert self._as_tenant("tenant-y", lambda: shared.key_prefix) == "t:tenant-y:"
+            backend = self._as_tenant("tenant-x", provider.get_backend)
+            assert contextvars.Context().run(lambda: backend.key_prefix) == "t:tenant-x:"
+            assert self._as_tenant("tenant-y", lambda: backend.key_prefix) == "t:tenant-y:"
+        finally:
+            provider.close()
+
+    def test_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self):
+        from cachekit import cache
+
+        fake = _FakeRedis()
+
+        @cache(ttl=60, backend=PerRequestRedisBackend(fake, "default", follow_context=True), l1_enabled=False)
+        def lookup(x):
+            return x
+
+        self._as_tenant("tenant-a", lookup, 1)
+        self._as_tenant("tenant-b", lookup, 1)
+
+        self._as_tenant("tenant-a", lookup.invalidate_cache)
+        assert self._tenants(fake) == {"tenant-b"}
+        self._as_tenant("tenant-b", lookup.invalidate_cache)  # tenant-b's entry stayed tracked
+        assert fake._store == {}
+
+    async def test_async_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self, monkeypatch):
+        from cachekit import cache
+
+        monkeypatch.setattr(Lock, "lua_release", None)  # bind the release script to this fake (see above)
+        fake = _FakeRedis()
+
+        @cache(ttl=60, backend=PerRequestRedisBackend(fake, "default", follow_context=True), l1_enabled=False)
+        async def lookup(x):
+            return x
+
+        async def as_tenant(tenant, fn, *args):
+            tenant_context.set(tenant)  # each create_task below runs this in its own context copy
+            await fn(*args)
+
+        await asyncio.create_task(as_tenant("tenant-a", lookup, 1))
+        await asyncio.create_task(as_tenant("tenant-b", lookup, 1))
+
+        await asyncio.create_task(as_tenant("tenant-a", lookup.ainvalidate_cache))
+        assert self._tenants(fake) == {"tenant-b"}
+        await asyncio.create_task(as_tenant("tenant-b", lookup.ainvalidate_cache))
+        assert fake._store == {}
+
+
+@pytest.mark.unit
+class TestClassifyRedisErrorMisfiles:
+    """TryAgainError subclasses ResponseError; InvalidResponse and LockError match no base branch."""
+
+    def test_try_again_is_transient(self):
+        exceptions = pytest.importorskip("redis.exceptions")
+        if not hasattr(exceptions, "TryAgainError"):
+            pytest.skip("redis-py lacks TryAgainError")
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(
+            exceptions.TryAgainError("TRYAGAIN Multiple keys request during rehashing"), operation="get"
+        )
+
+        assert error.error_type == BackendErrorType.TRANSIENT
+
+    @pytest.mark.parametrize("exc_name", ["InvalidResponse", "LockError"])
+    def test_protocol_and_lock_errors_are_permanent(self, exc_name):
+        import redis.exceptions
+
+        from cachekit.backends.errors import BackendErrorType
+        from cachekit.backends.redis.error_handler import classify_redis_error
+
+        error = classify_redis_error(getattr(redis.exceptions, exc_name)("boom"), operation="get")
+
+        assert error.error_type == BackendErrorType.PERMANENT
+
+
+def _decorate(is_async: bool, calls: list, **options):
+    """One @cache function per test, sync or async, recording each real execution in ``calls``."""
+    from cachekit import cache
+
+    if is_async:
+
+        @cache(ttl=60, **options)
+        async def lookup(x):
+            calls.append(x)
+            return x
+
+    else:
+
+        @cache(ttl=60, **options)
+        def lookup(x):
+            calls.append(x)
+            return x
+
+    return lookup
+
+
+async def _call(fn, *args):
+    result = fn(*args)
+    return await result if inspect.isawaitable(result) else result
+
+
+_BOTH_PATHS = pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+
+
+@pytest.fixture(params=["backend=", "shared-provider", "call-time-provider"])
+def tenant_backend(request, monkeypatch):
+    """How the function gets its tenant-scoped backend, a _FakeRedis behind each: ``backend=`` at
+    decoration, or at its first call from a provider handing out RedisBackendProvider's
+    get_shared_backend() (as env auto-detection does; the tenant is checked after resolving it) or
+    get_backend() (which checks the tenant while building it). Yields (decorator options, client).
+
+    tests/unit's conftest resets neither L1 nor the DI container, so this does both itself."""
+    from cachekit.backends.provider import BackendProviderInterface
+    from cachekit.config import decorator as decorator_config
+    from cachekit.di import DIContainer
+    from cachekit.l1_cache import get_l1_cache_manager
+
+    monkeypatch.setattr(Lock, "lua_release", None)  # async misses take the lock: bind its script to this fake
+    fake = _FakeRedis()
+    options = {}
+    if request.param == "backend=":
+        options["backend"] = PerRequestRedisBackend(fake, "default", follow_context=True)
+    else:
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379")
+        provider._client = fake
+        get_backend = provider.get_shared_backend if request.param == "shared-provider" else provider.get_backend
+        monkeypatch.setattr(decorator_config, "_default_backend", None)
+        monkeypatch.setitem(DIContainer()._singletons, BackendProviderInterface, SimpleNamespace(get_backend=get_backend))
+    get_l1_cache_manager().clear_all()
+    yield options, fake
+    get_l1_cache_manager().clear_all()
+
+
+@pytest.fixture
+def live_breakers(monkeypatch):
+    """Every circuit breaker a decorator builds from here on, so a test can open it."""
+    from cachekit.decorators import orchestrator
+
+    built = []
+
+    class Recorded(orchestrator.CircuitBreaker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(orchestrator, "CircuitBreaker", Recorded)
+    return built
+
+
+@pytest.mark.unit
+class TestUnsupportedTenantIdRaisesThroughTheDecorator:
+    """LAB-5713: a tenant id of a type _encode_tenant rejects is a caller bug, not a cache fault.
+
+    Both wrappers must raise it before the function runs, however the function got its backend and
+    whatever the breaker state. Degraded to an uncached call it counted a failure on the
+    per-function breaker every tenant shares, so one bad caller turned caching off for all of them."""
+
+    @_BOTH_PATHS
+    @pytest.mark.parametrize("tenant", [1.5, True, object()], ids=["float", "bool", "object"])
+    async def test_raises_before_the_function_runs(self, tenant_backend, caplog, is_async, tenant):
+        options, fake = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+
+        with as_tenant(tenant), pytest.raises(TypeError, match=f"not {type(tenant).__name__}$"):
+            await _call(lookup, 1)
+
+        assert calls == []
+        assert fake._store == {}
+        # Raised before any cache operation, so none is logged as a failed get / set.
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @_BOTH_PATHS
+    async def test_breaker_other_tenants_share_stays_closed(self, tenant_backend, is_async):
+        options, fake = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+
+        for _ in range(6):  # one past the default failure threshold
+            with as_tenant(1.5), pytest.raises(TypeError):
+                await _call(lookup, 1)
+
+        breaker = lookup.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+        with as_tenant("tenant-b"):
+            assert await _call(lookup, 1) == 1
+        assert calls == [1]
+        assert {key.split(":", 2)[1] for key in fake._store} == {"tenant-b"}
+
+    @_BOTH_PATHS
+    async def test_raises_while_the_breaker_is_open(self, tenant_backend, live_breakers, is_async):
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, l1_enabled=False, **options)
+        with as_tenant("tenant-b"):
+            await _call(lookup, 1)  # the function has its backend from here on
+        (breaker,) = live_breakers
+        for _ in range(breaker.config.failure_threshold):
+            breaker.record_failure()
+        assert lookup.get_health_status()["circuit_breaker"]["state"] == "open"
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 2)
+
+        assert calls == [1]
+
+    @_BOTH_PATHS
+    async def test_raises_on_an_l1_hit(self, tenant_backend, is_async):
+        """L1 is shared by every tenant, so an entry tenant-b cached is there for any caller: the
+        check runs before the L1 lookup once the function has its backend."""
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(is_async, calls, **options)
+        with as_tenant("tenant-b"):
+            await _call(lookup, 1)
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 1)
+
+        assert calls == [1]
+
+    @pytest.mark.parametrize("tenant_backend", ["shared-provider", "call-time-provider"], indirect=True)
+    async def test_async_interop_call_raises_rather_than_degrading(self, tenant_backend):
+        """The async interop path resolves the backend on a branch of its own. A tenant-scoped backend
+        is refused under interop anyway (at decoration, given as ``backend=``); an unsupported tenant
+        must not turn that into an uncached call."""
+        options, _ = tenant_backend
+        calls: list = []
+        lookup = _decorate(True, calls, l1_enabled=False, interop="lookup", namespace="users", **options)
+
+        with as_tenant(1.5), pytest.raises(TypeError):
+            await _call(lookup, 1)
+
+        assert calls == []
+        breaker = lookup.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)

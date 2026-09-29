@@ -13,7 +13,7 @@ Key Features:
 - **Backpressure control** to prevent backend overload
 - **Connection pooling** for optimized performance
 - **Health check methods** for comprehensive monitoring
-- **Structured logging** with correlation IDs and distributed tracing
+- **Structured logging** with per-operation fields
 - **Statistics collection** for Prometheus metrics integration
 
 Architecture Overview:
@@ -34,6 +34,7 @@ Born from production debugging of caching failures:
 Example Usage:
     ```python
     from cachekit import cache
+    from cachekit.config.nested import CircuitBreakerConfig
 
     # Intelligent cache with zero configuration (90% of use cases)
     @cache
@@ -58,7 +59,7 @@ Example Usage:
         return fetch_remote(key)
 
     # Manual configuration when needed (1% of use cases)
-    @cache(ttl=3600, namespace="custom", circuit_breaker=True)
+    @cache(ttl=3600, namespace="custom", circuit_breaker=CircuitBreakerConfig(failure_threshold=10))
     def custom_function():
         return special_computation()
 
@@ -99,7 +100,7 @@ from .health import (
 )
 
 # Interop mode (interop/v1): cross-SDK key generation and value codec.
-# The decorator API is @cache(interop="op", namespace="ns"); these helpers are
+# The decorator API is @cache(interop="op", namespace="users"); these helpers are
 # for manual key/value handling (debugging, out-of-band writers, migrations).
 from .interop import (
     InteropError,

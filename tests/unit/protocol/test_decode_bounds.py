@@ -1,10 +1,14 @@
-"""Untrusted-decode bounds (LAB-2503): protocol vectors + the SDK-local regression guard.
+"""Untrusted-decode bounds: protocol vectors + the SDK-local regression guard.
 
 Why the bound exists and how it works: the ``unpackb_bounded`` docstring in
 ``cachekit.serializers.base`` (the canonical home). This file pins, so a
 msgpack-python bump cannot silently move it:
-- every reject vector is rejected on every decode path, with a bounded peak;
-- every accept vector decodes on every path (the bound cannot over-tighten);
+- every reject vector is rejected on every decode path by the pre-decode structural guard
+  itself: the error (or one in its cause/context chain) is the guard's own
+  ``Unpack failed: MessagePack document ...``, which no decoder produces, so a path that
+  skips the guard fails even if msgpack still rejects the bytes later; the peak stays bounded;
+- ``validate_data`` (which returns a bool) proves the same through a spy on the guard;
+- every accept vector decodes on every path at its declared depth (the bound cannot over-tighten);
 - the nesting ceiling is exactly MSGPACK_MAX_NESTING;
 - the read path turns a bomb into SerializationError (a controlled miss), not a crash.
 
@@ -15,9 +19,14 @@ Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import threading
 import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
@@ -26,18 +35,26 @@ from typing import Any
 import msgpack
 import pytest
 
+import cachekit.serializers.base as serializers_base
+from cachekit import logging as ck_logging
 from cachekit._rust_serializer import ByteStorage, check_msgpack_structure
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
 from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.base import MSGPACK_MAX_NESTING, SerializationError, unpackb_bounded
+from cachekit.serializers.interop_serializer import InteropSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "decode-bounds.json"
-FIXTURE_SHA256 = "75c1204e6f58f5220581d3e40e75a68f2df605b4e3c817107b0c690cd7da5cd4"  # pragma: allowlist secret
+FIXTURE_SHA256 = "907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916"  # pragma: allowlist secret
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-EXPECTED_COUNTS = {"reject_vectors": 13, "accept_vectors": 2}
+EXPECTED_COUNTS = {"reject_vectors": 17, "accept_vectors": 3}
+
+# Only check_msgpack_structure raises this. msgpack's own rejections read "Unpack failed: incomplete
+# input" and the like, and the interop wrapper's "not a single well-formed MessagePack document" wraps
+# whatever it caught — so a substring match on "MessagePack document" would pass with the guard gone.
+GUARD_ERROR_PREFIX = "Unpack failed: MessagePack document "
 
 # Peak transient heap a rejected decode may cost: a small constant (tracemalloc + unpackb
 # overhead) plus a few multiples of the input. Unguarded, the nested_array32_input_len vector
@@ -46,8 +63,8 @@ PEAK_BUDGET = 2 * 1024 * 1024
 PEAK_PER_INPUT_BYTE = 4
 
 
-def _envelope(payload: bytes) -> bytes:
-    return bytes(ByteStorage("msgpack").store(payload, "msgpack"))
+def _envelope(payload: bytes, format_id: str = "msgpack") -> bytes:
+    return bytes(ByteStorage("msgpack").store(payload, format_id))
 
 
 CACHE_KEY = "ns:decode:bounds"
@@ -61,9 +78,9 @@ def _frame_template(serializer: str = "default") -> tuple[dict[str, Any], str]:
     return metadata, serializer_name
 
 
-def _forged_entry(payload: bytes) -> bytes:
+def _forged_entry(payload: bytes, serializer: str = "default") -> bytes:
     """A genuine CK v3 frame with its payload swapped — the backend-write attacker's move."""
-    metadata, serializer_name = _frame_template()
+    metadata, serializer_name = _frame_template(serializer)
     return SerializationWrapper.wrap(_envelope(payload), metadata, serializer_name)
 
 
@@ -71,23 +88,77 @@ def _forged_entry(payload: bytes) -> bytes:
 DECODE_PATHS: dict[str, Callable[[bytes], Any]] = {
     "unpackb_bounded": lambda b: unpackb_bounded(b, raw=False),
     "interop": decode_interop_value,
+    "interop_serializer": InteropSerializer().deserialize,
     "standard/plain": StandardSerializer(enable_integrity_checking=False).deserialize,
     "standard/envelope": lambda b: StandardSerializer().deserialize(_envelope(b)),
     "auto/plain": AutoSerializer(enable_integrity_checking=False).deserialize,
     "auto/envelope": lambda b: AutoSerializer().deserialize(_envelope(b)),
-    "handler.deserialize_data": lambda b: CacheSerializationHandler().deserialize_data(_forged_entry(b), cache_key=CACHE_KEY),
+    "handler/default": lambda b: CacheSerializationHandler().deserialize_data(_forged_entry(b), cache_key=CACHE_KEY),
+    "handler/auto": lambda b: CacheSerializationHandler("auto").deserialize_data(_forged_entry(b, "auto"), cache_key=CACHE_KEY),
+    # An unencrypted interop entry is the bare document — no frame to forge (pinned in TestOwnedBounds).
+    "handler/interop": lambda b: CacheSerializationHandler(interop_mode=True, encryption=False).deserialize_data(
+        b, cache_key=CACHE_KEY
+    ),
 }
 
 
-def _peak_of(fn: Callable[..., Any], *args: Any) -> tuple[Any, BaseException | None, int]:
+def _assert_guard_rejected(exc: BaseException) -> None:
+    """Fail unless the structural guard's own error is exc or in its cause/context chain."""
+    link: BaseException | None = exc
+    while link is not None:
+        if str(link).startswith(GUARD_ERROR_PREFIX):
+            return
+        link = link.__cause__ or link.__context__
+    pytest.fail(f"rejected, but not by the structural guard: {exc!r}")
+
+
+def _peak_of(fn: Callable[..., Any], *args: Any) -> int:
     tracemalloc.start()
     try:
-        return fn(*args), None, tracemalloc.get_traced_memory()[1]
-    except (ValueError, SerializationError) as e:
-        # The only rejections the read path maps to a controlled miss; any other type propagates.
-        return None, e, tracemalloc.get_traced_memory()[1]
+        with contextlib.suppress(ValueError, SerializationError):  # the tests assert the rejection in-process
+            fn(*args)
+        return tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
+
+
+def _measure_peaks() -> dict[str, int]:
+    """Every heap peak this file asserts on, keyed by case. Runs only in a fresh interpreter."""
+    # cachekit's structured logger flushes from a background thread: stop it, so no other thread
+    # can be allocating while tracemalloc starts or stops.
+    for structured in ck_logging._logger_instances.values():
+        structured.writer.stop()
+        structured.writer.join()
+    assert threading.active_count() == 1, f"tracemalloc must not start or stop beside {threading.enumerate()}"
+    cases = {
+        f"{path}:{v['name']}": (fn, bytes.fromhex(v["input_hex"]))
+        for path, fn in DECODE_PATHS.items()
+        for v in VECTORS["reject_vectors"]
+    }
+    validate_data = AutoSerializer(enable_integrity_checking=False).validate_data
+    cases |= {f"validate_data:{v['name']}": (validate_data, bytes.fromhex(v["input_hex"])) for v in VECTORS["reject_vectors"]}
+    peaks = {case: _peak_of(fn, data) for case, (fn, data) in cases.items()}
+    assert threading.active_count() == 1, f"a thread started while peaks were measured: {threading.enumerate()}"
+    return peaks
+
+
+@pytest.fixture(scope="module")
+def peaks() -> dict[str, int]:
+    # tracemalloc.start()/stop() swap the process-wide allocator hooks without synchronising
+    # with threads that are allocating at that moment, so on a free-threaded build a concurrent
+    # allocation (pytest-xdist's I/O thread, for one) can crash the process:
+    # https://github.com/python/cpython/issues/143143. Peaks are measured in a fresh,
+    # single-threaded interpreter running this file, importing the same modules as this one.
+    proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + this file)
+        [sys.executable, __file__],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"peak measurement subprocess exited {proc.returncode}:\n{proc.stderr}")
+    return json.loads(proc.stdout)
 
 
 def _vector_ids(group: str) -> list[str]:
@@ -108,19 +179,23 @@ class TestFixtureIsTheVendoredProtocolFile:
 @pytest.mark.parametrize("path", DECODE_PATHS)
 class TestProtocolVectors:
     @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
-    def test_reject_vector_is_rejected_with_bounded_peak(self, path: str, vector: dict[str, Any]) -> None:
+    def test_reject_vector_is_rejected_with_bounded_peak(self, path: str, vector: dict[str, Any], peaks: dict[str, int]) -> None:
         data = bytes.fromhex(vector["input_hex"])
-        _, err, peak = _peak_of(DECODE_PATHS[path], data)
-        assert err is not None, f"{vector['name']}: {path} decoded a reject vector"
+        # The only rejections the read path maps to a controlled miss; any other type propagates.
+        with pytest.raises((ValueError, SerializationError)) as excinfo:
+            DECODE_PATHS[path](data)
+        _assert_guard_rejected(excinfo.value)
+        peak = peaks[f"{path}:{vector['name']}"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(data), f"{vector['name']}: {path} peaked at {peak} bytes"
 
     @pytest.mark.parametrize("vector", VECTORS["accept_vectors"], ids=_vector_ids("accept_vectors"))
     def test_accept_vector_decodes(self, path: str, vector: dict[str, Any]) -> None:
         data = bytes.fromhex(vector["input_hex"])
         value = DECODE_PATHS[path](data)
+        # Every accept vector nests through the first element of a list, or the only value of a map.
         depth = 0
-        while isinstance(value, list):
-            depth, value = depth + 1, value[0] if value else None
+        while isinstance(value, (list, dict)):
+            depth, value = depth + 1, next(iter(value.values() if isinstance(value, dict) else value), None)
         assert depth == vector["nesting_depth"]
 
 
@@ -228,23 +303,69 @@ class TestOwnedBounds:
         with pytest.raises(SerializationError, match="not a decodable MessagePack payload"):
             AutoSerializer(enable_integrity_checking=False).deserialize(_reject_vector("bin32_overclaim"))
 
-    def test_validate_data_reports_a_bomb_as_invalid_within_the_peak_budget(self) -> None:
+    @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
+    def test_validate_data_reports_a_bomb_as_invalid_via_the_guard(
+        self, vector: dict[str, Any], peaks: dict[str, int], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Python-only validate_data is a decode path too: a bomb must read as invalid (not raise),
-        # and the walk must have stopped it before the decoder pre-allocated ~8000x the input.
+        # and the walk must have stopped it before the decoder pre-allocated ~8000x the input. The
+        # bool hides which check rejected, so a spy on the guard (looked up as a module global of
+        # serializers.base by unpackb_bounded at call time) records its error.
+        guard, guard_errors = serializers_base.check_msgpack_structure, []
+
+        def spy(data: Any, max_depth: int) -> None:
+            try:
+                guard(data, max_depth)
+            except ValueError as e:
+                guard_errors.append(e)
+                raise
+
+        monkeypatch.setattr(serializers_base, "check_msgpack_structure", spy)
         serializer = AutoSerializer(enable_integrity_checking=False)
         assert serializer.validate_data(msgpack.packb({"t": 1})) is True
-        bomb = _reject_vector("nested_array32_input_len_depth_1100")
-        valid, err, peak = _peak_of(serializer.validate_data, bomb)
-        assert (valid, err) == (False, None)
+        bomb = bytes.fromhex(vector["input_hex"])
+        assert serializer.validate_data(bomb) is False
+        assert guard_errors, "validate_data rejected the bomb without the structural guard raising"
+        peak = peaks[f"validate_data:{vector['name']}"]
         assert peak < PEAK_BUDGET + PEAK_PER_INPUT_BYTE * len(bomb), f"validate_data peaked at {peak} bytes"
 
+    def test_unencrypted_interop_entry_is_the_bare_document(self) -> None:
+        # Why "handler/interop" feeds the vector bytes straight to deserialize_data: there is no frame.
+        handler = CacheSerializationHandler(interop_mode=True, encryption=False)
+        assert handler.serialize_data({"t": 1}, cache_key=CACHE_KEY) == msgpack.packb({"t": 1})
+
+    @pytest.mark.parametrize("vector", VECTORS["reject_vectors"], ids=_vector_ids("reject_vectors"))
     @pytest.mark.parametrize("original_type", ["dataframe", "series"])
-    def test_bomb_behind_a_dataframe_or_series_frame_is_a_controlled_miss(self, original_type: str) -> None:
-        # AutoSerializer's metadata routes decode outside the verified-envelope normaliser; the bound's
-        # rejection must still reach the handler as SerializationError (evict + tamper hook), never a
-        # bare ValueError. The message match keeps a "Serializer mismatch" error from faking a pass.
+    def test_bomb_behind_a_dataframe_or_series_frame_is_a_controlled_miss(
+        self, original_type: str, vector: dict[str, Any]
+    ) -> None:
+        # AutoSerializer's metadata routes decode outside the verified-envelope normaliser, through its own
+        # unpackb_bounded call; the guard must still be what rejects, and the rejection must reach the
+        # handler as SerializationError (evict + tamper hook), never a bare ValueError. The message match
+        # keeps a "Serializer mismatch" error from faking a pass.
         metadata, serializer_name = _frame_template("auto")
-        bomb = _reject_vector("nested_array32_input_len_depth_1100")
-        frame = SerializationWrapper.wrap(_envelope(bomb), {**metadata, "original_type": original_type}, serializer_name)
-        with pytest.raises(SerializationError, match=f"failed to decode as {original_type}"):
+        bomb = bytes.fromhex(vector["input_hex"])
+        # The envelope carries the SAME format as the header: this test is about the decode bound,
+        # not about format disagreement (which fails closed earlier — see the test below). Tagging
+        # the envelope "msgpack" under a columnar header made this an accidental disagreement case.
+        frame = SerializationWrapper.wrap(
+            _envelope(bomb, original_type), {**metadata, "original_type": original_type}, serializer_name
+        )
+        with pytest.raises(SerializationError, match=f"failed to decode as {original_type}") as excinfo:
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
+        _assert_guard_rejected(excinfo.value)
+
+    def test_envelope_format_disagreeing_with_the_header_is_a_controlled_miss(self) -> None:
+        # A format disagreement must reach the handler as SerializationError (evict + tamper hook),
+        # never as a decoded value. One columnar case: the check is a string inequality, not a branch
+        # on which type — tests/unit/test_auto_serializer_mutation_and_corruption.py covers the shapes.
+        metadata, serializer_name = _frame_template("auto")
+        frame = SerializationWrapper.wrap(
+            _envelope(msgpack.packb({"t": 1})), {**metadata, "original_type": "dataframe"}, serializer_name
+        )
+        with pytest.raises(SerializationError, match="disagrees with header format"):
+            CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
+
+
+if __name__ == "__main__":
+    json.dump(_measure_peaks(), sys.stdout)
