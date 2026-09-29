@@ -1,12 +1,12 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "spec": "spec/interop-mode.md",
   "generator": "tools/interop-reference.py (CPython stdlib)",
   "cross_checked_by": "tools/interop-crosscheck.mjs (independent encoder + @noble/hashes blake2b + WebCrypto HKDF/AES-GCM)",
   "hash_algorithm": "blake2b-256 (digest_size=32, unkeyed) over canonical MessagePack of the flat argument array",
   "key_format": "{namespace}:{operation}:{args_hash}",
   "segment_pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
-  "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline).",
+  "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline). namespace additionally MUST NOT be exactly 'ns' or 'nsapi' (reserved: the server parses those key prefixes). The reservation is namespace-only; operation has no reserved values.",
   "width_coverage_note": "All *16 header boundaries (uint/int widths, str8->str16, bin8->bin16, fixarray->array16, fixmap->map16, including the root argument array) are pinned by vectors. The *32 tier (str32/bin32/array32/map32, >=64 KiB or >=65536 elements) is normative and implemented by both tools but untested-by-design: fixture blobs that size would bloat the file without exercising different logic (same length-prefix code path, wider field).",
   "error_vectors_note": "The 'error' field is a human-readable reason for maintainers. Conformance means the input MUST be rejected with an error; the message text is not normative.",
   "tagged_json": {
@@ -593,6 +593,18 @@
       "canonical_args_hex": "932aa568656c6c6f82a16101a16202",
       "args_hash": "03a0edbae0c1b5816c431652268d1527730175cdc0b45807cb07e1025ff971f6",
       "expected_key": "t:op:03a0edbae0c1b5816c431652268d1527730175cdc0b45807cb07e1025ff971f6"
+    },
+    {
+      "name": "reservation_scope",
+      "description": "The ns/nsapi reservation is exact-match and namespace-only: namespace 'nsapix' (rejected by an ns* or nsapi* prefix match) and operation 'nsapi' stay valid",
+      "namespace": "nsapix",
+      "operation": "nsapi",
+      "args": [
+        1
+      ],
+      "canonical_args_hex": "9101",
+      "args_hash": "405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a",
+      "expected_key": "nsapix:nsapi:405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a"
     }
   ],
   "value_vectors": [
@@ -712,6 +724,20 @@
       "operation": "get_user",
       "args": [],
       "error": "segment validation must be a FULL-string match (Python re.match + $ accepts a trailing newline; use fullmatch)"
+    },
+    {
+      "name": "reject_reserved_namespace_ns",
+      "namespace": "ns",
+      "operation": "get_user",
+      "args": [],
+      "error": "namespace 'ns' is reserved: the server parses a key starting 'ns:' as namespace-prefixed (here it would scope the key to a namespace named 'get_user')"
+    },
+    {
+      "name": "reject_reserved_namespace_nsapi",
+      "namespace": "nsapi",
+      "operation": "users.fetch_by_id",
+      "args": [],
+      "error": "namespace 'nsapi' is reserved: the server parses a key starting 'nsapi:' as namespace-prefixed (rejected whatever the operation, including one the server would 400 on for its '.')"
     }
   ],
   "aad_vectors": [

@@ -190,7 +190,7 @@ jobs:
 
     - name: Run markdown documentation examples
       if: ${{ !cancelled() && matrix.python-version == '3.12' }}
-      run: uv run pytest --markdown-docs docs/
+      run: uv run pytest --markdown-docs README.md docs/
 
     # Deterministic memory invariants (RSS/allocation bounds), not wall-clock benchmarks. These
     # are `performance and slow` — the mmap zero-copy read (#171) and the large-object allocation
