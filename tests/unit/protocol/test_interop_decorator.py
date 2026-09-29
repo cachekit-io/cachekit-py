@@ -301,6 +301,16 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    def test_wrapper_uses_the_validated_namespace_after_validation(self, backend: DictBackend):
+        """create_cache_wrapper rebinds namespace to the exact str it validated,
+        so later checks such as the key-registry 'ck' reservation cannot be
+        dodged by a subclass whose __eq__ lies."""
+        with pytest.raises(ConfigurationError, match="key registry"):
+
+            @_decorate(backend, interop="get_user", namespace=UnhashableAsReserved("ck"))
+            def f(x: int):
+                return x
+
     def test_custom_key_function_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="key"):
 
