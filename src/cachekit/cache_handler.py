@@ -1455,14 +1455,55 @@ class CacheOperationHandler:
             >>> key1 == key2  # _bypass_cache doesn't affect key
             True
         """
+        return self._generated_key(
+            func, args, kwargs, namespace, integrity_checking, self.serialization_handler.serializer_key_name
+        )
+
+    # Pre-0.20.0 releases never passed the serializer to generate_key, so every generated
+    # key ended in the default code `s` whatever the serializer was (LAB-4351). A
+    # deployment upgraded from one still holds those entries — and old replicas keep
+    # writing them during a rolling deploy — at a key the current code never computes.
+    # Invalidating only the current key would let an erasure return normally while the
+    # pre-upgrade copy survives to its TTL, or forever at ttl=None, so single-key
+    # invalidation also deletes this one. Over-deleting costs a `default`-serializer
+    # decorator on the same function and arguments one recompute; under-deleting leaks
+    # retained data. Remove only in a major release whose notes declare upgrades from below
+    # 0.20.0 unsupported: ttl=None entries never age out, so no TTL clock can retire this.
+    def get_legacy_cache_key(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        namespace: str | None,
+        integrity_checking: bool = True,
+    ) -> str:
+        """The key a pre-0.20.0 release wrote for this call; equal to get_cache_key's on the default serializer.
+
+        Examples:
+            >>> from cachekit.key_generator import CacheKeyGenerator
+            >>> def my_func(x): return x
+            >>> auto = CacheOperationHandler(CacheSerializationHandler("auto"), CacheKeyGenerator())
+            >>> auto.get_cache_key(my_func, (1,), {}, None)[-3:], auto.get_legacy_cache_key(my_func, (1,), {}, None)[-3:]
+            (':1a', ':1s')
+            >>> std = CacheOperationHandler(CacheSerializationHandler(), CacheKeyGenerator())
+            >>> std.get_legacy_cache_key(my_func, (1,), {}, None) == std.get_cache_key(my_func, (1,), {}, None)
+            True
+        """
+        return self._generated_key(func, args, kwargs, namespace, integrity_checking, "default")
+
+    def _generated_key(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        namespace: str | None,
+        integrity_checking: bool,
+        serializer_type: str,
+    ) -> str:
+        """generate_key minus reserved kwargs: one filter, so a legacy key hashes the same arguments."""
         filtered_kwargs = {k: v for k, v in kwargs.items() if k != "_bypass_cache"}
         return self.key_generator.generate_key(
-            func,
-            args,
-            filtered_kwargs,
-            namespace,
-            integrity_checking,
-            serializer_type=self.serialization_handler.serializer_key_name,
+            func, args, filtered_kwargs, namespace, integrity_checking, serializer_type=serializer_type
         )
 
     def _handle_l2_read_error(self, e: SerializationError, cache_key: str) -> None:

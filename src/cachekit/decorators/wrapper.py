@@ -1150,8 +1150,16 @@ def create_cache_wrapper(
         flat = bind_flat_args(_interop_sig, call_args, call_kwargs)
         return generate_interop_key(namespace, interop, flat)
 
+    # The generated key is the only one carrying a serializer code, so it alone has a
+    # pre-0.20.0 twin. One flag, read by both functions below, so the twin can never be
+    # computed for a key the write path did not generate.
+    _generated_key_mode = interop is None and custom_key_func is None and not fast_mode
+
     def _resolve_cache_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str:
         """Single key derivation shared by the read/write and invalidate paths (LAB-4387)."""
+        # Standard key generation with type-aware handling
+        if _generated_key_mode:
+            return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
         # Interop mode takes priority (mutually exclusive with key= and fast_mode)
         if interop is not None:
             return _interop_cache_key(call_args, call_kwargs)
@@ -1161,13 +1169,18 @@ def create_cache_wrapper(
             if not isinstance(custom_key, str):
                 raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
             return f"{namespace or 'default'}:{custom_key}"
-        if fast_mode:
-            # Minimal key generation - no string formatting overhead (10-50μs savings)
-            from ..hash_utils import cache_key_hash
+        # fast_mode: minimal key generation - no string formatting overhead (10-50μs savings)
+        from ..hash_utils import cache_key_hash
 
-            return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
-        # Standard key generation with type-aware handling
-        return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
+        return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
+
+    def _resolve_invalidation_keys(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> list[str]:
+        """The key _resolve_cache_key derives, plus its pre-0.20.0 twin on the generated-key path."""
+        cache_key = _resolve_cache_key(call_args, call_kwargs)
+        if not _generated_key_mode:
+            return [cache_key]
+        legacy_key = operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
+        return [cache_key] if legacy_key == cache_key else [cache_key, legacy_key]
 
     # Track the cache keys this process wrote or read for this function (for no-args
     # invalidation). Key normalization (hashing of long keys) makes prefix matching
@@ -2336,6 +2349,11 @@ def create_cache_wrapper(
         elif _l1_cache:
             _l1_cache.invalidate(cache_key)
 
+    def _invalidate_keys(cache_keys: list[str]) -> None:
+        """_invalidate_key per key: each logs its own failure, so one never skips the next."""
+        for cache_key in cache_keys:
+            _invalidate_key(cache_key)
+
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
 
@@ -2362,8 +2380,8 @@ def create_cache_wrapper(
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
-        # Same derivation as the write path — one key, not two (LAB-4387).
-        _invalidate_key(_resolve_cache_key(args, kwargs))
+        # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288).
+        _invalidate_keys(_resolve_invalidation_keys(args, kwargs))
 
     async def ainvalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
@@ -2389,10 +2407,10 @@ def create_cache_wrapper(
             return
 
         # Single-key invalidation (specific args provided, or zero-param function).
-        # Same derivation as the write path — one key, not two (LAB-4387). The sync delete runs
-        # off the loop; never a backend's delete_async, whose pooled client may be bound to an
-        # earlier event loop (asyncio.run per job).
-        await asyncio.to_thread(_invalidate_key, _resolve_cache_key(args, kwargs))
+        # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288). The
+        # sync deletes run off the loop; never a backend's delete_async, whose pooled client may
+        # be bound to an earlier event loop (asyncio.run per job).
+        await asyncio.to_thread(_invalidate_keys, _resolve_invalidation_keys(args, kwargs))
 
     def check_health() -> dict[str, Any]:
         """Check health status of this cached function's infrastructure."""
