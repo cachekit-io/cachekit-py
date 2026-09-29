@@ -22,7 +22,6 @@ import pytest
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import (
-    CacheInvalidator,
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
@@ -217,35 +216,33 @@ class TestStandardCacheHandlerRedaction:
         _assert_redacted(caplog, TENANT_KEY)
 
 
-class TestCacheInvalidatorRedaction:
-    """Invalidation failures (sync + async) log the digest of the generated key."""
-
-    def _invalidator(self, error: Exception) -> tuple[CacheInvalidator, _FailingBackend]:
-        backend = _FailingBackend(error)
-        return CacheInvalidator(key_generator=CacheKeyGenerator(), backend=backend, serializer_type="default"), backend
+class TestInvalidationRedaction:
+    """Single-key invalidation failures (sync + async) log the digest of the resolved key."""
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     def test_sync_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
-        invalidator, backend = self._invalidator(error)
+        backend = _FailingBackend(error)
 
+        @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret")
         def cached_func(user: str) -> str:
             return user
 
         with caplog.at_level(logging.ERROR):
-            invalidator.invalidate_cache(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+            cached_func.invalidate_cache("alice")
 
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])
 
     @pytest.mark.parametrize("error", ERRORS, ids=ERROR_IDS)
     async def test_async_invalidation_failure_redacts_key(self, error: Exception, caplog: pytest.LogCaptureFixture) -> None:
-        invalidator, backend = self._invalidator(error)
+        backend = _FailingBackend(error)
 
-        def cached_func(user: str) -> str:
+        @cache(backend=backend, l1_enabled=False, namespace="tenant-42-secret")
+        async def cached_func(user: str) -> str:
             return user
 
         with caplog.at_level(logging.ERROR):
-            await invalidator.invalidate_cache_async(cached_func, ("alice",), {}, namespace="tenant-42-secret")
+            await cached_func.ainvalidate_cache("alice")
 
         assert len(backend.received_keys) == 1
         _assert_redacted(caplog, backend.received_keys[0])

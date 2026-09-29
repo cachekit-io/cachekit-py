@@ -377,6 +377,22 @@ class TestDrain:
         assert backend.store == {}
         assert backend.drain_calls[0][1] == set()  # it knew no keys itself
 
+    def test_fresh_process_drains_custom_keys(self) -> None:
+        """The registry tracks the key the write path wrote, custom key= included (LAB-4387)."""
+        backend = TrackingBackend()
+
+        def f(x: int) -> int:
+            return x
+
+        writer = cache(backend=backend, ttl=60, namespace="drain_custom", key=lambda x: f"user:{x}")(f)
+        writer(1)
+        writer(2)
+        assert set(backend.store) == {key for _, key in backend.track_calls}
+
+        fresh = cache(backend=backend, ttl=60, namespace="drain_custom", key=lambda x: f"user:{x}")(f)
+        fresh.invalidate_cache()
+        assert backend.store == {}
+
     def test_untracked_key_removed_by_next_drain(self) -> None:
         """A key whose track_key failed is gone from L2 and L1 after a drain."""
         backend = TrackingBackend()

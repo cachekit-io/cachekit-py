@@ -412,7 +412,6 @@ CACHEKIT_SOCKET_TIMEOUT=1.0
 CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
 # Cache Configuration
-CACHEKIT_DEFAULT_TTL=3600
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
@@ -623,7 +622,7 @@ for i in range(3):
 | Resource | Description |
 |:---------|:------------|
 | [Troubleshooting Guide](troubleshooting.md) | Solutions for common errors |
-| [Error Codes](error-codes.md) | Complete error code reference |
+| [Error Reference](error-codes.md) | Exceptions cachekit raises or logs |
 
 ---
 

@@ -270,9 +270,9 @@ class LockableBackend(Protocol):
     features like cache stampede prevention and critical sections.
 
     Not all backends support this capability:
-    - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and
-      therefore the env-resolved Redis path hand out — and ``CachekitIOBackend``
-      (SaaS ``POST /v1/cache/{key}/lock``).
+    - Supported: ``PerRequestRedisBackend`` — the tenant-scoped Redis backend
+      ``RedisBackendProvider`` hands out and the env-resolved Redis path uses — and
+      ``CachekitIOBackend`` (SaaS ``POST /v1/cache/{key}/lock``).
     - Not supported: ``RedisBackend`` constructed directly and passed as
       ``backend=``, ``FileBackend``, L1-only (in-memory).
 
@@ -344,7 +344,8 @@ class KeyTrackableBackend(Protocol):
     A decorated function's no-argument ``invalidate_cache()`` must delete every key
     ANY process wrote for it, not only the keys the calling process remembers. A
     tracking backend keeps one server-side set of written keys per decorated
-    function (the registry id) and drains it on whole-function invalidation.
+    function (the registry id) — per tenant on a tenant-scoped backend — and drains
+    the calling tenant's set on whole-function invalidation.
 
     Not all backends support this capability:
     - Supported: ``PerRequestRedisBackend`` — what ``RedisBackendProvider`` and

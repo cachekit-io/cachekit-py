@@ -168,10 +168,10 @@ class CacheKeyGenerator:
             TypeError: If ``serializer_type`` is not a str.
             ValueError: If ``serializer_type`` is empty. A missing identity must fail here,
                 not fall back to a default code: a fallback is a shared bucket, and a key
-                computed from it is one nothing wrote — an invalidator holding it would
+                computed from it is one nothing wrote — an invalidation holding it would
                 report a successful delete of an entry that is still there.
         """
-        # Guard here, not per caller: every key (write path, CacheInvalidator, direct
+        # Guard here, not per caller: every key (write path, invalidate path, direct
         # generate_key users) passes through this one function.
         if not isinstance(serializer_type, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"serializer_type must be str, got {type(serializer_type).__name__}")

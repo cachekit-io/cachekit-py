@@ -2,7 +2,7 @@
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
-> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). On the env-resolved Redis backend, whole-function invalidation also deletes the L2 entries *other* processes wrote ([key registry](#whole-function-invalidation)). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance L1 invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
+> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). On the tenant-scoped Redis backend (env auto-detection, or a backend from `RedisBackendProvider`), whole-function invalidation also deletes the L2 entries *other* processes wrote for the calling tenant ([key registry](#whole-function-invalidation)). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance L1 invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
 
 > [!IMPORTANT]
 > The within-TTL SWR described on this page runs **only in L1-only mode** (`backend=None`): past the freshness threshold, the SDK serves the cached value and **re-runs your function** in the background. With a backend configured (Redis, File, Memcached), `swr_enabled` has no effect — there is no within-TTL SWR in backed modes. The one backed SWR that exists is `@cache.io`'s past-TTL [`stale_ttl` mode](../configuration.md#stale-while-revalidate-stale_ttl), which uses the CachekitIO backend's read-side freshness signal.
@@ -174,7 +174,7 @@ for uid in [1, 2, 3]:
 - User data refresh
 - Post cache invalidation
 
-**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local.
+**Effect:** The entry is removed from this process's L1 cache **and**, when an L2 backend is configured, deleted from shared L2. Cache keys are deterministic, so the L2 delete removes the entry no matter which process wrote it. In L1-only mode (`backend=None`) there is no L2 to delete from — the invalidation is purely local. If the L2 delete fails, cachekit logs an ERROR `Failed to delete L2 key` and tracks the key in this process, so a later no-args `invalidate_cache()` from the same process retries it. Tracking is process-local: another process, or this one after a restart, does not retry it.
 
 ### Whole-Function Invalidation
 
@@ -191,20 +191,24 @@ get_user.invalidate_cache()
 
 | Backend the decorator resolves | L2 entries deleted |
 |--------------------------------|--------------------|
-| Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (the default, no `backend=`) | Every entry **any process** wrote for the function |
+| Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (the default, no `backend=`), or a backend from `RedisBackendProvider` | Every entry **any process** wrote for the function, for the calling tenant |
 | `RedisBackend` passed as `backend=`, File, Memcached, CachekitIO | Only entries **this process** wrote or read |
 | L1-only (`backend=None`) | No L2; this process's L1 only |
 
-**Key registry (env-resolved Redis).** Every L2 write also adds the key to a server-side set for the function, `t:{tenant}:ck:reg:{namespace}:{hash}`. No-args invalidation drains that set and deletes every key in it, plus any key this process remembers that the set missed. The drain runs in bounded steps of 10 000 keys, so it never blocks Redis for long, and a write that lands during the drain is either deleted or left tracked for the next drain. It adds one pipelined round-trip (`SADD` + `EXPIRE`) to each L2 write — cache hits pay nothing. If that round-trip fails, the write still succeeds and cachekit logs a WARNING `Key tracking failed`: that key is then deleted only by this process's next drain, and other processes' drains miss it until its TTL. The warning fires at most once a minute per function in each process and carries the count of failures since the last one, so a registry outage doesn't flood the logs.
+**Key registry (tenant-scoped Redis).** Every L2 write also adds the key to a server-side set for the function, `t:{tenant}:ck:reg:{namespace}:{hash}`. No-args invalidation drains that set and deletes every key in it, plus any key this process remembers that the set missed. The drain runs in bounded steps of 10 000 keys, so it never blocks Redis for long, and a write that lands during the drain is either deleted or left tracked for the next drain. It adds one pipelined round-trip (`SADD` + `EXPIRE`) to each L2 write — cache hits pay nothing. If that round-trip fails, the write still succeeds and cachekit logs a WARNING `Key tracking failed`: that key is then deleted only by this process's next drain, and other processes' drains miss it until its TTL. The warning fires at most once a minute per function in each process and carries the count of failures since the last one, so a registry outage doesn't flood the logs.
 
 Things to know:
 
-- **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster is not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A key leaves the set only once it has been deleted, so tracked keys a failed drain did not reach wait in the set for the next drain.
+- **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster and sharding proxies (one endpoint in front of several shards) are not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A drain removes a key from the set only after deleting it, so tracked keys a failed drain did not reach stay in the set for the next drain, unless the set expires first.
 - **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation.
-- **Set lifetime.** A tracking set expires 7 days after the last write to its function. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
-- **Tenants.** The set is tenant-scoped like every other key, and a drain can only delete keys inside its own tenant prefix. A decorated function binds to the tenant in `tenant_context` at its first call, so set the tenant before that call. A process that never sets one drains tenant `default`; the INFO line `Key registry drained N keys` shows how many keys a drain deleted.
+- **Set lifetime.** A tracking set expires 7 days after the last tracked write to its function; each write whose tracking round-trip succeeds refreshes that expiry. While the set exists, a key leaves it only when a no-args drain deletes it: the key's own expiry and `invalidate_cache(args)` do not remove it. A zero-parameter function has no drain — its `invalidate_cache()` deletes its one key directly and leaves that key's member in the set until the set expires. A parameterised function that is written continuously and never invalidated with no args therefore grows its set by one member per distinct key. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
+- **Tenants.** The set is tenant-scoped like every other key. Each write is tracked in the set of the tenant in `tenant_context` for that call, and a drain empties only the calling tenant's set and can only delete keys inside that tenant's prefix — `default` when no tenant is set (see **Tenant scope** below). The INFO line `Key registry drained N keys` shows how many keys a drain deleted.
 - **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
 - **Same module path everywhere.** The set is named by the function's `module.qualname`, so every process must import the function from the same module path.
+
+**Custom `key=` functions.** Both forms work. `invalidate_cache(args...)` derives the key with the same `key=` function the write path used, so it deletes the exact entry from this process's L1 and from shared L2. No-args `invalidate_cache()` reaches what the table above says for the resolved backend — the registry tracks the key the write path actually wrote, custom or not. On the backends limited to "this process", tracked keys do not survive a restart, so after a deploy use the exact-args form.
+
+**Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked. L1 is not tenant-scoped: within a process, all tenants share one L1 entry per cache key, so a tenant can be served the value another tenant cached, and `invalidate_cache()` evicts that entry for every tenant. Disable L1 on functions whose results differ by tenant: `@cache(..., l1_enabled=False)`, or with a preset `@cache.production(..., l1_enabled=False)`, which keeps the preset's other L1 settings.
 
 ---
 
@@ -213,7 +217,7 @@ Things to know:
 CacheKit does **not** ship cross-instance L1 invalidation in Python. When running multiple processes or pods against a shared L2 backend:
 
 - `invalidate_cache(args...)` deletes the key from shared L2, so any pod's next **L1 miss** fetches fresh data.
-- `invalidate_cache()` with no arguments does the same for every key of the function on the env-resolved Redis backend ([key registry](#whole-function-invalidation)); on other backends it reaches only the keys the calling process knows.
+- `invalidate_cache()` with no arguments does the same for every key the calling tenant has for the function on the tenant-scoped Redis backend ([key registry](#whole-function-invalidation)); on other backends it reaches only the keys the calling process knows.
 - Pods that still hold the entry in L1 keep serving it until their **L1 TTL** expires (L1 expires 1 second before L2 by design).
 - Worst-case staleness after an invalidation is therefore bounded by the entry's remaining TTL. Size TTLs accordingly for data where cross-pod staleness matters.
 
@@ -288,11 +292,12 @@ def test_function():
 | `test()` | ❌ |
 | `dev()` | L1-only¹ |
 | `production()` | L1-only¹ |
-| `secure()` | L1-only¹ |
+| `secure()` | ❌³ |
 | `io()` | ✓² |
 
 ¹ Within-TTL SWR runs only in L1-only mode (`backend=None`) — with a backend configured, `swr_enabled` has no effect (see the callout at the top of this page).
 ² `@cache.io` ships past-TTL SWR via [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) (default-on), using the CachekitIO backend's freshness signal — a different mechanism from the L1-only within-TTL refresh described here.
+³ `@cache.secure` raises `ConfigurationError` with `backend=None` (L1-only stores raw objects, which cannot be ciphertext), so the L1-only SWR never runs for it.
 
 ---
 
@@ -338,7 +343,7 @@ def apply_category_discount(category_id: int, discount: float):
     get_product.invalidate_cache()
 ```
 
-On the env-resolved Redis backend this deletes every process's L2 entries for `get_product`. On other backends it deletes only the entries this process wrote or read, so for bulk updates where cross-process consistency matters there, prefer short TTLs over relying on invalidation. Either way, other processes' L1 copies live until their L1 TTL.
+On the tenant-scoped Redis backend this deletes every process's L2 entries for `get_product` under the calling tenant (`default` when none is set); to clear several tenants, call it once under each tenant's `tenant_context`. On other backends it deletes only the entries this process wrote or read, so for bulk updates where cross-process consistency matters there, prefer short TTLs over relying on invalidation. Either way, other processes' L1 copies live until their L1 TTL.
 
 ---
 
