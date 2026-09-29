@@ -13,7 +13,7 @@ Key Features:
 - **Backpressure control** to prevent backend overload
 - **Connection pooling** for optimized performance
 - **Health check methods** for comprehensive monitoring
-- **Structured logging** with distributed tracing
+- **Structured logging** with per-operation fields
 - **Statistics collection** for Prometheus metrics integration
 
 Architecture Overview:
