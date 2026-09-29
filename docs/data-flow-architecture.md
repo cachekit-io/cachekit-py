@@ -179,7 +179,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │  • L1Cache.put(cache_key, encrypted_or_plaintext_bytes, ttl)                │
 │                                                                             │
 │  Return deserialized Python object to user:                                 │
-│  • Record metrics (operation="get", hit=True)                               │
+│  • Record metrics (operation="get", serializer="rust")                      │
 │  • Structured logging (if enabled)                                          │
 │  • Return cached value to user ✓                                            │
 └─────────────────────────────────────────────────────────────────────────────┘

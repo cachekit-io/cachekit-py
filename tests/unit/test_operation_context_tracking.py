@@ -1,260 +1,100 @@
 """Unit tests for automatic operation context tracking in FeatureOrchestrator.
 
 Tests the contextvars-based automatic operation detection that preserves
-critical observability data without manual parameter passing.
+critical observability data without manual parameter passing. record_failure()
+reads the context; record_success() feeds the circuit breaker only, because each
+success site records its own fully labelled metric.
 """
 
 import asyncio
+import contextvars
+from typing import Any
 
 import pytest
 
 from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.reliability.async_metrics import AsyncMetricsCollector
 from cachekit.reliability.circuit_breaker import CircuitBreakerConfig
+
+
+@pytest.fixture
+def recorded(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture every record that reaches the metrics collector."""
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(AsyncMetricsCollector, "record_cache_operation", lambda self, **kw: calls.append(kw))
+    return calls
+
+
+def _orchestrator(circuit_breaker_enabled: bool = False) -> FeatureOrchestrator:
+    return FeatureOrchestrator(
+        namespace="test",
+        circuit_breaker_enabled=circuit_breaker_enabled,
+        circuit_breaker_config=CircuitBreakerConfig(failure_threshold=5, success_threshold=2, timeout_seconds=30.0),
+        backpressure_enabled=False,
+        collect_stats=True,
+    )
 
 
 class TestOperationContextTracking:
     """Test automatic operation context tracking with contextvars."""
 
-    def test_set_operation_context_stores_values(self):
-        """Test that set_operation_context() stores operation and duration."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            backpressure_enabled=False,
-            collect_stats=True,
-        )
+    def test_record_failure_uses_context_automatically(self, recorded: list[dict[str, Any]]):
+        orchestrator = _orchestrator(circuit_breaker_enabled=True)
 
-        # Set operation context
-        orchestrator.set_operation_context("get", duration_ms=1.5)
-
-        # Verify context is stored by checking record_success uses it
-        orchestrator.record_success()
-
-        # Get metrics and verify operation was recorded
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 1
-
-    def test_record_success_uses_context_automatically(self):
-        """Test that record_success() automatically uses set context."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
-
-        # Set context for a "set" operation
-        orchestrator.set_operation_context("set", duration_ms=2.5)
-        orchestrator.record_success()
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 1
-
-    def test_record_failure_uses_context_automatically(self):
-        """Test that record_failure() automatically uses set context."""
-        config = CircuitBreakerConfig(
-            failure_threshold=5,
-            success_threshold=2,
-            timeout_seconds=30.0,
-        )
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=True,
-            circuit_breaker_config=config,
-            collect_stats=True,
-        )
-
-        # Set context for a "get" operation
         orchestrator.set_operation_context("get", duration_ms=3.5)
+        orchestrator.record_failure(Exception("Redis timeout"))
 
-        # Record failure with context
-        test_error = Exception("Redis timeout")
-        orchestrator.record_failure(test_error)
+        assert recorded == [{"operation": "get", "namespace": "test", "success": False, "duration_ms": 3.5}]
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 1
 
-        # Verify operation was tracked
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 1
+    def test_record_failure_defaults_when_context_not_set(self, recorded: list[dict[str, Any]]):
+        # An empty Context, so no operation context set earlier on this thread leaks in.
+        contextvars.Context().run(_orchestrator().record_failure, Exception("test"))
 
-        # Verify circuit breaker recorded failure
-        cb_stats = orchestrator.circuit_breaker.get_stats()
-        assert cb_stats["failure_count"] == 1
+        assert [(c["operation"], c["duration_ms"]) for c in recorded] == [("cache_operation", 0.0)]
 
-    def test_context_defaults_when_not_set(self):
-        """Test that record_success/failure work without context (defaults)."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
+    def test_record_success_emits_no_metric(self, recorded: list[dict[str, Any]]):
+        """Every success site records its own labelled metric; a second record here double-counts."""
+        orchestrator = _orchestrator(circuit_breaker_enabled=True)
 
-        # Call without setting context - should use defaults
-        orchestrator.record_success()
+        for _ in range(3):
+            orchestrator.set_operation_context("get", duration_ms=1.5)
+            orchestrator.record_success()
 
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 1
+        assert recorded == []
+        assert orchestrator.circuit_breaker.get_stats()["state"] == "CLOSED"
 
-        # Record failure without context
-        orchestrator.record_failure(Exception("test"))
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 2
+    def test_context_isolation_between_operations(self, recorded: list[dict[str, Any]]):
+        orchestrator = _orchestrator()
 
-    def test_different_operation_types(self):
-        """Test tracking different operation types."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
+        for operation, duration in [("get", 1.234567), ("set", 98.765432), ("connection", 0.0)]:
+            orchestrator.set_operation_context(operation, duration_ms=duration)
+            orchestrator.record_failure(Exception(operation))
 
-        # Track different operations
-        operations = [
-            ("get", 1.2),
-            ("set", 2.3),
-            ("l1_get", 0.001),
+        assert [(c["operation"], c["duration_ms"]) for c in recorded] == [
+            ("get", 1.234567),
+            ("set", 98.765432),
             ("connection", 0.0),
         ]
 
-        for operation, duration in operations:
-            orchestrator.set_operation_context(operation, duration_ms=duration)
-            orchestrator.record_success()
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 4
-
-    def test_context_isolation_between_operations(self):
-        """Test that each operation has isolated context."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
-
-        # First operation
-        orchestrator.set_operation_context("get", duration_ms=1.5)
-        orchestrator.record_success()
-
-        # Second operation with different context
-        orchestrator.set_operation_context("set", duration_ms=3.0)
-        orchestrator.record_success()
-
-        # Third operation - verify previous contexts don't interfere
-        orchestrator.set_operation_context("l1_get", duration_ms=0.001)
-        orchestrator.record_success()
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 3
-
     @pytest.mark.asyncio
-    async def test_context_works_across_async_boundaries(self):
-        """Test that contextvars work correctly in async code."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
+    async def test_context_isolation_between_concurrent_tasks(self, recorded: list[dict[str, Any]]):
+        orchestrator = _orchestrator()
 
-        async def async_operation(op_type: str, duration: float) -> None:
-            """Simulate async cache operation."""
-            orchestrator.set_operation_context(op_type, duration_ms=duration)
-            await asyncio.sleep(0.01)  # Simulate async work
-            orchestrator.record_success()
-
-        # Run multiple async operations concurrently
-        await asyncio.gather(
-            async_operation("get", 1.5),
-            async_operation("set", 2.5),
-            async_operation("l1_get", 0.001),
-        )
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 3
-
-    @pytest.mark.asyncio
-    async def test_context_isolation_between_concurrent_tasks(self):
-        """Test that concurrent tasks have isolated contexts."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
-
-        async def task_with_context(op_type: str, delay: float) -> str:
-            """Task that sets context and verifies isolation."""
+        async def task_with_context(op_type: str, delay: float) -> None:
             orchestrator.set_operation_context(op_type, duration_ms=delay * 1000)
             await asyncio.sleep(delay)
-            orchestrator.record_success()
-            return op_type
+            orchestrator.record_failure(Exception(op_type))
 
-        # Run tasks with different contexts concurrently
-        results = await asyncio.gather(
+        await asyncio.gather(
             task_with_context("get", 0.01),
             task_with_context("set", 0.02),
             task_with_context("l1_get", 0.005),
         )
 
-        assert len(results) == 3
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 3
-
-    def test_context_with_circuit_breaker_integration(self):
-        """Test that context works with circuit breaker tracking."""
-        config = CircuitBreakerConfig(
-            failure_threshold=5,
-            success_threshold=2,
-            timeout_seconds=30.0,
-        )
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=True,
-            circuit_breaker_config=config,
-            collect_stats=True,
-        )
-
-        # Record successful operations first
-        for _ in range(3):
-            orchestrator.set_operation_context("get", duration_ms=1.5)
-            orchestrator.record_success()
-
-        # Verify metrics tracked all operations
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 3
-
-        # Verify circuit breaker state remains CLOSED with successes
-        cb_stats = orchestrator.circuit_breaker.get_stats()
-        assert cb_stats["state"] == "CLOSED"
-
-    def test_zero_duration_for_connection_failures(self):
-        """Test that connection failures use 0.0 duration."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
-
-        # Connection failures should have 0.0 duration
-        orchestrator.set_operation_context("connection", duration_ms=0.0)
-        orchestrator.record_failure(Exception("Connection failed"))
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 1
-
-    def test_context_preserves_accuracy(self):
-        """Test that context preserves exact operation type and duration."""
-        orchestrator = FeatureOrchestrator(
-            namespace="test",
-            circuit_breaker_enabled=False,
-            collect_stats=True,
-        )
-
-        # Test precise duration tracking
-        test_cases = [
-            ("get", 1.234567),
-            ("set", 98.765432),
-            ("l1_get", 0.001234),
+        # Each task's failure carries its own context, not whichever task set it last.
+        assert sorted((c["operation"], c["duration_ms"]) for c in recorded) == [
+            ("get", 10.0),
+            ("l1_get", 5.0),
+            ("set", 20.0),
         ]
-
-        for operation, duration in test_cases:
-            orchestrator.set_operation_context(operation, duration_ms=duration)
-            orchestrator.record_success()
-
-        stats = orchestrator.metrics_collector.get_stats()
-        assert stats["total_operations"] == 3

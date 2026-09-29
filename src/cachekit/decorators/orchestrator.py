@@ -298,19 +298,19 @@ class FeatureOrchestrator:
             )
 
     def set_operation_context(self, operation: str, duration_ms: float = 0.0):
-        """Set operation context for automatic tracking in record_success/failure.
+        """Set operation context for automatic tracking in record_failure.
 
         Args:
             operation: Operation type (e.g., "get", "set", "delete")
             duration_ms: Operation duration in milliseconds (optional)
 
         This method sets thread-local context that will be automatically used by
-        subsequent record_success() or record_failure() calls. Works across async
-        boundaries thanks to contextvars.
+        a subsequent record_failure() call. Works across async boundaries thanks
+        to contextvars.
 
         Example:
             features.set_operation_context("get", duration_ms=1.5)
-            features.record_success()  # Automatically uses "get" and 1.5ms
+            features.record_failure(error)  # Automatically uses "get" and 1.5ms
         """
         _operation_context.set(
             {
@@ -347,25 +347,14 @@ class FeatureOrchestrator:
             )
 
     def record_success(self):
-        """Record operation success with automatic context detection.
+        """Record operation success with the circuit breaker.
 
-        Automatically uses operation type and duration from set_operation_context()
-        if available, otherwise falls back to defaults.
+        Emits no metrics: every success site also calls record_cache_operation() with the
+        full label set (serializer, size), and a second, unlabelled record here would count
+        each operation twice in cache_operations_total, once under serializer="unknown".
         """
-        # Get operation context (async-safe)
-        ctx = _operation_context.get() or {}
-        operation = ctx.get("operation", "cache_operation")
-        duration_ms = ctx.get("duration_ms", 0.0)
-
         if self._circuit_breaker:
             self._circuit_breaker._on_success()
-        if self._metrics_collector:
-            self._metrics_collector.record_cache_operation(
-                operation=operation,
-                namespace=self.namespace,
-                success=True,
-                duration_ms=duration_ms,
-            )
 
     def record_cache_operation(
         self,
@@ -375,7 +364,6 @@ class FeatureOrchestrator:
         duration_ms: float,
         serializer: str = "unknown",
         size_bytes: int = 0,
-        hit: Optional[bool] = None,
     ):
         """Record cache operation metrics."""
         if self._metrics_collector:
@@ -386,7 +374,6 @@ class FeatureOrchestrator:
                 duration_ms=duration_ms,
                 serializer=serializer,
                 size_bytes=size_bytes,
-                hit=hit,
             )
 
     def check_health(self) -> dict[str, Any]:
