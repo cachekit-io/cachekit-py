@@ -5,8 +5,7 @@ the classic Circuit Breaker pattern. The circuit breaker monitors error rates
 and temporarily blocks requests when a service is struggling, giving it time
 to recover.
 
-The implementation follows established threading patterns from the codebase
-using RLock and double-checked locking for thread safety.
+Every state read and transition happens under a single RLock.
 """
 
 import logging
@@ -244,7 +243,7 @@ class CircuitBreaker:
            - If the budget is spent and the cycle is older than timeout_seconds:
              start a fresh cycle and admit
 
-        Thread-safe: Uses double-checked locking to ensure atomic state transitions.
+        Thread-safe: the check and any transition run under one hold of ``_lock``.
         """
         with self._lock:
             current_time = time.time()
@@ -255,26 +254,8 @@ class CircuitBreaker:
             if self._state == CircuitState.OPEN:
                 # Check if we've waited long enough to test recovery
                 if current_time - self._last_failure_time > self.config.timeout_seconds:
-                    # Double-checked locking pattern to prevent race conditions:
-                    #
-                    # PROBLEM: Multiple threads could see the timeout has expired and all
-                    # try to transition to HALF_OPEN state simultaneously. This would result
-                    # in multiple "test" requests being sent to Redis when we only want one.
-                    #
-                    # SOLUTION: Even though we're already holding the lock, we check the state
-                    # again after the timeout check. This ensures that if another thread already
-                    # transitioned the state between our first check and now, we won't transition
-                    # again. This is critical because the timeout check is a "read" operation
-                    # that multiple threads could pass simultaneously before any transitions occur.
-                    #
-                    # TIMELINE EXAMPLE:
-                    # Thread 1: Sees OPEN state, checks timeout (expired), about to transition
-                    # Thread 2: Also sees OPEN state, checks timeout (expired), waiting for lock
-                    # Thread 1: Transitions to HALF_OPEN, releases lock
-                    # Thread 2: Acquires lock, but now the second state check prevents duplicate transition
-                    if self._state == CircuitState.OPEN:
-                        self._transition_to_half_open()
-                        return self._allow_half_open_request()
+                    self._transition_to_half_open()
+                    return self._allow_half_open_request()
                 return False  # Still in timeout period - reject
 
             # HALF_OPEN state - limited testing.
