@@ -15,6 +15,12 @@ from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
+# Metrics the collector records itself. Caller-supplied counters and histograms may not reuse these names:
+# a generic metric cached under one first would break every later cache-operation or circuit-breaker update.
+_BUILTIN_METRIC_NAMES = frozenset(
+    {"cache_operations_total", "cache_operation_duration_ms", "cache_operation_size_bytes", "circuit_breaker_state"}
+)
+
 try:
     from prometheus_client import Counter, Gauge, Histogram  # type: ignore[assignment]
 
@@ -298,16 +304,16 @@ class AsyncMetricsCollector:
                     circuit_states[key] += 1
 
                 elif metric["type"] == "counter":
-                    self._check_generic_metric(metric)
+                    value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
-                    counters[name][labels_key] += metric["value"]
+                    counters[name][labels_key] += value
 
                 elif metric["type"] == "histogram":
-                    self._check_generic_metric(metric)
+                    value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
                     name = metric["name"]
                     labels_key = tuple(sorted(metric["labels"].items()))
-                    histograms[name].append((metric["value"], labels_key))
+                    histograms[name].append((value, labels_key))
 
             except Exception as e:
                 logger.error(f"Error processing metric: {redact_error_for_log(e)}")
@@ -315,26 +321,35 @@ class AsyncMetricsCollector:
                 # Return metric data to pool for reuse
                 self._return_to_pool(metric)
 
-        # Batch update Prometheus metrics. The per-metric handlers skip what prometheus_client rejects with
-        # ValueError; this catches anything else, such as OverflowError for a value too large for a float.
-        # Most worker call sites (the shutdown drain among them) have no handler above them, so an escaping
-        # exception would end the worker and strand every record still queued.
+        # Batch update Prometheus metrics. Bad caller input is rejected per record above, and the per-metric
+        # handlers skip what prometheus_client rejects with ValueError. This is the thread boundary for anything
+        # unforeseen: most worker call sites (the shutdown drain among them) have no handler above them, so an
+        # escaping exception would end the worker and strand every record still queued.
         try:
             self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
     @staticmethod
-    def _check_generic_metric(metric: dict[str, Any]) -> None:
-        """Reject a caller-supplied record whose types would make Prometheus fail with an error other than ValueError.
+    def _check_generic_metric(name: Any, labels: dict[Any, Any], value: Any) -> float:
+        """Validate a caller-supplied counter or histogram and return its value as a float.
 
-        The update step only isolates ValueError, so a record breaking this contract must be dropped here,
-        where one bad record is logged and skipped, rather than abort the whole batch.
+        Rejects input that would make the batch update fail with an error other than ValueError, which is
+        all the update step isolates per metric. In async mode a rejected record is logged and skipped on
+        its own; in sync mode the error reaches the caller.
+
+        Raises:
+            TypeError: If the name or a label name is not a str, or the value is not a number.
+            ValueError: If the name is reserved for a metric the collector records itself.
+            OverflowError: If the value is too large for a float.
         """
-        if not isinstance(metric["name"], str) or not all(isinstance(k, str) for k in metric["labels"]):
+        if not isinstance(name, str) or not all(isinstance(k, str) for k in labels):
             raise TypeError("metric name and label names must be str")
-        if not isinstance(metric["value"], (int, float)):
+        if name in _BUILTIN_METRIC_NAMES:
+            raise ValueError(f"metric name {name} is reserved")
+        if not isinstance(value, (int, float)):
             raise TypeError("metric value must be a number")
+        return float(value)
 
     def _update_prometheus_metrics(
         self,
@@ -583,6 +598,7 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
+        value = self._check_generic_metric(metric_name, labels, value)
         counter = self._get_metric(metric_name, Counter, f"Counter metric {metric_name}", list(labels.keys()))
         counter.labels(**labels).inc(value)
 
@@ -591,6 +607,7 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
+        value = self._check_generic_metric(metric_name, labels, value)
         histogram = self._get_metric(metric_name, Histogram, f"Histogram metric {metric_name}", list(labels.keys()))
         histogram.labels(**labels).observe(value)
 

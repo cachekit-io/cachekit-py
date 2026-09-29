@@ -151,12 +151,45 @@ def test_flush_skips_a_name_already_used_by_another_metric_kind(caplog, same_bat
     assert [r.getMessage() for r in caplog.records] == [f"Failed to create histogram {reused_name}: ValueError"]
 
 
-def test_flush_never_raises_so_a_bad_batch_cannot_end_the_worker(caplog):
+def test_flush_never_raises_so_a_bad_batch_cannot_end_the_worker(caplog, monkeypatch):
     collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
-    # A number too large for a float passes the type check, then prometheus_client raises OverflowError.
-    batch = [{"type": "histogram", "name": f"flush_overflow_{uuid.uuid4().hex}", "labels": {"a": "one"}, "value": 10**400}]
+
+    def fail(*args):
+        raise RuntimeError("unforeseen")
+
+    # Stands in for any failure the per-record and per-metric handling does not foresee.
+    monkeypatch.setattr(collector, "_update_prometheus_metrics", fail)
+    batch = [{"type": "histogram", "name": f"flush_backstop_{uuid.uuid4().hex}", "labels": {"a": "one"}, "value": 1.0}]
 
     with caplog.at_level(logging.ERROR, logger="cachekit.reliability.async_metrics"):
         collector._flush_batch(batch)
 
-    assert [r.getMessage() for r in caplog.records] == ["Failed to update metrics batch: OverflowError"]
+    assert [r.getMessage() for r in caplog.records] == ["Failed to update metrics batch: RuntimeError"]
+
+
+def test_overflowing_value_costs_only_its_own_record():
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    histogram_name = f"flush_overflow_valid_{uuid.uuid4().hex}"
+    # One value too large for a float leads the batch; the 99 valid observations behind it must still publish.
+    batch = [{"type": "histogram", "name": f"flush_overflow_{uuid.uuid4().hex}", "labels": {"a": "one"}, "value": 10**400}]
+    batch += [{"type": "histogram", "name": histogram_name, "labels": {"op": "get"}, "value": 1.0} for _ in range(99)]
+
+    collector._flush_batch(batch)
+
+    assert collector._metrics_cache[histogram_name].labels(op="get")._sum.get() == 99
+
+
+def test_generic_metrics_cannot_take_a_builtin_name():
+    namespace = f"shutdown-drain-builtin-{uuid.uuid4().hex}"
+    sync_collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    with pytest.raises(ValueError, match="reserved"):
+        sync_collector.record_histogram("circuit_breaker_state", 1.0)
+    assert "circuit_breaker_state" not in sync_collector._metrics_cache
+
+    collector = AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
+    collector.record_histogram("cache_operations_total", 1.0)
+    collector.record_cache_operation(operation="get", namespace=namespace, success=True, duration_ms=1.0)
+    collector.shutdown()
+
+    counter = collector._metrics_cache["cache_operations_total"]
+    assert counter.labels(operation="get", namespace=namespace, success="True", serializer="unknown")._value.get() == 1
