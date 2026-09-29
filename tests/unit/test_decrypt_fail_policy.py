@@ -68,8 +68,8 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(bytes(tampered), meta, cache_key="key:a")
 
     def test_non_string_original_type_is_corruption_not_tamper(self):
-        """LAB-4350: the header is an AAD *input*, not authenticated content —
-        a rotted ``original_type`` is corruption, not tamper."""
+        """LAB-4350: a non-string ``original_type`` cannot be built into the AAD,
+        so no tag check runs — it is corruption, not tamper."""
         wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
         enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
         meta.original_type = ["rotted"]

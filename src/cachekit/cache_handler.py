@@ -1175,8 +1175,8 @@ class CacheSerializationHandler:
 
             # SECURITY (LAB-241 / CWE-757): the CK frame header is plaintext and NOT
             # covered by the AES-GCM tag (AAD v0x03 binds tenant/cache_key/format/
-            # compressed — not the header itself). A backend-write attacker can plant
-            # a frame claiming `encrypted: false` with an arbitrary plaintext payload;
+            # compressed/original_type — not the header itself). A backend-write attacker
+            # can plant a frame claiming `encrypted: false` with an arbitrary plaintext payload;
             # an encryption-enabled reader must never let that header downgrade it to
             # the unauthenticated plaintext path. Fail closed — callers treat
             # SerializationError as a miss and evict, so legacy plaintext entries
