@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.errors import BackendError
+from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
@@ -431,7 +431,6 @@ def create_cache_wrapper(
     interop: str | None = None,
     # L1-only mode flag
     _l1_only_mode: bool = False,
-    **kwargs: Any,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -983,7 +982,6 @@ def create_cache_wrapper(
                     success=True,
                     duration_ms=get_duration_ms,
                     size_bytes=size_bytes,
-                    hit=True,
                 )
         except (ValueError, TypeError) as exc:
             # The collector's documented refusals: duplicated timeseries, a label set
@@ -1309,10 +1307,6 @@ def create_cache_wrapper(
 
         token = set_current_function_stats(_stats)
 
-        # Generate correlation ID for request tracking
-        correlation_id = features.generate_correlation_id()
-        features.set_correlation_id(correlation_id)
-
         cache_key = None  # Initialize to avoid UnboundLocalError
 
         # Create tracing span for cache operation
@@ -1332,7 +1326,6 @@ def create_cache_wrapper(
             if interop is not None:
                 # Interop/v1: out-of-model arguments MUST be rejected with an
                 # error — never silently degrade to uncached execution.
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 raise
             # Key generation failed - execute function without caching
@@ -1353,7 +1346,6 @@ def create_cache_wrapper(
             try:
                 return func(*args, **kwargs)
             finally:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
         if _l1_only_mode and _object_cache:
             if _l1_swr_active and ttl is not None:
@@ -1381,7 +1373,6 @@ def create_cache_wrapper(
                             # the slot and this exact refresh so a later call retries
                             _l1_swr_slots.release()
                             _object_cache.cancel_refresh(cache_key, version)
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 return cached_value
 
@@ -1393,10 +1384,21 @@ def create_cache_wrapper(
                 _cached_keys.add((_l2_scope(), cache_key))
                 return result
             finally:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
 
         # L1+L2 MODE: Original behavior with backend initialization
+
+        # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+        # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
+        # caller before the function runs, whatever the breaker state, and never counts a failure
+        # on the breaker every tenant of this function shares. "" until the backend is resolved;
+        # the first call checks right after resolving it, below. Sits outside the main
+        # try/finally, so the raise path restores the context itself.
+        try:
+            _l2_scope()
+        except Exception:
+            reset_current_function_stats(token)
+            raise
 
         # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
         # with its probe budget spent) - run the function uncached. This sits
@@ -1412,7 +1414,6 @@ def create_cache_wrapper(
                 error="Circuit breaker rejected the request",
                 error_type="CircuitBreakerOpen",
             )
-            features.clear_correlation_id()
             reset_current_function_stats(token)
             return func(*args, **kwargs)
 
@@ -1425,6 +1426,7 @@ def create_cache_wrapper(
                 nonlocal _backend
                 if _backend is None:
                     _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1433,6 +1435,12 @@ def create_cache_wrapper(
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                reset_current_function_stats(token)
+                raise
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -1458,7 +1466,6 @@ def create_cache_wrapper(
             try:
                 ensure_interop_backend_compatible(_backend)
             except Exception:
-                features.clear_correlation_id()
                 reset_current_function_stats(token)
                 raise
 
@@ -1482,7 +1489,6 @@ def create_cache_wrapper(
                             success=True,
                             duration_ms=0.001,  # ~1μs for L1 hit
                             size_bytes=len(l1_bytes),
-                            hit=True,
                         )
 
                     features.log_cache_operation(
@@ -1602,7 +1608,6 @@ def create_cache_wrapper(
                         success=True,
                         duration_ms=duration * 1000,
                         size_bytes=size_bytes,
-                        hit=True,
                     )
 
                 # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
@@ -1679,7 +1684,6 @@ def create_cache_wrapper(
                         success=True,
                         duration_ms=total_latency,
                         serializer="rust",
-                        hit=False,  # Was a miss
                     )
 
             except InteropError:
@@ -1708,7 +1712,6 @@ def create_cache_wrapper(
                 cache_key=cache_key or "unknown",
                 namespace=namespace or "default",
                 duration_ms=0.0,
-                correlation_id=correlation_id,
             )
 
             # Execute function without any caching
@@ -1720,8 +1723,6 @@ def create_cache_wrapper(
             features.record_failure(e)
             raise
         finally:
-            # Clear correlation ID after operation
-            features.clear_correlation_id()
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 
@@ -1762,7 +1763,7 @@ def create_cache_wrapper(
             # Preserves types (tuples, sets, frozensets) that MessagePack would degrade.
             if _l1_only_mode and _object_cache is None:
                 # L1 disabled in L1-only mode -> no cache anywhere; call through
-                # (outer finally clears correlation ID and resets stats context)
+                # (outer finally resets stats context)
                 return await func(*args, **kwargs)
             if _l1_only_mode and _object_cache:
                 if _l1_swr_active and ttl is not None:
@@ -1783,7 +1784,6 @@ def create_cache_wrapper(
                             )
                             _l1_swr_tasks.add(refresh_task)
                             refresh_task.add_done_callback(functools.partial(_l1_swr_task_done, cache_key=cache_key))
-                    features.clear_correlation_id()
                     return cached_value
 
                 # Cache miss - execute function and store raw result
@@ -1794,10 +1794,15 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
+            # Tenant scope, before the breaker check (LAB-5713): see sync_wrapper. "" until the
+            # backend is resolved; the first call checks right after resolving it, below. The
+            # outer finally resets the stats context.
+            _l2_scope()
+
             # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
-            # The outer finally clears correlation ID / stats context.
+            # The outer finally resets the stats context.
             if not features.should_allow_request():
                 features.log_cache_operation(
                     operation="circuit_breaker_open",
@@ -1818,11 +1823,13 @@ def create_cache_wrapper(
             # early-returns and would bypass the per-call re-check (mirrors
             # sync_wrapper's ordering). Backend is resolved eagerly for interop
             # calls only, so the non-interop L1 fast path is unchanged. The raise
-            # propagates; the outer finally clears correlation ID / stats context.
+            # propagates; the outer finally resets stats context.
             if interop is not None:
                 if _backend is None:
                     try:
                         _backend = _resolve_lazy_backend()
+                    except UnsupportedTenantError:
+                        raise  # a caller bug, not a client failure: see sync_wrapper
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1834,7 +1841,7 @@ def create_cache_wrapper(
                             duration_ms=0.0,
                         )
                         return await func(*args, **kwargs)
-                ensure_interop_backend_compatible(_backend)
+                ensure_interop_backend_compatible(_backend)  # reads key_prefix, so runs the tenant check too
 
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
@@ -1856,7 +1863,6 @@ def create_cache_wrapper(
                                 success=True,
                                 duration_ms=0.001,  # Sub-microsecond
                                 size_bytes=len(l1_bytes),
-                                hit=True,
                             )
 
                         # Record L1 hit for cache_info()
@@ -1897,6 +1903,8 @@ def create_cache_wrapper(
             if _backend is None:
                 try:
                     _backend = _resolve_lazy_backend()
+                except UnsupportedTenantError:
+                    raise  # a caller bug, not a client failure: see sync_wrapper
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1908,6 +1916,7 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
+                _l2_scope()  # first call: the tenant check above ran before the backend existed
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
@@ -1919,10 +1928,6 @@ def create_cache_wrapper(
 
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()
-            # Create correlation context for distributed tracing
-            correlation_id = None
-            if features._enable_structured_logging:
-                correlation_id = features.create_correlation_id()
 
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
@@ -1996,7 +2001,6 @@ def create_cache_wrapper(
                     cache_key=cache_key or "unknown",
                     namespace=namespace or "default",
                     duration_ms=get_duration_ms,
-                    correlation_id=correlation_id,
                 )
 
             # CACHE MISS - Use distributed lock to prevent thundering herd
@@ -2107,7 +2111,6 @@ def create_cache_wrapper(
                                     success=True,
                                     duration_ms=set_duration_ms,
                                     serializer="rust",
-                                    hit=False,  # Was a miss
                                 )
 
                         except InteropError:
@@ -2122,7 +2125,6 @@ def create_cache_wrapper(
                                 cache_key=cache_key or "unknown",
                                 namespace=namespace or "default",
                                 duration_ms=set_duration_ms,
-                                correlation_id=correlation_id,
                             )
 
                         return result
@@ -2194,7 +2196,6 @@ def create_cache_wrapper(
                             success=True,
                             duration_ms=set_duration_ms,
                             serializer="rust",
-                            hit=False,  # Was a miss
                         )
 
                 except InteropError:
@@ -2209,7 +2210,6 @@ def create_cache_wrapper(
                         cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
-                        correlation_id=correlation_id,
                     )
 
                 return result
@@ -2219,8 +2219,6 @@ def create_cache_wrapper(
                 features.record_failure(e)
                 raise
         finally:
-            # Clear correlation ID after operation (matches sync wrapper)
-            features.clear_correlation_id()
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
 

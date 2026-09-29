@@ -336,9 +336,9 @@ async def fetch_sensitive(x):
 Lock waiters that time out log a `Failed to acquire lock for {key} after 5.0s`
 warning; lock backend errors log a `Lock operation failed … executing without
 lock` warning. For miss-rate monitoring (stampede detection), watch `operation="set"` on
-`cache_operations_total` as a cache-write proxy — misses write back, but it can
-double-count (when stats collection is on) or miss failed writes, so treat it as a proxy,
-not an exact miss count — see [Prometheus Metrics](prometheus-metrics.md).
+`cache_operations_total` as a cache-write proxy — misses write back, but failed writes
+record nothing, so treat it as a proxy, not an exact miss count — see
+[Prometheus Metrics](prometheus-metrics.md).
 
 ---
 

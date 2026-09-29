@@ -1,0 +1,105 @@
+{
+  "version": "1.0.0",
+  "generator": "urllib.parse.quote(key, safe=\"\")",
+  "spec": "spec/saas-api.md § Cache-Key Path Encoding",
+  "ci_verification": "tools/path-encoding-verify.py (stdlib only; mutation self-test first)",
+  "contract": "`encoded` is the single `{key}` path segment in the reference form (spec rule 1); `decoded` is the key the server sees after its single percent-decode and equals `key` in every transmittable row (spec rules 3-4). Rows with `reject: true` are the reserved segments of spec rule 2 (`.`, `..`, `health`, `ttl`, `lock`): a conformant client raises before building the URL, so `encoded` and `decoded` are null. `encoded_alternates` lists the `encodeURIComponent` form (`! * ' ( )` raw) where it differs from `encoded`, and is absent otherwise; reject rows carry none. An SDK conforms when its encoding of `key` is in `[encoded] + encoded_alternates` (a missing `encoded_alternates` is `[]`).",
+  "vectors": [
+    {
+      "key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1s",
+      "encoded": "ns%3Atest%3Afunc%3A__main__.get_user%3Aargs%3A3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153%3A1s",
+      "decoded": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1s",
+      "note": "Canonical 7-segment auto-mode key (test-vectors/cache-keys.json `single_integer`). Only `:` is encoded; identical bytes from all three reference encoders."
+    },
+    {
+      "key": "default:../../admin",
+      "encoded": "default%3A..%2F..%2Fadmin",
+      "decoded": "default:../../admin",
+      "note": "Embedded traversal: every `/` is `%2F`, so no `../` boundary exists for a URL parser to collapse. Server decodes once, then rejects (`/` outside charset; `..` substring)."
+    },
+    {
+      "key": "x/../../health",
+      "encoded": "x%2F..%2F..%2Fhealth",
+      "decoded": "x/../../health",
+      "note": "Traversal aimed at the `/v1/cache/health` route token; inert once `/` is `%2F`. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "k?x=1#f",
+      "encoded": "k%3Fx%3D1%23f",
+      "decoded": "k?x=1#f",
+      "note": "Query/fragment injection: `?` and `#` MUST be encoded or the client's URL parser truncates the key and emits a query string. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "a b",
+      "encoded": "a%20b",
+      "decoded": "a b",
+      "note": "Space is `%20` in a path segment, never `+` (form-encoding, which the server does not decode). Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "100%",
+      "encoded": "100%25",
+      "decoded": "100%",
+      "note": "A literal `%` is encoded exactly once; the server decodes once and sees `100%`, then rejects it (charset). `%2525` would decode to `100%25`, a different key."
+    },
+    {
+      "key": ".",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Dot segment: the plain encoding `.` is removed by every URL parser, and `%2E` is collapsed by the server's WHATWG parse (`/v1/cache/%2E` → `/v1/cache/`). No wire form reaches the validator."
+    },
+    {
+      "key": "..",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Dot segment: unencoded, `/v1/cache/..` collapses to `/v1/` and `/v1/cache/../ttl` to `/v1/ttl`; `%2E%2E` is collapsed the same way by the server's WHATWG parse. No wire form reaches the validator."
+    },
+    {
+      "key": "health",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Route token: `/v1/cache/health` is the health endpoint, so a GET for this key would return the health payload as a cache hit."
+    },
+    {
+      "key": "ttl",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Route token: a final `ttl` segment selects the TTL sub-resource, so `/v1/cache/ttl` is read as an empty key plus `/ttl`."
+    },
+    {
+      "key": "lock",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Route token: a final `lock` segment selects the lock sub-resource, so `/v1/cache/lock` is read as an empty key plus `/lock`."
+    },
+    {
+      "key": "a:..",
+      "encoded": "a%3A..",
+      "decoded": "a:..",
+      "note": "Trailing dots but NOT an all-dot segment: not a dot segment under either parsing model, so the dots stay raw. Server rejects the decoded `..` substring."
+    },
+    {
+      "key": "..a",
+      "encoded": "..a",
+      "decoded": "..a",
+      "note": "Leading dots, not an all-dot segment: sent verbatim (all characters unreserved). Server rejects the decoded `..` substring."
+    },
+    {
+      "key": "ns:key",
+      "encoded": "ns%3Akey",
+      "decoded": "ns:key",
+      "note": "`:` → `%3A`, decoded once server-side. The server then rejects it: a key starting `ns:` must be `ns:{namespace}:{rest}` with a non-empty `{rest}` (spec/cache-key-format.md § Server-Side Requirements, Namespace), and this one has no `{rest}`."
+    },
+    {
+      "key": "f(x)!*'",
+      "encoded": "f%28x%29%21%2A%27",
+      "decoded": "f(x)!*'",
+      "encoded_alternates": ["f(x)!*'"],
+      "note": "Encoder-variance row (spec rule 4): `quote(safe=\"\")` and `urlencoding::encode` produce `encoded`; `encodeURIComponent` produces the alternate. Both decode to `key`. Server rejects the decoded key (charset)."
+    }
+  ]
+}

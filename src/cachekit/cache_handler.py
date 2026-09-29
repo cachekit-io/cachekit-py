@@ -38,6 +38,7 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.interop import InteropError
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.base import (
+    EnvelopeShapeError,
     SerializationError,
     SerializationFormat,
     SerializationMetadata,
@@ -46,6 +47,7 @@ from cachekit.serializers.base import (
 )
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
+    EncryptionError,
     KeyringConfigurationError,
 )
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -131,6 +133,12 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
       encryption, missing tenant_id). Benign during lazy plaintext→encrypted
       migration, so it ALWAYS fails open (miss + evict, LAB-241) — but spikes
       outside a migration window warrant investigation.
+    - ``envelope_shape``: EnvelopeShapeError — an entry nothing verified decoded to
+      the shape of a ByteStorage envelope and was refused (LAB-2736). Either a rotted
+      integrity-on envelope or a legitimate top-level 4-element list; the read path
+      cannot tell them apart, so this is NOT reliable corruption evidence and is kept
+      out of ``corruption``. Always fails open. The same redacted key repeating in the
+      WARNING log is the second case: that value recomputes on every read, forever.
     - ``corruption``: any other SerializationError — checksum mismatch, malformed
       frame, serializer mismatch, deserialize failure on authenticated
       plaintext. Not tamper evidence; always fails open.
@@ -157,6 +165,8 @@ def handle_decrypt_failure(error: Exception, *, tier: str, cache_key: str, fail_
         reason = "auth_tamper"
     elif isinstance(error, SuspiciousCacheEntryError):
         reason = "suspicious_envelope"
+    elif isinstance(error, EnvelopeShapeError):
+        reason = "envelope_shape"
     else:
         reason = "corruption"
 
@@ -1174,8 +1184,8 @@ class CacheSerializationHandler:
 
             # SECURITY (LAB-241 / CWE-757): the CK frame header is plaintext and NOT
             # covered by the AES-GCM tag (AAD v0x03 binds tenant/cache_key/format/
-            # compressed — not the header itself). A backend-write attacker can plant
-            # a frame claiming `encrypted: false` with an arbitrary plaintext payload;
+            # compressed/original_type — not the header itself). A backend-write attacker
+            # can plant a frame claiming `encrypted: false` with an arbitrary plaintext payload;
             # an encryption-enabled reader must never let that header downgrade it to
             # the unauthenticated plaintext path. Fail closed — callers treat
             # SerializationError as a miss and evict, so legacy plaintext entries
@@ -1230,16 +1240,25 @@ class CacheSerializationHandler:
                         "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
                     )
                 tenant_id = metadata.tenant_id
-                serializer = self._get_cached_encryption_wrapper(tenant_id)
-
-                # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
-                return serializer.deserialize(serialized_data, metadata, cache_key)
+                try:
+                    serializer = self._get_cached_encryption_wrapper(tenant_id)
+                    # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
+                    return serializer.deserialize(serialized_data, metadata, cache_key)
+                except KeyringConfigurationError as e:
+                    if self.encryption:
+                        raise
+                    # Drift read: only the unauthenticated header's encrypted flag brought
+                    # us here, so a keyring fault must heal as miss + evict (corruption),
+                    # never fail loud — a raise would let a planted frame block recompute
+                    # and overwrite of its key until TTL.
+                    raise EncryptionError(f"Config-drift read hit a keyring fault: {e}") from e
             else:
                 # Data is not encrypted - use base serializer directly (no cache_key needed)
                 return base_serializer.deserialize(serialized_data, metadata)
         except (ValueError, SerializationError):
-            # ValueError: cache_key missing for encrypted data — FAIL CLOSED
-            # SerializationError/EncryptionError: let the outer handler log and handle
+            # Re-raised unwrapped for the read sites to classify: only
+            # KeyringConfigurationError fails loud there; a plain ValueError is a miss,
+            # and SerializationError goes through handle_decrypt_failure.
             raise
         except Exception as e:
             get_logger().error(f"Deserialization failed with {self.serializer_name}: {redact_error_for_log(e)}")
@@ -1287,6 +1306,8 @@ class CacheSerializationHandler:
                 return wrapper.deserialize_without_key_identity(data, metadata, cache_key)
             return self._base_serializer.deserialize(data)
         except (ValueError, SerializationError):
+            # Same contract as deserialize_data: only KeyringConfigurationError
+            # fails loud at the read sites; a plain ValueError there is a miss.
             raise
         except Exception as e:
             get_logger().error(f"Interop deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
@@ -1514,8 +1535,8 @@ class CacheOperationHandler:
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1560,8 +1581,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1599,8 +1620,8 @@ class CacheOperationHandler:
             deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the
@@ -1644,8 +1665,8 @@ class CacheOperationHandler:
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
-            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index) —
-            # never a legitimate miss, and not tamper. Re-raised past the broad
+            # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
+            # an EncryptionWrapper construction fault) — never a legitimate miss, and not tamper. Re-raised past the broad
             # `except Exception` below, which would otherwise swallow it into
             # `return None`: a silent fail-open miss with no metric and no
             # eviction, even under fail_closed=True. That is precisely the

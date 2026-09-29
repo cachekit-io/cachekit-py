@@ -216,7 +216,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key contains whitespace, `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
 
 #### Notes
 
@@ -833,7 +833,6 @@ query examples, and alerting rules.
 ### Structured Logging
 
 All operations include structured logging with:
-- Correlation IDs for request tracking
 - Operation context (namespace, cache key, serializer)
 - Performance metrics (duration, cache hit/miss)
 - Error classification and recovery actions
