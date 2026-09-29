@@ -64,14 +64,10 @@ class _NoopMetric:
     def labels(self, **kwargs):
         return self
 
-    def inc(self, amount=1):
+    def _ignore(self, amount=1):
         pass
 
-    def observe(self, amount):
-        pass
-
-    def set(self, value):
-        pass
+    inc = observe = set = _ignore
 
 
 # Metric objects are process-wide because prometheus_client's default registry is.
@@ -81,14 +77,22 @@ _metrics_cache: dict[str, Any] = {}
 _metrics_cache_lock = threading.Lock()
 
 
-def _reset_metrics_cache_lock() -> None:
-    # A fork while another thread holds the lock leaves the child a lock nobody will release.
-    global _metrics_cache_lock
-    _metrics_cache_lock = threading.Lock()
+def _acquire_metrics_cache_lock() -> None:
+    _metrics_cache_lock.acquire()
+
+
+def _release_metrics_cache_lock() -> None:
+    _metrics_cache_lock.release()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_metrics_cache_lock)
+    # Hold the lock across fork (as the logging module does): a child must never inherit it
+    # held by a thread that no longer exists, nor a metric registered but not yet cached.
+    os.register_at_fork(
+        before=_acquire_metrics_cache_lock,
+        after_in_parent=_release_metrics_cache_lock,
+        after_in_child=_release_metrics_cache_lock,
+    )
 
 
 class AsyncMetricsCollector:

@@ -105,19 +105,67 @@ def test_name_owned_by_host_app_is_dropped_not_renamed(caplog: pytest.LogCapture
     assert not [s.name for m in REGISTRY.collect() for s in m.samples if renamed.match(s.name)]
 
 
+def test_non_collision_registration_error_propagates() -> None:
+    with pytest.raises(ValueError, match="[Rr]eserved"):
+        AsyncMetricsCollector(sync_mode=True).record_counter(f"reserved_{uuid.uuid4().hex}", {"__k": "v"})
+
+
+def _child_exit_code(child: Any) -> int:
+    """Fork, run ``child()`` in the child on a thread with a deadline, return its exit code."""
+    pid = os.fork()
+    if pid == 0:
+        result: list[bool] = []
+        worker = threading.Thread(target=lambda: result.append(child()), daemon=True)
+        worker.start()
+        worker.join(5)
+        os._exit(0 if result == [True] else 1)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_fork_while_metric_lock_held_does_not_hang_child() -> None:
+def test_fork_while_another_thread_holds_metric_lock_does_not_hang_child() -> None:
     import cachekit.reliability.async_metrics as am
 
-    with am._metrics_cache_lock:  # stands in for another thread mid-registration at fork time
-        pid = os.fork()
-        if pid == 0:  # child: registering a fresh metric must not block on the inherited lock
-            done = threading.Event()
-            name = f"after_fork_{uuid.uuid4().hex}"
-            threading.Thread(
-                target=lambda: (AsyncMetricsCollector(sync_mode=True).record_counter(name, {"k": "v"}), done.set()), daemon=True
-            ).start()
-            os._exit(0 if done.wait(5) else 1)
+    held, release = threading.Event(), threading.Event()
 
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+    def holder() -> None:
+        with am._metrics_cache_lock:
+            held.set()
+            release.wait(5)
+
+    threading.Thread(target=holder, daemon=True).start()
+    held.wait(5)
+    threading.Timer(0.2, release.set).start()  # fork waits for the holder instead of copying its lock
+
+    def register() -> bool:
+        AsyncMetricsCollector(sync_mode=True).record_counter(f"after_fork_{uuid.uuid4().hex}", {"k": "v"})
+        return True
+
+    assert _child_exit_code(register) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_mid_registration_child_keeps_the_real_metric() -> None:
+    import cachekit.reliability.async_metrics as am
+
+    name = f"mid_fork_{uuid.uuid4().hex}"
+    registered, proceed = threading.Event(), threading.Event()
+
+    class _SlowCounter(prometheus_client.Counter):
+        """Pauses after registering in REGISTRY, before _get_metric caches it."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            registered.set()
+            proceed.wait(5)
+
+    collector = AsyncMetricsCollector(sync_mode=True)
+    threading.Thread(target=lambda: collector._get_metric(name, _SlowCounter, "d", ["k"]), daemon=True).start()
+    registered.wait(5)
+    threading.Timer(0.2, proceed.set).start()
+
+    def child_sees_real_metric() -> bool:
+        return not isinstance(collector._get_metric(name, prometheus_client.Counter, "d", ["k"]), am._NoopMetric)
+
+    assert _child_exit_code(child_sees_real_metric) == 0
