@@ -193,3 +193,33 @@ def test_generic_metrics_cannot_take_a_builtin_name():
 
     counter = collector._metrics_cache["cache_operations_total"]
     assert counter.labels(operation="get", namespace=namespace, success="True", serializer="unknown")._value.get() == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "cache_operations",
+        "cache_operations_total",
+        "cache_operations_created",
+        "cache_operation_duration_ms_sum",
+        "cache_operation_size_bytes_bucket",
+        "circuit_breaker_state_total",
+    ],
+)
+@pytest.mark.parametrize("kind", ["counter", "histogram"])
+def test_generic_metrics_cannot_claim_a_builtin_series(name, kind):
+    # Each name equals a built-in base or a series prometheus_client derives from one.
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    with pytest.raises(ValueError, match="reserved"):
+        if kind == "counter":
+            collector.record_counter(name, {"operation": "get"})
+        else:
+            collector.record_histogram(name, 1.0, {"operation": "get"})
+    assert name not in collector._metrics_cache
+
+
+def test_names_that_only_share_a_prefix_stay_available():
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    name = f"cache_operation_latency_{uuid.uuid4().hex}"
+    collector.record_counter(name, {"op": "get"})
+    assert collector._metrics_cache[name].labels(op="get")._value.get() == 1
