@@ -363,10 +363,19 @@ class AsyncMetricsCollector:
                 first_labels_key = next(iter(label_values.keys()))
                 label_names = [k for k, v in first_labels_key] if first_labels_key else []
 
-                counter_metric = self._get_metric(name, Counter, f"Counter metric {name}", label_names)
+                try:
+                    counter_metric = self._get_metric(name, Counter, f"Counter metric {name}", label_names)
+                except Exception as e:
+                    # Caller-supplied names can be invalid for Prometheus; skip that metric, not the batch.
+                    logger.error(f"Failed to create counter {name}: {redact_error_for_log(e)}")
+                    continue
                 for labels_key, value in label_values.items():
                     labels_dict = dict(labels_key)  # type: ignore[arg-type]
-                    counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                    try:
+                        counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                    except Exception as e:
+                        # Caller-supplied labels can mismatch the metric's schema; skip that series, not the batch.
+                        logger.error(f"Failed to update counter {name}: {redact_error_for_log(e)}")
 
         # Update generic histograms
         for name, observations in histograms.items():
@@ -375,10 +384,17 @@ class AsyncMetricsCollector:
                 first_value, first_labels_key = observations[0]
                 label_names = [k for k, v in first_labels_key] if first_labels_key else []
 
-                histogram_metric = self._get_metric(name, Histogram, f"Histogram metric {name}", label_names)
+                try:
+                    histogram_metric = self._get_metric(name, Histogram, f"Histogram metric {name}", label_names)
+                except Exception as e:
+                    logger.error(f"Failed to create histogram {name}: {redact_error_for_log(e)}")
+                    continue
                 for value, labels_key in observations:
                     labels_dict = dict(labels_key)
-                    histogram_metric.labels(**labels_dict).observe(value)
+                    try:
+                        histogram_metric.labels(**labels_dict).observe(value)
+                    except Exception as e:
+                        logger.error(f"Failed to update histogram {name}: {redact_error_for_log(e)}")
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
         """Get or create a cached metric instance."""
