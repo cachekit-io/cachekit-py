@@ -44,7 +44,7 @@ Rule of thumb applied throughout the audit:
 ## Concurrency audit (LAB-511)
 
 Every lock-free fast path and shared mutable module/instance state named by
-the ticket, plus what the free-threaded CI lane surfaced:
+the ticket, plus what the free-threaded CI lane surfaced and sites added since:
 
 | Site | Mechanism | Verdict |
 |:-----|:----------|:--------|
@@ -59,6 +59,7 @@ the ticket, plus what the free-threaded CI lane surfaced:
 | `decorators/wrapper.py` `_cached_keys` | Builtin `set`, snapshot-copied before iteration in invalidation | Safe — single ops atomic; a copy racing an add can only miss a concurrently-written key, which invalidate-all semantics tolerate |
 | `object_cache.py` `ObjectCache` | `RLock` on every public method | Safe |
 | `reliability/metrics_collection.py` `get_async_metrics_collector` | Double-checked module-global singleton | Safe — single-assignment publication of a fully-constructed object; worst case a benign duplicate worker-restart check |
+| `reliability/async_metrics.py` `_metrics_cache` + `_metrics_cache_lock()` | Double-checked module dict of Prometheus metric objects; one `Lock` per PID, created with `dict.setdefault`; held across `os.fork` by at-fork hooks | Safe — the lock-free read sees `None` or a fully constructed metric (single-assignment publication). `setdefault` is atomic under per-object locking, so threads racing to create a new process's lock all get the same one; a child forked without the hooks never takes its parent's lock. Tests in `tests/unit/test_async_metrics_shared_series.py` |
 | Rust extension (`rust/src/`, cachekit-core 0.5.0) | `#[pymodule(gil_used = false)]`; every `#[pyclass]` exposes only `&self` methods; nonce counter is `AtomicU64`, metrics behind `Mutex`; PyO3 enforces `Send + Sync` on pyclasses at compile time | Safe — declared free-threading-ready. (The wasm32 `Cell` nonce variant is single-threaded by target.) |
 
 ## The CI safety net
