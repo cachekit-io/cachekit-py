@@ -89,7 +89,7 @@ def your_function(args):
 - **`ttl`** (`int | None`, default: `None` on bare `@cache`; each preset sets its own — see the [preset matrix](configuration.md#intent-presets)) - Cache time-to-live in seconds. `None` = no expiration; on a preset that is an explicit opt-in.
 - **`namespace`** (`str | None`, default: `None`) - Cache key prefix for organization
 - **`serializer`** (`str | SerializerProtocol`, default: `"default"`) - Serializer name (`"default"`, `"std"`, `"auto"`, `"arrow"`, `"orjson"`) or `SerializerProtocol` instance
-- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption)
+- **`integrity_checking`** (`bool`, default: `True`) - Enable xxHash3-64 checksums for corruption detection (non-cryptographic — detects bit rot and storage bugs, NOT tampering; tamper resistance requires encryption). Behaviour when a writer and reader disagree on this flag: [cross-config reads](serializers/auto.md#cross-config-reads-integrity_checking-mismatch)
 - **`key`** (`Callable[..., str] | None`, default: `None`) - Custom key function for complex types; receives `(*args, **kwargs)` and returns `str`
 
 #### Performance Parameters
