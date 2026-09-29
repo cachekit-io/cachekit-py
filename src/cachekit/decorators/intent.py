@@ -114,7 +114,8 @@ def cache(
             ``api_key`` (``@cache.io`` only) — the cachekit.io API key; falls back
             to ``CACHEKIT_API_KEY`` when omitted. ``@cache.io`` always builds its
             own CachekitIOBackend and rejects ``backend=`` and ``config=`` with
-            ConfigurationError.
+            ConfigurationError. ``@cache.secure`` rejects ``config=`` too; its RORO
+            form is ``@cache(config=DecoratorConfig.secure(...))``.
 
     Returns:
         Decorated function with intelligent caching
@@ -136,12 +137,12 @@ def cache(
 
             return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
 
-        # config= would replace the io preset wholesale (any backend, silently), which the
-        # io docstring promises cannot happen. DecoratorConfig.io() already IS the config.
-        if _intent == "io" and config is not None:
+        # config= would replace the io/secure preset wholesale, silently: io would take any backend,
+        # secure would take an unencrypted config and cache plaintext. The factory already IS the config.
+        if _intent in ("io", "secure") and config is not None:
             raise ConfigurationError(
-                "@cache.io() does not accept config= — DecoratorConfig.io() already is the io "
-                "config. For the RORO form use @cache(config=DecoratorConfig.io(...))."
+                f"@cache.{_intent}() does not accept config= — DecoratorConfig.{_intent}() already is the "
+                f"{_intent} config. For the RORO form use @cache(config=DecoratorConfig.{_intent}(...))."
             )
 
         # Resolve backend at decorator application time
@@ -205,6 +206,14 @@ def cache(
         if config is not None:
             # DecoratorConfig instance provided (type checked above) - use it with overrides
             resolved_config = config
+            # An override may not disable integrity on an encrypted config= — the rule
+            # DecoratorConfig.secure() enforces on its own kwargs.
+            integrity_override = manual_overrides.get("integrity_checking", True)
+            if config.encryption.enabled is True and not integrity_override:
+                raise ConfigurationError(
+                    f"integrity_checking={integrity_override!r} cannot override an encrypted config= "
+                    "(e.g. DecoratorConfig.secure()). Omit integrity_checking."
+                )
             if manual_overrides or backend is not None:
                 # Apply overrides by creating new DecoratorConfig with merged settings
                 override_dict = manual_overrides.copy()
