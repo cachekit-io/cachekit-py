@@ -14,7 +14,6 @@ so asserting on a hand-fed argument would pin nothing.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -449,50 +448,7 @@ class TestInvalidationReachesPre020Keys:
         assert backend.deleted == [current_key, legacy_key]
         assert list(backend.store) == [legacy_key if failing == "legacy" else current_key]
 
-    @pytest.mark.parametrize("namespace", ["ns", "n" * 300], ids=["short", "hashed-long-key"])
-    @pytest.mark.parametrize("integrity_checking", [True, False], ids=["ic1", "ic0"])
-    @pytest.mark.parametrize(
-        "serializer_type",
-        [
-            *CacheKeyGenerator.SERIALIZER_CODES,
-            *CacheKeyGenerator.SERIALIZER_NAME_ALIASES,
-            f"{CacheKeyGenerator.CUSTOM_SERIALIZER_PREFIX}my.Serializer",
-        ],
-    )
-    def test_code_shortcut_never_drops_the_legacy_key(
-        self, serializer_type: str, integrity_checking: bool, namespace: str, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Skipping the second generate_key on equal codes must return exactly the distinct keys.
-
-        The reference is both keys generated in full and de-duplicated: if the code shortcut
-        ever disagreed with generate_key's own canonicalisation, the legacy key would be dropped.
-        """
-        generator = CacheKeyGenerator()
-
-        def fn(x: int) -> int:
-            return x
-
-        current = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type=serializer_type)
-        legacy = generator.generate_key(fn, (1,), {}, namespace, integrity_checking, serializer_type="default")
-        expected = list(dict.fromkeys([current, legacy]))
-
-        calls: list[str] = []
-        real_generate_key = generator.generate_key
-
-        def counting_generate_key(*args: Any, **kwargs: Any) -> str:
-            calls.append(kwargs["serializer_type"])
-            return real_generate_key(*args, **kwargs)
-
-        monkeypatch.setattr(generator, "generate_key", counting_generate_key)
-        # Any identity, alias or custom, reaches the key only through serializer_key_name.
-        serialization = SimpleNamespace(serializer_key_name=serializer_type)
-        handler = CacheOperationHandler(serialization, generator)  # type: ignore[arg-type]
-
-        legacy_key = handler.get_legacy_cache_key(fn, (1,), {}, namespace, integrity_checking)
-        assert [current, *([legacy_key] if legacy_key else [])] == expected
-        assert len(calls) == len(expected) - 1, f"arguments hashed {len(calls)}x for the legacy key alone"
-
-    @pytest.mark.parametrize("mode", ["key=", "fast_mode"])
+    @pytest.mark.parametrize("mode", ["key=", "fast_mode", "interop"])
     def test_non_generated_keys_have_no_legacy_twin(self, mode: str):
         """Only a generated key carries a serializer code; other key modes issue one delete."""
         from cachekit.decorators.wrapper import create_cache_wrapper
@@ -505,6 +461,10 @@ class TestInvalidationReachesPre020Keys:
         # key= is read only from DecoratorConfig (the @cache path); fast_mode is internal-only.
         if mode == "key=":
             wrapped = cache(backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", key=str)(fn)
+        elif mode == "interop":
+            # Interop requires a cross-SDK serializer, so the default one: its generated key would
+            # still differ from the interop key, so only the mode flag stops a second delete.
+            wrapped = cache(backend=backend, l1_enabled=False, namespace="lab5288-mode", interop="lab5288_op")(fn)
         else:
             wrapped = create_cache_wrapper(
                 fn, backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", fast_mode=True

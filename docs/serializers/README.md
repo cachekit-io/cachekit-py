@@ -74,8 +74,8 @@ copy that a v0.20.0 replica wrote under the new key survives. Re-issue any erasu
 the rollout once the last v0.19 replica is retired, or cover it with the flush below.
 
 **What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
-arguments you never invalidate. No-argument `invalidate_cache()` / `cache_clear()` does not
-reach them either: it deletes the keys this process tracked plus, on the tenant-scoped Redis
+arguments you never invalidate. On a function that takes parameters, no-argument
+`invalidate_cache()` / `cache_clear()` does not reach them either: it deletes the keys this process tracked plus, on the tenant-scoped Redis
 backend, the keys in the server-side key registry, and releases before v0.20.0 recorded their
 keys in neither. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
 entry gone rather than aging out, follow the flush procedure in the retention warning
@@ -158,7 +158,7 @@ def get_data():
 > `:{integrity_flag}s` key, kept for the v0.20.0 upgrade (see
 > [above](#breaking-change-in-v0200-the-key-carries-the-real-serializer)). Any move *away*
 > from a non-default serializer is not covered — to another one (`"auto"` to `"arrow"`) or
-> to the default (`"auto"` to `"default"`, or to `@cache.secure`, which requires it).
+> to the default (`"auto"` to `"default"`, or to `@cache.secure` on its default serializer).
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no
