@@ -520,6 +520,26 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
         with pytest.raises(EnvelopeShapeError, match=r'cannot be cached.*\{"v": value\}'):
             AutoSerializer(enable_integrity_checking=False).serialize(value)
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [{"__datetime__": True, "value": "not-a-date"}, 1, 2, 3],
+            [{"__uuid__": True, "value": 5}, 1, 2, 3],
+        ],
+        ids=["bad-iso-datetime-marker-valueerror", "int-uuid-marker-attributeerror"],
+    )
+    def test_a_four_element_value_the_reader_cannot_decode_fails_as_a_serialization_error(self, value: list) -> None:
+        """The writer's check runs the reader's decode, so a user dict that collides with a type
+        marker fails it. The reader turns that failure into ``SerializationError``; the writer
+        must too, or ``serialize`` leaks a raw ``ValueError`` / ``AttributeError`` for a value it
+        used to accept. Not ``EnvelopeShapeError``: the shape was never tested."""
+        s = AutoSerializer(enable_integrity_checking=False)
+        with pytest.raises(SerializationError, match="cannot decode") as exc_info:
+            s.serialize(value)
+        assert not isinstance(exc_info.value, EnvelopeShapeError)
+        with pytest.raises(SerializationError):
+            s.deserialize(msgpack.packb(value, use_bin_type=True))
+
     @pytest.mark.parametrize("value", ENVELOPE_SHAPED)
     def test_an_integrity_on_writer_still_caches_envelope_shaped_values(self, value: list) -> None:
         """The checksum identifies an integrity-on entry, so its reader never asks the shape question."""

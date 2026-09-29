@@ -534,6 +534,9 @@ class AutoSerializer:
             EnvelopeShapeError: Integrity checking is off and ``obj`` is a top-level 4-element list
                 this serializer's own reader refuses as envelope-shaped (see :meth:`deserialize`'s
                 Raises:). Wrap it (``{"v": obj}``) or use the default serializer.
+            SerializationError: Integrity checking is off and ``obj`` is a top-level 4-element list
+                that reader cannot decode at all, e.g. one holding a dict that collides with a type
+                marker. It could never be read back.
         """
         # metadata.compressed feeds the AES-GCM AAD v0x03 (EncryptionWrapper binds str(compressed)),
         # so it MUST reflect the codec actually applied: True iff the ByteStorage LZ4 envelope wrapped
@@ -1192,9 +1195,18 @@ class AutoSerializer:
         # every read and be evicted and rewritten on every call. Refused here it is a plain miss. The
         # reader's own decode and predicate decide it, on the value as the reader sees it (bytearray ->
         # bytes, IntEnum -> int, a marked tuple -> tuple), so a 4-element array the reader cannot decode
-        # at all fails here too. Only on 0x94, the fixarray header of a top-level 4-element array, so
-        # every other write skips the extra decode.
-        if msgpack_data[:1] == b"\x94" and self._looks_like_envelope(unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)):
+        # at all fails here too, as the SerializationError the reader would raise. Only on 0x94, the
+        # fixarray header of a top-level 4-element array, so every other write skips the extra decode.
+        if msgpack_data[:1] != b"\x94":
+            return msgpack_data
+        try:
+            decoded = unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(
+                f"Value cannot be cached by an AutoSerializer with integrity checking off: its reader cannot decode it "
+                f"({bounded_error(e)})"
+            ) from e
+        if self._looks_like_envelope(decoded):
             raise EnvelopeShapeError(
                 "Value cannot be cached by an AutoSerializer with integrity checking off: it is a 4-element list "
                 'shaped like a ByteStorage envelope, which this serializer\'s reader refuses. Wrap it (e.g. {"v": value}) '
