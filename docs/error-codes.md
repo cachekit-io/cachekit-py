@@ -4,11 +4,10 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Four exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Three exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
-- An **async** function raises `UnboundLocalError` once the circuit breaker opens (a known defect; sync functions degrade as described).
 - An **async** function can currently raise the backend's own exception instead of degrading (a known defect): `redis.exceptions.ConnectionError` on every call once Redis goes away after the first successful call, and `httpx.HTTPStatusError` on a CachekitIO 401, 403 or 400, without running the function. On a CachekitIO 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
 
 ## Encryption Errors
@@ -377,13 +376,13 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **Message** (logged): `Circuit breaker ... transitioned to OPEN`
 
-**Exception**: none for sync functions: while the breaker is open, `@cache` skips the backend and runs the function. Async functions currently raise `UnboundLocalError` (`cannot access local variable 'BackendError' ...`) on every call while the breaker is open — a known defect.
+**Exception**: none: while the breaker is open, a function with an L2 backend skips L1 and L2 and runs uncached, sync or async. In L1-only mode (`backend=None`) the breaker is never consulted.
 
-**Cause**: Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged and the call runs uncached. What counts is an exception raised by the decorated function itself (for some async configurations, only a `BackendError` from the function), a failure to create the backend client, or a cached entry that fails to deserialize or decrypt (see *Deserialization failed* and *Decryption failed*). For such an entry cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the call recomputes normally, but the failure still counts, so a backend that keeps returning corrupted or undecryptable entries opens the breaker. With fail-closed on, an authentication failure raises `DecryptionAuthenticationError` instead, keeps the entry as evidence, and does not count; a corrupted entry still counts. Each decorated function has its own breaker, and that many such failures open it even when the backend is healthy.
+**Cause**: Five failures in total since the breaker last closed or the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts, except that a `BackendError` from the function reruns it without the lock, and a failure of that rerun counts); a failure to generate the cache key or to create the backend client; a `KeyringConfigurationError` on an L2 read; and, for async functions only, a result that fails to serialize or encrypt for the cache write. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function has raised, cached entries have failed to deserialize or decrypt, or the backend client could not be created — `failure_threshold` times in total (five by default) since the process started
-- Caching is disabled for this function until the process restarts
+- Your function has raised, or another failure listed under **Cause** has occurred, `failure_threshold` times in total (five by default) since the breaker last closed or the process started
+- Calls to this function run uncached until the breaker recovers. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which admits up to three probe calls (`half_open_requests`) while further calls run uncached. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
 
 **Solutions**:
 
@@ -393,8 +392,8 @@ redis-cli ping
 # Output: PONG means Redis is healthy
 ```
 
-2. **Restart the process to reset the breaker**:
-- An open breaker does not currently close on its own (a known defect): it never goes half-open, so it stays open until the process restarts
+2. **Let the breaker recover** — no restart is needed:
+- Once the cause is fixed, the probe calls after the cooldown close the breaker. While the cause persists, each failed probe reopens it for another cooldown
 
 3. **Fix the underlying issue**:
 ```bash
@@ -414,7 +413,7 @@ redis-cli ping
 def my_function():
     return expensive_operation()
 
-# When circuit breaker is open (sync functions):
+# When circuit breaker is open (sync and async functions):
 # - Function still executes: expensive_operation() runs
 # - Cache is bypassed: result is NOT cached
 # - No exception raised: caller gets result normally

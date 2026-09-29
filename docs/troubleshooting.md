@@ -14,8 +14,8 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures in total since the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, cached entries that fail to deserialize or decrypt (cachekit attempts to evict each one and the call recomputes, but it still counts; with fail-closed on, an authentication failure raises, keeps the entry, and does not count), or a failure to create the backend client. Backend read and write failures do not currently count
-- Caching is disabled for this function until the process restarts
+- Five failures in total since the breaker last closed or the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, a failure to generate the cache key or create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Calls to this function run uncached until the breaker recovers: after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
 
@@ -32,9 +32,9 @@ env | grep REDIS
 export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
-3. **Restart the process to reset the breaker**:
-- An open breaker does not currently close on its own (a known defect), so it stays open until the process restarts
-- While open, sync functions run without caching. Async functions currently raise `UnboundLocalError` while the breaker is open (a known defect) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
+3. **Let the breaker recover** — no restart is needed:
+- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
+- While open, sync and async functions with an L2 backend run without caching (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
 ```bash
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many in total open the breaker for that function and stop caching it, even with a healthy backend. For some async configurations only a `BackendError` counts.
+Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many in total open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count, except that a `BackendError` reruns it without the lock, and a failure of that rerun counts.
 
 </details>
 

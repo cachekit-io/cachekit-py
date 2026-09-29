@@ -347,6 +347,7 @@ class FeatureOrchestrator:
         namespace: Optional[str] = None,
         span: Optional[Any] = None,
         duration_ms: float = 0.0,
+        *,
         count_toward_breaker: bool = True,
         **extra_context: Any,
     ) -> None:
