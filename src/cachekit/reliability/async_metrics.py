@@ -315,8 +315,14 @@ class AsyncMetricsCollector:
                 # Return metric data to pool for reuse
                 self._return_to_pool(metric)
 
-        # Batch update Prometheus metrics
-        self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+        # Batch update Prometheus metrics. The per-metric handlers skip what prometheus_client rejects with
+        # ValueError; this catches anything else, such as OverflowError for a value too large for a float.
+        # Most worker call sites (the shutdown drain among them) have no handler above them, so an escaping
+        # exception would end the worker and strand every record still queued.
+        try:
+            self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+        except Exception as e:
+            logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
     @staticmethod
     def _check_generic_metric(metric: dict[str, Any]) -> None:
@@ -423,7 +429,16 @@ class AsyncMetricsCollector:
                     )
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
-        """Get or create a cached metric instance."""
+        """Get or create a cached metric instance.
+
+        Raises:
+            ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
+                does for a name registered twice. Otherwise the caller would call a method the cached
+                metric lacks.
+        """
+        cached = self._metrics_cache.get(name)
+        if cached is not None and not isinstance(cached, metric_class):
+            raise ValueError(f"metric {name} is already a {type(cached).__name__}, not a {metric_class.__name__}")
         if name not in self._metrics_cache:
             try:
                 self._metrics_cache[name] = metric_class(name, description, labels)

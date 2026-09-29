@@ -125,3 +125,38 @@ def test_shutdown_flush_skips_records_that_break_the_type_contract(caplog):
     assert collector._queue is not None and collector._queue.qsize() == 0
     assert collector._metrics_cache[histogram_name].labels(op="get")._sum.get() == n
     assert sum("Error processing metric" in r.getMessage() for r in caplog.records) == 3
+
+
+@pytest.mark.parametrize("same_batch", [True, False], ids=["same-batch", "later-batch"])
+def test_flush_skips_a_name_already_used_by_another_metric_kind(caplog, same_batch):
+    suffix = uuid.uuid4().hex
+    reused_name = f"flush_kind_reused_{suffix}"
+    histogram_name = f"flush_kind_histogram_{suffix}"
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    counter_record = {"type": "counter", "name": reused_name, "labels": {"a": "one"}, "value": 1.0}
+    batch = [
+        {"type": "histogram", "name": reused_name, "labels": {"a": "one"}, "value": 1.0},
+        {"type": "histogram", "name": histogram_name, "labels": {"op": "get"}, "value": 1.0},
+    ]
+    if same_batch:
+        batch.insert(0, counter_record)
+    else:
+        collector._flush_batch([counter_record])
+
+    with caplog.at_level(logging.ERROR, logger="cachekit.reliability.async_metrics"):
+        collector._flush_batch(batch)
+
+    assert collector._metrics_cache[reused_name].labels(a="one")._value.get() == 1
+    assert collector._metrics_cache[histogram_name].labels(op="get")._sum.get() == 1
+    assert [r.getMessage() for r in caplog.records] == [f"Failed to create histogram {reused_name}: ValueError"]
+
+
+def test_flush_never_raises_so_a_bad_batch_cannot_end_the_worker(caplog):
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    # A number too large for a float passes the type check, then prometheus_client raises OverflowError.
+    batch = [{"type": "histogram", "name": f"flush_overflow_{uuid.uuid4().hex}", "labels": {"a": "one"}, "value": 10**400}]
+
+    with caplog.at_level(logging.ERROR, logger="cachekit.reliability.async_metrics"):
+        collector._flush_batch(batch)
+
+    assert [r.getMessage() for r in caplog.records] == ["Failed to update metrics batch: OverflowError"]
