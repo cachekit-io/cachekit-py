@@ -290,6 +290,11 @@ A: cachekit does not expose metrics for you. Confirm your app starts
 the **default** registry, and that at least one decorated function has run — series are
 created lazily on first use.
 
+**Q: A log says "Metric '…' is already registered outside cachekit; not recording it"**
+A: Your application (or another library) registered a metric with the same name on the
+default registry first. cachekit never renames its series, so it skips that one metric
+rather than fail your cache calls. Rename your own metric to get cachekit's back.
+
 **Q: Where is the hit rate?**
 A: There is no hit/miss series or label. `cache_operations_total` exposes operation
 success (`success`), not hits. Use `operation="set"` as a cache-write proxy for misses
