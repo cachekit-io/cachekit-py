@@ -250,6 +250,16 @@ class AsyncMetricsCollector:
             metric_name: Name of the counter metric
             labels: Dictionary of labels for the metric
             value: Value to increment by (default: 1.0)
+
+        In sync mode the errors below reach the caller. In batched mode the same checks run in the worker,
+        which logs the rejected record and skips it, so the call itself never raises.
+
+        Raises:
+            TypeError: If ``metric_name`` or a label name is not a str, or ``value`` is not a real number.
+            ValueError: If ``metric_name`` would register a series the collector records itself (such as
+                ``cache_operations_total``), if it is already registered as another metric kind, or if the
+                label names differ from those the metric was first recorded with.
+            OverflowError: If ``value`` is too large for a float.
         """
         self._operation_count += 1
 
@@ -268,6 +278,16 @@ class AsyncMetricsCollector:
             metric_name: Name of the histogram metric
             value: Value to observe
             labels: Dictionary of labels for the metric
+
+        In sync mode the errors below reach the caller. In batched mode the same checks run in the worker,
+        which logs the rejected record and skips it, so the call itself never raises.
+
+        Raises:
+            TypeError: If ``metric_name`` or a label name is not a str, or ``value`` is not a real number.
+            ValueError: If ``metric_name`` would register a series the collector records itself (such as
+                ``cache_operations_total``), if it is already registered as another metric kind, or if the
+                label names differ from those the metric was first recorded with.
+            OverflowError: If ``value`` is too large for a float.
         """
         self._operation_count += 1
 
