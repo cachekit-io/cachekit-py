@@ -252,10 +252,32 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_reserved_namespace_rejected_at_decoration(self, backend: DictBackend, reserved: str):
+        # The server parses a key starting ns:/nsapi: as namespace-prefixed,
+        # so the key would be rejected or misrouted — fail before any call.
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @_decorate(backend, interop="get_user", namespace=reserved)
+            def f(x: int):
+                return x
+
+    def test_reservation_scope_accepted(self, backend: DictBackend):
+        """The reservation is exact-match and namespace-only: operation nsapi in
+        namespace nsapix decorates and writes the byte-pinned vector key."""
+        vector = KEY_VECTORS["reservation_scope"]
+
+        @_decorate(backend, interop=vector["operation"], namespace=vector["namespace"])
+        def f(x: int):
+            return x
+
+        f(*vector["args"])
+        assert list(backend.store) == [vector["expected_key"]]
+
     def test_custom_key_function_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="key"):
 
-            @_decorate(backend, interop="op", namespace="ns", key=lambda x: str(x))
+            @_decorate(backend, interop="op", namespace="users", key=lambda x: str(x))
             def f(x: int):
                 return x
 
@@ -289,12 +311,12 @@ class TestInteropRejections:
             return x
 
         with pytest.raises(ConfigurationError, match="fast_mode"):
-            create_cache_wrapper(f, interop="op", namespace="ns", backend=backend, fast_mode=True)
+            create_cache_wrapper(f, interop="op", namespace="users", backend=backend, fast_mode=True)
 
     def test_non_default_serializer_rejected(self, backend: DictBackend):
         with pytest.raises(ConfigurationError, match="serializer"):
 
-            @_decorate(backend, interop="op", namespace="ns", serializer="orjson")
+            @_decorate(backend, interop="op", namespace="users", serializer="orjson")
             def f(x: int):
                 return x
 
@@ -306,7 +328,7 @@ class TestInteropRejections:
 
         calls = []
 
-        @_decorate(backend, interop="op", namespace="ns")
+        @_decorate(backend, interop="op", namespace="users")
         def f(x):
             calls.append(x)
             return 1
@@ -318,7 +340,7 @@ class TestInteropRejections:
     def test_out_of_model_value_raises_at_store(self, backend: DictBackend):
         """A value outside the interop model fails loud at store time."""
 
-        @_decorate(backend, interop="op", namespace="ns")
+        @_decorate(backend, interop="op", namespace="users")
         def f(x: int):
             return {1, 2, 3}  # sets do not round-trip cross-SDK
 
@@ -333,7 +355,7 @@ class TestInteropRejections:
 
         with pytest.raises(ConfigurationError, match="prefix"):
 
-            @_decorate(prefixed, interop="op", namespace="ns")
+            @_decorate(prefixed, interop="op", namespace="users")
             def f(x: int):
                 return x
 
@@ -344,7 +366,7 @@ class TestInteropRejections:
         (contract-violating dynamic backend) still fails closed."""
         mutable = DictBackend(key_prefix="")
 
-        @_decorate(mutable, interop="op", namespace="ns")
+        @_decorate(mutable, interop="op", namespace="users")
         def f(x: int):
             return x
 
@@ -361,7 +383,7 @@ class TestInteropRejections:
         cached values from a backend that had started prefixing keys."""
         mutable = DictBackend(key_prefix="")
 
-        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="ns")
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="users")
         async def f(x: int):
             return x
 
@@ -384,7 +406,7 @@ class TestInteropRejections:
             calls.append(x)
             return x
 
-        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
         provider = Mock()
         provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
@@ -404,7 +426,7 @@ class TestInteropRejections:
         async def f(x: int):
             return x * 2
 
-        wrapped = create_cache_wrapper(f, interop="op", namespace="ns")
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
         provider = Mock()
         provider.get_backend.side_effect = RuntimeError("backend down")
@@ -431,7 +453,7 @@ class TestInteropRejections:
         and raw-object storage would skip the cross-SDK value contract."""
         with pytest.raises(ConfigurationError, match="shared backend"):
 
-            @cache(backend=None, interop="op", namespace="ns")
+            @cache(backend=None, interop="op", namespace="users")
             def f(x: int):
                 return x
 
@@ -573,7 +595,7 @@ class TestInteropEncryption:
             @_decorate(
                 backend,
                 interop="op",
-                namespace="ns",
+                namespace="users",
                 encryption=True,
                 master_key=self.MASTER_KEY_HEX,
                 single_tenant_mode=True,
@@ -590,7 +612,7 @@ class TestInteropEncryption:
             @_decorate(
                 backend,
                 interop="op",
-                namespace="ns",
+                namespace="users",
                 encryption=True,
                 master_key=self.MASTER_KEY_HEX,
                 tenant_extractor=ArgumentNameExtractor("tenant_id"),
