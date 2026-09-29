@@ -1397,7 +1397,6 @@ def create_cache_wrapper(
                 error="Circuit breaker rejected the request",
                 error_type="CircuitBreakerOpen",
             )
-            features.clear_correlation_id()
             reset_current_function_stats(token)
             return func(*args, **kwargs)
 
