@@ -327,7 +327,9 @@ def fetch(key):
 def fetch_sensitive(key):
     # Encryption happens before L2 write
     # If L2 fails → Circuit opens
-    # Encryption/decryption code not involved
+    # A decrypt/integrity failure on read never counts toward the breaker.
+    # Fail-open (default): it is a cache miss and the function runs.
+    # fail_closed=True: an authentication failure raises DecryptionAuthenticationError
     return db.fetch(key)  # illustrative - not defined
 ```
 

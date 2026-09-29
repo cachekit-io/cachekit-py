@@ -628,10 +628,18 @@ Cached after first use: No additional overhead
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
-    # Decryption error → Circuit breaker catches
-    # Encryption happens before circuit breaker (at write time)
+    # Decrypt or integrity failure on read → cache miss, entry evicted, function runs.
+    # It does NOT count toward the circuit breaker.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
+
+A decrypt or integrity failure says nothing about backend health, so the breaker ignores it. For
+fail-open reads, the `cache_get_deserialize` failure metric and warning log still fire. This keeps a
+lazy plaintext→encrypted migration, where every pre-encryption entry is refused once, from opening
+the breaker. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError`
+to the caller instead of recomputing. It emits `cachekit_decrypt_failures_total` and the
+authentication error log, but not the `cache_get_deserialize` metric or warning log. It does not
+count toward the breaker either.
 
 **Encryption + L1 Cache**:
 ```python notest

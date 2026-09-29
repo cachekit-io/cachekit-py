@@ -742,6 +742,10 @@ def create_cache_wrapper(
 
     # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
     # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    # The entry is a miss, not a backend failure, so it must not count toward the
+    # circuit breaker: a refused plaintext entry during a plaintext→encrypted migration,
+    # or a handful planted by a backend writer, would otherwise open it and switch off
+    # caching for this function.
     def _on_l2_deserialize_error(error: Exception, key: str) -> None:
         features.handle_cache_error(
             error=error,
@@ -749,6 +753,7 @@ def create_cache_wrapper(
             cache_key=key,
             namespace=namespace or "default",
             duration_ms=0.0,
+            count_toward_breaker=False,
         )
 
     operation_handler.on_deserialize_error = _on_l2_deserialize_error
