@@ -96,3 +96,27 @@ async def test_one_operation_one_record(
 
     assert len(recorded) == 1, recorded
     assert (recorded[0]["operation"], recorded[0]["serializer"]) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("sync_mode", [True, False], ids=["sync-sink", "batched-sink"])
+def test_collector_counts_one_record_once(sync_mode: bool) -> None:
+    """Both collector modes turn one record into one counter increment, with no hit field queued."""
+    namespace = f"single-record-sink-{sync_mode}"
+    collector = AsyncMetricsCollector(sync_mode=sync_mode, auto_detect_mode=False)
+    # Stop the batched worker first and flush by hand: shutdown() can stop the worker
+    # before it takes a queued record, which would make this test racy.
+    collector.shutdown()
+
+    collector.record_cache_operation(
+        operation="get", namespace=namespace, success=True, duration_ms=1.0, serializer="rust", size_bytes=8
+    )
+    if not sync_mode:
+        assert collector._queue is not None
+        batch = [collector._queue.get_nowait()]
+        assert collector._queue.empty()
+        assert "hit" not in batch[0]
+        collector._flush_batch(batch)
+
+    counter = collector._metrics_cache["cache_operations_total"]
+    assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 1
