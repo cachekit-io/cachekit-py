@@ -379,8 +379,8 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext, so a reader can parse it before it has a key.
-Its JSON bytes are not what the AES-GCM tag covers; the tag covers the AAD. AAD v0x03
-is built from the reader's tenant, the cache key, and the header's wire format,
+Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
+the AAD. AAD v0x03 is built from the tenant, the cache key, and the header's wire format,
 compression flag and (when set) original type, so a change to one of those header
 values that alters the AAD fails authentication. The `encrypted` flag is **not** an
 AAD input: nothing authenticates it.
@@ -410,8 +410,9 @@ accepted:
 - **`tenant_id`** — required *before* decryption to derive the per-tenant key
   (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
   opaque identifier, not secret material, and it *is* tamper-protected: the reader
-  rejects a header `tenant_id` that differs from its own configured tenant before it
-  decrypts (`auth_tamper`), and AAD v0x03 binds the reader's tenant into the GCM tag.
+  derives the per-tenant key from the header's `tenant_id`, so a modified value selects
+  a different key and the read fails authentication (`auth_tamper`) — a key-fingerprint
+  mismatch under fail-closed, a GCM tag failure otherwise.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
