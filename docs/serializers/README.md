@@ -74,9 +74,10 @@ copy that a v0.20.0 replica wrote under the new key survives. Re-issue any erasu
 the rollout once the last v0.19 replica is retired, or cover it with the flush below.
 
 **What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
-arguments you never invalidate, and no-argument `invalidate_cache()` / `cache_clear()` only
-deletes the keys the current process wrote — in a freshly deployed process that is none of the
-old ones. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
+arguments you never invalidate. No-argument `invalidate_cache()` / `cache_clear()` does not
+reach them either: it deletes the keys this process tracked plus, on the tenant-scoped Redis
+backend, the keys in the server-side key registry, and releases before v0.20.0 recorded their
+keys in neither. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
 entry gone rather than aging out, follow the flush procedure in the retention warning
 [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
@@ -161,7 +162,8 @@ def get_data():
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no
-> bulk delete — `cache_clear()` only knows the keys the current process wrote — so flush on
+> bulk delete — `cache_clear()` reaches only keys this release tracked, never a pre-upgrade
+> one — so flush on
 > the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
 > matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries

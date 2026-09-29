@@ -14,13 +14,14 @@ so asserting on a hand-fed argument would pin nothing.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.cache_handler import CacheInvalidator, CacheOperationHandler, CacheSerializationHandler
+from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.standard_serializer import StandardSerializer
 
@@ -95,7 +96,7 @@ class TestSerializerCodeReachesTheKey:
         assert _suffix(key) == expected
 
     def test_invalidate_deletes_the_key_the_write_path_wrote(self):
-        """CacheInvalidator derives the suffix independently — it must agree, or it deletes nothing."""
+        """invalidate_cache must delete the exact key the write path wrote, serializer suffix included."""
         backend = _RecordingBackend()
         calls = 0
 
@@ -111,21 +112,9 @@ class TestSerializerCodeReachesTheKey:
 
         fn.invalidate_cache(1)
         assert written_key in backend.deleted, (
-            f"invalidator deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
+            f"invalidate_cache deleted {backend.deleted!r}, but the write path wrote {written_key!r}"
         )
         assert backend.store == {}
-
-    def test_invalidator_without_a_serializer_identity_deletes_nothing(self):
-        """A missing identity must fail loud, not compute a key nothing wrote and 'succeed'."""
-        backend = _RecordingBackend()
-
-        def fn(x: int) -> int:
-            return x
-
-        invalidator = CacheInvalidator(CacheKeyGenerator(), backend, serializer_type="")
-        with pytest.raises(ValueError, match="serializer_type"):
-            invalidator.invalidate_cache(fn, (1,), {}, None)
-        assert backend.deleted == []
 
     def test_integrity_flag_still_independent_of_serializer_code(self):
         """The ic half of the suffix was correct before this fix and must stay so."""
@@ -495,7 +484,56 @@ class TestInvalidationReachesPre020Keys:
             return real_generate_key(*args, **kwargs)
 
         monkeypatch.setattr(generator, "generate_key", counting_generate_key)
-        invalidator = CacheInvalidator(generator, integrity_checking=integrity_checking, serializer_type=serializer_type)
+        # Any identity, alias or custom, reaches the key only through serializer_key_name.
+        serialization = SimpleNamespace(serializer_key_name=serializer_type)
+        handler = CacheOperationHandler(serialization, generator)  # type: ignore[arg-type]
 
-        assert invalidator._invalidation_keys(fn, (1,), {}, namespace) == expected
-        assert len(calls) == len(expected), f"arguments hashed {len(calls)}x for {len(expected)} distinct key(s)"
+        legacy_key = handler.get_legacy_cache_key(fn, (1,), {}, namespace, integrity_checking)
+        assert [current, *([legacy_key] if legacy_key else [])] == expected
+        assert len(calls) == len(expected) - 1, f"arguments hashed {len(calls)}x for the legacy key alone"
+
+    @pytest.mark.parametrize("mode", ["key=", "fast_mode"])
+    def test_non_generated_keys_have_no_legacy_twin(self, mode: str):
+        """Only a generated key carries a serializer code; other key modes issue one delete."""
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        backend = _RecordingBackend()
+
+        def fn(x: int) -> int:
+            return x
+
+        # key= is read only from DecoratorConfig (the @cache path); fast_mode is internal-only.
+        if mode == "key=":
+            wrapped = cache(backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", key=str)(fn)
+        else:
+            wrapped = create_cache_wrapper(
+                fn, backend=backend, l1_enabled=False, namespace="lab5288-mode", serializer="auto", fast_mode=True
+            )
+        wrapped(1)
+        (written_key,) = backend.store
+        backend.deleted.clear()
+
+        wrapped.invalidate_cache(1)
+
+        assert backend.deleted == [written_key]
+
+    def test_failed_legacy_delete_is_retried_by_no_args_invalidation(self):
+        """A twin whose delete failed stays tracked, so the next whole-function invalidation retries it."""
+        backend = _FailOnKeysBackend()
+
+        @cache(backend=backend, ttl=None, namespace="lab5288-retry", serializer="auto", l1_enabled=False)
+        def fn(x: int) -> int:
+            return x
+
+        fn(1)
+        (current_key,) = backend.store
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"old"
+        backend.fail_on = {legacy_key}
+
+        fn.invalidate_cache(1)
+        assert list(backend.store) == [legacy_key]
+
+        backend.fail_on = set()
+        fn.invalidate_cache()
+        assert backend.store == {}, "no-args invalidation did not retry the failed legacy delete"

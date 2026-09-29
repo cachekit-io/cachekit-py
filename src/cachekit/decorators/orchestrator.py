@@ -1,7 +1,7 @@
 import contextvars
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ..hash_utils import redact_error_for_log, redact_key_for_log
 from ..monitoring.correlation_tracking import CorrelationTracker
@@ -12,6 +12,7 @@ from ..reliability import (
     AsyncMetricsCollector,
     BackpressureController,
     CircuitBreaker,
+    CircuitBreakerConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ class FeatureOrchestrator:
         backpressure_enabled: bool = True,
         collect_stats: bool = True,
         enable_structured_logging: bool = True,
-        circuit_breaker_config: Optional[dict[str, Any]] = None,
+        circuit_breaker_config: Optional[Union[dict[str, Any], CircuitBreakerConfig]] = None,
         backpressure_config: Optional[dict[str, Any]] = None,
     ):
         self.namespace = namespace
@@ -79,8 +80,6 @@ class FeatureOrchestrator:
         self._pool_monitor = None
 
         if circuit_breaker_enabled:
-            from ..reliability.circuit_breaker import CircuitBreakerConfig
-
             # Handle both dict and CircuitBreakerConfig objects
             if circuit_breaker_config is None:
                 # Create default config
@@ -137,15 +136,19 @@ class FeatureOrchestrator:
             self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
-        """Check if request should be allowed based on circuit breaker state."""
+        """Ask the circuit breaker to admit this request.
+
+        This is the breaker's admission decision, not a state read: it runs the
+        OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
+        HALF_OPEN probe slot when it admits. Call it once per request, and record
+        the outcome of every admitted request (``record_success`` /
+        ``record_failure``). A rejected request is not a failure — do not record it.
+        """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
             return True
 
-        # Use the circuit breaker's call method or check state
-        from ..reliability.circuit_breaker import CircuitState
-
-        return self._circuit_breaker.get_state() != CircuitState.OPEN
+        return self._circuit_breaker.should_attempt_call()
 
     def can_accept_request(self) -> bool:
         """Check if system can accept new request based on load control."""

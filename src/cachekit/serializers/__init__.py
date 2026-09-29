@@ -91,7 +91,7 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
     serializer instantiation.
 
     Args:
-        name: Serializer name ("default", "std", "auto", "arrow", "orjson")
+        name: Serializer name ("default", "std", "auto", "pythonic", "arrow", "orjson")
         enable_integrity_checking: Enable integrity checking (default: True)
             - For "default"/"std": Controls ByteStorage layer (True = LZ4 + xxHash3-64, False = pure MessagePack)
             - For "auto": Controls ByteStorage layer (True = LZ4 + xxHash3-64, False = raw MessagePack, no ByteStorage)

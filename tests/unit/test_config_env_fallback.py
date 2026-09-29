@@ -91,6 +91,16 @@ class TestRedisBackendConfigEnv:
         # Verify no cross-contamination
         assert not hasattr(cache_config, "redis_url")
 
+    def test_no_process_wide_default_ttl(self, monkeypatch):
+        """protocol/spec/intent-presets.md rule 3: no process-wide TTL override.
+
+        CACHEKIT_DEFAULT_TTL is reserved by the spec; setting it must neither
+        surface a field nor break construction (LAB-4641).
+        """
+        monkeypatch.setenv("CACHEKIT_DEFAULT_TTL", "7200")
+        config = CachekitConfig.from_env()
+        assert not hasattr(config, "default_ttl")
+
     def test_removed_knob_env_vars_are_ignored(self, monkeypatch):
         """Stale exports of removed CachekitConfig knobs must not break startup."""
         removed = {
