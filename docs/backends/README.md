@@ -250,9 +250,9 @@ a cache fault: the call does not fall back to running uncached, and it does not 
 the function's circuit breaker, which every tenant of that function shares.
 
 The check needs the function's backend. A function whose backend is resolved at its first call
-(see the resolution order below) skips the check until then. That covers a call the circuit
-breaker turns away before the backend was ever resolved, and an L1 hit on an async function
-before its first L1 miss. The check is on the id's type only. L1 is shared by every tenant (see
+(see the resolution order below) skips the check until then. That covers a call made while the
+circuit breaker is open before the backend was ever resolved, which runs the function uncached,
+and an L1 hit on an async function before its first L1 miss. The check is on the id's type only. L1 is shared by every tenant (see
 above), so do not rely on the `TypeError` to keep tenants apart.
 
 **Resolution order**:
