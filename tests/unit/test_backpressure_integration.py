@@ -1,6 +1,7 @@
 """Test backpressure controller integration with cache decorator."""
 
 import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -116,8 +117,9 @@ class TestBackpressureIntegration:
 
         Saturation is driven by events, not sleeps: a sleeping backend only overlaps requests
         if every thread starts within the sleep, which scheduler load breaks (LAB-6381).
-        No wait races the test's own clock: the holders block until the finally releases
-        them, and an overflow request that slips past backpressure returns at once.
+        No worker wait races the test's clock: the holders block until the finally releases
+        them, and an overflow request that slips past backpressure returns at once. Only the
+        test thread has a deadline, and expiry fails the test; it never frees a permit.
         """
         holder_keys = {"key_0", "key_1"}
         entered = threading.Semaphore(0)  # one release per holder inside the backend
@@ -136,6 +138,7 @@ class TestBackpressureIntegration:
         handler = StandardCacheHandler(mock_backend, backpressure_controller=backpressure_controller)
 
         results = {}
+        stall_limit = 30  # hang guard per phase, far above the ~0.1s a healthy run takes
 
         def worker(worker_id):
             # handler.get swallows BackendError and returns None, so None is a rejection
@@ -150,19 +153,26 @@ class TestBackpressureIntegration:
             # fail rather than wait on a signal that cannot come.
             for thread in holders:
                 thread.start()
+                deadline = time.monotonic() + stall_limit
                 while not entered.acquire(timeout=0.1):
                     assert thread.is_alive(), f"holder never reached the backend: {results}"
+                    assert time.monotonic() < deadline, "holder stalled before reaching the backend"
 
             # Permits stay held, so each overflow request is rejected: queue full, or permit timeout.
-            # Unbounded joins are safe: every overflow path ends in the 0.05s permit wait or a non-blocking get.
+            # Every overflow path ends in the 0.05s permit wait or a non-blocking get, so one that
+            # outlives the deadline means that wait stalled.
             for thread in overflow:
                 thread.start()
+            deadline = time.monotonic() + stall_limit
             for thread in overflow:
-                thread.join()
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not any(t.is_alive() for t in overflow), f"overflow request stalled: {results}"
         finally:
             release.set()
+            cleanup_deadline = time.monotonic() + 5
             for thread in holders + overflow:
-                thread.join(timeout=5)
+                if thread.ident is not None:  # unstarted when an earlier phase failed
+                    thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
         assert results == {0: b"value", 1: b"value", 2: None, 3: None, 4: None}
         assert mock_backend.get.call_count == 2, "rejected requests must not reach the backend"
