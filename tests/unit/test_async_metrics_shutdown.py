@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from fractions import Fraction
 
 import pytest
 
@@ -218,8 +219,24 @@ def test_generic_metrics_cannot_claim_a_builtin_series(name, kind):
     assert name not in collector._metrics_cache
 
 
-def test_names_that_only_share_a_prefix_stay_available():
+@pytest.mark.parametrize(
+    "name",
+    [
+        "cache_operation_latency",
+        "cache_operations_errors_total",
+        "circuit_breaker_state_changes_total",
+        "cache_operation_duration_ms_p99",
+    ],
+)
+def test_names_whose_series_do_not_collide_stay_available(name):
     collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
-    name = f"cache_operation_latency_{uuid.uuid4().hex}"
-    collector.record_counter(name, {"op": "get"})
-    assert collector._metrics_cache[name].labels(op="get")._value.get() == 1
+    unique = f"{name}_{uuid.uuid4().hex}" if not name.endswith("_total") else f"{name[:-6]}_{uuid.uuid4().hex}_total"
+    collector.record_counter(unique, {"op": "get"})
+    assert collector._metrics_cache[unique].labels(op="get")._value.get() == 1
+
+
+def test_sync_mode_accepts_any_real_number():
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    name = f"sync_real_value_{uuid.uuid4().hex}"
+    collector.record_histogram(name, Fraction(1, 2), {"op": "get"})
+    assert collector._metrics_cache[name].labels(op="get")._sum.get() == 0.5

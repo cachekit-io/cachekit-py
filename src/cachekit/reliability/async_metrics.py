@@ -5,6 +5,7 @@ synchronous Prometheus updates from the hot path.
 """
 
 import logging
+import numbers
 import queue
 import threading
 import time
@@ -15,15 +16,15 @@ from cachekit.hash_utils import redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
-# Base names of the metrics the collector records itself. prometheus_client derives every series name from
-# the base (cache_operations_total, cache_operations_created, cache_operation_duration_ms_sum, ...), so a
-# caller-supplied name that is a base, or a base extended with "_", could claim a built-in series. The built-in
-# metric would then register under a renamed series, or break every later cache-operation update.
-_BUILTIN_METRIC_BASES = (
-    "cache_operations",
-    "cache_operation_duration_ms",
-    "cache_operation_size_bytes",
-    "circuit_breaker_state",
+# Suffixes prometheus_client appends to a metric's base name to form its series names.
+_SERIES_SUFFIXES = ("", "_total", "_created", "_bucket", "_count", "_sum")
+
+# Every series name the collector's own metrics register. A caller-supplied metric whose series would include
+# one of these could claim it: the built-in metric would then register under a renamed series, or break every
+# later cache-operation update.
+_BUILTIN_SERIES = frozenset(
+    {"cache_operations", "cache_operations_total", "cache_operations_created", "circuit_breaker_state"}
+    | {f"{h}{s}" for h in ("cache_operation_duration_ms", "cache_operation_size_bytes") for s in _SERIES_SUFFIXES}
 )
 
 try:
@@ -350,10 +351,11 @@ class AsyncMetricsCollector:
         """
         if not isinstance(name, str) or not all(isinstance(k, str) for k in labels):
             raise TypeError("metric name and label names must be str")
-        base = name.removesuffix("_total")  # prometheus_client strips it from counter names
-        if any(base == b or base.startswith(f"{b}_") for b in _BUILTIN_METRIC_BASES):
+        # A counter's base drops "_total"; checking both forms against every suffix covers both metric kinds.
+        bases = (name, name.removesuffix("_total"))
+        if any(f"{b}{s}" in _BUILTIN_SERIES for b in bases for s in _SERIES_SUFFIXES):
             raise ValueError(f"metric name {name} is reserved")
-        if not isinstance(value, (int, float)):
+        if not isinstance(value, numbers.Real):
             raise TypeError("metric value must be a number")
         return float(value)
 
