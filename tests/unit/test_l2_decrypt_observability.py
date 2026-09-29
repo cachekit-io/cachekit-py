@@ -6,10 +6,12 @@ failure, corrupt data), the decorator must:
   2. Treat it as a miss and recompute (fail-open — existing behavior).
   3. Evict the poisoned entry and emit the cache_get_deserialize metric on
      both sync and async decorator paths (#159).
+  4. Leave the circuit breaker untouched: the failure is a miss, not a backend failure.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Iterator
@@ -20,9 +22,12 @@ import pytest
 
 from cachekit import cache
 from cachekit.cache_handler import CacheHit, CacheOperationHandler, CacheSerializationHandler
+from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.key_generator import CacheKeyGenerator
+from cachekit.l1_cache import get_l1_cache
+from cachekit.reliability import AsyncMetricsCollector
 from cachekit.serializers.base import SerializationError
-from cachekit.serializers.encryption_wrapper import EncryptionError
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError
 from cachekit.serializers.wrapper import _PREFIX_LEN, SerializationWrapper
 
 
@@ -429,3 +434,141 @@ class TestCorruptFrameHeaderEvicts:
 
         assert handler.get_cached_value("") is None
         mock_ch.delete.assert_not_called()  # a caller bug, not a poisoned entry
+
+
+_SECURE_KEY = "a" * 64  # test-only placeholder, not a secret
+_BREAKER_THRESHOLD = 5  # the @cache.secure breaker's default failure_threshold
+
+
+def _refused_plaintext(keys: list[str], envelopes: list[bytes]) -> list[bytes]:
+    """Pre-encryption entries: plaintext envelopes an encrypting reader refuses."""
+    writer = CacheSerializationHandler(serializer_name="default")
+    return [writer.serialize_data({"result": -1}, cache_key=key) for key in keys]
+
+
+def _substituted(keys: list[str], envelopes: list[bytes]) -> list[bytes]:
+    """Each key serves another key's ciphertext, so the AAD check fails."""
+    return envelopes[1:] + envelopes[:1]
+
+
+def _corrupt(keys: list[str], envelopes: list[bytes]) -> list[bytes]:
+    """An unknown CK frame version: corruption, not tamper evidence."""
+    return [blob[:2] + b"\x09" + blob[3:] for blob in envelopes]
+
+
+def _secure_fn(backend: DictBackend, namespace: str, calls: list[int], *, is_async: bool, **kwargs: Any) -> Any:
+    decorator = cache.secure(master_key=_SECURE_KEY, backend=backend, namespace=namespace, ttl=300, **kwargs)
+    if is_async:
+
+        @decorator
+        async def afn(x: int) -> dict:
+            calls.append(x)
+            return {"result": x}
+
+        return afn
+
+    @decorator
+    def fn(x: int) -> dict:
+        calls.append(x)
+        return {"result": x}
+
+    return fn
+
+
+async def _call(fn: Any, x: int) -> Any:
+    result = fn(x)
+    return await result if inspect.isawaitable(result) else result
+
+
+async def _populate_then_poison(fn: Any, backend: DictBackend, namespace: str, poison: Any) -> list[str]:
+    """Cache fn(0..N-1) in L2, replace every entry with ``poison``, and drop L1."""
+    for x in range(_BREAKER_THRESHOLD):
+        assert await _call(fn, x) == {"result": x}
+    keys = sorted(backend._store)
+    assert len(keys) == _BREAKER_THRESHOLD
+    for key, blob in zip(keys, poison(keys, [backend._store[k] for k in keys]), strict=True):
+        backend._store[key] = blob
+    get_l1_cache(namespace).clear()  # force the next reads through L2
+    return keys
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+class TestL2ReadFailureLeavesBreakerAlone:
+    """A decrypt/integrity failure on an L2 read is a miss, never a backend failure.
+
+    It must not count toward the circuit breaker. Otherwise enabling encryption over
+    N >= failure_threshold live plaintext entries (lazy migration), or N entries planted
+    by anyone who can write to the backend, opens the breaker and silently disables
+    caching for the function.
+    """
+
+    @pytest.mark.parametrize(
+        ("poison", "reason"),
+        [(_refused_plaintext, "suspicious_envelope"), (_substituted, "auth_tamper"), (_corrupt, "corruption")],
+        ids=["refused-plaintext", "auth-tamper", "corruption"],
+    )
+    async def test_fail_open_read_failure_is_miss_and_breaker_stays_closed(
+        self,
+        is_async: bool,
+        poison: Any,
+        reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        backend = DictBackend()
+        calls: list[int] = []
+        namespace = f"breaker-{reason}-{is_async}"
+        fn = _secure_fn(backend, namespace, calls, is_async=is_async)
+        keys = await _populate_then_poison(fn, backend, namespace, poison)
+
+        metrics: list[dict[str, Any]] = []
+        record_metric = AsyncMetricsCollector.record_cache_operation
+        monkeypatch.setattr(
+            AsyncMetricsCollector,
+            "record_cache_operation",
+            lambda self, **kw: (metrics.append(kw), record_metric(self, **kw))[1],
+        )
+        logged: list[str] = []
+        log_operation = FeatureOrchestrator.log_cache_operation
+        monkeypatch.setattr(
+            FeatureOrchestrator,
+            "log_cache_operation",
+            lambda self, **kw: (logged.append(kw.get("operation", "")), log_operation(self, **kw))[1],
+        )
+
+        calls.clear()
+        with caplog.at_level(logging.WARNING):
+            for x in range(_BREAKER_THRESHOLD):
+                assert await _call(fn, x) == {"result": x}
+
+        # Each read was a miss plus a recompute, of the failure class under test.
+        assert calls == list(range(_BREAKER_THRESHOLD))
+        assert sum(f"({reason})" in r.message for r in caplog.records) == _BREAKER_THRESHOLD
+        assert set(backend.deleted) == set(keys)
+        # The breaker never saw them.
+        breaker = fn.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+        # Observability is kept: one failure record and one structured log per read.
+        deserialize_records = [m for m in metrics if m["operation"] == "cache_get_deserialize"]
+        assert len(deserialize_records) == _BREAKER_THRESHOLD
+        assert not any(m["success"] for m in deserialize_records)
+        assert logged.count("cache_get_deserialize_failed") == _BREAKER_THRESHOLD
+
+    async def test_fail_closed_tamper_raises_and_breaker_stays_closed(
+        self, is_async: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        backend = DictBackend()
+        calls: list[int] = []
+        namespace = f"breaker-fail-closed-{is_async}"
+        fn = _secure_fn(backend, namespace, calls, is_async=is_async, fail_closed=True)
+        await _populate_then_poison(fn, backend, namespace, _substituted)
+
+        for x in range(_BREAKER_THRESHOLD):
+            with pytest.raises(DecryptionAuthenticationError):
+                await _call(fn, x)
+
+        breaker = fn.get_health_status()["circuit_breaker"]
+        assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)

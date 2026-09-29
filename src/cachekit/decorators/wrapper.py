@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
-from ..backends.errors import BackendError
+from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
@@ -580,25 +580,15 @@ def create_cache_wrapper(
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
 
-    # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
-    # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
-    # drain another's keys. namespace=None and namespace="default" write different auto-mode
-    # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
-    # a key written under it could take the ck:reg: shape and overwrite a tracking set.
-    if namespace == "ck" or (namespace or "").startswith("ck:"):
-        raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
-    _registry_id = (
-        f"ck:reg:{namespace if namespace is not None else ''}:"
-        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
-    )
-
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
-    # that bypass DecoratorConfig validation.
+    # that bypass DecoratorConfig validation. Runs before any other use of namespace
+    # and rebinds both segments to the exact str values it checked, so a str subclass
+    # (e.g. a (str, Enum) member) cannot render differently in a key.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
         try:
-            validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
+            interop, namespace = validate_interop_config(interop, namespace, has_custom_key=custom_key_func is not None)
         except InteropError as e:
             raise ConfigurationError(str(e)) from e
         if fast_mode:
@@ -615,6 +605,18 @@ def create_cache_wrapper(
         # are re-checked per call (see the wrappers below).
         ensure_interop_backend_compatible(backend)
         _interop_sig = inspect.signature(func)
+
+    # Key registry id: names this function's server-side tracking set on a KeyTrackableBackend.
+    # 64-bit hash, not func_hash's 32: a registry collision makes one function's invalidation
+    # drain another's keys. namespace=None and namespace="default" write different auto-mode
+    # keys, so they get different sets (None -> empty segment). The "ck" namespace is reserved:
+    # a key written under it could take the ck:reg: shape and overwrite a tracking set.
+    if namespace == "ck" or (namespace or "").startswith("ck:"):
+        raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
+    _registry_id = (
+        f"ck:reg:{namespace if namespace is not None else ''}:"
+        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
+    )
 
     # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
     # "secure MUST hold only ciphertext" in L1). Encryption is a serializer layer, and the
@@ -740,6 +742,10 @@ def create_cache_wrapper(
 
     # Corrupt/tampered L2 entries are evicted inside get_cached_value(_async); this hook
     # makes both sync and async paths emit the same cache_get_deserialize metric (#159).
+    # The entry is a miss, not a backend failure, so it must not count toward the
+    # circuit breaker: a refused plaintext entry during a plaintext→encrypted migration,
+    # or a handful planted by a backend writer, would otherwise open it and switch off
+    # caching for this function.
     def _on_l2_deserialize_error(error: Exception, key: str) -> None:
         features.handle_cache_error(
             error=error,
@@ -747,6 +753,7 @@ def create_cache_wrapper(
             cache_key=key,
             namespace=namespace or "default",
             duration_ms=0.0,
+            count_toward_breaker=False,
         )
 
     operation_handler.on_deserialize_error = _on_l2_deserialize_error
@@ -1383,6 +1390,18 @@ def create_cache_wrapper(
 
         # L1+L2 MODE: Original behavior with backend initialization
 
+        # Tenant scope, before the breaker check and outside every degrade try (LAB-5713): an
+        # unsupported tenant id type is a caller bug, so its UnsupportedTenantError reaches the
+        # caller before the function runs, whatever the breaker state, and never counts a failure
+        # on the breaker every tenant of this function shares. "" until the backend is resolved;
+        # the first call checks right after resolving it, below. Sits outside the main
+        # try/finally, so the raise path restores the context itself.
+        try:
+            _l2_scope()
+        except Exception:
+            reset_current_function_stats(token)
+            raise
+
         # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
         # with its probe budget spent) - run the function uncached. This sits
         # outside the try below on purpose: that except records a failure, and a
@@ -1409,6 +1428,7 @@ def create_cache_wrapper(
                 nonlocal _backend
                 if _backend is None:
                     _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
 
                 # Setup cache handler strategy on first use
                 handler = StandardCacheHandler(
@@ -1417,6 +1437,12 @@ def create_cache_wrapper(
                     ttl_refresh_threshold=ttl_refresh_threshold,
                 )
                 operation_handler.set_cache_handler(handler)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                reset_current_function_stats(token)
+                raise
             except Exception as e:
                 # Guard clause: Client creation failed - early return with fallback
                 features.handle_cache_error(
@@ -1773,10 +1799,15 @@ def create_cache_wrapper(
                 return result
 
             # L1+L2 MODE: Original behavior with backend initialization
+            # Tenant scope, before the breaker check (LAB-5713): see sync_wrapper. "" until the
+            # backend is resolved; the first call checks right after resolving it, below. The
+            # outer finally resets the stats context.
+            _l2_scope()
+
             # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
-            # The outer finally clears correlation ID / stats context.
+            # The outer finally resets the stats context.
             if not features.should_allow_request():
                 features.log_cache_operation(
                     operation="circuit_breaker_open",
@@ -1802,6 +1833,8 @@ def create_cache_wrapper(
                 if _backend is None:
                     try:
                         _backend = _resolve_lazy_backend()
+                    except UnsupportedTenantError:
+                        raise  # a caller bug, not a client failure: see sync_wrapper
                     except Exception as e:
                         # If Redis connection fails, execute function without caching - RETURN EARLY
                         # This prevents the decorator from breaking the application
@@ -1813,7 +1846,7 @@ def create_cache_wrapper(
                             duration_ms=0.0,
                         )
                         return await func(*args, **kwargs)
-                ensure_interop_backend_compatible(_backend)
+                ensure_interop_backend_compatible(_backend)  # reads key_prefix, so runs the tenant check too
 
             # Guard clause: L1 cache check first - early return eliminates network latency
             if _l1_cache and cache_key:
@@ -1876,6 +1909,8 @@ def create_cache_wrapper(
             if _backend is None:
                 try:
                     _backend = _resolve_lazy_backend()
+                except UnsupportedTenantError:
+                    raise  # a caller bug, not a client failure: see sync_wrapper
                 except Exception as e:
                     # If Redis connection fails, execute function without caching - RETURN EARLY
                     # This prevents the decorator from breaking the application
@@ -1887,6 +1922,7 @@ def create_cache_wrapper(
                         duration_ms=0.0,
                     )
                     return await func(*args, **kwargs)
+                _l2_scope()  # first call: the tenant check above ran before the backend existed
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

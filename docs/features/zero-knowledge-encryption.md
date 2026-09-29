@@ -534,6 +534,22 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
                           single_tenant_mode=True, fail_closed=True)
 ```
 
+**Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
+raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
+`cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
+shorter than 32 bytes, more than three previous keys, or the current key repeated among
+them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+settings load, so this surfaces only when keys bypass that check: passed to
+`EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
+environment's previous keys. Outside config-drift reads (below), the fault never
+evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
+`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
+decorators an L2 read logs it as a cache error and runs the call uncached. Two cases take
+other paths: a missing or short *current* master key raises `EncryptionError`, and an
+encryption-disabled handler reading an entry that claims encryption treats the fault as
+corruption (miss + evict), because only the unauthenticated header sent it down the
+decrypt path.
+
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key
 > in `CACHEKIT_PREVIOUS_MASTER_KEYS`** makes every pre-rotation entry raise
@@ -628,10 +644,18 @@ Cached after first use: No additional overhead
 ```python notest
 @cache.secure(ttl=300, master_key=secret_key)  # Both enabled
 def get_data():
-    # Decryption error → Circuit breaker catches
-    # Encryption happens before circuit breaker (at write time)
+    # Decrypt or integrity failure on read → cache miss, entry evicted, function runs.
+    # It does NOT count toward the circuit breaker.
     return fetch_data()  # illustrative - fetch_data not defined
 ```
+
+A decrypt or integrity failure says nothing about backend health, so the breaker ignores it. For
+fail-open reads, the `cache_get_deserialize` failure metric and warning log still fire. This keeps a
+lazy plaintext→encrypted migration, where every pre-encryption entry is refused once, from opening
+the breaker. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError`
+to the caller instead of recomputing. It emits `cachekit_decrypt_failures_total` and the
+authentication error log, but not the `cache_get_deserialize` metric or warning log. It does not
+count toward the breaker either.
 
 **Encryption + L1 Cache**:
 ```python notest

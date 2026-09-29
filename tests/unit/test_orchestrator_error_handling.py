@@ -161,6 +161,34 @@ class TestErrorHandlerContract:
 
         assert updated_failures > initial_failures, "Error handler must record failures in circuit breaker"
 
+    def test_backend_error_counts_toward_circuit_breaker(self):
+        """A backend failure that is not an excluded error type trips the breaker."""
+        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True)
+
+        orchestrator.handle_cache_error(
+            error=BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT),
+            operation="cache_get",
+            cache_key="test:key",
+        )
+
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 1
+
+    def test_error_handler_can_skip_circuit_breaker_but_keeps_metrics(self, monkeypatch):
+        """count_toward_breaker=False records the failure metric without breaker accounting."""
+        orchestrator = FeatureOrchestrator(namespace="test", circuit_breaker_enabled=True, collect_stats=True)
+        metrics: list[dict] = []
+        monkeypatch.setattr(orchestrator.metrics_collector, "record_cache_operation", lambda **kw: metrics.append(kw))
+
+        orchestrator.handle_cache_error(
+            error=ValueError("undecodable entry"),
+            operation="cache_get_deserialize",
+            cache_key="test:key",
+            count_toward_breaker=False,
+        )
+
+        assert orchestrator.circuit_breaker.get_stats()["failure_count"] == 0
+        assert [(m["operation"], m["success"]) for m in metrics] == [("cache_get_deserialize", False)]
+
     def test_error_handler_preserves_operation_context(self):
         """Error handler must set operation context correctly."""
         orchestrator = FeatureOrchestrator(namespace="test", collect_stats=True)

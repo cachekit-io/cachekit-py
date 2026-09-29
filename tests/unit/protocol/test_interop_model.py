@@ -4,12 +4,14 @@ The protocol vectors (test_interop_vectors.py) byte-pin the canonical forms;
 these tests pin the SDK-local model edges around them: msgpack 32-bit length
 tiers, argument normalization of Python-idiomatic types (Enum/Path/Decimal),
 ``*args``/``**kwargs`` flattening, temporal value sentinels, strict
-single-document decoding, and the reserved-namespace boundary.
+single-document decoding, the reserved-namespace boundary, and str-subclass
+segments (validated and rendered as their exact str value).
 """
 
 from __future__ import annotations
 
 import inspect
+import sys
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
@@ -160,3 +162,71 @@ class TestReservedNamespaces:
     def test_reservation_is_exact_match_and_namespace_only(self, operation: str, namespace: str):
         assert validate_interop_config(operation, namespace) == (operation, namespace)
         assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
+
+
+class NS(str, Enum):
+    USERS = "users"
+
+
+class OP(str, Enum):
+    GET_USER = "get_user"
+
+
+class FormatsAsNsapi(str):
+    """Value 'users', but formats as the reserved 'nsapi'."""
+
+    def __format__(self, spec: str) -> str:
+        return "nsapi"
+
+
+class UnhashableAsReserved(str):
+    """Value 'nsapi', but hashes and compares unlike it, so set membership misses."""
+
+    def __hash__(self) -> int:
+        return 0
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+
+class TestSegmentSubclasses:
+    """A ``str`` subclass is validated and rendered as its exact ``str`` value.
+
+    Otherwise the checked string and the key string can differ: a ``(str, Enum)``
+    member formats as ``NS.USERS`` since Python 3.11, a subclass can override
+    ``__format__``, and ``__hash__``/``__eq__`` decide the reserved-set lookup.
+    """
+
+    PLAIN_KEY = generate_interop_key("users", "get_user", [42])
+
+    def test_str_enum_mixin_renders_its_value(self):
+        assert generate_interop_key(NS.USERS, OP.GET_USER, [42]) == self.PLAIN_KEY
+        op, ns = validate_interop_config(OP.GET_USER, NS.USERS)
+        assert (type(op), type(ns)) == (str, str)
+        assert (op, ns) == ("get_user", "users")
+
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
+    def test_strenum_renders_its_value(self):
+        from enum import StrEnum
+
+        class Names(StrEnum):
+            USERS = "users"
+            GET_USER = "get_user"
+
+        assert generate_interop_key(Names.USERS, Names.GET_USER, [42]) == self.PLAIN_KEY
+        op, ns = validate_interop_config(Names.GET_USER, Names.USERS)
+        assert (type(op), type(ns)) == (str, str)
+
+    def test_overridden_format_never_mints_a_reserved_prefix(self):
+        key = generate_interop_key(FormatsAsNsapi("users"), FormatsAsNsapi("get_user"), [42])
+        assert key == self.PLAIN_KEY
+        assert not key.startswith(("ns:", "nsapi:"))
+        op, ns = validate_interop_config(FormatsAsNsapi("get_user"), FormatsAsNsapi("users"))
+        assert f"{ns}:{op}" == "users:get_user"
+
+    @pytest.mark.parametrize("reserved", ["ns", "nsapi"])
+    def test_overridden_hash_cannot_skip_the_reservation(self, reserved: str):
+        with pytest.raises(InteropError, match="reserved"):
+            generate_interop_key(UnhashableAsReserved(reserved), "get_user", [1])
+        with pytest.raises(InteropError, match="reserved"):
+            validate_interop_config("get_user", UnhashableAsReserved(reserved))

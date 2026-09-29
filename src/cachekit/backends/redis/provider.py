@@ -27,13 +27,14 @@ from redis.commands.core import Script
 from redis.exceptions import LockNotOwnedError
 
 from cachekit.backends.base import BaseBackend
-from cachekit.backends.errors import BackendError
+from cachekit.backends.errors import BackendError, UnsupportedTenantError
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
-# Module-level ContextVar for async-safe tenant isolation
+# Module-level ContextVar for async-safe tenant isolation. Any other type raises TypeError
+# (see _encode_tenant); through @cache, before the function runs.
 tenant_context: ContextVar[str | bytes | int | uuid.UUID | None] = ContextVar("tenant_context", default=None)
 
 T = TypeVar("T")
@@ -104,7 +105,11 @@ def _encode_tenant(tenant_id: object) -> str:
     (``int``; ``hex`` on 3.14) are trusted on purpose: asyncpg's UUID leaves the stdlib ``int``
     slot empty and supplies them itself, so never read the slot directly. Anything else except
     str / bytes raises TypeError (fail closed): the ``str()`` of an arbitrary object, e.g. a
-    default repr embedding ``id()``, can map two tenants to one prefix.
+    default repr embedding ``id()``, can map two tenants to one prefix. The TypeError is an
+    ``UnsupportedTenantError``: through ``@cache`` it reaches the caller before the decorated
+    function runs, sync and async alike, and before the breaker and L1 checks once the function
+    has its backend — never degraded to an uncached call or counted against the circuit breaker
+    every tenant of the function shares. A type check, not isolation: L1 is not tenant-scoped.
 
     The encoding is by text, not by type: ``1``, ``"1"`` and ``b"1"`` share one prefix, as do a
     UUID and ``str(uuid)``, so one tenant read as int in one place and str in another stays one
@@ -116,12 +121,16 @@ def _encode_tenant(tenant_id: object) -> str:
     elif isinstance(tenant_id, uuid.UUID):
         tenant_id = uuid.UUID.__str__(tenant_id)
     if not isinstance(tenant_id, (str, bytes)):
-        raise TypeError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
+        raise UnsupportedTenantError(f"tenant_id must be str, bytes, int or UUID, not {type(tenant_id).__name__}")
     return url_encode(tenant_id, safe="")
 
 
 class PerRequestRedisBackend:
-    """Per-request Redis backend wrapper with tenant isolation.
+    """Tenant-scoped Redis backend over a shared client.
+
+    Cheap enough to build per request, but one instance can also serve every request:
+    ``RedisBackendProvider.get_shared_backend()`` returns one object shared for the life of the
+    process, scoped per operation (``follow_context``, below).
 
     Implements all Code-Craftsman fixes:
     - Fix #1: Accepts shared Redis client (not creating per operation)
@@ -192,6 +201,7 @@ class PerRequestRedisBackend:
 
         Raises:
             RuntimeError: If tenant_id is None (fail-fast validation - Fix #9)
+            TypeError: If tenant_id is not str, bytes, int or UUID (see _encode_tenant)
         """
         # Fix #9: Fail-fast validation
         if tenant_id is None:
@@ -768,6 +778,7 @@ class RedisBackendProvider:
 
         Raises:
             RuntimeError: If tenant_context is not set (fail-fast - Fix #9)
+            TypeError: If tenant_context holds a type other than str, bytes, int or UUID
         """
         # Extract tenant from ContextVar
         tenant_id = tenant_context.get()
