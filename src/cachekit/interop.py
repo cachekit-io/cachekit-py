@@ -228,9 +228,34 @@ def _normalize_arg(v: object) -> object:
     Decimal's textual form is caller-visible contract: "1.0" and "1.00" hash
     differently — agree on the form across SDKs or avoid Decimal arguments.
     """
-    if v is None or isinstance(v, (bool, int, float, str, bytes, bytearray)):
-        # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the
-        # encoder, which every path hits.
+    # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the encoder,
+    # which every path hits. A real scalar subclass is first reduced to its exact
+    # base-type value through the base type's own slot, so the hashed bytes are
+    # the argument's value and never the output of a method the subclass can
+    # override (encode, to_bytes, is_integer, __int__, __bytes__, __lt__).
+    # Dispatch is on type(v), never isinstance: isinstance honours a __class__
+    # property, so an int subclass reporting str would take the str branch.
+    t = type(v)
+    if v is None or t is bool:  # bool cannot be subclassed
+        return v
+    u: Any = v  # the slots take their own type; issubclass(t, ...) does not narrow v
+    if issubclass(t, str):
+        return str.__str__(u)
+    if issubclass(t, int):
+        return int.__int__(u)
+    if issubclass(t, float):
+        return float.__float__(u)
+    # bytes.__bytes__ does not exist on Python 3.10; the base type's full slice
+    # copies the buffer without calling anything a subclass defines.
+    if issubclass(t, bytes):
+        return bytes.__getitem__(u, slice(None))
+    if issubclass(t, bytearray):
+        return bytes(bytearray.__getitem__(u, slice(None)))
+    if isinstance(v, (bool, int, float, str, bytes, bytearray)):
+        # Not a subclass: it only reports a scalar type through __class__, as a
+        # lazy proxy does (SimpleLazyObject, wrapt). The slots would raise
+        # TypeError on it, so it keeps its pre-existing pass-through and is
+        # hashed through its own forwarded methods.
         return v
     if isinstance(v, datetime):
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
@@ -257,7 +282,18 @@ def _normalize_arg(v: object) -> object:
         for k, val in v.items():
             if not isinstance(k, str):
                 raise InteropError(f"interop map keys must be strings, got {type(k).__name__}")
-            norm[k] = _normalize_arg(val)
+            # Check first, then normalize: normalizing first would accept Enum,
+            # Path, UUID and Decimal keys and widen the str-keys contract. The
+            # second check catches a non-str subclass that reports str.
+            key = _normalize_arg(k)
+            if not isinstance(key, str):
+                raise InteropError(f"interop map keys must be strings, got {type(k).__name__}")
+            if key in norm:
+                # Only a subclass overriding __eq__/__hash__ gets two equal keys
+                # into one dict. Such a map has no canonical encoding, and
+                # keeping either value would hash it like a different argument.
+                raise InteropError(f"interop map has duplicate key {key!r} after normalization")
+            norm[key] = _normalize_arg(val)
         return norm
     if isinstance(v, Enum):
         return _normalize_arg(v.value)
@@ -287,7 +323,8 @@ def validate_segment(name: str, segment: object) -> str:
 
     Full-string match against ``^[a-z0-9][a-z0-9._-]{0,63}$`` — never silently
     normalized. re.fullmatch, not re.match: $ accepts a trailing newline.
-    A namespace must additionally not be one of :data:`RESERVED_NAMESPACES`.
+    Neither segment may contain ``..``, and a namespace must additionally not
+    be one of :data:`RESERVED_NAMESPACES`.
 
     A ``str`` subclass is checked and returned as its exact ``str`` value, so
     callers must render the returned value, not the argument. The subclass's own
@@ -303,6 +340,15 @@ def validate_segment(name: str, segment: object) -> str:
         raise InteropError(
             f"invalid interop {name} {value!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
             f"(lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
+        )
+    # SEGMENT_RE admits `..`, but the server rejects `..` anywhere in a key
+    # (protocol spec/cache-key-format.md "Server-Side Requirements", Traversal
+    # row). The `:` delimiters separate the segments and the hash is hex, so any
+    # `..` in a key lies inside one segment.
+    if ".." in value:
+        raise InteropError(
+            f"invalid interop {name} {value!r}: must not contain '..', because the CachekitIO server "
+            f"rejects '..' anywhere in a key"
         )
     if name == "namespace" and value in RESERVED_NAMESPACES:
         raise InteropError(

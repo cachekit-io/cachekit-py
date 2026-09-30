@@ -10,7 +10,7 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -527,3 +527,104 @@ class TestL1EnabledFlag:
     def test_bare_form_uses_l1_defaults(self, _resolved: list[DecoratorConfig]) -> None:
         self._decorate(cache, l1_enabled=False)
         assert _resolved[0].l1 == L1CacheConfig(enabled=False)
+
+
+# One override per field a preset sets itself, each unequal to every preset's default for that field.
+_NESTED_OVERRIDES: dict[str, object] = {
+    "circuit_breaker": CircuitBreakerConfig(failure_threshold=3),
+    "l1": L1CacheConfig(max_size_mb=200, swr_enabled=False),
+    "backpressure": BackpressureConfig(max_concurrent_requests=7),
+    "monitoring": MonitoringConfig(collect_stats=False, enable_tracing=True),
+}
+_PRESET_OVERRIDES: dict[str, dict[str, object]] = {
+    "minimal": {**_NESTED_OVERRIDES, "integrity_checking": True},
+    "production": {**_NESTED_OVERRIDES, "integrity_checking": False},
+    "dev": {**_NESTED_OVERRIDES, "integrity_checking": False},
+    "test": {**_NESTED_OVERRIDES, "integrity_checking": True},
+    "io": {**_NESTED_OVERRIDES, "integrity_checking": False, "swr_by_default": False},
+    # secure: integrity_checking is forced (falsy rejected), encryption= is not an override.
+    "secure": _NESTED_OVERRIDES,
+}
+_PRESET_FIELD_CASES = [(preset, name) for preset, overrides in _PRESET_OVERRIDES.items() for name in overrides]
+
+
+def _field_values(config: DecoratorConfig) -> dict[str, object]:
+    # backend is excluded: io builds a fresh CachekitIOBackend per call, which compares by identity.
+    return {f.name: getattr(config, f.name) for f in fields(config) if f.name != "backend"}
+
+
+@pytest.mark.unit
+class TestPresetFieldOverrides:
+    """A preset accepts an override for every field it sets itself, and the caller's value wins (LAB-5361).
+
+    protocol spec/intent-presets.md § Explicit Configuration rule 1: an explicit argument MUST override
+    the preset default. Every other field keeps the preset's default.
+    """
+
+    @pytest.fixture
+    def _resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+        seen: list[DecoratorConfig] = []
+
+        def spy(f, config, **_kwargs):
+            seen.append(config)
+            return f
+
+        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        return seen
+
+    @staticmethod
+    def _assert_only_field_overridden(config: DecoratorConfig, preset: str, name: str) -> None:
+        expected = _field_values(getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset]))
+        expected[name] = _PRESET_OVERRIDES[preset][name]
+        assert _field_values(config) == expected
+
+    @pytest.mark.parametrize(("preset", "name"), _PRESET_FIELD_CASES)
+    def test_classmethod_override_wins(self, preset: str, name: str) -> None:
+        value = _PRESET_OVERRIDES[preset][name]
+        config = getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], **{name: value})
+        assert getattr(config, name) is value
+        self._assert_only_field_overridden(config, preset, name)
+
+    @pytest.mark.parametrize(("preset", "name"), _PRESET_FIELD_CASES)
+    def test_decorator_override_wins(self, _resolved: list[DecoratorConfig], preset: str, name: str) -> None:
+        value = _PRESET_OVERRIDES[preset][name]
+
+        @getattr(cache, preset)(**_PRESET_KWARGS[preset], **{name: value})
+        def fn() -> int:
+            return 1
+
+        assert getattr(_resolved[0], name) is value
+        self._assert_only_field_overridden(_resolved[0], preset, name)
+
+    @pytest.mark.parametrize("name", list(_NESTED_OVERRIDES))
+    def test_secure_override_keeps_encryption_invariants(self, _resolved: list[DecoratorConfig], name: str) -> None:
+        classmethod_config = DecoratorConfig.secure(master_key=_SECURE_KEY, **{name: _NESTED_OVERRIDES[name]})
+
+        @cache.secure(master_key=_SECURE_KEY, **{name: _NESTED_OVERRIDES[name]})
+        def fn() -> int:
+            return 1
+
+        for config in (classmethod_config, _resolved[0]):
+            assert config.encryption.enabled is True
+            assert config.encryption.master_key == _SECURE_KEY
+            assert config.integrity_checking is True
+
+    def test_secure_rejects_encryption_override(self, _resolved: list[DecoratorConfig]) -> None:
+        plaintext = EncryptionConfig(enabled=False)
+        with pytest.raises(TypeError, match="multiple values for keyword argument 'encryption'"):
+            DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=plaintext)
+        with pytest.raises(TypeError, match="multiple values for keyword argument 'encryption'"):
+
+            @cache.secure(master_key=_SECURE_KEY, encryption=plaintext)
+            def fn() -> int:
+                return 1
+
+        assert _resolved == []
+
+    def test_l1_enabled_applies_on_top_of_l1_override(self, _resolved: list[DecoratorConfig]) -> None:
+        @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)
+        def fn() -> int:
+            return 1
+
+        assert _resolved[0].l1.enabled is False
+        assert _resolved[0].l1.max_size_mb == 200

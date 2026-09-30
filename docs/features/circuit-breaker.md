@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens: calls skip the backend and run your function uncached instead of failing. Auto-recovers after cooldown.
+Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens: calls skip the backend and run your function uncached instead of failing, while values already in the in-process L1 cache are still served. Auto-recovers after cooldown.
 
 ```python notest
 @cache(ttl=300, backend=None)  # Circuit breaker enabled by default
@@ -86,8 +86,8 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | State | Behavior | Transition |
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
-| **OPEN** | Skip the backend: the function runs uncached (sync and async), and no failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
-| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further calls run uncached | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
+| **OPEN** | Skip the backend: an L1 hit is still served, and an L1 miss runs the function uncached (sync and async). No failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
+| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further L1 misses run uncached. L1 hits are served and are neither probes nor successes | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```
@@ -180,9 +180,10 @@ assert problematic_function.get_health_status()["circuit_breaker"]["config"]["ti
 ```python
 @cache(ttl=300)  # 5 minute cache
 def get_data():
-    # Circuit OPEN: L1 and L2 are skipped, so no cache, stale or fresh, is served
+    # Circuit OPEN: L2 is skipped. An L1 hit is still served, but L1 is per process and
+    # expires with the TTL, and nothing is written to it while the circuit is OPEN
     # (backend errors do not currently count toward the breaker, so an outage alone does not open it)
-    # Result: every call runs this function, so the database takes full load
+    # Result: every L1 miss runs this function, so the database takes close to full load
     # Solution: size the data source for uncached traffic during an outage
     return fetch_data()
 ```
@@ -296,7 +297,7 @@ class CircuitBreaker:
 ### Integration with Caching
 ```
 Circuit CLOSED → L1, then L2, then the function, as usual
-Circuit OPEN → L1 and L2 are both skipped: the function runs uncached
+Circuit OPEN → L1 is still read (a hit is served); L2 is skipped, so an L1 miss runs the function uncached
 Redis error → Logged: a failed read is a miss, a failed write skips L2 only, and L1 still stores the result (backend errors do not currently count toward the breaker)
 ```
 

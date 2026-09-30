@@ -263,6 +263,8 @@ class DecoratorConfig:
         }
 
     # Intent Presets (Class Methods)
+    # Each preset builds its defaults and lets the caller's kwargs win (``defaults | kwargs``): an explicit
+    # argument MUST override the preset default (protocol intent-presets.md § Explicit Configuration).
 
     @classmethod
     def minimal(cls, **kwargs: Any) -> DecoratorConfig:
@@ -274,7 +276,8 @@ class DecoratorConfig:
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
         Args:
-            **kwargs: Overrides (ttl, namespace, backend, integrity_checking=True to opt-in, etc.)
+            **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
+                integrity_checking=True to opt-in, l1, circuit_breaker, backpressure, monitoring, etc.)
                 Default ttl=300 (protocol/spec/intent-presets.md); ttl=None = never expire.
 
         Returns:
@@ -291,23 +294,23 @@ class DecoratorConfig:
             >>> DecoratorConfig.minimal(ttl=None).ttl is None  # explicit no-expiry opt-in
             True
         """
-        kwargs.setdefault("ttl", 300)
-        return cls(
-            integrity_checking=False,  # Speed-first: no checksum overhead
-            l1=L1CacheConfig(
+        defaults: dict[str, Any] = {
+            "ttl": 300,
+            "integrity_checking": False,  # Speed-first: no checksum overhead
+            "l1": L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=False),
-            backpressure=BackpressureConfig(enabled=True),
-            monitoring=MonitoringConfig(
+            "circuit_breaker": CircuitBreakerConfig(enabled=False),
+            "backpressure": BackpressureConfig(enabled=True),
+            "monitoring": MonitoringConfig(
                 collect_stats=False,
                 enable_tracing=False,
                 enable_structured_logging=False,
                 enable_prometheus_metrics=False,
             ),
-            **kwargs,
-        )
+        }
+        return cls(**(defaults | kwargs))
 
     @classmethod
     def production(cls, **kwargs: Any) -> DecoratorConfig:
@@ -319,7 +322,8 @@ class DecoratorConfig:
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
         Args:
-            **kwargs: Overrides (ttl, namespace, backend, etc.)
+            **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
+                integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
                 Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
 
         Returns:
@@ -333,24 +337,27 @@ class DecoratorConfig:
             True
             >>> config.integrity_checking
             True
+            >>> from cachekit.config.nested import CircuitBreakerConfig
+            >>> DecoratorConfig.production(circuit_breaker=CircuitBreakerConfig(failure_threshold=3)).circuit_breaker.failure_threshold
+            3
         """
-        kwargs.setdefault("ttl", 600)
-        return cls(
-            integrity_checking=True,  # Production: integrity guarantee
-            l1=L1CacheConfig(
+        defaults: dict[str, Any] = {
+            "ttl": 600,
+            "integrity_checking": True,  # Production: integrity guarantee
+            "l1": L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=True),
-            backpressure=BackpressureConfig(enabled=True),
-            monitoring=MonitoringConfig(
+            "circuit_breaker": CircuitBreakerConfig(enabled=True),
+            "backpressure": BackpressureConfig(enabled=True),
+            "monitoring": MonitoringConfig(
                 collect_stats=True,
                 enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=True,
             ),
-            **kwargs,
-        )
+        }
+        return cls(**(defaults | kwargs))
 
     @classmethod
     def secure(cls, master_key: str, tenant_extractor: Callable[..., str] | None = None, **kwargs: Any) -> DecoratorConfig:
@@ -365,7 +372,8 @@ class DecoratorConfig:
         Args:
             master_key: Encryption master key (hex-encoded, minimum 32 bytes for AES-256)
             tenant_extractor: Optional tenant ID extractor for multi-tenant encryption
-            **kwargs: Overrides (ttl, namespace, backend, etc.) - integrity_checking=False is rejected.
+            **kwargs: Overrides (ttl, namespace, backend, l1, circuit_breaker, backpressure, monitoring, etc.)
+                     - integrity_checking=False is rejected; encryption= is not an override (TypeError).
                      Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
@@ -386,7 +394,6 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
-        kwargs.setdefault("ttl", 600)
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
         deployment_uuid = kwargs.pop("deployment_uuid", None)
@@ -411,12 +418,25 @@ class DecoratorConfig:
         else:
             single_tenant_mode = tenant_extractor is None
 
-        return cls(
-            integrity_checking=True,  # NON-NEGOTIABLE for encryption (security invariant)
-            l1=L1CacheConfig(
+        defaults: dict[str, Any] = {
+            "ttl": 600,
+            "integrity_checking": True,  # NON-NEGOTIABLE for encryption (security invariant)
+            "l1": L1CacheConfig(
                 enabled=True,  # L1 stores encrypted bytes. Enabled: ~50ns hits vs 2-7ms Redis
                 swr_enabled=True,
             ),
+            "circuit_breaker": CircuitBreakerConfig(enabled=True),
+            "backpressure": BackpressureConfig(enabled=True),
+            "monitoring": MonitoringConfig(
+                collect_stats=True,
+                enable_tracing=True,
+                enable_structured_logging=True,
+                enable_prometheus_metrics=True,
+            ),
+        }
+        # encryption= stays outside the merge: a caller's encryption= collides with it and raises TypeError,
+        # so no override can replace the preset's EncryptionConfig.
+        return cls(
             encryption=EncryptionConfig(
                 enabled=True,
                 master_key=master_key,
@@ -425,15 +445,7 @@ class DecoratorConfig:
                 deployment_uuid=deployment_uuid,
                 fail_closed=fail_closed,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=True),
-            backpressure=BackpressureConfig(enabled=True),
-            monitoring=MonitoringConfig(
-                collect_stats=True,
-                enable_tracing=True,
-                enable_structured_logging=True,
-                enable_prometheus_metrics=True,
-            ),
-            **kwargs,
+            **(defaults | kwargs),
         )
 
     @classmethod
@@ -446,7 +458,8 @@ class DecoratorConfig:
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
         Args:
-            **kwargs: Overrides (ttl, namespace, backend, etc.)
+            **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
+                integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
                 Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
@@ -461,23 +474,23 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
-        kwargs.setdefault("ttl", 300)
-        return cls(
-            integrity_checking=True,  # Development: catch data corruption early
-            l1=L1CacheConfig(
+        defaults: dict[str, Any] = {
+            "ttl": 300,
+            "integrity_checking": True,  # Development: catch data corruption early
+            "l1": L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=True),
-            backpressure=BackpressureConfig(enabled=True),
-            monitoring=MonitoringConfig(
+            "circuit_breaker": CircuitBreakerConfig(enabled=True),
+            "backpressure": BackpressureConfig(enabled=True),
+            "monitoring": MonitoringConfig(
                 collect_stats=True,
                 enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=False,
             ),
-            **kwargs,
-        )
+        }
+        return cls(**(defaults | kwargs))
 
     @classmethod
     def test(cls, **kwargs: Any) -> DecoratorConfig:
@@ -489,7 +502,8 @@ class DecoratorConfig:
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
         Args:
-            **kwargs: Overrides (ttl, namespace, backend, etc.)
+            **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
+                integrity_checking, l1, circuit_breaker, backpressure, monitoring, etc.)
                 Default ttl=300 (SDK-local preset; spec rule 4 forbids never-expire as a default); ttl=None = never expire.
 
         Returns:
@@ -504,23 +518,23 @@ class DecoratorConfig:
             >>> config.integrity_checking
             False
         """
-        kwargs.setdefault("ttl", 300)
-        return cls(
-            integrity_checking=False,  # Testing: fast deterministic behavior
-            l1=L1CacheConfig(
+        defaults: dict[str, Any] = {
+            "ttl": 300,
+            "integrity_checking": False,  # Testing: fast deterministic behavior
+            "l1": L1CacheConfig(
                 enabled=True,
                 swr_enabled=False,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=False),
-            backpressure=BackpressureConfig(enabled=False),
-            monitoring=MonitoringConfig(
+            "circuit_breaker": CircuitBreakerConfig(enabled=False),
+            "backpressure": BackpressureConfig(enabled=False),
+            "monitoring": MonitoringConfig(
                 collect_stats=False,
                 enable_tracing=False,
                 enable_structured_logging=False,
                 enable_prometheus_metrics=False,
             ),
-            **kwargs,
-        )
+        }
+        return cls(**(defaults | kwargs))
 
     @classmethod
     def io(cls, api_key: str | None = None, **kwargs: Any) -> DecoratorConfig:
@@ -542,7 +556,8 @@ class DecoratorConfig:
 
         Args:
             api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
-            **kwargs: Overrides (ttl, namespace, etc.). ``backend`` is not one — io always
+            **kwargs: Overrides (ttl, namespace, integrity_checking, swr_by_default, l1, circuit_breaker,
+                backpressure, monitoring, etc.). ``backend`` is not one — io always
                 caches through its own CachekitIOBackend and rejects ``backend=``.
                 Default ttl=3600 (protocol/spec/intent-presets.md); ttl=None = never expire
                 (and disables the stale_ttl SWR window, which needs a positive ttl).
@@ -562,7 +577,6 @@ class DecoratorConfig:
             >>> DecoratorConfig.io(api_key="ck_test_key", ttl=300).ttl  # pragma: allowlist secret
             300
         """
-        kwargs.setdefault("ttl", 3600)
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 
@@ -579,25 +593,28 @@ class DecoratorConfig:
 
         # Use production-grade settings with SaaS backend
         # Encryption is opt-in via encryption=EncryptionConfig(...); env-key auto-activation is deprecated
-        return cls(
-            backend=backend,
-            integrity_checking=True,
+        defaults: dict[str, Any] = {
+            "ttl": 3600,
+            "integrity_checking": True,
             # SWR default-on for the managed backend (LAB-381 design decision):
             # boundary requests serve stale + revalidate in the background.
             # stale_ttl resolves to ttl (capped) at wrap time; pass stale_ttl=0
             # to opt out, or an explicit value to size the window.
-            swr_by_default=True,
-            l1=L1CacheConfig(
+            "swr_by_default": True,
+            "l1": L1CacheConfig(
                 enabled=True,
                 swr_enabled=True,
             ),
-            circuit_breaker=CircuitBreakerConfig(enabled=True),
-            backpressure=BackpressureConfig(enabled=True),
-            monitoring=MonitoringConfig(
+            "circuit_breaker": CircuitBreakerConfig(enabled=True),
+            "backpressure": BackpressureConfig(enabled=True),
+            "monitoring": MonitoringConfig(
                 collect_stats=True,
                 enable_tracing=True,
                 enable_structured_logging=True,
                 enable_prometheus_metrics=True,
             ),
-            **kwargs,
+        }
+        return cls(
+            backend=backend,
+            **(defaults | kwargs),
         )

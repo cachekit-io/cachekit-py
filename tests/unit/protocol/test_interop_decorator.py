@@ -263,6 +263,28 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    @pytest.mark.parametrize(("operation", "namespace"), [("get_user", "a..b"), ("x..y", "users")])
+    def test_double_dot_segment_rejected_at_decoration(self, backend: DictBackend, operation: str, namespace: str):
+        # The server rejects '..' anywhere in a key, so the key would fail on
+        # every CachekitIO request; fail before any call, on every backend.
+        with pytest.raises(ConfigurationError, match=r"must not contain '\.\.'"):
+
+            @_decorate(backend, interop=operation, namespace=namespace)
+            def f(x: int):
+                return x
+
+    def test_lone_dots_accepted(self, backend: DictBackend):
+        """Only '..' is forbidden: dotted segments decorate and write the
+        byte-pinned vector key."""
+        vector = KEY_VECTORS["lone_dots_stay_valid"]
+
+        @_decorate(backend, interop=vector["operation"], namespace=vector["namespace"])
+        def f(x: int):
+            return x
+
+        f(*vector["args"])
+        assert list(backend.store) == [vector["expected_key"]]
+
     def test_reservation_scope_accepted(self, backend: DictBackend):
         """The reservation is exact-match and namespace-only: operation nsapi in
         namespace nsapix decorates and writes the byte-pinned vector key."""
@@ -430,6 +452,20 @@ class TestInteropRejections:
             await f(1)  # same args → L1 hit path; must still fail closed
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
+    def test_key_prefix_appearing_later_fails_closed_per_call_sync_l1_hit(self):
+        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission (LAB-5351),
+        and the per-call re-check must still run before it."""
+        mutable = DictBackend(key_prefix="")
+
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="users")
+        def f(x: int):
+            return x
+
+        assert f(1) == 1  # clean backend works; warms L1 for x=1
+        mutable._key_prefix = "tenant-a:"  # contract violation after the fact
+        with pytest.raises(ConfigurationError, match="prefix"):
+            f(1)  # same args → L1 hit path; must still fail closed
+
     async def test_async_lazy_provider_prefixing_backend_fails_closed(self):
         """Lazy DI resolution (backend unknown at decoration) still runs the
         guard before the first async call touches L1 or executes the function."""
@@ -452,6 +488,29 @@ class TestInteropRejections:
                 await wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
 
+    def test_sync_lazy_provider_prefixing_backend_fails_closed(self):
+        """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
+        resolved lazily behind admission. Checking before resolution alone would be a no-op
+        (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        calls: list[int] = []
+
+        def f(x: int):
+            calls.append(x)
+            return x
+
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
+
+        provider = Mock()
+        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                wrapped(1)
+        assert calls == [], "function must NOT run against an incompatible backend"
+
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
     def test_invalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
         """Invalidation runs the same guard as reads and writes. Without it, an invalidate-only
@@ -472,9 +531,16 @@ class TestInteropRejections:
         provider = Mock()
         provider.get_backend.return_value = prefixed
         with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
-            with pytest.raises(ConfigurationError, match="prefix"):
-                wrapped.invalidate_cache(*call_args)
-        assert key in prefixed.store
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    wrapped.invalidate_cache(*call_args)
+        delete.assert_not_called()
 
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
     async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
@@ -494,9 +560,16 @@ class TestInteropRejections:
         provider = Mock()
         provider.get_backend.return_value = prefixed
         with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
-            with pytest.raises(ConfigurationError, match="prefix"):
-                await wrapped.ainvalidate_cache(*call_args)
-        assert key in prefixed.store
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert await wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    await wrapped.ainvalidate_cache(*call_args)
+        delete.assert_not_called()
 
     async def test_async_lazy_provider_failure_falls_back_uncached(self):
         """Backend-creation failure degrades to uncached execution (same

@@ -77,6 +77,9 @@ logger = logging.getLogger(__name__)
 # `self.default_format` ("msgpack", enforced in __init__), _serialize_dataframe "dataframe",
 # _serialize_series "series". Those are the only three ByteStorage.store call sites.
 _ENVELOPE_FORMATS = frozenset({"msgpack", "dataframe", "series"})
+# Every header `original_type` serialize() can write: the envelope formats plus the two that
+# never travel in an envelope. serialize() always writes the field, so an absent one is rot too.
+_HEADER_FORMATS = _ENVELOPE_FORMATS | {"numpy", "arrow"}
 
 # Error message constants for unsupported types
 PYDANTIC_ERROR_MESSAGE = (
@@ -700,6 +703,15 @@ class AutoSerializer:
                 the other just moves the hole to the other field, so instead: ``format_id``
                 must be one :meth:`serialize` can write, and a header claim that is present
                 must equal it. A disagreement is corruption -> raise -> evict and recompute.
+                An integrity-on header that lost its claim leaves the verified ``format_id`` to decide.
+
+                With integrity OFF there is no envelope, so the header claim is the only copy and
+                is held to the same "a format :meth:`serialize` can write" rule instead: a claim
+                outside ``msgpack``/``dataframe``/``series``/``numpy``/``arrow``, or an absent one
+                (:meth:`serialize` always writes it), raises once the NumPy and Arrow structural
+                routes have passed. Without that, one rotted header byte returned a stored
+                ``Series`` as its columnar ``dict``. A claim rotted to a different writable format
+                still decides unopposed; closing that needs the format inside a digest.
 
                 A present claim must also BE a string, checked once where this method reads it.
                 The header is plaintext JSON and ``SerializationMetadata.from_dict`` does not type
@@ -777,6 +789,13 @@ class AutoSerializer:
             return self._arrow_serializer.deserialize(data, metadata)
 
         if metadata is not None:
+            # Integrity off, there is no envelope to agree with, so the header claim alone would
+            # steer the decode: an unknown or absent claim matched no branch below and returned a
+            # stored Series as its columnar dict. Refuse any claim serialize() cannot write. Runs
+            # after the structural routes, so an Arrow/NumPy entry that lost its claim still decodes.
+            # Integrity on, the envelope's verified format decides instead — see Raises:.
+            if not self.enable_integrity_checking and header_format not in _HEADER_FORMATS:
+                raise SerializationError(f"Cache entry header claims format {header_format!r:.40}, which no writer emits")
             # _deserialize_numpy strips + verifies the optional xxHash3-64 checksum prefix itself.
             if header_format == "numpy":
                 return self._deserialize_numpy(data)
