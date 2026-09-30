@@ -228,10 +228,29 @@ def _normalize_arg(v: object) -> object:
     Decimal's textual form is caller-visible contract: "1.0" and "1.00" hash
     differently — agree on the form across SDKs or avoid Decimal arguments.
     """
-    if v is None or isinstance(v, (bool, int, float, str, bytes, bytearray)):
-        # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the
-        # encoder, which every path hits.
+    # Range/NaN/Infinity/surrogate enforcement lives in ONE place: the encoder,
+    # which every path hits. A scalar subclass is first reduced to its exact
+    # base-type value through the base type's own slot, so the hashed bytes are
+    # the argument's value and never the output of a method the subclass can
+    # override (encode, to_bytes, is_integer, __int__, __bytes__, __lt__).
+    # The issubclass(t, ...) guard keeps a proxy that only reports the type
+    # through __class__ (SimpleLazyObject, wrapt) away from the slots, which
+    # would raise TypeError; it passes through and hashes as before.
+    t = type(v)
+    if v is None or isinstance(v, bool):
         return v
+    if isinstance(v, str):
+        return str.__str__(v) if issubclass(t, str) else v
+    if isinstance(v, int):
+        return int.__int__(v) if issubclass(t, int) else v
+    if isinstance(v, float):
+        return float.__float__(v) if issubclass(t, float) else v
+    # bytes.__bytes__ does not exist on Python 3.10; the base type's full slice
+    # copies the buffer without calling anything a subclass defines.
+    if isinstance(v, bytes):
+        return bytes.__getitem__(v, slice(None)) if issubclass(t, bytes) else v
+    if isinstance(v, bytearray):
+        return bytes(bytearray.__getitem__(v, slice(None))) if issubclass(t, bytearray) else v
     if isinstance(v, datetime):
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
             raise InteropError("naive datetimes are not allowed in interop arguments (timezone ambiguity)")
@@ -257,7 +276,13 @@ def _normalize_arg(v: object) -> object:
         for k, val in v.items():
             if not isinstance(k, str):
                 raise InteropError(f"interop map keys must be strings, got {type(k).__name__}")
-            norm[k] = _normalize_arg(val)
+            key = str.__str__(k) if issubclass(type(k), str) else k
+            if key in norm:
+                # Only a subclass overriding __eq__/__hash__ gets two equal keys
+                # into one dict. Such a map has no canonical encoding, and
+                # keeping either value would hash it like a different argument.
+                raise InteropError(f"interop map has duplicate key {key!r} after normalization")
+            norm[key] = _normalize_arg(val)
         return norm
     if isinstance(v, Enum):
         return _normalize_arg(v.value)

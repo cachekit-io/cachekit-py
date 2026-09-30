@@ -4,8 +4,9 @@ The protocol vectors (test_interop_vectors.py) byte-pin the canonical forms;
 these tests pin the SDK-local model edges around them: msgpack 32-bit length
 tiers, argument normalization of Python-idiomatic types (Enum/Path/Decimal),
 ``*args``/``**kwargs`` flattening, temporal value sentinels, strict
-single-document decoding, the reserved-namespace boundary, and str-subclass
-segments (validated and rendered as their exact str value).
+single-document decoding, the reserved-namespace boundary, str-subclass
+segments (validated and rendered as their exact str value), and scalar-subclass
+arguments (hashed as their exact base-type value).
 """
 
 from __future__ import annotations
@@ -230,3 +231,152 @@ class TestSegmentSubclasses:
             generate_interop_key(UnhashableAsReserved(reserved), "get_user", [1])
         with pytest.raises(InteropError, match="reserved"):
             validate_interop_config("get_user", UnhashableAsReserved(reserved))
+
+
+class AsAdminStr(str):
+    def encode(self, *args, **kwargs) -> bytes:
+        return b"admin"
+
+
+class LyingToBytes(int):
+    def to_bytes(self, *args, **kwargs) -> bytes:
+        return b"\xff" * args[0]
+
+
+class LyingCompare(int):
+    def __le__(self, other: object) -> bool:
+        return False
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+    def __ge__(self, other: object) -> bool:
+        return False
+
+
+class LyingIsInteger(float):
+    def is_integer(self) -> bool:
+        return False
+
+
+class LyingInt(float):
+    def __int__(self) -> int:
+        return 99
+
+
+class AsAdminBytes(bytes):
+    def __bytes__(self) -> bytes:
+        return b"admin"
+
+
+class AsAdminBytearray(bytearray):
+    def __bytes__(self) -> bytes:
+        return b"admin"
+
+
+class LtOnly(str):
+    def __lt__(self, other: object) -> bool:
+        return True
+
+
+class EqualsPlainA(str):
+    """Value 'a', but hashes unlike 'a', so a dict holds it beside a plain 'a' key."""
+
+    def __hash__(self) -> int:
+        return 1
+
+
+class ForwardingProxy:
+    """Reports its target's type through __class__ and forwards attributes, like wrapt's ObjectProxy."""
+
+    def __init__(self, target: object) -> None:
+        object.__setattr__(self, "_target", target)
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        return type(object.__getattribute__(self, "_target"))
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+
+class TestArgSubclasses:
+    """A ``str``/``int``/``float``/``bytes`` subclass argument hashes as its exact base-type value.
+
+    The encoder would otherwise call the subclass's own ``encode``, ``to_bytes``,
+    ``is_integer``, ``__int__``, ``__bytes__`` or ``__lt__``, so the hashed bytes
+    need not be the argument's value — ``AsAdminStr("user")`` would read the
+    entry cached for ``"admin"``.
+    """
+
+    @pytest.mark.parametrize(
+        ("arg", "plain", "forged"),
+        [
+            (AsAdminStr("user"), "user", "admin"),
+            (LyingToBytes(1000), 1000, None),
+            (LyingIsInteger(2.0), 2.0, None),
+            (LyingInt(3.0), 3, 99),
+            (AsAdminBytes(b"user"), b"user", b"admin"),
+            (AsAdminBytearray(b"user"), b"user", b"admin"),
+            ([AsAdminStr("user")], ["user"], ["admin"]),
+            ({"k": AsAdminStr("user")}, {"k": "user"}, {"k": "admin"}),
+            ({AsAdminStr("user"): 1}, {"user": 1}, {"admin": 1}),
+            ({"a": 1, LtOnly("b"): 2}, {"a": 1, "b": 2}, None),
+            ({AsAdminStr("user")}, {"user"}, {"admin"}),
+        ],
+        ids=[
+            "str.encode",
+            "int.to_bytes",
+            "float.is_integer",
+            "float.__int__",
+            "bytes.__bytes__",
+            "bytearray.__bytes__",
+            "nested-list-element",
+            "dict-value",
+            "dict-key",
+            "dict-key-__lt__",
+            "set-element",
+        ],
+    )
+    def test_hashes_like_the_equal_plain_value(self, arg, plain, forged):
+        assert args_hash([arg]) == args_hash([plain])
+        if forged is not None:
+            assert args_hash([arg]) != args_hash([forged])
+
+    def test_lying_int_comparisons_hash_like_the_plain_value(self):
+        assert args_hash([LyingCompare(300)]) == args_hash([300])
+
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum is new in Python 3.11")
+    def test_strenum_hashes_like_its_value(self):
+        from enum import StrEnum
+
+        class Role(StrEnum):
+            ADMIN = "admin"
+
+        assert args_hash([Role.ADMIN]) == args_hash(["admin"])
+
+    def test_intenum_hashes_like_its_value(self):
+        from enum import IntEnum
+
+        class Level(IntEnum):
+            HIGH = 3
+
+        assert args_hash([Level.HIGH]) == args_hash([3])
+        assert args_hash([OP.GET_USER]) == args_hash(["get_user"])
+
+    def test_keys_equal_after_normalization_raise(self):
+        arg = {EqualsPlainA("a"): 1, "a": 2}
+        assert len(arg) == 2  # the dict really holds two keys
+        # Collapsing to either value would hash it like {"a": 1} or {"a": 2}.
+        with pytest.raises(InteropError, match="duplicate key 'a'"):
+            args_hash([arg])
+
+    def test_forwarding_proxy_still_hashes_like_its_target(self):
+        # Not a subclass: the base-type slots would raise TypeError on it, so it
+        # keeps its pre-existing pass-through rather than breaking lazy proxies.
+        proxy = ForwardingProxy("user")
+        assert isinstance(proxy, str)
+        assert args_hash([proxy]) == args_hash(["user"])
