@@ -583,6 +583,16 @@ def create_cache_wrapper(
 
     func_hash = function_hash(f"{func.__module__}.{func.__qualname__}")
 
+    # Rebind a str namespace to its exact str value before any use (LAB-6197). A str
+    # subclass renders through its own __format__/__eq__/startswith: a (str, Enum) member
+    # formats as "NS.USERS" on Python 3.11+ but "users" on 3.10, which split registry ids and
+    # key= keys across versions and could slip a crafted value past the "ck" check below.
+    # _legacy_namespace keeps the pre-fix f-string rendering for the registry drain below.
+    _legacy_namespace: str | None = None
+    if isinstance(namespace, str):
+        _legacy_namespace = f"{namespace}"
+        namespace = str.__str__(namespace)
+
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
     # that bypass DecoratorConfig validation. Runs before any other use of namespace
@@ -616,9 +626,17 @@ def create_cache_wrapper(
     # a key written under it could take the ck:reg: shape and overwrite a tracking set.
     if namespace == "ck" or (namespace or "").startswith("ck:"):
         raise ConfigurationError("namespace 'ck' (and 'ck:*') is reserved for cachekit's key registry")
-    _registry_id = (
-        f"ck:reg:{namespace if namespace is not None else ''}:"
-        f"{blake3_hash(f'{func.__module__}.{func.__qualname__}', digest_size=8)}"
+    _registry_hash = blake3_hash(f"{func.__module__}.{func.__qualname__}", digest_size=8)
+    _registry_id = f"ck:reg:{namespace if namespace is not None else ''}:{_registry_hash}"
+    # Pre-fix releases named the set with the namespace's f-string rendering. Auto-mode keys
+    # did not move, so entries tracked under the old name are still served; the no-args drain
+    # empties that set too, or they would outlive invalidate_cache() (LAB-5288 precedent).
+    # Remove only in a major release whose notes declare upgrades from below the fixing
+    # release unsupported (the rule get_legacy_cache_key follows).
+    _legacy_registry_id = (
+        f"ck:reg:{_legacy_namespace}:{_registry_hash}"
+        if _legacy_namespace is not None and _legacy_namespace != namespace
+        else None
     )
 
     # ENCRYPTION + L1-ONLY (LAB-4665, protocol spec/intent-presets.md § L1 Posture rule 3:
@@ -2316,6 +2334,8 @@ def create_cache_wrapper(
                 scope = _l2_scope()
                 mine = {entry for entry in snap if entry[0] == scope}
                 deleted = _backend.drain_tracked(_registry_id, {key for _, key in mine})  # type: ignore[union-attr]
+                if _legacy_registry_id is not None:
+                    deleted |= _backend.drain_tracked(_legacy_registry_id, ())  # type: ignore[union-attr]
                 # Trim BEFORE evicting: _put_l1 puts then records, so a concurrent write can
                 # never leave an L1 entry whose key is no longer in _cached_keys.
                 trim = mine - watch
