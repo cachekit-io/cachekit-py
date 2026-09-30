@@ -13,6 +13,7 @@ import asyncio
 import contextvars
 import logging
 import os
+import sys
 import threading
 import time
 from enum import Enum
@@ -862,11 +863,23 @@ class TestNamespaceExactStr:
         assert backend.store == {}
         assert [r for r, _ in backend.drain_calls] == [rid, legacy_rid]
 
-    @pytest.mark.parametrize("namespace", ["users", _StrEnumNS.USERS, None])
-    def test_unchanged_namespaces_drain_once(self, namespace: Optional[str]) -> None:
+    @pytest.mark.parametrize(
+        ("namespace", "interop", "legacy"),
+        [
+            ("users", None, None),
+            (_StrEnumNS.USERS, None, None),
+            (None, None, None),
+            # f"{member}" is "_NS.USERS" only from 3.11; on 3.10 the set name never moved.
+            (_NS.USERS, None, "_NS.USERS" if sys.version_info >= (3, 11) else None),
+            # 0.20.0 shipped the registry with interop's exact-str rebind: no pre-fix set exists.
+            (_NS.USERS, "get_user", None),
+        ],
+    )
+    def test_no_args_drain_ids(self, namespace: Optional[str], interop: Optional[str], legacy: Optional[str]) -> None:
+        """Only a namespace whose set name actually moved gets a second drain."""
         backend = TrackingBackend()
 
-        @cache(backend=backend, ttl=60, namespace=namespace, l1_enabled=False)
+        @cache(backend=backend, ttl=60, namespace=namespace, interop=interop, l1_enabled=False)
         def f(x: int) -> int:
             return x
 
@@ -874,4 +887,5 @@ class TestNamespaceExactStr:
         (rid,) = _registry_ids(backend)
         assert rid.startswith(f"ck:reg:{'users' if namespace is not None else ''}:")
         f.invalidate_cache()
-        assert [r for r, _ in backend.drain_calls] == [rid]
+        expected = [rid] if legacy is None else [rid, f"ck:reg:{legacy}:{rid.rsplit(':', 1)[1]}"]
+        assert [r for r, _ in backend.drain_calls] == expected

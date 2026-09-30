@@ -595,9 +595,8 @@ def create_cache_wrapper(
 
     # INTEROP MODE (interop/v1, protocol spec/interop-mode.md): validate loudly at
     # decoration time. These checks also cover direct create_cache_wrapper callers
-    # that bypass DecoratorConfig validation. Runs before any other use of namespace
-    # and rebinds both segments to the exact str values it checked, so a str subclass
-    # (e.g. a (str, Enum) member) cannot render differently in a key.
+    # that bypass DecoratorConfig validation. Rebinds interop to the exact str value it
+    # checked; namespace is already exact from the block above.
     _interop_sig: inspect.Signature | None = None
     if interop is not None:
         try:
@@ -631,11 +630,13 @@ def create_cache_wrapper(
     # Pre-fix releases named the set with the namespace's f-string rendering. Auto-mode keys
     # did not move, so entries tracked under the old name are still served; the no-args drain
     # empties that set too, or they would outlive invalidate_cache() (LAB-5288 precedent).
-    # Remove only in a major release whose notes declare upgrades from below the fixing
-    # release unsupported (the rule get_legacy_cache_key follows).
+    # Interop is skipped: 0.20.0 shipped the registry with interop's exact-str rebind, so no
+    # release wrote a non-exact interop set. This drains the set name 0.20.x wrote: remove
+    # it only in a major release whose notes declare upgrades from 0.20.x unsupported (the
+    # rule get_legacy_cache_key follows).
     _legacy_registry_id = (
         f"ck:reg:{_legacy_namespace}:{_registry_hash}"
-        if _legacy_namespace is not None and _legacy_namespace != namespace
+        if interop is None and _legacy_namespace is not None and _legacy_namespace != namespace
         else None
     )
 
