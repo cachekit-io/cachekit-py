@@ -24,6 +24,7 @@ from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.config import singleton
 from cachekit.config.settings import CachekitConfig
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
@@ -436,3 +437,67 @@ class TestRedactingSettings:
         assert (err["type"], err["loc"], err["msg"]) == ("value_error", ("url",), "rejected (port 6379)" if ctx else "rejected")
         assert "url" not in err
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+
+_KEY_HEX = "ab" * 32
+_CACHEKIT_SRC = pathlib.Path(sys.modules["cachekit"].__file__ or "").resolve().parent
+
+
+def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
+    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``.
+
+    Error trackers capture frame locals by default (Sentry's ``include_local_variables``), and their
+    scrubbers match top-level key names, so a raw key held in any local is a key sent off-host.
+    """
+    found = []
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        if pathlib.Path(code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
+            for name, value in tb.tb_frame.f_locals.items():
+                try:
+                    rendered = repr(value)
+                except Exception:  # a half-built model can fail to repr; it holds no raw input
+                    continue
+                if secret in rendered:
+                    found.append(f"{code.co_name}:{name}")
+        tb = tb.tb_next
+    return found
+
+
+@pytest.mark.unit
+class TestRedactingSettingsFrameLocals:
+    """No cachekit frame on a raised config error's traceback keeps the raw input (CWE-532)."""
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: CachekitConfig(master_key=_KEY_HEX, max_value_size=-1),  # type: ignore[arg-type]
+            lambda: CachekitConfig(master_key=_KEY_HEX, previous_master_keys=[_KEY_HEX]),  # type: ignore[arg-type,list-item]
+            lambda: CachekitConfig.model_validate({"master_key": _KEY_HEX, "max_value_size": -1}),
+            lambda: CachekitConfig.model_validate_json(json.dumps({"master_key": _KEY_HEX, "max_value_size": -1})),
+            lambda: CachekitConfig.model_validate_strings({"master_key": _KEY_HEX, "max_value_size": "-1"}),
+            lambda: CachekitIOBackendConfig(api_key=_KEY_HEX, timeout=-1),  # type: ignore[arg-type]
+        ],
+        ids=["kwarg", "kwarg-repromotion", "model_validate", "model_validate_json", "model_validate_strings", "io-api-key"],
+    )
+    def test_programmatic_input_leaves_no_frame_local(self, build: Callable[[], object]) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        assert _cachekit_locals_holding(exc_info.value, _KEY_HEX) == []
+
+    @pytest.mark.parametrize(
+        "build",
+        [CachekitConfig, CachekitConfig.from_env, singleton.get_settings],
+        ids=["constructor", "from_env", "get_settings"],
+    )
+    def test_env_repromotion_leaves_no_frame_local(self, monkeypatch: pytest.MonkeyPatch, build: Callable[[], object]) -> None:
+        """Already clean before the frame-locals fix (the raw err dicts die with _redacted_copy's frame); a guard."""
+        monkeypatch.setattr(singleton, "_settings_instance", None)
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _KEY_HEX)
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", _KEY_HEX)
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        assert _cachekit_locals_holding(exc_info.value, _KEY_HEX) == []
