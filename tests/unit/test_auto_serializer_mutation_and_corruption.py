@@ -454,6 +454,74 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    @pytest.mark.parametrize("kind", ["arrow", "numpy"])
+    def test_a_healthy_checksummed_read_hashes_the_body_once(self, kind: str, metadata_present: bool) -> None:
+        """The routing gate's digest check is load-bearing (the collision tests above), so the
+        delegate must not repeat it: a second pass over the body cost a tenth of a large Arrow
+        read. Counting the hash calls pins it for both metadata routes."""
+        if kind == "arrow":
+            pytest.importorskip("pyarrow")
+            value = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        else:
+            value = np.arange(12, dtype=np.float64).reshape(3, 4)
+        s = AutoSerializer()
+        data, meta = s.serialize(value)
+        assert meta.original_type == kind
+        assert xxhash.xxh3_64_digest(data[8:]) == data[:8], "this test needs a checksummed entry"
+
+        with mock.patch("xxhash.xxh3_64_digest", wraps=xxhash.xxh3_64_digest) as digest:
+            result = s.deserialize(data, meta if metadata_present else None)
+
+        assert digest.call_count == 1
+        if kind == "arrow":
+            pd.testing.assert_frame_equal(result, value)
+        else:
+            np.testing.assert_array_equal(result, value)
+
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    def test_a_bare_legacy_arrow_entry_still_decodes(self, metadata_present: bool) -> None:
+        """A bare ``ARROW1`` entry (legacy, no checksum prefix) skips the gate's hash and goes
+        through ``ArrowSerializer.deserialize``, not the pre-verified entry point."""
+        pytest.importorskip("pyarrow")
+        frame = pd.DataFrame({"a": [1.0, 2.0]})
+        data, meta = AutoSerializer().serialize(frame)
+        bare = data[8:]
+        assert bare[:6] == b"ARROW1"
+
+        pd.testing.assert_frame_equal(AutoSerializer().deserialize(bare, meta if metadata_present else None), frame)
+
+    def test_a_checksummed_arrow_entry_without_arrow_serializer_names_the_extra(self) -> None:
+        pytest.importorskip("pyarrow")
+        data, meta = AutoSerializer().serialize(pd.DataFrame({"a": [1.0]}))
+
+        with pytest.raises(SerializationError, match="ArrowSerializer not available"):
+            _no_arrow().deserialize(data, meta)
+
+    def test_a_structural_numpy_read_without_numpy_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The structural route calls the body parser directly, so the parser carries the guard."""
+        import cachekit.serializers.auto_serializer as auto
+
+        data, _ = AutoSerializer().serialize(np.arange(3.0))
+        monkeypatch.setattr(auto, "HAS_NUMPY", False)
+
+        with pytest.raises(RuntimeError, match="NumPy not installed"):
+            AutoSerializer().deserialize(data, None)
+
+    def test_deserialize_numpy_verifies_a_checksummed_entry_itself(self) -> None:
+        """``_deserialize_numpy`` keeps its own verify-then-parse for direct callers."""
+        value = np.arange(6.0).reshape(2, 3)
+        data, _ = AutoSerializer().serialize(value)
+        assert data[8:17] == b"NUMPY_RAW"
+
+        np.testing.assert_array_equal(AutoSerializer()._deserialize_numpy(data), value)
+
+    def test_a_numpy_header_over_non_numpy_bytes_is_refused(self) -> None:
+        meta = SerializationMetadata.from_dict({"format": "msgpack", "original_type": "numpy"})
+
+        with pytest.raises(SerializationError, match="expected NUMPY_RAW header"):
+            AutoSerializer().deserialize(b"not a numpy entry at all", meta)
+
     @pytest.mark.parametrize(
         "make_metadata",
         [
