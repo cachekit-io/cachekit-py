@@ -95,8 +95,9 @@ redis_cache_operations_total{operation="backpressure",status="rejected",serializ
 #         plaintext claim under encryption / missing tenant_id — benign during lazy
 #         migration, suspect otherwise), "envelope_shape" (an unverified entry decoded
 #         to the shape of a ByteStorage envelope — a rotted envelope or a legitimate
-#         4-element list, indistinguishable; the same redacted key repeating in the WARNING log is the latter,
-#         recomputing on every read — see docs/error-codes.md), "corruption" (checksum/format
+#         4-element list, indistinguishable; current writers refuse to store the latter, so the same
+#         redacted key repeating in the WARNING log is another writer still storing it — see
+#         docs/error-codes.md), "corruption" (checksum/format
 #         failure — storage rot or bugs); tier ("l1" or "l2").
 # ALERT on reason="auth_tamper": a nonzero rate is a security event, not noise.
 cachekit_decrypt_failures_total{reason="auth_tamper",tier="l2"}

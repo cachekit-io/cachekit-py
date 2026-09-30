@@ -529,6 +529,14 @@ class AutoSerializer:
 
         Returns:
             Tuple[bytes, SerializationMetadata]: Serialized data with metadata
+
+        Raises:
+            EnvelopeShapeError: Integrity checking is off and ``obj`` is a top-level 4-element list
+                this serializer's own reader refuses as envelope-shaped (see :meth:`deserialize`'s
+                Raises:). Wrap it (``{"v": obj}``) or use the default serializer.
+            SerializationError: Integrity checking is off and ``obj`` is a top-level 4-element list
+                that reader cannot decode at all, e.g. one holding a dict that collides with a type
+                marker. It could never be read back.
         """
         # metadata.compressed feeds the AES-GCM AAD v0x03 (EncryptionWrapper binds str(compressed)),
         # so it MUST reflect the codec actually applied: True iff the ByteStorage LZ4 envelope wrapped
@@ -640,13 +648,16 @@ class AutoSerializer:
                 ==========================  ========  =========  ============  ===============
                 rule                        healthy   rot        map-encoded   envelope-shaped
                 ==========================  ========  =========  ============  ===============
-                shape (this)                reject    reject \\*  **returned**  **refused**
+                shape (this)                reject    reject \\*  **returned**  **refused** †
                 shape AND parse             reject    **ret.**   **returned**  accepted
                 parse, rot treated as a hit reject    reject     reject        **refused**
                 ==========================  ========  =========  ============  ===============
 
                 \\* minus a marker-byte residual, 13 of 12,495 single-byte rots on a 49-byte
                 envelope, measured in :meth:`_looks_like_envelope`.
+
+                † on read. An integrity-off :meth:`serialize` refuses to write one, so only an
+                entry written before that check, or by another writer, reaches this cell.
 
                 "Envelope-shaped" is the predicate, not a picture: a top-level 4-element ``list``
                 of which any THREE of ``bytes`` / eight small ints / non-negative int / known
@@ -659,10 +670,12 @@ class AutoSerializer:
                 Returning a rotted envelope hands the caller its compressed payload as their
                 object — silent wrong data; refusing an envelope-shaped value is a deterministic
                 miss that recomputes the right answer. A clean failure beats a quiet one, so the
-                refusal is the cost taken — priced in full: recompute re-produces the same bytes,
-                so for that value EVERY read misses, forever, and each raises
-                :class:`EnvelopeShapeError`, counted under its own ``envelope_shape`` telemetry
-                reason precisely so a permanent benign refusal cannot read as a corruption spike.
+                refusal is the cost taken — priced in full: such a value can never be cached with
+                integrity checking off. Writing it anyway made every read a refusal, an eviction
+                and a backend rewrite, so :meth:`serialize` refuses it instead, raising the same
+                :class:`EnvelopeShapeError` — a plain miss. A read that does meet one raises it
+                too, counted under its own ``envelope_shape`` telemetry reason so a benign refusal
+                cannot read as a corruption spike.
                 A parse is no escape: a legitimate 4/4 list parses as a ``StorageEnvelope`` and
                 then fails the checksum, byte-indistinguishable from a rotted one. Map-encoded
                 envelopes (``to_vec_named`` or a foreign writer, never this one and never rot)
@@ -1174,12 +1187,32 @@ class AutoSerializer:
         """Serialize general object with MessagePack."""
         # Pre-process tuples into markers (msgpack natively flattens them to lists)
         obj = _wrap_tuples(obj)
-        msgpack_data = msgpack.packb(obj, **self._msgpack_pack_opts)
+        msgpack_data: bytes = msgpack.packb(obj, **self._msgpack_pack_opts)  # type: ignore[assignment]  # stub: Optional
 
         if self.enable_integrity_checking:
             return self._byte_storage.store(msgpack_data, self.default_format)  # type: ignore[return-value]
-        else:
-            return msgpack_data  # type: ignore[return-value]
+        # Never write what our own reader refuses (see deserialize's Raises:): the entry would miss on
+        # every read and be evicted and rewritten on every call. Refused here it is a plain miss. The
+        # reader's own decode and predicate decide it, on the value as the reader sees it (bytearray ->
+        # bytes, IntEnum -> int, a marked tuple -> tuple), so a 4-element array the reader cannot decode
+        # at all fails here too, as the SerializationError the reader would raise. Only on 0x94, the
+        # fixarray header of a top-level 4-element array, so every other write skips the extra decode.
+        if msgpack_data[:1] != b"\x94":
+            return msgpack_data
+        try:
+            decoded = unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+        except PAYLOAD_DECODE_ERRORS as e:
+            raise SerializationError(
+                f"Value cannot be cached by an AutoSerializer with integrity checking off: its reader cannot decode it "
+                f"({bounded_error(e)})"
+            ) from e
+        if self._looks_like_envelope(decoded):
+            raise EnvelopeShapeError(
+                "Value cannot be cached by an AutoSerializer with integrity checking off: it is a 4-element list "
+                'shaped like a ByteStorage envelope, which this serializer\'s reader refuses. Wrap it (e.g. {"v": value}) '
+                "or use the default serializer"
+            )
+        return msgpack_data
 
     def estimate_compression_ratio(self, obj: Any) -> float:
         """Estimate compression ratio for an object.

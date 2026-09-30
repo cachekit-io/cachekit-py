@@ -27,6 +27,7 @@ Types that the default `StandardSerializer` (MessagePack) loses, but `AutoSerial
 
 | Type | Default (`"default"`) | Auto (`"auto"`) |
 |------|:---------------------:|:---------------:|
+| `tuple` | → `list` | Preserved |
 | `set` | → `list` | Preserved |
 | `frozenset` | → `list` | Preserved |
 | `datetime` | → string | Preserved (ISO-8601 roundtrip) |
@@ -35,9 +36,6 @@ Types that the default `StandardSerializer` (MessagePack) loses, but `AutoSerial
 | `numpy.ndarray` | Not supported | Preserved (zero-copy binary) |
 | `pandas.DataFrame` | Not supported | Preserved (columnar format) |
 | `pandas.Series` | Not supported | Preserved |
-
-> [!NOTE]
-> **Tuples** are not yet preserved by AutoSerializer — they still become lists through MessagePack. This is tracked in [#78](https://github.com/cachekit-io/cachekit-py/issues/78).
 
 ## How It Works
 
@@ -51,7 +49,10 @@ AutoSerializer uses **type markers** in the serialized data to preserve Python t
 {"__set__": True, "value": [1, 2, 3], "frozen": True}
 
 # datetime is serialized as:
-{"__datetime__": "2026-03-28T12:00:00+00:00"}
+{"__datetime__": True, "value": "2026-03-28T12:00:00+00:00"}
+
+# tuple (1, 2) is serialized as:
+{"__tuple__": True, "value": [1, 2]}
 ```
 
 These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP) will see them as plain dicts, not as the original types.

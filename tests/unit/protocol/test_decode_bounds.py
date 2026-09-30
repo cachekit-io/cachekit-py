@@ -23,10 +23,6 @@ import contextlib
 import functools
 import hashlib
 import json
-import os
-import subprocess
-import sys
-import threading
 import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
@@ -36,7 +32,6 @@ import msgpack
 import pytest
 
 import cachekit.serializers.base as serializers_base
-from cachekit import logging as ck_logging
 from cachekit._rust_serializer import ByteStorage, check_msgpack_structure
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.interop import decode_interop_value
@@ -45,6 +40,7 @@ from cachekit.serializers.base import MSGPACK_MAX_NESTING, SerializationError, u
 from cachekit.serializers.interop_serializer import InteropSerializer
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
+from tests.utils.tracemalloc_isolation import measure_in_subprocess
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "decode-bounds.json"
 FIXTURE_SHA256 = "907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916"  # pragma: allowlist secret
@@ -123,13 +119,7 @@ def _peak_of(fn: Callable[..., Any], *args: Any) -> int:
 
 
 def _measure_peaks() -> dict[str, int]:
-    """Every heap peak this file asserts on, keyed by case. Runs only in a fresh interpreter."""
-    # cachekit's structured logger flushes from a background thread: stop it, so no other thread
-    # can be allocating while tracemalloc starts or stops.
-    for structured in ck_logging._logger_instances.values():
-        structured.writer.stop()
-        structured.writer.join()
-    assert threading.active_count() == 1, f"tracemalloc must not start or stop beside {threading.enumerate()}"
+    """Every heap peak this file asserts on, keyed by case. Runs only via measure_in_subprocess."""
     cases = {
         f"{path}:{v['name']}": (fn, bytes.fromhex(v["input_hex"]))
         for path, fn in DECODE_PATHS.items()
@@ -137,28 +127,12 @@ def _measure_peaks() -> dict[str, int]:
     }
     validate_data = AutoSerializer(enable_integrity_checking=False).validate_data
     cases |= {f"validate_data:{v['name']}": (validate_data, bytes.fromhex(v["input_hex"])) for v in VECTORS["reject_vectors"]}
-    peaks = {case: _peak_of(fn, data) for case, (fn, data) in cases.items()}
-    assert threading.active_count() == 1, f"a thread started while peaks were measured: {threading.enumerate()}"
-    return peaks
+    return {case: _peak_of(fn, data) for case, (fn, data) in cases.items()}
 
 
 @pytest.fixture(scope="module")
 def peaks() -> dict[str, int]:
-    # tracemalloc.start()/stop() swap the process-wide allocator hooks without synchronising
-    # with threads that are allocating at that moment, so on a free-threaded build a concurrent
-    # allocation (pytest-xdist's I/O thread, for one) can crash the process:
-    # https://github.com/python/cpython/issues/143143. Peaks are measured in a fresh,
-    # single-threaded interpreter running this file, importing the same modules as this one.
-    proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + this file)
-        [sys.executable, __file__],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"peak measurement subprocess exited {proc.returncode}:\n{proc.stderr}")
-    return json.loads(proc.stdout)
+    return measure_in_subprocess(_measure_peaks)
 
 
 def _vector_ids(group: str) -> list[str]:
@@ -365,7 +339,3 @@ class TestOwnedBounds:
         )
         with pytest.raises(SerializationError, match="disagrees with header format"):
             CacheSerializationHandler("auto").deserialize_data(frame, cache_key=CACHE_KEY)
-
-
-if __name__ == "__main__":
-    json.dump(_measure_peaks(), sys.stdout)
