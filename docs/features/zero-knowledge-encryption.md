@@ -551,18 +551,16 @@ settings load, so this surfaces only when keys bypass that check: passed to
 `EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
 environment's previous keys. Outside config-drift reads (below), the fault never
 evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users
-and callers of the `CacheOperationHandler` read methods receive it in both fail modes. Behind
+and callers of the `CacheOperationHandler` read and write methods receive it in both fail modes. Behind
 the `@cache` decorators, a read of an existing encrypted entry raises it too, from L1 or L2 and
 from the re-read after a distributed-lock wait, so the function does not run and no
 circuit-breaker failure is counted. A key with no entry yet reads as a miss before the keyring
-is built, so the fault surfaces at the write instead, and the write does not raise it: a sync
-function logs it and returns its result uncached on every call, and an async function does the
-same but also counts each one toward the circuit breaker, which opens after five (the default
-threshold) and then skips reads of cached keys too. Two cases take
-other paths: a missing or short *current* master key raises `EncryptionError`, and an
-encryption-disabled handler reading an entry that claims encryption treats the fault as
-corruption (miss + evict), because only the unauthenticated header sent it down the
-decrypt path.
+is built, so the fault surfaces at the write instead, and the write raises it too, sync or async:
+the function has already run, but its result is neither cached nor returned, and no
+circuit-breaker failure is counted. Two cases take other paths: a missing or short *current*
+master key raises `EncryptionError`, and an encryption-disabled handler reading an entry that
+claims encryption treats the fault as corruption (miss + evict), because only the
+unauthenticated header sent it down the decrypt path.
 
 > **⚠️ Key rotation under fail-closed:** with `fail_closed` enabled there is no
 > silent self-heal — rotating `CACHEKIT_MASTER_KEY` **without retaining the old key

@@ -1742,9 +1742,11 @@ def create_cache_wrapper(
                         serializer="rust",
                     )
 
-            except InteropError:
-                # Interop/v1 data-model rejection: fail loud, never "computed
-                # but silently never cached" (spec-mandated; matches cachekit-ts).
+            except (InteropError, KeyringConfigurationError):
+                # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts),
+                # or a LOCAL keyring config fault, which a cold key first hits on this
+                # write (see the L2 read): fail loud, never "computed but silently
+                # never cached".
                 raise
             except Exception as e:
                 # Caching failed but function succeeded - return result anyway
@@ -1774,6 +1776,12 @@ def create_cache_wrapper(
             result = func(*args, **kwargs)
             return result
 
+        except KeyringConfigurationError:
+            # From the write, or a nested cached call's: a local config fault, not a
+            # backend failure. Counting it would open the breaker, and an open breaker
+            # skips the L2 read and write that raise it, so every later call would run
+            # uncached without a word.
+            raise
         except Exception as e:
             # Other exceptions - record and re-raise
             features.record_failure(e)
@@ -2160,8 +2168,10 @@ def create_cache_wrapper(
                                     serializer="rust",
                                 )
 
-                        except InteropError:
-                            # Interop/v1 data-model rejection: fail loud (spec-mandated).
+                        except (InteropError, KeyringConfigurationError):
+                            # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                            # keyring config fault (see the sync write): fail loud. It
+                            # leaves through the lock clause below as the double-check's does.
                             raise
                         except Exception as e:
                             # Caching failed but function succeeded - return result anyway
@@ -2245,8 +2255,9 @@ def create_cache_wrapper(
                             serializer="rust",
                         )
 
-                except InteropError:
-                    # Interop/v1 data-model rejection: fail loud (spec-mandated).
+                except (InteropError, KeyringConfigurationError):
+                    # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                    # keyring config fault (see the sync write): fail loud.
                     raise
                 except Exception as e:
                     # Caching failed but function succeeded - return result anyway
@@ -2261,6 +2272,9 @@ def create_cache_wrapper(
 
                 return result
 
+            except KeyringConfigurationError:
+                # From the write, or a nested cached call's: never counted (see the sync wrapper).
+                raise
             except Exception as e:
                 # Function execution failed - record and re-raise
                 features.record_failure(e)

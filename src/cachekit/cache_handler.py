@@ -1790,9 +1790,10 @@ class CacheOperationHandler:
 
             # The envelope goes to L1 even when the backend write failed (L1 still serves it)
             return StoreOutcome(envelope=serialized_data, stored=bool(stored))
-        except InteropError:
-            # Interop/v1 data-model rejection: fail loud, never "computed but
-            # silently never cached" (spec-mandated; matches cachekit-ts).
+        except (InteropError, KeyringConfigurationError):
+            # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts), or
+            # a LOCAL keyring config fault, which a cold key first hits here, on the
+            # write: fail loud, never "computed but silently never cached".
             raise
         except Exception as e:
             get_logger().warning(
@@ -1854,9 +1855,8 @@ class CacheOperationHandler:
                 get_logger().cache_stored(cache_key, ttl)
 
             return StoreOutcome(envelope=serialized_data, stored=bool(stored))
-        except InteropError:
-            # Interop/v1 data-model rejection: fail loud, never "computed but
-            # silently never cached" (spec-mandated; matches cachekit-ts).
+        except (InteropError, KeyringConfigurationError):
+            # As in store_result: fail loud, never "computed but silently never cached".
             raise
         except Exception as e:
             get_logger().warning(
