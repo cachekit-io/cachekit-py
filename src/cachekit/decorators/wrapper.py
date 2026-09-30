@@ -2331,23 +2331,31 @@ def create_cache_wrapper(
         """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
         via asyncio.to_thread, like _drain_all.
 
-        Untrack BEFORE the delete: a concurrent write landing after the delete re-tracks its key
-        (_put_l1 records after the put), so it can never be left in L2 untracked. A failed delete
-        re-tracks the key, so a later no-args invalidate_cache() retries it.
+        Untrack BEFORE the delete: every write path calls _put_l1, which re-tracks the key, after
+        its L2 set, so a concurrent write landing after the delete can never be left in L2 untracked.
+        A delete that does not return normally, whatever it raises, re-tracks the key, so a later
+        no-args invalidate_cache() retries it.
         """
         entry = (_l2_scope(), cache_key)
         _cached_keys.discard(entry)
-        if _backend and not _l1_only_mode:
-            try:
-                _backend.delete(cache_key)
-            except Exception as e:
-                # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
-                _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
-                _cached_keys.add(entry)
-        if _object_cache:
-            _object_cache.delete(cache_key)
-        elif _l1_cache:
-            _l1_cache.invalidate(cache_key)
+        try:
+            if _backend and not _l1_only_mode:
+                deleted = False
+                try:
+                    _backend.delete(cache_key)
+                    deleted = True
+                except Exception as e:
+                    # ERROR: a failed delete keeps serving stale data (for interop, to OTHER SDKs too).
+                    _logger.error("Failed to delete L2 key %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                finally:
+                    # finally, not except: a BaseException (gevent Timeout, KeyboardInterrupt) must re-track too.
+                    if not deleted:
+                        _cached_keys.add(entry)
+        finally:
+            if _object_cache:
+                _object_cache.delete(cache_key)
+            elif _l1_cache:
+                _l1_cache.invalidate(cache_key)
 
     def _invalidate_keys(cache_keys: list[str]) -> None:
         """_invalidate_key per key: each logs its own failure, so one never skips the next."""
