@@ -169,3 +169,51 @@ def test_child_forked_mid_switch_can_still_switch(monkeypatch):
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     collector.shutdown()
+
+
+def test_mode_switch_after_shutdown_starts_no_worker():
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    namespace = f"mode-switch-after-shutdown-{uuid.uuid4().hex}"
+    _steer(collector, 1)
+    _record(collector, namespace)
+    assert collector._sync_mode
+    collector.shutdown()
+
+    _steer(collector, 500)
+    _record(collector, namespace)
+
+    # shutdown() is final: a later rise in the rate must not bring a worker back.
+    assert collector._sync_mode
+    assert collector._worker_thread is not None and not collector._worker_thread.is_alive()
+
+
+def test_shutdown_during_a_switch_to_batched_stops_the_new_worker():
+    namespace = f"mode-switch-shutdown-race-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    _steer(collector, 1)
+    _record(collector, namespace)
+    assert collector._sync_mode and collector._worker_thread is not None
+    collector._worker_thread.join(5)
+    inside, release = threading.Event(), threading.Event()
+
+    class ParkingEvent(threading.Event):
+        def clear(self):
+            # Park the restart between its checks and clearing the stop signal, where shutdown() must not slip in.
+            inside.set()
+            release.wait(5)
+            super().clear()
+
+    collector._stopped = ParkingEvent()
+    _steer(collector, 500)
+    switcher = threading.Thread(target=_record, args=(collector, namespace), daemon=True)
+    switcher.start()
+    assert inside.wait(5)
+
+    stopper = threading.Thread(target=collector.shutdown, daemon=True)
+    stopper.start()
+    threading.Timer(0.2, release.set).start()
+    switcher.join(5)
+    stopper.join(5)
+
+    assert not stopper.is_alive()
+    assert not collector._worker_thread.is_alive()

@@ -201,6 +201,7 @@ class AsyncMetricsCollector:
         # Keyed by pid, like _metrics_locks: a child forked while a thread was mid-switch must not wait
         # on the copy of the lock that thread still holds, because the thread does not exist in the child.
         self._mode_locks: dict[int, threading.Lock] = {}
+        self._shutdown_requested = False
 
         # Memory pool for reducing allocations
         self._metric_pool = []
@@ -569,10 +570,15 @@ class AsyncMetricsCollector:
 
     def shutdown(self, timeout: float = 5.0):
         """Gracefully shutdown the metrics collector."""
-        if not self._sync_mode and self._stopped is not None:
-            self._stopped.set()
-            if self._worker_thread is not None:
-                self._worker_thread.join(timeout)
+        # Under the mode lock, so a switch back to batched mode cannot restart the worker after this stops it.
+        with self._mode_lock():
+            self._shutdown_requested = True
+            if self._stopped is not None:
+                self._stopped.set()
+            worker = self._worker_thread
+        # Join outside the lock: a producer's mode check must not wait on the worker's drain.
+        if worker is not None:
+            worker.join(timeout)
 
     def _init_async_mode(self) -> bool:
         """Start the batching worker, creating the queue on first use.
@@ -623,7 +629,7 @@ class AsyncMetricsCollector:
         # Two producers can pass the mode check at once; the lock keeps them from starting two workers.
         with self._mode_lock():
             # Switch to async mode if high frequency (>100 ops/sec)
-            if self._sync_mode and ops_per_second > 100:
+            if self._sync_mode and ops_per_second > 100 and not self._shutdown_requested:
                 # Never join the old worker here: this runs on the caller's thread. Stay synchronous and
                 # retry at the next mode check instead.
                 if not self._init_async_mode():
