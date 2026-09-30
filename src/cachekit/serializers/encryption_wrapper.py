@@ -49,6 +49,18 @@ class DecryptionAuthenticationError(EncryptionError):
     pass
 
 
+class TenantMismatchError(DecryptionAuthenticationError):
+    """The entry is encrypted for a different tenant than the one this read decrypts as.
+
+    Tamper-class wherever the entry came from the backend. The decorator's L1 guards
+    alone treat it as a miss: L1 is keyed by the bare cache key and holds only this
+    process's own authenticated writes and backfills, so another tenant's envelope
+    there is a keying collision, not tamper evidence.
+    """
+
+    pass
+
+
 class EncryptionWrapper:
     """Encryption wrapper that composes any SerializerProtocol with AES-256-GCM encryption layer.
 
@@ -435,13 +447,14 @@ class EncryptionWrapper:
                 ...
             DecryptionAuthenticationError: Decryption failed: ...
 
-            Tenant mismatch raises DecryptionAuthenticationError (tamper-class):
+            Tenant mismatch raises TenantMismatchError, a DecryptionAuthenticationError
+            (tamper-class) whose message names neither tenant:
 
             >>> other_wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-2")
-            >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")  # doctest: +IGNORE_EXCEPTION_DETAIL
+            >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")
             Traceback (most recent call last):
                 ...
-            DecryptionAuthenticationError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
+            cachekit.serializers.encryption_wrapper.TenantMismatchError: Tenant mismatch: entry encrypted for a different tenant
 
             An entry claiming plaintext is refused outright — the wrapper is
             encryption-mandatory and fails closed on its own (LAB-271,
@@ -488,14 +501,14 @@ class EncryptionWrapper:
         # an entry claiming another tenant at this cache key is another tenant's entry
         # at a shared key, cross-tenant substitution, or config drift — it must count as
         # auth_tamper telemetry and be honored by the fail-closed policy, not vanish into
-        # the corruption bucket. CacheSerializationHandler builds this wrapper for the
-        # caller's tenant when it has a tenant_extractor, so that is where this check
-        # fires; without one it builds it for the header's tenant, and a forged header
-        # tenant fails key derivation or AES-GCM authentication instead.
+        # the corruption bucket. The message names neither tenant: under fail-closed it
+        # reaches the caller, who must not learn another tenant's id (CWE-209). The ids
+        # go to the debug log only.
         if metadata.tenant_id != self.tenant_id:
-            raise DecryptionAuthenticationError(
-                f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"
+            logger.debug(
+                "Tenant mismatch: entry encrypted for tenant %r, reader is tenant %r", metadata.tenant_id, self.tenant_id
             )
+            raise TenantMismatchError("Tenant mismatch: entry encrypted for a different tenant")
 
         # Keyring selection by exact fingerprint match (spec/encryption.md →
         # "Key Rotation (Keyring)"): the frame's key_fingerprint is compared

@@ -89,7 +89,7 @@ else:
 
 **Message**: `Decryption failed: ...`. A key or tenant mismatch reads `Key fingerprint mismatch: ...` or `Tenant mismatch: ...` instead.
 
-**Exception**: `DecryptionAuthenticationError` (`from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError`, a `SerializationError` subclass)
+**Exception**: `DecryptionAuthenticationError` (`from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError`, a `SerializationError` subclass); a tenant mismatch raises its subclass `TenantMismatchError`
 
 **What it means**: By default a `@cache.secure` read does not raise. It logs `... cache decrypt/integrity failure (auth_tamper) for ...`, attempts to evict the entry (best effort) and recomputes. The exception reaches your code only with fail-closed on: `CACHEKIT_ENCRYPTION_FAIL_CLOSED=true`, or `@cache.secure(fail_closed=True)` on the decorator. Fail-closed keeps the entry as evidence.
 

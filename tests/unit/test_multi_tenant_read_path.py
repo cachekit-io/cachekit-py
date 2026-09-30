@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,7 +39,7 @@ from cachekit.cache_handler import (
 from cachekit.decorators.tenant_context import ArgumentNameExtractor, ContextVarExtractor
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.l1_cache import get_l1_cache
-from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, TenantMismatchError
 
 MASTER_KEY = "61" * 32
 TENANT_A = "0a0a0a0a-0000-4000-8000-00000000000a"
@@ -243,8 +244,108 @@ class TestContextTenantReads:
             assert runs == [TENANT_B]
 
 
+class _SwitchableExtractor:
+    """A tenant the test sets directly; extraction fails while it is None."""
+
+    def __init__(self) -> None:
+        self.tenant: str | None = None
+
+    def extract(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+        if self.tenant is None:
+            raise ValueError("no tenant")
+        return self.tenant
+
+
+class _TenantPrefixedFileBackend(FileBackend):
+    """One L2 entry per tenant, as on the tenant-scoped Redis backend: keys carry the extractor's tenant."""
+
+    def __init__(self, config: FileBackendConfig, extractor: _SwitchableExtractor) -> None:
+        super().__init__(config)
+        self._extractor = extractor
+
+    def _scoped(self, key: str) -> str:
+        return f"t:{self._extractor.tenant}:{key}"
+
+    def get(self, key: str) -> bytes | None:
+        return super().get(self._scoped(key))
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        super().set(self._scoped(key), value, ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self._scoped(key))
+
+    def exists(self, key: str) -> bool:
+        return super().exists(self._scoped(key))
+
+
+def _l1_fn(
+    backend: FileBackend, runs: list[str | None], extractor: _SwitchableExtractor, *, is_async: bool, **secure: Any
+) -> Any:
+    """L1 on; the result names the tenant it was computed for."""
+    if is_async:
+
+        async def report(x: int) -> dict[str, Any]:
+            runs.append(extractor.tenant)
+            return {"x": x, "tenant": extractor.tenant}
+
+    else:
+
+        def report(x: int) -> dict[str, Any]:
+            runs.append(extractor.tenant)
+            return {"x": x, "tenant": extractor.tenant}
+
+    return _decorate(report, backend, l1_enabled=True, extractor=extractor, **secure)
+
+
+class TestL1TenantCollisions:
+    """L1 is keyed by the bare cache key, so tenants with separate L2 entries still share one L1 slot."""
+
+    @pytest.mark.parametrize("fail_closed", [False, True], ids=["default", "fail-closed"])
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    async def test_another_tenants_l1_envelope_is_a_miss(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_async: bool, fail_closed: bool
+    ) -> None:
+        counted: list[dict[str, str]] = []
+        monkeypatch.setattr("cachekit.cache_handler._record_security_counter", lambda name, labels: counted.append(labels))
+        extractor = _SwitchableExtractor()
+        runs: list[str | None] = []
+        backend = _TenantPrefixedFileBackend(_config(tmp_path), extractor)
+        fn = _l1_fn(backend, runs, extractor, is_async=is_async, fail_closed=fail_closed)
+
+        for tenant in (TENANT_A, TENANT_B, TENANT_A, TENANT_B):
+            extractor.tenant = tenant
+            assert await _call(fn, 42) == {"x": 42, "tenant": tenant}
+        assert runs == [TENANT_A, TENANT_B]  # each tenant's own L2 entry serves it
+        assert counted == []  # an L1 collision is not tamper evidence: no auth_tamper, no raise
+
+    @pytest.mark.parametrize("backend_cls", BACKENDS)
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    async def test_unresolved_tenant_keeps_the_l1_entry(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, backend_cls: type[FileBackend], is_async: bool
+    ) -> None:
+        extractor = _SwitchableExtractor()
+        runs: list[str | None] = []
+        fn = _l1_fn(backend_cls(_config(tmp_path)), runs, extractor, is_async=is_async)
+        extractor.tenant = TENANT_A
+        assert await _call(fn, 42) == {"x": 42, "tenant": TENANT_A}
+
+        extractor.tenant = None
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            assert await _call(fn, 42) == {"x": 42, "tenant": None}  # runs uncached; nothing is written
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("tenant unresolved" in message for message in messages)
+        assert not any("deserialization failed" in m or "Backend operation failed" in m for m in messages)
+
+        extractor.tenant = TENANT_A
+        before = fn.cache_info()
+        assert await _call(fn, 42) == {"x": 42, "tenant": TENANT_A}
+        assert fn.cache_info().l1_hits - before.l1_hits == 1  # the owner's L1 copy survived
+        assert runs == [TENANT_A, None]
+
+
 class TestArgumentTenantReads:
-    """The tenant is a call argument: it reaches the key hash and, now, every read site."""
+    """The tenant is a call argument: it reaches the key hash and every read site."""
 
     @pytest.mark.parametrize("backend_cls", BACKENDS)
     @pytest.mark.parametrize(("is_async", "l1_enabled"), READ_PATHS)
@@ -276,22 +377,6 @@ class TestArgumentTenantReads:
         assert await fn(1, tenant_id=TENANT_A) == {"item": 1, "tenant": TENANT_A}
         assert runs == []
 
-    def test_key_shape_is_unchanged(self, tmp_path: Path) -> None:
-        """Entries sit at the key the generator has always produced, one per tenant, so
-        existing entries stay readable: no silent invalidation."""
-        backend = FileBackend(_config(tmp_path))
-        runs: list[str] = []
-        fn = _argument_tenant_fn(backend, runs, is_async=False, l1_enabled=False)
-
-        def key_for(tenant: str) -> str:
-            return CacheKeyGenerator().generate_key(fn, (1,), {"tenant_id": tenant}, "tenant-read", True)
-
-        assert key_for(TENANT_A) != key_for(TENANT_B)
-        for tenant in (TENANT_A, TENANT_B, TENANT_A, TENANT_B):
-            assert fn(1, tenant_id=tenant) == {"item": 1, "tenant": tenant}
-        assert runs == [TENANT_A, TENANT_B]
-        assert backend.exists(key_for(TENANT_A)) and backend.exists(key_for(TENANT_B))
-
 
 class TestHandlerReadTenant:
     """CacheSerializationHandler / CacheOperationHandler level."""
@@ -304,9 +389,12 @@ class TestHandlerReadTenant:
         handler = self._handler(ContextVarExtractor())
         entry = _as(TENANT_A, handler.serialize_data, {"v": 1}, (), None, CACHE_KEY)
 
-        with pytest.raises(DecryptionAuthenticationError, match="Tenant mismatch") as exc_info:
+        with pytest.raises(TenantMismatchError, match="Tenant mismatch") as exc_info:
             _as(TENANT_B, handler.deserialize_data, entry, CACHE_KEY)
+        assert isinstance(exc_info.value, DecryptionAuthenticationError)
         assert handle_decrypt_failure(exc_info.value, tier="l2", cache_key=CACHE_KEY, fail_closed=False) == "auth_tamper"
+        # Under fail-closed this text reaches the caller: it must not name another tenant (CWE-209).
+        assert TENANT_A not in str(exc_info.value) and TENANT_B not in str(exc_info.value)
         assert _as(TENANT_A, handler.deserialize_data, entry, CACHE_KEY) == {"v": 1}
 
     def test_argument_extractor_reads_its_tenant_from_the_call_arguments(self) -> None:

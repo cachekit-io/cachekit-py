@@ -21,6 +21,7 @@ from ..cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
+    TenantResolutionError,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
@@ -45,7 +46,12 @@ from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
+from ..serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+    TenantMismatchError,
+)
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -1502,6 +1508,16 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
+                except TenantMismatchError:
+                    # L1 is keyed by the bare cache key and holds only this process's own
+                    # authenticated writes and backfills, so another tenant's envelope here is
+                    # a keying collision, not tamper evidence: an L1 miss, no auth_tamper and no
+                    # raise. L2, which may hold this tenant's own entry, applies the policy.
+                    _l1_cache.invalidate(cache_key)
+                except TenantResolutionError:
+                    # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
+                    # with the entry, which stays. The L2 read below misses for the same reason.
+                    logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                 except SerializationError as e:
                     # Poisoned L1 must not outlive remediation of the durable L2 copy —
                     # invalidate BEFORE the policy decision (a fail-closed raise would
@@ -1904,6 +1920,12 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
+                    except TenantMismatchError:
+                        # Another tenant's envelope in L1: an L1 miss — see the sync L1 guard above.
+                        _l1_cache.invalidate(cache_key)
+                    except TenantResolutionError:
+                        # Caller's tenant unresolved: the entry stays — see the sync L1 guard above.
+                        logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                     except SerializationError as e:
                         # Poisoned L1 must not outlive remediation of the durable L2 copy —
                         # invalidate BEFORE the policy decision (a fail-closed raise would

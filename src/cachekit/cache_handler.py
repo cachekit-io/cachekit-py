@@ -98,6 +98,14 @@ LOCK_BLOCKING_TIMEOUT = 5  # Wait max 5 seconds to acquire the lock
 LOCK_RETRY_INTERVAL = 0.1  # Sleep for 100ms between retries after lock fails
 
 
+class TenantResolutionError(ValueError):
+    """An encrypted read on a handler with a tenant_extractor could not extract the caller's tenant.
+
+    The caller's context is at fault, not the entry, which may be valid for its own
+    tenant: every read site treats this as a miss that keeps the entry, L1 and L2 alike.
+    """
+
+
 def _record_security_counter(name: str, labels: dict[str, str]) -> None:
     """Best-effort security-telemetry counter — must never break the read path.
 
@@ -1124,26 +1132,30 @@ class CacheSerializationHandler:
             Deserialized Python object
 
         Raises:
-            ValueError: If cache_key is empty when data is encrypted, or if the handler has a
-                tenant_extractor and the caller's tenant cannot be extracted (nothing is
-                decrypted; callers treat this as a miss)
+            ValueError: If cache_key is empty when data is encrypted
+            TenantResolutionError: If the handler has a tenant_extractor and the caller's
+                tenant cannot be extracted for an encrypted entry. Nothing is decrypted;
+                callers treat this as a miss that keeps the entry.
             SerializationError: If deserialization fails (including AAD mismatch or a
                 corrupt/unparseable envelope frame header), or if this handler has
                 encryption enabled and the entry's header claims plaintext — the
                 header is unauthenticated, so an encryption-enabled handler never
                 routes to the plaintext deserializer (fail closed, CWE-757 downgrade
                 protection). Callers treat this as a cache miss.
-            DecryptionAuthenticationError: If the entry is encrypted for a tenant other than
-                the one this read decrypts as (see Note).
+            DecryptionAuthenticationError: A SerializationError subclass, raised on any
+                authentication failure: tampered ciphertext, wrong key, AAD mismatch, or
+                (TenantMismatchError) an entry encrypted for a tenant other than the one this
+                read decrypts as (see Note). The read sites re-raise it under fail-closed.
 
         Note:
             The decryption tenant mirrors :meth:`serialize_data`:
-            - If tenant_extractor provided: the caller's tenant, extracted from args/kwargs.
-              The cache key carries no tenant, so an entry another tenant wrote at the same
-              key is refused as a tenant mismatch, never decrypted.
-            - Otherwise (single-tenant mode, or a config-drift read with encryption disabled):
-              the tenant recorded in the entry's header. It is bound into the AAD, so a forged
-              value fails authentication.
+            - With a tenant_extractor: the caller's tenant, extracted from args/kwargs, on
+              every encrypted read, config-drift reads included. The cache key carries no
+              tenant, so an entry another tenant wrote at the same key is refused as a
+              tenant mismatch, never decrypted.
+            - Without one (single-tenant mode, and drift reads by an extractor-less handler):
+              the tenant recorded in the entry's header. It is bound into the AAD, so a
+              forged value fails authentication.
 
         Examples:
             Basic round-trip (serialize then deserialize):
@@ -1265,16 +1277,19 @@ class CacheSerializationHandler:
                     # Multi-tenant mode: decrypt as the caller's tenant, extracted as on the write
                     # path, never as the header's. The key has no tenant segment, so another
                     # tenant's entry can sit at this key; the wrapper's tenant check refuses it.
-                    # A failed extraction is the caller's fault, not the entry's: re-raise it as a
-                    # plain ValueError, which the read sites treat as a miss that never evicts
-                    # the L2 entry (anything else would be wrapped below and evicted as corruption).
+                    # A failed extraction is the caller's fault, not the entry's: every read site
+                    # treats TenantResolutionError as a miss that keeps the entry (anything else
+                    # would be wrapped below and evicted as corruption).
                     try:
                         tenant_id = self.tenant_extractor.extract(args, kwargs or {})
                     except Exception as e:
-                        raise ValueError(f"Cannot resolve the caller's tenant for an encrypted read: {type(e).__name__}") from e
+                        raise TenantResolutionError(
+                            f"Cannot resolve the caller's tenant for an encrypted read: {type(e).__name__}"
+                        ) from e
                 else:
-                    # Single-tenant mode or a drift read: the header's tenant selects the key. It is
-                    # bound into the AAD, so a forged value fails authentication.
+                    # No tenant_extractor (single-tenant mode, or a drift read by an extractor-less
+                    # handler): the header's tenant selects the key. It is bound into the AAD, so a
+                    # forged value fails authentication.
                     tenant_id = metadata.tenant_id
                 try:
                     serializer = self._get_cached_encryption_wrapper(tenant_id)
@@ -1633,6 +1648,9 @@ class CacheOperationHandler:
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
@@ -1681,6 +1699,9 @@ class CacheOperationHandler:
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
@@ -1721,6 +1742,9 @@ class CacheOperationHandler:
             raise
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
+            return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
@@ -1774,6 +1798,9 @@ class CacheOperationHandler:
             raise
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
+            return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
