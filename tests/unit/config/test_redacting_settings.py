@@ -1,8 +1,8 @@
 """RedactingSettings: config validation errors never lead back to a raw input (CWE-532).
 
 CachekitConfig and every backend config inherit RedactingSettings, so these run against the concrete
-classes users construct, through every entry point: the constructor, from_env() and the
-model_validate* classmethods.
+classes users construct, through every entry point: the constructor, from_env(), the
+model_validate* classmethods, a pydantic.TypeAdapter and a field of the caller's own model.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import Field, ValidationError, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, ValidationInfo, create_model, field_validator
 from pydantic_core import PydanticCustomError
 
 import cachekit
@@ -27,6 +27,8 @@ from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import singleton
 from cachekit.config.settings import CachekitConfig
+
+_KEY_HEX = "ab" * 32
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     RedisBackendConfig,
@@ -201,6 +203,68 @@ class TestRedactingSettings:
             getattr(config_cls, method)(data)
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
+    @pytest.mark.parametrize(
+        ("method", "data"),
+        [
+            ("validate_python", "SECRET_VALUE"),
+            ("validate_python", ["SECRET_VALUE"]),
+            ("validate_json", '"SECRET_VALUE"'),
+            ("validate_json", '["SECRET_VALUE"]'),
+            ("validate_strings", {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}),
+        ],
+        ids=["non-mapping", "list", "json-string", "json-array", "strings"],
+    )
+    def test_type_adapter_redacts_every_input(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
+    ) -> None:
+        """A TypeAdapter validates through the core schema and never calls the model_validate* classmethods."""
+        with pytest.raises(ValidationError) as exc_info:
+            getattr(TypeAdapter(config_cls), method)(data)
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
+    @pytest.mark.parametrize(
+        ("method", "data"),
+        [
+            ("__call__", {"cfg": "SECRET_VALUE"}),
+            ("model_validate", {"cfg": ["SECRET_VALUE"]}),
+            ("model_validate_json", '{"cfg": "SECRET_VALUE"}'),
+            ("model_validate_strings", {"cfg": {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}}),
+        ],
+        ids=["constructor", "model_validate", "json", "strings"],
+    )
+    def test_config_as_a_field_redacts_every_input(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: dict[str, object] | str
+    ) -> None:
+        """The caller's own model validates the config field through the config's core schema."""
+        outer: type[BaseModel] = create_model("Outer", cfg=(config_cls, ...))
+        with pytest.raises(ValidationError) as exc_info:
+            if method == "__call__":
+                outer(**data)  # type: ignore[arg-type]
+            else:
+                getattr(outer, method)(data)
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+        assert all(err["loc"][0] == "cfg" for err in exc_info.value.errors())
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda data: TypeAdapter(CachekitConfig).validate_strings(data),
+            lambda data: create_model("Outer", cfg=(CachekitConfig, ...)).model_validate_strings({"cfg": data}),
+        ],
+        ids=["type-adapter", "field"],
+    )
+    def test_strings_mode_repromotion_redacts_the_keys(self, build: Callable[[dict[str, str]], object]) -> None:
+        """A model-level error snapshots the whole input dict, and the strings mode never calls __init__."""
+        with pytest.raises(ValidationError) as exc_info:
+            build({"master_key": _KEY_HEX, "previous_master_keys": _KEY_HEX})
+
+        _assert_no_route_to(exc_info.value, _KEY_HEX)
+        assert [err["type"] for err in exc_info.value.errors()] == ["value_error"]
 
     def test_undecodable_env_value_leaves_no_route_to_the_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A list field's env value must be JSON; the decoder's error, chained to pydantic-settings'
@@ -440,7 +504,6 @@ class TestRedactingSettings:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
 
-_KEY_HEX = "ab" * 32
 _CACHEKIT_SRC = pathlib.Path(cachekit.__file__).resolve().parent
 
 
@@ -475,8 +538,21 @@ class TestRedactingSettingsFrameLocals:
             lambda: CachekitConfig.model_validate_json(json.dumps({"master_key": _KEY_HEX, "max_value_size": -1})),
             lambda: CachekitConfig.model_validate_strings({"master_key": _KEY_HEX, "max_value_size": "-1"}),
             lambda: CachekitIOBackendConfig(api_key=_KEY_HEX, timeout=-1),  # type: ignore[arg-type]
+            lambda: TypeAdapter(CachekitConfig).validate_python(_KEY_HEX),
+            lambda: TypeAdapter(CachekitConfig).validate_strings({"master_key": _KEY_HEX, "previous_master_keys": _KEY_HEX}),
+            lambda: create_model("Outer", cfg=(CachekitConfig, ...))(cfg=_KEY_HEX),
         ],
-        ids=["kwarg", "kwarg-repromotion", "model_validate", "model_validate_json", "model_validate_strings", "io-api-key"],
+        ids=[
+            "kwarg",
+            "kwarg-repromotion",
+            "model_validate",
+            "model_validate_json",
+            "model_validate_strings",
+            "io-api-key",
+            "type-adapter",
+            "type-adapter-strings",
+            "field",
+        ],
     )
     def test_programmatic_input_leaves_no_frame_local(self, build: Callable[[], object]) -> None:
         with pytest.raises(ValidationError) as exc_info:

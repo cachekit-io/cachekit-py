@@ -7,8 +7,8 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
-from pydantic import ValidationError
-from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic import GetCoreSchemaHandler, ValidationError
+from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
 from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
 
@@ -47,6 +47,15 @@ class ConfigurationError(Exception):
     pass
 
 
+# Defined before RedactingSettings: pydantic builds the class's core schema, which binds this, as the
+# class statement runs.
+def _redacting_wrap(value: Any, handler: core_schema.ValidatorFunctionWrapHandler, title: str) -> Any:
+    try:
+        return _redacting(functools.partial(handler, value), title)
+    finally:
+        del value, handler
+
+
 class RedactingSettings(BaseSettings):
     """``BaseSettings`` whose validation errors never carry a raw input (CWE-532).
 
@@ -73,6 +82,16 @@ class RedactingSettings(BaseSettings):
         finally:
             del kwargs
 
+    # A TypeAdapter, or a model with a config field, validates through this class's core schema and
+    # calls neither __init__ nor a classmethod below, so the schema redacts too. It adds to __init__, not
+    # replaces it: redacting only here leaves pydantic's own __init__ frames, which hold the raw kwargs,
+    # on the traceback. The error raised in here is titled after pydantic's handler, so pass the class's.
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: type[Any], handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        return core_schema.no_info_wrap_validator_function(
+            functools.partial(_redacting_wrap, title=source.__name__), handler(source)
+        )
+
     # pydantic calls the overridden __init__ only for mapping input. Malformed JSON, a non-object
     # document, non-mapping input and the strings mode fail in the core validator first, so the
     # model_validate* classmethods redact on their own.
@@ -98,13 +117,14 @@ class RedactingSettings(BaseSettings):
             del obj, kwargs
 
 
-def _redacting(validate: Callable[[], _T]) -> _T:
+def _redacting(validate: Callable[[], _T], title: str | None = None) -> _T:
     """Run ``validate``, re-raising a failure with no raw input and no chain.
 
     A ValidationError becomes its redacted copy. A SettingsError (an env value that fails to decode
     chains the decoder's error, which holds the raw value) or a UnicodeError (an env file that is
     not valid UTF-8 carries the file's bytes) becomes a SettingsError with only its message, which
-    names what failed without quoting it. Not a context manager: raising from ``__exit__`` would
+    names what failed without quoting it. ``title`` overrides the ValidationError's title in the warning
+    and the withheld error. Not a context manager: raising from ``__exit__`` would
     chain the original, raw inputs and all.
     """
     try:
@@ -120,6 +140,7 @@ def _redacting(validate: Callable[[], _T]) -> _T:
     # ctx exception's str() raises once its chain is dropped is reported to sys.unraisablehook as the
     # msgs are read.
     if isinstance(failure, ValidationError):
+        title = title or failure.title
         withheld_because: str | None = None
         try:
             failure = _redacted_copy(failure)  # also drops this frame's last reference to the original
@@ -129,13 +150,11 @@ def _redacting(validate: Callable[[], _T]) -> _T:
             withheld_because = redact_error_for_log(e)
             withheld = PydanticCustomError("redaction_failed", "Validation failed; details withheld")
             failure = ValidationError.from_exception_data(
-                failure.title, [{"type": withheld, "loc": (), "input": "[REDACTED]"}], hide_input=True
+                title, [{"type": withheld, "loc": (), "input": "[REDACTED]"}], hide_input=True
             )
         if withheld_because is not None:
             # Logged outside the except, so a handler that reads sys.exc_info() gets nothing.
-            logger.warning(
-                "%s: config validation error details withheld; redacting it raised %s", failure.title, withheld_because
-            )
+            logger.warning("%s: config validation error details withheld; redacting it raised %s", title, withheld_because)
     raise failure
 
 
