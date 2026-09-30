@@ -79,9 +79,9 @@ CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Master key for @cache.secure / encryption=True — a key source, not a switch.
-# Deprecated in 0.20.0: its presence alone can still activate encryption on presets that
-# state no encryption= (warns once per process), but not on every one, so never rely on
-# it; the next minor release raises instead.
+# With it set, every preset except @cache.secure and @cache.local must state its intent:
+# one with no encryption intent raises ConfigurationError at decoration (use encryption=False
+# for plaintext).
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
 # Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
 # same per-key requirements as CACHEKIT_MASTER_KEY). Entries written under a
@@ -438,6 +438,10 @@ export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 export CACHEKIT_ARROW_COMPRESSION=zstd
 export LOG_LEVEL=WARNING
 ```
+
+The key does not switch encryption on: every preset except `@cache.secure` and `@cache.local` must
+state its intent (`encryption=False` for plaintext) or it raises `ConfigurationError` at decoration
+([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
 
 ---
 

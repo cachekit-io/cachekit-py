@@ -182,7 +182,8 @@ def compute(x):
 
 # Production: Add encryption (one parameter)
 @cache.secure(ttl=300)  # Enables AES-256-GCM
-# CACHEKIT_MASTER_KEY=hex_encoded_key
+# CACHEKIT_MASTER_KEY=hex_encoded_key — with it set, plaintext caches state it:
+# @cache(backend=None, ttl=300, encryption=False)
 ```
 
 **Limitations of alternatives**:

@@ -15,9 +15,9 @@
 
 ### `@cache` - Intelligent Cache (Recommended)
 
-**Primary Interface**: The intelligent cache decorator that automatically optimizes based on function analysis and intent. This is the main interface for cachekit.
+**Primary Interface**: The cache decorator, configured by preset (intent) or by explicit arguments. This is the main interface for cachekit.
 
-The `@cache` decorator provides intelligent configuration selection based on function analysis or explicit intent.
+The `@cache` decorator takes its configuration from a preset or from explicit arguments.
 
 ```python notest
 from cachekit import cache
@@ -31,7 +31,7 @@ def expensive_function():
 # These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY — see Encryption Parameters below)
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)
@@ -39,7 +39,7 @@ def custom_function():
     return do_expensive_computation()
 ```
 
-**Architecture**: The `@cache` decorator uses intelligent profile selection (fast/safe/secure) or auto-detection to configure caching behavior, then delegates to the wrapper factory for actual caching implementation.
+**Architecture**: The `@cache` decorator resolves its configuration from the preset and arguments, then delegates to the wrapper factory for actual caching implementation.
 
 **Intent-Based Profiles:**
 - **`@cache.minimal`** - Speed profile: StandardSerializer (default, multi-language compatible), reduced monitoring overhead, optimized for performance
@@ -48,13 +48,7 @@ def custom_function():
 - **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
 - **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
-- **`@cache`** - Auto-detection: Analyzes function name and signature to select optimal profile
-
-**Implementation Details:**
-- Function analysis detects security-sensitive names (`user`, `auth`, `payment`, etc.) → secure profile (EncryptionWrapper)
-- High-frequency function patterns (`get`, `calc`, `compute`, etc.) → fast profile (StandardSerializer with optimizations)
-- All other functions → default balanced profile (StandardSerializer)
-- Manual overrides always take precedence over auto-detection
+- **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
 
 ### `@cache(...)` - Manual Configuration
 
@@ -122,7 +116,7 @@ def your_function(args):
 
 #### Encryption Parameters
 
-- **`encryption`** (`EncryptionConfig`, default: `EncryptionConfig()`) - Client-side encryption configuration (use `@cache.secure` preset instead of configuring directly)
+- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` (`@cache.local` takes no `encryption=` and never raises) ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling
 
 #### Returns
 - Cached function result or fresh computation result
@@ -137,7 +131,7 @@ from cachekit import cache
 # First, set environment variable:
 # export REDIS_URL="redis://localhost:6379"
 
-@cache  # Auto-detects optimal configuration
+@cache  # Baseline: defaults, plaintext
 def analyze_dataset(dataset_id, filters=None):
     """Analyze large dataset with automatic caching."""
     return perform_analysis(dataset_id, filters)
@@ -596,7 +590,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
-- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` (env: `CACHEKIT_MASTER_KEY`)
+- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
 **Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
 
@@ -693,7 +687,7 @@ CACHEKIT_REDIS_URL=redis://localhost:6379/0
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
-# Encryption (for @cache.secure)
+# Encryption key for @cache.secure / encryption=True (a key source, not a switch)
 CACHEKIT_MASTER_KEY=<hex-encoded-32-bytes-minimum>
 
 # Fallback: REDIS_URL also supported (lower priority)

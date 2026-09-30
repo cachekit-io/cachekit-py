@@ -2,8 +2,9 @@
 
 #195: get_settings() built the config once and cached it process-wide. If the first build happened
 before CACHEKIT_MASTER_KEY entered the environment (e.g. an import-time @cache decorator before the
-app loads secrets), it froze master_key=None forever — encryption then silently never activated.
-The singleton must re-read once the key appears.
+app loads secrets), it froze master_key=None forever — a later @cache.secure then missed the key,
+and a later cache with no stated intent skipped the no-intent error. The singleton must re-read
+once the key appears, including after a first build that read an empty CACHEKIT_MASTER_KEY.
 
 #194: the missing-key error pointed users at REDIS_CACHE_MASTER_KEY, which is never read; the only
 honored variable is CACHEKIT_MASTER_KEY.
@@ -31,6 +32,18 @@ class TestKeylessSingletonSelfHeals:
             assert get_settings().master_key is None  # first build: env not yet set -> keyless
             monkeypatch.setenv("CACHEKIT_MASTER_KEY", _HEX_KEY)
             assert get_settings().master_key is not None  # must self-heal (the bug froze this at None)
+        finally:
+            reset_settings()
+
+    def test_get_settings_rereads_after_empty_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty variable (compose `${VAR:-}`, a k8s `value: ""`) freezes SecretStr(""), not None."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "")
+        reset_settings()
+        try:
+            assert not get_settings().master_key  # first build: empty key -> keyless
+            monkeypatch.setenv("CACHEKIT_MASTER_KEY", _HEX_KEY)
+            key = get_settings().master_key
+            assert key is not None and key.get_secret_value() == _HEX_KEY
         finally:
             reset_settings()
 

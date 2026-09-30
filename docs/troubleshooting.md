@@ -178,6 +178,7 @@ lsof -i :6379
 **Error messages** (types and when each raises: [Encryption Errors](error-codes.md#encryption-errors)):
 ```
 cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable
+A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...
 CACHEKIT_MASTER_KEY must be hex-encoded: ...
 CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ...
 Decryption failed: ...
@@ -189,9 +190,10 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 
 **Common causes**:
 1. Master key not set when using `@cache.secure()`
-2. Master key format invalid (not hex-encoded)
-3. Master key rotated (can't decrypt old cached data)
-4. Data corruption during storage/retrieval
+2. Master key set, but a cache states no encryption intent — add `encryption=False` for plaintext ([details](error-codes.md#master-key-present-no-encryption-intent))
+3. Master key format invalid (not hex-encoded)
+4. Master key rotated (can't decrypt old cached data)
+5. Data corruption during storage/retrieval
 
 **Quick fix**:
 ```bash

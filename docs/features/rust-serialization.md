@@ -76,7 +76,7 @@ This protects against Redis memory corruption, storage bugs, and bit rot. A corr
 > hash and the comparison is a plain equality check: an attacker with backend write
 > access can forge a valid checksum for arbitrary bytes in microseconds. On the
 > plaintext `@cache` path the stored bytes are therefore attacker-forgeable.
-> Tamper-resistance comes from AES-256-GCM (`@cache.secure` / `CACHEKIT_MASTER_KEY`),
+> Tamper-resistance comes from AES-256-GCM (`@cache.secure`, or an explicit `encryption=` option),
 > never from this checksum. See
 > [zero-knowledge-encryption.md](zero-knowledge-encryption.md#corruption-vs-tamper-telemetry-and-fail-closed-mode)
 > for the corruption-vs-tamper telemetry split.
