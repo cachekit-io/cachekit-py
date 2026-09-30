@@ -1001,3 +1001,89 @@ class TestForgedEntryErrorEchoIsBounded:
             assert handler.get_cached_value("ns:app:key") is None  # fail-open miss
         lines = [r.getMessage() for r in caplog.records if "decrypt/integrity failure" in r.getMessage()]
         assert lines and all(len(line) < ERROR_ECHO_MAX + 256 for line in lines)
+
+
+class TestIntegrityOffHeaderClaimMustBeWritable:
+    """With integrity off there is no envelope, so the header ``original_type`` is the only format
+    copy. One rotted byte turns ``"series"`` into an unknown string or rots the key away (``None``);
+    both matched no branch and a stored Series came back as its columnar ``dict``, no error. The
+    claim is now held to the formats ``serialize()`` can write, and ``serialize()`` always writes it."""
+
+    KEY = "ns:app:func:m.f:args:0:0"
+
+    @pytest.mark.parametrize("claim", ["Series", "seriex", None])
+    @pytest.mark.parametrize("stored", [SERIES, FRAME], ids=["series", "no-arrow-frame"])
+    def test_an_unwritable_or_absent_claim_is_refused(self, stored: object, claim: str | None) -> None:
+        s = _no_arrow(enable_integrity_checking=False)
+        data, meta = s.serialize(stored)
+        assert meta.original_type in ("series", "dataframe")
+        meta.original_type = claim
+
+        with pytest.raises(SerializationError, match="no writer emits"):
+            s.deserialize(data, meta)
+
+    def test_a_numpy_entry_that_lost_its_claim_still_decodes(self) -> None:
+        """The check runs after the structural routes: NUMPY_RAW bytes identify themselves."""
+        s = AutoSerializer(enable_integrity_checking=False)
+        arr = np.arange(6, dtype=np.int64)
+        data, meta = s.serialize(arr)
+        meta.original_type = None
+
+        np.testing.assert_array_equal(s.deserialize(data, meta), arr)
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [(b'"series"', b'"seriex"'), (b'"original_type"', b'"nriginal_type"')],
+        ids=["unknown-claim", "absent-claim"],
+    )
+    def test_the_l2_read_evicts_and_counts_it_as_corruption(
+        self, monkeypatch: pytest.MonkeyPatch, old: bytes, new: bytes
+    ) -> None:
+        recorded: list[dict[str, str]] = []
+
+        class _Collector:
+            def record_counter(self, name, labels=None, value=1.0):
+                if name == "cachekit_decrypt_failures_total":
+                    recorded.append(labels or {})
+
+        monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
+        serialization = CacheSerializationHandler(serializer_name="auto", enable_integrity_checking=False)
+        blob = serialization.serialize_data(SERIES, cache_key=self.KEY)
+        assert blob.count(old) == 1
+        handler = CacheOperationHandler(serialization, CacheKeyGenerator())
+        backend = mock.MagicMock()
+        backend.get.return_value = blob.replace(old, new)
+        handler.set_cache_handler(backend)
+
+        assert handler.get_cached_value(self.KEY) is None
+        backend.delete.assert_called_once_with(self.KEY)
+        assert [labels.get("reason") for labels in recorded] == ["corruption"]
+
+    def test_no_single_byte_header_rot_returns_anything_but_the_stored_series(self) -> None:
+        """Every one of the 255 alternative values of every CK-header byte, not a sample: a probe
+        set cannot see the bytes that matter (see the envelope sweep above). Every read either
+        raises SerializationError or returns the stored Series. Before the check: 1,771 dicts."""
+        serialization = CacheSerializationHandler(serializer_name="auto", enable_integrity_checking=False)
+        blob = serialization.serialize_data(SERIES, cache_key=self.KEY)
+        header_end = 7 + int.from_bytes(blob[3:7], "big")  # b"CK" + version + 4-byte length + JSON
+        assert b'"original_type": "series"' in blob[:header_end]
+
+        silent: list[tuple[int, int, str]] = []
+        leaked: list[tuple[int, int, str]] = []
+        for i in range(header_end):
+            for byte in range(256):
+                if blob[i] == byte:
+                    continue
+                mutant = bytearray(blob)
+                mutant[i] = byte
+                try:
+                    out = serialization.deserialize_data(bytes(mutant), cache_key=self.KEY)
+                except SerializationError:
+                    continue
+                except Exception as exc:
+                    leaked.append((i, byte, repr(exc)))
+                    continue
+                if not (isinstance(out, pd.Series) and out.equals(SERIES)):
+                    silent.append((i, byte, type(out).__name__))
+        assert not leaked, f"corrupt header leaked a non-SerializationError ({len(leaked)}): {leaked[:5]}"
+        assert not silent, f"silent wrong-value returns ({len(silent)}): {silent[:5]}"
