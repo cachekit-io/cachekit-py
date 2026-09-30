@@ -27,13 +27,22 @@ import msgpack
 
 from cachekit._rust_serializer import ByteStorage
 
-from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat, SerializationMetadata, unpackb_bounded
+from .base import (
+    PAYLOAD_DECODE_ERRORS,
+    SerializationError,
+    SerializationFormat,
+    SerializationMetadata,
+    immutable_buffer,
+    unpackb_bounded,
+)
 
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
 # marker: bin8/16/32 in the current encoding, an int array (fixarray, array16, array32) in the legacy one.
 _ENVELOPE_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6, *range(0x90, 0xA0), 0xDC, 0xDD))
 # Largest declared payload an integrity-off reader verifies; verifying costs a full decompress (see deserialize).
 _ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
+# lz4_flex's get_maximum_output_size for that budget: the most compressed bytes any envelope within it carries.
+_ENVELOPE_PROBE_MAX_COMPRESSED = 20 + _ENVELOPE_PROBE_MAX_SIZE * 110 // 100
 _CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
 
 # Error message constants for unsupported types (Task 2)
@@ -336,7 +345,7 @@ class StandardSerializer:
                 look-alike cannot match the checksum by chance. So without a ``compressed=True``
                 header, a rotted envelope, one declaring more than 256 KiB, and one in another
                 layout come back decoded as their fields, and a value equal to a valid envelope's
-                fields is refused on every read.
+                fields (declaring at most 256 KiB) is refused on every read.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -355,10 +364,7 @@ class StandardSerializer:
             # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
             if metadata is not None and metadata.compressed:
                 raise SerializationError(_CROSS_CONFIG_ERROR)
-            if isinstance(data, memoryview):
-                # Flatten to unsigned bytes as unpackb_bounded does, so the layout test indexes the same
-                # bytes the decode reads: a signed view reads the 0x94 lead as -108.
-                data = data.cast("B") if data.c_contiguous else bytes(data)
+            data = immutable_buffer(data)  # the decode and the envelope probe must judge one snapshot
             value = unpackb_bounded(data, **self._msgpack_unpack_opts)
             if self._is_verified_envelope(data, value):
                 raise SerializationError(_CROSS_CONFIG_ERROR)
@@ -372,12 +378,15 @@ class StandardSerializer:
     def _is_verified_envelope(self, data: bytes | memoryview, value: Any) -> bool:
         """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope that passes ``retrieve()``."""
         # Necessary conditions, never a verdict. The layout test spares ordinary reads the attempt. The
-        # size cap bounds it: retrieve() decompresses the whole declared payload before it checks the
-        # checksum, and a caller can cache a value that declares a large one. A 0x94 lead that decoded
-        # is a 4-element list, so value[2] is the declared original_size.
+        # size caps bound it: retrieve() copies the whole payload slot and decompresses the whole declared
+        # payload before it checks the checksum, and a caller can cache a value shaped like a large
+        # envelope. A 0x94 lead that decoded is a 4-element list whose slot 0 is bytes or a list, so
+        # value[2] is the declared original_size and len(value[0]) the compressed length.
         if len(data) < 2 or data[0] != 0x94 or data[1] not in _ENVELOPE_PAYLOAD_MARKERS:
             return False
         if not isinstance(value[2], int) or value[2] > _ENVELOPE_PROBE_MAX_SIZE:
+            return False
+        if len(value[0]) > _ENVELOPE_PROBE_MAX_COMPRESSED:
             return False
         try:
             self._byte_storage.retrieve(data)
