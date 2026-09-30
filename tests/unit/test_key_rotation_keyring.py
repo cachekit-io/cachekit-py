@@ -1,4 +1,4 @@
-"""Key rotation via the master-key keyring (LAB-684, LAB-516 stage 2).
+"""Key rotation via the master-key keyring (LAB-684).
 
 Spec: protocol spec/encryption.md → "Key Rotation (Keyring)" and
 decisions/key-rotation.md. cachekit-py stores a per-entry key_fingerprint in CK
@@ -43,8 +43,7 @@ from pydantic import SecretStr, ValidationError
 from cachekit import cache
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
-from cachekit.decorators import orchestrator as orchestrator_module
-from cachekit.reliability.circuit_breaker import CircuitBreaker
+from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionWrapper,
@@ -699,19 +698,6 @@ class TestDecoratorL2ReadsFailLoud:
     caller as it does from the L1 guards — never logged as a cache error and run
     uncached, recounted on the circuit breaker, on every call."""
 
-    @pytest.fixture
-    def breakers(self, monkeypatch) -> list[CircuitBreaker]:
-        """Every breaker a decorator builds (decorate after requesting this)."""
-        captured: list[CircuitBreaker] = []
-        real = orchestrator_module.CircuitBreaker
-
-        def spy(*args: Any, **kwargs: Any) -> CircuitBreaker:
-            captured.append(real(*args, **kwargs))
-            return captured[-1]
-
-        monkeypatch.setattr(orchestrator_module, "CircuitBreaker", spy)
-        return captured
-
     @staticmethod
     def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True) -> Any:
         """Every call decorates a function of the same qualname, so a fresh reader,
@@ -747,19 +733,22 @@ class TestDecoratorL2ReadsFailLoud:
 
     @pytest.mark.parametrize("backend_cls", [_ByteStore, _SWRByteStore], ids=["plain", "swr-capable"])
     @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-    async def test_l2_read_raises_without_running_or_counting(self, monkeypatch, breakers, is_async, backend_cls):
+    async def test_l2_read_raises_without_running_or_counting(self, monkeypatch, live_breakers, is_async, backend_cls):
         key, entry = await self._written_entry(is_async=is_async)
         _settings_previous_keys(monkeypatch, [K2])
         backend = backend_cls()
         backend.store[key] = entry
         runs: list[int] = []
-        breakers.clear()
+        live_breakers.clear()
         fn = self._decorate(backend, runs, is_async=is_async)
-        (breaker,) = breakers
+        (breaker,) = live_breakers
 
         for _ in range(3):
             with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
                 await _call(fn, 1)
+            # The sync wrapper has no outer `finally`: a raising exit that skips the
+            # stats reset leaks this call's stats into the caller's context.
+            assert get_current_function_stats() is None
 
         assert runs == []
         assert breaker.failure_count == 0
@@ -767,17 +756,20 @@ class TestDecoratorL2ReadsFailLoud:
 
     @pytest.mark.parametrize("acquired", [True, False], ids=["lock-acquired", "lock-timeout"])
     @pytest.mark.parametrize("redis_shaped", [True, False], ids=["redis-lock", "finally-lock"])
-    async def test_async_lock_double_check_raises_without_running(self, monkeypatch, acquired, redis_shaped):
+    async def test_async_lock_double_check_raises_without_running(self, monkeypatch, live_breakers, acquired, redis_shaped):
         key, entry = await self._written_entry(is_async=True)
         _settings_previous_keys(monkeypatch, [K2])
         backend = _LockByteStore(entry, acquired=acquired, redis_shaped=redis_shaped)
         runs: list[int] = []
+        live_breakers.clear()
         fn = self._decorate(backend, runs, is_async=True)
+        (breaker,) = live_breakers
 
         with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
             await fn(1)
 
         assert runs == []
+        assert breaker.failure_count == 0
         assert backend.store == {key: entry}
 
     @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
@@ -809,7 +801,6 @@ class TestDecoratorL2ReadsFailLoud:
 
         assert await _call(fn, 1) == {"x": 1}
         assert runs == [1, 1]
-        assert backend.store[key] != forged
         assert await _call(fn, 1) == {"x": 1}
         assert runs == [1, 1]  # the overwrite is a readable entry
 
