@@ -2340,7 +2340,7 @@ def create_cache_wrapper(
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
         wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
         its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
-        tenant-scoped (LAB-4773).
+        tenant-scoped.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
