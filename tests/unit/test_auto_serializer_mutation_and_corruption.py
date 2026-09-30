@@ -454,6 +454,31 @@ class TestEnvelopeVerificationVsNotAnEnvelope:
 
         assert s.deserialize(data, meta if metadata_present else None) == value
 
+    @pytest.mark.parametrize("metadata_present", [True, False])
+    @pytest.mark.parametrize("kind", ["arrow", "numpy"])
+    def test_a_healthy_checksummed_read_hashes_the_body_once(self, kind: str, metadata_present: bool) -> None:
+        """The routing gate's digest check is load-bearing (the collision tests above), so the
+        delegate must not repeat it: a second pass over the body cost a tenth of a large Arrow
+        read. Counting the hash calls pins it for both metadata routes."""
+        if kind == "arrow":
+            pytest.importorskip("pyarrow")
+            value = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        else:
+            value = np.arange(12, dtype=np.float64).reshape(3, 4)
+        s = AutoSerializer()
+        data, meta = s.serialize(value)
+        assert meta.original_type == kind
+        assert xxhash.xxh3_64_digest(data[8:]) == data[:8], "this test needs a checksummed entry"
+
+        with mock.patch("xxhash.xxh3_64_digest", wraps=xxhash.xxh3_64_digest) as digest:
+            result = s.deserialize(data, meta if metadata_present else None)
+
+        assert digest.call_count == 1
+        if kind == "arrow":
+            pd.testing.assert_frame_equal(result, value)
+        else:
+            np.testing.assert_array_equal(result, value)
+
     @pytest.mark.parametrize(
         "make_metadata",
         [

@@ -424,7 +424,20 @@ class ArrowSerializer:
                     f"Invalid data: not a recognized Arrow envelope "
                     f"(expected [8-byte checksum][Arrow IPC] or raw Arrow IPC); got {n} bytes"
                 )
+        except (pa.ArrowInvalid, pa.ArrowSerializationError, OSError) as e:
+            raise SerializationError(f"Failed to deserialize Arrow IPC data: {e}") from e
+        return self._read_verified_ipc(body)
 
+    def _read_verified_ipc(self, body: memoryview) -> Any:
+        """Decode an Arrow IPC ``body`` whose checksum the caller has ALREADY verified.
+
+        Never hashes: :meth:`deserialize` verifies before calling this, and
+        ``AutoSerializer.deserialize`` calls it only after its routing gate has checked the same
+        digest, so a healthy read hashes the body once instead of twice. Every caller must hand
+        it gate-verified or bare (legacy, unchecksummed) bytes — an unverified body passed here
+        is decoded as-is.
+        """
+        try:
             # pa.py_buffer over the memoryview is zero-copy; open_file decompresses transparently.
             reader = pa.ipc.open_file(pa.py_buffer(body))
             table = reader.read_all()
