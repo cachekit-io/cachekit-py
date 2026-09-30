@@ -516,6 +516,48 @@ class TestDrain:
         f.invalidate_cache()
         assert backend.store == {}
 
+    @pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["Exception", "BaseException"])
+    def test_single_key_delete_that_raises_keeps_key_tracked(
+        self, error: type[BaseException], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """invalidate_cache(args) untracks before its L2 delete. A delete that raises anything,
+        not only an Exception, re-tracks the key so a later no-args call retries it, and the L1
+        copy is still evicted. Only an Exception is caught and logged; the rest propagates."""
+        backend = PlainBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="single_key_raise")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        f(1)
+        (key,) = backend.store
+        real_delete = backend.delete
+
+        def delete_raises(k: str) -> bool:
+            raise error("delete interrupted")
+
+        backend.delete = delete_raises  # type: ignore[method-assign]
+        with caplog.at_level(logging.ERROR, logger="cachekit.decorators.wrapper"):
+            if issubclass(error, Exception):
+                f.invalidate_cache(1)
+            else:
+                with pytest.raises(error):
+                    f.invalidate_cache(1)
+        backend.delete = real_delete  # type: ignore[method-assign]
+
+        errors = [r for r in caplog.records if "Failed to delete L2 key" in r.getMessage()]
+        assert len(errors) == (1 if issubclass(error, Exception) else 0)
+        assert ("", key) in _closure_cell(f, "_cached_keys").cell_contents  # (L2 scope, key); unscoped backend
+        value = backend.store.pop(key)
+        f(1)  # L1 evicted and L2 emptied: the function runs again
+        assert calls == 2
+        backend.store[key] = value
+        f.invalidate_cache()  # no-args retry reaches the re-tracked key
+        assert backend.store == {}
+
     def test_other_tenant_rewrite_during_drain_keeps_only_its_own_entry(self) -> None:
         """Watches hold (scope, key): tenant b rewriting the same key during tenant a's drain
         keeps b's entry recorded and does not keep a's drained entry alive."""

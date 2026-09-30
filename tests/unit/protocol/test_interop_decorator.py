@@ -472,9 +472,16 @@ class TestInteropRejections:
         provider = Mock()
         provider.get_backend.return_value = prefixed
         with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
-            with pytest.raises(ConfigurationError, match="prefix"):
-                wrapped.invalidate_cache(*call_args)
-        assert key in prefixed.store
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    wrapped.invalidate_cache(*call_args)
+        delete.assert_not_called()
 
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
     async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
@@ -494,9 +501,16 @@ class TestInteropRejections:
         provider = Mock()
         provider.get_backend.return_value = prefixed
         with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
-            with pytest.raises(ConfigurationError, match="prefix"):
-                await wrapped.ainvalidate_cache(*call_args)
-        assert key in prefixed.store
+            if not call_args:
+                # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
+                prefixed._key_prefix = ""
+                del prefixed.store[key]
+                assert await wrapped(42) == 42
+                prefixed._key_prefix = "t:default:"
+            with patch.object(prefixed, "delete", wraps=prefixed.delete) as delete:
+                with pytest.raises(ConfigurationError, match="prefix"):
+                    await wrapped.ainvalidate_cache(*call_args)
+        delete.assert_not_called()
 
     async def test_async_lazy_provider_failure_falls_back_uncached(self):
         """Backend-creation failure degrades to uncached execution (same
