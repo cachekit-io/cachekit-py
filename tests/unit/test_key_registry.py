@@ -13,8 +13,10 @@ import asyncio
 import contextvars
 import logging
 import os
+import sys
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -797,3 +799,169 @@ class TestL1InvalidateMany:
         l1._lock = real_lock
         assert acquisitions == 3  # 1 000-key batches: a large drain never holds every get/put off at once
         assert l1.get("k2499") == (False, None)
+
+
+class _NS(str, Enum):
+    USERS = "users"
+
+
+class _StrEnumNS(str, Enum):
+    """enum.StrEnum's rendering (3.11+), spelled out so the test also runs on 3.10."""
+
+    USERS = "users"
+    __str__ = str.__str__
+    __format__ = str.__format__
+
+
+class _FormatsAs(str):
+    """A str whose __format__ lies: f-strings render ``rendered``, "".join the real value."""
+
+    rendered = "ck:reg:users"
+
+    def __format__(self, spec: str) -> str:
+        return self.rendered
+
+
+class _LegacyFormat(_FormatsAs):
+    rendered = "legacy"
+
+
+class _HidesCk(str):
+    """A str that claims not to be "ck" and not to start with it."""
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+    def startswith(self, *args: Any, **kwargs: Any) -> bool:  # type: ignore[override]
+        return False
+
+
+@pytest.mark.unit
+class TestNamespaceExactStr:
+    """A str-subclass namespace keys and names its registry set by its underlying str (LAB-6197)."""
+
+    def test_str_enum_registry_id_uses_value(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_NS.USERS, l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:users:")
+
+    def test_str_enum_custom_key_uses_value(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_NS.USERS, key=lambda *a, **kw: "k", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        assert set(backend.store) == {"users:k"}
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:users:")
+
+    def test_format_override_cannot_forge_registry_shape(self) -> None:
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_FormatsAs("x"), key=lambda *a, **kw: "k", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        assert set(backend.store) == {"x:k"}
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith("ck:reg:x:")
+
+    @pytest.mark.parametrize("value", ["ck", "ck:reg"])
+    def test_eq_and_startswith_override_cannot_bypass_ck_reservation(self, value: str) -> None:
+        ns = _HidesCk(value)
+        assert not ns == "ck" and not ns.startswith("ck:")  # the overrides the old check trusted
+        with pytest.raises(ConfigurationError, match="reserved"):
+
+            @cache(backend=TrackingBackend(), ttl=60, namespace=ns)
+            def f(x: int) -> int:
+                return x
+
+    def test_drain_also_empties_pre_fix_registry_set(self) -> None:
+        """Entries tracked under the pre-fix f-string registry id go on a no-args drain."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=_LegacyFormat("x"), l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        legacy_rid = "ck:reg:legacy:" + rid.rsplit(":", 1)[1]
+        backend.store["pre-upgrade-key"] = b"x"  # written and tracked by pre-fix code
+        backend.sets[legacy_rid] = {"pre-upgrade-key"}
+
+        f.invalidate_cache()
+        assert backend.store == {}
+        assert [r for r, _ in backend.drain_calls] == [rid, legacy_rid]
+
+    def test_legacy_drain_failure_still_applies_primary_drain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A failed legacy drain must not discard what the primary drain deleted: another
+        wrapper's shared-L1 copy of a drained key is still evicted, and the old set is kept."""
+
+        class LegacyFails(TrackingBackend):
+            def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+                if registry_id.startswith("ck:reg:legacy:"):
+                    raise BackendError("legacy drain failed")
+                return super().drain_tracked(registry_id, local_keys)
+
+        backend = LegacyFails()
+        calls: list[int] = []
+
+        def f(x: int) -> int:
+            calls.append(x)
+            return x
+
+        ns = _LegacyFormat("legacy_fail")
+        writer = cache(backend=backend, ttl=60, namespace=ns)(f)
+        writer(1)  # this wrapper's L1 now holds the entry
+        (rid,) = _registry_ids(backend)
+        legacy_rid = "ck:reg:legacy:" + rid.rsplit(":", 1)[1]
+        backend.sets[legacy_rid] = {"pre-upgrade-key"}
+
+        fresh = cache(backend=backend, ttl=60, namespace=ns)(f)  # knows no keys itself
+        with caplog.at_level(logging.WARNING):
+            fresh.invalidate_cache()
+
+        assert "Legacy key registry drain failed" in caplog.text
+        assert "invalidating local keys only" not in caplog.text
+        assert legacy_rid in backend.sets  # retried by the next drain
+        writer(1)
+        assert calls == [1, 1]  # the shared L1 copy was evicted, so it recomputed
+
+    @pytest.mark.parametrize(
+        ("namespace", "interop", "legacy"),
+        [
+            ("users", None, None),
+            (_StrEnumNS.USERS, None, None),
+            (None, None, None),
+            # f"{member}" is "_NS.USERS" only from 3.11; on 3.10 the set name never moved.
+            (_NS.USERS, None, "_NS.USERS" if sys.version_info >= (3, 11) else None),
+            # 0.20.0 shipped the registry with interop's exact-str rebind: no pre-fix set exists.
+            (_NS.USERS, "get_user", None),
+        ],
+    )
+    def test_no_args_drain_ids(self, namespace: Optional[str], interop: Optional[str], legacy: Optional[str]) -> None:
+        """Only a namespace whose set name actually moved gets a second drain."""
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace=namespace, interop=interop, l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        (rid,) = _registry_ids(backend)
+        assert rid.startswith(f"ck:reg:{'users' if namespace is not None else ''}:")
+        f.invalidate_cache()
+        expected = [rid] if legacy is None else [rid, f"ck:reg:{legacy}:{rid.rsplit(':', 1)[1]}"]
+        assert [r for r, _ in backend.drain_calls] == expected
