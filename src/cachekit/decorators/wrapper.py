@@ -1651,6 +1651,13 @@ def create_cache_wrapper(
             # recorded there). Never swallow this into an uncached recompute.
             reset_current_function_stats(token)
             raise
+        except KeyringConfigurationError:
+            # LOCAL keyring config fault re-raised by get_cached_value* — same
+            # contract as the L1 guard above. The generic clause below would log it
+            # as a cache error, count it on the breaker, and recompute uncached on
+            # every call (LAB-4841).
+            reset_current_function_stats(token)
+            raise
         except Exception as e:
             # Cache GET failed - execute function without caching
             get_duration_ms = (time.time() - start_time) * 1000
@@ -2009,6 +2016,9 @@ def create_cache_wrapper(
                 # reach the caller: the generic clause below would demote it to a
                 # fail-open "record and recompute".
                 raise
+            except KeyringConfigurationError:
+                # LOCAL keyring config fault — see the sync L2 read.
+                raise
             except Exception as e:
                 # Backend/network error - record but continue to function execution
                 get_duration_ms = (time.perf_counter() - start_time) * 1000
@@ -2058,6 +2068,10 @@ def create_cache_wrapper(
                                 # (cachekit-py#170) — must not be demoted to a recompute
                                 # by the generic clause below.
                                 raise
+                            except KeyringConfigurationError:
+                                # LOCAL keyring config fault — see the sync L2 read. The
+                                # lock clause below carries it out of either lock shape.
+                                raise
                             except Exception as e:
                                 # If double-check fails, continue to execute function
                                 _logger.debug(
@@ -2087,6 +2101,9 @@ def create_cache_wrapper(
                                 # Fail-closed tamper raise from get_cached_value_async
                                 # (cachekit-py#170) — must not be demoted to a recompute
                                 # by the generic clause below.
+                                raise
+                            except KeyringConfigurationError:
+                                # LOCAL keyring config fault — see the sync L2 read.
                                 raise
                             except Exception:
                                 # Cache check failed - fall through to execute function

@@ -549,9 +549,11 @@ them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` w
 settings load, so this surfaces only when keys bypass that check: passed to
 `EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
 environment's previous keys. Outside config-drift reads (below), the fault never
-evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users and callers of the
-`CacheOperationHandler` read methods receive it in both fail modes; behind the `@cache`
-decorators an L2 read logs it as a cache error and runs the call uncached. Two cases take
+evicts and is not counted on `cachekit_decrypt_failures_total`. Direct `EncryptionWrapper` users,
+callers of the `CacheOperationHandler` read methods and callers of `@cache`-decorated
+functions receive it in both fail modes. Behind the decorators every read raises it, L1 or
+L2, including the re-read after a distributed-lock wait, so the function does not run and no
+circuit-breaker failure is counted. Two cases take
 other paths: a missing or short *current* master key raises `EncryptionError`, and an
 encryption-disabled handler reading an entry that claims encryption treats the fault as
 corruption (miss + evict), because only the unauthenticated header sent it down the
