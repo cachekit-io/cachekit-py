@@ -19,6 +19,7 @@ import pytest
 from pydantic import Field, ValidationError, ValidationInfo, field_validator
 from pydantic_core import PydanticCustomError
 
+import cachekit
 from cachekit.backends.base_config import BaseBackendConfig
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
@@ -440,7 +441,7 @@ class TestRedactingSettings:
 
 
 _KEY_HEX = "ab" * 32
-_CACHEKIT_SRC = pathlib.Path(sys.modules["cachekit"].__file__ or "").resolve().parent
+_CACHEKIT_SRC = pathlib.Path(cachekit.__file__).resolve().parent
 
 
 def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
