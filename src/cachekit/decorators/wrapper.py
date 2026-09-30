@@ -2356,7 +2356,13 @@ def create_cache_wrapper(
                 mine = {entry for entry in snap if entry[0] == scope}
                 deleted = _backend.drain_tracked(_registry_id, {key for _, key in mine})  # type: ignore[union-attr]
                 if _legacy_registry_id is not None:
-                    deleted |= _backend.drain_tracked(_legacy_registry_id, ())  # type: ignore[union-attr]
+                    # Its own try: the primary drain already deleted keys that other wrappers
+                    # may hold in the shared L1, so its result must still be applied below.
+                    # A failed legacy drain leaves its members in the old set for the next one.
+                    try:
+                        deleted |= _backend.drain_tracked(_legacy_registry_id, ())  # type: ignore[union-attr]
+                    except Exception as e:
+                        _logger.warning("Legacy key registry drain failed: %s", redact_error_for_log(e))
                 # Trim BEFORE evicting: _put_l1 puts then records, so a concurrent write can
                 # never leave an L1 entry whose key is no longer in _cached_keys.
                 trim = mine - watch

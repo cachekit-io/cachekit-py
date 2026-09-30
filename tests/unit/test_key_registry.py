@@ -905,6 +905,40 @@ class TestNamespaceExactStr:
         assert backend.store == {}
         assert [r for r, _ in backend.drain_calls] == [rid, legacy_rid]
 
+    def test_legacy_drain_failure_still_applies_primary_drain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A failed legacy drain must not discard what the primary drain deleted: another
+        wrapper's shared-L1 copy of a drained key is still evicted, and the old set is kept."""
+
+        class LegacyFails(TrackingBackend):
+            def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+                if registry_id.startswith("ck:reg:legacy:"):
+                    raise BackendError("legacy drain failed")
+                return super().drain_tracked(registry_id, local_keys)
+
+        backend = LegacyFails()
+        calls: list[int] = []
+
+        def f(x: int) -> int:
+            calls.append(x)
+            return x
+
+        ns = _LegacyFormat("legacy_fail")
+        writer = cache(backend=backend, ttl=60, namespace=ns)(f)
+        writer(1)  # this wrapper's L1 now holds the entry
+        (rid,) = _registry_ids(backend)
+        legacy_rid = "ck:reg:legacy:" + rid.rsplit(":", 1)[1]
+        backend.sets[legacy_rid] = {"pre-upgrade-key"}
+
+        fresh = cache(backend=backend, ttl=60, namespace=ns)(f)  # knows no keys itself
+        with caplog.at_level(logging.WARNING):
+            fresh.invalidate_cache()
+
+        assert "Legacy key registry drain failed" in caplog.text
+        assert "invalidating local keys only" not in caplog.text
+        assert legacy_rid in backend.sets  # retried by the next drain
+        writer(1)
+        assert calls == [1, 1]  # the shared L1 copy was evicted, so it recomputed
+
     @pytest.mark.parametrize(
         ("namespace", "interop", "legacy"),
         [
