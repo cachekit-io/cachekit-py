@@ -105,7 +105,7 @@ def expensive_computation(x: int) -> dict:
 > - **L1+L2 caching**: L1 hits ~50ns (local memory), L1 miss → L2 Redis (~2-7ms)
 > - **Circuit breaker**: Redis down? Cache gracefully, don't cascade failures
 > - **Distributed locking**: Prevents cache stampedes across pods
-> - **Encryption**: Client-side AES-256-GCM, Redis never sees plaintext values
+> - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus counters for hits/misses/errors
 
 ```python
@@ -265,7 +265,7 @@ def get_user(id):
 
 **Why cachekit wins**:
 - **CachekitIOBackend**: Drop-in L2 backend backed by `api.cachekit.io` — no Redis cluster to provision, patch, or scale
-- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never your plaintext data
+- **Zero-knowledge compatible**: Pair with `@cache.secure` and the managed backend stores only ciphertext values, never plaintext values; the cache key stays cleartext ([details](features/zero-knowledge-encryption.md#cleartext-cache-key-accepted-exposure))
 - **Same decorator API**: Swap backend by setting `CACHEKIT_API_KEY` — zero code changes
 
 ```python notest
