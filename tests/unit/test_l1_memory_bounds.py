@@ -439,6 +439,38 @@ class TestCleanupThreadAfterFork:
             for holder in holders:
                 holder.join(5)
 
+    def test_at_fork_hook_reraises_only_after_repairing_every_cache(self, monkeypatch):
+        import weakref
+
+        from cachekit import l1_cache
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet([manager]))  # leave the global manager alone
+        caches = [manager.get_cache("raising-ns"), manager.get_cache("later-ns")]
+        orphaned = []
+        for cache in caches:
+            cache.put("pre-fork", b"v")
+            cache._lock.acquire()  # _is_owned(): the hook resets it, as for a hold orphaned at fork
+            orphaned.append(cache._lock)
+
+        class RaiseOnDropWarning(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                if record.args and record.args[0] == "raising-ns":
+                    raise RuntimeError("filter failed")
+                return True
+
+        raising = RaiseOnDropWarning()
+        l1_cache.logger.addFilter(raising)
+        try:
+            with pytest.raises(RuntimeError, match="filter failed"):  # reported, not swallowed
+                l1_cache._reset_cache_locks_after_fork()
+        finally:
+            l1_cache.logger.removeFilter(raising)
+
+        assert [cache._lock is lock for cache, lock in zip(caches, orphaned, strict=True)] == [False, False]
+        assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
+        assert manager._locks_reset_pid == os.getpid()
+
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("stopped-ns")
