@@ -1,7 +1,7 @@
 """RedactingSettings: config validation errors never lead back to a raw input (CWE-532).
 
 CachekitConfig and every backend config inherit RedactingSettings, so these run against the concrete
-classes users construct, through every entry point: the constructor, from_env(), the
+classes users construct, through each entry point: the constructor, from_env(), the
 model_validate* classmethods, a pydantic.TypeAdapter and a field of the caller's own model.
 """
 
@@ -122,6 +122,10 @@ class _UnrebuildableCtxConfig(BaseBackendConfig):
         raise PydanticCustomError("bad_url", "bad URL", {1: "one"})  # type: ignore[dict-item]
 
 
+class _SelfReferentialConfig(RedisBackendConfig):
+    child: _SelfReferentialConfig | None = None
+
+
 @pytest.mark.unit
 class TestRedactingSettings:
     """Every surface of a config validation error, for every config class and entry point."""
@@ -216,7 +220,7 @@ class TestRedactingSettings:
         ],
         ids=["non-mapping", "list", "json-string", "json-array", "strings"],
     )
-    def test_type_adapter_redacts_every_input(
+    def test_type_adapter_redacts_the_input(
         self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
     ) -> None:
         """A TypeAdapter validates through the core schema and never calls the model_validate* classmethods."""
@@ -236,7 +240,7 @@ class TestRedactingSettings:
         ],
         ids=["constructor", "model_validate", "json", "strings"],
     )
-    def test_config_as_a_field_redacts_every_input(
+    def test_config_as_a_field_redacts_the_input(
         self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: dict[str, object] | str
     ) -> None:
         """The caller's own model validates the config field through the config's core schema."""
@@ -249,6 +253,37 @@ class TestRedactingSettings:
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
         assert all(err["loc"][0] == "cfg" for err in exc_info.value.errors())
+
+    @pytest.mark.parametrize("uses", [1, 2], ids=["first-model", "after-another-model"])
+    def test_a_model_with_config_fields_keeps_one_schema_definition(self, uses: int) -> None:
+        """The redacting wrapper carries the config's ref, so the config stays one $defs entry. A model built
+        after another reuses the config's cached schema, which must still carry that ref."""
+        for _ in range(uses):
+            outer: type[BaseModel] = create_model("Outer", a=(RedisBackendConfig, ...), b=(RedisBackendConfig, ...))
+
+        schema = outer.model_json_schema()
+
+        assert list(schema["$defs"]) == ["RedisBackendConfig"]
+        assert schema["properties"]["a"] == {"$ref": "#/$defs/RedisBackendConfig"}
+        assert str(outer.__pydantic_core_schema__).count("'function-wrap'") == 1
+
+    def test_a_self_referential_config_builds_its_schema(self) -> None:
+        assert list(_SelfReferentialConfig.model_json_schema()["$defs"]) == ["_SelfReferentialConfig"]
+        with pytest.raises(ValidationError) as exc_info:
+            _SelfReferentialConfig(child={"child": "SECRET_VALUE"})  # type: ignore[arg-type]
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    def test_a_union_member_loc_names_the_config_class(self) -> None:
+        """A union member's loc names its validator; a per-process repr would split error grouping."""
+        outer: type[BaseModel] = create_model("Outer", cfg=(RedisBackendConfig | CachekitConfig, ...))
+        with pytest.raises(ValidationError) as exc_info:
+            outer(cfg="SECRET_VALUE")
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+        assert [err["loc"][:2] for err in exc_info.value.errors()] == [
+            ("cfg", "function-wrap[RedisBackendConfig()]"),
+            ("cfg", "function-wrap[CachekitConfig()]"),
+        ]
 
     @pytest.mark.parametrize(
         "build",
@@ -525,6 +560,20 @@ def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
     return found
 
 
+def _locals_holding(exc: BaseException, secret: str) -> list[str]:
+    """Like ``_cachekit_locals_holding``, over every frame but this test file's, pydantic's included."""
+    found = []
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        if pathlib.Path(code.co_filename).resolve() != pathlib.Path(__file__).resolve():
+            for name, value in tb.tb_frame.f_locals.items():
+                if secret in repr(value):
+                    found.append(f"{code.co_name}:{name}")
+        tb = tb.tb_next
+    return found
+
+
 @pytest.mark.unit
 class TestRedactingSettingsFrameLocals:
     """No cachekit frame on a raised config error's traceback keeps the raw input (CWE-532)."""
@@ -574,3 +623,21 @@ class TestRedactingSettingsFrameLocals:
             build()
 
         assert _cachekit_locals_holding(exc_info.value, _KEY_HEX) == []
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: CachekitConfig.model_validate({"master_key": "ab" * 32, "max_value_size": -1}),
+            lambda: CachekitConfig.model_validate_json(json.dumps({"master_key": "ab" * 32, "max_value_size": -1})),
+            lambda: CachekitConfig.model_validate_strings({"master_key": "ab" * 32, "max_value_size": "-1"}),
+        ],
+        ids=["model_validate", "model_validate_json", "model_validate_strings"],
+    )
+    def test_classmethods_leave_no_frame_local_outside_the_caller(self, build: Callable[[], object]) -> None:
+        """The core schema redacts too, but pydantic's own classmethod frame holds the raw input: the
+        classmethod overrides keep that frame off the traceback. The input is an inline temporary, so only
+        a frame below the caller's could hold it."""
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        assert _locals_holding(exc_info.value, _KEY_HEX) == []

@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, get_args
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
 
 from pydantic import GetCoreSchemaHandler, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
@@ -47,6 +47,9 @@ class ConfigurationError(Exception):
     pass
 
 
+_REDACTING_SCHEMA = "cachekit_redacting"
+
+
 # Defined before RedactingSettings: pydantic builds the class's core schema, which binds this, as the
 # class statement runs.
 def _redacting_wrap(value: Any, handler: core_schema.ValidatorFunctionWrapHandler, title: str) -> Any:
@@ -63,7 +66,8 @@ class RedactingSettings(BaseSettings):
     snapshot the raw input, which for a settings model is cleartext credentials (a master key, an
     API key, a password in a URL) and is exactly what error trackers serialize. A model-level error
     (``loc == ()``) snapshots the whole input dict. A failure in the constructor (``from_env()``
-    included) or a ``model_validate*`` classmethod is re-raised as a copy with every input redacted
+    included) or a ``model_validate*`` classmethod, or in the config's own validator when a
+    ``TypeAdapter`` or a field of another model validates it, is re-raised as a copy with every input redacted
     and each error's type and loc kept, and its msg and ctx too, except where a ctx exception's msg
     came from its dropped traceback or chain, or a custom error's msg would change when formatted
     again with its own ctx (that ctx is dropped). An error that cannot be rebuilt at all comes back
@@ -82,19 +86,28 @@ class RedactingSettings(BaseSettings):
         finally:
             del kwargs
 
-    # A TypeAdapter, or a model with a config field, validates through this class's core schema and
-    # calls neither __init__ nor a classmethod below, so the schema redacts too. It adds to __init__, not
-    # replaces it: redacting only here leaves pydantic's own __init__ frames, which hold the raw kwargs,
-    # on the traceback. The error raised in here is titled after pydantic's handler, so pass the class's.
+    # A TypeAdapter, or a model with a config field, validates non-mapping, JSON-document and
+    # strings-mode input through this class's core schema without reaching __init__ or a classmethod
+    # below, so the schema redacts too. It adds to __init__, not replaces it: redacting only here leaves
+    # pydantic's own __init__ frames, which hold the raw kwargs, on the traceback. The ref moves to the
+    # wrapper so a model with a config field still gets one $defs entry, not an inlined copy per use.
+    # The wrapper's __name__ is the class's, so a union member's loc names it, not a partial's repr.
     @classmethod
     def __get_pydantic_core_schema__(cls, source: type[Any], handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
-        return core_schema.no_info_wrap_validator_function(
-            functools.partial(_redacting_wrap, title=source.__name__), handler(source)
-        )
+        schema = handler(source)
+        # Once built, the class's schema comes back as a reference to it, or as the wrapper itself; it
+        # already redacts. Wrap only a fresh schema, and copy it: popping the ref off a cached schema
+        # would strip it from every model built later.
+        if schema["type"] == "definition-ref" or schema.get("metadata", {}).get(_REDACTING_SCHEMA):
+            return schema
+        schema = schema.copy()
+        ref = cast("str | None", schema.pop("ref", None))
+        wrap = functools.partial(_redacting_wrap, title=source.__name__)
+        wrap.__name__ = source.__name__  # pyright: ignore[reportAttributeAccessIssue]
+        return core_schema.no_info_wrap_validator_function(wrap, schema, ref=ref, metadata={_REDACTING_SCHEMA: True})
 
-    # pydantic calls the overridden __init__ only for mapping input. Malformed JSON, a non-object
-    # document, non-mapping input and the strings mode fail in the core validator first, so the
-    # model_validate* classmethods redact on their own.
+    # Still needed beside the schema: malformed JSON fails before any validator runs, and pydantic's
+    # own classmethod frames hold the raw input (`obj`, `json_data`) on the traceback.
     @classmethod
     def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
         try:
@@ -123,8 +136,8 @@ def _redacting(validate: Callable[[], _T], title: str | None = None) -> _T:
     A ValidationError becomes its redacted copy. A SettingsError (an env value that fails to decode
     chains the decoder's error, which holds the raw value) or a UnicodeError (an env file that is
     not valid UTF-8 carries the file's bytes) becomes a SettingsError with only its message, which
-    names what failed without quoting it. ``title`` overrides the ValidationError's title in the warning
-    and the withheld error. Not a context manager: raising from ``__exit__`` would
+    names what failed without quoting it. ``title`` overrides the ValidationError's title in the warning,
+    and in the withheld error outside a schema (inside one, pydantic-core keeps the outer title). Not a context manager: raising from ``__exit__`` would
     chain the original, raw inputs and all.
     """
     try:
