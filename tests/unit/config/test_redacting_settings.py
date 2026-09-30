@@ -128,10 +128,10 @@ class _SelfReferentialConfig(RedisBackendConfig):
 
 @pytest.mark.unit
 class TestRedactingSettings:
-    """Every surface of a config validation error, for every config class and entry point."""
+    """Each surface of a config validation error, for each config class and entry point."""
 
     @pytest.mark.parametrize("config_cls", BACKEND_CONFIGS)
-    def test_validation_errors_redact_every_input(self, config_cls: type[BaseBackendConfig]) -> None:
+    def test_validation_errors_redact_the_input(self, config_cls: type[BaseBackendConfig]) -> None:
         """CWE-532: backend configs hold credentials, so no surface of a ValidationError may carry a raw input.
 
         Pinned here, not per backend: the inherited RedactingSettings.__init__ does the redacting, and a
@@ -197,7 +197,7 @@ class TestRedactingSettings:
         ],
         ids=["dict", "non-mapping", "object", "json-object", "json-malformed", "json-array", "strings"],
     )
-    def test_model_validate_methods_redact_every_input(
+    def test_model_validate_methods_redact_the_input(
         self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
     ) -> None:
         """The inherited validate classmethods build a model too. pydantic calls __init__ only for
@@ -254,18 +254,24 @@ class TestRedactingSettings:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
         assert all(err["loc"][0] == "cfg" for err in exc_info.value.errors())
 
-    @pytest.mark.parametrize("uses", [1, 2], ids=["first-model", "after-another-model"])
-    def test_a_model_with_config_fields_keeps_one_schema_definition(self, uses: int) -> None:
-        """The redacting wrapper carries the config's ref, so the config stays one $defs entry. A model built
-        after another reuses the config's cached schema, which must still carry that ref."""
-        for _ in range(uses):
-            outer: type[BaseModel] = create_model("Outer", a=(RedisBackendConfig, ...), b=(RedisBackendConfig, ...))
+    def test_a_model_with_config_fields_keeps_one_schema_definition(self) -> None:
+        """The redacting wrapper carries the config's ref, so the config stays one $defs entry."""
+        outer: type[BaseModel] = create_model("Outer", a=(RedisBackendConfig, ...), b=(RedisBackendConfig, ...))
 
         schema = outer.model_json_schema()
 
         assert list(schema["$defs"]) == ["RedisBackendConfig"]
         assert schema["properties"]["a"] == {"$ref": "#/$defs/RedisBackendConfig"}
         assert str(outer.__pydantic_core_schema__).count("'function-wrap'") == 1
+
+    def test_the_schema_hook_leaves_the_handlers_schema_intact(self) -> None:
+        """The ref moves to the wrapper off a copy: the handler's schema may be one pydantic holds elsewhere."""
+        handed: dict[str, object] = {"type": "any", "ref": "stub-ref"}
+
+        wrapped = RedisBackendConfig.__get_pydantic_core_schema__(RedisBackendConfig, lambda _: handed)  # type: ignore[arg-type]
+
+        assert handed == {"type": "any", "ref": "stub-ref"}
+        assert (wrapped["type"], wrapped.get("ref"), wrapped["schema"].get("ref")) == ("function-wrap", "stub-ref", None)  # type: ignore[typeddict-item]
 
     def test_a_self_referential_config_builds_its_schema(self) -> None:
         assert list(_SelfReferentialConfig.model_json_schema()["$defs"]) == ["_SelfReferentialConfig"]
@@ -542,31 +548,20 @@ class TestRedactingSettings:
 _CACHEKIT_SRC = pathlib.Path(cachekit.__file__).resolve().parent
 
 
-def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
-    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``.
+def _cachekit_locals_holding(exc: BaseException, secret: str, *, below_caller: bool = False) -> list[str]:
+    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``, or with
+    ``below_caller`` every frame but this test file's, pydantic's included.
 
     Error trackers capture frame locals by default (Sentry's ``include_local_variables``), and their
     scrubbers match top-level key names, so a raw key held in any local is a key sent off-host.
     """
+    this_file = pathlib.Path(__file__).resolve()
     found = []
     tb = exc.__traceback__
     while tb is not None:
         code = tb.tb_frame.f_code
-        if pathlib.Path(code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
-            for name, value in tb.tb_frame.f_locals.items():
-                if secret in repr(value):
-                    found.append(f"{code.co_name}:{name}")
-        tb = tb.tb_next
-    return found
-
-
-def _locals_holding(exc: BaseException, secret: str) -> list[str]:
-    """Like ``_cachekit_locals_holding``, over every frame but this test file's, pydantic's included."""
-    found = []
-    tb = exc.__traceback__
-    while tb is not None:
-        code = tb.tb_frame.f_code
-        if pathlib.Path(code.co_filename).resolve() != pathlib.Path(__file__).resolve():
+        path = pathlib.Path(code.co_filename).resolve()
+        if path != this_file if below_caller else path.is_relative_to(_CACHEKIT_SRC):
             for name, value in tb.tb_frame.f_locals.items():
                 if secret in repr(value):
                     found.append(f"{code.co_name}:{name}")
@@ -640,4 +635,4 @@ class TestRedactingSettingsFrameLocals:
         with pytest.raises(ValidationError) as exc_info:
             build()
 
-        assert _locals_holding(exc_info.value, _KEY_HEX) == []
+        assert _cachekit_locals_holding(exc_info.value, _KEY_HEX, below_caller=True) == []
