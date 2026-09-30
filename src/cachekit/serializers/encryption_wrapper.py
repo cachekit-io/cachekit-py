@@ -413,7 +413,8 @@ class EncryptionWrapper:
                 unauthenticated bytes), the tenant mismatches, or AES-GCM
                 authentication fails
             SerializationError: Corrupt plaintext header (non-string or non-encodable
-                original_type) — corruption-class (evict + recompute), not tamper
+                original_type, or non-encodable compressed) — corruption-class
+                (evict + recompute), not tamper
             EncryptionError: If deserialization fails after authenticated decryption
 
         Examples:
@@ -531,8 +532,8 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # AAD build sits OUTSIDE the tag-verification try: an original_type that cannot be built
-        # into the AAD is corruption, not tamper (see _create_aad).
+        # AAD build sits OUTSIDE the tag-verification try: an original_type or compressed that
+        # cannot be built into the AAD is corruption, not tamper (see _create_aad).
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -600,7 +601,8 @@ class EncryptionWrapper:
             TypeError: If cache_key is not a string
             ValueError: If cache_key is empty
             SerializationError: Corrupt plaintext header (non-string or
-                non-encodable original_type) — corruption-class, not tamper
+                non-encodable original_type, or non-encodable compressed) —
+                corruption-class, not tamper
             DecryptionAuthenticationError: When no keyring entry authenticates
                 the ciphertext
             EncryptionError: If deserialization fails after authenticated
@@ -637,8 +639,8 @@ class EncryptionWrapper:
             original_type=metadata.original_type,
         )
 
-        # AAD build sits OUTSIDE the tag-verification try: an original_type that cannot be built
-        # into the AAD is corruption, not tamper (see _create_aad).
+        # AAD build sits OUTSIDE the tag-verification try: an original_type or compressed that
+        # cannot be built into the AAD is corruption, not tamper (see _create_aad).
         aad = self._create_aad(raw_metadata, cache_key)
 
         try:
@@ -723,8 +725,13 @@ class EncryptionWrapper:
             self.tenant_id.encode("utf-8"),
             cache_key.encode("utf-8"),  # SECURITY: prevents ciphertext substitution attacks
             metadata.format.value.encode("utf-8"),
-            str(metadata.compressed).encode("utf-8"),
         ]
+        # `compressed` arrives untyped from the header too: str() never raises, but a lone
+        # surrogate cannot be UTF-8 encoded — corruption-class, like original_type below.
+        try:
+            components.append(str(metadata.compressed).encode("utf-8"))
+        except UnicodeEncodeError as e:
+            raise SerializationError("Corrupt frame header: compressed is not UTF-8 encodable") from e
 
         # `original_type` arrives untyped from the plaintext CK header (json.loads →
         # SerializationMetadata.from_dict passes it straight through). The AAD built from the

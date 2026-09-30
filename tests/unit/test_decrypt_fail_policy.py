@@ -77,6 +77,16 @@ class TestExceptionTaxonomy:
             wrapper.deserialize(enc, meta, cache_key="key:a")
         assert not isinstance(exc_info.value, DecryptionAuthenticationError)
 
+    def test_non_encodable_compressed_is_corruption_not_tamper(self):
+        """A lone-surrogate ``compressed`` cannot be built into the AAD either,
+        so no tag check runs — it is corruption, not tamper."""
+        wrapper = EncryptionWrapper(master_key=_KEY_BYTES, tenant_id="t1")
+        enc, meta = wrapper.serialize({"v": 1}, cache_key="key:a")
+        meta.compressed = "\ud800"
+        with pytest.raises(SerializationError, match="compressed") as exc_info:
+            wrapper.deserialize(enc, meta, cache_key="key:a")
+        assert not isinstance(exc_info.value, DecryptionAuthenticationError)
+
     def test_post_decrypt_deserialize_failure_is_not_auth_error(self):
         """A failure AFTER successful authentication is corruption-class, not tamper."""
 
@@ -364,6 +374,30 @@ class TestGetCachedValueFailPolicy:
         strategy.store["key:d"] = b"CK\x03" + len(header).to_bytes(4, "big") + header + bytes(payload)
         assert handler.get_cached_value("key:d") is None  # miss, not raise
         assert strategy.deleted == ["key:d"]  # self-heals
+
+    def test_fail_closed_non_encodable_compressed_header_is_corruption(self, monkeypatch):
+        """A lone-surrogate ``compressed`` in the stored plaintext header cannot be
+        built into the AAD: corruption-class, evicted and counted even under
+        fail_closed=True — not swallowed as a silent miss that never evicts."""
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        class _Collector:
+            def record_counter(self, name, labels=None, value=1.0):
+                recorded.append((name, labels or {}))
+
+        import cachekit.reliability.async_metrics as am
+
+        monkeypatch.setattr(am, "get_async_metrics_collector", lambda **kw: _Collector())
+        handler, strategy, serialization = _make_operation_handler(fail_closed=True)
+        entry = serialization.serialize_data({"v": 1}, cache_key="key:e")
+        payload, metadata_dict, serializer_name = SerializationWrapper.unwrap(entry)
+        metadata_dict["compressed"] = "\ud800"
+        # Plant the frame bytes directly: `wrap` refuses a lone surrogate, `json.loads` accepts it.
+        header = json.dumps({"s": serializer_name, "m": metadata_dict, "v": "2.0"}).encode()
+        strategy.store["key:e"] = b"CK\x03" + len(header).to_bytes(4, "big") + header + bytes(payload)
+        assert handler.get_cached_value("key:e") is None  # miss, not raise
+        assert strategy.deleted == ["key:e"]  # self-heals
+        assert recorded == [("cachekit_decrypt_failures_total", {"reason": "corruption", "tier": "l2"})]
 
     def test_fail_open_valid_entry_roundtrips(self):
         """Regression: the happy path is untouched by the policy plumbing."""

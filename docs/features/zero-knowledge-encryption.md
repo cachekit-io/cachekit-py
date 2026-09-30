@@ -502,7 +502,8 @@ them (cachekit-py#170):
   WARNING log is another writer still storing it (see *Deserialization failed* in [error-codes.md](../error-codes.md)).
 - **`corruption`** — everything else: checksum mismatch, truncated/malformed frame,
   serializer mismatch, a deserialize failure on *already-authenticated* plaintext, or a
-  non-string or non-UTF-8-encodable `original_type` in the frame header. Such a value
+  non-string or non-UTF-8-encodable `original_type`, or a non-UTF-8-encodable `compressed`,
+  in the frame header. Such a value
   cannot be built into the AAD at all, so no tag check runs — the read is
   corruption-class, and the entry is evicted and recomputed even in fail-closed mode.
   Storage rot and bugs, not evidence of tampering.
