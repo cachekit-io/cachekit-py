@@ -1,21 +1,14 @@
-"""Tests for CacheSerializationHandler encryption auto-detection.
+"""Tests for CacheSerializationHandler's encryption tri-state and the no-intent construction error.
 
-When CACHEKIT_MASTER_KEY is set and encryption is not explicitly configured
-(encryption=None), the handler still auto-enables encryption with single_tenant_mode=True —
-DEPRECATED (protocol intent-presets.md § Encryption Activation): this release warns once per
-process, the next minor release raises at construction instead.
-
-Encryption is tri-state (issue #128): None=unset, True=force-on, False=hard opt-out. An
-explicit False must survive a present CACHEKIT_MASTER_KEY.
+Encryption is tri-state (issue #128): None=unset, True=force-on, False=hard opt-out. A master key
+is a key source, never an activation switch (protocol intent-presets.md § Encryption Activation):
+encryption=None with a key present, from CACHEKIT_MASTER_KEY or master_key=, raises
+ConfigurationError at construction; with no key it stays plaintext. An explicit False must survive
+a present key and still decrypt stale ciphertext on read.
 """
 
 from __future__ import annotations
 
-import logging
-import multiprocessing
-import os
-import threading
-from multiprocessing.queues import Queue
 from typing import Any
 
 import pytest
@@ -39,28 +32,69 @@ def _envelope_is_encrypted(handler: CacheSerializationHandler, data: object, cac
     return SerializationMetadata.from_dict(metadata_dict).encrypted
 
 
+def _extractor(*_args: Any, **_kwargs: Any) -> str:
+    return "tenant-1"
+
+
+def _assert_names_explicit_spellings(error: pytest.ExceptionInfo[ConfigurationError], key_source: str) -> None:
+    """The error must name the key's source and every spelling that constructs, so the fix is copy-pasteable."""
+    message = str(error.value)
+    assert f"A master key is present ({key_source})" in message
+    assert "@cache.secure(...)" in message
+    assert "encryption=True with single_tenant_mode=True" in message
+    assert "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)" in message
+    assert "encryption=False" in message
+
+
 @pytest.mark.unit
-class TestEncryptionAutoDetect:
-    """CacheSerializationHandler auto-detects CACHEKIT_MASTER_KEY."""
+class TestNoIntentWithKeyRaises:
+    """encryption=None + a master key from either source -> ConfigurationError at construction."""
 
     @pytest.fixture(autouse=True)
     def _reset(self):
         yield
         reset_settings()
 
-    def test_auto_detect_enables_encryption(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Handler enables encryption when CACHEKIT_MASTER_KEY is set."""
+    def test_env_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         reset_settings()
 
-        handler = CacheSerializationHandler(serializer_name="default")
+        with pytest.raises(ConfigurationError) as error:
+            CacheSerializationHandler(serializer_name="default")
 
-        assert handler.encryption is True
-        assert handler.master_key == _FAKE_KEY
-        assert handler.single_tenant_mode is True
+        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
 
-    def test_auto_detect_no_op_without_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Handler stays plaintext when CACHEKIT_MASTER_KEY is not set."""
+    def test_passed_master_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A passed key is a key source exactly like the env var: no exemption for it."""
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            CacheSerializationHandler(serializer_name="default", master_key=_FAKE_KEY)
+
+        _assert_names_explicit_spellings(error, "master_key=")
+
+    def test_tenant_extractor_with_env_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A tenant_extractor states no encryption intent: with the key set it must raise, not store plaintext."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            CacheSerializationHandler(serializer_name="default", tenant_extractor=_extractor)
+
+        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
+
+    def test_tenant_extractor_without_key_stays_plaintext(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        handler = CacheSerializationHandler(serializer_name="default", tenant_extractor=_extractor)
+
+        assert handler.encryption is False
+        assert _envelope_is_encrypted(handler, {"x": 1}, "ck:extractor-no-key") is False
+
+    def test_no_key_stays_plaintext(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Zero-config: no key from either source and no intent -> plaintext, no error."""
         monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
         reset_settings()
 
@@ -68,9 +102,9 @@ class TestEncryptionAutoDetect:
 
         assert handler.encryption is False
         assert handler.master_key is None
+        assert _envelope_is_encrypted(handler, {"x": 1}, "ck:no-key") is False
 
-    def test_auto_detect_no_op_when_explicitly_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Explicit encryption=True is not overwritten by env var."""
+    def test_explicit_true_uses_passed_key_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         env_key = "ab" * 32  # pragma: allowlist secret
         explicit_key = "cc" * 32  # pragma: allowlist secret
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", env_key)
@@ -85,43 +119,23 @@ class TestEncryptionAutoDetect:
 
         assert handler.master_key == explicit_key
 
-    def test_auto_detect_no_op_when_tenant_extractor_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If tenant_extractor is passed, auto-detect is skipped (user expressing intent)."""
+    def test_explicit_false_with_tenant_extractor_and_env_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         reset_settings()
 
-        def extractor(*a, **kw):
-            return "tenant-1"
+        handler = CacheSerializationHandler(serializer_name="default", encryption=False, tenant_extractor=_extractor)
 
-        handler = CacheSerializationHandler(
-            serializer_name="default",
-            encryption=False,
-            tenant_extractor=extractor,
-        )
-
-        # Explicit encryption=False is a hard opt-out — auto-detect never runs
         assert handler.encryption is False
 
 
 @pytest.mark.unit
 class TestEncryptionTriState:
-    """Tri-state encryption: None=auto, True=force-on, False=explicit opt-out (issue #128)."""
+    """Tri-state encryption: None=unset, True=force-on, False=explicit opt-out (issue #128)."""
 
     @pytest.fixture(autouse=True)
     def _reset(self):
         yield
         reset_settings()
-
-    def test_default_param_is_none_auto_detects(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """encryption defaults to None (unset) and auto-detects from the env key."""
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
-        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DEPLOYMENT_UUID)
-        reset_settings()
-
-        handler = CacheSerializationHandler(serializer_name="default")
-
-        assert handler.encryption is True
-        assert _envelope_is_encrypted(handler, {"x": 1}, "ck:auto") is True
 
     def test_explicit_false_opts_out_despite_master_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """REGRESSION (issue #128): encryption=False must NOT auto-encrypt when a key is set.
@@ -156,32 +170,83 @@ class TestEncryptionTriState:
         assert handler.encryption is True
         assert _envelope_is_encrypted(handler, {"x": 1}, "ck:forced") is True
 
-    def test_decorator_explicit_false_yields_plaintext_bare_encrypts(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """End-to-end via @cache: bare encrypts, encryption=False opts out, encryption=True forces on."""
+    def test_explicit_false_still_decrypts_stale_ciphertext(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Legacy-decrypt: an entry written under encryption=True reads back under encryption=False.
+
+        The reader holds no key of its own; EncryptionWrapper resolves CACHEKIT_MASTER_KEY itself on
+        the config-drift read path, which counts every such read.
+        """
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DEPLOYMENT_UUID)
+        reset_settings()
+        counters: list[tuple[str, dict[str, str]]] = []
+        monkeypatch.setattr(cache_handler_mod, "_record_security_counter", lambda name, labels: counters.append((name, labels)))
+
+        writer = CacheSerializationHandler(serializer_name="default", encryption=True, single_tenant_mode=True)
+        stale = writer.serialize_data({"x": 1}, cache_key="ck:drift")
+        reader = CacheSerializationHandler(serializer_name="default", encryption=False)
+
+        assert _envelope_is_encrypted(writer, {"x": 1}, "ck:drift") is True
+        assert _envelope_is_encrypted(reader, {"x": 1}, "ck:drift") is False
+        assert reader.deserialize_data(stale, cache_key="ck:drift") == {"x": 1}
+        assert counters == [("cachekit_config_drift_reads_total", {"reason": "encryption_disabled"})]
+
+    @pytest.mark.parametrize("preset", ["minimal", "production", "io", "dev", "test"])
+    def test_preset_without_intent_raises_at_decoration(self, monkeypatch: pytest.MonkeyPatch, preset: str) -> None:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_placeholder")  # @cache.io builds its backend first
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            getattr(cache, preset)(lambda: None)
+
+        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
+
+    def test_bare_decorator_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError, match="encryption= is unset"):
+            cache(ttl=60)(lambda: None)
+
+    def test_flat_master_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            cache(ttl=60, master_key=_FAKE_KEY)(lambda: None)
+
+        _assert_names_explicit_spellings(error, "master_key=")
+
+    def test_preset_encryption_config_key_without_enabled_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EncryptionConfig(master_key=K) with enabled unset is the same no-intent case as the flat kwarg."""
+        from cachekit.config.nested import EncryptionConfig
+
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            cache.production(encryption=EncryptionConfig(master_key=_FAKE_KEY))(lambda: None)
+
+        _assert_names_explicit_spellings(error, "master_key=")
+
+    @pytest.mark.parametrize(
+        "decorate",
+        [
+            pytest.param(lambda: cache(ttl=60, encryption=False), id="bare-false"),
+            pytest.param(lambda: cache(ttl=60, encryption=True, single_tenant_mode=True), id="bare-true"),
+            pytest.param(lambda: cache.production(encryption=False), id="preset-false"),
+            pytest.param(lambda: cache.secure(), id="secure"),
+            pytest.param(lambda: cache.local(), id="local"),
+        ],
+    )
+    def test_explicit_intent_constructs_with_env_key(self, monkeypatch: pytest.MonkeyPatch, decorate: Any) -> None:
+        """Every explicit spelling the error names constructs; @cache.local never builds the handler."""
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DEPLOYMENT_UUID)
         reset_settings()
 
-        from cachekit.config.decorator import DecoratorConfig
-        from cachekit.config.nested import EncryptionConfig
-
-        # Bare @cache leaves encryption unset (None) -> auto-detect path stays available.
-        # Construction runs full validation via __post_init__; no raise == valid.
-        bare = DecoratorConfig(backend=None)
-        assert bare.encryption.enabled is None
-
-        # @cache(encryption=False) maps to an explicit opt-out that survives the env key.
-        # Explicit False never requires a master key (validates on construction).
-        opted_out = DecoratorConfig(backend=None, encryption=EncryptionConfig(enabled=False))
-        assert opted_out.encryption.enabled is False
-
-        # @cache(encryption=True) validates against the env-resolved key (force-on).
-        # No inline key needed: __post_init__ resolves CACHEKIT_MASTER_KEY from env.
-        forced = DecoratorConfig(
-            backend=None,
-            encryption=EncryptionConfig(enabled=True, single_tenant_mode=True),
-        )
-        assert forced.encryption.enabled is True
+        assert callable(decorate()(lambda: None))
 
 
 @pytest.mark.unit
@@ -235,7 +300,8 @@ class TestDecoratorEncryptionFlattening:
 
     def test_flat_key_params_fold_in_without_encryption_flag(self, captured_config: dict[str, Any]) -> None:
         """master_key / single_tenant_mode / deployment_uuid fold in even when `encryption`
-        is omitted — `enabled` stays None (auto), exercising the per-key loop branch."""
+        is omitted — `enabled` stays None (unset), exercising the per-key loop branch. The handler
+        then refuses the key (TestNoIntentWithKeyRaises); the wrapper is patched out here."""
         from cachekit.config.nested import EncryptionConfig
 
         @cache(master_key=_FAKE_KEY, single_tenant_mode=True, deployment_uuid=_DEPLOYMENT_UUID, backend=None)
@@ -262,149 +328,3 @@ class TestDecoratorEncryptionFlattening:
         assert isinstance(enc, EncryptionConfig)
         # If the guard failed, enabled would be an EncryptionConfig, not the bool False.
         assert enc.enabled is False
-
-
-@pytest.mark.unit
-class TestAutoActivationDeprecationWarning:
-    """Release-N migration gate: presence-activation warns ONCE per process via logger.warning,
-    naming the explicit spellings (`@cache.secure(...)`, `encryption=True`, `encryption=False`)
-    so the fix is copy-pasteable from the log line.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _fresh_process(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(cache_handler_mod, "_AUTO_ACTIVATION_WARNED_PIDS", {})
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
-        reset_settings()
-        yield
-        reset_settings()
-
-    @staticmethod
-    def _activation_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-        return [r for r in caplog.records if r.levelno == logging.WARNING and "auto-enabled" in r.message]
-
-    def test_warns_once_per_process_and_names_the_explicit_spellings(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            first = CacheSerializationHandler(serializer_name="default")
-            second = CacheSerializationHandler(serializer_name="default")
-
-        # Release N still activates — only the warning is new.
-        assert first.encryption is True and second.encryption is True
-        records = self._activation_records(caplog)
-        assert len(records) == 1, [r.message for r in records]
-        assert "@cache.secure(" in records[0].message
-        assert "encryption=True" in records[0].message
-        assert "encryption=False" in records[0].message
-        # Not every no-intent cache encrypts: the line must name both exceptions, not claim every cache encrypts.
-        assert "L1-only" in records[0].message
-        assert "master_key= or tenant_extractor=" in records[0].message
-        # Legacy-decrypt is CK-frame only: headerless interop entries stay ciphertext after encryption=False.
-        assert "except in an interop cache" in records[0].message
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            pytest.param({"encryption": False}, id="explicit-false"),
-            pytest.param({"encryption": True, "single_tenant_mode": True}, id="explicit-true"),
-        ],
-    )
-    def test_explicit_intent_does_not_warn(self, caplog: pytest.LogCaptureFixture, kwargs: dict[str, Any]) -> None:
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            CacheSerializationHandler(serializer_name="default", **kwargs)
-        assert self._activation_records(caplog) == []
-
-    def test_rejected_construction_does_not_spend_the_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A constructor that validation rejects must not claim the once-per-process warning."""
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            with pytest.raises(ConfigurationError, match="cross-SDK-compatible serializer"):
-                CacheSerializationHandler(serializer_name="auto")
-            assert self._activation_records(caplog) == []
-            CacheSerializationHandler(serializer_name="default")
-        assert len(self._activation_records(caplog)) == 1
-
-    def test_rejected_decorator_does_not_spend_the_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A decorator rejected after its handler would be built must not claim the warning either."""
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            with pytest.raises(ConfigurationError, match="stale_ttl must be a non-negative integer"):
-                cache(ttl=60, stale_ttl=-1)(lambda: None)
-            assert self._activation_records(caplog) == []
-            cache(ttl=60)(lambda: None)
-        assert len(self._activation_records(caplog)) == 1
-
-    def test_no_key_does_not_warn(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        monkeypatch.delenv("CACHEKIT_MASTER_KEY")
-        reset_settings()
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            handler = CacheSerializationHandler(serializer_name="default")
-        assert handler.encryption is False
-        assert self._activation_records(caplog) == []
-
-    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
-    def test_forked_child_warns_for_itself(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A forked worker is a new process: it must not inherit the parent's already-fired warning."""
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            CacheSerializationHandler(serializer_name="default")
-            assert len(self._activation_records(caplog)) == 1
-
-            ctx = multiprocessing.get_context("fork")
-            queue = ctx.Queue()
-
-            def child(q: Queue[int]) -> None:
-                caplog.clear()  # the child's copy still holds the parent's record
-                CacheSerializationHandler(serializer_name="default")
-                q.put(len(self._activation_records(caplog)))
-
-            process = ctx.Process(target=child, args=(queue,))
-            process.start()
-            try:
-                child_warnings = queue.get(timeout=30)
-            finally:
-                process.join(timeout=30)
-                if process.is_alive():  # a hung child would otherwise block pytest's exit forever
-                    process.kill()
-                    process.join()
-
-        assert child_warnings == 1
-
-    def test_racing_constructions_warn_once(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        """Threads that reach the once-per-process decision together must still log it once.
-
-        The PID stand-in parks each thread at a barrier each time the guard compares or hashes it, so
-        every thread has checked before any records the warning: the interleaving under which a
-        check-then-set, compare or membership, logs once per thread (free-threaded builds reach it
-        without help).
-        """
-        threads = 8
-        barrier = threading.Barrier(threads, timeout=5)  # a lock-serialised guard breaks it, then carries on
-
-        class _ParkingPid(int):
-            def _park(self) -> None:
-                try:
-                    barrier.wait()
-                except threading.BrokenBarrierError:
-                    pass
-
-            def __eq__(self, other: object) -> bool:
-                self._park()
-                return super().__eq__(other)
-
-            def __hash__(self) -> int:
-                self._park()
-                return super().__hash__()
-
-        pid = _ParkingPid(os.getpid())
-        monkeypatch.setattr(os, "getpid", lambda: pid)
-        built: list[CacheSerializationHandler] = []
-        workers = [
-            threading.Thread(target=lambda: built.append(CacheSerializationHandler(serializer_name="default")), daemon=True)
-            for _ in range(threads)
-        ]
-        with caplog.at_level(logging.WARNING, logger="cachekit.cache_handler"):
-            for worker in workers:
-                worker.start()
-            for worker in workers:
-                worker.join(timeout=30)
-
-        assert not any(worker.is_alive() for worker in workers)
-        assert len(built) == threads  # a raising constructor would otherwise vanish into a thread warning
-        assert len(self._activation_records(caplog)) == 1

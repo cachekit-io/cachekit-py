@@ -31,7 +31,7 @@ def expensive_function():
 # These are decorator syntax examples showing different presets:
 @cache.minimal(backend=None)      # Speed-critical: trading, gaming, real-time
 @cache.production(backend=None)   # Reliability-critical: payments, APIs
-@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY)
+@cache.secure(master_key=secret_key)  # Security-critical: PII, medical, financial (or omit master_key and set CACHEKIT_MASTER_KEY; every other cache then needs encryption=False)
 
 # Manual control when needed (1% of use cases)
 @cache(ttl=3600, namespace="custom", backend=None)
@@ -48,13 +48,7 @@ def custom_function():
 - **`@cache.dev`** - Development profile: Verbose logging, easy debugging, Prometheus disabled for simplicity
 - **`@cache.test`** - Testing profile: Deterministic behavior, all protections disabled, no monitoring for reproducible tests
 - **`@cache.io`** - cachekit.io SaaS profile: HTTP-based edge caching via api.cachekit.io, zero infrastructure required *(cachekit.io is in closed beta — [request access](https://cachekit.io))*
-- **`@cache`** - Auto-detection: Analyzes function name and signature to select optimal profile
-
-**Implementation Details:**
-- Function analysis detects security-sensitive names (`user`, `auth`, `payment`, etc.) → secure profile (EncryptionWrapper)
-- High-frequency function patterns (`get`, `calc`, `compute`, etc.) → fast profile (StandardSerializer with optimizations)
-- All other functions → default balanced profile (StandardSerializer)
-- Manual overrides always take precedence over auto-detection
+- **`@cache`** - Baseline: no preset; every setting at its default or as passed. It never inspects the function to pick a profile, and never encrypts unless told to
 
 ### `@cache(...)` - Manual Configuration
 
@@ -122,7 +116,7 @@ def your_function(args):
 
 #### Encryption Parameters
 
-- **`encryption`** (`EncryptionConfig`, default: `EncryptionConfig()`) - Client-side encryption configuration (use `@cache.secure` preset instead of configuring directly)
+- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`). `@cache.secure` is the preset spelling
 
 #### Returns
 - Cached function result or fresh computation result
@@ -596,7 +590,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
-- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` (env: `CACHEKIT_MASTER_KEY`)
+- **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch: while it is set, a cache that states no `encryption=` raises `ConfigurationError`
 
 **Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
 
@@ -693,7 +687,7 @@ CACHEKIT_REDIS_URL=redis://localhost:6379/0
 CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
-# Encryption (for @cache.secure)
+# Encryption key for @cache.secure / encryption=True; while set, every other cache states encryption=False
 CACHEKIT_MASTER_KEY=<hex-encoded-32-bytes-minimum>
 
 # Fallback: REDIS_URL also supported (lower priority)

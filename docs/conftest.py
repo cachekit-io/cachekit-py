@@ -27,7 +27,7 @@ def master_key_env(monkeypatch):
 
     Opt-in per fence (```python fixture:master_key_env) so the fence can bind the key the
     way an application does instead of relying on the injected secret_key. Not global:
-    an ambient key still auto-activates encryption (deprecated) — see secret_key below.
+    an ambient key makes every fence with no encryption= raise — see secret_key below.
     """
     monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
     reset_settings()
@@ -110,11 +110,9 @@ def pytest_markdown_docs_globals():
     # so @cache.secure fences can pass it explicitly (master_key=secret_key).
     #
     # We deliberately DO NOT set CACHEKIT_MASTER_KEY in the environment here.
-    # Since the PR #127 auto-detect + PR #200 settings re-read, an ambient
-    # master key turns encryption on globally, and the v0.6.0 cross-SDK rule
-    # then rejects any plain `@cache` fence using a non-cross-SDK serializer
-    # (serializer="auto", custom serializer instances) at decoration time.
-    # tests/conftest.py hit the same trap and fixed it the same way. See #205.
+    # A master key present with no stated encryption= intent raises
+    # ConfigurationError at decoration, so an ambient key would break every
+    # plain `@cache` fence. tests/conftest.py makes the same choice.
     secret_key = "a" * 64  # 32 bytes in hex
 
     globals_dict = {

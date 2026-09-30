@@ -34,12 +34,46 @@ def get_sensitive_data():
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
+Exporting it makes every other cache in the process that states no `encryption=` raise
+([below](#master-key-present-no-encryption-intent)); passing `master_key=` to `@cache.secure` does not.
+
 **Verification**:
 ```bash
 # Verify key is set and correct length
 python -c "import os; k = os.getenv('CACHEKIT_MASTER_KEY', ''); print(f'Key length: {len(k)} (need 64)')"
 # Output: Key length: 64 (need 64)
 ```
+
+---
+
+### Master key present, no encryption intent
+
+**Message**: `A master key is present (CACHEKIT_MASTER_KEY) but encryption= is unset. ...` (or `(master_key=)` when the key was passed)
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied
+
+**Cause**: a master key is available — `CACHEKIT_MASTER_KEY` is set, or `master_key=` was passed (flat on bare `@cache`, or `EncryptionConfig(master_key=...)`) — but the cache states no encryption intent: no `encryption=`, or an `EncryptionConfig` without `enabled=`. A key is a key source, not an activation switch, so cachekit refuses to guess between encrypting and storing plaintext. This applies to every preset except `@cache.secure` and `@cache.local`, including `backend=None` and `tenant_extractor=` caches ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
+
+**When it occurs**:
+```python notest
+# CACHEKIT_MASTER_KEY is set in the environment
+@cache.production(ttl=600)  # Raises ConfigurationError here, at decoration time
+def get_catalog():
+    return fetch_catalog()
+```
+
+**Solution**: state the intent on each such cache.
+```python notest
+@cache.production(ttl=600, encryption=False)  # plaintext; stale ciphertext still decrypts on read
+def get_catalog():
+    return fetch_catalog()
+
+@cache.production(ttl=600, encryption=EncryptionConfig(enabled=True, single_tenant_mode=True))  # encrypt
+def get_orders():
+    return fetch_orders()
+```
+
+Or use `@cache.secure(...)` for the encrypted ones. On bare `@cache` the flat spelling is `encryption=True, single_tenant_mode=True`.
 
 ---
 

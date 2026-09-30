@@ -281,7 +281,7 @@ class TestSerializerWithEncryptionInProduction:
         """
         call_count = 0
 
-        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_rt")
+        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_rt", encryption=True, single_tenant_mode=True)
         def load_data(user_id: str) -> pd.DataFrame:
             nonlocal call_count
             call_count += 1
@@ -342,7 +342,7 @@ class TestSerializerWithEncryptionInProduction:
     def test_dataframe_index_preserved_with_encrypted_arrow_serializer(self, redis_isolated):
         """DataFrame index is preserved through the encrypted Arrow path end-to-end."""
 
-        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_idx")
+        @cache(ttl=300, serializer=ArrowSerializer(), namespace="enc_arrow_idx", encryption=True, single_tenant_mode=True)
         def get_indexed_data() -> pd.DataFrame:
             return pd.DataFrame({"value": [10, 20, 30]}, index=["a", "b", "c"])
 
