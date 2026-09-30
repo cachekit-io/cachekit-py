@@ -124,11 +124,6 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         gt=0,
         description="Request timeout in seconds",
     )
-    max_retries: int = Field(
-        default=3,
-        ge=0,
-        description="Maximum retry attempts for transient errors",
-    )
     connection_pool_size: int = Field(
         default=10,
         gt=0,

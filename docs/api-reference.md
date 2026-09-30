@@ -192,7 +192,6 @@ def critical_business_logic():
 | `CACHEKIT_API_KEY` | **Yes** | — | API key (`ck_live_...`) for authentication |
 | `CACHEKIT_API_URL` | No | `https://api.cachekit.io` | API endpoint override |
 | `CACHEKIT_TIMEOUT` | No | `5.0` | HTTP request timeout in seconds |
-| `CACHEKIT_MAX_RETRIES` | No | `3` | Maximum retry attempts for transient errors |
 
 #### Usage
 
@@ -596,9 +595,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`l1_enabled`** (`bool`, default: `True`) - Enable L1 in-memory cache (env: `CACHEKIT_L1_ENABLED`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
-- **`enable_prometheus_metrics`** (`bool`, default: `True`) - Enable Prometheus metrics collection (env: `CACHEKIT_ENABLE_PROMETHEUS_METRICS`)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` (env: `CACHEKIT_MASTER_KEY`)
 
 **Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
@@ -611,7 +608,7 @@ from cachekit.config import get_settings
 config = get_settings()
 ```
 
-**Note:** Configuration is typically loaded automatically via environment variables. Explicit configuration is rarely needed. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
+**Note:** Configuration is typically loaded automatically via environment variables. The SDK reads only `get_settings()`, which it builds from the environment; a `CachekitConfig(...)` you construct yourself configures nothing. TTL is not a `CachekitConfig` field — see [Default TTL](configuration.md#intent-presets).
 
 
 ---

@@ -125,9 +125,6 @@ CACHEKIT_API_URL=https://api.cachekit.io
 # Optional: Request timeout in seconds (default: 5.0, must be > 0)
 CACHEKIT_TIMEOUT=5.0
 
-# Optional: Maximum retry attempts for transient errors (default: 3, minimum: 0)
-CACHEKIT_MAX_RETRIES=3
-
 # Optional: HTTP connection pool size (default: 10, must be > 0)
 CACHEKIT_CONNECTION_POOL_SIZE=10
 
@@ -143,7 +140,6 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_MAX_RETRIES` | `int` | `3` | No | Max retry attempts for transient errors |
 | `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
