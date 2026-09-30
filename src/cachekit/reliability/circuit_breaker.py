@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -26,12 +27,17 @@ from cachekit.reliability.metrics_collection import (
 
 logger = logging.getLogger(__name__)
 
+# CLOSED opens on failure_threshold failures within this rolling window, the default
+# in cachekit-ts and cachekit-rs. A plain count since the last close would let rare
+# failures on a healthy backend open the breaker on any long-lived process.
+_FAILURE_WINDOW_SECONDS = 60.0
+
 
 class CircuitState(Enum):
     """Circuit breaker states following the classic pattern.
 
     State transitions:
-    CLOSED -> OPEN: When failure_threshold is exceeded
+    CLOSED -> OPEN: When failure_threshold failures fall within a 60 s rolling window
     OPEN -> HALF_OPEN: After timeout_seconds have elapsed
     HALF_OPEN -> CLOSED: After success_threshold successful requests
     HALF_OPEN -> OPEN: On any failure during testing
@@ -62,8 +68,9 @@ class CircuitBreakerConfig:
     and temporarily blocking requests when a service is struggling.
 
     Attributes:
-        failure_threshold: Number of consecutive failures before opening circuit.
-            Lower values make the circuit more sensitive to errors.
+        failure_threshold: Number of failures within a 60 s rolling window that opens
+            the circuit. Successes do not reset the count; failures older than the
+            window stop counting. Lower values make the circuit more sensitive to errors.
         success_threshold: Number of consecutive successes in HALF_OPEN before closing.
             Higher values ensure more stable recovery.
         timeout_seconds: How long to stay OPEN before testing recovery. It also bounds
@@ -102,7 +109,7 @@ class CircuitBreakerConfig:
         ValueError: failure_threshold must be positive, got 0
     """
 
-    failure_threshold: int = 5  # Opens circuit after 5 consecutive failures
+    failure_threshold: int = 5  # Opens circuit after 5 failures within 60 s
     success_threshold: int = 3  # Closes circuit after 3 consecutive successes
     timeout_seconds: float = 30.0  # Wait 30s before testing recovery
     half_open_requests: int = 3  # Probes per HALF_OPEN cycle; must reach success_threshold to close
@@ -220,7 +227,7 @@ class CircuitBreaker:
         self.config = config
         self.namespace = namespace
         self._state = CircuitState.CLOSED
-        self._failure_count = 0  # Consecutive failures in CLOSED state
+        self._failure_times: deque[float] = deque()  # Failure timestamps, pruned to the window
         self._success_count = 0  # Consecutive successes in HALF_OPEN state
         self._last_failure_time = 0.0  # Timestamp of last failure (for timeout)
         self._half_open_permits = 0  # Current test requests in HALF_OPEN
@@ -317,8 +324,7 @@ class CircuitBreaker:
 
         with self._lock:
             # Guard clause: already OPEN. A failure recorded now comes from a call
-            # that was never admitted (key generation runs before admission) or
-            # from one admitted before the breaker opened. Counting it would push
+            # admitted before the breaker opened. Counting it would push
             # _last_failure_time forward and keep the breaker OPEN under steady
             # traffic.
             if self._state == CircuitState.OPEN:
@@ -328,19 +334,26 @@ class CircuitBreaker:
             if self._state == CircuitState.HALF_OPEN:
                 self._half_open_permits = max(0, self._half_open_permits - 1)
 
-            self._failure_count += 1
-            self._last_failure_time = time.time()
+            now = time.time()
+            self._failure_times.append(now)
+            self._prune_failures(now)
+            self._last_failure_time = now
 
             if self._state == CircuitState.CLOSED:
-                if self._failure_count >= self.config.failure_threshold:
+                if len(self._failure_times) >= self.config.failure_threshold:
                     self._transition_to_open()
             elif self._state == CircuitState.HALF_OPEN:
                 self._transition_to_open()
 
+    def _prune_failures(self, now: float):
+        """Drop failure timestamps older than the rolling window. Caller holds _lock."""
+        while self._failure_times and self._failure_times[0] < now - _FAILURE_WINDOW_SECONDS:
+            self._failure_times.popleft()
+
     def _transition_to_closed(self):
         """Transition to CLOSED state."""
         self._state = CircuitState.CLOSED
-        self._failure_count = 0
+        self._failure_times.clear()
         self._success_count = 0
         self._half_open_permits = 0  # Reset permit counter
         self._half_open_total_attempts = 0  # Reset attempt counter
@@ -372,9 +385,10 @@ class CircuitBreaker:
 
     @property
     def failure_count(self) -> int:
-        """Get current failure count."""
+        """Get the number of failures within the rolling window."""
         with self._lock:
-            return self._failure_count
+            self._prune_failures(time.time())
+            return len(self._failure_times)
 
     @property
     def success_count(self) -> int:
@@ -443,9 +457,10 @@ class CircuitBreaker:
             Dictionary with current state and counters
         """
         with self._lock:
+            self._prune_failures(time.time())
             return {
                 "state": self._state.name,
-                "failure_count": self._failure_count,
+                "failure_count": len(self._failure_times),
                 "success_count": self._success_count,
                 "half_open_permits": self._half_open_permits,
                 "last_failure_time": self._last_failure_time,

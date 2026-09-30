@@ -603,3 +603,74 @@ class TestIntentPresetsKeepLiveBreakerDefaults:
         wrapped = getattr(cache, preset)(ttl=300, backend=None)(lambda: 1)
 
         assert wrapped.get_health_status()["circuit_breaker"] is None
+
+
+class TestClosedFailureWindow:
+    """CLOSED opens on failure_threshold failures within a 60 s rolling window (LAB-5352).
+
+    Parity with cachekit-ts and cachekit-rs: successes in CLOSED neither reset the count
+    nor extend the window, and failures older than the window stop counting.
+    """
+
+    def _fail_at(self, breaker, traveller, seconds):
+        traveller.move_to(seconds)
+        assert breaker.should_attempt_call()
+        breaker.record_failure()
+
+    def test_threshold_failures_within_window_open(self):
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+        with time_machine.travel(0, tick=False) as traveller:
+            for t in (0, 10, 20, 30):
+                self._fail_at(breaker, traveller, t)
+            assert breaker.state == CircuitState.CLOSED
+            assert breaker.failure_count == 4
+
+            self._fail_at(breaker, traveller, 40)
+            assert breaker.state == CircuitState.OPEN
+
+    def test_failure_every_30s_for_10_minutes_stays_closed(self):
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+        with time_machine.travel(0, tick=False) as traveller:
+            for t in range(0, 601, 30):
+                self._fail_at(breaker, traveller, t)
+                assert breaker.state == CircuitState.CLOSED, f"opened at t={t}s"
+            # t-60, t-30 and t: a failure exactly 60 s old still counts, as in cachekit-rs.
+            assert breaker.failure_count == 3
+            assert breaker.get_stats()["failure_count"] == 3
+
+    def test_successes_between_failures_do_not_reset_the_count(self):
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+        with time_machine.travel(0, tick=False) as traveller:
+            for t in (0, 12, 24, 36):
+                self._fail_at(breaker, traveller, t)
+                for _ in range(100):
+                    assert breaker.should_attempt_call()
+                    breaker.record_success()
+            assert breaker.state == CircuitState.CLOSED
+            assert breaker.failure_count == 4
+
+            self._fail_at(breaker, traveller, 48)
+            assert breaker.state == CircuitState.OPEN
+
+    def test_sparse_failures_on_a_healthy_backend_never_open(self):
+        """The reported defect: five failures an hour apart used to open a default breaker."""
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+        with time_machine.travel(0, tick=False) as traveller:
+            for hour in range(5):
+                self._fail_at(breaker, traveller, hour * 3600)
+                for _ in range(100):
+                    breaker.record_success()
+            assert breaker.state == CircuitState.CLOSED
+            assert breaker.failure_count == 1
+
+    def test_expired_failures_leave_the_count(self):
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="test")
+        with time_machine.travel(0, tick=False) as traveller:
+            for t in (0, 1, 2, 3):
+                self._fail_at(breaker, traveller, t)
+            traveller.move_to(64)
+            assert breaker.failure_count == 0
+
+            self._fail_at(breaker, traveller, 64)
+            assert breaker.state == CircuitState.CLOSED
+            assert breaker.failure_count == 1

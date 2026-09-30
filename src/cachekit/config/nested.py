@@ -84,7 +84,7 @@ class CircuitBreakerConfig:
 
     Attributes:
         enabled: Enable circuit breaker protection (default: True)
-        failure_threshold: Consecutive failures before opening circuit (default: 5)
+        failure_threshold: Failures within a 60 s rolling window that open the circuit (default: 5)
         success_threshold: Consecutive successes in HALF_OPEN to close circuit (default: 3)
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
             probe; finite and > 0 (default: 30.0). It also caps probing at
