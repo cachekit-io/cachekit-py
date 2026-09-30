@@ -1,12 +1,12 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "spec": "spec/interop-mode.md",
   "generator": "tools/interop-reference.py (CPython stdlib)",
   "cross_checked_by": "tools/interop-crosscheck.mjs (independent encoder + @noble/hashes blake2b + WebCrypto HKDF/AES-GCM)",
   "hash_algorithm": "blake2b-256 (digest_size=32, unkeyed) over canonical MessagePack of the flat argument array",
   "key_format": "{namespace}:{operation}:{args_hash}",
   "segment_pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
-  "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline). namespace additionally MUST NOT be exactly 'ns' or 'nsapi' (reserved: the server parses those key prefixes). The reservation is namespace-only; operation has no reserved values.",
+  "segment_pattern_note": "Full-string match REQUIRED (Python: re.fullmatch, not re.match \u2014 $ matches before a trailing newline). namespace additionally MUST NOT be exactly 'ns' or 'nsapi' (reserved: the server parses those key prefixes). The reservation is namespace-only; operation has no reserved values. Neither segment may contain '..' (the pattern admits it; the server rejects '..' anywhere in a key). A lone '.' stays valid.",
   "width_coverage_note": "All *16 header boundaries (uint/int widths, str8->str16, bin8->bin16, fixarray->array16, fixmap->map16, including the root argument array) are pinned by vectors. The *32 tier (str32/bin32/array32/map32, >=64 KiB or >=65536 elements) is normative and implemented by both tools but untested-by-design: fixture blobs that size would bloat the file without exercising different logic (same length-prefix code path, wider field).",
   "error_vectors_note": "The 'error' field is a human-readable reason for maintainers. Conformance means the input MUST be rejected with an error; the message text is not normative.",
   "tagged_json": {
@@ -605,6 +605,18 @@
       "canonical_args_hex": "9101",
       "args_hash": "405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a",
       "expected_key": "nsapix:nsapi:405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a"
+    },
+    {
+      "name": "lone_dots_stay_valid",
+      "description": "Only '..' is forbidden: a lone trailing '.' (namespace 'app.') and non-adjacent dots (operation 'users.fetch.by_id') stay valid",
+      "namespace": "app.",
+      "operation": "users.fetch.by_id",
+      "args": [
+        1
+      ],
+      "canonical_args_hex": "9101",
+      "args_hash": "405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a",
+      "expected_key": "app.:users.fetch.by_id:405f09a3617bcc1425ea95b9840d9c2713e3ecebd5a3227abc599317b732e21a"
     }
   ],
   "value_vectors": [
@@ -738,6 +750,20 @@
       "operation": "users.fetch_by_id",
       "args": [],
       "error": "namespace 'nsapi' is reserved: the server parses a key starting 'nsapi:' as namespace-prefixed (rejected whatever the operation, including one the server would 400 on for its '.')"
+    },
+    {
+      "name": "reject_double_dot_namespace",
+      "namespace": "a..b",
+      "operation": "get_user",
+      "args": [],
+      "error": "namespace must not contain '..': the pattern admits it, but the server rejects '..' anywhere in a key"
+    },
+    {
+      "name": "reject_double_dot_operation",
+      "namespace": "users",
+      "operation": "x..",
+      "args": [],
+      "error": "operation must not contain '..': the pattern admits it, but the server rejects '..' anywhere in a key (here at the end of the segment, which a check that skips the last pair misses)"
     }
   ],
   "aad_vectors": [
