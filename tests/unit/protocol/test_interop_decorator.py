@@ -263,6 +263,28 @@ class TestInteropRejections:
             def f(x: int):
                 return x
 
+    @pytest.mark.parametrize(("operation", "namespace"), [("get_user", "a..b"), ("x..y", "users")])
+    def test_double_dot_segment_rejected_at_decoration(self, backend: DictBackend, operation: str, namespace: str):
+        # The server rejects '..' anywhere in a key, so the key would fail on
+        # every CachekitIO request; fail before any call, on every backend.
+        with pytest.raises(ConfigurationError, match=r"must not contain '\.\.'"):
+
+            @_decorate(backend, interop=operation, namespace=namespace)
+            def f(x: int):
+                return x
+
+    def test_lone_dots_accepted(self, backend: DictBackend):
+        """Only '..' is forbidden: dotted segments decorate and write the
+        byte-pinned vector key."""
+        vector = KEY_VECTORS["lone_dots_stay_valid"]
+
+        @_decorate(backend, interop=vector["operation"], namespace=vector["namespace"])
+        def f(x: int):
+            return x
+
+        f(*vector["args"])
+        assert list(backend.store) == [vector["expected_key"]]
+
     def test_reservation_scope_accepted(self, backend: DictBackend):
         """The reservation is exact-match and namespace-only: operation nsapi in
         namespace nsapix decorates and writes the byte-pinned vector key."""

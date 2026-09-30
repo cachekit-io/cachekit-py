@@ -164,6 +164,29 @@ class TestReservedNamespaces:
         assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
 
 
+class TestDoubleDotSegments:
+    """Neither segment may contain ``..``: the segment pattern admits it, but the
+    server rejects ``..`` anywhere in a key. A lone ``.`` stays valid."""
+
+    @pytest.mark.parametrize(
+        ("operation", "namespace"),
+        [("get_user", "a..b"), ("x..y", "users"), ("users.v1..beta", "users"), ("get_user", "a...b"), ("x..", "users")],
+    )
+    def test_double_dot_rejected_by_keygen_and_config(self, operation: str, namespace: str):
+        with pytest.raises(InteropError, match=r"must not contain '\.\.'"):
+            generate_interop_key(namespace, operation, [1])
+        with pytest.raises(InteropError, match=r"must not contain '\.\.'"):
+            validate_interop_config(operation, namespace)
+
+    @pytest.mark.parametrize(
+        ("operation", "namespace"),
+        [("users.fetch.by_id", "app.v1"), ("get.", "users"), ("a.b.c", "x.y")],
+    )
+    def test_lone_dots_accepted(self, operation: str, namespace: str):
+        assert validate_interop_config(operation, namespace) == (operation, namespace)
+        assert generate_interop_key(namespace, operation, [1]).startswith(f"{namespace}:{operation}:")
+
+
 class NS(str, Enum):
     USERS = "users"
 

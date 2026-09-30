@@ -79,7 +79,7 @@ Treat operation names like queue names or topic names: a **cross-team contract**
 
 The contract for one operation is the operation name **plus** the effective argument list (arity, order, types):
 
-- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized). `ns` and `nsapi` are reserved as namespaces (operations, and namespaces such as `nsx`, are unaffected), because the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed ([cache-key-format.md → Server-Side Requirements](https://github.com/cachekit-io/protocol/blob/main/spec/cache-key-format.md#server-side-requirements)).
+- `namespace` and `operation` must match `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only — enforced loudly at decoration time, never silently normalized). `ns` and `nsapi` are reserved as namespaces (operations, and namespaces such as `nsx`, are unaffected), because the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed ([cache-key-format.md → Server-Side Requirements](https://github.com/cachekit-io/protocol/blob/main/spec/cache-key-format.md#server-side-requirements)). Neither segment may contain `..` (`a..b` raises; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key. Both rules apply on every backend, so a namespace valid on one backend is valid on all.
 - A `str` subclass is checked and keyed as its plain `str` value, so a `StrEnum` or `(str, Enum)` member `USERS = "users"` is the namespace `users`. Earlier releases put a `(str, Enum)` member's formatted name into the key on Python 3.11 and later (`NS.USERS:get_user:…`, a key no other SDK derives). Upgrading moves those functions to the correct key. The old entries are not deleted: they retire only by TTL (never, if none was set). To erase them on Redis, `SCAN` for the old prefix (here `NS.USERS:get_user:*`) and `UNLINK` the matches.
 - Named arguments bind to their declared positions and **introspectable defaults are applied**: `get_user(42)`, `get_user(user_id=42)` and `get_user(42, include_profile=False)` all produce the same key.
 - Arguments must fit the closed interop data model (int in `[-2^63, 2^64-1]`, float, str, bytes, bool, None, list/tuple, dict with str keys, set, tz-aware datetime, UUID; Python conveniences: Enum → value, Path → POSIX string, Decimal → string). Anything else raises `InteropError` **at call time** — interop mode never silently degrades to uncached execution.
@@ -115,7 +115,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 
 | Situation | Behavior |
 | :--- | :--- |
-| Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` | `ConfigurationError` at decoration time |
+| Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` and a segment containing `..` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
 | Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |

@@ -287,7 +287,8 @@ def validate_segment(name: str, segment: object) -> str:
 
     Full-string match against ``^[a-z0-9][a-z0-9._-]{0,63}$`` — never silently
     normalized. re.fullmatch, not re.match: $ accepts a trailing newline.
-    A namespace must additionally not be one of :data:`RESERVED_NAMESPACES`.
+    Neither segment may contain ``..``, and a namespace must additionally not
+    be one of :data:`RESERVED_NAMESPACES`.
 
     A ``str`` subclass is checked and returned as its exact ``str`` value, so
     callers must render the returned value, not the argument. The subclass's own
@@ -303,6 +304,15 @@ def validate_segment(name: str, segment: object) -> str:
         raise InteropError(
             f"invalid interop {name} {value!r}: must full-string match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
             f"(lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
+        )
+    # SEGMENT_RE admits `..`, but the server rejects `..` anywhere in a key
+    # (protocol spec/cache-key-format.md "Server-Side Requirements", Traversal
+    # row). The `:` delimiters separate the segments and the hash is hex, so any
+    # `..` in a key lies inside one segment.
+    if ".." in value:
+        raise InteropError(
+            f"invalid interop {name} {value!r}: must not contain '..', because the CachekitIO server "
+            f"rejects '..' anywhere in a key"
         )
     if name == "namespace" and value in RESERVED_NAMESPACES:
         raise InteropError(
