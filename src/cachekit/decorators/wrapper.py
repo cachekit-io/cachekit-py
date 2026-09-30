@@ -2269,8 +2269,13 @@ def create_cache_wrapper(
         Keys other processes wrote and this one never saw stay in L2 until their TTL. Another
         tenant's entry keeps its L2 value and stays tracked; only its L1 copy is evicted,
         because L1 is not tenant-scoped (LAB-4773).
+
+        Failed deletes are logged once per call with their count: the call never raises, so
+        this record is the caller's only signal, and a per-key record would flood during an
+        outage.
         """
         scope = _l2_scope()
+        failed = 0
         with _watch_records() as watch:
             for entry in set(_cached_keys):  # snapshot: other threads add while this runs
                 entry_scope, key = entry
@@ -2283,6 +2288,7 @@ def create_cache_wrapper(
                     except Exception as e:
                         _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                         l2_deleted = False  # keep key tracked for retry
+                        failed += 1
                 if l2_deleted:
                     _cached_keys.discard(entry)
                     if entry in watch:  # rewritten meanwhile: its new value may still be in L2
@@ -2291,6 +2297,9 @@ def create_cache_wrapper(
                     _object_cache.delete(key)
                 elif _l1_cache:
                     _l1_cache.invalidate(key)
+        if failed:
+            # ERROR, as for a single key: every failed entry may still be served from L2.
+            _logger.error("Failed to delete %d L2 key(s); they stay tracked for the next invalidate_cache()", failed)
 
     def _drain_all() -> None:
         """Whole-function invalidation. Sync; ainvalidate_cache runs it via asyncio.to_thread.
