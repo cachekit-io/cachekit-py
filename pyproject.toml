@@ -272,7 +272,7 @@ fuzz = [
 # [project] dependencies instead — see the anyio/h2 entries above.
 [tool.uv]
 constraint-dependencies = [
-    "urllib3>=2.7.0",
+    "urllib3>=2.8.0",
     "fonttools>=4.60.2",
     "werkzeug>=3.1.4",
     # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixes
