@@ -179,6 +179,10 @@ It is the fallback for the cases where the key cannot separate the serializers:
 And it cannot help at all where the envelope name is identical too — two instances of one
 class, as in the caution above.
 
+An entry that records no serializer name at all is rejected before it is decoded. Every
+cachekit-py writer records one, so a nameless entry is treated as a corrupt envelope
+(`Corrupt cache envelope: …`): a miss, with the entry evicted and the value recomputed.
+
 **For zero-downtime migrations**, use namespace versioning:
 
 ```python notest

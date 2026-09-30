@@ -1174,7 +1174,7 @@ class CacheSerializationHandler:
 
             # Validate serializer compatibility - cached data must match decorator's serializer
             # This prevents deserialization errors when switching serializers
-            if serializer_name != self._serializer_string_name and serializer_name != "unknown":
+            if serializer_name != self._serializer_string_name:
                 raise SerializationError(
                     f"Serializer mismatch: cached data uses '{serializer_name}', "
                     f"but decorator configured with '{self._serializer_string_name}'. "

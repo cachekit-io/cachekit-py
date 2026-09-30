@@ -142,6 +142,25 @@ class TestUnwrapRejectsGarbage:
         with pytest.raises(ValueError, match="Invalid cache envelope header length"):
             SerializationWrapper.unwrap(frame)
 
+    def test_frame_without_serializer_name_raises_valueerror(self):
+        # LAB-4432: the protocol treats a nameless value as a mismatch; never default a name.
+        header = b'{"m":{},"v":"2.0"}'
+        frame = b"CK" + bytes((3,)) + len(header).to_bytes(4, "big") + header + b"payload"
+        with pytest.raises(ValueError, match="records no serializer name"):
+            SerializationWrapper.unwrap(frame)
+
+    @pytest.mark.parametrize("name", [None, "", 0])
+    def test_frame_with_non_name_serializer_raises_valueerror(self, name):
+        header = json.dumps({"m": {}, "s": name, "v": "2.0"}).encode("utf-8")
+        frame = b"CK" + bytes((3,)) + len(header).to_bytes(4, "big") + header + b"payload"
+        with pytest.raises(ValueError, match="records no serializer name"):
+            SerializationWrapper.unwrap(frame)
+
+    def test_legacy_envelope_without_serializer_name_raises_valueerror(self):
+        legacy = json.dumps({"data": base64.b64encode(PAYLOAD).decode("ascii"), "metadata": META, "version": "2.0"})
+        with pytest.raises(ValueError, match="records no serializer name"):
+            SerializationWrapper.unwrap(legacy)
+
 
 class TestEncryptionThroughFrame:
     """The binary frame is on the hot path for @cache.secure too: encrypted payloads and
