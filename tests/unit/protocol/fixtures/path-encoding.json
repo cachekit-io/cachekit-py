@@ -1,9 +1,9 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "generator": "urllib.parse.quote(key, safe=\"\")",
   "spec": "spec/saas-api.md § Cache-Key Path Encoding",
   "ci_verification": "tools/path-encoding-verify.py (stdlib only; mutation self-test first)",
-  "contract": "`encoded` is the single `{key}` path segment in the reference form (spec rule 1); `decoded` is the key the server sees after its single percent-decode and equals `key` in every transmittable row (spec rules 3-4). Rows with `reject: true` are the reserved segments of spec rule 2 (`.`, `..`, `health`, `ttl`, `lock`): a conformant client raises before building the URL, so `encoded` and `decoded` are null. `encoded_alternates` lists the `encodeURIComponent` form (`! * ' ( )` raw) where it differs from `encoded`, and is absent otherwise; reject rows carry none. An SDK conforms when its encoding of `key` is in `[encoded] + encoded_alternates` (a missing `encoded_alternates` is `[]`).",
+  "contract": "`encoded` is the single `{key}` path segment in the reference form (spec rule 1); `decoded` is the key the server sees after its single percent-decode and equals `key` in every transmittable row (spec rules 3-4). Rows with `reject: true` are the keys spec rule 2 reserves (the empty key, `.`, `..`, `health`, `ttl`, `lock`): a conformant client raises before building the URL, so `encoded` and `decoded` are null. `encoded_alternates` lists the `encodeURIComponent` form (`! * ' ( )` raw) where it differs from `encoded`, and is absent otherwise; reject rows carry none. An SDK conforms when its encoding of `key` is in `[encoded] + encoded_alternates` (a missing `encoded_alternates` is `[]`).",
   "vectors": [
     {
       "key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1s",
@@ -40,6 +40,13 @@
       "encoded": "100%25",
       "decoded": "100%",
       "note": "A literal `%` is encoded exactly once; the server decodes once and sees `100%`, then rejects it (charset). `%2525` would decode to `100%25`, a different key."
+    },
+    {
+      "key": "",
+      "encoded": null,
+      "decoded": null,
+      "reject": true,
+      "note": "Empty key: it encodes to an empty segment, so `/v1/cache/{key}` becomes `/v1/cache/` and `/v1/cache/{key}/ttl` becomes `/v1/cache//ttl`, neither of which addresses a stored entry."
     },
     {
       "key": ".",

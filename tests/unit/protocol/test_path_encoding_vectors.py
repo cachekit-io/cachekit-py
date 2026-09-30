@@ -1,8 +1,8 @@
-"""Cache-key path encoding against the protocol test vectors (LAB-2880).
+"""Cache-key path encoding against the protocol test vectors (LAB-2880, LAB-6550).
 
 Fixture: tests/unit/protocol/fixtures/path-encoding.json, vendored from
-cachekit-io/protocol @ 2736a81f2f853cf08c5563c0fe7c8361331fa3ad
-(sha256 7df23f90af9da4198a1344049273d120f4ac944f55b2945765973068d6f27005).
+cachekit-io/protocol @ 774281b09892a064feee6049ee29beb62f068804 (vectors 1.1.0,
+sha256 8f6fd4be5440da9cf4bbb1a112cb89c410c4e46734c7d8a9c023eaa034727ee3).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 Row semantics live in the fixture's ``contract`` field (spec/saas-api.md
@@ -24,7 +24,7 @@ from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "path-encoding.json"
-FIXTURE_SHA256 = "7df23f90af9da4198a1344049273d120f4ac944f55b2945765973068d6f27005"  # pragma: allowlist secret
+FIXTURE_SHA256 = "8f6fd4be5440da9cf4bbb1a112cb89c410c4e46734c7d8a9c023eaa034727ee3"  # pragma: allowlist secret
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["vectors"]
 
