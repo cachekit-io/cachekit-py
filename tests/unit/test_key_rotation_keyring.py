@@ -21,7 +21,8 @@ Covers:
   site as KeyringConfigurationError, never a warning-and-miss; header rot and
   data-derived ValueErrors stay a miss. Behind @cache that holds on every L2 read
   (sync, async, SWR-capable, the async lock double-checks), with the function never
-  run and nothing counted on the circuit breaker.
+  run and nothing counted on the circuit breaker, and on the write of a cold key
+  (sync, async, both async lock shapes), on every call, with the breaker closed.
 - End-to-end rotation round-trip through CacheSerializationHandler with the env
   configuration: write under k1, rotate to k2 with k1 decrypt-only, read without
   re-encryption; drop k1, read follows the fail policy.
@@ -44,6 +45,7 @@ from cachekit import cache
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
 from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.reliability.circuit_breaker import CircuitState
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionWrapper,
@@ -666,18 +668,20 @@ class _SWRByteStore(_ByteStore):
 class _LockByteStore(_ByteStore):
     """Lockable store whose lock writes ``entry`` as it is taken: the pre-lock read
     misses, and the double-check read finds what another worker wrote meanwhile.
+    With ``entry=None`` the double-check misses too, and the key stays cold.
 
     ``redis_shaped`` re-raises lock-body errors through classify_redis_error, as
     RedisBackend.acquire_lock does; otherwise they leave the lock unwrapped, as from
     CachekitIO's, which only releases in ``finally``."""
 
-    def __init__(self, entry: bytes, *, acquired: bool, redis_shaped: bool) -> None:
+    def __init__(self, entry: bytes | None, *, acquired: bool, redis_shaped: bool) -> None:
         super().__init__()
         self._entry, self._acquired, self._redis_shaped = entry, acquired, redis_shaped
 
     @asynccontextmanager
     async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
-        self.store[key] = self._entry
+        if self._entry is not None:
+            self.store[key] = self._entry
         try:
             yield self._acquired
         except Exception as exc:
@@ -692,42 +696,42 @@ async def _call(fn: Any, *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
+def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True) -> Any:
+    """Every call decorates a function of the same qualname, so a fresh reader,
+    whose wrapper is built lazily on its first read, computes the writer's key."""
+    if is_async:
+
+        async def compute(x: int) -> dict[str, int]:
+            runs.append(x)
+            return {"x": x}
+
+    else:
+
+        def compute(x: int) -> dict[str, int]:
+            runs.append(x)
+            return {"x": x}
+
+    return cache(
+        backend=backend,
+        ttl=300,
+        l1_enabled=False,
+        namespace="lab4841",
+        encryption=encryption,
+        single_tenant_mode=encryption,
+        master_key=K2.hex(),
+    )(compute)
+
+
 @pytest.mark.usefixtures("_read_site_env")
 class TestDecoratorL2ReadsFailLoud:
     """LAB-4841: behind @cache, a keyring config fault on an L2 read reaches the
     caller as it does from the L1 guards — never logged as a cache error and run
     uncached, recounted on the circuit breaker, on every call."""
 
-    @staticmethod
-    def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True) -> Any:
-        """Every call decorates a function of the same qualname, so a fresh reader,
-        whose wrapper is built lazily on its first read, computes the writer's key."""
-        if is_async:
-
-            async def compute(x: int) -> dict[str, int]:
-                runs.append(x)
-                return {"x": x}
-
-        else:
-
-            def compute(x: int) -> dict[str, int]:
-                runs.append(x)
-                return {"x": x}
-
-        return cache(
-            backend=backend,
-            ttl=300,
-            l1_enabled=False,
-            namespace="lab4841",
-            encryption=encryption,
-            single_tenant_mode=encryption,
-            master_key=K2.hex(),
-        )(compute)
-
     async def _written_entry(self, *, is_async: bool) -> tuple[str, bytes]:
         """The encrypted entry for compute(1), written before any fault is injected."""
         writer = _ByteStore()
-        assert await _call(self._decorate(writer, [], is_async=is_async), 1) == {"x": 1}
+        assert await _call(_decorate(writer, [], is_async=is_async), 1) == {"x": 1}
         ((key, entry),) = writer.store.items()
         return key, entry
 
@@ -740,7 +744,7 @@ class TestDecoratorL2ReadsFailLoud:
         backend.store[key] = entry
         runs: list[int] = []
         live_breakers.clear()
-        fn = self._decorate(backend, runs, is_async=is_async)
+        fn = _decorate(backend, runs, is_async=is_async)
         (breaker,) = live_breakers
 
         for _ in range(3):
@@ -762,7 +766,7 @@ class TestDecoratorL2ReadsFailLoud:
         backend = _LockByteStore(entry, acquired=acquired, redis_shaped=redis_shaped)
         runs: list[int] = []
         live_breakers.clear()
-        fn = self._decorate(backend, runs, is_async=True)
+        fn = _decorate(backend, runs, is_async=True)
         (breaker,) = live_breakers
 
         with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
@@ -792,7 +796,7 @@ class TestDecoratorL2ReadsFailLoud:
 
         backend = _ByteStore()
         runs: list[int] = []
-        fn = self._decorate(backend, runs, is_async=is_async, encryption=False)
+        fn = _decorate(backend, runs, is_async=is_async, encryption=False)
         assert await _call(fn, 1) == {"x": 1}
         ((key, entry),) = backend.store.items()
         envelope, metadata, serializer_name = SerializationWrapper.unwrap(entry)
@@ -803,6 +807,41 @@ class TestDecoratorL2ReadsFailLoud:
         assert runs == [1, 1]
         assert await _call(fn, 1) == {"x": 1}
         assert runs == [1, 1]  # the overwrite is a readable entry
+
+
+@pytest.mark.usefixtures("_read_site_env")
+class TestDecoratorL2WritesFailLoud:
+    """On a cold key the read misses before any wrapper is built, so the keyring
+    config fault first fires on the write. It reaches the caller there too, and is
+    never counted: a breaker it opened would skip the read-side raise on every later
+    call and serve uncached without a word."""
+
+    @pytest.mark.parametrize(
+        ("is_async", "make_backend"),
+        [
+            (False, _ByteStore),
+            (True, _ByteStore),
+            (True, lambda: _LockByteStore(None, acquired=True, redis_shaped=True)),
+            (True, lambda: _LockByteStore(None, acquired=True, redis_shaped=False)),
+        ],
+        ids=["sync", "async", "async-redis-lock", "async-finally-lock"],
+    )
+    async def test_cold_key_write_raises_on_every_call(self, monkeypatch, live_breakers, is_async, make_backend):
+        _settings_previous_keys(monkeypatch, [K2])
+        backend = make_backend()
+        runs: list[int] = []
+        fn = _decorate(backend, runs, is_async=is_async)
+        (breaker,) = live_breakers
+
+        for _ in range(7):  # past the default failure_threshold of five
+            with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
+                await _call(fn, 1)
+            assert get_current_function_stats() is None
+
+        assert runs == [1] * 7  # the function runs; its result is never stored
+        assert backend.store == {}
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.failure_count == 0
 
 
 class TestEndToEndRotation:
