@@ -750,6 +750,81 @@ class TestInvalidateNoArgsMultiDelete:
         assert backend.store == {}
         assert _tracked(f) == set()
 
+    def test_descriptor_backed_delete_loses_capability(self) -> None:
+        """A slot or property delete can differ per instance: no batch path, even beside _delete_many."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class SlottedDelete:
+            __slots__ = ("delete",)
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return set()
+
+        slotted = SlottedDelete()
+        slotted.delete = lambda key: True  # type: ignore[method-assign]
+        assert not _supports_multi_delete(slotted)
+
+        class PropertyDelete(MultiDeleteBackend):
+            @property
+            def delete(self) -> Any:  # type: ignore[override]
+                return lambda key: True
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return set()
+
+        assert not _supports_multi_delete(PropertyDelete())
+
+        class SlottedBatch:
+            __slots__ = ("_delete_many",)
+
+            def delete(self, key: str) -> bool:
+                return True
+
+        assert not _supports_multi_delete(SlottedBatch())
+
+    def test_slotted_prefixed_delete_sweeps_through_it(self) -> None:
+        """Kody's case end to end: a per-instance prefixing delete in a slot, beside a raw batch."""
+        from collections.abc import Callable
+
+        class Slotted:
+            __slots__ = ("store", "delete", "batches")
+
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+                self.batches: list[list[str]] = []
+                self.delete: Callable[[str], bool] = lambda key: self.store.pop("app:" + key, None) is not None
+
+            def get(self, key: str) -> Optional[bytes]:
+                return self.store.get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                self.store["app:" + key] = value
+
+            def _delete_many(self, keys: list[str]) -> set[str]:  # raw keys: wrong for this backend
+                self.batches.append(list(keys))
+                for k in keys:
+                    self.store.pop(k, None)
+                return set()
+
+            def exists(self, key: str) -> bool:
+                return "app:" + key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, Any]]:
+                return True, {"backend_type": "fake", "latency_ms": 0.0}
+
+        backend = Slotted()
+
+        @cache(backend=backend, ttl=60, namespace="multi_slotted_prefix")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
     def test_dynamically_prefixed_delete_sweeps_through_it(self) -> None:
         """An instance whose delete() rewrites keys: the sweep must not batch-delete the raw keys."""
 

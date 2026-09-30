@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import types
 import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
@@ -377,8 +378,9 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
 
     Conservative beyond the class: an instance attribute named ``delete`` or ``_delete_many``,
     or a class that customises ``__getattribute__``, can make the ``delete`` a caller sees
-    differ from the class's, so either one also means no batch path. A false negative only
-    costs round trips; a false positive loses erasure.
+    differ from the class's, and so can a class entry that is not a plain function (a
+    ``__slots__`` member, a property, any other descriptor): each means no batch path. A
+    false negative only costs round trips; a false positive loses erasure.
     """
     cls = type(backend)
     if cls.__getattribute__ is not object.__getattribute__:
@@ -389,12 +391,15 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
         instance_attrs = {}
     if not isinstance(instance_attrs, dict) or "delete" in instance_attrs or "_delete_many" in instance_attrs:
         return False
-    mro = cls.__mro__
-    batch_owner = next((c for c in mro if "_delete_many" in c.__dict__), None)
-    if batch_owner is None or not callable(batch_owner.__dict__["_delete_many"]):
-        return False
-    delete_owner = next((c for c in mro if "delete" in c.__dict__), None)
-    return delete_owner is None or issubclass(batch_owner, delete_owner)
+    owners: dict[str, type] = {}
+    for name in ("delete", "_delete_many"):
+        owner = next((c for c in cls.__mro__ if name in c.__dict__), None)
+        # Only a plain function resolves the same for every instance; a slot, property or other
+        # descriptor may not, so it cannot vouch that the batch deletes what delete() would.
+        if owner is None or not isinstance(owner.__dict__[name], types.FunctionType):
+            return False
+        owners[name] = owner
+    return issubclass(owners["_delete_many"], owners["delete"])
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
