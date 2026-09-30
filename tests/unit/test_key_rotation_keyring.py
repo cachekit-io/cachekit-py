@@ -22,7 +22,8 @@ Covers:
   data-derived ValueErrors stay a miss. Behind @cache that holds on every L2 read
   (sync, async, SWR-capable, the async lock double-checks), with the function never
   run and nothing counted on the circuit breaker, and on the write of a cold key
-  (sync, async, both async lock shapes), on every call, with the breaker closed.
+  (sync, async, both async lock shapes, L1 on or off), on every call, with the
+  breaker closed; CacheOperationHandler's write methods raise it too.
 - End-to-end rotation round-trip through CacheSerializationHandler with the env
   configuration: write under k1, rotate to k2 with k1 decrypt-only, read without
   re-encryption; drop k1, read follows the fail policy.
@@ -45,6 +46,7 @@ from cachekit import cache
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
 from cachekit.decorators.stats_context import get_current_function_stats
+from cachekit.l1_cache import get_l1_cache
 from cachekit.reliability.circuit_breaker import CircuitState
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
@@ -696,7 +698,7 @@ async def _call(fn: Any, *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True) -> Any:
+def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True, l1_enabled: bool = False) -> Any:
     """Every call decorates a function of the same qualname, so a fresh reader,
     whose wrapper is built lazily on its first read, computes the writer's key."""
     if is_async:
@@ -714,7 +716,7 @@ def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryptio
     return cache(
         backend=backend,
         ttl=300,
-        l1_enabled=False,
+        l1_enabled=l1_enabled,
         namespace="lab4841",
         encryption=encryption,
         single_tenant_mode=encryption,
@@ -810,11 +812,12 @@ class TestDecoratorL2ReadsFailLoud:
 
 
 @pytest.mark.usefixtures("_read_site_env")
-class TestDecoratorL2WritesFailLoud:
+class TestL2WritesFailLoud:
     """On a cold key the read misses before any wrapper is built, so the keyring
-    config fault first fires on the write. It reaches the caller there too, and is
-    never counted: a breaker it opened would skip the read-side raise on every later
-    call and serve uncached without a word."""
+    config fault first fires on the write. It reaches the caller there too, from
+    @cache and from CacheOperationHandler, and @cache never counts it: a breaker it
+    opened would skip the read-side raise on every later call and serve uncached
+    without a word."""
 
     @pytest.mark.parametrize(
         ("is_async", "make_backend"),
@@ -826,11 +829,14 @@ class TestDecoratorL2WritesFailLoud:
         ],
         ids=["sync", "async", "async-redis-lock", "async-finally-lock"],
     )
-    async def test_cold_key_write_raises_on_every_call(self, monkeypatch, live_breakers, is_async, make_backend):
+    @pytest.mark.parametrize("l1_enabled", [False, True], ids=["l1-off", "l1-on"])
+    async def test_cold_key_write_raises_on_every_call(self, monkeypatch, live_breakers, is_async, make_backend, l1_enabled):
         _settings_previous_keys(monkeypatch, [K2])
         backend = make_backend()
+        l1 = get_l1_cache("lab4841")
+        l1.clear()
         runs: list[int] = []
-        fn = _decorate(backend, runs, is_async=is_async)
+        fn = _decorate(backend, runs, is_async=is_async, l1_enabled=l1_enabled)
         (breaker,) = live_breakers
 
         for _ in range(7):  # past the default failure_threshold of five
@@ -840,8 +846,58 @@ class TestDecoratorL2WritesFailLoud:
 
         assert runs == [1] * 7  # the function runs; its result is never stored
         assert backend.store == {}
+        assert l1.get_stats()["entries"] == 0  # the raise precedes the L1 put
         assert breaker.state is CircuitState.CLOSED
         assert breaker.failure_count == 0
+
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    async def test_fault_raised_by_the_function_is_not_counted(self, live_breakers, is_async):
+        """The decorated function can raise it too, from a nested cached call."""
+        if is_async:
+
+            async def compute(x: int) -> None:
+                raise KeyringConfigurationError("Keyring configuration invalid: nested")
+
+        else:
+
+            def compute(x: int) -> None:
+                raise KeyringConfigurationError("Keyring configuration invalid: nested")
+
+        fn = cache(backend=_ByteStore(), ttl=300, l1_enabled=False, namespace="lab4841")(compute)
+        (breaker,) = live_breakers
+
+        for _ in range(7):
+            with pytest.raises(KeyringConfigurationError, match="nested"):
+                await _call(fn, 1)
+
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.failure_count == 0
+
+    @pytest.mark.parametrize("method", ["store_result", "store_result_async"])
+    async def test_operation_handler_write_raises(self, monkeypatch, method):
+        from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
+        from cachekit.key_generator import CacheKeyGenerator
+
+        class _Backend:
+            def __init__(self) -> None:
+                self.sets: list[str] = []
+
+            def set(self, cache_key: str, *args: Any, **kwargs: Any) -> bool:
+                self.sets.append(cache_key)
+                return True
+
+            async def set_async(self, cache_key: str, *args: Any, **kwargs: Any) -> bool:
+                return self.set(cache_key)
+
+        _settings_previous_keys(monkeypatch, [K2])
+        backend = _Backend()
+        serialization = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=K2.hex())
+        op = CacheOperationHandler(serialization, CacheKeyGenerator(), cache_handler=backend)
+
+        with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
+            await _call(getattr(op, method), "key:a", {"x": 1}, 60)
+
+        assert backend.sets == []
 
 
 class TestEndToEndRotation:

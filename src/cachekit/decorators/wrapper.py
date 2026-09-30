@@ -1758,9 +1758,10 @@ def create_cache_wrapper(
             return result
 
         except KeyringConfigurationError:
-            # From the write: local config, not a function or backend failure. Counting
-            # it would open the breaker, and an open breaker skips the L2 read and write
-            # that raise it, so every later call would run uncached without a word.
+            # From the write, or a nested cached call's: a local config fault, not a
+            # backend failure. Counting it would open the breaker, and an open breaker
+            # skips the L2 read and write that raise it, so every later call would run
+            # uncached without a word.
             raise
         except Exception as e:
             # Other exceptions - record and re-raise
@@ -2253,7 +2254,7 @@ def create_cache_wrapper(
                 return result
 
             except KeyringConfigurationError:
-                # From the write: never counted (see the sync wrapper).
+                # From the write, or a nested cached call's: never counted (see the sync wrapper).
                 raise
             except Exception as e:
                 # Function execution failed - record and re-raise

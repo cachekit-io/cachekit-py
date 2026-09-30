@@ -1855,9 +1855,8 @@ class CacheOperationHandler:
                 get_logger().cache_stored(cache_key, ttl)
 
             return StoreOutcome(envelope=serialized_data, stored=bool(stored))
-        except InteropError:
-            # Interop/v1 data-model rejection: fail loud, never "computed but
-            # silently never cached" (spec-mandated; matches cachekit-ts).
+        except (InteropError, KeyringConfigurationError):
+            # As in store_result: fail loud, never "computed but silently never cached".
             raise
         except Exception as e:
             get_logger().warning(
