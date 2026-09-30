@@ -403,6 +403,15 @@ class AsyncMetricsCollector:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
     @staticmethod
+    def _series(metric: Any, labels: dict[str, Any]) -> Any:
+        """Return the series of ``metric`` that ``labels`` names.
+
+        prometheus_client rejects ``.labels()`` on a metric built with no label names, so a label-less
+        record updates the metric itself.
+        """
+        return metric.labels(**labels) if labels else metric
+
+    @staticmethod
     def _check_generic_metric(name: Any, labels: dict[Any, Any], value: Any) -> float:
         """Validate a caller-supplied counter or histogram and return its value as a float.
 
@@ -487,7 +496,7 @@ class AsyncMetricsCollector:
                 for labels_key, value in label_values.items():
                     labels_dict = dict(labels_key)  # type: ignore[arg-type]
                     try:
-                        counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                        self._series(counter_metric, labels_dict).inc(value)  # type: ignore[arg-type]
                     except ValueError as e:
                         failures, last_error = failures + 1, e
                 if last_error is not None:
@@ -509,7 +518,7 @@ class AsyncMetricsCollector:
                 for value, labels_key in observations:
                     labels_dict = dict(labels_key)
                     try:
-                        histogram_metric.labels(**labels_dict).observe(value)
+                        self._series(histogram_metric, labels_dict).observe(value)
                     except ValueError as e:
                         failures, last_error = failures + 1, e
                 if last_error is not None:
@@ -676,7 +685,7 @@ class AsyncMetricsCollector:
 
         value = self._check_generic_metric(metric_name, labels, value)
         counter = self._get_metric(metric_name, Counter, f"Counter metric {metric_name}", list(labels.keys()))
-        counter.labels(**labels).inc(value)
+        self._series(counter, labels).inc(value)
 
     def _record_histogram_sync(self, metric_name: str, value: float, labels: dict[str, Any]):
         """Record histogram directly to Prometheus (sync mode)."""
@@ -685,7 +694,7 @@ class AsyncMetricsCollector:
 
         value = self._check_generic_metric(metric_name, labels, value)
         histogram = self._get_metric(metric_name, Histogram, f"Histogram metric {metric_name}", list(labels.keys()))
-        histogram.labels(**labels).observe(value)
+        self._series(histogram, labels).observe(value)
 
     # Async mode implementations (queued processing)
     def _record_cache_operation_async(
