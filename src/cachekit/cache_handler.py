@@ -383,8 +383,11 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
     cls = type(backend)
     if cls.__getattribute__ is not object.__getattribute__:
         return False
-    instance_attrs = getattr(backend, "__dict__", {})
-    if "delete" in instance_attrs or "_delete_many" in instance_attrs:
+    try:  # object.__getattribute__: a __slots__ backend's __getattr__ must not answer for __dict__
+        instance_attrs = object.__getattribute__(backend, "__dict__")
+    except AttributeError:
+        instance_attrs = {}
+    if not isinstance(instance_attrs, dict) or "delete" in instance_attrs or "_delete_many" in instance_attrs:
         return False
     mro = cls.__mro__
     batch_owner = next((c for c in mro if "_delete_many" in c.__dict__), None)

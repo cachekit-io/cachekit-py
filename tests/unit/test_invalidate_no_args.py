@@ -702,6 +702,54 @@ class TestInvalidateNoArgsMultiDelete:
         assert not _supports_multi_delete(Dispatching())
         assert _supports_multi_delete(MultiDeleteBackend())
 
+    def test_slots_backend_with_getattr_does_not_break_the_guard(self) -> None:
+        """A __slots__ backend has no instance __dict__; its __getattr__ must not answer for one."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Slotted:
+            __slots__ = ("store",)
+
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+
+            def __getattr__(self, name: str) -> Any:
+                if name == "__dict__":  # reached only through a plain getattr: slots leave no __dict__
+                    return lambda *a, **k: None  # not a container: `in` on it would raise TypeError
+                raise AttributeError(name)
+
+            def get(self, key: str) -> Optional[bytes]:
+                return self.store.get(key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                self.store[key] = value
+
+            def delete(self, key: str) -> bool:
+                return self.store.pop(key, None) is not None
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                for k in keys:
+                    self.store.pop(k, None)
+                return set()
+
+            def exists(self, key: str) -> bool:
+                return key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, Any]]:
+                return True, {"backend_type": "fake", "latency_ms": 0.0}
+
+        backend = Slotted()
+        assert _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_slots_getattr")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        assert f.invalidate_cache() is None
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
     def test_dynamically_prefixed_delete_sweeps_through_it(self) -> None:
         """An instance whose delete() rewrites keys: the sweep must not batch-delete the raw keys."""
 
