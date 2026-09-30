@@ -11,9 +11,14 @@ ALL cached entries for that function (namespace-level invalidation).
 
 from __future__ import annotations
 
+import contextvars
+import logging
+from typing import Any, Optional
+
 import pytest
 
 from cachekit import cache
+from cachekit.backends.errors import BackendError
 from cachekit.backends.file import FileBackend, FileBackendConfig
 
 
@@ -327,3 +332,253 @@ class TestInvalidateNoArgsCrossFunctionIsolation:
         assert a_count == 2  # recalculated
         fn_b(1)
         assert b_count == 1  # still cached
+
+
+_tenant: contextvars.ContextVar[str] = contextvars.ContextVar("_tenant", default="a")
+_ERROR_TEXT = "detail naming the raw key"
+
+
+class FlakyBackend:
+    """In-memory L2 whose delete raises ``delete_error`` while it is set. No key registry."""
+
+    def __init__(self, delete_error: Optional[BaseException] = None) -> None:
+        self.store: dict[str, bytes] = {}
+        self.delete_error = delete_error
+
+    def get(self, key: str) -> Optional[bytes]:
+        return self.store.get(key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        self.store[key] = value
+
+    def delete(self, key: str) -> bool:
+        if self.delete_error is not None:
+            raise self.delete_error
+        return self.store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self.store
+
+    def health_check(self) -> tuple[bool, dict[str, Any]]:
+        return True, {"backend_type": "fake", "latency_ms": 0.0}
+
+
+class ScopedFlakyBackend(FlakyBackend):
+    """FlakyBackend under a per-context tenant prefix, like a tenant-scoped backend."""
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def get(self, key: str) -> Optional[bytes]:
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def delete(self, key: str) -> bool:
+        return super().delete(self.key_prefix + key)
+
+
+class DrainFailingBackend(FlakyBackend):
+    """Has a key registry whose drain always fails, so no-args falls back to the local sweep."""
+
+    def track_key(self, registry_id: str, key: str) -> None:
+        pass
+
+    def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+        raise BackendError("drain failed")
+
+
+def _failed_delete_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Visible (WARNING+) failed-delete records on a cachekit logger."""
+    return [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name.startswith("cachekit") and "Failed to delete" in r.getMessage()
+    ]
+
+
+FAILURES = [BackendError(_ERROR_TEXT), OSError(_ERROR_TEXT)]
+
+
+@pytest.mark.unit
+class TestInvalidateFailedDeleteVisibility:
+    """A failed L2 delete never raises, and a failing no-args sweep logs ONE visible counted record."""
+
+    @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
+    @pytest.mark.parametrize("with_args", [True, False], ids=["args", "no_args"])
+    def test_sync_never_raises(self, error: BaseException, with_args: bool) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace=f"visible_sync_raise_{with_args}")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        backend.delete_error = error
+        assert (f.invalidate_cache(1) if with_args else f.invalidate_cache()) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
+    @pytest.mark.parametrize("with_args", [True, False], ids=["args", "no_args"])
+    async def test_async_never_raises(self, error: BaseException, with_args: bool) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace=f"visible_async_raise_{with_args}")
+        async def f(x: int) -> int:
+            return x
+
+        await f(1)
+        backend.delete_error = error
+        assert (await f.ainvalidate_cache(1) if with_args else await f.ainvalidate_cache()) is None
+
+    @pytest.mark.parametrize("error", FAILURES, ids=lambda e: type(e).__name__)
+    def test_sync_sweep_logs_one_counted_record(self, caplog: pytest.LogCaptureFixture, error: BaseException) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_sync_count")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(5000):
+            f(i)
+        raw_keys = list(backend.store)
+        backend.delete_error = error
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "delete 5000 L2 key" in message
+        assert _ERROR_TEXT not in message
+        assert not any(key in message for key in raw_keys)
+
+    @pytest.mark.asyncio
+    async def test_async_sweep_logs_one_counted_record(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_async_count")
+        async def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            await f(i)
+        raw_keys = list(backend.store)
+        backend.delete_error = BackendError(_ERROR_TEXT)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            await f.ainvalidate_cache()
+
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "delete 3 L2 key" in message
+        assert _ERROR_TEXT not in message
+        assert not any(key in message for key in raw_keys)
+
+    def test_drain_fallback_logs_one_record_beside_drain_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = DrainFailingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_drain_fallback")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        backend.delete_error = OSError(_ERROR_TEXT)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 2 L2 key" in records[0].getMessage()
+        assert sum("Key registry drain failed" in r.getMessage() for r in caplog.records) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_drain_fallback_logs_one_record(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = DrainFailingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_async_drain_fallback")
+        async def f(x: int) -> int:
+            return x
+
+        await f(1)
+        backend.delete_error = BackendError(_ERROR_TEXT)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            await f.ainvalidate_cache()
+
+        assert len(_failed_delete_records(caplog)) == 1
+
+    def test_successful_sweep_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_success")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        assert _failed_delete_records(caplog) == []
+        assert backend.store == {}
+
+    def test_l1_only_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        @cache(backend=None, ttl=60, namespace="visible_l1_only")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        assert _failed_delete_records(caplog) == []
+
+    def test_other_tenant_entries_are_not_counted(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = ScopedFlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_tenants")
+        def f(x: int) -> int:
+            return x
+
+        token = _tenant.set("b")
+        try:
+            f(1)
+            f(2)  # tenant b's two entries: skipped by tenant a's sweep, never counted
+        finally:
+            _tenant.reset(token)
+        backend.delete_error = BackendError(_ERROR_TEXT)
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()  # tenant a owns nothing
+        assert _failed_delete_records(caplog) == []
+
+        f(3)  # tenant a's one entry
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 1 L2 key" in records[0].getMessage()
+
+    def test_failed_keys_are_retried_once_backend_recovers(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FlakyBackend()
+
+        @cache(backend=backend, ttl=60, namespace="visible_retry")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        backend.delete_error = BackendError(_ERROR_TEXT)
+        f.invalidate_cache()
+        assert len(backend.store) == 2  # still in L2, still tracked
+
+        backend.delete_error = None
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        assert backend.store == {}
+        assert _failed_delete_records(caplog) == []
