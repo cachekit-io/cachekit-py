@@ -1,7 +1,9 @@
 """Test that pydantic-settings properly handles environment variables for backend configs."""
 
 import pytest
+from pydantic import ValidationError
 
+from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import CachekitConfig
 
@@ -110,12 +112,26 @@ class TestRedisBackendConfigEnv:
             "EARLY_REFRESH_RATIO": "0.5",
             "ENABLE_CORRUPTION_DETECTION": "false",
             "MAX_KEY_SIZE": "2048",
+            "L1_ENABLED": "false",
+            "ENABLE_PROMETHEUS_METRICS": "false",
+            "BACKEND_PROVIDER_CLASS": "cachekit.backends.redis.provider.RedisBackendProvider",
         }
         for name, value in removed.items():
             monkeypatch.setenv(f"CACHEKIT_{name}", value)
 
         config = CachekitConfig.from_env()
         assert [knob for knob in removed if hasattr(config, knob.lower())] == []
+
+    def test_removed_cachekitio_max_retries_env_var_is_ignored(self, monkeypatch):
+        """A stale CACHEKIT_MAX_RETRIES export must not break CachekitIO startup; the kwarg is rejected."""
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_key")
+        monkeypatch.setenv("CACHEKIT_MAX_RETRIES", "5")
+
+        config = CachekitIOBackendConfig.from_env()
+        assert not hasattr(config, "max_retries")
+
+        with pytest.raises(ValidationError):
+            CachekitIOBackendConfig(api_key="ck_test_key", max_retries=5)  # pragma: allowlist secret
 
 
 class TestRedisUrlAliasChoicesPriority:

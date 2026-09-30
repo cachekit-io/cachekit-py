@@ -46,12 +46,9 @@ class CachekitConfig(RedactingSettings):
     handled by backend-specific config classes.
 
     Attributes:
-        enable_prometheus_metrics: Whether to enable Prometheus metrics collection
         max_value_size: Maximum cache value size in bytes
-        l1_enabled: Enable L1 in-memory cache for performance
         l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
         l1_cleanup_interval_seconds: Background cleanup interval for expired entries
-        backend_provider_class: Backend provider class path (for testing)
 
     Examples:
         Create with defaults:
@@ -139,10 +136,6 @@ class CachekitConfig(RedactingSettings):
             "values stay buffered). Env: CACHEKIT_ARROW_COMPRESSION."
         ),
     )
-    enable_prometheus_metrics: bool = Field(
-        default=True,
-        description="Whether to enable Prometheus metrics collection",
-    )
 
     # Size limits
     max_value_size: int = Field(
@@ -152,10 +145,6 @@ class CachekitConfig(RedactingSettings):
     )
 
     # L1 (In-Memory) Cache Configuration
-    l1_enabled: bool = Field(
-        default=True,
-        description="Enable L1 in-memory cache for performance (eliminates network latency)",
-    )
     l1_max_size_mb: int = Field(
         default=100,
         gt=0,
@@ -225,12 +214,6 @@ class CachekitConfig(RedactingSettings):
             "DecryptionAuthenticationError to the caller instead of silently recomputing. "
             "Per-decorator EncryptionConfig(fail_closed=...) overrides this fleet-wide default."
         ),
-    )
-
-    # Backend provider configuration (for testing)
-    backend_provider_class: Optional[str] = Field(
-        default=None,
-        description="Backend provider class path (e.g., 'cachekit.backends.redis.provider.RedisBackendProvider')",
     )
 
     @field_validator("previous_master_keys", mode="before")
