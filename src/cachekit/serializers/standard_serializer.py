@@ -355,6 +355,10 @@ class StandardSerializer:
             # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
             if metadata is not None and metadata.compressed:
                 raise SerializationError(_CROSS_CONFIG_ERROR)
+            if isinstance(data, memoryview):
+                # Flatten to unsigned bytes as unpackb_bounded does, so the layout test indexes the same
+                # bytes the decode reads: a signed view reads the 0x94 lead as -108.
+                data = data.cast("B") if data.c_contiguous else bytes(data)
             value = unpackb_bounded(data, **self._msgpack_unpack_opts)
             if self._is_verified_envelope(data, value):
                 raise SerializationError(_CROSS_CONFIG_ERROR)

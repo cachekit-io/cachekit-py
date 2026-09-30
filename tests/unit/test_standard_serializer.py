@@ -511,7 +511,16 @@ class TestStandardSerializerIntegrityChecking:
             pytest.param(lambda meta: None, id="no-metadata"),
         ],
     )
-    @pytest.mark.parametrize("wrap", [bytes, memoryview])
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            pytest.param(bytes, id="bytes"),
+            pytest.param(memoryview, id="memoryview"),
+            # indexes to signed ints (0x94 reads as -108), so the layout test must see a normalised view
+            pytest.param(lambda b: memoryview(b).cast("b"), id="signed-memoryview"),
+            pytest.param(bytearray, id="bytearray"),
+        ],
+    )
     def test_enveloped_entry_read_with_integrity_off_fails_closed(self, header, wrap) -> None:
         """Writer on, reader off: the envelope is refused whatever the header says, rather than
         returning its positional fields ``[payload, checksum, size, format]`` as the value."""
