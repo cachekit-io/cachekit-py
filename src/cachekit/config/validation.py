@@ -63,23 +63,39 @@ class RedactingSettings(BaseSettings):
     ValueError), so fail-loud propagation paths are unchanged.
     """
 
+    # Every entry point drops its raw-input locals in a finally: the raised error's traceback holds
+    # these frames, and error trackers capture frame locals (Sentry does by default). The partial is
+    # never bound here, so _redacting holds the only reference and drops it before raising. `obj` is
+    # the caller's object, so it is unbound, never mutated.
     def __init__(self, **kwargs: Any) -> None:
-        _redacting(functools.partial(super().__init__, **kwargs))
+        try:
+            _redacting(functools.partial(super().__init__, **kwargs))
+        finally:
+            del kwargs
 
     # pydantic calls the overridden __init__ only for mapping input. Malformed JSON, a non-object
     # document, non-mapping input and the strings mode fail in the core validator first, so the
     # model_validate* classmethods redact on their own.
     @classmethod
     def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
-        return _redacting(functools.partial(super().model_validate, obj, **kwargs))
+        try:
+            return _redacting(functools.partial(super().model_validate, obj, **kwargs))
+        finally:
+            del obj, kwargs
 
     @classmethod
     def model_validate_json(cls, json_data: str | bytes | bytearray, **kwargs: Any) -> Self:
-        return _redacting(functools.partial(super().model_validate_json, json_data, **kwargs))
+        try:
+            return _redacting(functools.partial(super().model_validate_json, json_data, **kwargs))
+        finally:
+            del json_data, kwargs
 
     @classmethod
     def model_validate_strings(cls, obj: Any, **kwargs: Any) -> Self:
-        return _redacting(functools.partial(super().model_validate_strings, obj, **kwargs))
+        try:
+            return _redacting(functools.partial(super().model_validate_strings, obj, **kwargs))
+        finally:
+            del obj, kwargs
 
 
 def _redacting(validate: Callable[[], _T]) -> _T:
@@ -97,6 +113,8 @@ def _redacting(validate: Callable[[], _T]) -> _T:
         failure: ValidationError | SettingsError = e
     except (SettingsError, UnicodeError) as e:
         failure = SettingsError(str(e))
+    finally:
+        del validate  # it binds the raw input, and this frame is on the traceback of what is raised
     # Redacted and raised OUTSIDE the except block, so nothing raised or reported meanwhile has the
     # original as its __context__: `raise ... from None` only suppresses display, and the exception a
     # ctx exception's str() raises once its chain is dropped is reported to sys.unraisablehook as the
