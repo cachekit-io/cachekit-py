@@ -59,7 +59,7 @@ FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
 # Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
-_RESERVED_KEY_SEGMENTS = frozenset({".", "..", "health", "ttl", "lock"})
+_RESERVED_KEY_SEGMENTS = frozenset({"", ".", "..", "health", "ttl", "lock"})
 
 _API_KEY_HINT = (
     "\n\ncachekit.io requires an API key: pass api_key=... or set CACHEKIT_API_KEY\nGet an API key at: https://cachekit.io"
@@ -261,15 +261,17 @@ class CachekitIOBackend:
         canonical key round-trips byte-for-byte. See ``SECURITY.md`` for the cross-SDK
         wire-parity contract (cachekit-rs / cachekit-ts).
 
-        Reserved segments: ``.``, ``..``, ``health``, ``ttl`` and ``lock`` encode to
-        themselves and cannot be sent at all (protocol ``spec/saas-api.md`` § Cache-Key Path
-        Encoding, rule 2). The dots are dot-segments that a URL parser removes before routing
-        (``..`` -> ``/v1``, ``../ttl`` -> ``/v1/ttl``), and percent-encoding them does not
-        help: the SaaS parses the URL under WHATWG, which collapses ``%2E`` / ``%2E%2E`` too.
-        The words are route tokens (``/v1/cache/health`` is the health endpoint). Either way
-        the request would reach a different route with the bearer token, so these keys are
-        rejected before any request is made. Only an exact match is reserved: ``a:..`` and
-        ``..a`` are sent as-is, and canonical keys (which always contain ``:``) never match.
+        Reserved segments: the empty key, ``.``, ``..``, ``health``, ``ttl`` and ``lock``
+        encode to themselves and cannot be sent at all (protocol ``spec/saas-api.md``
+        § Cache-Key Path Encoding, rule 2). The dots are dot-segments that a URL parser
+        removes before routing (``..`` -> ``/v1``, ``../ttl`` -> ``/v1/ttl``), and
+        percent-encoding them does not help: the SaaS parses the URL under WHATWG, which
+        collapses ``%2E`` / ``%2E%2E`` too. The words are route tokens (``/v1/cache/health``
+        is the health endpoint). The empty key is an empty segment: ``/v1/cache/`` and
+        ``/v1/cache//ttl`` address no stored entry. Each of these would send the bearer token
+        to a path that is not the caller's entry, so they are rejected before any request
+        is made. Only an exact match is reserved: ``a:..`` and ``..a`` are sent as-is, and
+        canonical keys (which always contain ``:``) never match.
 
         Raises:
             BackendError: ``PERMANENT`` (never retried) — the key is reserved. Raised from every

@@ -14,8 +14,9 @@ token:
     ../ttl   ->  GET /v1/ttl          (collapse onto a *different* route)
 
 A bare ``.`` / ``..`` key has no safe wire form (percent-encoded dots are collapsed
-server-side), and neither do the route tokens ``health`` / ``ttl`` / ``lock``: those
-five are rejected before any request (protocol rule 2, LAB-2880). See ``SECURITY.md``.
+server-side), and neither do the route tokens ``health`` / ``ttl`` / ``lock`` or the
+empty key: those six are rejected before any request (protocol rule 2, LAB-2880,
+LAB-6550). See ``SECURITY.md``.
 
 These tests drive the real backend methods through a real ``httpx`` client backed
 by a ``MockTransport`` and assert on ``request.url.raw_path`` — the actual bytes
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json as _json
 from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
@@ -53,8 +55,13 @@ _TRAVERSAL_KEYS = [
 
 # Rule 2 reserved segments: no wire form reaches the SaaS key validator, so the
 # client must raise before building the URL (dot segments collapse client- or
-# server-side; the words are route tokens under /v1/cache/).
-_RESERVED_KEYS = [".", "..", "health", "ttl", "lock"]
+# server-side; the words are route tokens under /v1/cache/; an empty key addresses
+# no stored entry). Taken from the pinned protocol fixture's ``reject`` rows, so a
+# new reserved key reaches every operation below by re-vendoring alone.
+_PATH_ENCODING_FIXTURE = Path(__file__).parents[1] / "protocol" / "fixtures" / "path-encoding.json"
+_RESERVED_KEYS = [
+    v["key"] for v in _json.loads(_PATH_ENCODING_FIXTURE.read_text(encoding="utf-8"))["vectors"] if v.get("reject")
+]
 
 
 def _recording_transport() -> tuple[httpx.MockTransport, list[httpx.Request]]:

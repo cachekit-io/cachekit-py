@@ -104,9 +104,9 @@ async def async_cached_function(x):
 # is_healthy, details = await backend.health_check_async()
 ```
 
-Direct calls reject five reserved keys, `.`, `..`, `health`, `ttl` and `lock`, with a
-`PERMANENT` `BackendError` before any request is sent: no URL can carry them to the
-cache (see [SECURITY.md](../../SECURITY.md#cache-key-path-encoding-cwe-22)). Decorator keys
+Direct calls reject six reserved keys, the empty key `""`, `.`, `..`, `health`, `ttl` and
+`lock`, with a `PERMANENT` `BackendError` before any request is sent: no URL can carry them
+to a stored entry (see [SECURITY.md](../../SECURITY.md#cache-key-path-encoding-cwe-22)). Decorator keys
 always contain `:`, so they never hit this.
 
 ## Distributed Locking (async only)
