@@ -1417,77 +1417,31 @@ def create_cache_wrapper(
             reset_current_function_stats(token)
             raise
 
-        # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
-        # with its probe budget spent) - run the function uncached. This sits
-        # outside the try below on purpose: that except records a failure, and a
-        # rejection is not one. Recorded, every rejected call would push the OPEN
-        # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        if not features.should_allow_request():
-            features.log_cache_operation(
-                operation="circuit_breaker_open",
-                key=cache_key,
-                namespace=namespace or "default",
-                serializer="rust",
-                error="Circuit breaker rejected the request",
-                error_type="CircuitBreakerOpen",
-            )
-            reset_current_function_stats(token)
-            return func(*args, **kwargs)
-
-        with features.create_span("redis_cache", span_attributes) as span:
-            try:
-                # Add cache key to span attributes
-                if span:
-                    features.set_span_attributes(span, {"cache.key": cache_key})
-
-                nonlocal _backend
-                if _backend is None:
-                    _backend = _resolve_lazy_backend()
-                    _l2_scope()  # first call: the tenant check above ran before the backend existed
-
-                # Setup cache handler strategy on first use
-                handler = StandardCacheHandler(
-                    _backend,
-                    backpressure_controller=features.backpressure,
-                    ttl_refresh_threshold=ttl_refresh_threshold,
-                )
-                operation_handler.set_cache_handler(handler)
-            except UnsupportedTenantError:
-                # From the first-call check above, or from a provider that checks the tenant while
-                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
-                # client failure, so never degraded or counted (LAB-5713).
-                reset_current_function_stats(token)
-                raise
-            except Exception as e:
-                # Guard clause: Client creation failed - early return with fallback
-                features.handle_cache_error(
-                    error=e,
-                    operation="client_creation",
-                    cache_key=cache_key or "unknown",
-                    namespace=namespace or "default",
-                    span=span,
-                    duration_ms=0.0,
-                    serializer="rust",
-                )
-                # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
-                reset_current_function_stats(token)
-                return func(*args, **kwargs)
+        nonlocal _backend
 
         # Interop fail-closed guard (CWE-636): a key-prefixing backend would make
-        # this SDK read/write a key other SDKs cannot see. Re-checked per call
-        # (outside the try above, so it propagates) because the backend is
-        # lazily resolved and a prefix could appear dynamically. The raise path
-        # must restore the stats context itself — it sits outside the main
-        # try/finally (see test_context_leak_regression.py).
-        if interop is not None:
+        # this SDK read/write a key other SDKs cannot see. Re-checked on every call
+        # because the backend is lazily resolved and a prefix could appear
+        # dynamically. It runs before the L1 lookup, because an L1 hit returns early
+        # and must not skip it (LAB-5351). ensure_interop_backend_compatible(None)
+        # is a no-op, so until the backend is resolved an interop call skips L1 and
+        # is checked right after resolution, below. The raise paths sit outside the
+        # main try/finally, so they restore the stats context themselves (see
+        # test_context_leak_regression.py).
+        interop_checked = False
+        if interop is not None and _backend is not None:
             try:
                 ensure_interop_backend_compatible(_backend)
             except Exception:
                 reset_current_function_stats(token)
                 raise
+            interop_checked = True
 
-        # Guard clause: L1 cache check first - early return eliminates network latency
-        if _l1_cache and cache_key:
+        # Guard clause: L1 cache check first - early return eliminates network latency.
+        # It runs before the breaker's admission check and records no breaker outcome:
+        # the breaker tracks backend health, and an L1 hit never reaches the backend,
+        # so it is served whatever the breaker state (LAB-5351).
+        if _l1_cache and cache_key and (interop is None or interop_checked):
             l1_found, l1_bytes = _l1_cache.get(cache_key)
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
@@ -1495,7 +1449,6 @@ def create_cache_wrapper(
                     l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                     features.set_operation_context("l1_get", duration_ms=0.001)
-                    features.record_success()
 
                     # Record L1 cache hit metrics
                     if features.collect_stats:
@@ -1562,6 +1515,69 @@ def create_cache_wrapper(
                         f"L1 cache deserialization failed for {redact_cache_key(cache_key)}: {redact_error_for_log(e)}"
                     )
                     _l1_cache.invalidate(cache_key)
+
+        # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
+        # with its probe budget spent) - run the function uncached. This sits
+        # outside the try below on purpose: that except records a failure, and a
+        # rejection is not one. Recorded, every rejected call would push the OPEN
+        # window forward and reopen HALF_OPEN, so the breaker never recovers.
+        if not features.should_allow_request():
+            features.log_cache_operation(
+                operation="circuit_breaker_open",
+                key=cache_key,
+                namespace=namespace or "default",
+                serializer="rust",
+                error="Circuit breaker rejected the request",
+                error_type="CircuitBreakerOpen",
+            )
+            reset_current_function_stats(token)
+            return func(*args, **kwargs)
+
+        with features.create_span("redis_cache", span_attributes) as span:
+            try:
+                # Add cache key to span attributes
+                if span:
+                    features.set_span_attributes(span, {"cache.key": cache_key})
+
+                if _backend is None:
+                    _backend = _resolve_lazy_backend()
+                    _l2_scope()  # first call: the tenant check above ran before the backend existed
+
+                # Setup cache handler strategy on first use
+                handler = StandardCacheHandler(
+                    _backend,
+                    backpressure_controller=features.backpressure,
+                    ttl_refresh_threshold=ttl_refresh_threshold,
+                )
+                operation_handler.set_cache_handler(handler)
+            except UnsupportedTenantError:
+                # From the first-call check above, or from a provider that checks the tenant while
+                # building the backend (RedisBackendProvider.get_backend): a caller bug, not a
+                # client failure, so never degraded or counted (LAB-5713).
+                reset_current_function_stats(token)
+                raise
+            except Exception as e:
+                # Guard clause: Client creation failed - early return with fallback
+                features.handle_cache_error(
+                    error=e,
+                    operation="client_creation",
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    span=span,
+                    duration_ms=0.0,
+                    serializer="rust",
+                )
+                # WHY: Early return on backend failure - outside main try-finally, needs explicit cleanup
+                reset_current_function_stats(token)
+                return func(*args, **kwargs)
+
+        # First interop call: the check above had no backend to check (see there).
+        if interop is not None and not interop_checked:
+            try:
+                ensure_interop_backend_compatible(_backend)
+            except Exception:
+                reset_current_function_stats(token)
+                raise
 
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
@@ -1816,52 +1832,21 @@ def create_cache_wrapper(
             # outer finally resets the stats context.
             _l2_scope()
 
-            # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
-            # with its probe budget spent) - run the function uncached, as
-            # sync_wrapper does. Not recorded as a failure: a rejection is not one.
-            # The outer finally resets the stats context.
-            if not features.should_allow_request():
-                features.log_cache_operation(
-                    operation="circuit_breaker_open",
-                    key=cache_key,
-                    namespace=namespace or "default",
-                    serializer="rust",
-                    error="Circuit breaker rejected the request",
-                    error_type="CircuitBreakerOpen",
-                )
-                return await func(*args, **kwargs)
-
             nonlocal _backend
 
-            # Interop fail-closed guard (CWE-636): a key-prefixing backend would
-            # make this SDK read/write a key other SDKs cannot see. Re-checked per
-            # call because the backend is lazily resolved and a prefix could
-            # appear dynamically. MUST run before the L1 check below — an L1 hit
-            # early-returns and would bypass the per-call re-check (mirrors
-            # sync_wrapper's ordering). Backend is resolved eagerly for interop
-            # calls only, so the non-interop L1 fast path is unchanged. The raise
-            # propagates; the outer finally resets stats context.
-            if interop is not None:
-                if _backend is None:
-                    try:
-                        _backend = _resolve_lazy_backend()
-                    except UnsupportedTenantError:
-                        raise  # a caller bug, not a client failure: see sync_wrapper
-                    except Exception as e:
-                        # If Redis connection fails, execute function without caching - RETURN EARLY
-                        # This prevents the decorator from breaking the application
-                        features.handle_cache_error(
-                            error=e,
-                            operation="client_creation",
-                            cache_key=cache_key or "unknown",
-                            namespace=namespace or "default",
-                            duration_ms=0.0,
-                        )
-                        return await func(*args, **kwargs)
-                ensure_interop_backend_compatible(_backend)  # reads key_prefix, so runs the tenant check too
+            # Interop fail-closed guard (CWE-636): see sync_wrapper. Checked before
+            # the L1 lookup once the backend is resolved; until then an interop call
+            # skips L1 and is checked right after resolution, below, so backend
+            # resolution stays behind admission (LAB-5351). The raise propagates;
+            # the outer finally resets the stats context.
+            interop_checked = False
+            if interop is not None and _backend is not None:
+                ensure_interop_backend_compatible(_backend)
+                interop_checked = True
 
-            # Guard clause: L1 cache check first - early return eliminates network latency
-            if _l1_cache and cache_key:
+            # Guard clause: L1 cache check first - early return eliminates network latency.
+            # Before admission and recording no breaker outcome, as in sync_wrapper (LAB-5351).
+            if _l1_cache and cache_key and (interop is None or interop_checked):
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
@@ -1869,7 +1854,6 @@ def create_cache_wrapper(
                         l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
 
                         features.set_operation_context("l1_get", duration_ms=0.001)
-                        features.record_success()
 
                         # Record L1 cache hit metrics (same labels as the sync L1 hit)
                         if features.collect_stats:
@@ -1916,6 +1900,21 @@ def create_cache_wrapper(
                         )
                         _l1_cache.invalidate(cache_key)
 
+            # Guard clause: the circuit breaker rejected this call (OPEN, or HALF_OPEN
+            # with its probe budget spent) - run the function uncached, as
+            # sync_wrapper does. Not recorded as a failure: a rejection is not one.
+            # The outer finally resets the stats context.
+            if not features.should_allow_request():
+                features.log_cache_operation(
+                    operation="circuit_breaker_open",
+                    key=cache_key,
+                    namespace=namespace or "default",
+                    serializer="rust",
+                    error="Circuit breaker rejected the request",
+                    error_type="CircuitBreakerOpen",
+                )
+                return await func(*args, **kwargs)
+
             # Initialize backend only when needed (lazy init for performance)
             if _backend is None:
                 try:
@@ -1934,6 +1933,10 @@ def create_cache_wrapper(
                     )
                     return await func(*args, **kwargs)
                 _l2_scope()  # first call: the tenant check above ran before the backend existed
+
+            # First interop call: the check above had no backend to check (see there).
+            if interop is not None and not interop_checked:
+                ensure_interop_backend_compatible(_backend)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

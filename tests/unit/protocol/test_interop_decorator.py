@@ -430,6 +430,20 @@ class TestInteropRejections:
             await f(1)  # same args → L1 hit path; must still fail closed
         assert not any(k.startswith("tenant-a:") for k in mutable.store)
 
+    def test_key_prefix_appearing_later_fails_closed_per_call_sync_l1_hit(self):
+        """Sync mirror of the L1-hit case: the L1 lookup now runs before admission (LAB-5351),
+        and the per-call re-check must still run before it."""
+        mutable = DictBackend(key_prefix="")
+
+        @cache(backend=mutable, l1_enabled=True, interop="op", namespace="users")
+        def f(x: int):
+            return x
+
+        assert f(1) == 1  # clean backend works; warms L1 for x=1
+        mutable._key_prefix = "tenant-a:"  # contract violation after the fact
+        with pytest.raises(ConfigurationError, match="prefix"):
+            f(1)  # same args → L1 hit path; must still fail closed
+
     async def test_async_lazy_provider_prefixing_backend_fails_closed(self):
         """Lazy DI resolution (backend unknown at decoration) still runs the
         guard before the first async call touches L1 or executes the function."""
@@ -450,6 +464,29 @@ class TestInteropRejections:
         with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
             with pytest.raises(ConfigurationError, match="prefix"):
                 await wrapped(1)
+        assert calls == [], "function must NOT run against an incompatible backend"
+
+    def test_sync_lazy_provider_prefixing_backend_fails_closed(self):
+        """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
+        resolved lazily behind admission. Checking before resolution alone would be a no-op
+        (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
+        from unittest.mock import Mock, patch
+
+        from cachekit.decorators.wrapper import create_cache_wrapper
+
+        calls: list[int] = []
+
+        def f(x: int):
+            calls.append(x)
+            return x
+
+        wrapped = create_cache_wrapper(f, interop="op", namespace="users")
+
+        provider = Mock()
+        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
+        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+            with pytest.raises(ConfigurationError, match="prefix"):
+                wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
 
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])

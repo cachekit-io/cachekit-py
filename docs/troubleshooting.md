@@ -15,7 +15,7 @@
 
 **What it means**:
 - Five failures in total since the breaker last closed or the process started (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count): exceptions raised by the decorated function itself, a failure to generate the cache key or create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
-- Calls to this function run uncached until the breaker recovers: after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
+- Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
 
@@ -34,7 +34,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 
 3. **Let the breaker recover** — no restart is needed:
 - After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
-- While open, sync and async functions with an L2 backend run without caching (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
+- While open, sync and async functions with an L2 backend still serve L1 hits and run without caching on an L1 miss (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
 ```bash
