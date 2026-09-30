@@ -1352,6 +1352,7 @@ def create_cache_wrapper(
                 cache_key="<generation_failed>",
                 namespace=namespace or "default",
                 duration_ms=0.0,
+                count_toward_breaker=False,  # pre-admission, never reached the backend
             )
             reset_current_function_stats(token)
             return func(*args, **kwargs)
@@ -1773,6 +1774,7 @@ def create_cache_wrapper(
                     cache_key="<generation_failed>",
                     namespace=namespace or "default",
                     duration_ms=0.0,
+                    count_toward_breaker=False,  # pre-admission, never reached the backend
                 )
                 return await func(*args, **kwargs)
 

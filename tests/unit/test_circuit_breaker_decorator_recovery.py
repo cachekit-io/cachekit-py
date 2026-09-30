@@ -303,7 +303,7 @@ class TestSlidingWindow:
     async def test_failures_recorded_while_open_do_not_extend_the_window(
         self, is_async, resolver, backend, live_breakers, clock
     ):
-        """Key generation runs, and records its failures, before the admission check."""
+        """Calls whose key generation fails, before the admission check, do not extend the window."""
 
         def key(x: str) -> str:
             if x.startswith("unkeyable"):
