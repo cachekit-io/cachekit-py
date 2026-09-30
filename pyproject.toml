@@ -272,7 +272,12 @@ fuzz = [
 # [project] dependencies instead — see the anyio/h2 entries above.
 [tool.uv]
 constraint-dependencies = [
-    "urllib3>=2.7.0",
+    # urllib3 is a dev-only transitive dep (requests -> urllib3; requests is a
+    # dev dependency and also arrives via pip-audit).
+    # 2.8.0 fixes GHSA-8988-9cw3-xx77 (HTTPS proxy TLS config ignored),
+    # GHSA-gh4c-6fx4-qh6g (chunked deflate infinite loop) and
+    # GHSA-vxq7-64xx-v4gw (unbounded chunk-size line buffering).
+    "urllib3>=2.8.0",
     "fonttools>=4.60.2",
     "werkzeug>=3.1.4",
     # pip is a dev-only transitive dep (pip-audit -> pip-api -> pip). 26.1.2 fixes
