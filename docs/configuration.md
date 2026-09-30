@@ -79,7 +79,7 @@ CACHEKIT_MAX_VALUE_SIZE=104857600
 CACHEKIT_ARROW_COMPRESSION=zstd
 
 # Master key for @cache.secure / encryption=True — a key source, not a switch.
-# With it set, every cache must state its intent: a preset with no encryption= raises
+# With it set, every cache must state its intent: one with no encryption intent raises
 # ConfigurationError at decoration (use encryption=False for plaintext).
 CACHEKIT_MASTER_KEY=<hex-encoded-key-32-bytes-minimum>
 # Key rotation: decrypt-only previous master keys (comma-separated hex, max 3,
@@ -438,9 +438,8 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 export LOG_LEVEL=WARNING
 ```
 
-The key does not switch encryption on. Encrypt with `@cache.secure(...)` or an explicit
-`encryption=` option, and give every other cache in the process `encryption=False`: with the
-key set, a cache that states no intent raises `ConfigurationError` at decoration.
+The key does not switch encryption on: every other cache in the process needs `encryption=False`
+([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
 
 ---
 

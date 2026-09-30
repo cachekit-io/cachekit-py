@@ -34,7 +34,7 @@ def get_sensitive_data():
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
-Exporting it makes every other cache in the process that states no `encryption=` raise
+Exporting it makes every other cache in the process that states no encryption intent raise
 ([below](#master-key-present-no-encryption-intent)); passing `master_key=` to `@cache.secure` does not.
 
 **Verification**:
@@ -48,11 +48,11 @@ python -c "import os; k = os.getenv('CACHEKIT_MASTER_KEY', ''); print(f'Key leng
 
 ### Master key present, no encryption intent
 
-**Message**: `A master key is present (CACHEKIT_MASTER_KEY) but encryption= is unset. ...` (or `(master_key=)` when the key was passed)
+**Message**: `A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...` (or `(master_key=)` when the key was passed)
 
 **Exception**: `ConfigurationError`, raised when the decorator is applied
 
-**Cause**: a master key is available — `CACHEKIT_MASTER_KEY` is set, or `master_key=` was passed (flat on bare `@cache`, or `EncryptionConfig(master_key=...)`) — but the cache states no encryption intent: no `encryption=`, or an `EncryptionConfig` without `enabled=`. A key is a key source, not an activation switch, so cachekit refuses to guess between encrypting and storing plaintext. This applies to every preset except `@cache.secure` and `@cache.local`, including `backend=None` and `tenant_extractor=` caches ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
+**Cause**: a master key is available — `CACHEKIT_MASTER_KEY` is set, or `master_key=` was passed (flat on bare `@cache`, or `EncryptionConfig(master_key=...)`) — but the cache states no encryption intent: no `encryption=`, or an `EncryptionConfig` without `enabled=`. A key is a key source, not an activation switch, so cachekit refuses to guess between encrypting and storing plaintext. This applies to every preset except `@cache.secure` and `@cache.local`, including `backend=None` and caches with a tenant extractor ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
 
 **When it occurs**:
 ```python notest

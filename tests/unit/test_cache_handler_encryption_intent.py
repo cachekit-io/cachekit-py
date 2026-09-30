@@ -17,6 +17,7 @@ import cachekit.cache_handler as cache_handler_mod
 from cachekit import cache
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError
+from cachekit.config.nested import EncryptionConfig
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.base import SerializationMetadata
 from cachekit.serializers.wrapper import SerializationWrapper
@@ -44,6 +45,7 @@ def _assert_names_explicit_spellings(error: pytest.ExceptionInfo[ConfigurationEr
     assert "encryption=True with single_tenant_mode=True" in message
     assert "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)" in message
     assert "encryption=False" in message
+    assert "the only choice with backend=None" in message
 
 
 @pytest.mark.unit
@@ -63,6 +65,8 @@ class TestNoIntentWithKeyRaises:
             CacheSerializationHandler(serializer_name="default")
 
         _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
+        assert "or a tenant_extractor" in str(error.value)
+        assert "still decrypts stale ciphertext on read" in str(error.value)
 
     def test_passed_master_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A passed key is a key source exactly like the env var: no exemption for it."""
@@ -73,6 +77,18 @@ class TestNoIntentWithKeyRaises:
             CacheSerializationHandler(serializer_name="default", master_key=_FAKE_KEY)
 
         _assert_names_explicit_spellings(error, "master_key=")
+
+    def test_interop_cache_message_fits_interop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Interop rejects tenant_extractor and never legacy-decrypts, so the message must not offer either."""
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        reset_settings()
+
+        with pytest.raises(ConfigurationError) as error:
+            CacheSerializationHandler(serializer_name="default", interop_mode=True)
+
+        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
+        assert "tenant_extractor" not in str(error.value)
+        assert "never decrypts stale ciphertext" in str(error.value)
 
     def test_tenant_extractor_with_env_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A tenant_extractor states no encryption intent: with the key set it must raise, not store plaintext."""
@@ -191,23 +207,18 @@ class TestEncryptionTriState:
         assert reader.deserialize_data(stale, cache_key="ck:drift") == {"x": 1}
         assert counters == [("cachekit_config_drift_reads_total", {"reason": "encryption_disabled"})]
 
-    @pytest.mark.parametrize("preset", ["minimal", "production", "io", "dev", "test"])
-    def test_preset_without_intent_raises_at_decoration(self, monkeypatch: pytest.MonkeyPatch, preset: str) -> None:
+    @pytest.mark.parametrize("preset", [None, "minimal", "production", "io", "dev", "test"])
+    def test_no_intent_raises_at_decoration(self, monkeypatch: pytest.MonkeyPatch, preset: str | None) -> None:
+        """Bare @cache and every preset but .secure / .local raise; None is bare @cache."""
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_placeholder")  # @cache.io builds its backend first
         reset_settings()
+        decorator = cache if preset is None else getattr(cache, preset)
 
         with pytest.raises(ConfigurationError) as error:
-            getattr(cache, preset)(lambda: None)
+            decorator(lambda: None)
 
         _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
-
-    def test_bare_decorator_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
-        reset_settings()
-
-        with pytest.raises(ConfigurationError, match="encryption= is unset"):
-            cache(ttl=60)(lambda: None)
 
     def test_flat_master_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
@@ -220,8 +231,6 @@ class TestEncryptionTriState:
 
     def test_preset_encryption_config_key_without_enabled_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """EncryptionConfig(master_key=K) with enabled unset is the same no-intent case as the flat kwarg."""
-        from cachekit.config.nested import EncryptionConfig
-
         monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
         reset_settings()
 
@@ -236,6 +245,10 @@ class TestEncryptionTriState:
             pytest.param(lambda: cache(ttl=60, encryption=False), id="bare-false"),
             pytest.param(lambda: cache(ttl=60, encryption=True, single_tenant_mode=True), id="bare-true"),
             pytest.param(lambda: cache.production(encryption=False), id="preset-false"),
+            pytest.param(
+                lambda: cache.production(encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)),
+                id="preset-true",
+            ),
             pytest.param(lambda: cache.secure(), id="secure"),
             pytest.param(lambda: cache.local(), id="local"),
         ],
@@ -276,8 +289,6 @@ class TestDecoratorEncryptionFlattening:
         return captured
 
     def test_flat_encryption_false_maps_to_opt_out(self, captured_config: dict[str, Any]) -> None:
-        from cachekit.config.nested import EncryptionConfig
-
         @cache(encryption=False, backend=None)
         def fn() -> int:
             return 1
@@ -287,8 +298,6 @@ class TestDecoratorEncryptionFlattening:
         assert enc.enabled is False
 
     def test_flat_encryption_true_maps_to_force_on(self, captured_config: dict[str, Any]) -> None:
-        from cachekit.config.nested import EncryptionConfig
-
         @cache(encryption=True, master_key=_FAKE_KEY, single_tenant_mode=True, backend=None)
         def fn() -> int:
             return 1
@@ -302,7 +311,6 @@ class TestDecoratorEncryptionFlattening:
         """master_key / single_tenant_mode / deployment_uuid fold in even when `encryption`
         is omitted — `enabled` stays None (unset), exercising the per-key loop branch. The handler
         then refuses the key (TestNoIntentWithKeyRaises); the wrapper is patched out here."""
-        from cachekit.config.nested import EncryptionConfig
 
         @cache(master_key=_FAKE_KEY, single_tenant_mode=True, deployment_uuid=_DEPLOYMENT_UUID, backend=None)
         def fn() -> int:
@@ -318,7 +326,6 @@ class TestDecoratorEncryptionFlattening:
     def test_prebuilt_encryption_config_passes_through_unwrapped(self, captured_config: dict[str, Any]) -> None:
         """An already-constructed EncryptionConfig is NOT re-wrapped (would nest a config in
         `.enabled`); the passthrough guard skips the mapping block."""
-        from cachekit.config.nested import EncryptionConfig
 
         @cache(encryption=EncryptionConfig(enabled=False), backend=None)
         def fn() -> int:

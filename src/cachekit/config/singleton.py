@@ -51,16 +51,17 @@ def get_settings() -> CachekitConfig:
     if instance is not None:
         # Self-heal the keyless-then-key-set ordering trap (#195): if the config was first built
         # before CACHEKIT_MASTER_KEY entered the environment (e.g. an import-time cache decorator
-        # evaluated before the app loaded its secrets), it froze master_key=None — a later
-        # @cache.secure / encryption=True would then miss the key the environment now holds, and a
-        # later cache with no encryption= would skip the no-intent error. Re-read once the key
-        # appears, so it is seen without an explicit reset_settings(). Idempotent: after the rebuild
-        # master_key is set, so this never fires again (no per-call churn once a key is present).
-        if instance.master_key is None and os.environ.get("CACHEKIT_MASTER_KEY"):
+        # evaluated before the app loaded its secrets), it froze an empty master_key — None, or
+        # SecretStr("") from a variable set to "". A later @cache.secure / encryption=True would then
+        # miss the key the environment now holds, and a later cache with no encryption= would skip the
+        # no-intent error. Re-read once the key appears, so it is seen without an explicit
+        # reset_settings(). Idempotent: after the rebuild master_key is set, so this never fires again
+        # (no per-call churn once a key is present).
+        if not instance.master_key and os.environ.get("CACHEKIT_MASTER_KEY"):
             with _settings_lock:
                 # Re-read the global under the lock: a peer may have rebuilt it (key now set) or
                 # reset_settings() may have cleared it (back to None). Rebuild only if still keyless.
-                if _settings_instance is None or _settings_instance.master_key is None:
+                if _settings_instance is None or not _settings_instance.master_key:
                     _settings_instance = CachekitConfig.from_env()
                 return _settings_instance
         return instance

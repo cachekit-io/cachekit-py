@@ -616,23 +616,27 @@ class CacheSerializationHandler:
         #   True  -> explicit force-on (validated below)
         #   False -> explicit hard opt-out; honored even when a master key is present
         #
-        # Why (protocol spec/intent-presets.md § Encryption Activation): a master key is a key SOURCE —
-        # the fallback for .secure / encryption=True, and legacy-decrypt of stale CK-framed ciphertext on
-        # read (EncryptionWrapper resolves it itself) — never an activation SWITCH. A key with no stated
-        # intent is ambiguous, so it is refused rather than guessed, whatever tenant_extractor or backend
-        # is: silently encrypting and silently storing plaintext are both wrong for someone. An explicit
-        # False MUST NOT be promoted to True just because CACHEKIT_MASTER_KEY exists (issue #128).
+        # Why (protocol spec/intent-presets.md § Encryption Activation): a master key is a key SOURCE, never
+        # an activation SWITCH, so a key with no stated intent is refused rather than guessed, whatever
+        # tenant_extractor or backend is. An explicit False MUST NOT be promoted to True (issue #128).
         if encryption is None:
             key_source = "master_key=" if master_key else "CACHEKIT_MASTER_KEY" if get_settings().master_key else None
             if key_source is not None:
                 raise ConfigurationError(
-                    f"A master key is present ({key_source}) but encryption= is unset. A master key is a key "
-                    f"source, not an activation switch, so a cache must state its intent: @cache.secure(...) to "
-                    f"require encryption; encryption=True with single_tenant_mode=True or a tenant_extractor (on a "
-                    f"preset: encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it on; "
-                    f"or encryption=False to store plaintext. encryption=False still decrypts stale ciphertext on "
-                    f"read, except in an interop cache (interop=...): move every SDK that binds it to "
-                    f"encryption=False and a new namespace together, or stale entries come back as wrong values."
+                    f"A master key is present ({key_source}) but this cache states no encryption intent (no "
+                    f"encryption=, or an EncryptionConfig without enabled=). A master key is a key source, not an "
+                    f"activation switch. State the intent: @cache.secure(...) to require encryption; "
+                    f"encryption=True with single_tenant_mode=True{'' if interop_mode else ' or a tenant_extractor'} "
+                    f"(on a preset: encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it "
+                    f"on; or encryption=False to store plaintext, the only choice with backend=None, which stores "
+                    f"raw objects. "
+                    + (
+                        "In this interop cache encryption=False never decrypts stale ciphertext: move every SDK that "
+                        "binds it to encryption=False and a new namespace together, or stale entries come back as "
+                        "wrong values."
+                        if interop_mode
+                        else "encryption=False still decrypts stale ciphertext on read."
+                    )
                 )
             encryption = False
 

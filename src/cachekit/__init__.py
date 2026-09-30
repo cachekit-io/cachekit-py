@@ -50,7 +50,7 @@ Example Usage:
     def process_payment(amount: Decimal):
         return payment_gateway.charge(amount)
 
-    @cache.secure    # Security-critical functions
+    @cache.secure(master_key=secret_key)    # Security-critical; key from your secret store
     def get_user_data(user_id: int) -> UserProfile:
         return db.fetch_user(user_id)
 

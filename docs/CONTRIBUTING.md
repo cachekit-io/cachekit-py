@@ -63,7 +63,7 @@ These functions are provided for documentation examples and return mock data:
 - `secret_key` - Test encryption key (value: `"a" * 64`). `@cache.secure` examples must
   pass it explicitly (`master_key=secret_key`); the conftest does **not** set
   `CACHEKIT_MASTER_KEY` in the environment because an ambient key makes every fence that
-  states no `encryption=` raise `ConfigurationError` at decoration.
+  states no encryption intent raise `ConfigurationError` at decoration.
 - `master_key_env` - opt-in pytest fixture for a fence that binds its own key the way an
   application does (`secret_key = os.environ["CACHEKIT_MASTER_KEY"]`). Request it in the info
   string, `` ```python fixture:master_key_env ``; it sets `CACHEKIT_MASTER_KEY` for that fence only.

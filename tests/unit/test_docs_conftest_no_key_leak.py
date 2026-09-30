@@ -5,10 +5,8 @@ on PRs, so a regression here would turn `main` red instead of failing review.
 This fast unit test runs on every PR and fails loudly if `docs/conftest.py`
 starts setting CACHEKIT_MASTER_KEY in the process environment again.
 
-Why it matters: an ambient master key turns encryption on globally (PR #127
-auto-detect + PR #200 settings re-read), and the v0.6.0 cross-SDK rule then
-rejects every plain `@cache` doc fence that uses a non-cross-SDK serializer
-(serializer="auto", custom serializer instances) at decoration time.
+Why it matters: with an ambient master key, every plain `@cache` doc fence that
+states no encryption intent raises ConfigurationError at decoration time.
 """
 
 from __future__ import annotations
