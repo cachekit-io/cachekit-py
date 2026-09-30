@@ -1,5 +1,7 @@
 """Auto mode switching must leave exactly one live worker on the queue whenever the collector is batched."""
 
+import os
+import signal
 import threading
 import time
 import uuid
@@ -128,4 +130,42 @@ def test_concurrent_switches_start_one_worker(monkeypatch):
 
     assert not collector._sync_mode
     assert len(started) == 1
+    collector.shutdown()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_forked_mid_switch_can_still_switch(monkeypatch):
+    namespace = f"mode-switch-fork-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05)
+    assert collector._sync_mode
+    parent_pid = os.getpid()
+    inside, release = threading.Event(), threading.Event()
+    real_info = async_metrics.logger.info
+
+    def info_that_blocks_in_parent(*args, **kwargs):
+        # Park the parent's switching thread inside the switch, holding the mode lock, while the process forks.
+        if os.getpid() == parent_pid:
+            inside.set()
+            release.wait(5)
+        real_info(*args, **kwargs)
+
+    monkeypatch.setattr(async_metrics.logger, "info", info_that_blocks_in_parent)
+    _steer(collector, 500)
+    switcher = threading.Thread(target=_record, args=(collector, namespace), daemon=True)
+    switcher.start()
+    assert inside.wait(5)
+
+    pid = os.fork()
+    if pid == 0:  # child: SIGALRM kills it if the switch blocks on the lock the parked thread holds
+        try:
+            signal.alarm(5)
+            _steer(collector, 500)
+            _record(collector, namespace)
+            os._exit(0 if not collector._sync_mode else 1)
+        finally:
+            os._exit(2)
+    release.set()
+    switcher.join(5)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
     collector.shutdown()

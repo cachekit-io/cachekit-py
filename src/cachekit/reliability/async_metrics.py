@@ -198,7 +198,9 @@ class AsyncMetricsCollector:
         self._stopped = None
         self._worker_thread = None
         self._dropped_metrics = 0
-        self._mode_lock = threading.Lock()
+        # Keyed by pid, like _metrics_locks: a child forked while a thread was mid-switch must not wait
+        # on the copy of the lock that thread still holds, because the thread does not exist in the child.
+        self._mode_locks: dict[int, threading.Lock] = {}
 
         # Memory pool for reducing allocations
         self._metric_pool = []
@@ -590,6 +592,15 @@ class AsyncMetricsCollector:
         self._worker_thread.start()
         return True
 
+    def _mode_lock(self) -> threading.Lock:
+        """Return this process's mode-switch lock, creating it on first use."""
+        pid = os.getpid()
+        lock = self._mode_locks.get(pid)
+        if lock is None:
+            # setdefault is atomic, so threads racing here in a new child all get one lock.
+            lock = self._mode_locks.setdefault(pid, threading.Lock())
+        return lock
+
     def _should_check_mode(self) -> bool:
         """Check if we should evaluate mode switching."""
         now = time.time()
@@ -610,7 +621,7 @@ class AsyncMetricsCollector:
         ops_per_second = self._operation_count / elapsed
 
         # Two producers can pass the mode check at once; the lock keeps them from starting two workers.
-        with self._mode_lock:
+        with self._mode_lock():
             # Switch to async mode if high frequency (>100 ops/sec)
             if self._sync_mode and ops_per_second > 100:
                 # Never join the old worker here: this runs on the caller's thread. Stay synchronous and
