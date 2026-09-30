@@ -455,11 +455,7 @@ def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
         code = tb.tb_frame.f_code
         if pathlib.Path(code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
             for name, value in tb.tb_frame.f_locals.items():
-                try:
-                    rendered = repr(value)
-                except Exception:  # a half-built model can fail to repr; it holds no raw input
-                    continue
-                if secret in rendered:
+                if secret in repr(value):
                     found.append(f"{code.co_name}:{name}")
         tb = tb.tb_next
     return found
