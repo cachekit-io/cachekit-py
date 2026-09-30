@@ -15,6 +15,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from time import monotonic
 from typing import Optional
 
 # Import backend error types for failure detection
@@ -29,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 # CLOSED opens on failure_threshold failures within this rolling window, the default
 # in cachekit-ts and cachekit-rs. A plain count since the last close would let rare
-# failures on a healthy backend open the breaker on any long-lived process.
+# failures on a healthy backend open the breaker on any long-lived process. The window
+# runs on the monotonic clock, so a wall-clock correction cannot keep old failures in it.
 _FAILURE_WINDOW_SECONDS = 60.0
 
 
@@ -227,7 +229,7 @@ class CircuitBreaker:
         self.config = config
         self.namespace = namespace
         self._state = CircuitState.CLOSED
-        self._failure_times: deque[float] = deque()  # Failure timestamps, pruned to the window
+        self._failure_times: deque[float] = deque()  # monotonic() failure times, pruned to the window
         self._success_count = 0  # Consecutive successes in HALF_OPEN state
         self._last_failure_time = 0.0  # Timestamp of last failure (for timeout)
         self._half_open_permits = 0  # Current test requests in HALF_OPEN
@@ -334,10 +336,10 @@ class CircuitBreaker:
             if self._state == CircuitState.HALF_OPEN:
                 self._half_open_permits = max(0, self._half_open_permits - 1)
 
-            now = time.time()
+            now = monotonic()
             self._failure_times.append(now)
             self._prune_failures(now)
-            self._last_failure_time = now
+            self._last_failure_time = time.time()
 
             if self._state == CircuitState.CLOSED:
                 if len(self._failure_times) >= self.config.failure_threshold:
@@ -387,7 +389,7 @@ class CircuitBreaker:
     def failure_count(self) -> int:
         """Get the number of failures within the rolling window."""
         with self._lock:
-            self._prune_failures(time.time())
+            self._prune_failures(monotonic())
             return len(self._failure_times)
 
     @property
@@ -457,7 +459,7 @@ class CircuitBreaker:
             Dictionary with current state and counters
         """
         with self._lock:
-            self._prune_failures(time.time())
+            self._prune_failures(monotonic())
             return {
                 "state": self._state.name,
                 "failure_count": len(self._failure_times),
