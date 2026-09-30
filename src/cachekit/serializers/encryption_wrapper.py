@@ -227,7 +227,8 @@ class EncryptionWrapper:
         # re-raises it, but the read sites (CacheOperationHandler.get_cached_value*
         # and the decorator L1 guards) re-raise only KeyringConfigurationError
         # and turn anything else into a warning plus a miss. This wrapper is
-        # built lazily on the first read for a tenant, so these faults surface
+        # built lazily on the first read for a tenant (the caller's with a
+        # tenant_extractor, else the entry header's), so these faults surface
         # at a read site as often as at a write.
         if previous_master_keys is None:
             settings = get_settings()
@@ -267,7 +268,8 @@ class EncryptionWrapper:
         # would then present as silent misses plus entry-by-entry eviction (the
         # LAB-241/LAB-683 failure class). Let it propagate (taxonomy note above).
         #
-        # On a read, tenant_id comes from the unauthenticated frame header, so a
+        # On a read by a handler without a tenant_extractor, tenant_id comes from
+        # the unauthenticated frame header (with one, from the caller), so a
         # fault here must not be one a writer can choose. It is not: both calls
         # validate tenant_id through the same HKDF input checks, and
         # derive_tenant_keys above has already accepted this tenant_id (a tenant
@@ -483,9 +485,13 @@ class EncryptionWrapper:
             )
 
         # Verify tenant match for security. Tamper-class (DecryptionAuthenticationError):
-        # an entry claiming another tenant at this cache key is either cross-tenant
-        # substitution or config drift — it must count as auth_tamper telemetry and be
-        # honored by the fail-closed policy, not vanish into the corruption bucket.
+        # an entry claiming another tenant at this cache key is another tenant's entry
+        # at a shared key, cross-tenant substitution, or config drift — it must count as
+        # auth_tamper telemetry and be honored by the fail-closed policy, not vanish into
+        # the corruption bucket. CacheSerializationHandler builds this wrapper for the
+        # caller's tenant when it has a tenant_extractor, so that is where this check
+        # fires; without one it builds it for the header's tenant, and a forged header
+        # tenant fails key derivation or AES-GCM authentication instead.
         if metadata.tenant_id != self.tenant_id:
             raise DecryptionAuthenticationError(
                 f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"

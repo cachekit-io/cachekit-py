@@ -366,6 +366,15 @@ df = get_patient_records(42)
 > `ArgumentNameExtractor` a non-UUID id fails at store time, and a bare `lambda` fails on
 > every call; either way the failure is logged and the result is not written to the cache.
 
+On an encrypted cache, a shared entry is never decrypted for the wrong tenant. A read
+decrypts as the caller's tenant, resolved by `tenant_extractor` exactly as on the write,
+and refuses an entry encrypted for any other tenant as `auth_tamper` (see Corruption vs
+Tamper below). By default that read is a miss: the function runs and its result overwrites
+the entry, so tenants that share a key keep evicting each other. With `fail_closed=True`
+the read raises `DecryptionAuthenticationError` instead, until the entry expires or is
+invalidated. A read whose tenant cannot be resolved decrypts nothing and is a plain miss.
+Either way, keep tenants on separate keys as the caution above says.
+
 ### Key Rotation Pattern
 
 The keyring has one **current** master key
@@ -504,12 +513,15 @@ Encrypted entries expose three fields in the plaintext header: `tenant_id`,
 `encryption_algorithm`, and `key_fingerprint`. This exposure is deliberate and
 accepted:
 
-- **`tenant_id`** — required *before* decryption to derive the per-tenant key
-  (HKDF); moving it inside the ciphertext is a chicken-and-egg problem. It is an
-  opaque identifier, not secret material, and it *is* tamper-protected: the reader
-  derives the per-tenant key from the header's `tenant_id`, so a modified value selects
-  a different key and the read fails authentication (`auth_tamper`) — a key-fingerprint
-  mismatch under fail-closed, a GCM tag failure otherwise.
+- **`tenant_id`** — the tenant the entry was encrypted for, needed *before*
+  decryption; moving it inside the ciphertext is a chicken-and-egg problem. It is an
+  opaque identifier, not secret material, and it *is* tamper-protected. A cache with a
+  `tenant_extractor` derives the per-tenant key (HKDF) from the caller's tenant and
+  refuses an entry whose `tenant_id` differs (`auth_tamper`) before attempting to
+  decrypt. A cache without one derives the key from the header's `tenant_id`, so a
+  modified value selects a different key and the read fails authentication
+  (`auth_tamper`) — a key-fingerprint mismatch under fail-closed, a GCM tag failure
+  otherwise.
 - **`key_fingerprint`** — a one-way fingerprint of the derived key, used only for
   clearer diagnostics during key rotation. It reveals nothing about key material.
 - **`encryption_algorithm`** — public information (`AES-256-GCM`); hiding the
@@ -543,9 +555,11 @@ access as metadata exposure in your threat model.
 Four failure classes surface on the decrypt read path, and cachekit distinguishes
 them (cachekit-py#170):
 
-- **`auth_tamper`** — cryptographic authentication failed: the ciphertext was modified,
+- **`auth_tamper`** — the entry failed authentication: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys). The plaintext frame header fields built into the AAD
+  between cache keys), or, on a cache with a `tenant_extractor`, the entry was encrypted
+  for a tenant other than the caller's (refused before any decrypt attempt). The
+  plaintext frame header fields built into the AAD
   (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
   them is authenticated by the tag: a header change that produces different AAD bytes
   also fails here. (The tag authenticates the constructed AAD, not the header's JSON

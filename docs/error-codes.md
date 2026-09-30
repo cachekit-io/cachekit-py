@@ -97,6 +97,7 @@ else:
 - Master key was changed (old encrypted data can't be decrypted)
 - Cached data was corrupted during storage/retrieval
 - Data was modified externally
+- Another tenant's entry sits at the same key (`Tenant mismatch: ...`, a cache with a `tenant_extractor`)
 
 **When it occurs**:
 ```python notest
@@ -169,6 +170,14 @@ redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r re
 ```
 
 The function recomputes and re-caches on the next call.
+
+**Option 4: Tenant mismatch**
+
+Cache keys carry no tenant, so tenants calling with identical arguments share an
+entry, and a read refuses the one another tenant wrote. Evicting it helps only until
+that tenant writes it again. Keep tenants on separate keys: give each its own
+`namespace` or deployment, or make the tenant id a keyword argument of the cached
+function (see [Multi-Tenant Isolation](features/zero-knowledge-encryption.md#multi-tenant-isolation)).
 
 **Prevention**: rotate with the keyring, not a key swap — follow the
 [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/) (see also [Key Rotation Pattern](features/zero-knowledge-encryption.md#key-rotation-pattern)).
