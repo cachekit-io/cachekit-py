@@ -34,8 +34,9 @@ def get_sensitive_data():
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
-Exporting it makes every other cache in the process that states no encryption intent raise
-([below](#master-key-present-no-encryption-intent)); passing `master_key=` to `@cache.secure` does not.
+Exporting it makes every preset except `@cache.secure` and `@cache.local` that states no encryption
+intent raise ([below](#master-key-present-no-encryption-intent)); passing `master_key=`
+to `@cache.secure` instead affects only that cache.
 
 **Verification**:
 ```bash

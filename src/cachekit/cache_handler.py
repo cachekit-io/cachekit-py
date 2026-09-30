@@ -628,8 +628,8 @@ class CacheSerializationHandler:
                     f"activation switch. State the intent: @cache.secure(...) to require encryption; "
                     f"encryption=True with single_tenant_mode=True{'' if interop_mode else ' or a tenant_extractor'} "
                     f"(on a preset: encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)) to force it "
-                    f"on; or encryption=False to store plaintext, the only choice with backend=None, which stores "
-                    f"raw objects. "
+                    f"on; or encryption=False to store plaintext"
+                    f"{'' if interop_mode else ', the only choice with backend=None, which stores raw objects'}. "
                     + (
                         "In this interop cache encryption=False never decrypts stale ciphertext: move every SDK that "
                         "binds it to encryption=False and a new namespace together, or stale entries come back as "

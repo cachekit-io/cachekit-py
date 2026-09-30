@@ -20,6 +20,7 @@ from cachekit.config import ConfigurationError
 from cachekit.config.nested import EncryptionConfig
 from cachekit.config.singleton import reset_settings
 from cachekit.serializers.base import SerializationMetadata
+from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError
 from cachekit.serializers.wrapper import SerializationWrapper
 
 _FAKE_KEY = "ab" * 32  # pragma: allowlist secret
@@ -37,7 +38,9 @@ def _extractor(*_args: Any, **_kwargs: Any) -> str:
     return "tenant-1"
 
 
-def _assert_names_explicit_spellings(error: pytest.ExceptionInfo[ConfigurationError], key_source: str) -> None:
+def _assert_names_explicit_spellings(
+    error: pytest.ExceptionInfo[ConfigurationError], key_source: str, *, interop: bool = False
+) -> None:
     """The error must name the key's source and every spelling that constructs, so the fix is copy-pasteable."""
     message = str(error.value)
     assert f"A master key is present ({key_source})" in message
@@ -45,17 +48,13 @@ def _assert_names_explicit_spellings(error: pytest.ExceptionInfo[ConfigurationEr
     assert "encryption=True with single_tenant_mode=True" in message
     assert "encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)" in message
     assert "encryption=False" in message
-    assert "the only choice with backend=None" in message
+    # Interop already rejects backend=None upstream, so only a non-interop message may mention it.
+    assert ("the only choice with backend=None" in message) is not interop
 
 
 @pytest.mark.unit
 class TestNoIntentWithKeyRaises:
     """encryption=None + a master key from either source -> ConfigurationError at construction."""
-
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        yield
-        reset_settings()
 
     def test_env_key_without_intent_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
@@ -79,14 +78,14 @@ class TestNoIntentWithKeyRaises:
         _assert_names_explicit_spellings(error, "master_key=")
 
     def test_interop_cache_message_fits_interop(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Interop rejects tenant_extractor and never legacy-decrypts, so the message must not offer either."""
+        """Interop rejects tenant_extractor and backend=None and never legacy-decrypts, so the message offers none."""
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
         reset_settings()
 
         with pytest.raises(ConfigurationError) as error:
             CacheSerializationHandler(serializer_name="default", interop_mode=True)
 
-        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
+        _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY", interop=True)
         assert "tenant_extractor" not in str(error.value)
         assert "never decrypts stale ciphertext" in str(error.value)
 
@@ -100,40 +99,38 @@ class TestNoIntentWithKeyRaises:
 
         _assert_names_explicit_spellings(error, "CACHEKIT_MASTER_KEY")
 
-    def test_tenant_extractor_without_key_stays_plaintext(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
-        reset_settings()
 
-        handler = CacheSerializationHandler(serializer_name="default", tenant_extractor=_extractor)
+@pytest.mark.unit
+class TestEncryptionTriState:
+    """Tri-state encryption: None=unset, True=force-on, False=explicit opt-out (issue #128)."""
 
-        assert handler.encryption is False
-        assert _envelope_is_encrypted(handler, {"x": 1}, "ck:extractor-no-key") is False
-
-    def test_no_key_stays_plaintext(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("tenant_extractor", [None, _extractor], ids=["no-extractor", "extractor"])
+    def test_no_key_stays_plaintext(self, monkeypatch: pytest.MonkeyPatch, tenant_extractor: Any) -> None:
         """Zero-config: no key from either source and no intent -> plaintext, no error."""
         monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
         reset_settings()
 
-        handler = CacheSerializationHandler(serializer_name="default")
+        handler = CacheSerializationHandler(serializer_name="default", tenant_extractor=tenant_extractor)
 
         assert handler.encryption is False
         assert handler.master_key is None
         assert _envelope_is_encrypted(handler, {"x": 1}, "ck:no-key") is False
 
-    def test_explicit_true_uses_passed_key_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        env_key = "ab" * 32  # pragma: allowlist secret
+    def test_explicit_true_encrypts_under_passed_key_not_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A passed master_key= wins over CACHEKIT_MASTER_KEY: only a holder of the passed key can decrypt."""
         explicit_key = "cc" * 32  # pragma: allowlist secret
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", env_key)
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
+        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DEPLOYMENT_UUID)
         reset_settings()
 
-        handler = CacheSerializationHandler(
-            serializer_name="default",
-            encryption=True,
-            master_key=explicit_key,
-            single_tenant_mode=True,
-        )
+        def build(**kwargs: Any) -> CacheSerializationHandler:
+            return CacheSerializationHandler(serializer_name="default", encryption=True, single_tenant_mode=True, **kwargs)
 
-        assert handler.master_key == explicit_key
+        blob = build(master_key=explicit_key).serialize_data({"x": 1}, cache_key="ck:explicit")
+
+        assert build(master_key=explicit_key).deserialize_data(blob, cache_key="ck:explicit") == {"x": 1}
+        with pytest.raises(DecryptionAuthenticationError):
+            build().deserialize_data(blob, cache_key="ck:explicit")
 
     def test_explicit_false_with_tenant_extractor_and_env_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
@@ -142,16 +139,6 @@ class TestNoIntentWithKeyRaises:
         handler = CacheSerializationHandler(serializer_name="default", encryption=False, tenant_extractor=_extractor)
 
         assert handler.encryption is False
-
-
-@pytest.mark.unit
-class TestEncryptionTriState:
-    """Tri-state encryption: None=unset, True=force-on, False=explicit opt-out (issue #128)."""
-
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        yield
-        reset_settings()
 
     def test_explicit_false_opts_out_despite_master_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """REGRESSION (issue #128): encryption=False must NOT auto-encrypt when a key is set.
@@ -170,21 +157,6 @@ class TestEncryptionTriState:
         assert handler.master_key is None
         # The on-the-wire envelope must be plaintext, not ciphertext.
         assert _envelope_is_encrypted(handler, {"x": 1}, "ck:optout") is False
-
-    def test_explicit_true_forces_encryption_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """encryption=True forces encryption on (single-tenant) even via the env key."""
-        monkeypatch.setenv("CACHEKIT_MASTER_KEY", _FAKE_KEY)
-        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", _DEPLOYMENT_UUID)
-        reset_settings()
-
-        handler = CacheSerializationHandler(
-            serializer_name="default",
-            encryption=True,
-            single_tenant_mode=True,
-        )
-
-        assert handler.encryption is True
-        assert _envelope_is_encrypted(handler, {"x": 1}, "ck:forced") is True
 
     def test_explicit_false_still_decrypts_stale_ciphertext(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Legacy-decrypt: an entry written under encryption=True reads back under encryption=False.

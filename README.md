@@ -158,8 +158,8 @@ def get_user_profile(user_id: int):
     return db.fetch_user(user_id)
 ```
 
-Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every other cache in the
-process must state its intent (`encryption=False` for plaintext), or it raises
+Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every preset except
+`@cache.secure` and `@cache.local` must state its intent (`encryption=False` for plaintext), or it raises
 `ConfigurationError` at decoration: the key is a key source, never an on switch.
 
 | Feature | `@cache.minimal` | `@cache.dev` | `@cache.test` | `@cache.production` | `@cache.secure` |

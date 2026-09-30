@@ -42,9 +42,9 @@ def test_docs_globals_hook_does_not_set_master_key_env(monkeypatch: pytest.Monke
     globals_dict = module.pytest_markdown_docs_globals()
 
     assert "CACHEKIT_MASTER_KEY" not in os.environ, (
-        "docs/conftest.py set CACHEKIT_MASTER_KEY in the environment. This turns "
-        "encryption on globally and breaks plain @cache fences using serializer='auto' "
-        "or custom serializers. Pass the key explicitly (master_key=secret_key) in the "
+        "docs/conftest.py set CACHEKIT_MASTER_KEY in the environment. Then every plain "
+        "@cache fence that states no encryption intent raises ConfigurationError at "
+        "decoration. Pass the key explicitly (master_key=secret_key) in the "
         "@cache.secure fences instead. See issue #205."
     )
     # The key must still be available to fences that opt in explicitly.

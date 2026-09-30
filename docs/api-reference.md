@@ -116,7 +116,7 @@ def your_function(args):
 
 #### Encryption Parameters
 
-- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling
+- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` (`@cache.local` takes no `encryption=` and never raises) ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling
 
 #### Returns
 - Cached function result or fresh computation result
