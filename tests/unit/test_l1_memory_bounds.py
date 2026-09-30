@@ -359,7 +359,7 @@ class TestCleanupThreadAfterFork:
 
                 holder = threading.Thread(target=hold)
                 holder.start()
-                held.wait(5)
+                assert held.wait(5)  # else the take-over below never meets a live holder and the test proves nothing
                 other.put("k", b"v")  # first put runs the take-over while a live child thread holds busy-ns
                 release.set()
                 holder.join(5)
@@ -379,6 +379,66 @@ class TestCleanupThreadAfterFork:
         finally:
             manager.stop_background_cleanup()
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    @pytest.mark.parametrize("two_managers", [False, True], ids=["one-manager", "two-managers"])
+    def test_at_fork_hook_repairs_every_cache_when_its_warning_raises(self, two_managers):
+        import multiprocessing
+        import queue as queue_mod
+
+        from cachekit import l1_cache
+
+        first = L1CacheManager(default_max_memory_mb=10)
+        second = L1CacheManager(default_max_memory_mb=10) if two_managers else first
+        caches = [first.get_cache("raising-ns"), second.get_cache("later-ns")]
+
+        class RaiseOnDropWarning(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                # Only this test's first cache: a drop warning from any other live manager passes.
+                if record.args and record.args[0] == "raising-ns":
+                    raise RuntimeError("filter failed")
+                return True
+
+        raising = RaiseOnDropWarning()
+        l1_cache.logger.addFilter(raising)
+        held, release = [threading.Event() for _ in caches], threading.Event()
+
+        def hold(cache: L1Cache, done: threading.Event) -> None:
+            with cache._lock:
+                done.set()
+                release.wait()
+
+        holders = [threading.Thread(target=hold, args=pair, daemon=True) for pair in zip(caches, held, strict=True)]
+        for holder in holders:
+            holder.start()
+        assert all(event.wait(5) for event in held)
+        try:
+            ctx = multiprocessing.get_context("fork")
+            queue = ctx.Queue()
+
+            def child(q) -> None:
+                # From the child's main thread: a lock the hook left orphaned hangs here for good.
+                found = [cache.get("k")[0] for cache in caches]
+                q.put({"found": found, "reset": [m._locks_reset_pid == os.getpid() for m in (first, second)]})
+
+            process = ctx.Process(target=child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=20)
+            except queue_mod.Empty:
+                outcome = "child hung on a cache lock the at-fork hook left orphaned"
+            finally:
+                process.join(timeout=10)
+                if process.is_alive():  # a hung child would otherwise block pytest's exit
+                    process.kill()
+
+            assert outcome == {"found": [False, False], "reset": [True, True]}
+            assert process.exitcode == 0
+        finally:
+            l1_cache.logger.removeFilter(raising)
+            release.set()
+            for holder in holders:
+                holder.join(5)
+
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("stopped-ns")
@@ -393,6 +453,7 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("orphan-ns")
         cache.put("pre-fork", b"v")
+        held_bytes = cache._current_memory_bytes
         _as_if_forked(manager, parent_ran_cleanup=False)
         orphaned = cache._lock
         orphaned.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
@@ -407,7 +468,8 @@ class TestCleanupThreadAfterFork:
             cache.put("k", b"v")
 
         assert not cache.get("pre-fork")[0] and cache.get("k")[0]
-        assert any("dropped 1 entries" in r.message for r in caplog.records)
+        # Logged after the clear, but with what the cache held before it.
+        assert any(f"dropped 1 entries ({held_bytes} bytes)" in r.message for r in caplog.records)
 
     def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)

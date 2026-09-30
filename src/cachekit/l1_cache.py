@@ -260,16 +260,18 @@ class L1Cache:
         if not lock._is_owned() and lock.acquire(timeout=timeout):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
             lock.release()
             return
-        logger.warning(
-            "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
-            self.namespace,
-            len(self._cache),
-            self._current_memory_bytes,
-        )
+        dropped, dropped_bytes = len(self._cache), self._current_memory_bytes
         # Clear before publishing the new lock: the orphaned one still shuts every other thread out.
         self._cache.clear()
         self._current_memory_bytes = 0
         self._lock = threading.RLock()
+        # Log only once repaired: a raising logging Filter escapes Logger.handle.
+        logger.warning(
+            "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
+            self.namespace,
+            dropped,
+            dropped_bytes,
+        )
 
     def _remove_entry(self, key: str) -> None:
         """Remove entry from cache and update memory tracking.
@@ -451,6 +453,8 @@ class L1CacheManager:
         they put(), so _reset_cache_locks_after_fork repairs orphaned cache locks before that
         first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
+        The take-over resets cache locks only when that hook did not run in this PID
+        (_locks_reset_pid): after it, a held cache lock belongs to a live child thread.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -594,10 +598,16 @@ def _reset_cache_locks_after_fork() -> None:
     Only the locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
     """
     pid = os.getpid()
+    error: Optional[Exception] = None
     for manager in list(_managers):
         for cache in list(manager._caches.values()):
-            cache._reset_lock_after_fork(timeout=0)
+            try:
+                cache._reset_lock_after_fork(timeout=0)
+            except Exception as e:  # its drop warning, logged after the repair: repair the rest too
+                error = error or e
         manager._locks_reset_pid = pid
+    if error is not None:
+        raise error  # only now; Python reports an at-fork hook's exception and carries on
 
 
 if hasattr(os, "register_at_fork"):
