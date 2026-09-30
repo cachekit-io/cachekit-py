@@ -409,6 +409,31 @@ def bounded_error(exc: BaseException | str) -> str:
     return text.translate(_LOG_UNSAFE_ESCAPES)
 
 
+def immutable_buffer(data: bytes | bytearray | memoryview) -> bytes | memoryview:
+    """Return ``data`` as one flat, unsigned, immutable byte buffer, copying only when it must.
+
+    For callers that read one untrusted document twice (a structure walk then a decode, or a decode
+    then an envelope probe): a mutable exporter could change between the reads, so both must see
+    one snapshot.
+
+    Examples:
+        >>> immutable_buffer(bytearray(b"ab"))
+        b'ab'
+        >>> immutable_buffer(memoryview(b"\\x94").cast("b"))[0]  # a signed view reads 0x94 as -108
+        148
+    """
+    if isinstance(data, memoryview):
+        # cast("B") flattens a multi-dimensional view and retypes any C-contiguous format
+        # ("b"/"c"/"H"...) to unsigned bytes without copying, so len() is the byte count and indexing
+        # yields byte values; a non-contiguous view has no flat form and is copied.
+        data = data.cast("B") if data.c_contiguous else bytes(data)
+    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
+        # A mutable exporter (bytearray, mmap, a memoryview over either) is snapshotted. bytes and a
+        # memoryview of bytes stay zero-copy — the same containment proof the Rust side's bytes_view uses.
+        data = bytes(data)
+    return data
+
+
 def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) -> Any:
     """Decode one untrusted MessagePack document under cachekit-owned bounds.
 
@@ -446,17 +471,7 @@ def unpackb_bounded(data: bytes | bytearray | memoryview, **unpack_opts: Any) ->
         ...
         ValueError: Unpack failed: MessagePack document nests deeper than 1024 levels
     """
-    if isinstance(data, memoryview):
-        # The walk (PyBuffer<u8>) and the decode must see one flat byte string: cast("B") flattens a
-        # multi-dimensional view and retypes any C-contiguous format ("b"/"c"/"H"...) to unsigned bytes
-        # without copying, so len(data) is the byte count the max_*_len caps need; a non-contiguous
-        # view has no flat form and is copied.
-        data = data.cast("B") if data.c_contiguous else bytes(data)
-    if not isinstance(data, bytes) and not (isinstance(data, memoryview) and isinstance(data.obj, bytes)):
-        # A mutable exporter (bytearray, a memoryview over one) could change between the walk and
-        # the decode, so both must see one immutable document. bytes and a memoryview of bytes stay
-        # zero-copy — the same containment proof the Rust side's bytes_view uses.
-        data = bytes(data)
+    data = immutable_buffer(data)  # the walk and the decode must see one document
     n = len(data)
     check_msgpack_structure(data, MSGPACK_MAX_NESTING)
     return msgpack.unpackb(data, max_str_len=n, max_bin_len=n, max_array_len=n, max_map_len=n, max_ext_len=n, **unpack_opts)

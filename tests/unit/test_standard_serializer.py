@@ -8,14 +8,69 @@ and multi-language compatibility.
 from __future__ import annotations
 
 import math
+import random
+import re
 from datetime import date, datetime, time
 
+import msgpack
 import pytest
 
-from cachekit.serializers.base import SerializationError, SerializationFormat, SerializerProtocol
+from cachekit.serializers import standard_serializer
+from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata, SerializerProtocol
 from cachekit.serializers.standard_serializer import (
     StandardSerializer,
 )
+
+CROSS_CONFIG_MESSAGE = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
+
+PROBE_BUDGET = 256 * 1024  # largest declared payload an integrity-off reader verifies (see deserialize Raises:)
+LZ4_BOUND_FOR_BUDGET = 20 + PROBE_BUDGET * 110 // 100  # lz4_flex get_maximum_output_size(PROBE_BUDGET)
+
+
+class _RetrieveSpy:
+    """Counts retrieve() calls on the wrapped ByteStorage."""
+
+    def __init__(self, inner) -> None:
+        self.inner, self.calls = inner, 0
+
+    def retrieve(self, data):
+        self.calls += 1
+        return self.inner.retrieve(data)
+
+
+# Integrity-off values and the bytes main wrote for them. The first three are shaped like a ByteStorage
+# envelope ``[bytes, [8 ints], int, format]`` and pass the two-byte pre-filter (``\x94\xc4``), so
+# retrieve() is what clears them; the first two score a perfect 4/4 on
+# AutoSerializer._looks_like_envelope, so their round-trip proves shape decides nothing here.
+INTEGRITY_OFF_VALUES = [
+    pytest.param(
+        [b"x", [1] * 8, 0, "msgpack"],
+        b"\x94\xc4\x01x\x98\x01\x01\x01\x01\x01\x01\x01\x01\x00\xa7msgpack",
+        id="4of4-minimal",
+    ),
+    pytest.param(
+        [b"\x89PNG", [255, 0, 0, 255, 0, 255, 0, 255], 4096, "series"],
+        b"\x94\xc4\x04\x89PNG\x98\xcc\xff\x00\x00\xcc\xff\x00\xcc\xff\x00\xcc\xff\xcd\x10\x00\xa6series",
+        id="4of4-png",
+    ),
+    pytest.param(
+        [b"blob", [1, 2, 3, 4, 5, 6, 7, 8], 42, "label"],
+        b"\x94\xc4\x04blob\x98\x01\x02\x03\x04\x05\x06\x07\x08*\xa5label",
+        id="3of4",
+    ),
+    pytest.param([1, 2, 3, "msgpack"], b"\x94\x01\x02\x03\xa7msgpack", id="plain-4-list"),
+    pytest.param({"admin": False, "user": "alice"}, b"\x82\xa5admin\xc2\xa4user\xa5alice", id="dict"),
+]
+
+
+def _envelope(payload_len: int, *, legacy: bool = False) -> bytes:
+    """A healthy integrity-on envelope around ``payload_len`` random bytes, optionally re-encoded in
+    the legacy layout older core versions wrote (payload as an int array instead of ``bin``)."""
+    data, _ = StandardSerializer().serialize(random.Random(payload_len).randbytes(payload_len))
+    if not legacy:
+        return data
+    compressed, checksum, original_size, fmt = msgpack.unpackb(data)
+    return msgpack.packb([list(compressed), checksum, original_size, fmt], use_bin_type=True)
 
 
 @pytest.mark.unit
@@ -459,17 +514,178 @@ class TestStandardSerializerIntegrityChecking:
         deserialized = serializer.deserialize(serialized)
         assert deserialized == data
 
-    def test_enveloped_entry_read_with_integrity_off_fails_closed(self) -> None:
-        """Writer on, reader off: the ByteStorage envelope cannot be verified or unwrapped
-        without ByteStorage. Before the gate unpackb ran on the envelope bytes and silently
-        returned its positional fields — ``[payload, checksum, size, format]`` — as the value."""
-        on = StandardSerializer(enable_integrity_checking=True)
-        data, meta = on.serialize({"a": 1, "b": [1, 2, 3]})
+    @pytest.mark.parametrize(
+        "header",
+        [
+            pytest.param(lambda meta: meta, id="compressed-true"),
+            pytest.param(
+                lambda meta: SerializationMetadata.from_dict({k: v for k, v in meta.to_dict().items() if k != "compressed"}),
+                id="compressed-absent",
+            ),
+            pytest.param(lambda meta: None, id="no-metadata"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            pytest.param(bytes, id="bytes"),
+            pytest.param(memoryview, id="memoryview"),
+            # indexes to signed ints (0x94 reads as -108), so the layout test must see a normalised view
+            pytest.param(lambda b: memoryview(b).cast("b"), id="signed-memoryview"),
+            pytest.param(bytearray, id="bytearray"),
+        ],
+    )
+    def test_enveloped_entry_read_with_integrity_off_fails_closed(self, header, wrap) -> None:
+        """Writer on, reader off: the envelope is refused whatever the header says, rather than
+        returning its positional fields ``[payload, checksum, size, format]`` as the value."""
+        data, meta = StandardSerializer(enable_integrity_checking=True).serialize({"admin": False, "user": "alice"})
         assert meta.compressed is True
 
         off = StandardSerializer(enable_integrity_checking=False)
-        with pytest.raises(SerializationError, match="integrity checking disabled"):
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$") as excinfo:
+            off.deserialize(wrap(data), header(meta))
+        assert type(excinfo.value) is SerializationError  # no subclass: shape decides nothing here
+
+    @pytest.mark.parametrize(
+        ("payload_len", "legacy", "markers"),
+        [
+            pytest.param(8, False, (0xC4,), id="bin8"),
+            pytest.param(300, False, (0xC5,), id="bin16"),
+            pytest.param(70_000, False, (0xC6,), id="bin32"),
+            pytest.param(8, True, tuple(range(0x90, 0xA0)), id="legacy-fixarray"),
+            pytest.param(300, True, (0xDC,), id="legacy-array16"),
+            pytest.param(70_000, True, (0xDD,), id="legacy-array32"),
+        ],
+    )
+    def test_every_envelope_layout_bytestorage_writes_is_refused_with_integrity_off(self, payload_len, legacy, markers) -> None:
+        """The pre-filter admits every payload-slot marker ByteStorage has written, current (bin) and
+        legacy (int array), at each msgpack length boundary."""
+        data = _envelope(payload_len, legacy=legacy)
+        assert data[0] == 0x94
+        assert data[1] in markers
+
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            StandardSerializer(enable_integrity_checking=False).deserialize(data)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(b"\x00" * (PROBE_BUDGET - 5), id="compressible"),  # bin32 header is 5 bytes
+            # incompressible: the longest payload slot a real envelope within the budget carries
+            pytest.param(random.Random(0).randbytes(PROBE_BUDGET - 5), id="incompressible"),
+        ],
+    )
+    def test_envelope_at_the_probe_budget_is_refused_without_metadata(self, payload) -> None:
+        data, _ = StandardSerializer().serialize(payload)
+        compressed, _, declared, _ = msgpack.unpackb(data)
+        assert declared == PROBE_BUDGET
+        assert len(compressed) <= LZ4_BOUND_FOR_BUDGET
+
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            StandardSerializer(enable_integrity_checking=False).deserialize(data)
+
+    def test_envelope_over_the_probe_budget_is_verified_only_through_its_header(self) -> None:
+        """retrieve() decompresses the whole declared payload before it checks the checksum, so a
+        value declaring more than the budget is never probed. That keeps a caller-shaped value from
+        costing a large decompress per read; the price is the documented residual: a healthy
+        envelope over the budget read with no metadata comes back as its fields. Its own
+        ``compressed=True`` header still refuses it at any size."""
+        data, meta = StandardSerializer().serialize(b"\x00" * (PROBE_BUDGET - 4))
+        fields = msgpack.unpackb(data)
+        assert fields[2] == PROBE_BUDGET + 1
+
+        off = StandardSerializer(enable_integrity_checking=False)
+        assert off.deserialize(data) == fields
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
             off.deserialize(data, meta)
+
+    @pytest.mark.parametrize(("value", "golden"), INTEGRITY_OFF_VALUES)
+    @pytest.mark.parametrize("with_metadata", [True, False])
+    def test_envelope_shaped_value_round_trips_with_integrity_off(self, value, golden, with_metadata) -> None:
+        """Only an envelope that VERIFIES is refused, so a legitimate value shaped exactly like
+        one still round-trips — with its own metadata and without."""
+        off = StandardSerializer(enable_integrity_checking=False)
+        data, meta = off.serialize(value)
+        assert off.deserialize(data, meta if with_metadata else None) == value
+
+    @pytest.mark.parametrize(
+        ("slot", "rot"),
+        [
+            pytest.param(1, lambda checksum: [checksum[0] ^ 1, *checksum[1:]], id="checksum"),
+            pytest.param(2, lambda original_size: original_size + 1, id="original_size"),
+        ],
+    )
+    def test_rotted_envelope_is_refused_only_through_its_header_with_integrity_off(self, slot, rot) -> None:
+        """A retrieve() failure of any kind means "not verified", so without metadata the plain decode
+        stands: the documented residual, as rot in the reader's own entries goes undetected. The
+        writer's ``compressed=True`` header, which ``@cache`` always passes, still refuses it."""
+        data, meta = StandardSerializer(enable_integrity_checking=True).serialize({"a": 1})
+        fields = msgpack.unpackb(data)
+        fields[slot] = rot(fields[slot])
+        rotted = msgpack.packb(fields, use_bin_type=True)
+
+        off = StandardSerializer(enable_integrity_checking=False)
+        assert off.deserialize(rotted) == fields
+        with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+            off.deserialize(rotted, meta)
+
+    def test_value_equal_to_a_valid_envelope_is_refused_with_integrity_off(self) -> None:
+        """The documented residual on the other side: a value that IS a valid envelope's fields
+        verifies, so it is refused on every read, with its own metadata and without."""
+        envelope_fields = msgpack.unpackb(_envelope(8))
+        off = StandardSerializer(enable_integrity_checking=False)
+        data, meta = off.serialize(envelope_fields)
+
+        for metadata in (meta, None):
+            with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+                off.deserialize(data, metadata)
+
+    @pytest.mark.parametrize("healthy_at_decode", [True, False], ids=["rotted-after-decode", "repaired-after-decode"])
+    def test_decode_and_probe_judge_one_snapshot_of_a_mutable_buffer(self, monkeypatch, healthy_at_decode) -> None:
+        """A bytearray (or a view over an mmap) can change between the plain decode and the probe.
+        Both must judge the bytes that decoded: a healthy envelope is refused even if the buffer rots
+        afterwards, and a rotted one is returned as the fields it decoded to even if it is repaired."""
+        data, _ = StandardSerializer().serialize({"a": 1})
+        pos = len(msgpack.packb(msgpack.unpackb(data)[0]))  # last byte of the LZ4 payload, always a literal
+        buf = bytearray(data)
+        if not healthy_at_decode:
+            buf[pos] ^= 1
+        decoded_fields = msgpack.unpackb(bytes(buf))
+        real_unpackb_bounded = standard_serializer.unpackb_bounded
+
+        def decode_then_flip(*args, **kwargs):
+            value = real_unpackb_bounded(*args, **kwargs)
+            buf[pos] ^= 1  # the caller's buffer changes after the decode has read it
+            return value
+
+        monkeypatch.setattr(standard_serializer, "unpackb_bounded", decode_then_flip)
+        off = StandardSerializer(enable_integrity_checking=False)
+        if healthy_at_decode:
+            with pytest.raises(SerializationError, match=f"^{re.escape(CROSS_CONFIG_MESSAGE)}$"):
+                off.deserialize(buf)
+        else:
+            assert off.deserialize(buf) == decoded_fields
+
+    @pytest.mark.parametrize(("extra", "probed"), [(0, True), (1, False)], ids=["at-lz4-bound", "over-lz4-bound"])
+    def test_probe_skips_a_payload_slot_longer_than_any_envelope_within_budget(self, extra, probed) -> None:
+        """No envelope declaring at most the budget can carry a payload longer than lz4_flex's
+        worst-case output for the budget, so a longer slot 0 is never handed to retrieve(), which
+        would copy all of it before failing. The value round-trips either way."""
+        value = [b"\x00" * (LZ4_BOUND_FOR_BUDGET + extra), [1] * 8, 1000, "x"]
+        off = StandardSerializer(enable_integrity_checking=False)
+        data, _ = off.serialize(value)
+        spy = _RetrieveSpy(off._byte_storage)
+        off._byte_storage = spy  # type: ignore[assignment]
+
+        assert off.deserialize(data) == value
+        assert spy.calls == int(probed)
+
+    @pytest.mark.parametrize(("value", "golden"), INTEGRITY_OFF_VALUES)
+    def test_integrity_off_write_bytes_are_pinned(self, value, golden) -> None:
+        """Integrity-off writes are plain MessagePack; the read-side gate must not move them."""
+        data, meta = StandardSerializer(enable_integrity_checking=False).serialize(value)
+        assert data == golden
+        assert meta.compressed is False
 
     def test_metadata_format_msgpack(self) -> None:
         """Test that metadata always reports SerializationFormat.MSGPACK."""
