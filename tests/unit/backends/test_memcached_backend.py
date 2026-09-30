@@ -353,3 +353,92 @@ class TestLazyImport:
 
         with pytest.raises(AttributeError, match="has no attribute"):
             _ = cachekit.backends.NoSuchBackend  # type: ignore[attr-defined]
+
+
+class _FakeServer:
+    """Stands in for one server's pymemcache client inside a real HashClient."""
+
+    def __init__(self, server: object) -> None:
+        self.server = server
+        self.sends: list[tuple[list[str], object]] = []
+        self.error: Exception | None = None
+
+    def delete_many(self, keys: list[str], noreply: object = None) -> bool:
+        self.sends.append((list(keys), noreply))
+        if self.error is not None:
+            raise self.error
+        return True
+
+
+@pytest.mark.unit
+class TestDeleteMany:
+    """_delete_many against a real HashClient (real routing and retry handling), fake servers."""
+
+    @staticmethod
+    def _backend(servers: int = 2, key_prefix: str = "") -> tuple[MemcachedBackend, dict[object, _FakeServer]]:
+        cfg = MemcachedBackendConfig(servers=[f"127.0.0.1:{21000 + i}" for i in range(servers)], key_prefix=key_prefix)
+        backend = MemcachedBackend(cfg)
+        fakes = {name: _FakeServer(client.server) for name, client in backend._client.clients.items()}
+        backend._client.clients.update(fakes)
+        return backend, fakes
+
+    def test_one_acknowledged_send_per_server(self) -> None:
+        backend, fakes = self._backend()
+        keys = [f"k{i}" for i in range(200)]
+
+        assert backend._delete_many(keys) == set()
+
+        sends = [s for f in fakes.values() for s in f.sends]
+        assert len(sends) == 2  # both servers own some keys; one send each
+        assert all(noreply is False for _, noreply in sends)
+        assert sorted(k for ks, _ in sends for k in ks) == sorted(keys)
+        for name, fake in fakes.items():
+            for sent, _ in fake.sends:
+                assert all(backend._client.hasher.get_node(k) == name for k in sent)
+
+    def test_sends_are_capped(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        backend._delete_many([f"k{i}" for i in range(2500)])
+        (fake,) = fakes.values()
+        assert [len(ks) for ks, _ in fake.sends] == [1000, 1000, 500]
+
+    def test_prefix_applied_and_failures_reported_raw(self) -> None:
+        backend, fakes = self._backend(servers=1, key_prefix="app:")
+        (fake,) = fakes.values()
+        fake.error = OSError("connection reset")
+
+        assert backend._delete_many(["a", "b"]) == {"a", "b"}
+        assert fake.sends[0][0] == ["app:a", "app:b"]
+
+    def test_failing_server_fails_only_its_keys(self) -> None:
+        backend, fakes = self._backend()
+        keys = [f"k{i}" for i in range(200)]
+        bad_name, bad = next(iter(fakes.items()))
+        bad.error = OSError("connection reset")
+
+        failed = backend._delete_many(keys)
+
+        assert failed and failed == {k for k in keys if backend._client.hasher.get_node(k) == bad_name}
+
+    def test_server_in_retry_window_is_not_counted_deleted(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        ((name, fake),) = fakes.items()
+        fake.error = OSError("down")
+        assert backend._delete_many(["a"]) == {"a"}  # marks the server failed
+        fake.error = None
+        fake.sends.clear()
+
+        # Within retry_timeout HashClient skips the server and returns its default: not an ack.
+        assert backend._delete_many(["a", "b"]) == {"a", "b"}
+        assert fake.sends == []
+
+    def test_invalid_key_fails_alone(self) -> None:
+        backend, fakes = self._backend(servers=1)
+        assert backend._delete_many(["good", "has space"]) == {"has space"}
+        (fake,) = fakes.values()
+        assert fake.sends[0][0] == ["good"]
+
+    def test_empty(self) -> None:
+        backend, fakes = self._backend()
+        assert backend._delete_many([]) == set()
+        assert all(f.sends == [] for f in fakes.values())

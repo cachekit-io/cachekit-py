@@ -437,3 +437,48 @@ class TestEdgeCases:
             backend.delete("cycle")
 
         assert backend.get("cycle") is None
+
+
+class TestBatchedWholeFunctionInvalidation:
+    """No-args invalidate_cache() deletes through _delete_many: pipelined, acknowledged, prefixed."""
+
+    def test_sweep_batches_and_every_key_misses(self, backend: MemcachedBackend) -> None:
+        from unittest.mock import patch
+
+        from cachekit import cache
+
+        config = MemcachedBackendConfig(
+            servers=[f"{MEMCACHED_HOST}:{MEMCACHED_PORT}"],
+            key_prefix="batch_ns:",
+            connect_timeout=2.0,
+            timeout=2.0,
+        )
+        prefixed = MemcachedBackend(config)
+
+        @cache(backend=prefixed, ttl=60, namespace="mc_batched")
+        def f(x: int) -> int:
+            return x
+
+        keys: list[str] = []
+        real_set = prefixed.set
+
+        def recording_set(key: str, value: bytes, ttl: int | None = None) -> None:
+            keys.append(key)
+            real_set(key, value, ttl)
+
+        with patch.object(prefixed, "set", side_effect=recording_set):
+            for i in range(1500):
+                f(i)
+        assert len(keys) == 1500
+        assert all(prefixed.get(k) is not None for k in keys)
+        assert all(prefixed._client.get(k) is None for k in keys[:5])  # stored under the prefix only
+
+        with (
+            patch.object(prefixed, "_delete_many", wraps=prefixed._delete_many) as batch,
+            patch.object(prefixed, "delete", wraps=prefixed.delete) as single,
+        ):
+            f.invalidate_cache()
+
+        assert batch.call_count == 1
+        assert single.call_count == 0
+        assert all(prefixed.get(k) is None for k in keys)

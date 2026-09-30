@@ -354,6 +354,23 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
     return callable(getattr(cls, "track_key", None)) and callable(getattr(cls, "drain_tracked", None))
 
 
+class _MultiDeleteBackend(Protocol):
+    """Internal: a backend that deletes many keys in one round trip (per server).
+
+    ``_delete_many`` returns the keys it could not confirm deleted. A key only counts as
+    deleted once the server acknowledged its delete; a key already absent counts as
+    deleted. It may also raise as a whole, in which case the outcome of every key is
+    unknown. Deliberately private: not part of the backend extension surface.
+    """
+
+    def _delete_many(self, keys: list[str]) -> set[str]: ...
+
+
+def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
+    """Type guard for ``_MultiDeleteBackend``, checked on the CLASS like ``supports_key_tracking``."""
+    return callable(getattr(type(backend), "_delete_many", None))
+
+
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
     """Pad a released 2-tuple ``(bytes, is_stale)`` hit to ``(bytes, is_stale, None)`` (LAB-557).
 

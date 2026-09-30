@@ -582,3 +582,258 @@ class TestInvalidateFailedDeleteVisibility:
             f.invalidate_cache()
         assert backend.store == {}
         assert _failed_delete_records(caplog) == []
+
+
+class MultiDeleteBackend(FlakyBackend):
+    """FlakyBackend with the internal multi-key delete: counts calls, fails chosen keys.
+
+    ``_delete_many`` reports every key in ``fail_keys`` as not deleted, raises
+    ``batch_error`` as a whole while it is set, and calls ``during_batch`` (if set) after
+    applying a batch, before returning to the sweep.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[str]] = []
+        self.single_deletes: list[str] = []
+        self.fail_keys: set[str] = set()
+        self.batch_error: Optional[BaseException] = None
+        self.during_batch: Optional[Any] = None
+
+    def delete(self, key: str) -> bool:
+        self.single_deletes.append(key)
+        return super().delete(key)
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        self.batches.append(list(keys))
+        if self.batch_error is not None:
+            raise self.batch_error
+        failed = {k for k in keys if k in self.fail_keys}
+        for k in keys:
+            if k not in failed:
+                self.store.pop(k, None)
+        if self.during_batch is not None:
+            self.during_batch(keys)
+        return failed
+
+
+class ScopedMultiDeleteBackend(MultiDeleteBackend):
+    """MultiDeleteBackend under a per-context tenant prefix; records every L2 read."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def get(self, key: str) -> Optional[bytes]:
+        self.reads.append(self.key_prefix + key)
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        return {k[len(self.key_prefix) :] for k in super()._delete_many([self.key_prefix + k for k in keys])}
+
+
+def _tracked(fn: Any) -> set[tuple[str, str]]:
+    from tests.unit.test_key_registry import _closure_cell
+
+    return _closure_cell(fn, "_cached_keys").cell_contents
+
+
+@pytest.mark.unit
+class TestInvalidateNoArgsMultiDelete:
+    """No-args invalidation batches L2 deletes on a backend with the internal multi-key delete."""
+
+    def test_capability_is_internal_and_class_level(self, tmp_path: Any) -> None:
+        import cachekit.backends as backends
+        from cachekit.backends.memcached.backend import MemcachedBackend
+        from cachekit.backends.redis.backend import RedisBackend
+        from cachekit.cache_handler import _supports_multi_delete
+
+        assert _supports_multi_delete(MultiDeleteBackend())
+        assert not _supports_multi_delete(FlakyBackend())
+        assert not _supports_multi_delete(FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
+        assert callable(RedisBackend._delete_many) and callable(MemcachedBackend._delete_many)
+
+        class Dynamic(FlakyBackend):
+            def __getattr__(self, name: str) -> Any:
+                return lambda *a, **k: set()
+
+        assert not _supports_multi_delete(Dynamic())  # instance-level attributes do not count
+        assert not any("delete_many" in name.lower() or "multi" in name.lower() for name in backends.__all__)
+
+    def test_custom_backend_without_capability_keeps_per_key_loop(self) -> None:
+        deletes: list[str] = []
+
+        class Minimal(FlakyBackend):
+            def delete(self, key: str) -> bool:
+                deletes.append(key)
+                return super().delete(key)
+
+        backend = Minimal()
+
+        @cache(backend=backend, ttl=60, namespace="multi_minimal")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(5):
+            f(i)
+        f.invalidate_cache()
+        assert len(deletes) == 5
+        assert backend.store == {}
+
+    @pytest.mark.parametrize(("n", "calls"), [(5000, 1), (12_345, 2)])
+    def test_round_trips_bounded(self, n: int, calls: int) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace=f"multi_bounded_{n}")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(n):
+            f(i)
+        f.invalidate_cache()
+
+        assert len(backend.batches) == calls
+        assert all(len(b) <= 10_000 for b in backend.batches)
+        assert sum(len(b) for b in backend.batches) == n
+        assert backend.single_deletes == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_reported_failures_stay_tracked_and_are_counted(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_partial")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(10):
+            f(i)
+        failing = set(list(backend.store)[:2])
+        backend.fail_keys = failing
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        assert {key for _, key in _tracked(f)} == failing
+        assert set(backend.store) == failing
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 2 L2 key" in records[0].getMessage()
+
+        backend.fail_keys = set()
+        backend.batches.clear()
+        f.invalidate_cache()  # the retry sends exactly the two failed keys
+        assert [set(b) for b in backend.batches] == [failing]
+        assert backend.store == {}
+
+    def test_batch_that_raises_falls_back_per_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_raise")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(4):
+            f(i)
+        backend.batch_error = BackendError(_ERROR_TEXT)
+        f.invalidate_cache()
+        assert len(backend.batches) == 1
+        assert len(backend.single_deletes) == 4
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+        for i in range(4):
+            f(i)
+        backend.delete_error = OSError(_ERROR_TEXT)  # the per-key fallback fails too
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 4 L2 key" in records[0].getMessage()
+        assert len(_tracked(f)) == 4
+
+    def test_l2_delete_precedes_trim_precedes_l1_eviction(self) -> None:
+        backend = MultiDeleteBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="multi_order")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        f(1)
+        f(2)
+        seen: dict[str, Any] = {}
+
+        def check(keys: list[str]) -> None:
+            seen["tracked"] = len(_tracked(f))
+            before = calls
+            f(1)  # still an L1 hit: L1 is evicted only after the batch returns
+            seen["l1_hit"] = calls == before
+
+        backend.during_batch = check
+        f.invalidate_cache()
+        assert seen == {"tracked": 2, "l1_hit": True}
+        backend.during_batch = None
+        f(1)
+        assert calls == 3  # L1 evicted after the batch
+
+    def test_rewrite_during_batch_stays_recorded(self) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        backend.during_batch = lambda keys: f(1)  # a concurrent miss rewrites k after its delete
+        f.invalidate_cache()
+
+        assert len(_tracked(f)) == 1
+        (entry,) = _tracked(f)
+        assert entry[1] in backend.store
+        backend.during_batch = None
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    def test_only_calling_tenants_keys_go_to_the_batch(self) -> None:
+        backend = ScopedMultiDeleteBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="multi_tenants")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        token = _tenant.set("b")
+        try:
+            f(1)
+            f(2)
+        finally:
+            _tenant.reset(token)
+        f(3)  # tenant a
+        b_keys = {k for k in backend.store if k.startswith("t:b:")}
+
+        f.invalidate_cache()  # as tenant a
+
+        assert len(backend.batches) == 1
+        assert all(k.startswith("t:a:") for k in backend.batches[0]) and len(backend.batches[0]) == 1
+        assert set(backend.store) == b_keys  # tenant b's L2 untouched
+        assert {scope for scope, _ in _tracked(f)} == {"t:b:"}  # and still tracked
+        backend.reads.clear()
+        token = _tenant.set("b")
+        try:
+            assert f(1) == 1
+        finally:
+            _tenant.reset(token)
+        assert calls == 3  # served from tenant b's surviving L2 value, not recomputed
+        assert backend.reads  # ...after an L1 miss: only tenant b's L1 copy was evicted
