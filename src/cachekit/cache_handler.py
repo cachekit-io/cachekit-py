@@ -514,7 +514,7 @@ class CacheSerializationHandler:
     Architecture:
     - Serializer: Defines HOW to serialize (default/msgpack, future: pickle, json)
     - Encryption: Defines WHETHER to encrypt (security layer on top, orthogonal)
-    - Tenant extraction: For multi-tenant encryption key isolation (FAIL CLOSED)
+    - Tenant extraction: selects the per-tenant derived key (not a tenancy boundary; no shared-key fallback)
 
     Modes (encryption is tri-state: None=auto / True=force-on / False=hard opt-out):
     - encryption=None: no intent stated — plaintext. DEPRECATED: while CACHEKIT_MASTER_KEY is set and neither
@@ -523,7 +523,7 @@ class CacheSerializationHandler:
     - encryption=False: Explicit opt-out — direct serialization (plaintext), even if a master key is set
     - encryption=True, tenant_extractor=None: Single-tenant encrypted (tenant_id "default"
       unless deployment_uuid / CACHEKIT_DEPLOYMENT_UUID is set)
-    - encryption=True, tenant_extractor provided: Multi-tenant encrypted (FAIL CLOSED)
+    - encryption=True, tenant_extractor provided: Multi-tenant encrypted (no shared-key fallback)
 
     Examples:
         Basic usage without encryption:
@@ -589,7 +589,7 @@ class CacheSerializationHandler:
             tenant_extractor: Optional TenantContextExtractor for multi-tenant encryption.
                              Only used if encryption=True.
                              If None: single-tenant mode (tenant_id "default" unless overridden).
-                             If provided: multi-tenant mode (extracts tenant_id, FAIL CLOSED).
+                             If provided: multi-tenant mode (extracts tenant_id; no shared-key fallback).
             single_tenant_mode: Explicitly enable single-tenant mode (requires encryption=True).
                                Mutually exclusive with tenant_extractor.
             deployment_uuid: Optional explicit tenant_id override for single-tenant mode
@@ -616,7 +616,7 @@ class CacheSerializationHandler:
             TypeError: If serializer_name is not a string or SerializerProtocol instance.
 
         Note:
-            FAIL CLOSED security policy: If encryption=True and tenant_extractor provided
+            No shared-key fallback: If encryption=True and tenant_extractor provided
             but extraction fails, ValueError propagates to caller (no fallback to shared key).
         """
         self.serializer_name = serializer_name
@@ -867,7 +867,7 @@ class CacheSerializationHandler:
         instances (which internally cache derived keys).
 
         Args:
-            tenant_id: Tenant identifier for key isolation
+            tenant_id: Tenant identifier for per-tenant key derivation
 
         Returns:
             Cached or newly created EncryptionWrapper instance
@@ -937,14 +937,14 @@ class CacheSerializationHandler:
             Serialized data wrapped for cache storage
 
         Raises:
-            ValueError: If tenant extraction fails in multi-tenant mode (FAIL CLOSED)
+            ValueError: If tenant extraction fails in multi-tenant mode (no shared-key fallback)
             ValueError: If cache_key is empty when encryption is enabled
             ValueError: If the serialized envelope exceeds max_value_size
                 (CACHEKIT_MAX_VALUE_SIZE) — the L2 oversized-entry ceiling
             SerializationError: If serialization fails
 
         Note:
-            Tenant extraction uses FAIL CLOSED security policy:
+            Tenant extraction has no shared-key fallback:
             - If tenant_extractor provided: extracts tenant_id from args/kwargs or raises ValueError
             - If single_tenant_mode=True: uses the tenant_id resolved in __init__ (explicit UUID, else "default")
 
@@ -981,10 +981,11 @@ class CacheSerializationHandler:
         try:
             # Wrap with encryption layer if requested (defines WHETHER to encrypt)
             if self.encryption:
-                # Extract tenant_id based on configuration (FAIL CLOSED)
+                # Extract tenant_id based on configuration (no shared-key fallback)
                 if self.tenant_extractor:
                     # Multi-tenant mode: MUST extract tenant_id
-                    # If extraction fails, ValueError bubbles up (FAIL CLOSED - no fallback)
+                    # A failed extraction raises out of serialize_data (no shared-key fallback); the
+                    # decorator's store path catches it, logs it and skips the write
                     tenant_id = self.tenant_extractor.extract(args, kwargs)
                 else:
                     # Single-tenant mode: tenant_id resolved once in __init__

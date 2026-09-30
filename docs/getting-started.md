@@ -236,8 +236,10 @@ export REDIS_URL="redis://localhost:6379"
 export CACHEKIT_REDIS_URL="redis://localhost:6379"
 export CACHEKIT_CONNECTION_POOL_SIZE=20
 
-# CachekitIO Cloud (closed beta)
-export CACHEKIT_API_KEY=ck_your_api_key
+# CachekitIO Cloud (closed beta). CACHEKIT_API_KEY is also a backend selector: set it
+# INSTEAD of CACHEKIT_REDIS_URL, never both (two selectors leave caches that rely on env
+# auto-detection uncached).
+# export CACHEKIT_API_KEY=ck_your_api_key
 ```
 
 ---

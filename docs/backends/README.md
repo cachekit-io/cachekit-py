@@ -211,26 +211,40 @@ without `backend=` pins the default when it is first seen — at decoration if
 already set, otherwise at first call — so the usual layout (business modules
 imported at the top of the file, `set_default_backend()` in `main()`) works.
 Later `set_default_backend()` calls do not re-point already-pinned functions.
-Exception: `stale_ttl` and `@cache.io`'s default stale window validate SWR
-capability at decoration, so set a CachekitIO default *before* importing modules
-that use them.
+Exception: an explicit `stale_ttl` validates SWR capability at decoration, so set a
+CachekitIO default *before* importing modules that use it. `@cache.io` is not affected:
+it builds its own `CachekitIOBackend` and never consults `set_default_backend()`.
 
 ### 3. Environment Variable Auto-Detection (Lowest Priority)
 
 If no explicit backend and no module-level default, `DefaultBackendProvider`
-picks a backend from exactly one environment selector, in this order:
+picks a backend at the function's first call from the one environment selector that is
+set. The four prefixed selectors are mutually exclusive, with no precedence between them:
+set exactly one.
 
-| Priority | Environment variable        | Backend            |
-|----------|-----------------------------|--------------------|
-| 1        | `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
-| 2        | `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
-| 3        | `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
-| 4        | `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
-| 5        | `REDIS_URL`, or nothing set | Redis, as 2 (localhost fallback) |
+| Environment variable        | Backend            |
+|-----------------------------|--------------------|
+| `CACHEKIT_API_KEY`          | `CachekitIOBackend` (SaaS) |
+| `CACHEKIT_REDIS_URL`        | Redis (tenant-scoped, keys prefixed `t:{tenant}:`) |
+| `CACHEKIT_MEMCACHED_SERVERS`| `MemcachedBackend` |
+| `CACHEKIT_FILE_CACHE_DIR`   | `FileBackend`      |
+| none of the above: `REDIS_URL`, or nothing set | Redis, as above (localhost fallback) |
 
 Setting more than one of the four `CACHEKIT_*` selectors is ambiguous and raises
 `ConfigurationError` at first call. The decorator catches it, logs a WARNING on
-the `cachekit.decorators.orchestrator` logger, and runs the function uncached.
+the `cachekit.decorators.orchestrator` logger, and runs the function uncached:
+
+```text
+Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
+```
+
+The misconfiguration never heals on its own. After 5 consecutive failures (the default) the
+function's circuit breaker opens and logs one `transitioned to OPEN` WARNING on
+`cachekit.reliability.circuit_breaker`. Calls keep running uncached, but no longer log each
+failure at WARNING: the breaker re-probes every `recovery_timeout` (30 s by default), and each
+probe logs one more `client_creation` failure and one more OPEN WARNING. The function's
+`get_health_status()` reports the breaker as `open` and `check_health()` as unhealthy.
+
 `REDIS_URL` is a 12-factor fallback and never counts as a conflict.
 
 The Redis prefix scopes L2 only. L1 is shared by every tenant in the process; see

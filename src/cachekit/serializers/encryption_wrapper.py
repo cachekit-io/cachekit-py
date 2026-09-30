@@ -1,13 +1,13 @@
 """Encryption Wrapper for Zero-Knowledge Encryption
 
 Provides client-side encryption on top of any SerializerProtocol implementation.
-Uses AES-256-GCM for authenticated encryption with per-tenant key isolation.
+Uses AES-256-GCM for authenticated encryption with per-tenant key derivation.
 
 Architectural Note:
     EncryptionWrapper is a Decorator pattern implementation, not a serialization format.
     It wraps any SerializerProtocol (StandardSerializer, OrjsonSerializer, ArrowSerializer)
     and adds an encryption layer. This enables zero-knowledge caching where the backend
-    never sees plaintext, regardless of data type (JSON, DataFrames, MessagePack, etc.).
+    never sees plaintext values, regardless of data type (JSON, DataFrames, MessagePack, etc.).
 """
 
 import logging
@@ -61,12 +61,12 @@ class EncryptionWrapper:
     Features:
     - Client-side AES-256-GCM encryption (zero-knowledge)
     - Hardware-accelerated via ring library
-    - Per-tenant cryptographic isolation
+    - Per-tenant key derivation (not a tenancy boundary)
     - Domain separation for security
     - Works with ANY serializer (StandardSerializer, OrjsonSerializer, ArrowSerializer)
 
     Security Model:
-    - Storage backend never sees plaintext
+    - Storage backend never sees plaintext values
     - Each tenant gets different derived keys
     - Domain separation prevents key confusion attacks
     - Authentication tags prevent tampering
@@ -160,7 +160,7 @@ class EncryptionWrapper:
             serializer: Any SerializerProtocol implementation to wrap with encryption.
                            Defaults to StandardSerializer (cross-language MessagePack).
             master_key: 256-bit master key for encryption. If None, reads from environment.
-            tenant_id: Tenant identifier for key isolation
+            tenant_id: Tenant identifier for per-tenant key derivation
             fail_closed: Treat key-fingerprint mismatch as a hard authentication
                 failure (raise DecryptionAuthenticationError before attempting
                 decryption) instead of warn-and-attempt. This flag gates ONLY the
