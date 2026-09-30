@@ -377,8 +377,8 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
     ``__getattribute__``) would have the sweep batch-delete keys that do not exist, then
     untrack entries whose real L2 keys survive. So rather than inspect every way lookup can
     be customised, this resolves both names exactly as the sweep will call them and requires
-    each to be a method bound to this backend whose function is the class's own plain
-    function, with ``_delete_many`` defined at or below the class that defines ``delete``.
+    each to be a genuine bound method (``types.MethodType``) of this backend whose function
+    is the class's own plain function, with ``_delete_many`` defined at or below the class that defines ``delete``.
     Anything else takes the per-key path: a false negative only costs round trips, a false
     positive loses erasure.
     """
@@ -392,7 +392,9 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
         if not isinstance(func, types.FunctionType):
             return False
         resolved = getattr(backend, name, None)
-        if getattr(resolved, "__func__", None) is not func or getattr(resolved, "__self__", None) is not backend:
+        # type() first: a MethodType's __func__/__self__ are C slots no object can fake, and
+        # reading them runs no user code, so a forged or raising proxy is rejected untouched.
+        if type(resolved) is not types.MethodType or resolved.__func__ is not func or resolved.__self__ is not backend:
             return False  # the instance resolves this name to something other than the class's function
         owners[name] = owner  # type: ignore[assignment]
     return issubclass(owners["_delete_many"], owners["delete"])

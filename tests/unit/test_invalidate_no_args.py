@@ -859,6 +859,80 @@ class TestInvalidateNoArgsMultiDelete:
         assert backend.store == {}
         assert _tracked(f) == set()
 
+    def test_forged_bound_method_delete_sweeps_through_it(self) -> None:
+        """A callable exposing the class function as __func__ and the backend as __self__, but
+        prefixing keys when called, must not pass for the class's own bound method."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+        backend = Prefixed()
+
+        class Forged:
+            def __init__(self) -> None:  # instance attributes: a class-level function would bind
+                self.__func__ = MultiDeleteBackend.delete
+                self.__self__ = backend
+
+            def __call__(self, key: str) -> bool:
+                return MultiDeleteBackend.delete(backend, "app:" + key)
+
+        backend.delete = Forged()  # type: ignore[method-assign]
+        assert not _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_forged_method")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_raising_attribute_proxy_delete_never_raises(self) -> None:
+        """A delete wrapper whose __getattr__ raises KeyError (a dict-backed proxy): the guard
+        must not read attributes off it, and invalidate_cache() must still erase and return None."""
+
+        class Proxy:
+            def __init__(self, target: Any) -> None:
+                self._target = target
+
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                return self._target(*args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                raise KeyError(name)
+
+        backend = MultiDeleteBackend()
+        backend.delete = Proxy(backend.delete)  # type: ignore[method-assign]
+
+        @cache(backend=backend, ttl=60, namespace="multi_raising_proxy")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        assert f.invalidate_cache() is None
+        assert backend.batches == []  # per-key, through the wrapper
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_genuine_bound_method_in_instance_dict_keeps_capability(self) -> None:
+        """An instance entry that IS the class function bound to this backend behaves like it."""
+        import types
+
+        from cachekit.cache_handler import _supports_multi_delete
+
+        backend = MultiDeleteBackend()
+        backend.delete = types.MethodType(MultiDeleteBackend.delete, backend)  # type: ignore[method-assign]
+        assert _supports_multi_delete(backend)
+
     def test_bound_to_another_instance_loses_capability(self) -> None:
         from cachekit.cache_handler import _supports_multi_delete
 
