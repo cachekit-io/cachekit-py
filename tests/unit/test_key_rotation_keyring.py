@@ -784,8 +784,8 @@ class TestDecoratorL2ReadsFailLoud:
     async def test_forged_drift_frame_still_recomputes_and_overwrites(self, monkeypatch, is_async):
         """Control: an encryption-disabled function reaches its keyring only when a
         forged header claims `encrypted: true`, so that fault is relabelled a miss
-        before the decorator sees it (LAB-4818). The new re-raises must leave the
-        planted frame healing on the next call instead of failing every read."""
+        before the decorator sees it. The new re-raises must leave the planted frame
+        healing on the next call instead of failing every read."""
         from cachekit.cache_handler import CacheSerializationHandler
         from cachekit.config.singleton import reset_settings
         from cachekit.serializers.wrapper import SerializationWrapper
