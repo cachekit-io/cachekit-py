@@ -1,4 +1,4 @@
-"""Key rotation via the master-key keyring (LAB-684, LAB-516 stage 2).
+"""Key rotation via the master-key keyring (LAB-684).
 
 Spec: protocol spec/encryption.md → "Key Rotation (Keyring)" and
 decisions/key-rotation.md. cachekit-py stores a per-entry key_fingerprint in CK
@@ -19,7 +19,9 @@ Covers:
   attempting; fail-open attempts the current key only).
 - Construction-time keyring config faults reach the caller of a production read
   site as KeyringConfigurationError, never a warning-and-miss; header rot and
-  data-derived ValueErrors stay a miss.
+  data-derived ValueErrors stay a miss. Behind @cache that holds on every L2 read
+  (sync, async, SWR-capable, the async lock double-checks), with the function never
+  run and nothing counted on the circuit breaker.
 - End-to-end rotation round-trip through CacheSerializationHandler with the env
   configuration: write under k1, rotate to k2 with k1 decrypt-only, read without
   re-encryption; drop k1, read follows the fail policy.
@@ -29,13 +31,19 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from cachekit import cache
+from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.config.settings import MAX_PREVIOUS_MASTER_KEYS, CachekitConfig
+from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionWrapper,
@@ -486,22 +494,24 @@ def _fingerprints_for_tenant(monkeypatch: pytest.MonkeyPatch, tenant_for: Any) -
     monkeypatch.setattr(ew, "Keyring", _Keyring)
 
 
+@pytest.fixture
+def _read_site_env(monkeypatch):
+    from cachekit.config.singleton import reset_settings
+
+    monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
+    monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
+    reset_settings()
+    yield
+    reset_settings()
+
+
+@pytest.mark.usefixtures("_read_site_env")
 class TestConstructionFaultsFailLoudAtReadSite:
     """The per-tenant wrapper is built lazily on the first read, so a keyring config
     fault must escape the read site as KeyringConfigurationError, not a silent miss —
     except on config-drift reads, where the header chose the decrypt path."""
 
     CACHE_KEY = "key:a"
-
-    @pytest.fixture(autouse=True)
-    def _env(self, monkeypatch):
-        from cachekit.config.singleton import reset_settings
-
-        monkeypatch.setenv("CACHEKIT_DEPLOYMENT_UUID", "00000000-0000-0000-0000-00000000abcd")
-        monkeypatch.delenv("CACHEKIT_PREVIOUS_MASTER_KEYS", raising=False)
-        reset_settings()
-        yield
-        reset_settings()
 
     def _handler(self) -> CacheSerializationHandler:
         from cachekit.cache_handler import CacheSerializationHandler
@@ -621,6 +631,178 @@ class TestConstructionFaultsFailLoudAtReadSite:
         # Guard against a vacuous pass: an AttributeError from this fake would
         # take the same `except Exception` route to None.
         assert len(raised) == 1
+
+
+class _ByteStore:
+    """In-memory backend for decorator-level read-site tests."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+
+    def get(self, key: str) -> bytes | None:
+        return self.store.get(key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+        self.store[key] = value
+
+    def delete(self, key: str) -> bool:
+        return self.store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self.store
+
+    def health_check(self) -> tuple[bool, dict[str, Any]]:
+        return True, {}
+
+
+class _SWRByteStore(_ByteStore):
+    """SWR-capable (supports_swr), so the decorator reads through get_cached_value_with_freshness*."""
+
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
+        value = self.store.get(key)
+        return None if value is None else (value, False, None)
+
+
+class _LockByteStore(_ByteStore):
+    """Lockable store whose lock writes ``entry`` as it is taken: the pre-lock read
+    misses, and the double-check read finds what another worker wrote meanwhile.
+
+    ``redis_shaped`` re-raises lock-body errors through classify_redis_error, as
+    RedisBackend.acquire_lock does; otherwise they leave the lock unwrapped, as from
+    CachekitIO's, which only releases in ``finally``."""
+
+    def __init__(self, entry: bytes, *, acquired: bool, redis_shaped: bool) -> None:
+        super().__init__()
+        self._entry, self._acquired, self._redis_shaped = entry, acquired, redis_shaped
+
+    @asynccontextmanager
+    async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
+        self.store[key] = self._entry
+        try:
+            yield self._acquired
+        except Exception as exc:
+            if not self._redis_shaped:
+                raise
+            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+
+
+async def _call(fn: Any, *args: Any) -> Any:
+    """Call a decorated function, awaiting it when it is async."""
+    result = fn(*args)
+    return await result if inspect.isawaitable(result) else result
+
+
+@pytest.mark.usefixtures("_read_site_env")
+class TestDecoratorL2ReadsFailLoud:
+    """LAB-4841: behind @cache, a keyring config fault on an L2 read reaches the
+    caller as it does from the L1 guards — never logged as a cache error and run
+    uncached, recounted on the circuit breaker, on every call."""
+
+    @staticmethod
+    def _decorate(backend: _ByteStore, runs: list[int], *, is_async: bool, encryption: bool = True) -> Any:
+        """Every call decorates a function of the same qualname, so a fresh reader,
+        whose wrapper is built lazily on its first read, computes the writer's key."""
+        if is_async:
+
+            async def compute(x: int) -> dict[str, int]:
+                runs.append(x)
+                return {"x": x}
+
+        else:
+
+            def compute(x: int) -> dict[str, int]:
+                runs.append(x)
+                return {"x": x}
+
+        return cache(
+            backend=backend,
+            ttl=300,
+            l1_enabled=False,
+            namespace="lab4841",
+            encryption=encryption,
+            single_tenant_mode=encryption,
+            master_key=K2.hex(),
+        )(compute)
+
+    async def _written_entry(self, *, is_async: bool) -> tuple[str, bytes]:
+        """The encrypted entry for compute(1), written before any fault is injected."""
+        writer = _ByteStore()
+        assert await _call(self._decorate(writer, [], is_async=is_async), 1) == {"x": 1}
+        ((key, entry),) = writer.store.items()
+        return key, entry
+
+    @pytest.mark.parametrize("backend_cls", [_ByteStore, _SWRByteStore], ids=["plain", "swr-capable"])
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    async def test_l2_read_raises_without_running_or_counting(self, monkeypatch, live_breakers, is_async, backend_cls):
+        key, entry = await self._written_entry(is_async=is_async)
+        _settings_previous_keys(monkeypatch, [K2])
+        backend = backend_cls()
+        backend.store[key] = entry
+        runs: list[int] = []
+        live_breakers.clear()
+        fn = self._decorate(backend, runs, is_async=is_async)
+        (breaker,) = live_breakers
+
+        for _ in range(3):
+            with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
+                await _call(fn, 1)
+            # The sync wrapper has no outer `finally`: a raising exit that skips the
+            # stats reset leaks this call's stats into the caller's context.
+            assert get_current_function_stats() is None
+
+        assert runs == []
+        assert breaker.failure_count == 0
+        assert backend.store == {key: entry}  # a config fault never evicts the valid entry
+
+    @pytest.mark.parametrize("acquired", [True, False], ids=["lock-acquired", "lock-timeout"])
+    @pytest.mark.parametrize("redis_shaped", [True, False], ids=["redis-lock", "finally-lock"])
+    async def test_async_lock_double_check_raises_without_running(self, monkeypatch, live_breakers, acquired, redis_shaped):
+        key, entry = await self._written_entry(is_async=True)
+        _settings_previous_keys(monkeypatch, [K2])
+        backend = _LockByteStore(entry, acquired=acquired, redis_shaped=redis_shaped)
+        runs: list[int] = []
+        live_breakers.clear()
+        fn = self._decorate(backend, runs, is_async=True)
+        (breaker,) = live_breakers
+
+        with pytest.raises(KeyringConfigurationError, match="Keyring configuration invalid"):
+            await fn(1)
+
+        assert runs == []
+        assert breaker.failure_count == 0
+        assert backend.store == {key: entry}
+
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    async def test_forged_drift_frame_still_recomputes_and_overwrites(self, monkeypatch, is_async):
+        """Control: an encryption-disabled function reaches its keyring only when a
+        forged header claims `encrypted: true`, so that fault is relabelled a miss
+        before the decorator sees it. The new re-raises must leave the planted frame
+        healing on the next call instead of failing every read."""
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.singleton import reset_settings
+        from cachekit.serializers.wrapper import SerializationWrapper
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", K3.hex())
+        monkeypatch.setenv("CACHEKIT_PREVIOUS_MASTER_KEYS", K2.hex())
+        reset_settings()
+        # Precondition: this config really faults, or a plain auth failure on the
+        # fingerprint-less frame would also heal and the test would pass vacuously.
+        with pytest.raises(KeyringConfigurationError):
+            CacheSerializationHandler(encryption=False, master_key=K2.hex())._get_cached_encryption_wrapper("x")
+
+        backend = _ByteStore()
+        runs: list[int] = []
+        fn = self._decorate(backend, runs, is_async=is_async, encryption=False)
+        assert await _call(fn, 1) == {"x": 1}
+        ((key, entry),) = backend.store.items()
+        envelope, metadata, serializer_name = SerializationWrapper.unwrap(entry)
+        forged = SerializationWrapper.wrap(envelope, {**metadata, "encrypted": True, "tenant_id": "x"}, serializer_name)
+        backend.store[key] = forged
+
+        assert await _call(fn, 1) == {"x": 1}
+        assert runs == [1, 1]
+        assert await _call(fn, 1) == {"x": 1}
+        assert runs == [1, 1]  # the overwrite is a readable entry
 
 
 class TestEndToEndRotation:

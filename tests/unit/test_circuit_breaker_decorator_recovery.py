@@ -39,7 +39,6 @@ import time_machine
 from cachekit import cache
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
-from cachekit.decorators import orchestrator as orchestrator_module
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.interop import InteropError
@@ -109,21 +108,6 @@ def resolver(monkeypatch: pytest.MonkeyPatch, backend: _CountingBackend) -> _Fla
     flaky = _FlakyResolver(backend)
     monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", flaky)
     return flaky
-
-
-@pytest.fixture
-def live_breakers(monkeypatch: pytest.MonkeyPatch) -> list[CircuitBreaker]:
-    """Capture every breaker a decorator builds (decorate AFTER requesting this)."""
-    captured: list[CircuitBreaker] = []
-    real = orchestrator_module.CircuitBreaker
-
-    def spy(*args, **kwargs) -> CircuitBreaker:
-        breaker = real(*args, **kwargs)
-        captured.append(breaker)
-        return breaker
-
-    monkeypatch.setattr(orchestrator_module, "CircuitBreaker", spy)
-    return captured
 
 
 @pytest.fixture

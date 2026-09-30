@@ -1662,10 +1662,13 @@ def create_cache_wrapper(
                 # (only inner try at line ~567, not the outer try-finally at ~645-720)
                 reset_current_function_stats(token)
                 return result
-        except DecryptionAuthenticationError:
-            # Fail-closed tamper failure propagated from get_cached_value — it only
-            # raises when encryption.fail_closed=True (the metric and error log were
-            # recorded there). Never swallow this into an uncached recompute.
+        except (DecryptionAuthenticationError, KeyringConfigurationError):
+            # Both propagate from get_cached_value* and must reach the caller: a
+            # fail-closed tamper failure (raised only when encryption.fail_closed=True;
+            # the metric and error log were recorded there), and a LOCAL keyring config
+            # fault (same contract as the L1 guard above). The generic clause below
+            # would log either as a cache error, count it on the breaker, and recompute
+            # uncached on every call (LAB-4841).
             reset_current_function_stats(token)
             raise
         except Exception as e:
@@ -2007,12 +2010,13 @@ def create_cache_wrapper(
 
                     return result
 
-            except DecryptionAuthenticationError:
+            except (DecryptionAuthenticationError, KeyringConfigurationError):
                 # Fail-closed tamper failure propagated from get_cached_value_async —
                 # the tamper metric, error log, evidence retention, and fail policy all
-                # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108). It must
-                # reach the caller: the generic clause below would demote it to a
-                # fail-open "record and recompute".
+                # fired inside handle_decrypt_failure (cachekit-py#170, LAB-108) — or a
+                # LOCAL keyring config fault (see the sync L2 read). Either must reach
+                # the caller: the generic clause below would demote it to a fail-open
+                # "record and recompute".
                 raise
             except Exception as e:
                 # Backend/network error - record but continue to function execution
@@ -2058,10 +2062,14 @@ def create_cache_wrapper(
                                     _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
-                            except DecryptionAuthenticationError:
+                            except (DecryptionAuthenticationError, KeyringConfigurationError):
                                 # Fail-closed tamper raise from get_cached_value_async
-                                # (cachekit-py#170) — must not be demoted to a recompute
-                                # by the generic clause below.
+                                # (cachekit-py#170) or a LOCAL keyring config fault (see
+                                # the sync L2 read) — must not be demoted to a recompute
+                                # by the generic clause below. The lock clause's
+                                # `except Exception` then delivers a KeyringConfigurationError:
+                                # re-raised as is from a finally-only lock, and unwrapped
+                                # through original_exception from a Redis lock's BackendError.
                                 raise
                             except Exception as e:
                                 # If double-check fails, continue to execute function
@@ -2088,10 +2096,8 @@ def create_cache_wrapper(
                                     _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
                                     _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
                                     return result
-                            except DecryptionAuthenticationError:
-                                # Fail-closed tamper raise from get_cached_value_async
-                                # (cachekit-py#170) — must not be demoted to a recompute
-                                # by the generic clause below.
+                            except (DecryptionAuthenticationError, KeyringConfigurationError):
+                                # Same as the lock-acquired double-check above.
                                 raise
                             except Exception:
                                 # Cache check failed - fall through to execute function
