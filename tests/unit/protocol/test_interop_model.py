@@ -289,6 +289,42 @@ class EqualsPlainA(str):
         return 1
 
 
+def _reports(cls: type):
+    """A __class__ property that makes isinstance(obj, cls) true without subclassing cls."""
+    return property(lambda self: cls)
+
+
+class IntReportsStr(int):
+    __class__ = _reports(str)  # type: ignore[assignment]
+
+    def to_bytes(self, *args, **kwargs) -> bytes:
+        return (int(self) + 1).to_bytes(*args, **kwargs)
+
+    def encode(self, *args, **kwargs) -> bytes:
+        return b"admin"
+
+
+class BytesReportsStr(bytes):
+    __class__ = _reports(str)  # type: ignore[assignment]
+
+    def encode(self, *args, **kwargs) -> bytes:
+        return b"admin"
+
+
+class StrReportsBool(str):
+    __class__ = _reports(bool)  # type: ignore[assignment]
+
+    def __bool__(self) -> bool:
+        return True
+
+
+class IntReportsBool(int):
+    __class__ = _reports(bool)  # type: ignore[assignment]
+
+    def __bool__(self) -> bool:
+        return True
+
+
 class ForwardingProxy:
     """Reports its target's type through __class__ and forwards attributes, like wrapt's ObjectProxy."""
 
@@ -316,6 +352,12 @@ class TestArgSubclasses:
         ("arg", "plain", "forged"),
         [
             (AsAdminStr("user"), "user", "admin"),
+            (IntReportsStr(300), 300, "admin"),
+            (BytesReportsStr(b"user"), b"user", "admin"),
+            (StrReportsBool("admin"), "admin", True),
+            (IntReportsBool(5), 5, True),
+            ({"k": StrReportsBool("admin")}, {"k": "admin"}, {"k": True}),
+            ({StrReportsBool("admin")}, {"admin"}, {True}),
             (LyingToBytes(1000), 1000, None),
             (LyingIsInteger(2.0), 2.0, None),
             (LyingInt(3.0), 3, 99),
@@ -329,6 +371,12 @@ class TestArgSubclasses:
         ],
         ids=[
             "str.encode",
+            "int-reports-str",
+            "bytes-reports-str",
+            "str-reports-bool",
+            "int-reports-bool",
+            "dict-value-reports-bool",
+            "set-element-reports-bool",
             "int.to_bytes",
             "float.is_integer",
             "float.__int__",
@@ -365,6 +413,8 @@ class TestArgSubclasses:
             HIGH = 3
 
         assert args_hash([Level.HIGH]) == args_hash([3])
+
+    def test_str_enum_mixin_hashes_like_its_value(self):
         assert args_hash([OP.GET_USER]) == args_hash(["get_user"])
 
     def test_keys_equal_after_normalization_raise(self):
@@ -373,6 +423,11 @@ class TestArgSubclasses:
         # Collapsing to either value would hash it like {"a": 1} or {"a": 2}.
         with pytest.raises(InteropError, match="duplicate key 'a'"):
             args_hash([arg])
+
+    def test_non_str_key_reporting_str_is_rejected(self):
+        assert isinstance(IntReportsStr(5), str)
+        with pytest.raises(InteropError, match="map keys must be strings"):
+            args_hash([{IntReportsStr(5): 1}])
 
     def test_forwarding_proxy_still_hashes_like_its_target(self):
         # Not a subclass: the base-type slots would raise TypeError on it, so it
