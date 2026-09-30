@@ -32,6 +32,9 @@ from .base import PAYLOAD_DECODE_ERRORS, SerializationError, SerializationFormat
 # Every envelope ByteStorage has written opens with a fixarray-4 (0x94) and then its payload slot's
 # marker: bin8/16/32 in the current encoding, an int array (fixarray, array16, array32) in the legacy one.
 _ENVELOPE_PAYLOAD_MARKERS = frozenset((0xC4, 0xC5, 0xC6, *range(0x90, 0xA0), 0xDC, 0xDD))
+# Largest declared payload an integrity-off reader verifies; verifying costs a full decompress (see deserialize).
+_ENVELOPE_PROBE_MAX_SIZE = 256 * 1024
+_CROSS_CONFIG_ERROR = "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
 
 # Error message constants for unsupported types (Task 2)
 NUMPY_ERROR_MESSAGE = (
@@ -318,28 +321,22 @@ class StandardSerializer:
 
         Args:
             data: Bytes from serialize() (with or without ByteStorage envelope)
-            metadata: Optional metadata. Only ``compressed`` is read: with integrity checking
-                off, ``compressed=True`` rejects the entry outright (see Raises).
+            metadata: Optional metadata. Only ``compressed`` is read (see Raises).
 
         Returns:
             Deserialized Python object
 
         Raises:
             SerializationError: If data is malformed, not valid MessagePack, or integrity check
-                fails. Also, with integrity checking off, if the entry is a ByteStorage envelope:
-                ``metadata.compressed`` says so, or the bytes pass ``ByteStorage.retrieve()``,
-                which covers a header without that key and a call with no metadata. This reader
-                does not unwrap envelopes, and unpackb on one returns its four fields as the value.
-
-                A verified ``retrieve()`` decides, never shape, which is a deliberate difference
-                from :class:`AutoSerializer`'s envelope-shape refusal. Three reasons. The docs
-                send users who hit that refusal here, on the promise that every value
-                round-trips. The 64-bit checksum is the one thing a look-alike value cannot
-                match by chance, so no legitimate value is refused; the cost is that a *rotted*
-                envelope reaching this reader is returned, which is what integrity off already
-                means for rot. And this is the cross-SDK serializer: the TypeScript SDK's
-                compression-off reader also tells an envelope from a value by verifying it. The
-                two-byte test in front of ``retrieve()`` only keeps it off ordinary reads.
+                fails. With integrity checking off, also if the entry is a ByteStorage envelope,
+                which this reader does not unwrap: ``metadata.compressed`` says so, or the bytes
+                have the layout ByteStorage writes, declare at most 256 KiB, and pass
+                ``ByteStorage.retrieve()``. Shape alone never refuses a value, unlike
+                :class:`AutoSerializer`: the docs send users here to escape that refusal, and a
+                look-alike cannot match the checksum by chance. So without a ``compressed=True``
+                header, a rotted envelope, one declaring more than 256 KiB, and one in another
+                layout come back decoded as their fields, and a value equal to a valid envelope's
+                fields is refused on every read.
 
         Examples:
             >>> serializer = StandardSerializer()
@@ -354,26 +351,29 @@ class StandardSerializer:
             if self.enable_integrity_checking:
                 # Unwrap ByteStorage envelope (decompress + validate integrity)
                 msgpack_data, _ = self._byte_storage.retrieve(data)
-            else:
-                # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
-                if (metadata is not None and metadata.compressed) or self._is_verified_envelope(data):
-                    raise SerializationError(
-                        "Cache entry was written with integrity checking on but this reader has integrity checking disabled"
-                    )
-                msgpack_data = data
-
-            # Deserialize MessagePack
-            return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+                return unpackb_bounded(msgpack_data, **self._msgpack_unpack_opts)
+            # No unwrap here: an enveloped entry is refused, not decoded (see Raises).
+            if metadata is not None and metadata.compressed:
+                raise SerializationError(_CROSS_CONFIG_ERROR)
+            value = unpackb_bounded(data, **self._msgpack_unpack_opts)
+            if self._is_verified_envelope(data, value):
+                raise SerializationError(_CROSS_CONFIG_ERROR)
+            return value
         except SerializationError:
             # Re-raise SerializationError (integrity check failure) without swallowing
             raise
         except PAYLOAD_DECODE_ERRORS as e:
             raise SerializationError(f"Failed to deserialize MessagePack data: {e}") from e
 
-    def _is_verified_envelope(self, data: bytes | memoryview) -> bool:
-        """True only when ``data`` is a ByteStorage envelope that passes ``retrieve()``."""
-        # A necessary condition, never a verdict: it only spares ordinary reads the retrieve() attempt.
+    def _is_verified_envelope(self, data: bytes | memoryview, value: Any) -> bool:
+        """True only when ``data``, already decoded to ``value``, is a ByteStorage envelope that passes ``retrieve()``."""
+        # Necessary conditions, never a verdict. The layout test spares ordinary reads the attempt. The
+        # size cap bounds it: retrieve() decompresses the whole declared payload before it checks the
+        # checksum, and a caller can cache a value that declares a large one. A 0x94 lead that decoded
+        # is a 4-element list, so value[2] is the declared original_size.
         if len(data) < 2 or data[0] != 0x94 or data[1] not in _ENVELOPE_PAYLOAD_MARKERS:
+            return False
+        if not isinstance(value[2], int) or value[2] > _ENVELOPE_PROBE_MAX_SIZE:
             return False
         try:
             self._byte_storage.retrieve(data)
