@@ -664,6 +664,50 @@ class TestInvalidateNoArgsMultiDelete:
         assert not _supports_multi_delete(Dynamic())  # instance-level attributes do not count
         assert not any("delete_many" in name.lower() or "multi" in name.lower() for name in backends.__all__)
 
+    def test_subclass_overriding_delete_loses_inherited_capability(self) -> None:
+        from cachekit.backends.memcached.backend import MemcachedBackend
+        from cachekit.backends.redis.backend import RedisBackend
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class PrefixedRedis(RedisBackend):
+            def delete(self, key: str) -> bool:
+                return super().delete("app:" + key)
+
+        class TunedRedis(RedisBackend):  # does not touch delete: keeps the batch path
+            pass
+
+        class PrefixedWithBatch(PrefixedRedis):  # re-declares a matching batch: keeps it
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return super()._delete_many(["app:" + k for k in keys])
+
+        for cls in (RedisBackend, MemcachedBackend, TunedRedis, PrefixedWithBatch):
+            assert _supports_multi_delete(object.__new__(cls)), cls
+        assert not _supports_multi_delete(object.__new__(PrefixedRedis))
+
+    def test_subclass_overriding_delete_sweeps_through_its_delete(self) -> None:
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+            def delete(self, key: str) -> bool:
+                return super().delete("app:" + key)
+
+        backend = Prefixed()
+
+        @cache(backend=backend, ttl=60, namespace="multi_prefixed_subclass")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []  # the parent's batch would delete unprefixed keys
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
     def test_custom_backend_without_capability_keeps_per_key_loop(self) -> None:
         deletes: list[str] = []
 

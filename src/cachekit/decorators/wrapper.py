@@ -2308,20 +2308,20 @@ def create_cache_wrapper(
         finally:
             _drain_watches.pop(owner, None)
 
-    def _delete_l2(keys: list[str]) -> tuple[set[str], Union[Exception, None]]:
-        """L2-delete ``keys``: return those not confirmed deleted, and the error of a multi-key
-        call that fell back. Never raises.
+    def _delete_l2(keys: list[str]) -> tuple[set[str], Union[str, None]]:
+        """L2-delete ``keys``: return those not confirmed deleted, and the redacted error of a
+        multi-key call that fell back (rendered, so no traceback outlives it). Never raises.
 
         One multi-key call on a backend that has one. If that call raises as a whole, every
         key's outcome is unknown, so the batch falls back to per-key deletes: one bad batch
         cannot abort the sweep, and each key still gets its own verdict.
         """
-        batch_error: Union[Exception, None] = None
+        batch_error: Union[str, None] = None
         if _supports_multi_delete(_backend):
             try:
                 return _backend._delete_many(keys), None
             except Exception as e:
-                batch_error = e
+                batch_error = redact_error_for_log(e)
         failed: set[str] = set()
         for key in keys:
             try:
@@ -2351,7 +2351,7 @@ def create_cache_wrapper(
         """
         scope = _l2_scope()
         failed = 0
-        fallbacks: list[Exception] = []
+        fallbacks, last_fallback = 0, ""
         has_l2 = _backend is not None and not _l1_only_mode
         with _watch_records() as watch:
             snap = list(_cached_keys)  # snapshot: other threads add while this runs
@@ -2362,7 +2362,7 @@ def create_cache_wrapper(
                 undeleted, batch_error = _delete_l2(mine) if has_l2 and mine else (set(), None)
                 failed += len(undeleted)
                 if batch_error is not None:
-                    fallbacks.append(batch_error)
+                    fallbacks, last_fallback = fallbacks + 1, batch_error
                 for entry in batch:
                     entry_scope, key = entry
                     if entry_scope == scope and key not in undeleted:
@@ -2378,8 +2378,8 @@ def create_cache_wrapper(
             # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
             _logger.warning(
                 "Multi-key L2 delete failed for %d batch(es); deleted those keys one by one. Latest error: %s",
-                len(fallbacks),
-                redact_error_for_log(fallbacks[-1]),
+                fallbacks,
+                last_fallback,
             )
         if failed:
             # ERROR, as for a single key: every failed entry may still be served from L2.

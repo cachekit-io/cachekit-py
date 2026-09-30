@@ -368,8 +368,19 @@ class _MultiDeleteBackend(Protocol):
 
 
 def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
-    """Type guard for ``_MultiDeleteBackend``, checked on the CLASS like ``supports_key_tracking``."""
-    return callable(getattr(type(backend), "_delete_many", None))
+    """Type guard for ``_MultiDeleteBackend``, checked on the CLASS like ``supports_key_tracking``.
+
+    An inherited ``_delete_many`` counts only if no subclass overrides ``delete`` below the
+    class that defines it. A subclass of ``RedisBackend`` whose ``delete`` rewrites the key
+    (a prefix, say) would otherwise have the parent's batch delete the untransformed keys,
+    and the sweep would untrack entries whose real L2 keys survive.
+    """
+    mro = type(backend).__mro__
+    batch_owner = next((c for c in mro if "_delete_many" in c.__dict__), None)
+    if batch_owner is None or not callable(batch_owner.__dict__["_delete_many"]):
+        return False
+    delete_owner = next((c for c in mro if "delete" in c.__dict__), None)
+    return delete_owner is None or issubclass(batch_owner, delete_owner)
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
