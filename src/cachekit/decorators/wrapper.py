@@ -2308,18 +2308,20 @@ def create_cache_wrapper(
         finally:
             _drain_watches.pop(owner, None)
 
-    def _delete_l2(keys: list[str]) -> set[str]:
-        """L2-delete ``keys`` and return those not confirmed deleted. Never raises.
+    def _delete_l2(keys: list[str]) -> tuple[set[str], Union[Exception, None]]:
+        """L2-delete ``keys``: return those not confirmed deleted, and the error of a multi-key
+        call that fell back. Never raises.
 
         One multi-key call on a backend that has one. If that call raises as a whole, every
         key's outcome is unknown, so the batch falls back to per-key deletes: one bad batch
         cannot abort the sweep, and each key still gets its own verdict.
         """
+        batch_error: Union[Exception, None] = None
         if _supports_multi_delete(_backend):
             try:
-                return _backend._delete_many(keys)
+                return _backend._delete_many(keys), None
             except Exception as e:
-                _logger.debug("Multi-key L2 delete failed, deleting one by one: %s", redact_error_for_log(e))
+                batch_error = e
         failed: set[str] = set()
         for key in keys:
             try:
@@ -2327,14 +2329,15 @@ def create_cache_wrapper(
             except Exception as e:
                 _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
                 failed.add(key)  # keep key tracked for retry
-        return failed
+        return failed, batch_error
 
     def _local_invalidate_all() -> None:
         """Invalidate every key THIS process knows (_cached_keys): L2 delete, then trim, then L1.
 
         The whole-function path for backends without a key registry, and the fallback when a
-        drain fails. Keys go to L2 in batches of at most _DELETE_BATCH (one round trip per
-        batch where the backend supports it, else one per key). Per batch, the L2 delete
+        drain fails. Keys go to L2 in batches of at most _DELETE_BATCH: one multi-key call per
+        batch where the backend supports it (the backend may split it; Memcached sends per
+        server, 1,000 keys a send), else one call per key. Per batch, the L2 delete
         comes first: evicting L1 first would let an L2-hit backfill landing in between
         re-cache the old value in L1. A key whose delete failed, or that was re-recorded
         while this runs, stays in _cached_keys for the next attempt. Keys other processes
@@ -2348,6 +2351,7 @@ def create_cache_wrapper(
         """
         scope = _l2_scope()
         failed = 0
+        fallbacks: list[Exception] = []
         has_l2 = _backend is not None and not _l1_only_mode
         with _watch_records() as watch:
             snap = list(_cached_keys)  # snapshot: other threads add while this runs
@@ -2355,8 +2359,10 @@ def create_cache_wrapper(
                 batch = snap[start : start + _DELETE_BATCH]
                 # Another tenant's L2 entry is not the caller's to delete: it stays tracked.
                 mine = [key for entry_scope, key in batch if entry_scope == scope]
-                undeleted = _delete_l2(mine) if has_l2 and mine else set()
+                undeleted, batch_error = _delete_l2(mine) if has_l2 and mine else (set(), None)
                 failed += len(undeleted)
+                if batch_error is not None:
+                    fallbacks.append(batch_error)
                 for entry in batch:
                     entry_scope, key = entry
                     if entry_scope == scope and key not in undeleted:
@@ -2367,6 +2373,14 @@ def create_cache_wrapper(
                         _object_cache.delete(key)
                     elif _l1_cache:
                         _l1_cache.invalidate(key)
+        if fallbacks:
+            # Once per call, like the ERROR below. A backend whose multi-key delete always fails
+            # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
+            _logger.warning(
+                "Multi-key L2 delete failed for %d batch(es); deleted those keys one by one. Latest error: %s",
+                len(fallbacks),
+                redact_error_for_log(fallbacks[-1]),
+            )
         if failed:
             # ERROR, as for a single key: every failed entry may still be served from L2.
             _logger.error("Failed to delete %d L2 key(s); they stay tracked for the next invalidate_cache()", failed)

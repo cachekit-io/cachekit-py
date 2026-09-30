@@ -184,20 +184,31 @@ class MemcachedBackend:
         that server's ``delete_many`` with ``noreply=False``, which reads a reply for every
         key. ``NOT_FOUND`` counts as deleted. A send whose call raises, or that the client
         skips (server in its retry window), is reported failed as a whole: pymemcache
-        cannot say which of its keys, if any, were deleted. Sends carry at most
-        ``_PIPELINE_KEYS`` keys, so the server's replies never back up behind a send that
-        has not finished.
+        cannot say which of its keys, if any, were deleted; those keys stay tracked for the
+        next sweep. Sends carry at most ``_PIPELINE_KEYS`` keys, so the server's replies
+        never back up behind a send that has not finished.
+
+        Only pymemcache's own failures (``MemcacheError``, ``OSError``) are absorbed. Anything
+        else, such as an ``AttributeError`` from a pymemcache release that renamed the
+        HashClient internals used here, raises, so the caller falls back to per-key deletes.
 
         Returns:
             The keys not confirmed deleted.
+
+        Raises:
+            Exception: Any error that is not a Memcached or socket failure.
         """
+        from pymemcache.exceptions import MemcacheError
+
+        get_client = self._client._get_client  # bound outside the trys: drift must raise
+        run = self._client._safely_run_func
         failed: set[str] = set()
         groups: dict[Any, dict[str, str]] = {}  # client -> {wire key: key}
         for key in keys:
             wire_key = self._prefixed_key(key)
             try:
-                client = self._client._get_client(wire_key)
-            except Exception as exc:  # invalid key, or every server down
+                client = get_client(wire_key)
+            except MemcacheError as exc:  # invalid key, or every server down
                 _logger.debug("Memcached delete skipped a key: %s", redact_error_for_log(exc))
                 client = None
             if client is None:
@@ -209,8 +220,8 @@ class MemcachedBackend:
             for i in range(0, len(wire_keys), _PIPELINE_KEYS):
                 chunk = wire_keys[i : i + _PIPELINE_KEYS]
                 try:
-                    acked = self._client._safely_run_func(client, client.delete_many, False, chunk, noreply=False)
-                except Exception as exc:
+                    acked = run(client, client.delete_many, False, chunk, noreply=False)
+                except (MemcacheError, OSError) as exc:
                     _logger.debug("Memcached delete_many failed for %d key(s): %s", len(chunk), redact_error_for_log(exc))
                     acked = False
                 if not acked:

@@ -442,3 +442,34 @@ class TestDeleteMany:
         backend, fakes = self._backend()
         assert backend._delete_many([]) == set()
         assert all(f.sends == [] for f in fakes.values())
+
+    @pytest.mark.parametrize("private", ["_get_client", "_safely_run_func"])
+    def test_api_drift_raises_instead_of_failing_keys(self, private: str) -> None:
+        """A renamed HashClient internal must raise, so the sweep falls back to per-key deletes."""
+        backend, _ = self._backend(servers=1)
+        with patch.object(backend._client, private, side_effect=AttributeError(private)):
+            with pytest.raises(AttributeError):
+                backend._delete_many(["a"])
+
+    def test_api_drift_sweep_still_erases_every_key(self) -> None:
+        """End to end: with a broken internal, a no-args sweep deletes through public delete()."""
+        from cachekit import cache
+
+        backend, _ = self._backend(servers=1)
+        store: dict[str, bytes] = {}
+        with (
+            patch.object(backend, "get", side_effect=lambda k: store.get(k)),
+            patch.object(backend, "set", side_effect=lambda k, v, ttl=None: store.__setitem__(k, v)),
+            patch.object(backend, "delete", side_effect=lambda k: store.pop(k, None) is not None),
+            patch.object(backend._client, "_safely_run_func", side_effect=AttributeError("renamed")),
+        ):
+
+            @cache(backend=backend, ttl=60, namespace="mc_api_drift")
+            def f(x: int) -> int:
+                return x
+
+            for i in range(5):
+                f(i)
+            assert len(store) == 5
+            f.invalidate_cache()
+            assert store == {}

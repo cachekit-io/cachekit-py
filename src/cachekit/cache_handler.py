@@ -355,7 +355,8 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
 
 
 class _MultiDeleteBackend(Protocol):
-    """Internal: a backend that deletes many keys in one round trip (per server).
+    """Internal: a backend that deletes many keys in one multi-key call (the backend may split
+    it into several sends; Memcached sends per server, 1,000 keys a send).
 
     ``_delete_many`` returns the keys it could not confirm deleted. A key only counts as
     deleted once the server acknowledged its delete; a key already absent counts as

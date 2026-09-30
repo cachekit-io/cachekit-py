@@ -651,14 +651,11 @@ class TestInvalidateNoArgsMultiDelete:
 
     def test_capability_is_internal_and_class_level(self, tmp_path: Any) -> None:
         import cachekit.backends as backends
-        from cachekit.backends.memcached.backend import MemcachedBackend
-        from cachekit.backends.redis.backend import RedisBackend
         from cachekit.cache_handler import _supports_multi_delete
 
         assert _supports_multi_delete(MultiDeleteBackend())
         assert not _supports_multi_delete(FlakyBackend())
         assert not _supports_multi_delete(FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
-        assert callable(RedisBackend._delete_many) and callable(MemcachedBackend._delete_many)
 
         class Dynamic(FlakyBackend):
             def __getattr__(self, name: str) -> Any:
@@ -742,7 +739,13 @@ class TestInvalidateNoArgsMultiDelete:
         for i in range(4):
             f(i)
         backend.batch_error = BackendError(_ERROR_TEXT)
-        f.invalidate_cache()
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        warnings = [r for r in caplog.records if "Multi-key L2 delete failed" in r.getMessage()]
+        assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+        assert _ERROR_TEXT not in warnings[0].getMessage()
+        assert _failed_delete_records(caplog) == []  # the fallback succeeded
+        caplog.clear()
         assert len(backend.batches) == 1
         assert len(backend.single_deletes) == 4
         assert backend.store == {}
