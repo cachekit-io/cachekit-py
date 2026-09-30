@@ -252,7 +252,7 @@ import time
 # Circuit breaker state transitions (illustrative pseudocode)
 class CircuitBreaker:
     state: Literal["CLOSED", "OPEN", "HALF_OPEN"]
-    failure_times: list[float]  # Recent failures; len() is the failure count
+    failure_times: list[float]  # Recent failures (monotonic clock); len() is the failure count
     last_failure_time: float  # Failures recorded while OPEN do not move it
     half_open_since: float
 
@@ -261,10 +261,10 @@ class CircuitBreaker:
             try:
                 return func()  # Normal operation
             except Exception:
-                now = time.time()
+                now = time.monotonic()
                 # Rolling 60 s window: older failures stop counting, successes never reset it
                 self.failure_times = [t for t in self.failure_times if now - t <= 60] + [now]
-                self.last_failure_time = now
+                self.last_failure_time = time.time()
                 if len(self.failure_times) >= threshold:  # threshold = config value
                     self.state = "OPEN"  # Open circuit
                 raise
