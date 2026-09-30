@@ -474,8 +474,8 @@ class TestBatchedWholeFunctionInvalidation:
         assert all(prefixed._client.get(k) is None for k in keys[:5])  # stored under the prefix only
 
         with (
-            patch.object(prefixed, "_delete_many", wraps=prefixed._delete_many) as batch,
-            patch.object(prefixed, "delete", wraps=prefixed.delete) as single,
+            patch.object(MemcachedBackend, "_delete_many", autospec=True, side_effect=MemcachedBackend._delete_many) as batch,
+            patch.object(MemcachedBackend, "delete", autospec=True, side_effect=MemcachedBackend.delete) as single,
         ):
             f.invalidate_cache()
 

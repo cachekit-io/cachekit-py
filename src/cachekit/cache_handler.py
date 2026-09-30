@@ -374,8 +374,19 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
     class that defines it. A subclass of ``RedisBackend`` whose ``delete`` rewrites the key
     (a prefix, say) would otherwise have the parent's batch delete the untransformed keys,
     and the sweep would untrack entries whose real L2 keys survive.
+
+    Conservative beyond the class: an instance attribute named ``delete`` or ``_delete_many``,
+    or a class that customises ``__getattribute__``, can make the ``delete`` a caller sees
+    differ from the class's, so either one also means no batch path. A false negative only
+    costs round trips; a false positive loses erasure.
     """
-    mro = type(backend).__mro__
+    cls = type(backend)
+    if cls.__getattribute__ is not object.__getattribute__:
+        return False
+    instance_attrs = getattr(backend, "__dict__", {})
+    if "delete" in instance_attrs or "_delete_many" in instance_attrs:
+        return False
+    mro = cls.__mro__
     batch_owner = next((c for c in mro if "_delete_many" in c.__dict__), None)
     if batch_owner is None or not callable(batch_owner.__dict__["_delete_many"]):
         return False

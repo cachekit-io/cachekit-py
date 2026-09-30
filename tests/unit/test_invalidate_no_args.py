@@ -684,6 +684,53 @@ class TestInvalidateNoArgsMultiDelete:
             assert _supports_multi_delete(object.__new__(cls)), cls
         assert not _supports_multi_delete(object.__new__(PrefixedRedis))
 
+    def test_dynamic_or_instance_delete_loses_capability(self) -> None:
+        from cachekit.cache_handler import _supports_multi_delete
+
+        patched = MultiDeleteBackend()
+        patched.delete = lambda key: True  # type: ignore[method-assign]
+        assert not _supports_multi_delete(patched)
+
+        batch_patched = MultiDeleteBackend()
+        batch_patched._delete_many = lambda keys: set()  # type: ignore[method-assign]
+        assert not _supports_multi_delete(batch_patched)
+
+        class Dispatching(MultiDeleteBackend):
+            def __getattribute__(self, name: str) -> Any:
+                return object.__getattribute__(self, name)
+
+        assert not _supports_multi_delete(Dispatching())
+        assert _supports_multi_delete(MultiDeleteBackend())
+
+    def test_dynamically_prefixed_delete_sweeps_through_it(self) -> None:
+        """An instance whose delete() rewrites keys: the sweep must not batch-delete the raw keys."""
+
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+            def __getattribute__(self, name: str) -> Any:
+                if name == "delete":
+                    parent = MultiDeleteBackend.delete.__get__(self)
+                    return lambda key: parent("app:" + key)
+                return object.__getattribute__(self, name)
+
+        backend = Prefixed()
+
+        @cache(backend=backend, ttl=60, namespace="multi_dynamic_prefix")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
     def test_subclass_overriding_delete_sweeps_through_its_delete(self) -> None:
         class Prefixed(MultiDeleteBackend):
             def get(self, key: str) -> Optional[bytes]:

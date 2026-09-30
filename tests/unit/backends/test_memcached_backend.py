@@ -460,7 +460,7 @@ class TestDeleteMany:
         with (
             patch.object(backend, "get", side_effect=lambda k: store.get(k)),
             patch.object(backend, "set", side_effect=lambda k, v, ttl=None: store.__setitem__(k, v)),
-            patch.object(backend, "delete", side_effect=lambda k: store.pop(k, None) is not None),
+            patch.object(MemcachedBackend, "delete", autospec=True, side_effect=lambda self, k: store.pop(k, None) is not None),
             patch.object(backend._client, "_safely_run_func", side_effect=AttributeError("renamed")),
         ):
 
