@@ -825,6 +825,48 @@ class TestInvalidateNoArgsMultiDelete:
         assert backend.store == {}
         assert _tracked(f) == set()
 
+    def test_shadowed_instance_dict_delete_sweeps_through_it(self) -> None:
+        """A __dict__ property hides the real instance dict: the guard must still see its delete."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Shadowed(MultiDeleteBackend):
+            @property
+            def __dict__(self) -> dict[str, Any]:  # type: ignore[override]
+                return {}
+
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+        backend = Shadowed()
+        # Write into the real instance dict through the base class's own __dict__ descriptor.
+        base_dict = next(c.__dict__["__dict__"] for c in type(backend).__mro__[1:] if "__dict__" in c.__dict__)
+        parent = MultiDeleteBackend.delete.__get__(backend)
+        base_dict.__get__(backend)["delete"] = lambda key: parent("app:" + key)
+        assert backend.__dict__ == {}  # the shadow hides it
+        assert not _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_shadowed_dict")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_bound_to_another_instance_loses_capability(self) -> None:
+        from cachekit.cache_handler import _supports_multi_delete
+
+        a, b = MultiDeleteBackend(), MultiDeleteBackend()
+        b.delete = a.delete  # type: ignore[method-assign]  # right function, wrong self
+        assert not _supports_multi_delete(b)
+        assert _supports_multi_delete(a)
+
     def test_dynamically_prefixed_delete_sweeps_through_it(self) -> None:
         """An instance whose delete() rewrites keys: the sweep must not batch-delete the raw keys."""
 

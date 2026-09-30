@@ -369,36 +369,32 @@ class _MultiDeleteBackend(Protocol):
 
 
 def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
-    """Type guard for ``_MultiDeleteBackend``, checked on the CLASS like ``supports_key_tracking``.
+    """Type guard for ``_MultiDeleteBackend``: true only when the batch provably deletes what
+    ``backend.delete`` would.
 
-    An inherited ``_delete_many`` counts only if no subclass overrides ``delete`` below the
-    class that defines it. A subclass of ``RedisBackend`` whose ``delete`` rewrites the key
-    (a prefix, say) would otherwise have the parent's batch delete the untransformed keys,
-    and the sweep would untrack entries whose real L2 keys survive.
-
-    Conservative beyond the class: an instance attribute named ``delete`` or ``_delete_many``,
-    or a class that customises ``__getattribute__``, can make the ``delete`` a caller sees
-    differ from the class's, and so can a class entry that is not a plain function (a
-    ``__slots__`` member, a property, any other descriptor): each means no batch path. A
-    false negative only costs round trips; a false positive loses erasure.
+    The batch sends the raw keys it is given. A ``delete`` that rewrites keys (a subclass
+    adding a prefix, an instance attribute, a slot, a property, a custom
+    ``__getattribute__``) would have the sweep batch-delete keys that do not exist, then
+    untrack entries whose real L2 keys survive. So rather than inspect every way lookup can
+    be customised, this resolves both names exactly as the sweep will call them and requires
+    each to be a method bound to this backend whose function is the class's own plain
+    function, with ``_delete_many`` defined at or below the class that defines ``delete``.
+    Anything else takes the per-key path: a false negative only costs round trips, a false
+    positive loses erasure.
     """
     cls = type(backend)
     if cls.__getattribute__ is not object.__getattribute__:
-        return False
-    try:  # object.__getattribute__: a __slots__ backend's __getattr__ must not answer for __dict__
-        instance_attrs = object.__getattribute__(backend, "__dict__")
-    except AttributeError:
-        instance_attrs = {}
-    if not isinstance(instance_attrs, dict) or "delete" in instance_attrs or "_delete_many" in instance_attrs:
-        return False
+        return False  # lookup is not stable between this check and the sweep's calls
     owners: dict[str, type] = {}
     for name in ("delete", "_delete_many"):
         owner = next((c for c in cls.__mro__ if name in c.__dict__), None)
-        # Only a plain function resolves the same for every instance; a slot, property or other
-        # descriptor may not, so it cannot vouch that the batch deletes what delete() would.
-        if owner is None or not isinstance(owner.__dict__[name], types.FunctionType):
+        func = owner.__dict__[name] if owner is not None else None
+        if not isinstance(func, types.FunctionType):
             return False
-        owners[name] = owner
+        resolved = getattr(backend, name, None)
+        if getattr(resolved, "__func__", None) is not func or getattr(resolved, "__self__", None) is not backend:
+            return False  # the instance resolves this name to something other than the class's function
+        owners[name] = owner  # type: ignore[assignment]
     return issubclass(owners["_delete_many"], owners["delete"])
 
 
