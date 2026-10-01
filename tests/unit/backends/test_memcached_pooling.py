@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("pymemcache")
 
-from cachekit.backends.errors import BackendError
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.backend import MemcachedBackend
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 
@@ -100,6 +100,8 @@ class FakeMemcached:
                 if out:
                     conn.sendall(out)
         except (EOFError, OSError):
+            pass
+        finally:
             conn.close()
 
 
@@ -133,6 +135,7 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
 
     stop = threading.Event()
     errors: list[str] = []
+    finished: list[int] = []  # a worker killed by a non-BackendError never gets here
 
     def worker(tid: int) -> None:
         i = 0
@@ -144,9 +147,10 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
                 got = backend.get(key)
                 if got != value:
                     errors.append(f"thread {tid}: {key} -> {got!r}, expected {value!r}")
-            except Exception as exc:  # noqa: BLE001 - every failure is the finding
+            except BackendError as exc:
                 errors.append(f"thread {tid}: {type(exc).__name__}: {exc}")
             i += 1
+        finished.append(tid)
 
     threads = [threading.Thread(target=worker, args=(t,)) for t in range(3)]
     for t in threads:
@@ -157,7 +161,7 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
             try:
                 if not backend.delete(key):
                     reported_absent.append(key)
-            except Exception as exc:  # noqa: BLE001
+            except BackendError as exc:
                 errors.append(f"sweep: {key}: {type(exc).__name__}: {exc}")
     finally:
         stop.set()
@@ -165,6 +169,7 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
             t.join(timeout=10)
 
     assert not errors, errors[:5]
+    assert sorted(finished) == [0, 1, 2]
     assert reported_absent == [], f"{len(reported_absent)} live keys reported absent"
     with server.lock:
         assert not any(k.startswith(b"tracked:") for k in server.store)
@@ -172,7 +177,7 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
 
 
 def test_op_beyond_max_pool_size_raises_without_marking_server_failed(server: FakeMemcached) -> None:
-    """pymemcache's pool does not wait: op N+1 on a server raises, and the server stays live."""
+    """pymemcache's pool does not wait: op N+1 on a server raises TRANSIENT, and the server stays live."""
     pool_size = 2
     backend = _backend(server, max_pool_size=pool_size, timeout=10.0)
 
@@ -187,6 +192,7 @@ def test_op_beyond_max_pool_size_raises_without_marking_server_failed(server: Fa
         with pytest.raises(BackendError) as excinfo:
             backend.get("one-too-many")
         assert isinstance(excinfo.value.original_exception, RuntimeError)
+        assert excinfo.value.error_type == BackendErrorType.TRANSIENT
         _assert_server_healthy(backend)
     finally:
         server.release.set()

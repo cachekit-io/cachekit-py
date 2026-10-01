@@ -73,6 +73,18 @@ def classify_memcached_error(
             key=key,
         )
 
+    # Transient — connection pool exhausted. pymemcache's pool raises a bare RuntimeError
+    # ("Too many objects, N >= max") instead of waiting once max_pool_size connections to
+    # one server are checked out. It is load, not a fault, so it retries like one.
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Too many objects"):
+        return BackendError(
+            message=f"Memcached connection pool exhausted during {operation}: raise max_pool_size",
+            error_type=BackendErrorType.TRANSIENT,
+            original_exception=exc,
+            operation=operation,
+            key=key,
+        )
+
     # Permanent — illegal input, client errors (don't retry).
     # Only the exception TYPE goes in the message: pymemcache embeds the raw
     # cache key in illegal-input error text ("Key is too long: %r"), and the

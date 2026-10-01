@@ -75,7 +75,7 @@ class MemcachedBackendConfig(BaseBackendConfig):
         le=100,
         description=(
             "Maximum pooled connections per server, i.e. concurrent operations per server per "
-            "process. The pool does not wait: an operation beyond this limit raises BackendError."
+            "process. The pool does not wait: an operation beyond this limit raises a TRANSIENT BackendError."
         ),
     )
     retry_attempts: int = Field(

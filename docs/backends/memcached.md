@@ -100,9 +100,11 @@ Each server gets a pool of up to `max_pool_size` connections (default 10). Every
 checks out its own connection, so threads sharing one backend never share a socket.
 
 - **The pool does not wait.** An operation that would need connection `max_pool_size + 1`
-  to one server, in one process, raises `BackendError` at once. The server is not marked
-  failed, and later operations succeed once connections are returned. Set `max_pool_size` at
-  or above the number of threads that can hit one server at the same time.
+  to one server, in one process, raises a TRANSIENT `BackendError` at once. pymemcache does
+  not mark the server failed, and later operations succeed once connections are returned.
+  The cachekit circuit breaker does count the error as a failure, as it does every backend
+  error, so sustained pool exhaustion can open it. Set `max_pool_size` at or above the number
+  of threads that can hit one server at the same time.
 - **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
   sockets would be shared across processes. Create the backend (or make the first cached
   call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
