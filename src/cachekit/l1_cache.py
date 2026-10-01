@@ -14,7 +14,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Optional
+from typing import Any, Concatenate, Optional, ParamSpec
 
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
@@ -27,6 +27,8 @@ DEFAULT_L1_TTL_SECONDS = 300
 _INVALIDATE_BATCH = 1_000
 
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
 
 
 @dataclass
@@ -303,8 +305,8 @@ class L1Cache:
             s.memory_bytes,
         )
 
-    def _on_current_state(self, mutate: Callable[..., None], *args: Any) -> None:
-        """Run mutate(state, *args) under the state lock, again on any state a fork reset published meanwhile.
+    def _on_current_state(self, mutate: Callable[Concatenate[_L1State, _P], None], *args: _P.args, **kwargs: _P.kwargs) -> None:
+        """Run mutate(state, *args, **kwargs) under the state lock, again on any state a fork reset published meanwhile.
 
         A removal queued behind a lock that a reset replaced would otherwise miss the fresh state,
         and a stale value put there after the reset would outlive its invalidation.
@@ -312,7 +314,7 @@ class L1Cache:
         while True:
             s = self._state
             with s.lock:
-                mutate(s, *args)
+                mutate(s, *args, **kwargs)
             if self._state is s:
                 return
 
