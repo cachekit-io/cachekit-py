@@ -236,7 +236,7 @@ class L1Cache:
             )
             return
 
-        # Before the first _lock use: the take-over replaces a _lock orphaned by fork.
+        # Before the first _state use: the take-over replaces a state whose lock fork orphaned.
         if self._before_store is not None:
             self._before_store()
 
@@ -290,7 +290,8 @@ class L1Cache:
         are dropped either way (an orphaned holder may have left them half-updated); L2 still has them.
         """
         s = self._state
-        if not s.lock._is_owned() and s.lock.acquire(timeout=timeout):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        owned = s.lock._is_owned()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        if not owned and s.lock.acquire(timeout=timeout):
             s.lock.release()
             return
         self._state = _L1State()
@@ -623,14 +624,15 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
 
 def _reset_cache_locks_after_fork() -> None:
-    """Replace every L1Cache lock a parent thread held at fork, before the child's first get().
+    """Replace the state of every cache whose lock is unavailable after fork, before the child's first get().
 
     Decorators get() before they put(), so the put-path take-over comes too late for a lock a
     parent thread (say the cleanup sweep) held at fork: that first get() would hang for the
     child's life. The child is single-threaded here, so a non-blocking probe (timeout=0) suffices.
     A lock the forking thread holds (it forked inside a critical section) is replaced too: a child
     that never returns there, like multiprocessing's, would keep it held for good, and one that
-    does return finishes on the state it bound. Only the locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
+    does return finishes on the state it bound. Only the locks: starting the cleanup thread stays
+    with _take_over_if_forked, outside the hook.
     """
     pid = os.getpid()
     error: Optional[Exception] = None

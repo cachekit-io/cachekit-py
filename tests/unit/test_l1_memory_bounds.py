@@ -242,6 +242,7 @@ def _report(w: int, outcome: object) -> NoReturn:
 
 def _child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
     """What the child at pid reported on the pipe r; a hung child is killed."""
+    assert pid > 0, "no child was forked"  # os.kill(0, ...) would signal pytest's whole process group
     data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
     if not data:
         os.kill(pid, signal.SIGKILL)
@@ -572,6 +573,7 @@ class TestCleanupThreadAfterFork:
             _report(w, outcome)
         os.close(w)
 
+        assert child, "get() no longer calls CacheEntry.is_expired"
         assert _child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
@@ -602,6 +604,7 @@ class TestCleanupThreadAfterFork:
         monkeypatch.setattr(CacheEntry, "is_expired", fork_here)
         assert cache.get("pre-fork") == (True, b"v")
         os.close(w)
+        assert child, "get() no longer calls CacheEntry.is_expired"
 
         # The fork dropped the namespace's entries; L2 still has them.
         assert _child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
@@ -660,15 +663,6 @@ class TestCleanupThreadAfterFork:
         held, waiting, release = threading.Event(), threading.Event(), threading.Event()
 
         class SignalOnWait:  # the old lock, announcing when the invalidating thread queues on it
-            def _is_owned(self) -> bool:
-                return real_lock._is_owned()
-
-            def acquire(self, timeout: float = -1) -> bool:
-                return real_lock.acquire(timeout=timeout)
-
-            def release(self) -> None:
-                real_lock.release()
-
             def __enter__(self) -> None:
                 waiting.set()
                 real_lock.acquire()
@@ -688,6 +682,7 @@ class TestCleanupThreadAfterFork:
         invalidator = threading.Thread(target=cache.invalidate, args=("k",))
         invalidator.start()
         assert waiting.wait(5)
+        old.lock = real_lock  # the reset probes it directly
         cache._reset_lock_after_fork(timeout=0)  # a take-over judging the live hold orphaned
         cache.put("k", b"stale")  # read from L2 before the invalidation, stored after the reset
         release.set()
