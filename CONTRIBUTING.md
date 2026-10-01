@@ -259,7 +259,6 @@ This is a **single-maintainer org** using documentation instead of enforcement. 
 
 ```bash
 make build  # Standard build
-make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ```
 
 ### Running Benchmarks

@@ -41,22 +41,3 @@ opt-level = 1
 opt-level = 3
 debug = true
 lto = "fat"
-
-# Profile-Guided Optimization - Generate profile data
-[profile.release-pgo-generate]
-inherits = "release"
-# PGO instrumentation adds overhead, disable some optimizations
-lto = false
-# Keep debug info for profiling
-debug = true
-
-# Profile-Guided Optimization - Use profile data
-[profile.release-pgo-use]
-inherits = "release"
-# Full LTO with profile data for maximum optimization
-lto = "fat"
-# Strip symbols for smaller binary
-strip = true
-# Maximum optimization with profile data
-opt-level = 3
-codegen-units = 1
