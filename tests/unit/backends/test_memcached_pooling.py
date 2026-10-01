@@ -40,10 +40,17 @@ class FakeMemcached:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(64)
         self.port = self._srv.getsockname()[1]
-        threading.Thread(target=self._accept, daemon=True).start()
+        self._closing = False
+        self._acceptor = threading.Thread(target=self._accept, daemon=True)
+        self._acceptor.start()
 
     def close(self) -> None:
         self.release.set()
+        # close() alone does not wake a thread blocked in accept() on Linux, so connect once
+        # to wake it, and join it before closing the listener.
+        self._closing = True
+        socket.create_connection(("127.0.0.1", self.port), timeout=5).close()
+        self._acceptor.join(timeout=5)
         self._srv.close()
 
     def _accept(self) -> None:
@@ -51,6 +58,9 @@ class FakeMemcached:
             try:
                 conn, _ = self._srv.accept()
             except OSError:
+                return
+            if self._closing:
+                conn.close()
                 return
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 

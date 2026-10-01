@@ -34,8 +34,10 @@ class MemcachedBackend:
     Thread-safe: each server gets a pool of up to ``max_pool_size`` connections, and
     each operation checks one out, so concurrent threads never share a socket. The
     pool does not wait: an operation that would need connection ``max_pool_size + 1``
-    to one server raises a TRANSIENT ``BackendError`` instead. Not fork-safe: build a new backend
-    in a forked child rather than reusing the parent's.
+    to one server raises a TRANSIENT ``BackendError`` instead. pymemcache does not lock its
+    server-failover state, so while a failed server is being retried, a concurrent operation on
+    it can raise a spurious ``BackendError``. Not fork-safe: build a new backend in a forked
+    child rather than reusing the parent's.
 
     Examples:
         Create backend with defaults (requires running Memcached):

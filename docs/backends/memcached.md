@@ -107,6 +107,10 @@ checks out its own connection, so threads sharing one backend never share a sock
   toward the [circuit breaker](../features/circuit-breaker.md#integration-with-caching), so
   pool exhaustion does not open it. Set `max_pool_size` at or above the number of threads
   that can hit one server at the same time.
+- **Server recovery is not race-free.** pymemcache does not lock its server-failover state.
+  While a failed server is being retried, concurrent operations on it can raise a spurious
+  `BackendError` wrapping a `KeyError`, whether or not the command itself ran. Under `@cache`
+  it degrades like any other backend error.
 - **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
   sockets would be shared across processes. Create the backend (or make the first cached
   call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
