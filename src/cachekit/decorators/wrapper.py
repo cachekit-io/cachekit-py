@@ -21,6 +21,8 @@ from ..cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
+    TenantResolutionError,
+    _supports_multi_delete,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
@@ -45,7 +47,12 @@ from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
+from ..serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+    TenantMismatchError,
+)
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -85,6 +92,10 @@ _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
 # between log at DEBUG and are counted into the next WARNING. A registry outage fails every
 # L2 write, and one WARNING per write would turn it into a log flood.
 _TRACK_WARN_INTERVAL_SECONDS = 60.0
+
+# Keys per multi-key L2 delete in a whole-function invalidation: bounds each server-side
+# command, like the Redis registry drain's chunk.
+_DELETE_BATCH = 10_000
 
 # Backed-mode (L2) SWR revalidation pool — deliberately separate from the L1
 # constant above so the two features can be tuned independently (LAB-381 panel).
@@ -922,7 +933,9 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
+    async def _l2_double_check(
+        cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -936,9 +949,9 @@ def create_cache_wrapper(
         get_cached_value_async.
         """
         if _l2_freshness_capable():
-            hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+            hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
             return hit if hit is not None else (None, False, None)
-        return await operation_handler.get_cached_value_async(cache_key), False, None
+        return await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs), False, None
 
     def _l1_backfill_from_l2(cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None) -> None:
         """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
@@ -1464,7 +1477,7 @@ def create_cache_wrapper(
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                 try:
-                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
 
                     features.set_operation_context("l1_get", duration_ms=0.001)
 
@@ -1498,6 +1511,16 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
+                except TenantMismatchError:
+                    # L1 is keyed by the bare cache key and holds only this process's own
+                    # authenticated writes and backfills, so another tenant's envelope here is
+                    # a keying collision, not tamper evidence: an L1 miss, no auth_tamper and no
+                    # raise. L2, which may hold this tenant's own entry, applies the policy.
+                    _l1_cache.invalidate(cache_key)
+                except TenantResolutionError:
+                    # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
+                    # with the entry, which stays. The L2 read below misses for the same reason.
+                    logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                 except SerializationError as e:
                     # Poisoned L1 must not outlive remediation of the durable L2 copy —
                     # invalidate BEFORE the policy decision (a fail-closed raise would
@@ -1614,12 +1637,12 @@ def create_cache_wrapper(
             _sync_l2_stale = False
             _sync_l2_fresh_for: int | None = None
             if _l2_freshness_capable():
-                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
+                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
                 _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
             else:
-                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
+                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
 
             duration = time.time() - start_time
 
@@ -1881,7 +1904,7 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
 
                         features.set_operation_context("l1_get", duration_ms=0.001)
 
@@ -1900,6 +1923,12 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
+                    except TenantMismatchError:
+                        # Another tenant's envelope in L1: an L1 miss — see the sync L1 guard above.
+                        _l1_cache.invalidate(cache_key)
+                    except TenantResolutionError:
+                        # Caller's tenant unresolved: the entry stays — see the sync L1 guard above.
+                        logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                     except SerializationError as e:
                         # Poisoned L1 must not outlive remediation of the durable L2 copy —
                         # invalidate BEFORE the policy decision (a fail-closed raise would
@@ -1990,12 +2019,12 @@ def create_cache_wrapper(
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
                 if _l2_freshness_capable():
-                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
                     cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
                     _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
                 else:
-                    cached_result = await operation_handler.get_cached_value_async(cache_key)
+                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
 
                 if cached_result is not None:
                     # Cache hit: envelope is the raw serialized bytes for L1 backfill
@@ -2079,7 +2108,7 @@ def create_cache_wrapper(
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
                                 _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
                                     result, cached_data = cached_result.value, cached_result.envelope
@@ -2113,7 +2142,7 @@ def create_cache_wrapper(
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                                 _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
                                     result, cached_data = cached_result.value, cached_result.envelope
@@ -2301,16 +2330,42 @@ def create_cache_wrapper(
         finally:
             _drain_watches.pop(owner, None)
 
+    def _delete_l2(keys: list[str]) -> tuple[set[str], Union[str, None]]:
+        """L2-delete ``keys``: return those not confirmed deleted, and the redacted error of a
+        multi-key call that fell back (rendered, so no traceback outlives it). Never raises.
+
+        One multi-key call on a backend that has one. If that call raises as a whole, every
+        key's outcome is unknown, so the batch falls back to per-key deletes: one bad batch
+        cannot abort the sweep, and each key still gets its own verdict.
+        """
+        batch_error: Union[str, None] = None
+        if _supports_multi_delete(_backend):
+            try:
+                return _backend._delete_many(keys), None
+            except Exception as e:
+                batch_error = redact_error_for_log(e)
+        failed: set[str] = set()
+        for key in keys:
+            try:
+                _backend.delete(key)  # type: ignore[union-attr]
+            except Exception as e:
+                _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
+                failed.add(key)  # keep key tracked for retry
+        return failed, batch_error
+
     def _local_invalidate_all() -> None:
         """Invalidate every key THIS process knows (_cached_keys): L2 delete, then trim, then L1.
 
         The whole-function path for backends without a key registry, and the fallback when a
-        drain fails. Per key, the L2 delete comes first: evicting L1 first would let an L2-hit
-        backfill landing in between re-cache the old value in L1. A key whose delete failed,
-        or that was re-recorded while this runs, stays in _cached_keys for the next attempt.
-        Keys other processes wrote and this one never saw stay in L2 until their TTL. Another
-        tenant's entry keeps its L2 value and stays tracked; only its L1 copy is evicted,
-        because L1 is not tenant-scoped (LAB-4773).
+        drain fails. Keys go to L2 in batches of at most _DELETE_BATCH: one multi-key call per
+        batch where the backend supports it (the backend may split it; Memcached sends per
+        server, 1,000 keys a send), else one call per key. Per batch, the L2 delete
+        comes first: evicting L1 first would let an L2-hit backfill landing in between
+        re-cache the old value in L1. A key whose delete failed, or that was re-recorded
+        while this runs, stays in _cached_keys for the next attempt. Keys other processes
+        wrote and this one never saw stay in L2 until their TTL. Another tenant's entry keeps
+        its L2 value and stays tracked; only its L1 copy is evicted, because L1 is not
+        tenant-scoped.
 
         Failed deletes are logged once per call with their count: the call never raises, so
         this record is the caller's only signal, and a per-key record would flood during an
@@ -2318,27 +2373,36 @@ def create_cache_wrapper(
         """
         scope = _l2_scope()
         failed = 0
+        fallbacks, last_fallback = 0, ""
+        has_l2 = _backend is not None and not _l1_only_mode
         with _watch_records() as watch:
-            for entry in set(_cached_keys):  # snapshot: other threads add while this runs
-                entry_scope, key = entry
-                l2_deleted = True
-                if entry_scope != scope:
-                    l2_deleted = False  # another tenant's L2 entry: not the caller's to delete, stays tracked
-                elif _backend is not None and not _l1_only_mode:
-                    try:
-                        _backend.delete(key)
-                    except Exception as e:
-                        _logger.debug("Failed to delete L2 key %s: %s", redact_cache_key(key), redact_error_for_log(e))
-                        l2_deleted = False  # keep key tracked for retry
-                        failed += 1
-                if l2_deleted:
-                    _cached_keys.discard(entry)
-                    if entry in watch:  # rewritten meanwhile: its new value may still be in L2
-                        _cached_keys.add(entry)
-                if _object_cache:
-                    _object_cache.delete(key)
-                elif _l1_cache:
-                    _l1_cache.invalidate(key)
+            snap = list(_cached_keys)  # snapshot: other threads add while this runs
+            for start in range(0, len(snap), _DELETE_BATCH):
+                batch = snap[start : start + _DELETE_BATCH]
+                # Another tenant's L2 entry is not the caller's to delete: it stays tracked.
+                mine = [key for entry_scope, key in batch if entry_scope == scope]
+                undeleted, batch_error = _delete_l2(mine) if has_l2 and mine else (set(), None)
+                failed += len(undeleted)
+                if batch_error is not None:
+                    fallbacks, last_fallback = fallbacks + 1, batch_error
+                for entry in batch:
+                    entry_scope, key = entry
+                    if entry_scope == scope and key not in undeleted:
+                        _cached_keys.discard(entry)
+                        if entry in watch:  # rewritten meanwhile: its new value may still be in L2
+                            _cached_keys.add(entry)
+                    if _object_cache:
+                        _object_cache.delete(key)
+                    elif _l1_cache:
+                        _l1_cache.invalidate(key)
+        if fallbacks:
+            # Once per call, like the ERROR below. A backend whose multi-key delete always fails
+            # (e.g. an ACL that denies UNLINK) otherwise silently pays one round trip per key.
+            _logger.warning(
+                "Multi-key L2 delete failed for %d batch(es); deleted those keys one by one. Latest error: %s",
+                fallbacks,
+                last_fallback,
+            )
         if failed:
             # ERROR, as for a single key: every failed entry may still be served from L2.
             _logger.error("Failed to delete %d L2 key(s); they stay tracked for the next invalidate_cache()", failed)

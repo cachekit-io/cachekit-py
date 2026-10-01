@@ -69,7 +69,8 @@ class BaseBackendConfig(RedactingSettings):
         model_config: Standard pydantic-settings configuration with:
             - env_nested_delimiter="__" for nested config support
             - case_sensitive=False for env var flexibility
-            - extra="forbid" for strict validation (catch typos)
+            - extra="forbid" for strict validation (catch typos; pydantic-settings>=2.15
+              matches constructor kwargs case-insensitively, so a case-only variant is accepted)
             - populate_by_name=True for alias support
             - hide_input_in_errors=True so no error text echoes a credential
 

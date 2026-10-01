@@ -176,8 +176,7 @@ jobs:
     # markdown blocks. None of them sit under tests/unit or tests/critical, so
     # the runs above never collect them.
     #
-    # No REDIS_URL here on purpose: the RedisBackendConfig docstring example
-    # fails `extra_forbidden` when it is exported (#225).
+    # No REDIS_URL here: the RedisBackendConfig() defaults example asserts the localhost default.
     - name: Run docstring examples
       if: ${{ !cancelled() && matrix.python-version == '3.12' }}
       run: uv run pytest --doctest-modules src/cachekit --ignore=src/cachekit/_rust_serializer.py

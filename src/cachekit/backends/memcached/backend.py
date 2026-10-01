@@ -6,12 +6,20 @@ multi-server support and a per-server connection pool. Implements BaseBackend pr
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Optional
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
 from cachekit.backends.memcached.error_handler import classify_memcached_error
+from cachekit.hash_utils import redact_error_for_log
+
+_logger = logging.getLogger(__name__)
+
+# Keys per pipelined delete_many send. pymemcache writes the whole send before reading any
+# reply; at ~10 bytes a reply, 1,000 keys stay far below a socket buffer.
+_PIPELINE_KEYS = 1_000
 
 
 def _parse_server(server: str) -> tuple[str, int]:
@@ -177,6 +185,58 @@ class MemcachedBackend:
             return bool(self._client.delete(self._prefixed_key(key), noreply=False))
         except Exception as exc:
             raise classify_memcached_error(exc, operation="delete", key=key) from exc
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        """Delete many keys with pipelined round trips per server (internal: whole-function invalidation).
+
+        ``HashClient.delete_many`` sends one ``delete`` per key, so this groups the keys by
+        server itself, the way ``HashClient.get_many`` does, and sends each group through
+        that server's ``delete_many`` with ``noreply=False``, which reads a reply for every
+        key. ``NOT_FOUND`` counts as deleted. A send whose call raises, or that the client
+        skips (server in its retry window), is reported failed as a whole: pymemcache
+        cannot say which of its keys, if any, were deleted; those keys stay tracked for the
+        next sweep. Sends carry at most ``_PIPELINE_KEYS`` keys, so the server's replies
+        never back up behind a send that has not finished.
+
+        Only pymemcache's own failures (``MemcacheError``, ``OSError``) are absorbed. Anything
+        else, such as an ``AttributeError`` from a pymemcache release that renamed the
+        HashClient internals used here, raises, so the caller falls back to per-key deletes.
+
+        Returns:
+            The keys not confirmed deleted.
+
+        Raises:
+            Exception: Any error that is not a Memcached or socket failure.
+        """
+        from pymemcache.exceptions import MemcacheError
+
+        get_client = self._client._get_client  # bound outside the trys: drift must raise
+        run = self._client._safely_run_func
+        failed: set[str] = set()
+        groups: dict[Any, dict[str, str]] = {}  # client -> {wire key: key}
+        for key in keys:
+            wire_key = self._prefixed_key(key)
+            try:
+                client = get_client(wire_key)
+            except MemcacheError as exc:  # invalid key, or every server down
+                _logger.debug("Memcached delete skipped a key: %s", redact_error_for_log(exc))
+                client = None
+            if client is None:
+                failed.add(key)
+            else:
+                groups.setdefault(client, {})[wire_key] = key
+        for client, group in groups.items():
+            wire_keys = list(group)
+            for i in range(0, len(wire_keys), _PIPELINE_KEYS):
+                chunk = wire_keys[i : i + _PIPELINE_KEYS]
+                try:
+                    acked = run(client, client.delete_many, False, chunk, noreply=False)
+                except (MemcacheError, OSError) as exc:
+                    _logger.debug("Memcached delete_many failed for %d key(s): %s", len(chunk), redact_error_for_log(exc))
+                    acked = False
+                if not acked:
+                    failed.update(group[k] for k in chunk)
+        return failed
 
     def exists(self, key: str) -> bool:
         """Check if key exists in Memcached.

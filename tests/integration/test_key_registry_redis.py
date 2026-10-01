@@ -351,3 +351,32 @@ class TestDecoratorOnRedis:
 
         b.invalidate_cache()
         assert len(client.keys("*key_registry_direct*")) == 1  # a's key survives: b never saw it
+
+
+class TestDirectRedisBackendBatchedSweep:
+    """A RedisBackend passed as backend= has no registry: its whole-function invalidation
+    deletes this process's keys, in multi-key UNLINKs rather than one DEL per key."""
+
+    def test_sweep_unlinks_in_batches_and_every_key_misses(self, client: redis.Redis) -> None:
+        from cachekit.backends.redis import RedisBackend
+
+        spy = MagicMock(wraps=client)
+        provider = MagicMock()
+        provider.get_sync_client.return_value = spy
+        backend = RedisBackend(redis_url="redis://unused:6379", client_provider=provider)
+
+        @cache(backend=backend, ttl=60, namespace="direct_redis_batched")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(2500):
+            f(i)
+        keys = [k.decode() for k in client.keys("*direct_redis_batched*")]
+        assert len(keys) == 2500
+        spy.reset_mock()
+
+        f.invalidate_cache()
+
+        assert spy.unlink.call_count == 1
+        assert spy.delete.call_count == 0
+        assert all(backend.get(k) is None for k in keys)

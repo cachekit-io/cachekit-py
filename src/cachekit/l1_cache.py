@@ -14,7 +14,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Optional
+from typing import Any, Concatenate, Optional, ParamSpec
 
 from cachekit.hash_utils import redact_error_for_log, redact_key_for_log
 
@@ -27,6 +27,8 @@ DEFAULT_L1_TTL_SECONDS = 300
 _INVALIDATE_BATCH = 1_000
 
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
 
 
 @dataclass
@@ -45,6 +47,38 @@ class CacheEntry:
     def is_expired(self) -> bool:
         """Check if entry has expired."""
         return time.time() >= self.expires_at
+
+
+class _L1State:
+    """The entries, their byte total, and the lock guarding both.
+
+    One object so a fork reset can replace all three with a single attribute store: a thread
+    still inside a critical section finishes on the state it bound, and nothing is shared across
+    the swap.
+    """
+
+    __slots__ = ("cache", "lock", "memory_bytes")
+
+    def __init__(self) -> None:
+        self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
+        self.lock = threading.RLock()
+        self.memory_bytes = 0
+
+    def remove(self, key: str) -> None:
+        """Remove key if present, keeping memory_bytes in step; call with lock held."""
+        entry = self.cache.pop(key, None)
+        if entry is not None:
+            self.memory_bytes -= entry.size_bytes
+
+    def remove_all(self, keys: Iterable[str]) -> None:
+        """Remove every key present; call with lock held."""
+        for key in keys:
+            self.remove(key)
+
+    def empty(self) -> None:
+        """Remove every entry; call with lock held."""
+        self.cache.clear()
+        self.memory_bytes = 0
 
 
 class L1Cache:
@@ -89,15 +123,12 @@ class L1Cache:
         self.namespace = namespace
         self._before_store = before_store
 
-        # Thread-safe cache storage
-        self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
-        self._lock = threading.RLock()
+        # Every critical section binds this once: `s = self._state; with s.lock: ...`. Reading
+        # self._state again inside one would mix states if a fork reset replaced it meanwhile.
+        self._state = _L1State()
 
-        # Memory tracking
-        self._current_memory_bytes = 0
-        self._eviction_count = 0
-
-        # Performance metrics
+        # Performance metrics. Kept outside _state so a fork reset does not zero them; a holder
+        # finishing on a replaced state may race one increment, which only skews stats.
         self._hits = 0
         self._misses = 0
         self._evictions = 0
@@ -135,8 +166,9 @@ class L1Cache:
             Value is bytes (encrypted or plaintext msgpack), not deserialized object.
             Caller (CacheHandler) is responsible for decryption/deserialization.
         """
-        with self._lock:
-            entry = self._cache.get(key)
+        s = self._state
+        with s.lock:
+            entry = s.cache.get(key)
 
             if entry is None:
                 self._misses += 1
@@ -145,13 +177,13 @@ class L1Cache:
             # Check TTL
             if entry.is_expired():
                 # Remove expired entry
-                self._remove_entry(key)
+                s.remove(key)
                 self._misses += 1
                 self._expired_evictions += 1
                 return False, None
 
             # LRU: Move to end
-            self._cache.move_to_end(key)
+            s.cache.move_to_end(key)
             self._hits += 1
 
             return True, entry.value
@@ -206,7 +238,7 @@ class L1Cache:
             )
             return
 
-        # Before the first _lock use: the take-over replaces a _lock orphaned by fork.
+        # Before the first _state use: the take-over replaces a state whose lock fork orphaned.
         if self._before_store is not None:
             self._before_store()
 
@@ -219,9 +251,7 @@ class L1Cache:
         # The value is still available from L2; we only decline to mirror it in L1. If a
         # smaller entry for this key was cached, drop it so L1 stops serving the stale value.
         if size > self.max_memory_bytes:
-            with self._lock:
-                if key in self._cache:
-                    self._remove_entry(key)
+            self._on_current_state(_L1State.remove, key)
             logger.debug(
                 "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
                 redact_key_for_log(key),
@@ -230,83 +260,89 @@ class L1Cache:
             )
             return
 
-        with self._lock:
+        s = self._state
+        with s.lock:
             # Check if key already exists
-            if key in self._cache:
-                old_entry = self._cache[key]
-                self._current_memory_bytes -= old_entry.size_bytes
+            if key in s.cache:
+                old_entry = s.cache[key]
+                s.memory_bytes -= old_entry.size_bytes
 
             # Evict entries if needed to make room
-            self._evict_for_space(size)
+            self._evict_for_space(s, size)
 
             # Store new entry
             entry = CacheEntry(value=value, expires_at=expiry, size_bytes=size)
-            self._cache[key] = entry
-            self._current_memory_bytes += size
+            s.cache[key] = entry
+            s.memory_bytes += size
 
             # Move to end (most recently used)
-            self._cache.move_to_end(key)
+            s.cache.move_to_end(key)
 
     def _reset_lock_after_fork(self, timeout: float = 1.0) -> None:
-        """Replace _lock if a parent thread held it at fork; call only from a fork take-over or hook.
+        """Replace the state if its lock is unavailable after fork; call only from a fork take-over or hook.
 
-        The holder does not exist in the child, so the lock never releases. _is_owned() first:
-        a thread started in the child can reuse the dead holder's ident and so "own" its hold.
-        The timeout waits out a child thread briefly holding the lock legitimately; the at-fork
-        hook passes 0 for a non-blocking probe, as no other child thread exists yet. An orphaned
-        holder may have left the entries half-updated, so they are dropped; L2 still has them.
+        A parent thread holding the lock at fork does not exist in the child, so it never releases.
+        _is_owned() first: a thread started in the child can reuse the dead holder's ident and so
+        "own" its hold. The timeout waits out a child thread briefly holding the lock legitimately;
+        the at-fork hook passes 0 for a non-blocking probe, as no other child thread exists yet.
+        Neither probe proves the holder dead: in the hook, _is_owned() also means the forking thread
+        forked from inside a critical section; without hooks, a live child thread may hold the lock
+        past the timeout. So the reset never clears or swaps anything in use. It publishes a fresh
+        empty state, and whichever thread holds the old lock finishes on the old state. The entries
+        are dropped either way (an orphaned holder may have left them half-updated); L2 still has them.
         """
-        lock = self._lock
-        if not lock._is_owned() and lock.acquire(timeout=timeout):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
-            lock.release()
+        s = self._state
+        owned = s.lock._is_owned()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        if not owned and s.lock.acquire(timeout=timeout):
+            s.lock.release()
             return
-        dropped, dropped_bytes = len(self._cache), self._current_memory_bytes
-        # Clear before publishing the new lock: the orphaned one still shuts every other thread out.
-        self._cache.clear()
-        self._current_memory_bytes = 0
-        self._lock = threading.RLock()
+        self._state = _L1State()
         # Log only once repaired: a raising logging Filter escapes Logger.handle.
         logger.warning(
             "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
             self.namespace,
-            dropped,
-            dropped_bytes,
+            len(s.cache),
+            s.memory_bytes,
         )
 
-    def _remove_entry(self, key: str) -> None:
-        """Remove entry from cache and update memory tracking.
+    def _on_current_state(self, mutate: Callable[Concatenate[_L1State, _P], None], *args: _P.args, **kwargs: _P.kwargs) -> None:
+        """Run mutate(state, *args, **kwargs) under the state lock, again on any state a fork reset published meanwhile.
 
-        Args:
-            key: Key to remove
+        A removal queued behind a lock that a reset replaced would otherwise miss the fresh state,
+        and a stale value put there after the reset would outlive its invalidation.
         """
-        if key in self._cache:
-            entry = self._cache.pop(key)
-            self._current_memory_bytes -= entry.size_bytes
+        while True:
+            s = self._state
+            with s.lock:
+                mutate(s, *args, **kwargs)
+            if self._state is s:
+                return
 
-    def _evict_for_space(self, needed_bytes: int) -> None:
+    def _evict_for_space(self, s: _L1State, needed_bytes: int) -> None:
         """Evict LRU entries to make space for new entry.
 
         Args:
+            s: The state the caller bound and holds the lock of
             needed_bytes: Bytes needed for new entry
         """
         # Check if we need to evict
-        if self._current_memory_bytes + needed_bytes <= self.max_memory_bytes:
+        if s.memory_bytes + needed_bytes <= self.max_memory_bytes:
             return
 
         # Evict LRU entries until we have space
         entries_to_remove = []
 
-        for key, entry in self._cache.items():
-            if self._current_memory_bytes + needed_bytes <= self.max_memory_bytes:
+        for key, entry in s.cache.items():
+            if s.memory_bytes + needed_bytes <= self.max_memory_bytes:
                 break
 
             entries_to_remove.append(key)
-            self._current_memory_bytes -= entry.size_bytes
+            s.memory_bytes -= entry.size_bytes
             self._evictions += 1
 
         # Remove entries
         for key in entries_to_remove:
-            self._cache.pop(key, None)
+            s.cache.pop(key, None)
 
         if entries_to_remove:
             logger.debug("L1Cache evicted %d entries to free %d bytes", len(entries_to_remove), needed_bytes)
@@ -317,8 +353,7 @@ class L1Cache:
         Args:
             key: Key to invalidate
         """
-        with self._lock:
-            self._remove_entry(key)
+        self._on_current_state(_L1State.remove, key)
 
     def invalidate_many(self, keys: Iterable[str]) -> None:
         """Invalidate (remove) several entries, taking the lock once per 1 000 keys.
@@ -339,16 +374,12 @@ class L1Cache:
         """
         it = iter(keys)
         while batch := list(islice(it, _INVALIDATE_BATCH)):
-            with self._lock:
-                for key in batch:
-                    self._remove_entry(key)
+            self._on_current_state(_L1State.remove_all, batch)
 
     def clear(self) -> None:
         """Clear all entries from L1 cache."""
-        with self._lock:
-            self._cache.clear()
-            self._current_memory_bytes = 0
-            logger.info("L1Cache cleared for namespace: %s", self.namespace)
+        self._on_current_state(_L1State.empty)
+        logger.info("L1Cache cleared for namespace: %s", self.namespace)
 
     def cleanup_expired(self) -> int:
         """Remove expired entries from cache.
@@ -359,13 +390,14 @@ class L1Cache:
         current_time = time.time()
         expired_keys = []
 
-        with self._lock:
-            for key, entry in self._cache.items():
+        s = self._state
+        with s.lock:
+            for key, entry in s.cache.items():
                 if current_time >= entry.expires_at:
                     expired_keys.append(key)
 
             for key in expired_keys:
-                self._remove_entry(key)
+                s.remove(key)
                 self._expired_evictions += 1
 
         if expired_keys:
@@ -379,16 +411,17 @@ class L1Cache:
         Returns:
             Dictionary of cache metrics
         """
-        with self._lock:
+        s = self._state
+        with s.lock:
             total_requests = self._hits + self._misses
             hit_rate = self._hits / total_requests if total_requests > 0 else 0.0
 
             return {
                 "namespace": self.namespace,
-                "entries": len(self._cache),
-                "memory_used_mb": self._current_memory_bytes / (1024 * 1024),
+                "entries": len(s.cache),
+                "memory_used_mb": s.memory_bytes / (1024 * 1024),
                 "memory_limit_mb": self.max_memory_bytes / (1024 * 1024),
-                "memory_usage_percent": (self._current_memory_bytes / self.max_memory_bytes) * 100,
+                "memory_usage_percent": (s.memory_bytes / self.max_memory_bytes) * 100,
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": hit_rate,
@@ -444,7 +477,7 @@ class L1CacheManager:
         """Take over inherited state in a forked child; restart cleanup if the parent ran it.
 
         Threads don't survive fork(): a prefork child (Gunicorn --preload, Celery prefork)
-        inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache._lock as
+        inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache state lock as
         parent state a parent thread may have held at fork. An owner-PID check rather than an
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
@@ -454,7 +487,10 @@ class L1CacheManager:
         first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
         The take-over resets cache locks only when that hook did not run in this PID
-        (_locks_reset_pid): after it, a held cache lock belongs to a live child thread.
+        (_locks_reset_pid): after it, a held cache lock belongs to a live child thread. Without
+        hooks it cannot tell a dead holder from a live child thread holding a cache lock past the
+        1 s probe, and then drops that cache's entries; the holder finishes unharmed on the state
+        it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -467,7 +503,7 @@ class L1CacheManager:
             self._lock = threading.Lock()
             self._stop_cleanup = threading.Event()
             # Only where no at-fork hook ran (uWSGI): after the hook, a held cache lock belongs to a
-            # live child thread, and resetting it would clear the cache under that thread.
+            # live child thread, and resetting it would drop that cache's entries for nothing.
             if self._locks_reset_pid != pid:
                 for cache in self._caches.values():  # before the cleanup worker takes their locks
                     cache._reset_lock_after_fork()
@@ -590,12 +626,15 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
 
 def _reset_cache_locks_after_fork() -> None:
-    """Replace every L1Cache lock a parent thread held at fork, before the child's first get().
+    """Replace the state of every cache whose lock is unavailable after fork, before the child's first get().
 
     Decorators get() before they put(), so the put-path take-over comes too late for a lock a
     parent thread (say the cleanup sweep) held at fork: that first get() would hang for the
-    child's life. The child is single-threaded here, so a non-blocking probe (timeout=0) is exact.
-    Only the locks: starting the cleanup thread stays with _take_over_if_forked, outside the hook.
+    child's life. The child is single-threaded here, so a non-blocking probe (timeout=0) suffices.
+    A lock the forking thread holds (it forked inside a critical section) is replaced too: a child
+    that never returns there, like multiprocessing's, would keep it held for good, and one that
+    does return finishes on the state it bound. Only the locks: starting the cleanup thread stays
+    with _take_over_if_forked, outside the hook.
     """
     pid = os.getpid()
     error: Optional[Exception] = None

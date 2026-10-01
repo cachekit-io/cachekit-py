@@ -441,7 +441,7 @@ class TestDecryptErrorTaxonomy:
             def supports_mmap_read(self) -> bool:
                 return False
 
-            def deserialize_data(self, data: Any, cache_key: str) -> Any:
+            def deserialize_data(self, data: Any, cache_key: str, *_: Any) -> Any:
                 raise KeyringConfigurationError("Keyring decrypt failed: simulated config fault")
 
         handler = CacheOperationHandler.__new__(CacheOperationHandler)
@@ -626,7 +626,7 @@ class TestConstructionFaultsFailLoudAtReadSite:
             def supports_mmap_read(self) -> bool:
                 return False
 
-            def deserialize_data(self, data: Any, cache_key: str) -> Any:
+            def deserialize_data(self, data: Any, cache_key: str, *_: Any) -> Any:
                 raised.append(UnicodeEncodeError("utf-8", "\udc80", 0, 1, "surrogates not allowed"))
                 raise raised[-1]
 

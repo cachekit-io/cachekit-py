@@ -181,3 +181,27 @@ class TestRedisUrlAliasChoicesPriority:
 
         config = RedisBackendConfig()
         assert config.redis_url == "redis://localhost:6379"
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"REDIS_URL": "redis://generic:6379"},
+            {"CACHEKIT_REDIS_URL": "redis://cachekit:6379"},
+            {"CACHEKIT_REDIS_URL": "redis://cachekit:6379", "REDIS_URL": "redis://generic:6379"},
+            {},
+        ],
+        ids=["redis_url", "cachekit_redis_url", "both", "neither"],
+    )
+    def test_explicit_kwarg_beats_env(self, monkeypatch, env):
+        """An explicit redis_url= kwarg wins over either env var (cachekit-py#225).
+
+        pydantic-settings < 2.12 rejected the kwarg as extra_forbidden whenever an
+        alias env var was set: the env value took the field and the kwarg was left over.
+        """
+        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        config = RedisBackendConfig(redis_url="redis://other:6380")
+        assert config.redis_url == "redis://other:6380"

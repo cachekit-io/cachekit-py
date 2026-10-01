@@ -200,6 +200,24 @@ class RedisBackend:
                 key=key,
             ) from e
 
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        """Delete many keys in one ``UNLINK`` (internal: whole-function invalidation).
+
+        A reply means Redis applied the command to every key, so no key is ever reported
+        failed; an absent key counts as deleted. A failed command raises, and the caller
+        then deletes the keys one by one.
+
+        Raises:
+            BackendError: If the ``UNLINK`` fails (connection, proxy that cannot route it, ...)
+        """
+        if not keys:
+            return set()
+        try:
+            self._get_client().unlink(*keys)
+        except Exception as e:
+            raise BackendError(message=f"Redis UNLINK failed: {type(e).__name__}", operation="delete") from e
+        return set()
+
     def exists(self, key: str) -> bool:
         """Check if key exists in Redis storage.
 
