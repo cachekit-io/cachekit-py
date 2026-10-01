@@ -1,6 +1,7 @@
 """Auto mode switching must leave exactly one live worker on the queue whenever the collector is batched."""
 
 import os
+import queue
 import signal
 import threading
 import time
@@ -68,12 +69,27 @@ def test_records_after_returning_to_batched_mode_reach_their_metric():
     assert collector.get_dropped_metrics_count() == 0
 
 
-def test_no_new_worker_starts_while_the_previous_one_is_alive():
+class _SignallingQueue(queue.Queue):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entered_get = threading.Event()
+
+    def get(self, *args, **kwargs):
+        self.entered_get.set()
+        return super().get(*args, **kwargs)
+
+
+def test_no_new_worker_starts_while_the_previous_one_is_alive(monkeypatch):
     namespace = f"mode-switch-wait-{uuid.uuid4().hex}"
+    fake_queue = SimpleNamespace(Queue=_SignallingQueue, Empty=queue.Empty, Full=queue.Full)
+    monkeypatch.setattr(async_metrics, "queue", fake_queue)
     # A long get() timeout keeps the stopped worker alive until it is fed a record.
     collector = AsyncMetricsCollector(flush_interval=30.0, max_queue_size=100, sync_mode=False)
     old_worker, q = collector._worker_thread, collector._queue
-    assert old_worker is not None and q is not None
+    assert old_worker is not None and isinstance(q, _SignallingQueue)
+    # Stop the worker only once it waits in get(). Stopped before its first loop check, it skips the loop and
+    # snapshots an empty queue for its exit drain, so the record put below would be left behind.
+    assert q.entered_get.wait(5)
 
     _steer(collector, 1)
     _record(collector, namespace)
@@ -140,16 +156,19 @@ def test_child_forked_mid_switch_can_still_switch(monkeypatch):
     assert collector._sync_mode
     parent_pid = os.getpid()
     inside, release = threading.Event(), threading.Event()
-    real_info = async_metrics.logger.info
 
-    def info_that_blocks_in_parent(*args, **kwargs):
-        # Park the parent's switching thread inside the switch, holding the mode lock, while the process forks.
-        if os.getpid() == parent_pid:
-            inside.set()
-            release.wait(5)
-        real_info(*args, **kwargs)
+    class ThreadThatBlocksInParent(threading.Thread):
+        def start(self):
+            # Park the parent's switching thread inside the switch, holding the mode lock, while the process forks.
+            # Park before the worker starts: a running worker can hold the queue's mutex across the fork, which
+            # hangs the child on the queue instead of testing the mode lock.
+            if os.getpid() == parent_pid:
+                inside.set()
+                release.wait(5)
+            super().start()
 
-    monkeypatch.setattr(async_metrics.logger, "info", info_that_blocks_in_parent)
+    fake_threading = SimpleNamespace(Thread=ThreadThatBlocksInParent, Event=threading.Event, Lock=threading.Lock)
+    monkeypatch.setattr(async_metrics, "threading", fake_threading)
     _steer(collector, 500)
     switcher = threading.Thread(target=_record, args=(collector, namespace), daemon=True)
     switcher.start()
