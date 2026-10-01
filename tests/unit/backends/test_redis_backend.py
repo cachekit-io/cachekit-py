@@ -156,6 +156,11 @@ class TestRedisPoolSocketKeepalive:
         pool = self._pool(build, url, keepalive)
         assert pool.connection_kwargs["socket_keepalive"] is keepalive
 
+    def test_url_query_option_overrides_config(self, build, keepalive):
+        """Documented precedence: redis-py's from_url lets querystring options win over kwargs."""
+        pool = self._pool(build, f"redis://localhost:6379/0?socket_keepalive={int(not keepalive)}", keepalive)
+        assert pool.connection_kwargs["socket_keepalive"] is (not keepalive)
+
     def test_unix_pool_makes_connections(self, build, keepalive):
         pool = self._pool(build, "unix:///tmp/cachekit-no-such.sock?db=0", keepalive)
         assert "socket_keepalive" not in pool.connection_kwargs

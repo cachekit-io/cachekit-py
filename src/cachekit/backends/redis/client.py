@@ -86,7 +86,9 @@ def create_connection_pool(
     OS TCP timeout) and the configured TCP keepalive apply uniformly.
 
     Args:
-        redis_url: Redis connection URL the pool is bound to
+        redis_url: Redis connection URL the pool is bound to. Its query
+            options (e.g. ?socket_timeout=1) override the config-derived
+            kwargs below: redis-py's from_url lets querystring arguments win.
         config: Pool tuning knobs; defaults to env-derived config. Its
             redis_url field is ignored — the explicit URL argument wins.
         max_connections: Override for config.connection_pool_size

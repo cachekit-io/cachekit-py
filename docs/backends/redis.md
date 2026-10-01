@@ -58,6 +58,8 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 | `socket_keepalive` | `True` | Set `SO_KEEPALIVE` on TCP connections, using the OS keepalive timers (env: `CACHEKIT_SOCKET_KEEPALIVE`). Not applied to `unix://` URLs |
 | `disable_hiredis` | `False` | Use pure Python parser instead of hiredis |
 
+Query options in `redis_url` override the pool fields above, because redis-py's `from_url` lets querystring arguments win. For example, `redis://host:6379/0?socket_timeout=1&socket_keepalive=0` sets a 1 s timeout and turns keepalive off, whatever the config says.
+
 ## When to Use
 
 **Use RedisBackend when**:
