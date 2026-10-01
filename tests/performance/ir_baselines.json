@@ -1,0 +1,35 @@
+{
+  "interpreters": {
+    "cpython-3.12-x86_64": {
+      "budgets": {
+        "l1_hit": 78344,
+        "l2_hit": 369551,
+        "minimal_l1_hit": 76601,
+        "miss": 354670,
+        "secure_l1_hit": 296708,
+        "serializer_arrow": 1961754,
+        "serializer_auto": 110228,
+        "serializer_default": 61354,
+        "serializer_encrypted": 115946,
+        "serializer_orjson": 23758
+      },
+      "python": "3.12.12"
+    },
+    "cpython-3.14-x86_64": {
+      "budgets": {
+        "l1_hit": 81539,
+        "l2_hit": 377674,
+        "minimal_l1_hit": 80032,
+        "miss": 361640,
+        "secure_l1_hit": 299628,
+        "serializer_arrow": 1958074,
+        "serializer_auto": 113486,
+        "serializer_default": 62618,
+        "serializer_encrypted": 118078,
+        "serializer_orjson": 23728
+      },
+      "python": "3.14.3"
+    }
+  },
+  "method": "main-thread callgrind Ir per op, (Ir[3000] - Ir[1000]) / 2000, fixed env (PYTHONHASHSEED=0, one BLAS/OMP thread), pinned clocks; written by tests/performance/ir_budget.py --update"
+}
