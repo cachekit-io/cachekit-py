@@ -18,8 +18,10 @@ from typing import Optional
 
 import redis
 import redis.asyncio as redis_async
+from pydantic import SecretStr
 
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.config.validation import hide_secret, reveal_secret
 
 _logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -
 
 
 def create_connection_pool(
-    redis_url: str,
+    redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
     max_connections: Optional[int] = None,
 ) -> redis.ConnectionPool:
@@ -82,9 +84,10 @@ def create_connection_pool(
         redis.ConnectionPool bound to redis_url (no connection is made here;
         the pool connects lazily on first use)
     """
+    redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only into from_url (CWE-532)
     cfg = config or RedisBackendConfig.from_env()
     return redis.ConnectionPool.from_url(
-        redis_url,
+        reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
@@ -93,7 +96,7 @@ def create_connection_pool(
 
 
 def create_async_connection_pool(
-    redis_url: str,
+    redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
     max_connections: Optional[int] = None,
 ) -> redis_async.ConnectionPool:
@@ -101,9 +104,10 @@ def create_async_connection_pool(
 
     Async twin of create_connection_pool() — same kwargs, same rationale.
     """
+    redis_url = hide_secret(redis_url)
     cfg = config or RedisBackendConfig.from_env()
     return redis_async.ConnectionPool.from_url(
-        redis_url,
+        reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,

@@ -94,7 +94,7 @@ class RedisBackend:
             # An explicitly passed URL must be honoured: build a per-instance
             # pool bound to it. Falling through to the env-configured global
             # pool could silently read/write a *different* Redis (#222).
-            self._client_provider = PooledClientProvider(reveal_secret(explicit_url), redis_config)
+            self._client_provider = PooledClientProvider(explicit_url, redis_config)
         else:
             # Zero-config: honour a DI-registered provider when present,
             # otherwise build a per-instance pool from env config so
