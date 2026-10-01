@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import fields, replace
 
 import pytest
+from pydantic import SecretStr
 
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
@@ -370,7 +371,9 @@ class TestIoPreset:
         def fn() -> int:
             return 1
 
-        assert seen["api_key"] == "ck_arg"  # pragma: allowlist secret
+        # Handed down wrapped, so no frame between the decorator and the backend holds it raw
+        assert isinstance(seen["api_key"], SecretStr)
+        assert seen["api_key"].get_secret_value() == "ck_arg"  # pragma: allowlist secret
 
     def test_decorator_config_kwarg_rejected(self) -> None:
         """config= would swap the whole preset (and its backend) in silently — reject it like backend=."""
