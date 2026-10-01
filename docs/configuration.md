@@ -225,7 +225,8 @@ CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0    # Default: 2.0 seconds (range: 0.1-30.
 CACHEKIT_MEMCACHED_TIMEOUT=1.0             # Default: 1.0 seconds (range: 0.1-30.0)
 
 # Connection pool
-CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 per server (range: 1-100)
+CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 connections per server (range: 1-100);
+                                           # an op beyond the limit raises, it does not wait
 CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2 (range: 0-10)
 
 # Optional key prefix for namespace isolation

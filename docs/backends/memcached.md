@@ -31,7 +31,7 @@ export CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0    # Default: 2.0 seconds
 export CACHEKIT_MEMCACHED_TIMEOUT=1.0             # Default: 1.0 seconds
 
 # Connection pool
-export CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 per server
+export CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 connections per server (see Concurrency)
 export CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2
 
 # Optional key prefix
@@ -92,6 +92,28 @@ backend = MemcachedBackend(config)
 - Cross-process: Yes (shared across pods)
 - Persistence: No (volatile memory only)
 - Consistent hashing: Yes (via pymemcache HashClient)
+- Thread-safe: Yes (per-server connection pool; see [Concurrency](#concurrency))
+
+## Concurrency
+
+Each server gets a pool of up to `max_pool_size` connections (default 10). Every operation
+checks out its own connection, so threads sharing one backend never share a socket.
+
+- **The pool does not wait.** An operation that would need connection `max_pool_size + 1`
+  to one server, in one process, raises a TRANSIENT `BackendError` at once. pymemcache does
+  not mark the server failed, and later operations succeed once connections are returned.
+  Under `@cache` it is handled like any backend error: a failed read is a miss and the
+  function runs, and a failed write skips L2 only. Backend errors do not currently count
+  toward the [circuit breaker](../features/circuit-breaker.md#integration-with-caching), so
+  pool exhaustion does not open it. Set `max_pool_size` at or above the number of threads
+  that can hit one server at the same time.
+- **Server recovery is not race-free.** pymemcache does not lock its server-failover state.
+  While a failed server is being retried, concurrent operations on it can raise a spurious
+  `BackendError` wrapping a `KeyError`, whether or not the command itself ran. Under `@cache`
+  it degrades like any other backend error.
+- **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
+  sockets would be shared across processes. Create the backend (or make the first cached
+  call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
 
 ## Limitations
 

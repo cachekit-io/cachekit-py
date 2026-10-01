@@ -73,7 +73,10 @@ class MemcachedBackendConfig(BaseBackendConfig):
         default=10,
         ge=1,
         le=100,
-        description="Maximum connections per server",
+        description=(
+            "Maximum pooled connections per server, i.e. concurrent operations per server per "
+            "process. The pool does not wait: an operation beyond this limit raises a TRANSIENT BackendError."
+        ),
     )
     retry_attempts: int = Field(
         default=2,
