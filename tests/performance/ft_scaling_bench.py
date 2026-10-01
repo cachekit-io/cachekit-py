@@ -169,19 +169,20 @@ def _decorated(scenario: str, port: int, computed: list[int], errors: list[str])
         cachekitio_config.is_private_ip = lambda hostname: False
 
         class CountingBackend(CachekitIOBackend):
-            def get(self, key: str) -> bytes | None:
+            pass
+
+        def counting(method):
+            def wrapper(self, *args, **kwargs):
                 try:
-                    return super().get(key)
+                    return method(self, *args, **kwargs)
                 except Exception as exc:
                     errors.append(type(exc).__name__)
                     raise
 
-            def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
-                try:
-                    super().set(key, value, ttl, stale_ttl)
-                except Exception as exc:
-                    errors.append(type(exc).__name__)
-                    raise
+            return wrapper
+
+        for name in ("get", "get_with_freshness", "set"):  # what the sync decorated path calls
+            setattr(CountingBackend, name, counting(getattr(CachekitIOBackend, name)))
 
         backend = CountingBackend(api_url=f"https://127.0.0.1:{port}", api_key="ck_test_bench")
         fn = cache(backend=backend, ttl=3600, namespace="ftb_io", l1=L1CacheConfig(enabled=False))(payload)
