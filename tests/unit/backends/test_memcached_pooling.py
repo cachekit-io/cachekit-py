@@ -216,3 +216,45 @@ def test_op_beyond_max_pool_size_raises_without_marking_server_failed(server: Fa
     backend.set("after", b"ok")
     assert backend.get("after") == b"ok"
     _assert_server_healthy(backend)
+
+
+def test_batched_sweep_fails_only_the_exhausted_servers_keys() -> None:
+    """A full pool on one server fails that server's sends; other servers' keys still go.
+
+    Raising instead would abort the whole sweep and send the caller into per-key deletes
+    against the same full pool.
+    """
+    full, free = FakeMemcached(), FakeMemcached()
+    try:
+        backend = MemcachedBackend(
+            MemcachedBackendConfig(servers=[f"127.0.0.1:{full.port}", f"127.0.0.1:{free.port}"], max_pool_size=1, timeout=10.0)
+        )
+        full_server = ("127.0.0.1", full.port)
+
+        def routes_to_full(key: str) -> bool:
+            return backend._client._get_client(key).server == full_server
+
+        keys = [f"tracked:{i}" for i in range(200)]
+        for key in keys:
+            backend.set(key, b"v")
+        on_full = {k for k in keys if routes_to_full(k)}
+        assert on_full and on_full != set(keys), "keys must span both servers"
+
+        hold_key = next(k for k in (f"hold-{i}" for i in range(1000)) if routes_to_full(k))
+        holder = threading.Thread(target=backend.get, args=(hold_key,))
+        holder.start()
+        try:
+            assert full.held.acquire(timeout=5), "held op never reached the server"
+            assert backend._delete_many(keys) == on_full
+            _assert_server_healthy(backend)
+        finally:
+            full.release.set()
+            holder.join(timeout=10)
+
+        with free.lock:
+            assert not any(k.startswith(b"tracked:") for k in free.store)
+        with full.lock:
+            assert {k.decode() for k in full.store if k.startswith(b"tracked:")} == on_full
+    finally:
+        full.close()
+        free.close()

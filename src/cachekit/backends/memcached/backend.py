@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
-from cachekit.backends.memcached.error_handler import classify_memcached_error
+from cachekit.backends.memcached.error_handler import classify_memcached_error, is_pool_exhausted
 from cachekit.hash_utils import redact_error_for_log
 
 _logger = logging.getLogger(__name__)
@@ -198,7 +198,8 @@ class MemcachedBackend:
         next sweep. Sends carry at most ``_PIPELINE_KEYS`` keys, so the server's replies
         never back up behind a send that has not finished.
 
-        Only pymemcache's own failures (``MemcacheError``, ``OSError``) are absorbed. Anything
+        Only pymemcache's own failures (``MemcacheError``, ``OSError``, and its pool-exhausted
+        ``RuntimeError``) are absorbed. Anything
         else, such as an ``AttributeError`` from a pymemcache release that renamed the
         HashClient internals used here, raises, so the caller falls back to per-key deletes.
 
@@ -233,6 +234,14 @@ class MemcachedBackend:
                     acked = run(client, client.delete_many, False, chunk, noreply=False)
                 except (MemcacheError, OSError) as exc:
                     _logger.debug("Memcached delete_many failed for %d key(s): %s", len(chunk), redact_error_for_log(exc))
+                    acked = False
+                except RuntimeError as exc:
+                    # A full connection pool is load on one server, not drift: fail this send
+                    # and carry on. Raising would abort every other server's sends and push the
+                    # caller into per-key deletes against the same full pool.
+                    if not is_pool_exhausted(exc):
+                        raise
+                    _logger.debug("Memcached delete_many skipped %d key(s): connection pool exhausted", len(chunk))
                     acked = False
                 if not acked:
                     failed.update(group[k] for k in chunk)
