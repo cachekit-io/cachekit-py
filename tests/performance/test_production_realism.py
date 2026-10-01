@@ -10,6 +10,9 @@ This test suite measures performance under realistic production workloads:
 
 CRITICAL: These tests provide CONSERVATIVE numbers for marketing claims.
 They measure worst-case realistic scenarios, not ideal conditions.
+
+Plaintext benchmarks state encryption=False: test_encryption_overhead runs only with
+CACHEKIT_MASTER_KEY set, and a present key with no stated intent raises at decoration.
 """
 
 from __future__ import annotations
@@ -139,7 +142,7 @@ def test_decorator_overhead_complex_dict() -> None:
     """
     payload = create_complex_dict("medium")  # ~10KB realistic API response
 
-    @cache(backend=None)  # L1-only to isolate decorator + serialization
+    @cache(backend=None, encryption=False)  # L1-only to isolate decorator + serialization
     def get_api_response(request_id: int) -> dict[str, Any]:
         return payload
 
@@ -184,7 +187,7 @@ def test_decorator_overhead_dataclass() -> None:
     """Measure decorator overhead with custom dataclass."""
     user = create_user_model(42)
 
-    @cache(backend=None)
+    @cache(backend=None, encryption=False)
     def get_user(user_id: int) -> User:
         return user
 
@@ -227,7 +230,7 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     ArrowSerializer is tested separately in test_serializer_benchmarks.py.
     """
 
-    @cache(backend=None, serializer="auto")
+    @cache(backend=None, serializer="auto", encryption=False)
     def get_data(query_id: int) -> pd.DataFrame:
         return medium_dataframe
 
@@ -285,7 +288,7 @@ def test_concurrent_cache_access() -> None:
     num_threads = 10
     iterations_per_thread = 1_000
 
-    @cache(backend=None)
+    @cache(backend=None, encryption=False)
     def get_data(item_id: int) -> dict[str, Any]:
         return payload
 
@@ -376,7 +379,7 @@ def test_encryption_overhead() -> None:
     from cachekit.config.nested import EncryptionConfig, L1CacheConfig
 
     # Config without encryption
-    config_plain = DecoratorConfig(backend=None)
+    config_plain = DecoratorConfig(backend=None, encryption=False)
 
     # Config with encryption (single-tenant mode)
     config_encrypted = DecoratorConfig(
@@ -490,7 +493,7 @@ def test_redis_l2_roundtrip() -> None:
     payload = create_complex_dict("medium")
 
     # Use L2-only mode to force Redis on every call
-    config = DecoratorConfig(backend=backend, l1=L1CacheConfig(enabled=False))
+    config = DecoratorConfig(backend=backend, l1=L1CacheConfig(enabled=False), encryption=False)
 
     @cache(config=config)
     def get_data(item_id: int) -> dict[str, Any]:
@@ -550,7 +553,7 @@ async def test_async_decorator_overhead() -> None:
     """
     payload = create_complex_dict("medium")
 
-    @cache(backend=None)
+    @cache(backend=None, encryption=False)
     async def get_data_async(item_id: int) -> dict[str, Any]:
         await asyncio.sleep(0)  # Yield control
         return payload

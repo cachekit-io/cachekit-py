@@ -199,8 +199,10 @@ class DecoratorConfig:
             # the alias map and the encryption config) — it runs at decoration
             # time on every path, so the error still fires before first use.
 
-        # `encryption=True/False` is the explicit spelling on every preset (protocol intent-presets.md
-        # § Encryption Activation), but the field is an EncryptionConfig and dataclasses do not coerce:
+        # `encryption=False` is the explicit opt-out on every preset (protocol intent-presets.md
+        # § Encryption Activation), and `encryption=True` the opt-in, though on a preset it still needs a
+        # tenant mode: EncryptionConfig(enabled=True, single_tenant_mode=True). The field is an
+        # EncryptionConfig and dataclasses do not coerce:
         # without this, `@cache.production(encryption=False)` dies in `.validate()` with AttributeError.
         # Bare `@cache` flattens the bool earlier (decorators/intent.py); presets reach here with it raw.
         if isinstance(self.encryption, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime kwarg, untyped
@@ -558,8 +560,8 @@ class DecoratorConfig:
 
         Encryption: opt in explicitly with encryption=EncryptionConfig(enabled=True,
         single_tenant_mode=True, master_key=...); omit master_key to use CACHEKIT_MASTER_KEY.
-        The env var alone activating encryption is deprecated (warns once this release,
-        raises in the next minor) — protocol intent-presets.md § Encryption Activation.
+        The env var never activates encryption: with it set and no encryption= stated,
+        construction raises ConfigurationError — protocol intent-presets.md § Encryption Activation.
 
         Args:
             api_key: cachekit.io API key (``ck_live_...``). Default: ``CACHEKIT_API_KEY``.
@@ -599,7 +601,7 @@ class DecoratorConfig:
         backend = CachekitIOBackend(api_key=api_key)
 
         # Use production-grade settings with SaaS backend
-        # Encryption is opt-in via encryption=EncryptionConfig(...); env-key auto-activation is deprecated
+        # Encryption is opt-in via encryption=EncryptionConfig(...); a key with no stated intent raises
         defaults: dict[str, Any] = {
             "ttl": 3600,
             "integrity_checking": True,

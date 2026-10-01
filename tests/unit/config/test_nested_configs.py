@@ -234,8 +234,8 @@ class TestEncryptionConfig:
     def test_defaults(self) -> None:
         """Test default values.
 
-        enabled defaults to None (tri-state, issue #128): unset means "defer to
-        CACHEKIT_MASTER_KEY auto-detection", distinct from an explicit False opt-out.
+        enabled defaults to None (tri-state, issue #128): unset means no intent stated
+        (plaintext without a master key, an error with one), distinct from an explicit False opt-out.
         """
         config = EncryptionConfig()
         assert config.enabled is None

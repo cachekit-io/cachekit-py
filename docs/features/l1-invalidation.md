@@ -283,7 +283,7 @@ def minimal_function():
     pass
 
 # Secure: All features + encryption
-@cache.secure()
+@cache.secure(master_key=secret_key)
 def secure_function():
     pass
 

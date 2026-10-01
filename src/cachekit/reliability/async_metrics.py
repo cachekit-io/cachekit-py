@@ -198,6 +198,10 @@ class AsyncMetricsCollector:
         self._stopped = None
         self._worker_thread = None
         self._dropped_metrics = 0
+        # Keyed by pid, like _metrics_locks: a child forked while a thread was mid-switch must not wait
+        # on the copy of the lock that thread still holds, because the thread does not exist in the child.
+        self._mode_locks: dict[int, threading.Lock] = {}
+        self._shutdown_requested = False
 
         # Memory pool for reducing allocations
         self._metric_pool = []
@@ -403,6 +407,15 @@ class AsyncMetricsCollector:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
     @staticmethod
+    def _series(metric: Any, labels: dict[str, Any]) -> Any:
+        """Return the series of ``metric`` that ``labels`` names.
+
+        prometheus_client rejects ``.labels()`` on a metric built with no label names, so a label-less
+        record updates the metric itself.
+        """
+        return metric.labels(**labels) if labels else metric
+
+    @staticmethod
     def _check_generic_metric(name: Any, labels: dict[Any, Any], value: Any) -> float:
         """Validate a caller-supplied counter or histogram and return its value as a float.
 
@@ -487,7 +500,7 @@ class AsyncMetricsCollector:
                 for labels_key, value in label_values.items():
                     labels_dict = dict(labels_key)  # type: ignore[arg-type]
                     try:
-                        counter_metric.labels(**labels_dict).inc(value)  # type: ignore[arg-type]
+                        self._series(counter_metric, labels_dict).inc(value)  # type: ignore[arg-type]
                     except ValueError as e:
                         failures, last_error = failures + 1, e
                 if last_error is not None:
@@ -509,7 +522,7 @@ class AsyncMetricsCollector:
                 for value, labels_key in observations:
                     labels_dict = dict(labels_key)
                     try:
-                        histogram_metric.labels(**labels_dict).observe(value)
+                        self._series(histogram_metric, labels_dict).observe(value)
                     except ValueError as e:
                         failures, last_error = failures + 1, e
                 if last_error is not None:
@@ -566,20 +579,42 @@ class AsyncMetricsCollector:
 
     def shutdown(self, timeout: float = 5.0):
         """Gracefully shutdown the metrics collector."""
-        if not self._sync_mode and self._stopped is not None:
-            self._stopped.set()
-            if self._worker_thread is not None:
-                self._worker_thread.join(timeout)
+        # Under the mode lock, so a switch back to batched mode cannot restart the worker after this stops it.
+        with self._mode_lock():
+            self._shutdown_requested = True
+            if self._stopped is not None:
+                self._stopped.set()
+            worker = self._worker_thread
+        # Join outside the lock: a producer's mode check must not wait on the worker's drain.
+        if worker is not None:
+            worker.join(timeout)
 
-    def _init_async_mode(self):
-        """Initialize async mode components."""
-        if self._queue is None:
+    def _init_async_mode(self) -> bool:
+        """Start the batching worker, creating the queue on first use.
+
+        Returns False, starting nothing, while the previous worker is still alive: a stopped worker keeps
+        reading the queue until its exit drain finishes, and that drain assumes it is the only consumer.
+        The queue is reused, never replaced, so producers always have one to put on.
+        """
+        if self._queue is None or self._stopped is None:
             self._queue = queue.Queue(maxsize=self.max_queue_size)
             self._stopped = threading.Event()
+        elif self._worker_thread is not None and self._worker_thread.is_alive():
+            return False
 
-            # Start worker thread
-            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="AsyncMetricsWorker")
-            self._worker_thread.start()
+        self._stopped.clear()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name="AsyncMetricsWorker")
+        self._worker_thread.start()
+        return True
+
+    def _mode_lock(self) -> threading.Lock:
+        """Return this process's mode-switch lock, creating it on first use."""
+        pid = os.getpid()
+        lock = self._mode_locks.get(pid)
+        if lock is None:
+            # setdefault is atomic, so threads racing here in a new child all get one lock.
+            lock = self._mode_locks.setdefault(pid, threading.Lock())
+        return lock
 
     def _should_check_mode(self) -> bool:
         """Check if we should evaluate mode switching."""
@@ -600,19 +635,25 @@ class AsyncMetricsCollector:
 
         ops_per_second = self._operation_count / elapsed
 
-        # Switch to async mode if high frequency (>100 ops/sec)
-        if self._sync_mode and ops_per_second > 100:
-            logger.info(f"Switching to async mode due to high frequency: {ops_per_second:.1f} ops/sec")
-            self._sync_mode = False
-            self._init_async_mode()
+        # Two producers can pass the mode check at once; the lock keeps them from starting two workers.
+        with self._mode_lock():
+            # Switch to async mode if high frequency (>100 ops/sec)
+            if self._sync_mode and ops_per_second > 100 and not self._shutdown_requested:
+                # Never join the old worker here: this runs on the caller's thread. Stay synchronous and
+                # retry at the next mode check instead.
+                if not self._init_async_mode():
+                    logger.debug("Previous metrics worker still draining; staying in sync mode")
+                    return
+                logger.info(f"Switching to async mode due to high frequency: {ops_per_second:.1f} ops/sec")
+                self._sync_mode = False
 
-        # Switch to sync mode if low frequency (<10 ops/sec) and currently async
-        elif not self._sync_mode and ops_per_second < 10:
-            logger.info(f"Switching to sync mode due to low frequency: {ops_per_second:.1f} ops/sec")
-            self._sync_mode = True
-            # Shutdown async components
-            if self._stopped is not None:
-                self._stopped.set()
+            # Switch to sync mode if low frequency (<10 ops/sec) and currently async
+            elif not self._sync_mode and ops_per_second < 10:
+                logger.info(f"Switching to sync mode due to low frequency: {ops_per_second:.1f} ops/sec")
+                self._sync_mode = True
+                # Shutdown async components
+                if self._stopped is not None:
+                    self._stopped.set()
 
     def _get_pooled_metric_data(self) -> dict[str, Any]:
         """Get a metric data dict from the pool to reduce allocations."""
@@ -676,7 +717,7 @@ class AsyncMetricsCollector:
 
         value = self._check_generic_metric(metric_name, labels, value)
         counter = self._get_metric(metric_name, Counter, f"Counter metric {metric_name}", list(labels.keys()))
-        counter.labels(**labels).inc(value)
+        self._series(counter, labels).inc(value)
 
     def _record_histogram_sync(self, metric_name: str, value: float, labels: dict[str, Any]):
         """Record histogram directly to Prometheus (sync mode)."""
@@ -685,7 +726,7 @@ class AsyncMetricsCollector:
 
         value = self._check_generic_metric(metric_name, labels, value)
         histogram = self._get_metric(metric_name, Histogram, f"Histogram metric {metric_name}", list(labels.keys()))
-        histogram.labels(**labels).observe(value)
+        self._series(histogram, labels).observe(value)
 
     # Async mode implementations (queued processing)
     def _record_cache_operation_async(

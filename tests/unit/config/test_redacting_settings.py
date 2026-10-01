@@ -1,8 +1,8 @@
 """RedactingSettings: config validation errors never lead back to a raw input (CWE-532).
 
 CachekitConfig and every backend config inherit RedactingSettings, so these run against the concrete
-classes users construct, through every entry point: the constructor, from_env() and the
-model_validate* classmethods.
+classes users construct, through each entry point: the constructor, from_env(), the
+model_validate* classmethods, a pydantic.TypeAdapter and a field of the caller's own model.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import Field, ValidationError, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, ValidationInfo, create_model, field_validator
 from pydantic_core import PydanticCustomError
 
 import cachekit
@@ -27,6 +27,8 @@ from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.config import singleton
 from cachekit.config.settings import CachekitConfig
+
+_KEY_HEX = "ab" * 32
 
 BACKEND_CONFIGS: list[type[BaseBackendConfig]] = [
     RedisBackendConfig,
@@ -120,12 +122,16 @@ class _UnrebuildableCtxConfig(BaseBackendConfig):
         raise PydanticCustomError("bad_url", "bad URL", {1: "one"})  # type: ignore[dict-item]
 
 
+class _SelfReferentialConfig(RedisBackendConfig):
+    child: _SelfReferentialConfig | None = None
+
+
 @pytest.mark.unit
 class TestRedactingSettings:
-    """Every surface of a config validation error, for every config class and entry point."""
+    """Each surface of a config validation error, for each config class and entry point."""
 
     @pytest.mark.parametrize("config_cls", BACKEND_CONFIGS)
-    def test_validation_errors_redact_every_input(self, config_cls: type[BaseBackendConfig]) -> None:
+    def test_validation_errors_redact_the_input(self, config_cls: type[BaseBackendConfig]) -> None:
         """CWE-532: backend configs hold credentials, so no surface of a ValidationError may carry a raw input.
 
         Pinned here, not per backend: the inherited RedactingSettings.__init__ does the redacting, and a
@@ -191,7 +197,7 @@ class TestRedactingSettings:
         ],
         ids=["dict", "non-mapping", "object", "json-object", "json-malformed", "json-array", "strings"],
     )
-    def test_model_validate_methods_redact_every_input(
+    def test_model_validate_methods_redact_the_input(
         self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
     ) -> None:
         """The inherited validate classmethods build a model too. pydantic calls __init__ only for
@@ -201,6 +207,105 @@ class TestRedactingSettings:
             getattr(config_cls, method)(data)
 
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
+    @pytest.mark.parametrize(
+        ("method", "data"),
+        [
+            ("validate_python", "SECRET_VALUE"),
+            ("validate_python", ["SECRET_VALUE"]),
+            ("validate_json", '"SECRET_VALUE"'),
+            ("validate_json", '["SECRET_VALUE"]'),
+            ("validate_strings", {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}),
+        ],
+        ids=["non-mapping", "list", "json-string", "json-array", "strings"],
+    )
+    def test_type_adapter_redacts_the_input(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: object
+    ) -> None:
+        """A TypeAdapter validates through the core schema and never calls the model_validate* classmethods."""
+        with pytest.raises(ValidationError) as exc_info:
+            getattr(TypeAdapter(config_cls), method)(data)
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    @pytest.mark.parametrize("config_cls", [*BACKEND_CONFIGS, CachekitConfig])
+    @pytest.mark.parametrize(
+        ("method", "data"),
+        [
+            ("__call__", {"cfg": "SECRET_VALUE"}),
+            ("model_validate", {"cfg": ["SECRET_VALUE"]}),
+            ("model_validate_json", '{"cfg": "SECRET_VALUE"}'),
+            ("model_validate_strings", {"cfg": {"totally_fake_field_that_doesnt_exist": "SECRET_VALUE"}}),
+        ],
+        ids=["constructor", "model_validate", "json", "strings"],
+    )
+    def test_config_as_a_field_redacts_the_input(
+        self, config_cls: type[BaseBackendConfig | CachekitConfig], method: str, data: dict[str, object] | str
+    ) -> None:
+        """The caller's own model validates the config field through the config's core schema."""
+        outer: type[BaseModel] = create_model("Outer", cfg=(config_cls, ...))
+        with pytest.raises(ValidationError) as exc_info:
+            if method == "__call__":
+                outer(**data)  # type: ignore[arg-type]
+            else:
+                getattr(outer, method)(data)
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+        assert all(err["loc"][0] == "cfg" for err in exc_info.value.errors())
+
+    def test_a_model_with_config_fields_keeps_one_schema_definition(self) -> None:
+        """The redacting wrapper carries the config's ref, so the config stays one $defs entry."""
+        outer: type[BaseModel] = create_model("Outer", a=(RedisBackendConfig, ...), b=(RedisBackendConfig, ...))
+
+        schema = outer.model_json_schema()
+
+        assert list(schema["$defs"]) == ["RedisBackendConfig"]
+        assert schema["properties"]["a"] == {"$ref": "#/$defs/RedisBackendConfig"}
+        assert str(outer.__pydantic_core_schema__).count("'function-wrap'") == 1
+
+    def test_the_schema_hook_leaves_the_handlers_schema_intact(self) -> None:
+        """The ref moves to the wrapper off a copy: the handler's schema may be one pydantic holds elsewhere."""
+        handed: dict[str, object] = {"type": "any", "ref": "stub-ref"}
+
+        wrapped = RedisBackendConfig.__get_pydantic_core_schema__(RedisBackendConfig, lambda _: handed)  # type: ignore[arg-type]
+
+        assert handed == {"type": "any", "ref": "stub-ref"}
+        assert (wrapped["type"], wrapped.get("ref"), wrapped["schema"].get("ref")) == ("function-wrap", "stub-ref", None)  # type: ignore[typeddict-item]
+
+    def test_a_self_referential_config_builds_its_schema(self) -> None:
+        assert list(_SelfReferentialConfig.model_json_schema()["$defs"]) == ["_SelfReferentialConfig"]
+        with pytest.raises(ValidationError) as exc_info:
+            _SelfReferentialConfig(child={"child": "SECRET_VALUE"})  # type: ignore[arg-type]
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+
+    def test_a_union_member_loc_names_the_config_class(self) -> None:
+        """A union member's loc names its validator; a per-process repr would split error grouping."""
+        outer: type[BaseModel] = create_model("Outer", cfg=(RedisBackendConfig | CachekitConfig, ...))
+        with pytest.raises(ValidationError) as exc_info:
+            outer(cfg="SECRET_VALUE")
+
+        _assert_no_route_to(exc_info.value, "SECRET_VALUE")
+        assert [err["loc"][:2] for err in exc_info.value.errors()] == [
+            ("cfg", "function-wrap[RedisBackendConfig()]"),
+            ("cfg", "function-wrap[CachekitConfig()]"),
+        ]
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda data: TypeAdapter(CachekitConfig).validate_strings(data),
+            lambda data: create_model("Outer", cfg=(CachekitConfig, ...)).model_validate_strings({"cfg": data}),
+        ],
+        ids=["type-adapter", "field"],
+    )
+    def test_strings_mode_repromotion_redacts_the_keys(self, build: Callable[[dict[str, str]], object]) -> None:
+        """A model-level error snapshots the whole input dict, and the strings mode never calls __init__."""
+        with pytest.raises(ValidationError) as exc_info:
+            build({"master_key": _KEY_HEX, "previous_master_keys": _KEY_HEX})
+
+        _assert_no_route_to(exc_info.value, _KEY_HEX)
+        assert [err["type"] for err in exc_info.value.errors()] == ["value_error"]
 
     def test_undecodable_env_value_leaves_no_route_to_the_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A list field's env value must be JSON; the decoder's error, chained to pydantic-settings'
@@ -440,21 +545,23 @@ class TestRedactingSettings:
         _assert_no_route_to(exc_info.value, "SECRET_VALUE")
 
 
-_KEY_HEX = "ab" * 32
 _CACHEKIT_SRC = pathlib.Path(cachekit.__file__).resolve().parent
 
 
-def _cachekit_locals_holding(exc: BaseException, secret: str) -> list[str]:
-    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``.
+def _cachekit_locals_holding(exc: BaseException, secret: str, *, below_caller: bool = False) -> list[str]:
+    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``, or with
+    ``below_caller`` every frame but this test file's, pydantic's included.
 
     Error trackers capture frame locals by default (Sentry's ``include_local_variables``), and their
     scrubbers match top-level key names, so a raw key held in any local is a key sent off-host.
     """
+    this_file = pathlib.Path(__file__).resolve()
     found = []
     tb = exc.__traceback__
     while tb is not None:
         code = tb.tb_frame.f_code
-        if pathlib.Path(code.co_filename).resolve().is_relative_to(_CACHEKIT_SRC):
+        path = pathlib.Path(code.co_filename).resolve()
+        if path != this_file if below_caller else path.is_relative_to(_CACHEKIT_SRC):
             for name, value in tb.tb_frame.f_locals.items():
                 if secret in repr(value):
                     found.append(f"{code.co_name}:{name}")
@@ -475,8 +582,21 @@ class TestRedactingSettingsFrameLocals:
             lambda: CachekitConfig.model_validate_json(json.dumps({"master_key": _KEY_HEX, "max_value_size": -1})),
             lambda: CachekitConfig.model_validate_strings({"master_key": _KEY_HEX, "max_value_size": "-1"}),
             lambda: CachekitIOBackendConfig(api_key=_KEY_HEX, timeout=-1),  # type: ignore[arg-type]
+            lambda: TypeAdapter(CachekitConfig).validate_python(_KEY_HEX),
+            lambda: TypeAdapter(CachekitConfig).validate_strings({"master_key": _KEY_HEX, "previous_master_keys": _KEY_HEX}),
+            lambda: create_model("Outer", cfg=(CachekitConfig, ...))(cfg=_KEY_HEX),
         ],
-        ids=["kwarg", "kwarg-repromotion", "model_validate", "model_validate_json", "model_validate_strings", "io-api-key"],
+        ids=[
+            "kwarg",
+            "kwarg-repromotion",
+            "model_validate",
+            "model_validate_json",
+            "model_validate_strings",
+            "io-api-key",
+            "type-adapter",
+            "type-adapter-strings",
+            "field",
+        ],
     )
     def test_programmatic_input_leaves_no_frame_local(self, build: Callable[[], object]) -> None:
         with pytest.raises(ValidationError) as exc_info:
@@ -498,3 +618,21 @@ class TestRedactingSettingsFrameLocals:
             build()
 
         assert _cachekit_locals_holding(exc_info.value, _KEY_HEX) == []
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: CachekitConfig.model_validate({"master_key": "ab" * 32, "max_value_size": -1}),
+            lambda: CachekitConfig.model_validate_json(json.dumps({"master_key": "ab" * 32, "max_value_size": -1})),
+            lambda: CachekitConfig.model_validate_strings({"master_key": "ab" * 32, "max_value_size": "-1"}),
+        ],
+        ids=["model_validate", "model_validate_json", "model_validate_strings"],
+    )
+    def test_classmethods_leave_no_frame_local_outside_the_caller(self, build: Callable[[], object]) -> None:
+        """The core schema redacts too, but pydantic's own classmethod frame holds the raw input: the
+        classmethod overrides keep that frame off the traceback. The input is an inline temporary, so only
+        a frame below the caller's could hold it."""
+        with pytest.raises(ValidationError) as exc_info:
+            build()
+
+        assert _cachekit_locals_holding(exc_info.value, _KEY_HEX, below_caller=True) == []

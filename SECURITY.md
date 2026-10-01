@@ -162,7 +162,7 @@ When enabled via `@cache.secure`, client-side AES-256-GCM encryption ensures the
 |:------------|:---------------|
 | Key size | Minimum 32 bytes (256 bits) |
 | Configuration | `CACHEKIT_MASTER_KEY` env var |
-| Activation | `@cache.secure`, or an explicit encryption option (`encryption=True` + tenant mode). Deprecated in 0.20.0: the env var's presence can also auto-enable encryption on a cache that states no `encryption=` (warns once per process), but not on every such cache, so never rely on it ([rules](docs/features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)); the next minor release raises at construction instead, leaving the env var a key source only, never a switch |
+| Activation | `@cache.secure`, or an explicit encryption option (`encryption=True` + tenant mode). The env var is a key source only, never a switch: a master key present on a cache that states no encryption intent raises `ConfigurationError` at decoration, on every preset except `@cache.secure` and `@cache.local` ([rules](docs/features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)) |
 | Logging | Never exposed in logs/errors |
 | Derivation | HKDF with unique tenant salts |
 | Single-tenant `tenant_id` | Literal `"default"` (protocol cross-SDK default) unless `deployment_uuid` / `CACHEKIT_DEPLOYMENT_UUID` is set; the same value binds HKDF and AAD |

@@ -767,13 +767,19 @@ class AutoSerializer:
         # magic test handed a checksum-intact ByteStorage entry whose VALUE merely began
         # b"xxNUMPY_RAW" to the numpy decoder, which read the envelope's first 8 bytes as a
         # digest, failed it, and raised on every read — a permanent miss on a healthy key.
-        if data.startswith(b"NUMPY_RAW") or self._checksummed_prefix(data, b"NUMPY_RAW"):
+        # Both structural routes hand the delegate the gate-verified body, so it is hashed once.
+        numpy_body = None
+        if data.startswith(b"NUMPY_RAW"):
+            numpy_body = memoryview(data)
+        elif self._checksummed_prefix(data, b"NUMPY_RAW"):
+            numpy_body = memoryview(data)[8:]
+        if numpy_body is not None:
             # Agreement, same rule as the envelope below — this route had none, so a "msgpack"
             # header over these bytes still returned an ndarray. Why it raises where the Arrow
             # gate skips: see Raises:, which is the one place that contract is stated.
             if header_format not in (None, "numpy"):
                 raise SerializationError(f"NumPy payload disagrees with header format {header_format!r:.40}")
-            return self._deserialize_numpy(data)
+            return self._parse_numpy_body(numpy_body)
 
         # Arrow IPC — [8-byte xxHash3-64][ARROW1...] or bare [ARROW1...]. Detected by structure
         # like the numpy case above and BEFORE the envelope path: Arrow never travels inside a
@@ -781,12 +787,17 @@ class AutoSerializer:
         # original_type is recoverable here rather than failing closed as an unparseable envelope.
         # A header naming a different format contradicts these bytes, so it is left to the
         # fail-closed gate below instead of being decoded on the strength of either one.
-        if header_format in (None, "arrow") and (data[:6] == b"ARROW1" or self._checksummed_prefix(data, b"ARROW1")):
-            if self._arrow_serializer is None:
-                raise SerializationError(
-                    "Cannot deserialize Arrow format: ArrowSerializer not available. Install with: pip install 'cachekit[data]'"
-                )
-            return self._arrow_serializer.deserialize(data, metadata)
+        if header_format in (None, "arrow"):
+            arrow_bare = data[:6] == b"ARROW1"
+            if arrow_bare or self._checksummed_prefix(data, b"ARROW1"):
+                if self._arrow_serializer is None:
+                    raise SerializationError(
+                        "Cannot deserialize Arrow format: ArrowSerializer not available. "
+                        "Install with: pip install 'cachekit[data]'"
+                    )
+                if arrow_bare:
+                    return self._arrow_serializer.deserialize(data, metadata)
+                return self._arrow_serializer._read_verified_ipc(memoryview(data)[8:])
 
         if metadata is not None:
             # Integrity off, there is no envelope to agree with, so the header claim alone would
@@ -961,11 +972,28 @@ class AutoSerializer:
         # [8-byte checksum][NUMPY_RAW...]; a raw entry (integrity-off / legacy) is [NUMPY_RAW...].
         # A mismatch fails closed (#155) — never reconstructs the corrupted array.
         if not data.startswith(b"NUMPY_RAW") and len(data) >= 17 and data[8:17] == b"NUMPY_RAW":
-            if xxhash.xxh3_64_digest(memoryview(data)[8:]) != data[:8]:
+            body = memoryview(data)[8:]
+            if xxhash.xxh3_64_digest(body) != data[:8]:
                 raise SerializationError("NumPy integrity check failed: xxHash3-64 checksum mismatch (corrupted cache entry)")
-            data = data[8:]
+            return self._parse_numpy_body(body)
+        return self._parse_numpy_body(memoryview(data))
 
-        if not data.startswith(b"NUMPY_RAW"):
+    def _parse_numpy_body(self, data: memoryview) -> np.ndarray:
+        """Parse a ``[NUMPY_RAW...]`` body whose checksum, if it had one, was ALREADY verified.
+
+        Never hashes and never strips by copying: the callers — :meth:`_deserialize_numpy` and
+        the structural route in :meth:`deserialize`, both after their own digest check — pass a
+        ``memoryview`` past the prefix, so a healthy read hashes the body once and copies it
+        only into the result array.
+
+        Raises:
+            RuntimeError: If numpy not installed
+            SerializationError: If data format is invalid or unrecognized
+        """
+        if not HAS_NUMPY:
+            raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
+        # A memoryview has no .startswith/.decode; compare slices and decode a bytes copy.
+        if data[:9] != b"NUMPY_RAW":
             raise SerializationError("Invalid NumPy data format - expected NUMPY_RAW header")
 
         try:
@@ -988,7 +1016,7 @@ class AutoSerializer:
             # error). Untrusted metadata must be exactly what its length prefix claims.
             if len(dtype_bytes) != dtype_len or len(shape_data) != shape_len or shape_len % 4:
                 raise SerializationError("Invalid NumPy data format - truncated or misaligned dtype/shape metadata")
-            dtype_str = dtype_bytes.decode("utf-8")
+            dtype_str = bytes(dtype_bytes).decode("utf-8")
 
             # Reconstruct shape from packed integers
             shape = []

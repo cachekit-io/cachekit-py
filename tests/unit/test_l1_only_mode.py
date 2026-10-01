@@ -611,6 +611,23 @@ class TestEncryptionRefusesL1Only:
             def leaks() -> str:
                 return "pii"
 
+    def test_message_names_full_resolution_order(self):
+        """LAB-6738: the hint lists every tier and all four selectors, never a subset."""
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError) as exc_info:
+
+            @cache.secure(master_key="a" * 64, backend=None)
+            def leaks() -> str:
+                return "pii"
+
+        msg = str(exc_info.value)
+        assert msg.startswith("encryption requires a backend")
+        tiers = ["set_default_backend()", "CACHEKIT_*", "REDIS_URL"]
+        assert [msg.index(t) for t in tiers] == sorted(msg.index(t) for t in tiers)
+        for selector in ("CACHEKIT_API_KEY", "CACHEKIT_REDIS_URL", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR"):
+            assert selector in msg
+
     def test_secure_with_backend_still_decorates(self):
         """The guard is about backend=None, not about secure: with a backend it stays valid."""
         from cachekit.decorators import cache
@@ -621,22 +638,26 @@ class TestEncryptionRefusesL1Only:
 
         assert callable(fine)
 
-    def test_master_key_env_alone_keeps_zero_config_l1_only(self, monkeypatch):
-        """Deliberately NOT guarded: key presence is not an explicit request to encrypt.
+    def test_master_key_env_without_intent_raises_l1_only(self, monkeypatch):
+        """An env key with no stated intent is refused for L1-only too: no backend carve-out.
 
-        Today cache_handler.py still auto-activates encryption in backed mode when the
-        env key is set (issue #128); L1-only never reaches the handler, so this path
-        holds plaintext. The spec says presence must never activate, so it must not
-        activate a refusal either — LAB-4642 removes the auto-activation at its root.
-        Zero-config @cache(backend=None) must keep working with the key set."""
+        This is not the refusal above. That one rejects explicit encryption at decoration; this
+        is the handler's no-intent error (a key is a key source, not an activation switch), which
+        the L1-only path reaches because it builds the handler as well. encryption=False is the
+        L1-only spelling that constructs with the key set."""
         from cachekit.config.singleton import reset_settings
         from cachekit.decorators import cache
 
         monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
         reset_settings()
         try:
+            with pytest.raises(ConfigurationError, match=r"A master key is present \(CACHEKIT_MASTER_KEY\)"):
 
-            @cache(backend=None)
+                @cache(backend=None)
+                def ambiguous() -> int:
+                    return 1
+
+            @cache(backend=None, encryption=False)
             def plain() -> int:
                 return 1
 
