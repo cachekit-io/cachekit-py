@@ -770,6 +770,13 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         KeyringConfigurationError,
         _KEY_HEX,
     ),
+    "wrapper-invalid-later-previous": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX), previous_master_keys=[b"\x01" * 32, None]),  # type: ignore[list-item]
+        TypeError,
+        b"\x01" * 32,
+    ),
+    "wrapper-str-key": ({}, lambda: EncryptionWrapper(master_key=_KEY_HEX), TypeError, _KEY_HEX),  # type: ignore[arg-type]
     "redis-backend-env-pool": (
         {"CACHEKIT_CONNECTION_POOL_SIZE": "notint"},
         lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@localhost:6379/0"),

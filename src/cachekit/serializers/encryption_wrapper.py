@@ -27,14 +27,21 @@ from cachekit.config import get_settings
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
 
 
-def _hide_key(key: bytes | SecretBytes) -> SecretBytes:
-    """Wrap raw key bytes so no frame on an error's traceback holds them in a local (CWE-532); see
-    cachekit.config.validation.hide_secret. Unwrapped only inline, where the Rust bindings take them."""
+def _hide_key(key: object) -> SecretBytes:
+    """Wrap a key so no frame on an error's traceback holds it raw in a local (CWE-532); see
+    cachekit.config.validation.hide_secret. Unwrapped only inline, where the Rust bindings take them.
+
+    Never raises, whatever the type: every key must be wrapped before any is checked, or a bad one would
+    raise while its raw neighbours are still bound. _require_bytes checks the wrapped value afterwards.
+    """
     if isinstance(key, SecretBytes):
         return key
-    if not isinstance(key, (bytes, bytearray, memoryview)):
-        raise TypeError(f"master keys must be bytes, got {type(key).__name__}")
-    return SecretBytes(bytes(key))
+    return SecretBytes(bytes(key) if isinstance(key, (bytearray, memoryview)) else key)  # type: ignore[arg-type]
+
+
+def _require_bytes(key: SecretBytes) -> None:
+    if not isinstance(key.get_secret_value(), bytes):
+        raise TypeError(f"master keys must be bytes, got {type(key.get_secret_value()).__name__}")
 
 
 logger = logging.getLogger(__name__)
@@ -205,6 +212,9 @@ class EncryptionWrapper:
         master_key = None if master_key is None else _hide_key(master_key)
         if previous_master_keys is not None:
             previous_master_keys = [_hide_key(key) for key in previous_master_keys]
+        for key in [master_key, *(previous_master_keys or ())]:
+            if key is not None:
+                _require_bytes(key)
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
 
