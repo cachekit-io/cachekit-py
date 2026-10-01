@@ -126,29 +126,35 @@ class PooledClientProvider(CacheClientProvider):
     """
 
     def __init__(self, redis_url: str, config: Optional[RedisBackendConfig] = None) -> None:
+        import redis
+
         from cachekit.backends.redis.client import create_connection_pool
         from cachekit.backends.redis.config import RedisBackendConfig
 
         self._redis_url = redis_url
         self._config = config or RedisBackendConfig.from_env()
         self._pool = create_connection_pool(redis_url, self._config)
-        self._async_pool: Optional[redis_async.ConnectionPool] = None
+        # One client per provider, not per operation: redis-py's constructor costs
+        # ~40 us (callback table, event dispatcher) and a pooled, non
+        # single-connection client is thread-safe, checking out a connection per
+        # command. A client over a caller-supplied pool never closes that pool.
+        self._client = redis.Redis(connection_pool=self._pool)
+        self._async_client: Optional[redis_async.Redis] = None
 
     def get_sync_client(self) -> redis.Redis:
-        import redis
-
-        return redis.Redis(connection_pool=self._pool)
+        return self._client
 
     async def get_async_client(self) -> redis_async.Redis:
         import redis.asyncio as redis_async
 
         from cachekit.backends.redis.client import create_async_connection_pool
 
-        if self._async_pool is None:
+        if self._async_client is None:
             # Created lazily inside a running loop. No await between the check
             # and the assignment, so single-loop use is race-free.
-            self._async_pool = create_async_connection_pool(self._redis_url, self._config)
-        return redis_async.Redis(connection_pool=self._async_pool)
+            pool = create_async_connection_pool(self._redis_url, self._config)
+            self._async_client = redis_async.Redis(connection_pool=pool)
+        return self._async_client
 
 
 class DefaultBackendProvider(BackendProviderInterface):
