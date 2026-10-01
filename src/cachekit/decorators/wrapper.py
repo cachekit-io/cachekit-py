@@ -658,8 +658,11 @@ def create_cache_wrapper(
         raise ConfigurationError(
             "encryption requires a backend: backend=None is L1-only and stores raw Python "
             "objects, which cannot be ciphertext. Drop backend=None (the backend then "
-            "resolves from CACHEKIT_API_KEY / REDIS_URL / set_default_backend()) or pass "
-            "one explicitly to keep @cache.secure / encryption=True."
+            "resolves from set_default_backend(), else the one CACHEKIT_* selector set: "
+            "CACHEKIT_API_KEY, CACHEKIT_REDIS_URL, CACHEKIT_MEMCACHED_SERVERS or "
+            "CACHEKIT_FILE_CACHE_DIR, else REDIS_URL / localhost Redis; see "
+            "docs/backends/README.md) or pass one explicitly to keep @cache.secure / "
+            "encryption=True."
         )
 
     # Store backend and handler type for consistent access
