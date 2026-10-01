@@ -58,7 +58,7 @@ class TestCacheKeyGenerator:
         assert len(keys) == 3
 
     def test_qualname_change_still_changes_key(self, key_generator):
-        """The func memo is keyed per call on (module, qualname), not frozen at first use."""
+        """A later ``__qualname__`` change still changes the key; guards against capturing the name at decoration time."""
 
         def func(x):
             return x
@@ -450,6 +450,24 @@ class TestExtendedTypeNormalization:
 
         assert key_generator.generate_key(func, (Level.LOW,), {}) == key_generator.generate_key(func, (1,), {})
         assert key_generator.generate_key(func, (Mode.FAST,), {}) == key_generator.generate_key(func, ("fast",), {})
+
+    def test_float_subclass_with_unhashable_metaclass_still_normalizes(self, key_generator):
+        """The fast path must not hash the argument's type (LAB-7068).
+
+        A float subclass whose metaclass is unhashable keys like 0.0 on the slow path;
+        a set-membership type check would raise TypeError instead.
+        """
+
+        class UnhashableType(type):
+            __hash__ = None  # type: ignore[assignment]
+
+        class NegativeZero(float, metaclass=UnhashableType):
+            pass
+
+        def func(x):
+            return x
+
+        assert key_generator.generate_key(func, (NegativeZero(-0.0),), {}) == key_generator.generate_key(func, (0.0,), {})
 
     def test_datetime_utc_only(self, key_generator):
         """Datetime normalizes to ISO format (UTC required)."""

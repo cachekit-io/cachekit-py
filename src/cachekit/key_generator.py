@@ -24,12 +24,6 @@ ARRAY_AGGREGATE_MAX = 5_000_000  # 5MB total across all args
 SUPPORTED_ARRAY_DTYPES = {"int32", "int64", "float32", "float64"}
 DTYPE_MAP = {"int32": "i32", "int64": "i64", "float32": "f32", "float64": "f64"}
 
-# Exact primitive types that _normalize passes through unchanged. Matched by type(), not
-# isinstance(): subclasses (IntEnum, StrEnum, str-mixin Enums) must still reach the Enum
-# branch so their keys stay what they are today. float is excluded because -0.0 must reach
-# the float branch to be normalised to 0.0.
-_PASSTHROUGH_TYPES = frozenset({int, str, bytes, bool, type(None)})
-
 
 class CacheKeyGenerator:
     """Generates consistent cache keys from function calls.
@@ -243,8 +237,13 @@ class CacheKeyGenerator:
         if _array_bytes_seen is None:
             _array_bytes_seen = [0]
 
-        # Fast path: exact primitives skip the isinstance ladder below (LAB-7068).
-        if type(obj) in _PASSTHROUGH_TYPES:
+        # Fast path: exact primitives skip the isinstance ladder below (LAB-7068). Matched by
+        # exact type, not isinstance(): subclasses (IntEnum, StrEnum, str-mixin Enums) must still
+        # reach the Enum branch so their keys stay what they are today. float is excluded because
+        # -0.0 must reach the float branch to be normalised to 0.0. Identity checks, not set
+        # membership, so the type is never hashed or compared through a metaclass __eq__.
+        t = type(obj)  # pyright: ignore[reportUnknownVariableType]
+        if t is int or t is str or t is bytes or t is bool or obj is None:
             return obj
 
         # === COLLECTIONS (recursive) ===
