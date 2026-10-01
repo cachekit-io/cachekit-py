@@ -17,6 +17,7 @@ Prints ``ready <port>`` on stdout once it is listening.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import socket
@@ -130,12 +131,20 @@ class _Protocol(asyncio.Protocol):
 
 
 def main() -> None:
-    port, certfile, keyfile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-    workers = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("port", type=int, help="port to listen on, 0 for any free port")
+    parser.add_argument("certfile")
+    parser.add_argument("keyfile")
+    parser.add_argument("workers", type=int, nargs="?", default=4, help="event-loop threads (default 4)")
+    args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error(f"port must be 0-65535, got {args.port}")
+    if args.workers < 1:
+        parser.error(f"workers must be at least 1, got {args.workers}")
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ctx.load_cert_chain(certfile, keyfile)
+    ctx.load_cert_chain(args.certfile, args.keyfile)
     ctx.set_alpn_protocols(["h2", "http/1.1"])
-    sock = socket.create_server(("127.0.0.1", port), backlog=1024)
+    sock = socket.create_server(("127.0.0.1", args.port), backlog=1024)
     sock.setblocking(False)
 
     def serve() -> None:
@@ -143,7 +152,7 @@ def main() -> None:
         loop.run_until_complete(loop.create_server(_Protocol, sock=sock, ssl=ctx))
         loop.run_forever()
 
-    WORKERS.extend(threading.Thread(target=serve, daemon=True) for _ in range(workers))
+    WORKERS.extend(threading.Thread(target=serve, daemon=True) for _ in range(args.workers))
     for thread in WORKERS:
         thread.start()
     print(f"ready {sock.getsockname()[1]}", flush=True)

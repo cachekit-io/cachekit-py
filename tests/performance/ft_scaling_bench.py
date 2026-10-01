@@ -52,7 +52,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Callable
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -78,7 +79,7 @@ def _gil_enabled() -> bool:
 # --- one arm, one process ---------------------------------------------------------------------------
 
 
-def run_cell(n: int, make_op, dur: float, warm: float) -> dict[str, float | None]:
+def run_cell(n: int, make_op: Callable[[int], Callable[[], object]], dur: float, warm: float) -> dict[str, float | None]:
     """Run make_op(tid)() on n threads for about dur seconds after warm seconds; return aggregate calls/s.
 
     Each thread's rate is its calls over its own counted interval, so a call that overruns the window
@@ -294,6 +295,9 @@ def _check_row(arm: str, row: dict) -> None:
     """Fail loudly when an arm did not run under the interpreter state it claims."""
     if ARMS[arm][0] == "ft" and not row["free_threaded_build"]:
         raise RuntimeError(f"--ft-python is not a free-threaded build (arm {arm})")
+    # A GIL that an import switched back on does not make a free-threaded binary a GIL build.
+    if ARMS[arm][0] == "gil" and row["free_threaded_build"]:
+        raise RuntimeError(f"--gil-python is a free-threaded build; arm {arm} needs a default GIL build")
     if arm in EXPECTED_GIL and row["gil_before_cells"] != EXPECTED_GIL[arm]:
         raise RuntimeError(f"arm {arm} ran with gil_enabled={row['gil_before_cells']}, expected {EXPECTED_GIL[arm]}")
 
@@ -347,6 +351,10 @@ def _spread(values: list[float], fmt: str) -> str:
 
 def summarise(path: Path) -> None:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    # Reps restart at 0 every session, so a repeated (arm, rep) means pooled sessions, which would
+    # silently overwrite rows and pair one session's arm with another's ft-nogil.
+    if pooled := sorted(k for k, count in Counter((r["arm"], r["rep"]) for r in rows).items() if count > 1):
+        raise SystemExit(f"{path}: arm/rep {pooled[0]} appears more than once; the file pools more than one session")
     kept = [r for r in rows if r["gil_before_cells"] == r["gil_after_cells"]]
     print(f"{len(rows)} processes, {len(rows) - len(kept)} dropped (GIL state changed while the cells ran)")
     loads = [r["load_start"][0] for r in kept] + [r["load_end"][0] for r in kept]

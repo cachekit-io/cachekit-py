@@ -177,10 +177,11 @@ so each arm's difference from `ft-nogil` is paired by repetition, with a 95%
 bootstrap CI that resamples whole repetitions; with fewer than five clean
 pairs it prints "insufficient clean reps" instead of a CI. A difference counts
 only if its CI excludes zero and it is larger than the `ft-nogil-aa` floor.
-The driver stops if an arm ran under the wrong GIL state or `--ft-python` is
-not a free-threaded build, and refuses an existing `--out` file so two
-sessions are never pooled. The summary also drops a process whose GIL state
-changed while the cells ran.
+The driver stops if an arm ran under the wrong GIL state, if `--ft-python` is
+not a free-threaded build, or if `--gil-python` is one. It refuses an existing
+`--out` file so two sessions are never pooled, and the summary refuses a file
+that repeats an arm's repetition. The summary also drops a process whose GIL
+state changed while the cells ran.
 
 Today the CachekitIO cell is tainted under no-GIL. Threads that share one
 backend share one HTTP/2 connection, and httpcore's sync HTTP/2 send path
