@@ -134,6 +134,35 @@ class TestRedisPoolDecodeResponses:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("keepalive", [True, False])
+@pytest.mark.parametrize("build", ["create_connection_pool", "create_async_connection_pool"])
+class TestRedisPoolSocketKeepalive:
+    """RedisBackendConfig.socket_keepalive must reach every TCP pool, and never a unix:// one.
+
+    redis-py's UnixDomainSocketConnection rejects socket_keepalive with a TypeError (with
+    either value) when the pool makes a connection, so passing it unconditionally would break
+    every unix-socket user. Pools connect lazily, so none of this needs a Redis server.
+    """
+
+    @staticmethod
+    def _pool(build, url, keepalive):
+        import cachekit.backends.redis.client as rc
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        return getattr(rc, build)(url, RedisBackendConfig(socket_keepalive=keepalive))
+
+    @pytest.mark.parametrize("url", ["redis://localhost:6379/0", "rediss://localhost:6380/0"])
+    def test_tcp_pool_carries_configured_keepalive(self, build, keepalive, url):
+        pool = self._pool(build, url, keepalive)
+        assert pool.connection_kwargs["socket_keepalive"] is keepalive
+
+    def test_unix_pool_makes_connections(self, build, keepalive):
+        pool = self._pool(build, "unix:///tmp/cachekit-no-such.sock?db=0", keepalive)
+        assert "socket_keepalive" not in pool.connection_kwargs
+        pool.make_connection()  # raised TypeError when the kwarg leaked through
+
+
+@pytest.mark.unit
 class TestRedisBackendProviderResolution:
     """#222 regression: RedisBackend honours redis_url and works zero-config.
 
