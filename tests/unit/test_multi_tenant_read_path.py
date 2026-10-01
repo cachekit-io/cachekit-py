@@ -30,6 +30,7 @@ import pytest
 from cachekit import cache
 from cachekit.backends.file import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
+from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
@@ -96,6 +97,19 @@ class _LockingFreshnessFileBackend(_LockingFileBackend, _FreshnessFileBackend):
     """Lockable and SWR-capable: the double-check reads through get_cached_value_with_freshness_async."""
 
 
+class _RedisLockingFileBackend(_LockingFileBackend):
+    """Wraps lock-body errors through classify_redis_error, as RedisBackend.acquire_lock does,
+    so a fail-closed refusal leaves the lock as a BackendError the wrapper must unwrap."""
+
+    @asynccontextmanager
+    async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
+        try:
+            async with super().acquire_lock(key, timeout, blocking_timeout) as acquired:
+                yield acquired
+        except Exception as exc:
+            raise classify_redis_error(exc, operation="acquire_lock", key=key) from exc
+
+
 BACKENDS = [
     pytest.param(FileBackend, id="file"),
     pytest.param(_FreshnessFileBackend, id="file-swr-capable"),
@@ -103,6 +117,7 @@ BACKENDS = [
 LOCK_BACKENDS = [
     pytest.param(_LockingFileBackend, id="file"),
     pytest.param(_LockingFreshnessFileBackend, id="file-swr-capable"),
+    pytest.param(_RedisLockingFileBackend, id="file-redis-lock"),
 ]
 READ_PATHS = [
     pytest.param(False, False, id="sync-l2"),

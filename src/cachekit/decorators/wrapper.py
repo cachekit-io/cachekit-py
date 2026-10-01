@@ -1783,20 +1783,9 @@ def create_cache_wrapper(
 
             return result
 
-        except BackendError as e:
-            # Backend is unavailable - execute without caching (graceful degradation)
-            features.handle_cache_error(
-                error=e,
-                operation="backend_connection",
-                cache_key=cache_key or "unknown",
-                namespace=namespace or "default",
-                duration_ms=0.0,
-            )
-
-            # Execute function without any caching
-            result = func(*args, **kwargs)
-            return result
-
+        # No `except BackendError` degradation here: the store's own failures are caught
+        # above, so only the function can raise one this far, and rerunning the function
+        # for it would repeat its side effects (LAB-5360). It is the function's exception.
         except KeyringConfigurationError:
             # From the write, or a nested cached call's: a local config fault, not a
             # backend failure. Counting it would open the breaker, and an open breaker
@@ -2094,6 +2083,7 @@ def create_cache_wrapper(
 
             # Check if backend supports distributed locking
             if supports_locking(_backend):
+                func_error: Exception | None = None
                 try:
                     # Use backend's async lock protocol
                     async with _backend.acquire_lock(
@@ -2159,59 +2149,66 @@ def create_cache_wrapper(
                                     f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
                                 )
 
-                        # Execute the original function (with or without lock)
-                        result = await func(*args, **kwargs)
-
-                        # Serialize and cache the result
+                        # Execute the original function (with or without lock). Its exception
+                        # is held here, outside the lock's error handling, and re-raised once
+                        # the lock is released: a Redis lock wraps whatever leaves its body in
+                        # a BackendError, and the clause below would take a function's own
+                        # BackendError for a lock failure and run the function again (LAB-5360).
                         try:
-                            serialized_data = operation_handler.serialization_handler.serialize_data(
-                                result, args, kwargs, cache_key=cache_key
-                            )
-
-                            # Store in Redis with TTL
-                            stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                                cache_key,
-                                serialized_data,
-                                ttl=ttl,
-                                stale_ttl=_stale_ttl,
-                            )
-
-                            # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                            _put_l1(cache_key, serialized_data, ttl)
-                            if stored:
-                                await _track_and_record_async(cache_key)
-
-                            # Record successful cache set
-                            set_duration_ms = (time.perf_counter() - start_time) * 1000
-                            features.set_operation_context("set", duration_ms=set_duration_ms)
-                            features.record_success()
-
-                            if features.collect_stats:
-                                features.record_cache_operation(
-                                    operation="set",
-                                    namespace=namespace or "default",
-                                    success=True,
-                                    duration_ms=set_duration_ms,
-                                    serializer="rust",
+                            result = await func(*args, **kwargs)
+                        except Exception as e:
+                            func_error = e
+                        else:
+                            # Serialize and cache the result
+                            try:
+                                serialized_data = operation_handler.serialization_handler.serialize_data(
+                                    result, args, kwargs, cache_key=cache_key
                                 )
 
-                        except (InteropError, KeyringConfigurationError):
-                            # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
-                            # keyring config fault (see the sync write): fail loud. It
-                            # leaves through the lock clause below as the double-check's does.
-                            raise
-                        except Exception as e:
-                            # Caching failed but function succeeded - return result anyway
-                            set_duration_ms = (time.perf_counter() - start_time) * 1000
-                            features.handle_cache_error(
-                                error=e,
-                                operation="cache_set",
-                                cache_key=cache_key or "unknown",
-                                namespace=namespace or "default",
-                                duration_ms=set_duration_ms,
-                            )
+                                # Store in Redis with TTL
+                                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                                    cache_key,
+                                    serialized_data,
+                                    ttl=ttl,
+                                    stale_ttl=_stale_ttl,
+                                )
 
-                        return result
+                                # Also store in L1 cache for fast subsequent access (using serialized bytes)
+                                _put_l1(cache_key, serialized_data, ttl)
+                                if stored:
+                                    await _track_and_record_async(cache_key)
+
+                                # Record successful cache set
+                                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                                features.set_operation_context("set", duration_ms=set_duration_ms)
+                                features.record_success()
+
+                                if features.collect_stats:
+                                    features.record_cache_operation(
+                                        operation="set",
+                                        namespace=namespace or "default",
+                                        success=True,
+                                        duration_ms=set_duration_ms,
+                                        serializer="rust",
+                                    )
+
+                            except (InteropError, KeyringConfigurationError):
+                                # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                                # keyring config fault (see the sync write): fail loud. It
+                                # leaves through the lock clause below as the double-check's does.
+                                raise
+                            except Exception as e:
+                                # Caching failed but function succeeded - return result anyway
+                                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                                features.handle_cache_error(
+                                    error=e,
+                                    operation="cache_set",
+                                    cache_key=cache_key or "unknown",
+                                    namespace=namespace or "default",
+                                    duration_ms=set_duration_ms,
+                                )
+
+                            return result
 
                 except DecryptionAuthenticationError:
                     # Fail-closed tamper failure from the lock double-check reads — must
@@ -2221,23 +2218,26 @@ def create_cache_wrapper(
                     # makes the security dependency explicit.)
                     raise
                 except Exception as e:
-                    # Check if this is a lock-related exception or function execution exception
-                    # BackendError may wrap function exceptions - check original_exception
-                    # If it's not a Backend error, it's from the function - re-raise
+                    # The function's exceptions never get here (held in func_error above).
+                    # What does is a lock failure, or a cache error the lock body re-raised
+                    # on purpose: fail-closed DecryptionAuthenticationError, InteropError,
+                    # KeyringConfigurationError. Those leave a finally-only lock as they are.
                     if not isinstance(e, BackendError):
                         raise
 
-                    # If it's a BackendError wrapping a non-backend exception, it's from the function
-                    if isinstance(e, BackendError) and e.original_exception:
-                        if not isinstance(e.original_exception, BackendError):
-                            # Function exception wrapped in BackendError - re-raise the original
-                            raise e.original_exception from e
+                    # A Redis lock wraps them in a BackendError; unwrap and re-raise the original.
+                    if e.original_exception and not isinstance(e.original_exception, BackendError):
+                        raise e.original_exception from e
 
                     # Lock operation failed - execute without lock
                     logger().warning(
                         f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
                     )
                     # Fall through to execute without locking
+
+                if func_error is not None:
+                    # The function's own exception, unchanged and never recorded (as before).
+                    raise func_error
 
             # Execute without locking (either backend doesn't support it or lock failed)
             if not supports_locking(_backend):
