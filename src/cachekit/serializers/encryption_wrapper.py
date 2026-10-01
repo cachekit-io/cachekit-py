@@ -49,6 +49,18 @@ class DecryptionAuthenticationError(EncryptionError):
     pass
 
 
+class TenantMismatchError(DecryptionAuthenticationError):
+    """The entry is encrypted for a different tenant than the one this read decrypts as.
+
+    Tamper-class wherever the entry came from the backend. The decorator's L1 guards
+    alone treat it as a miss: L1 is keyed by the bare cache key and holds only this
+    process's own authenticated writes and backfills, so another tenant's envelope
+    there is a keying collision, not tamper evidence.
+    """
+
+    pass
+
+
 class EncryptionWrapper:
     """Encryption wrapper that composes any SerializerProtocol with AES-256-GCM encryption layer.
 
@@ -227,7 +239,8 @@ class EncryptionWrapper:
         # re-raises it, but the read sites (CacheOperationHandler.get_cached_value*
         # and the decorator L1 guards) re-raise only KeyringConfigurationError
         # and turn anything else into a warning plus a miss. This wrapper is
-        # built lazily on the first read for a tenant, so these faults surface
+        # built lazily on the first read for a tenant (the caller's with a
+        # tenant_extractor, else the entry header's), so these faults surface
         # at a read site as often as at a write.
         if previous_master_keys is None:
             settings = get_settings()
@@ -267,7 +280,8 @@ class EncryptionWrapper:
         # would then present as silent misses plus entry-by-entry eviction (the
         # LAB-241/LAB-683 failure class). Let it propagate (taxonomy note above).
         #
-        # On a read, tenant_id comes from the unauthenticated frame header, so a
+        # On a read by a handler without a tenant_extractor, tenant_id comes from
+        # the unauthenticated frame header (with one, from the caller), so a
         # fault here must not be one a writer can choose. It is not: both calls
         # validate tenant_id through the same HKDF input checks, and
         # derive_tenant_keys above has already accepted this tenant_id (a tenant
@@ -433,13 +447,14 @@ class EncryptionWrapper:
                 ...
             DecryptionAuthenticationError: Decryption failed: ...
 
-            Tenant mismatch raises DecryptionAuthenticationError (tamper-class):
+            Tenant mismatch raises TenantMismatchError, a DecryptionAuthenticationError
+            (tamper-class) whose message names neither tenant:
 
             >>> other_wrapper = EncryptionWrapper(master_key=b"b" * 32, tenant_id="tenant-2")
-            >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")  # doctest: +IGNORE_EXCEPTION_DETAIL
+            >>> other_wrapper.deserialize(enc_data, enc_meta, cache_key="cart:user:42")
             Traceback (most recent call last):
                 ...
-            DecryptionAuthenticationError: Tenant mismatch: data encrypted for 'tenant-1', but current tenant is 'tenant-2'
+            cachekit.serializers.encryption_wrapper.TenantMismatchError: Tenant mismatch: entry encrypted for a different tenant
 
             An entry claiming plaintext is refused outright — the wrapper is
             encryption-mandatory and fails closed on its own (LAB-271,
@@ -483,13 +498,17 @@ class EncryptionWrapper:
             )
 
         # Verify tenant match for security. Tamper-class (DecryptionAuthenticationError):
-        # an entry claiming another tenant at this cache key is either cross-tenant
-        # substitution or config drift — it must count as auth_tamper telemetry and be
-        # honored by the fail-closed policy, not vanish into the corruption bucket.
+        # an entry claiming another tenant at this cache key is another tenant's entry
+        # at a shared key, cross-tenant substitution, or config drift — it must count as
+        # auth_tamper telemetry and be honored by the fail-closed policy, not vanish into
+        # the corruption bucket. The message names neither tenant: under fail-closed it
+        # reaches the caller, who must not learn another tenant's id (CWE-209). The ids
+        # go to the debug log only.
         if metadata.tenant_id != self.tenant_id:
-            raise DecryptionAuthenticationError(
-                f"Tenant mismatch: data encrypted for '{metadata.tenant_id}', but current tenant is '{self.tenant_id}'"
+            logger.debug(
+                "Tenant mismatch: entry encrypted for tenant %r, reader is tenant %r", metadata.tenant_id, self.tenant_id
             )
+            raise TenantMismatchError("Tenant mismatch: entry encrypted for a different tenant")
 
         # Keyring selection by exact fingerprint match (spec/encryption.md →
         # "Key Rotation (Keyring)"): the frame's key_fingerprint is compared

@@ -98,6 +98,14 @@ LOCK_BLOCKING_TIMEOUT = 5  # Wait max 5 seconds to acquire the lock
 LOCK_RETRY_INTERVAL = 0.1  # Sleep for 100ms between retries after lock fails
 
 
+class TenantResolutionError(ValueError):
+    """An encrypted read on a handler with a tenant_extractor could not extract the caller's tenant.
+
+    The caller's context is at fault, not the entry, which may be valid for its own
+    tenant: every read site treats this as a miss that keeps the entry, L1 and L2 alike.
+    """
+
+
 def _record_security_counter(name: str, labels: dict[str, str]) -> None:
     """Best-effort security-telemetry counter — must never break the read path.
 
@@ -1113,25 +1121,50 @@ class CacheSerializationHandler:
         budget = get_settings().max_value_size - len(prefix)
         serializer.serialize_to_sink(data, sink, max_bytes=budget)
 
-    def deserialize_data(self, data: str | bytes | memoryview, cache_key: str = "") -> Any:
+    def deserialize_data(
+        self,
+        data: str | bytes | memoryview,
+        cache_key: str = "",
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
         """Deserialize data from cache storage with cache_key verification.
 
         Args:
             data: Serialized data from cache (may be encrypted)
             cache_key: Cache key for AAD verification (SECURITY CRITICAL for encrypted data).
                       Required when data is encrypted to verify ciphertext binding.
+            args: Positional arguments from cached function (for tenant extraction)
+            kwargs: Keyword arguments from cached function (for tenant extraction)
 
         Returns:
             Deserialized Python object
 
         Raises:
             ValueError: If cache_key is empty when data is encrypted
+            TenantResolutionError: If the handler has a tenant_extractor and the caller's
+                tenant cannot be extracted for an encrypted entry. Nothing is decrypted;
+                callers treat this as a miss that keeps the entry.
             SerializationError: If deserialization fails (including AAD mismatch or a
                 corrupt/unparseable envelope frame header), or if this handler has
                 encryption enabled and the entry's header claims plaintext — the
                 header is unauthenticated, so an encryption-enabled handler never
                 routes to the plaintext deserializer (fail closed, CWE-757 downgrade
                 protection). Callers treat this as a cache miss.
+            DecryptionAuthenticationError: A SerializationError subclass, raised on any
+                authentication failure: tampered ciphertext, wrong key, AAD mismatch, or
+                (TenantMismatchError) an entry encrypted for a tenant other than the one this
+                read decrypts as (see Note). The read sites re-raise it under fail-closed.
+
+        Note:
+            The decryption tenant mirrors :meth:`serialize_data`:
+            - With a tenant_extractor: the caller's tenant, extracted from args/kwargs, on
+              every encrypted read, config-drift reads included. The cache key carries no
+              tenant, so an entry another tenant wrote at the same key is refused as a
+              tenant mismatch, never decrypted.
+            - Without one (single-tenant mode, and drift reads by an extractor-less handler):
+              the tenant recorded in the entry's header. It is bound into the AAD, so a
+              forged value fails authentication.
 
         Examples:
             Basic round-trip (serialize then deserialize):
@@ -1244,12 +1277,29 @@ class CacheSerializationHandler:
                 # Data is encrypted - use cached EncryptionWrapper for decryption
                 # CRITICAL-03 FIX: Use cached instance instead of creating new one
                 if not metadata.tenant_id:
-                    # Envelope claims encryption but lacks the tenant needed to derive the
-                    # key — malformed or field-stripped. suspicious_envelope telemetry.
+                    # Envelope claims encryption but lacks the tenant it was encrypted for —
+                    # malformed or field-stripped. suspicious_envelope telemetry.
                     raise SuspiciousCacheEntryError(
                         "Encrypted cache entry is missing tenant_id in metadata. Cannot decrypt without tenant context."
                     )
-                tenant_id = metadata.tenant_id
+                if self.tenant_extractor:
+                    # Multi-tenant mode: decrypt as the caller's tenant, extracted as on the write
+                    # path, never as the header's. The key has no tenant segment, so another
+                    # tenant's entry can sit at this key; the wrapper's tenant check refuses it.
+                    # A failed extraction is the caller's fault, not the entry's: every read site
+                    # treats TenantResolutionError as a miss that keeps the entry (anything else
+                    # would be wrapped below and evicted as corruption).
+                    try:
+                        tenant_id = self.tenant_extractor.extract(args, kwargs or {})
+                    except Exception as e:
+                        raise TenantResolutionError(
+                            f"Cannot resolve the caller's tenant for an encrypted read: {type(e).__name__}"
+                        ) from e
+                else:
+                    # No tenant_extractor (single-tenant mode, or a drift read by an extractor-less
+                    # handler): the header's tenant selects the key. It is bound into the AAD, so a
+                    # forged value fails authentication.
+                    tenant_id = metadata.tenant_id
                 try:
                     serializer = self._get_cached_encryption_wrapper(tenant_id)
                     # EncryptionWrapper.deserialize() requires cache_key for AAD v0x03 verification
@@ -1545,12 +1595,20 @@ class CacheOperationHandler:
             )
         self._notify_deserialize_error(e, cache_key)
 
-    def get_cached_value(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[CacheHit]:
+    def get_cached_value(
+        self,
+        cache_key: str,
+        refresh_ttl: Optional[int] = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Optional[CacheHit]:
         """Get value from cache if it exists.
 
         Args:
             cache_key: Cache key to retrieve (also used for AAD verification if encrypted)
             refresh_ttl: Optional TTL to refresh on hit
+            args: Function args (for tenant extraction in encryption)
+            kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
             A :class:`CacheHit` on a cache hit, None on cache miss or error. See
@@ -1574,7 +1632,8 @@ class CacheOperationHandler:
                     try:
                         get_logger().cache_hit(cache_key, "Backend(mmap)")
                         size_bytes = handle.view.nbytes  # payload length; the view is released in `finally`
-                        return CacheHit(self.serialization_handler.deserialize_data(handle.view, cache_key), None, size_bytes)
+                        value = self.serialization_handler.deserialize_data(handle.view, cache_key, args, kwargs)
+                        return CacheHit(value, None, size_bytes)
                     finally:
                         handle.close()
 
@@ -1582,7 +1641,7 @@ class CacheOperationHandler:
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
-                deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+                deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key, args, kwargs)
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
@@ -1598,11 +1657,16 @@ class CacheOperationHandler:
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    def get_cached_value_with_freshness(self, cache_key: str) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
+    def get_cached_value_with_freshness(
+        self, cache_key: str, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None
+    ) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
         """SWR variant of :meth:`get_cached_value` (LAB-381/LAB-557): also reports
         staleness and the server's remaining freshness in seconds.
 
@@ -1629,7 +1693,7 @@ class CacheOperationHandler:
                 return None
             cached_data, is_stale, fresh_for = hit
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
-            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key, args, kwargs)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
@@ -1644,11 +1708,16 @@ class CacheOperationHandler:
         except SerializationError as e:
             self._handle_l2_read_error(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_with_freshness_async(self, cache_key: str) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
+    async def get_cached_value_with_freshness_async(
+        self, cache_key: str, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None
+    ) -> Optional[tuple[CacheHit, bool, Optional[int]]]:
         """Async SWR variant (LAB-381/LAB-557): staleness + remaining freshness +
         the raw envelope for L1 backfill.
 
@@ -1668,7 +1737,7 @@ class CacheOperationHandler:
                 return None
             cached_data, is_stale, fresh_for = hit  # same 2-tuple contract as the sync variant above
             get_logger().cache_hit(cache_key, "Backend(stale)" if is_stale else "Backend")
-            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+            deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key, args, kwargs)
             return (CacheHit(deserialized, cached_data, len(cached_data)), is_stale, fresh_for)
         except KeyringConfigurationError:
             # LOCAL keyring config fault (bad tenant_id, bad keyring entry index, or
@@ -1683,16 +1752,27 @@ class CacheOperationHandler:
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
             return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
+            return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")
             return None
 
-    async def get_cached_value_async(self, cache_key: str, refresh_ttl: Optional[int] = None) -> Optional[CacheHit]:
+    async def get_cached_value_async(
+        self,
+        cache_key: str,
+        refresh_ttl: Optional[int] = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Optional[CacheHit]:
         """Get value from cache if it exists (async version).
 
         Args:
             cache_key: Cache key to retrieve (also used for AAD verification if encrypted)
             refresh_ttl: Optional TTL to refresh on hit
+            args: Function args (for tenant extraction in encryption)
+            kwargs: Function kwargs (for tenant extraction in encryption)
 
         Returns:
             A :class:`CacheHit` on a cache hit, None on cache miss or error. Same
@@ -1712,7 +1792,7 @@ class CacheOperationHandler:
             if cached_data is not None:
                 get_logger().cache_hit(cache_key, "Backend")
                 # Pass cache_key for AAD verification (required for encrypted data)
-                deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key)
+                deserialized = self.serialization_handler.deserialize_data(cached_data, cache_key, args, kwargs)
                 return CacheHit(deserialized, cached_data, len(cached_data))
             return None
         except KeyringConfigurationError:
@@ -1727,6 +1807,9 @@ class CacheOperationHandler:
             raise
         except SerializationError as e:
             await self._handle_l2_read_error_async(e, cache_key)  # raises when fail-closed (LAB-108)
+            return None
+        except TenantResolutionError:
+            get_logger().warning(f"Encrypted read of {redact_cache_key(cache_key)} skipped: caller's tenant unresolved (miss)")
             return None
         except Exception as e:
             get_logger().warning(f"Backend operation failed for get on {redact_cache_key(cache_key)}: {redact_error_for_log(e)}")

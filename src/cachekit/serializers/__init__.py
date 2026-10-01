@@ -22,6 +22,7 @@ from .encryption_wrapper import (
     EncryptionError,
     EncryptionWrapper,
     KeyringConfigurationError,
+    TenantMismatchError,
 )
 from .standard_serializer import StandardSerializer
 
@@ -240,6 +241,7 @@ __all__ = [
     "KeyringConfigurationError",
     "EncryptionError",
     "EncryptionWrapper",
+    "TenantMismatchError",
     "OrjsonSerializer",
     "StandardSerializer",
     # Base types

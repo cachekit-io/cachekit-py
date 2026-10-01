@@ -21,6 +21,7 @@ from ..cache_handler import (
     CacheOperationHandler,
     CacheSerializationHandler,
     StandardCacheHandler,
+    TenantResolutionError,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
@@ -46,7 +47,12 @@ from ..object_cache import ObjectCache
 from ..reliability import CircuitBreakerConfig
 from ..serializers import SERIALIZER_REGISTRY
 from ..serializers.base import SerializationError
-from ..serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionWrapper, KeyringConfigurationError
+from ..serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+    TenantMismatchError,
+)
 
 # Config import removed - using direct DecoratorConfig integration
 from .orchestrator import FeatureOrchestrator
@@ -927,7 +933,9 @@ def create_cache_wrapper(
             return ttl
         return min(DEFAULT_L1_TTL_SECONDS, fresh_for) if ttl is None else min(ttl, fresh_for)
 
-    async def _l2_double_check(cache_key: str) -> tuple[CacheHit | None, bool, int | None]:
+    async def _l2_double_check(
+        cache_key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[CacheHit | None, bool, int | None]:
         """Post-lock L2 double-check read, freshness-aware on a capable backend
         (LAB-557): a hit found after a lock wait gets the same stale-exclusion
         and remaining-freshness bound on its L1 BACKFILL as the primary hit path
@@ -941,9 +949,9 @@ def create_cache_wrapper(
         get_cached_value_async.
         """
         if _l2_freshness_capable():
-            hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+            hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
             return hit if hit is not None else (None, False, None)
-        return await operation_handler.get_cached_value_async(cache_key), False, None
+        return await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs), False, None
 
     def _l1_backfill_from_l2(cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None) -> None:
         """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
@@ -1469,7 +1477,7 @@ def create_cache_wrapper(
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                 try:
-                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                    l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
 
                     features.set_operation_context("l1_get", duration_ms=0.001)
 
@@ -1503,6 +1511,16 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
+                except TenantMismatchError:
+                    # L1 is keyed by the bare cache key and holds only this process's own
+                    # authenticated writes and backfills, so another tenant's envelope here is
+                    # a keying collision, not tamper evidence: an L1 miss, no auth_tamper and no
+                    # raise. L2, which may hold this tenant's own entry, applies the policy.
+                    _l1_cache.invalidate(cache_key)
+                except TenantResolutionError:
+                    # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
+                    # with the entry, which stays. The L2 read below misses for the same reason.
+                    logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                 except SerializationError as e:
                     # Poisoned L1 must not outlive remediation of the durable L2 copy —
                     # invalidate BEFORE the policy decision (a fail-closed raise would
@@ -1619,12 +1637,12 @@ def create_cache_wrapper(
             _sync_l2_stale = False
             _sync_l2_fresh_for: int | None = None
             if _l2_freshness_capable():
-                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key)
+                _fresh_hit = operation_handler.get_cached_value_with_freshness(cache_key, args, kwargs)
                 cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                 _sync_l2_stale = _fresh_hit[1] if _fresh_hit is not None else False
                 _sync_l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
             else:
-                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl)
+                cached_result = operation_handler.get_cached_value(cache_key, refresh_ttl, args, kwargs)
 
             duration = time.time() - start_time
 
@@ -1886,7 +1904,7 @@ def create_cache_wrapper(
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
                     try:
-                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key=cache_key)
+                        l1_value = operation_handler.serialization_handler.deserialize_data(l1_bytes, cache_key, args, kwargs)
 
                         features.set_operation_context("l1_get", duration_ms=0.001)
 
@@ -1905,6 +1923,12 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
+                    except TenantMismatchError:
+                        # Another tenant's envelope in L1: an L1 miss — see the sync L1 guard above.
+                        _l1_cache.invalidate(cache_key)
+                    except TenantResolutionError:
+                        # Caller's tenant unresolved: the entry stays — see the sync L1 guard above.
+                        logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
                     except SerializationError as e:
                         # Poisoned L1 must not outlive remediation of the durable L2 copy —
                         # invalidate BEFORE the policy decision (a fail-closed raise would
@@ -1995,12 +2019,12 @@ def create_cache_wrapper(
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
                 if _l2_freshness_capable():
-                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key)
+                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
                     cached_result = _fresh_hit[0] if _fresh_hit is not None else None
                     _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
                     _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
                 else:
-                    cached_result = await operation_handler.get_cached_value_async(cache_key)
+                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
 
                 if cached_result is not None:
                     # Cache hit: envelope is the raw serialized bytes for L1 backfill
@@ -2084,7 +2108,7 @@ def create_cache_wrapper(
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
                                 _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
                                 if cached_result is not None:
                                     # Another request filled the cache while we waited
                                     result, cached_data = cached_result.value, cached_result.envelope
@@ -2118,7 +2142,7 @@ def create_cache_wrapper(
                                 # Routed through the operation handler: corrupt entries evict (#159),
                                 # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                                 _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key)
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
                                 if cached_result is not None:
                                     # Cache was populated while waiting - use it
                                     result, cached_data = cached_result.value, cached_result.envelope

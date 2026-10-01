@@ -110,7 +110,7 @@ class TestGetCachedValueMmapBranch:
         assert result == CacheHit(sentinel, None, 4096)
         ch.get_buffer.assert_called_once_with("k")
         ch.get.assert_not_called()  # normal read path NOT used on the mmap hit
-        sh.deserialize_data.assert_called_once_with(handle.view, "k")
+        sh.deserialize_data.assert_called_once_with(handle.view, "k", (), None)
         handle.close.assert_called_once()  # mmap released in finally, never escapes the frame
 
     def test_not_eligible_uses_normal_read_path(self) -> None:
