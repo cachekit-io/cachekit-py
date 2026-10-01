@@ -21,6 +21,10 @@ _logger = logging.getLogger(__name__)
 # reply; at ~10 bytes a reply, 1,000 keys stay far below a socket buffer.
 _PIPELINE_KEYS = 1_000
 
+# What HashClient returns, unsent, for a server in its retry window. A private object, so no
+# server reply can equal it.
+_SKIPPED = object()
+
 
 def _parse_server(server: str) -> tuple[str, int]:
     """Parse 'host:port' string into (host, port) tuple.
@@ -104,8 +108,46 @@ class MemcachedBackend:
             return f"{self._key_prefix}{key}"
         return key
 
+    def _run(self, operation: str, cmd: str, key: str, *args: Any, **kwargs: Any) -> Any:
+        """Run one single-key HashClient command; raise rather than report a skip as an outcome.
+
+        For a server in its retry window, HashClient sends nothing and returns a default
+        (``False`` for ``delete``/``set``/``touch``) that reads as "absent", "stored" or "not
+        found". This sends through the same ``_safely_run_func`` with ``_SKIPPED`` as that
+        default, and raises a TRANSIENT ``BackendError`` when it comes back. Every other error
+        goes through ``classify_memcached_error``.
+
+        If pymemcache renames those internals, the public command runs instead, as before this
+        check existed: per-key commands are the fallback when ``_delete_many`` raises on the
+        same drift, so they must still reach the server.
+
+        Raises:
+            BackendError: If the command was skipped or failed.
+        """
+        wire_key = self._prefixed_key(key)
+        get_client = getattr(self._client, "_get_client", None)  # bound outside the try: drift
+        run = getattr(self._client, "_safely_run_func", None)  # must not read as a skip
+        try:
+            if get_client is None or run is None:
+                return getattr(self._client, cmd)(wire_key, *args, **kwargs)
+            client = get_client(wire_key)
+            result = run(client, getattr(client, cmd), _SKIPPED, wire_key, *args, **kwargs)
+        except Exception as exc:
+            raise classify_memcached_error(exc, operation=operation, key=key) from exc
+        if result is _SKIPPED:
+            raise BackendError(
+                message=f"Memcached skipped {operation}: its server is in the client's retry window",
+                error_type=BackendErrorType.TRANSIENT,
+                operation=operation,
+                key=key,
+            )
+        return result
+
     def get(self, key: str) -> Optional[bytes]:
         """Retrieve value from Memcached.
+
+        A server in HashClient's retry window reads as a miss here: the caller recomputes, as
+        on any miss, and the retry window opened with an error that was already raised.
 
         Args:
             key: Cache key to retrieve.
@@ -162,12 +204,9 @@ class MemcachedBackend:
         if ttl is not None and ttl > 0:
             expire = min(ttl, MAX_MEMCACHED_TTL)
 
-        try:
-            # noreply=False so an oversized/error reply from the server is read and surfaced
-            # rather than silently swallowed (HashClient defaults to noreply=True).
-            self._client.set(self._prefixed_key(key), value, expire=expire, noreply=False)
-        except Exception as exc:
-            raise classify_memcached_error(exc, operation="set", key=key) from exc
+        # noreply=False so an oversized/error reply from the server is read and surfaced
+        # rather than silently swallowed (HashClient defaults to noreply=True).
+        self._run("set", "set", key, value, expire=expire, noreply=False)
 
     def delete(self, key: str) -> bool:
         """Delete key from Memcached.
@@ -179,12 +218,10 @@ class MemcachedBackend:
             True if key existed and was deleted, False otherwise.
 
         Raises:
-            BackendError: If Memcached operation fails.
+            BackendError: If Memcached operation fails, or its server is in the client's retry
+                window (the key's state is then unknown).
         """
-        try:
-            return bool(self._client.delete(self._prefixed_key(key), noreply=False))
-        except Exception as exc:
-            raise classify_memcached_error(exc, operation="delete", key=key) from exc
+        return bool(self._run("delete", "delete", key, noreply=False))
 
     def _delete_many(self, keys: list[str]) -> set[str]:
         """Delete many keys with pipelined round trips per server (internal: whole-function invalidation).
@@ -261,10 +298,7 @@ class MemcachedBackend:
         Raises:
             BackendError: If Memcached operation fails.
         """
-        try:
-            return self._client.get(self._prefixed_key(key)) is not None
-        except Exception as exc:
-            raise classify_memcached_error(exc, operation="exists", key=key) from exc
+        return self._run("exists", "get", key) is not None
 
     async def refresh_ttl(self, key: str, ttl: int) -> bool:
         """Refresh a key's TTL via the Memcached ``touch`` command.
@@ -292,12 +326,9 @@ class MemcachedBackend:
         if ttl > 0:
             expire = min(ttl, MAX_MEMCACHED_TTL)
 
-        try:
-            # noreply=False so the server's hit/miss reply is read (matches set/delete);
-            # touch returns True if the expiry was updated, False if the key was not found.
-            return bool(self._client.touch(self._prefixed_key(key), expire=expire, noreply=False))
-        except Exception as exc:
-            raise classify_memcached_error(exc, operation="refresh_ttl", key=key) from exc
+        # noreply=False so the server's hit/miss reply is read (matches set/delete);
+        # touch returns True if the expiry was updated, False if the key was not found.
+        return bool(self._run("refresh_ttl", "touch", key, expire=expire, noreply=False))
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check Memcached health by pinging each server with a get.
@@ -310,8 +341,8 @@ class MemcachedBackend:
         """
         start = time.perf_counter()
         try:
-            # HashClient has no stats() — probe with a harmless get
-            self._client.get(self._prefixed_key("__cachekit_health__"))
+            # HashClient has no stats() — probe with a harmless get; a skipped probe raises
+            self._run("health_check", "get", "__cachekit_health__")
             elapsed_ms = (time.perf_counter() - start) * 1000
             return (
                 True,
