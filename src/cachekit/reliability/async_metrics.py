@@ -81,6 +81,9 @@ class _NoopMetric:
 
     inc = observe = set = set_function = _ignore
 
+    def remove(self, *labelvalues):
+        pass
+
 
 # Metric objects are process-wide because prometheus_client's default registry is.
 # Every collector (one per decorated function) must record into the same documented

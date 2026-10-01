@@ -198,6 +198,31 @@ def test_breaker_and_collectors_share_one_gauge(order: str):
     assert "already registered" not in result.stderr  # cachekit's warning reaches stderr via the last-resort handler
 
 
+_TRANSIENT_NAMESPACES = """
+import gc
+from prometheus_client import REGISTRY
+from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, _live_breakers
+
+def series():
+    return sum(1 for m in REGISTRY.collect() if m.name == "circuit_breaker_state" for _ in m.samples)
+
+for i in range(2000):
+    breaker = CircuitBreaker(CircuitBreakerConfig(), namespace=f"tenant{i}")
+    breaker.cycle = breaker  # freed by cyclic GC as well as by refcount below
+    del breaker
+gc.collect()
+CircuitBreaker(CircuitBreakerConfig(), namespace="tenant0")  # the next breaker retires the dead ones
+assert list(_live_breakers) == ["tenant0"], len(_live_breakers)
+assert series() == 3, series()
+"""
+
+
+def test_collected_namespaces_leave_no_series():
+    """Transient namespaces are retired, so scrape size tracks live namespaces, not every one ever seen."""
+    result = _run(_TRANSIENT_NAMESPACES)
+    assert result.returncode == 0, result.stderr
+
+
 def _run(script: str, env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env)  # noqa: S603 (trusted: sys.executable + literal code)
 
@@ -234,7 +259,7 @@ scraper.join()
 
 gc.collect()
 for ns in ["held"] + [f"ns{i}" for i in range(50)]:
-    assert REGISTRY.get_sample_value("circuit_breaker_state", {"namespace": ns, "state": "OPEN"}) == 0.0, ns
+    assert (REGISTRY.get_sample_value("circuit_breaker_state", {"namespace": ns, "state": "OPEN"}) or 0.0) == 0.0, ns
 """
 
 

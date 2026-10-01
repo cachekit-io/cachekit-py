@@ -202,6 +202,15 @@ class CacheOperationMetrics:
 # re-enter its non-reentrant locks on the same thread and hang.
 _live_breakers: dict[str, "weakref.WeakSet[CircuitBreaker]"] = {}
 _live_lock = threading.Lock()
+# Namespaces that lost a breaker. Appended at GC time, which must take no lock;
+# deque.append takes none. _track drains it to retire namespaces with no live breaker.
+_lost_breaker: deque[str] = deque()
+_breaker_refs: set["weakref.ref[CircuitBreaker]"] = set()
+
+
+def _on_collected(namespace: str, ref: "weakref.ref[CircuitBreaker]") -> None:
+    _breaker_refs.discard(ref)
+    _lost_breaker.append(namespace)
 
 
 def _reset_live_lock() -> None:
@@ -215,21 +224,40 @@ if hasattr(os, "register_at_fork"):
 
 def _count_in_state(namespace: str, state: "CircuitState") -> int:
     with _live_lock:
-        breakers = list(_live_breakers[namespace])
+        # .get: a scrape can call a series that _track retired after the scrape copied it.
+        breakers = list(_live_breakers.get(namespace, ()))
     return sum(1 for breaker in breakers if breaker._state is state)
 
 
 def _track(breaker: "CircuitBreaker") -> None:
-    """Count ``breaker`` in the ``circuit_breaker_state`` gauge for as long as it lives."""
+    """Count ``breaker`` in the ``circuit_breaker_state`` gauge for as long as it lives.
+
+    Also retires namespaces whose breakers have all been collected, so transient namespaces
+    do not leave series behind. That happens here, on an ordinary call, never at GC time; a
+    dead namespace exports zeros until the next breaker is created. Gauge calls stay under
+    _live_lock so a retirement cannot remove a namespace another thread is re-registering.
+    """
+    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE else None
     with _live_lock:
+        _breaker_refs.add(weakref.ref(breaker, functools.partial(_on_collected, breaker.namespace)))
+        lost = set()
+        while _lost_breaker:
+            lost.add(_lost_breaker.popleft())
+        lost.discard(breaker.namespace)
+        dead = [ns for ns in lost if ns in _live_breakers and not _live_breakers[ns]]
+        for ns in dead:
+            del _live_breakers[ns]
         first = breaker.namespace not in _live_breakers
         _live_breakers.setdefault(breaker.namespace, weakref.WeakSet()).add(breaker)
-    if first and PROMETHEUS_AVAILABLE:
-        gauge = circuit_breaker_gauge()
+        if gauge is None:
+            return
         for state in CircuitState:
-            gauge.labels(namespace=breaker.namespace, state=state.name).set_function(
-                functools.partial(_count_in_state, breaker.namespace, state)
-            )
+            for ns in dead:
+                gauge.remove(ns, state.name)
+            if first:
+                gauge.labels(namespace=breaker.namespace, state=state.name).set_function(
+                    functools.partial(_count_in_state, breaker.namespace, state)
+                )
 
 
 class CircuitBreaker:
