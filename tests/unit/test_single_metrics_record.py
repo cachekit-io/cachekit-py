@@ -104,9 +104,12 @@ def test_collector_counts_one_record_once(sync_mode: bool) -> None:
     """Both collector modes turn one record into one counter increment, with no hit field queued."""
     namespace = f"single-record-sink-{sync_mode}"
     collector = AsyncMetricsCollector(sync_mode=sync_mode, auto_detect_mode=False)
-    # Stop the batched worker first and flush by hand: shutdown() can stop the worker
-    # before it takes a queued record, which would make this test racy.
-    collector.shutdown()
+    if not sync_mode:
+        # Stop the batched worker first and flush by hand: a running worker could take the record before this
+        # reads it. Not via shutdown(), which also returns the collector to sync mode.
+        assert collector._stopped is not None and collector._worker_thread is not None
+        collector._stopped.set()
+        collector._worker_thread.join(5)
 
     collector.record_cache_operation(
         operation="get", namespace=namespace, success=True, duration_ms=1.0, serializer="rust", size_bytes=8
