@@ -31,7 +31,7 @@ export CACHEKIT_MEMCACHED_CONNECT_TIMEOUT=2.0    # Default: 2.0 seconds
 export CACHEKIT_MEMCACHED_TIMEOUT=1.0             # Default: 1.0 seconds
 
 # Connection pool
-export CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 per server
+export CACHEKIT_MEMCACHED_MAX_POOL_SIZE=10        # Default: 10 connections per server (see Concurrency)
 export CACHEKIT_MEMCACHED_RETRY_ATTEMPTS=2        # Default: 2
 
 # Optional key prefix
@@ -92,6 +92,20 @@ backend = MemcachedBackend(config)
 - Cross-process: Yes (shared across pods)
 - Persistence: No (volatile memory only)
 - Consistent hashing: Yes (via pymemcache HashClient)
+- Thread-safe: Yes (per-server connection pool; see [Concurrency](#concurrency))
+
+## Concurrency
+
+Each server gets a pool of up to `max_pool_size` connections (default 10). Every operation
+checks out its own connection, so threads sharing one backend never share a socket.
+
+- **The pool does not wait.** An operation that would need connection `max_pool_size + 1`
+  to one server, in one process, raises `BackendError` at once. The server is not marked
+  failed, and later operations succeed once connections are returned. Set `max_pool_size` at
+  or above the number of threads that can hit one server at the same time.
+- **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
+  sockets would be shared across processes. Create the backend (or make the first cached
+  call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
 
 ## Limitations
 

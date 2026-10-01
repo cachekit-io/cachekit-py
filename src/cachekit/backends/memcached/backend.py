@@ -1,7 +1,7 @@
 """Memcached backend implementation for cachekit.
 
-Thread-safe Memcached backend using pymemcache HashClient with consistent hashing
-for multi-server support. Implements BaseBackend protocol.
+Memcached backend using pymemcache HashClient with consistent hashing for
+multi-server support and a per-server connection pool. Implements BaseBackend protocol.
 """
 
 from __future__ import annotations
@@ -31,7 +31,11 @@ class MemcachedBackend:
     """Memcached storage backend implementing BaseBackend protocol.
 
     Uses pymemcache HashClient for consistent-hashing across multiple servers.
-    Thread-safe via HashClient's internal connection pooling.
+    Thread-safe: each server gets a pool of up to ``max_pool_size`` connections, and
+    each operation checks one out, so concurrent threads never share a socket. The
+    pool does not wait: an operation that would need connection ``max_pool_size + 1``
+    to one server raises ``BackendError`` instead. Not fork-safe: build a new backend
+    in a forked child rather than reusing the parent's.
 
     Examples:
         Create backend with defaults (requires running Memcached):
@@ -65,6 +69,10 @@ class MemcachedBackend:
             servers=servers,
             connect_timeout=self._config.connect_timeout,
             timeout=self._config.timeout,
+            # Without use_pooling, HashClient gives each server ONE plain Client (one socket,
+            # no lock) shared by every thread, and ignores max_pool_size. Concurrent commands
+            # then interleave on that socket, and the resulting errors mark the server dead.
+            use_pooling=True,
             max_pool_size=self._config.max_pool_size,
             retry_attempts=self._config.retry_attempts,
         )
