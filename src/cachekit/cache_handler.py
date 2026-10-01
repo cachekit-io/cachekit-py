@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import types
 import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
@@ -312,6 +313,51 @@ def supports_key_tracking(backend: object) -> TypeGuard[KeyTrackableBackend]:
     """
     cls = type(backend)
     return callable(getattr(cls, "track_key", None)) and callable(getattr(cls, "drain_tracked", None))
+
+
+class _MultiDeleteBackend(Protocol):
+    """Internal: a backend that deletes many keys in one multi-key call (the backend may split
+    it into several sends; Memcached sends per server, 1,000 keys a send).
+
+    ``_delete_many`` returns the keys it could not confirm deleted. A key only counts as
+    deleted once the server acknowledged its delete; a key already absent counts as
+    deleted. It may also raise as a whole, in which case the outcome of every key is
+    unknown. Deliberately private: not part of the backend extension surface.
+    """
+
+    def _delete_many(self, keys: list[str]) -> set[str]: ...
+
+
+def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
+    """Type guard for ``_MultiDeleteBackend``: true only when the batch provably deletes what
+    ``backend.delete`` would.
+
+    The batch sends the raw keys it is given. A ``delete`` that rewrites keys (a subclass
+    adding a prefix, an instance attribute, a slot, a property, a custom
+    ``__getattribute__``) would have the sweep batch-delete keys that do not exist, then
+    untrack entries whose real L2 keys survive. So rather than inspect every way lookup can
+    be customised, this resolves both names exactly as the sweep will call them and requires
+    each to be a genuine bound method (``types.MethodType``) of this backend whose function
+    is the class's own plain function, with ``_delete_many`` defined at or below the class that defines ``delete``.
+    Anything else takes the per-key path: a false negative only costs round trips, a false
+    positive loses erasure.
+    """
+    cls = type(backend)
+    if cls.__getattribute__ is not object.__getattribute__:
+        return False  # lookup is not stable between this check and the sweep's calls
+    owners: dict[str, type] = {}
+    for name in ("delete", "_delete_many"):
+        owner = next((c for c in cls.__mro__ if name in c.__dict__), None)
+        func = owner.__dict__[name] if owner is not None else None
+        if not isinstance(func, types.FunctionType):
+            return False
+        resolved = getattr(backend, name, None)
+        # type() first: a MethodType's __func__/__self__ are C slots no object can fake, and
+        # reading them runs no user code, so a forged or raising proxy is rejected untouched.
+        if type(resolved) is not types.MethodType or resolved.__func__ is not func or resolved.__self__ is not backend:
+            return False  # the instance resolves this name to something other than the class's function
+        owners[name] = owner  # type: ignore[assignment]
+    return issubclass(owners["_delete_many"], owners["delete"])
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:

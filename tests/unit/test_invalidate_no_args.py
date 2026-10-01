@@ -582,3 +582,591 @@ class TestInvalidateFailedDeleteVisibility:
             f.invalidate_cache()
         assert backend.store == {}
         assert _failed_delete_records(caplog) == []
+
+
+class MultiDeleteBackend(FlakyBackend):
+    """FlakyBackend with the internal multi-key delete: counts calls, fails chosen keys.
+
+    ``_delete_many`` reports every key in ``fail_keys`` as not deleted, raises
+    ``batch_error`` as a whole while it is set, and calls ``during_batch`` (if set) after
+    applying a batch, before returning to the sweep.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[str]] = []
+        self.single_deletes: list[str] = []
+        self.fail_keys: set[str] = set()
+        self.batch_error: Optional[BaseException] = None
+        self.during_batch: Optional[Any] = None
+
+    def delete(self, key: str) -> bool:
+        self.single_deletes.append(key)
+        return super().delete(key)
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        self.batches.append(list(keys))
+        if self.batch_error is not None:
+            raise self.batch_error
+        failed = {k for k in keys if k in self.fail_keys}
+        for k in keys:
+            if k not in failed:
+                self.store.pop(k, None)
+        if self.during_batch is not None:
+            self.during_batch(keys)
+        return failed
+
+
+class ScopedMultiDeleteBackend(MultiDeleteBackend):
+    """MultiDeleteBackend under a per-context tenant prefix; records every L2 read."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    @property
+    def key_prefix(self) -> str:
+        return f"t:{_tenant.get()}:"
+
+    def get(self, key: str) -> Optional[bytes]:
+        self.reads.append(self.key_prefix + key)
+        return super().get(self.key_prefix + key)
+
+    def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+        super().set(self.key_prefix + key, value, ttl)
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        return {k[len(self.key_prefix) :] for k in super()._delete_many([self.key_prefix + k for k in keys])}
+
+
+def _tracked(fn: Any) -> set[tuple[str, str]]:
+    from tests.unit.test_key_registry import _closure_cell
+
+    return _closure_cell(fn, "_cached_keys").cell_contents
+
+
+@pytest.mark.unit
+class TestInvalidateNoArgsMultiDelete:
+    """No-args invalidation batches L2 deletes on a backend with the internal multi-key delete."""
+
+    def test_capability_is_internal_and_class_level(self, tmp_path: Any) -> None:
+        import cachekit.backends as backends
+        from cachekit.cache_handler import _supports_multi_delete
+
+        assert _supports_multi_delete(MultiDeleteBackend())
+        assert not _supports_multi_delete(FlakyBackend())
+        assert not _supports_multi_delete(FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
+
+        class Dynamic(FlakyBackend):
+            def __getattr__(self, name: str) -> Any:
+                return lambda *a, **k: set()
+
+        assert not _supports_multi_delete(Dynamic())  # instance-level attributes do not count
+        assert not any("delete_many" in name.lower() or "multi" in name.lower() for name in backends.__all__)
+
+    def test_subclass_overriding_delete_loses_inherited_capability(self) -> None:
+        from cachekit.backends.memcached.backend import MemcachedBackend
+        from cachekit.backends.redis.backend import RedisBackend
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class PrefixedRedis(RedisBackend):
+            def delete(self, key: str) -> bool:
+                return super().delete("app:" + key)
+
+        class TunedRedis(RedisBackend):  # does not touch delete: keeps the batch path
+            pass
+
+        class PrefixedWithBatch(PrefixedRedis):  # re-declares a matching batch: keeps it
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return super()._delete_many(["app:" + k for k in keys])
+
+        for cls in (RedisBackend, MemcachedBackend, TunedRedis, PrefixedWithBatch):
+            assert _supports_multi_delete(object.__new__(cls)), cls
+        assert not _supports_multi_delete(object.__new__(PrefixedRedis))
+
+    def test_dynamic_or_instance_delete_loses_capability(self) -> None:
+        from cachekit.cache_handler import _supports_multi_delete
+
+        patched = MultiDeleteBackend()
+        patched.delete = lambda key: True  # type: ignore[method-assign]
+        assert not _supports_multi_delete(patched)
+
+        batch_patched = MultiDeleteBackend()
+        batch_patched._delete_many = lambda keys: set()  # type: ignore[method-assign]
+        assert not _supports_multi_delete(batch_patched)
+
+        class Dispatching(MultiDeleteBackend):
+            def __getattribute__(self, name: str) -> Any:
+                return object.__getattribute__(self, name)
+
+        assert not _supports_multi_delete(Dispatching())
+        assert _supports_multi_delete(MultiDeleteBackend())
+
+    def test_slots_backend_with_getattr_does_not_break_the_guard(self) -> None:
+        """A __slots__ backend has no instance __dict__; its __getattr__ must not answer for one."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Slotted:
+            __slots__ = ("store",)
+
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+
+            def __getattr__(self, name: str) -> Any:
+                if name == "__dict__":  # reached only through a plain getattr: slots leave no __dict__
+                    return lambda *a, **k: None  # not a container: `in` on it would raise TypeError
+                raise AttributeError(name)
+
+            def get(self, key: str) -> Optional[bytes]:
+                return self.store.get(key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                self.store[key] = value
+
+            def delete(self, key: str) -> bool:
+                return self.store.pop(key, None) is not None
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                for k in keys:
+                    self.store.pop(k, None)
+                return set()
+
+            def exists(self, key: str) -> bool:
+                return key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, Any]]:
+                return True, {"backend_type": "fake", "latency_ms": 0.0}
+
+        backend = Slotted()
+        assert _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_slots_getattr")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        assert f.invalidate_cache() is None
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_descriptor_backed_delete_loses_capability(self) -> None:
+        """A slot or property delete can differ per instance: no batch path, even beside _delete_many."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class SlottedDelete:
+            __slots__ = ("delete",)
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return set()
+
+        slotted = SlottedDelete()
+        slotted.delete = lambda key: True  # type: ignore[method-assign]
+        assert not _supports_multi_delete(slotted)
+
+        class PropertyDelete(MultiDeleteBackend):
+            @property
+            def delete(self) -> Any:  # type: ignore[override]
+                return lambda key: True
+
+            def _delete_many(self, keys: list[str]) -> set[str]:
+                return set()
+
+        assert not _supports_multi_delete(PropertyDelete())
+
+        class SlottedBatch:
+            __slots__ = ("_delete_many",)
+
+            def delete(self, key: str) -> bool:
+                return True
+
+        assert not _supports_multi_delete(SlottedBatch())
+
+    def test_slotted_prefixed_delete_sweeps_through_it(self) -> None:
+        """Kody's case end to end: a per-instance prefixing delete in a slot, beside a raw batch."""
+        from collections.abc import Callable
+
+        class Slotted:
+            __slots__ = ("store", "delete", "batches")
+
+            def __init__(self) -> None:
+                self.store: dict[str, bytes] = {}
+                self.batches: list[list[str]] = []
+                self.delete: Callable[[str], bool] = lambda key: self.store.pop("app:" + key, None) is not None
+
+            def get(self, key: str) -> Optional[bytes]:
+                return self.store.get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                self.store["app:" + key] = value
+
+            def _delete_many(self, keys: list[str]) -> set[str]:  # raw keys: wrong for this backend
+                self.batches.append(list(keys))
+                for k in keys:
+                    self.store.pop(k, None)
+                return set()
+
+            def exists(self, key: str) -> bool:
+                return "app:" + key in self.store
+
+            def health_check(self) -> tuple[bool, dict[str, Any]]:
+                return True, {"backend_type": "fake", "latency_ms": 0.0}
+
+        backend = Slotted()
+
+        @cache(backend=backend, ttl=60, namespace="multi_slotted_prefix")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_shadowed_instance_dict_delete_sweeps_through_it(self) -> None:
+        """A __dict__ property hides the real instance dict: the guard must still see its delete."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Shadowed(MultiDeleteBackend):
+            @property
+            def __dict__(self) -> dict[str, Any]:  # type: ignore[override]
+                return {}
+
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+        backend = Shadowed()
+        # Write into the real instance dict through the base class's own __dict__ descriptor.
+        base_dict = next(c.__dict__["__dict__"] for c in type(backend).__mro__[1:] if "__dict__" in c.__dict__)
+        parent = MultiDeleteBackend.delete.__get__(backend)
+        base_dict.__get__(backend)["delete"] = lambda key: parent("app:" + key)
+        assert backend.__dict__ == {}  # the shadow hides it
+        assert not _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_shadowed_dict")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_forged_bound_method_delete_sweeps_through_it(self) -> None:
+        """A callable exposing the class function as __func__ and the backend as __self__, but
+        prefixing keys when called, must not pass for the class's own bound method."""
+        from cachekit.cache_handler import _supports_multi_delete
+
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+        backend = Prefixed()
+
+        class Forged:
+            def __init__(self) -> None:  # instance attributes: a class-level function would bind
+                self.__func__ = MultiDeleteBackend.delete
+                self.__self__ = backend
+
+            def __call__(self, key: str) -> bool:
+                return MultiDeleteBackend.delete(backend, "app:" + key)
+
+        backend.delete = Forged()  # type: ignore[method-assign]
+        assert not _supports_multi_delete(backend)
+
+        @cache(backend=backend, ttl=60, namespace="multi_forged_method")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_raising_attribute_proxy_delete_never_raises(self) -> None:
+        """A delete wrapper whose __getattr__ raises KeyError (a dict-backed proxy): the guard
+        must not read attributes off it, and invalidate_cache() must still erase and return None."""
+
+        class Proxy:
+            def __init__(self, target: Any) -> None:
+                self._target = target
+
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                return self._target(*args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                raise KeyError(name)
+
+        backend = MultiDeleteBackend()
+        backend.delete = Proxy(backend.delete)  # type: ignore[method-assign]
+
+        @cache(backend=backend, ttl=60, namespace="multi_raising_proxy")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        assert f.invalidate_cache() is None
+        assert backend.batches == []  # per-key, through the wrapper
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_genuine_bound_method_in_instance_dict_keeps_capability(self) -> None:
+        """An instance entry that IS the class function bound to this backend behaves like it."""
+        import types
+
+        from cachekit.cache_handler import _supports_multi_delete
+
+        backend = MultiDeleteBackend()
+        backend.delete = types.MethodType(MultiDeleteBackend.delete, backend)  # type: ignore[method-assign]
+        assert _supports_multi_delete(backend)
+
+    def test_bound_to_another_instance_loses_capability(self) -> None:
+        from cachekit.cache_handler import _supports_multi_delete
+
+        a, b = MultiDeleteBackend(), MultiDeleteBackend()
+        b.delete = a.delete  # type: ignore[method-assign]  # right function, wrong self
+        assert not _supports_multi_delete(b)
+        assert _supports_multi_delete(a)
+
+    def test_dynamically_prefixed_delete_sweeps_through_it(self) -> None:
+        """An instance whose delete() rewrites keys: the sweep must not batch-delete the raw keys."""
+
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+            def __getattribute__(self, name: str) -> Any:
+                if name == "delete":
+                    parent = MultiDeleteBackend.delete.__get__(self)
+                    return lambda key: parent("app:" + key)
+                return object.__getattribute__(self, name)
+
+        backend = Prefixed()
+
+        @cache(backend=backend, ttl=60, namespace="multi_dynamic_prefix")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_subclass_overriding_delete_sweeps_through_its_delete(self) -> None:
+        class Prefixed(MultiDeleteBackend):
+            def get(self, key: str) -> Optional[bytes]:
+                return super().get("app:" + key)
+
+            def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> None:
+                super().set("app:" + key, value, ttl)
+
+            def delete(self, key: str) -> bool:
+                return super().delete("app:" + key)
+
+        backend = Prefixed()
+
+        @cache(backend=backend, ttl=60, namespace="multi_prefixed_subclass")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(3):
+            f(i)
+        f.invalidate_cache()
+        assert backend.batches == []  # the parent's batch would delete unprefixed keys
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_custom_backend_without_capability_keeps_per_key_loop(self) -> None:
+        deletes: list[str] = []
+
+        class Minimal(FlakyBackend):
+            def delete(self, key: str) -> bool:
+                deletes.append(key)
+                return super().delete(key)
+
+        backend = Minimal()
+
+        @cache(backend=backend, ttl=60, namespace="multi_minimal")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(5):
+            f(i)
+        f.invalidate_cache()
+        assert len(deletes) == 5
+        assert backend.store == {}
+
+    @pytest.mark.parametrize(("n", "calls"), [(5000, 1), (12_345, 2)])
+    def test_round_trips_bounded(self, n: int, calls: int) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace=f"multi_bounded_{n}")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(n):
+            f(i)
+        f.invalidate_cache()
+
+        assert len(backend.batches) == calls
+        assert all(len(b) <= 10_000 for b in backend.batches)
+        assert sum(len(b) for b in backend.batches) == n
+        assert backend.single_deletes == []
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+    def test_reported_failures_stay_tracked_and_are_counted(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_partial")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(10):
+            f(i)
+        failing = set(list(backend.store)[:2])
+        backend.fail_keys = failing
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+
+        assert {key for _, key in _tracked(f)} == failing
+        assert set(backend.store) == failing
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 2 L2 key" in records[0].getMessage()
+
+        backend.fail_keys = set()
+        backend.batches.clear()
+        f.invalidate_cache()  # the retry sends exactly the two failed keys
+        assert [set(b) for b in backend.batches] == [failing]
+        assert backend.store == {}
+
+    def test_batch_that_raises_falls_back_per_key(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_raise")
+        def f(x: int) -> int:
+            return x
+
+        for i in range(4):
+            f(i)
+        backend.batch_error = BackendError(_ERROR_TEXT)
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        warnings = [r for r in caplog.records if "Multi-key L2 delete failed" in r.getMessage()]
+        assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+        assert _ERROR_TEXT not in warnings[0].getMessage()
+        assert _failed_delete_records(caplog) == []  # the fallback succeeded
+        caplog.clear()
+        assert len(backend.batches) == 1
+        assert len(backend.single_deletes) == 4
+        assert backend.store == {}
+        assert _tracked(f) == set()
+
+        for i in range(4):
+            f(i)
+        backend.delete_error = OSError(_ERROR_TEXT)  # the per-key fallback fails too
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            f.invalidate_cache()
+        records = _failed_delete_records(caplog)
+        assert len(records) == 1
+        assert "delete 4 L2 key" in records[0].getMessage()
+        assert len(_tracked(f)) == 4
+
+    def test_l2_delete_precedes_trim_precedes_l1_eviction(self) -> None:
+        backend = MultiDeleteBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="multi_order")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        f(1)
+        f(2)
+        seen: dict[str, Any] = {}
+
+        def check(keys: list[str]) -> None:
+            seen["tracked"] = len(_tracked(f))
+            before = calls
+            f(1)  # still an L1 hit: L1 is evicted only after the batch returns
+            seen["l1_hit"] = calls == before
+
+        backend.during_batch = check
+        f.invalidate_cache()
+        assert seen == {"tracked": 2, "l1_hit": True}
+        backend.during_batch = None
+        f(1)
+        assert calls == 3  # L1 evicted after the batch
+
+    def test_rewrite_during_batch_stays_recorded(self) -> None:
+        backend = MultiDeleteBackend()
+
+        @cache(backend=backend, ttl=60, namespace="multi_rerecord", l1_enabled=False)
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        f(2)
+        backend.during_batch = lambda keys: f(1)  # a concurrent miss rewrites k after its delete
+        f.invalidate_cache()
+
+        assert len(_tracked(f)) == 1
+        (entry,) = _tracked(f)
+        assert entry[1] in backend.store
+        backend.during_batch = None
+        f.invalidate_cache()
+        assert backend.store == {}
+
+    def test_only_calling_tenants_keys_go_to_the_batch(self) -> None:
+        backend = ScopedMultiDeleteBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=60, namespace="multi_tenants")
+        def f(x: int) -> int:
+            nonlocal calls
+            calls += 1
+            return x
+
+        token = _tenant.set("b")
+        try:
+            f(1)
+            f(2)
+        finally:
+            _tenant.reset(token)
+        f(3)  # tenant a
+        b_keys = {k for k in backend.store if k.startswith("t:b:")}
+
+        f.invalidate_cache()  # as tenant a
+
+        assert len(backend.batches) == 1
+        assert all(k.startswith("t:a:") for k in backend.batches[0]) and len(backend.batches[0]) == 1
+        assert set(backend.store) == b_keys  # tenant b's L2 untouched
+        assert {scope for scope, _ in _tracked(f)} == {"t:b:"}  # and still tracked
+        backend.reads.clear()
+        token = _tenant.set("b")
+        try:
+            assert f(1) == 1
+        finally:
+            _tenant.reset(token)
+        assert calls == 3  # served from tenant b's surviving L2 value, not recomputed
+        assert backend.reads  # ...after an L1 miss: only tenant b's L1 copy was evicted

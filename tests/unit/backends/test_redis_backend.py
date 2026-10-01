@@ -1008,3 +1008,32 @@ class TestUnsupportedTenantIdRaisesThroughTheDecorator:
         assert calls == []
         breaker = lookup.get_health_status()["circuit_breaker"]
         assert (breaker["state"], breaker["failure_count"]) == ("closed", 0)
+
+
+@pytest.mark.unit
+class TestRedisDeleteMany:
+    """RedisBackend._delete_many: one UNLINK per call, raises as a whole."""
+
+    @staticmethod
+    def _backend(client: Mock) -> RedisBackend:
+        provider = Mock()
+        provider.get_sync_client.return_value = client
+        return RedisBackend(redis_url="redis://localhost:6379", client_provider=provider)
+
+    def test_one_unlink_for_all_keys(self) -> None:
+        client = Mock()
+        client.unlink.return_value = 1  # absent keys are still deleted
+        assert self._backend(client)._delete_many(["a", "b", "c"]) == set()
+        client.unlink.assert_called_once_with("a", "b", "c")
+        client.delete.assert_not_called()
+
+    def test_empty_sends_nothing(self) -> None:
+        client = Mock()
+        assert self._backend(client)._delete_many([]) == set()
+        client.unlink.assert_not_called()
+
+    def test_failure_raises_backend_error(self) -> None:
+        client = Mock()
+        client.unlink.side_effect = ConnectionError("reset")
+        with pytest.raises(BackendError):
+            self._backend(client)._delete_many(["a"])
