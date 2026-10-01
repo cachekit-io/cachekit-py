@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import string
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -652,3 +652,48 @@ class TestRequestSyncErrorClassification:
             backend._request_sync("GET", "some-key")
 
         assert exc_info.value.error_type == BackendErrorType.TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# TestMissWithoutException
+# ---------------------------------------------------------------------------
+
+
+_MISS_CALLS = [
+    ("get", None),
+    ("get_with_freshness", None),
+    ("exists", False),
+    ("delete", False),
+]
+
+
+@pytest.mark.unit
+class TestMissWithoutException:
+    """A 404 on a key read, exists or delete returns the miss without raising (LAB-7066).
+
+    The miss path must never build HTTPStatusError or a BackendError: that round-trip
+    is pure CPU on every cache miss.
+    """
+
+    @pytest.mark.parametrize(("method", "expected"), _MISS_CALLS)
+    def test_sync_miss_skips_error_path(
+        self, backend: CachekitIOBackend, mock_sync_client: MagicMock, method: str, expected: Any
+    ) -> None:
+        mock_sync_client.request.return_value = _make_response(404)
+        with patch("cachekit.backends.cachekitio.backend.classify_http_error") as classify:
+            assert getattr(backend, method)("missing-key") is expected
+        classify.assert_not_called()
+
+    @pytest.mark.parametrize(("method", "expected"), [(m, e) for m, e in _MISS_CALLS if m != "get_with_freshness"])
+    async def test_async_miss_skips_error_path(self, backend: CachekitIOBackend, method: str, expected: Any) -> None:
+        backend._async_client.request = AsyncMock(return_value=_make_response(404))
+        with patch("cachekit.backends.cachekitio.backend.classify_http_error") as classify:
+            assert await getattr(backend, f"{method}_async")("missing-key") is expected
+        classify.assert_not_called()
+
+    def test_404_outside_miss_paths_still_raises(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
+        """Only the opted-in callers treat 404 as a miss; a 404 on PUT stays a classified error."""
+        mock_sync_client.request.return_value = _make_response(404)
+        with pytest.raises(BackendError) as exc_info:
+            backend.set("some-key", b"data")
+        assert exc_info.value.error_type == BackendErrorType.PERMANENT
