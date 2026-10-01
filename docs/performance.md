@@ -11,7 +11,7 @@
 > [!TIP]
 > **Key numbers (p95 latency):**
 > - **L1 cache hit**: 500ns (pure dict lookup)
-> - **Decorator + L1 hit**: 30-50μs (realistic workload)
+> - **Decorator + L1 hit**: ~5.6μs median, CPython 3.12 (indicative wall clock; 78k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Complex payload (10KB dict)**: 242μs with serialization
 > - **DataFrame (10K rows, Arrow)**: 800μs total roundtrip
 > - **Concurrent access (10 threads)**: 231μs (minimal contention)
@@ -117,15 +117,11 @@ This measures the decorator machinery alone:
 
 ### Decorator + L1 Hit (Hot Path)
 
-**Mean: 32μs, p95: 36μs**
+**About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
 
-This is what users experience on cache hits. Overhead breakdown:
-- Decorator machinery: ~20μs
-- Argument processing: ~10μs
-- L1 cache lookup: ~0.5μs
-- Return value handling: ~5μs
+The deterministic figure is **78,344 instructions per call** on CPython 3.12 (81,539 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, metrics and the decorator's own bookkeeping are all inside that count.
 
-**72x slower than raw L1:** The decorator stack adds ~35.5μs on top of the 500ns L1 lookup, but this is still **50-1000x faster** than Redis (2-7ms).
+**About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
 
 ## Concurrent Access Performance
 
@@ -330,12 +326,12 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 - **Tune L1 size:** Increase `max_memory_mb` if needed (default: 100MB)
 - **Optimize L1 TTL:** Match L1 TTL to data freshness requirements
 
-### Bottleneck 3: Decorator Overhead (35μs)
+### Bottleneck 3: Decorator Overhead (~5μs)
 
-**Problem:** Decorator machinery adds 35μs on top of L1 cache.
+**Problem:** Decorator machinery adds ~5μs on top of the L1 lookup.
 
 **Mitigations:**
-- **This is acceptable:** 35μs is negligible compared to function execution time
+- **This is acceptable:** ~5μs is negligible compared to function execution time
 - **For ultra-low-latency:** Use direct `StandardCacheHandler` API (bypasses decorator)
 - **Batch queries:** Amortize decorator overhead across multiple items
 
@@ -365,20 +361,51 @@ if not found:
 
 ## Performance Regression Testing
 
-**Baseline targets** (fail CI if exceeded):
+Wall-clock benchmarks do not gate CI: on a shared machine their run-to-run noise is several percent. The wall-clock suites below are informational:
 
-```python notest
-# tests/performance/test_production_realism.py
-assert complex_dict_latency_p95 < 300_000  # 300μs
-assert dataclass_latency_p95 < 200_000     # 200μs
-assert concurrent_latency_p95 < 500_000    # 500μs
-assert encryption_overhead < 3.0           # 3x max
-```
-
-Run regression tests:
 ```bash
 uv run pytest tests/performance/ -v -m performance
 ```
+
+The regression gate is the instruction budget, run locally with `make perf-ir`.
+
+## Instruction Budgets
+
+`make perf-ir` counts the instructions each hot path executes per call and fails when any path costs **1% or more** above its committed budget. It warns from 0.2%. Instruction counts are deterministic where wall clock is not: repeat runs agree within 0.02% on every path except the Arrow round trip, which agrees within 0.2%.
+
+**Method** (`tests/performance/ir_budget.py`):
+- Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (log writer, L1 cleanup) vary by tens of percent between identical runs.
+- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel.
+- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower.
+- The L2 paths use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
+
+**Budgets** (instructions per call, `tests/performance/ir_baselines.json`):
+
+| Path | What one call does | CPython 3.12 | CPython 3.14 |
+|------|--------------------|-------------:|-------------:|
+| `l1_hit` | `@cache(backend=None)` L1 hit | 78,344 | 81,539 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,601 | 80,032 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 369,551 | 377,674 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 354,670 | 361,640 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,708 | 299,628 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 61,354 | 62,618 |
+| `serializer_auto` | `AutoSerializer` round trip | 110,228 | 113,486 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 23,758 | 23,728 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,961,754 | 1,958,074 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,946 | 118,078 |
+
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, with the release extension that `uv sync` builds.
+
+**Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by about 4,800 instructions (`l1_hit` +6.1%) and failed the gate, while the serializer paths stayed within 0.1%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
+
+**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered.
+
+```bash
+make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; a few minutes)
+make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
+```
+
+A deliberate cost increase (a new feature on the hot path) is recorded with `uv run python tests/performance/ir_budget.py --update --allow-increase`, and the PR states why.
 
 ## Real-World Performance Context
 

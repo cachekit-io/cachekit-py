@@ -17,6 +17,10 @@ self-calibration (`test_measurement_calibration.py`) — run before trusting any
 `gil_benchmark.py` reports serializer thread-scaling under the current interpreter.
 Run the whole battery with `make perf`; gate regressions with `make perf-compare`.
 
+**Instruction budgets.** `ir_budget.py` (`make perf-ir`) is the deterministic gate: main-thread
+callgrind instructions per call for each hot path, failing at +1% against `ir_baselines.json`.
+See [docs/performance.md](../../docs/performance.md#instruction-budgets).
+
 ---
 
 ## Test Organization
