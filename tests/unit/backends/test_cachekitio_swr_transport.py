@@ -69,13 +69,9 @@ class TestFreshnessRead:
         assert result == (b"payload", expected_stale, None)
 
     def test_miss_returns_none(self, backend: CachekitIOBackend) -> None:
-        err = BackendError(
-            "not found",
-            error_type=BackendErrorType.PERMANENT,
-            original_exception=httpx.HTTPStatusError("404", request=_DUMMY_REQUEST, response=_response(404)),
-        )
-        with patch.object(backend, "_request_sync", side_effect=err):
+        with patch.object(backend, "_request_sync", return_value=_response(404)) as request:
             assert backend.get_with_freshness("k") is None
+        assert request.call_args.kwargs["miss_on_404"] is True
 
     def test_non_404_error_propagates(self, backend: CachekitIOBackend) -> None:
         err = BackendError(

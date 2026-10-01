@@ -299,6 +299,8 @@ class CachekitIOBackend:
         self,
         method: str,
         endpoint: str,
+        *,
+        miss_on_404: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
         """Make sync HTTP request with error handling and metrics injection.
@@ -306,6 +308,9 @@ class CachekitIOBackend:
         Args:
             method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
             endpoint: API endpoint (relative to base_url/v1/cache/)
+            miss_on_404: Return a 404 response instead of raising. Key reads,
+                exists and delete treat 404 as a miss; skipping raise_for_status
+                saves the HTTPStatusError + BackendError round-trip on every miss.
             **kwargs: Additional request arguments
 
         Returns:
@@ -331,6 +336,8 @@ class CachekitIOBackend:
         url = f"/v1/cache/{endpoint}"
         try:
             response = self._sync_client.request(method, url, **kwargs)
+            if miss_on_404 and response.status_code == 404:
+                return response
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as exc:
@@ -349,6 +356,8 @@ class CachekitIOBackend:
         self,
         method: str,
         endpoint: str,
+        *,
+        miss_on_404: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
         """Make async HTTP request with error handling and metrics injection.
@@ -356,6 +365,9 @@ class CachekitIOBackend:
         Args:
             method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
             endpoint: API endpoint (relative to base_url/v1/cache/)
+            miss_on_404: Return a 404 response instead of raising. Key reads,
+                exists and delete treat 404 as a miss; skipping raise_for_status
+                saves the HTTPStatusError + BackendError round-trip on every miss.
             **kwargs: Additional request arguments
 
         Returns:
@@ -381,6 +393,8 @@ class CachekitIOBackend:
         url = f"/v1/cache/{endpoint}"
         try:
             response = await self._async_client.request(method, url, **kwargs)
+            if miss_on_404 and response.status_code == 404:
+                return response
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as exc:
@@ -410,15 +424,10 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails (network, auth, etc.)
         """
-        try:
-            response = self._request_sync("GET", self._encode_key(key))
-            return response.content
-        except BackendError as exc:
-            # 404 is not an error (cache miss)
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return None
-            raise
+        response = self._request_sync("GET", self._encode_key(key), miss_on_404=True)
+        if response.status_code == 404:
+            return None
+        return response.content
 
     @staticmethod
     def _is_stale(response: httpx.Response) -> bool:
@@ -464,14 +473,10 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails (network, auth, etc.)
         """
-        try:
-            response = self._request_sync("GET", self._encode_key(key))
-            return response.content, self._is_stale(response), self._fresh_for(response)
-        except BackendError as exc:
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return None
-            raise
+        response = self._request_sync("GET", self._encode_key(key), miss_on_404=True)
+        if response.status_code == 404:
+            return None
+        return response.content, self._is_stale(response), self._fresh_for(response)
 
     def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (sync).
@@ -512,15 +517,8 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        try:
-            self._request_sync("DELETE", self._encode_key(key))
-            return True
-        except BackendError as exc:
-            # 404 means key didn't exist (not an error for delete)
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return False
-            raise
+        response = self._request_sync("DELETE", self._encode_key(key), miss_on_404=True)
+        return response.status_code != 404
 
     def exists(self, key: str) -> bool:
         """Check if key exists in cache (sync).
@@ -534,16 +532,9 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        try:
-            # Use HEAD request (idiomatic HTTP for existence checks)
-            self._request_sync("HEAD", self._encode_key(key))
-            return True
-        except BackendError as exc:
-            # 404 means doesn't exist
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return False
-            raise
+        # Use HEAD request (idiomatic HTTP for existence checks)
+        response = self._request_sync("HEAD", self._encode_key(key), miss_on_404=True)
+        return response.status_code != 404
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check cachekit.io backend health (sync).
@@ -595,15 +586,10 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails (network, auth, etc.)
         """
-        try:
-            response = await self._request_async("GET", self._encode_key(key))
-            return response.content
-        except BackendError as exc:
-            # 404 is not an error (cache miss)
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return None
-            raise
+        response = await self._request_async("GET", self._encode_key(key), miss_on_404=True)
+        if response.status_code == 404:
+            return None
+        return response.content
 
     async def set_async(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (async).
@@ -633,15 +619,8 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        try:
-            await self._request_async("DELETE", self._encode_key(key))
-            return True
-        except BackendError as exc:
-            # 404 means key didn't exist (not an error for delete)
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return False
-            raise
+        response = await self._request_async("DELETE", self._encode_key(key), miss_on_404=True)
+        return response.status_code != 404
 
     async def exists_async(self, key: str) -> bool:
         """Check if key exists in cache (async).
@@ -655,16 +634,9 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        try:
-            # Use HEAD request (idiomatic HTTP for existence checks)
-            await self._request_async("HEAD", self._encode_key(key))
-            return True
-        except BackendError as exc:
-            # 404 means doesn't exist
-            if exc.original_exception and isinstance(exc.original_exception, httpx.HTTPStatusError):
-                if exc.original_exception.response.status_code == 404:
-                    return False
-            raise
+        # Use HEAD request (idiomatic HTTP for existence checks)
+        response = await self._request_async("HEAD", self._encode_key(key), miss_on_404=True)
+        return response.status_code != 404
 
     async def health_check_async(self) -> tuple[bool, dict[str, Any]]:
         """Check cachekit.io backend health (async).
