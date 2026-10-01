@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID
 
@@ -43,6 +43,20 @@ class TestCacheKeyGenerator:
         assert isinstance(key, str)
         assert len(key) > 0
         assert "test_func" in key
+
+    def test_func_name_memo_is_bounded(self):
+        """_sanitize_func_name is memoised, and the memo has a size cap (LAB-7068)."""
+        assert CacheKeyGenerator._sanitize_func_name.cache_info().maxsize == 1024
+
+    def test_qualname_change_still_changes_key(self, key_generator):
+        """The func memo is keyed per call on (module, qualname), not frozen at first use."""
+
+        def func(x):
+            return x
+
+        before = key_generator.generate_key(func, (1,), {})
+        func.__qualname__ = "renamed"
+        assert key_generator.generate_key(func, (1,), {}) != before
 
     def test_key_includes_function_module_and_name(self, key_generator):
         """Test that key includes function module and name."""
@@ -405,6 +419,28 @@ class TestExtendedTypeNormalization:
 
         assert key1 == key2
         assert key1 != key3
+
+    def test_int_and_str_enum_members_normalize_to_plain_value(self, key_generator):
+        """IntEnum and str-mixin Enums are int/str subclasses but must take the Enum branch.
+
+        The primitive fast path matches exact types only; an isinstance match would
+        return the member itself, which msgpack strict_types rejects (LAB-7068).
+        """
+
+        class Level(IntEnum):
+            LOW = 1
+
+        class Mode(str, Enum):
+            FAST = "fast"
+
+        assert type(key_generator._normalize(Level.LOW)) is int
+        assert type(key_generator._normalize(Mode.FAST)) is str
+
+        def func(x):
+            return x
+
+        assert key_generator.generate_key(func, (Level.LOW,), {}) == key_generator.generate_key(func, (1,), {})
+        assert key_generator.generate_key(func, (Mode.FAST,), {}) == key_generator.generate_key(func, ("fast",), {})
 
     def test_datetime_utc_only(self, key_generator):
         """Datetime normalizes to ISO format (UTC required)."""
