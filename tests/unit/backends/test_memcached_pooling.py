@@ -148,6 +148,9 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
     stop = threading.Event()
     errors: list[str] = []
     finished: list[int] = []  # a worker killed by a non-BackendError never gets here
+    # Set after a worker's first completed set/get pair, so the sweep cannot finish before
+    # every worker is issuing commands.
+    started = [threading.Event() for _ in range(3)]
 
     def worker(tid: int) -> None:
         i = 0
@@ -159,15 +162,18 @@ def test_concurrent_ops_during_sweep_do_not_share_a_socket(server: FakeMemcached
                 got = backend.get(key)
                 if got != value:
                     errors.append(f"thread {tid}: {key} -> {got!r}, expected {value!r}")
+                started[tid].set()
             except BackendError as exc:
                 errors.append(f"thread {tid}: {type(exc).__name__}: {exc}")
             i += 1
         finished.append(tid)
 
-    threads = [threading.Thread(target=worker, args=(t,)) for t in range(3)]
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(len(started))]
     for t in threads:
         t.start()
     try:
+        for tid, event in enumerate(started):
+            assert event.wait(timeout=5), f"worker {tid} never completed a set/get pair"
         reported_absent = []
         for key in tracked:
             try:
