@@ -7,15 +7,19 @@ vector that also evicts every other useful entry). Such values still live in L2.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
+import select
+import signal
 import threading
 import time
-from collections import OrderedDict
+from collections.abc import Callable
+from typing import NoReturn
 
 import pytest
 
-from cachekit.l1_cache import L1Cache, L1CacheManager
+from cachekit.l1_cache import CacheEntry, L1Cache, L1CacheManager
 
 MB = 1024 * 1024
 
@@ -28,7 +32,7 @@ class TestOversizedEntryRejection:
 
         found, _ = cache.get("big")
         assert found is False
-        assert cache._current_memory_bytes == 0
+        assert cache._state.memory_bytes == 0
 
     def test_rejected_oversized_put_does_not_evict_existing_entries(self):
         """A doomed oversized put must not evict good entries on its way to failing."""
@@ -39,7 +43,7 @@ class TestOversizedEntryRejection:
 
         assert cache.get("keep")[0] is True  # survivor
         assert cache.get("toobig")[0] is False
-        assert cache._current_memory_bytes <= cache.max_memory_bytes
+        assert cache._state.memory_bytes <= cache.max_memory_bytes
 
     def test_oversized_update_drops_stale_smaller_entry(self):
         """An oversized put for an EXISTING key must drop the stale value, not serve it."""
@@ -50,7 +54,7 @@ class TestOversizedEntryRejection:
         cache.put("k", b"\x00" * (5 * MB), redis_ttl=300)  # same key, now oversized
 
         assert cache.get("k")[0] is False  # stale smaller value evicted, not served
-        assert cache._current_memory_bytes == 0
+        assert cache._state.memory_bytes == 0
 
     def test_entry_equal_to_budget_is_stored(self):
         cache = L1Cache(max_memory_mb=1)
@@ -67,7 +71,7 @@ class TestOversizedEntryRejection:
         for i in range(20):
             cache.put(f"k{i}", b"\x00" * (300 * 1024), redis_ttl=300)  # 300KB each
         cache.put("huge", b"\x00" * (50 * MB), redis_ttl=300)  # rejected
-        assert cache._current_memory_bytes <= cache.max_memory_bytes
+        assert cache._state.memory_bytes <= cache.max_memory_bytes
 
 
 @pytest.mark.unit
@@ -79,14 +83,14 @@ class TestL1NonFiniteTtl:
         cache = L1Cache(max_memory_mb=10)
         cache.put("k", b"value", redis_ttl=bad_ttl)
         assert cache.get("k")[0] is False
-        assert cache._current_memory_bytes == 0
+        assert cache._state.memory_bytes == 0
 
     @pytest.mark.parametrize("bad_ttl", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_expires_at_not_stored(self, bad_ttl):
         cache = L1Cache(max_memory_mb=10)
         cache.put("k", b"value", expires_at=bad_ttl)
         assert cache.get("k")[0] is False
-        assert cache._current_memory_bytes == 0
+        assert cache._state.memory_bytes == 0
 
 
 @pytest.mark.unit
@@ -132,7 +136,7 @@ class TestConfiguredBudgetWiring:
         for i in range(5):  # 5 x 512KB = 2.5MB > 2MB budget
             cache.put(f"k{i}", b"\x00" * (512 * 1024), redis_ttl=300)
 
-        assert cache._current_memory_bytes <= 2 * MB
+        assert cache._state.memory_bytes <= 2 * MB
         assert cache.get("k0")[0] is False  # oldest evicted
         assert cache.get("k4")[0] is True  # newest survives
         assert cache._evictions > 0
@@ -228,6 +232,39 @@ def _wait_for(predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
+def _report(w: int, outcome: object) -> NoReturn:
+    """End a child forked with os.fork() with an outcome for its parent; never return into pytest."""
+    try:
+        os.write(w, repr(outcome).encode())  # literals only: ast.literal_eval reads it
+    finally:
+        os._exit(0)
+
+
+def _child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
+    """What the child at pid reported on the pipe r; a hung child is killed."""
+    assert pid > 0, "no child was forked"  # os.kill(0, ...) would signal pytest's whole process group
+    data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
+    if not data:
+        os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    os.close(r)
+    return ast.literal_eval(data.decode()) if data else "no outcome: the child hung or died"
+
+
+def _on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
+    """fn's result from a new thread, or "hung" if it holds the thread past timeout."""
+    out: list[object] = []
+    thread = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return out[0] if out else "hung"
+
+
+def _consistent(cache: L1Cache) -> bool:
+    s = cache._state
+    return s.memory_bytes == sum(entry.size_bytes for entry in s.cache.values())
+
+
 def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
     """Leave the manager in the state fork() hands a child: dead thread, foreign owner."""
     manager._cleanup_thread = threading.Thread(target=lambda: None) if parent_ran_cleanup else None
@@ -289,7 +326,7 @@ class TestCleanupThreadAfterFork:
         held, release = threading.Event(), threading.Event()
 
         def hold() -> None:
-            with cache._lock:
+            with cache._state.lock:
                 held.set()
                 release.wait()
 
@@ -349,11 +386,11 @@ class TestCleanupThreadAfterFork:
             queue = ctx.Queue()
 
             def child(q) -> None:
-                lock = busy._lock  # the hook found it free at fork and kept it
+                lock = busy._state.lock  # the hook found it free at fork and kept it
                 held, release = threading.Event(), threading.Event()
 
                 def hold() -> None:
-                    with busy._lock:
+                    with busy._state.lock:
                         held.set()
                         release.wait(10)
 
@@ -363,7 +400,7 @@ class TestCleanupThreadAfterFork:
                 other.put("k", b"v")  # first put runs the take-over while a live child thread holds busy-ns
                 release.set()
                 holder.join(5)
-                q.put({"same_lock": busy._lock is lock, "found": busy.get("pre-fork")[0]})
+                q.put({"same_lock": busy._state.lock is lock, "found": busy.get("pre-fork")[0]})
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -403,7 +440,7 @@ class TestCleanupThreadAfterFork:
         held, release = [threading.Event() for _ in caches], threading.Event()
 
         def hold(cache: L1Cache, done: threading.Event) -> None:
-            with cache._lock:
+            with cache._state.lock:
                 done.set()
                 release.wait()
 
@@ -450,8 +487,8 @@ class TestCleanupThreadAfterFork:
         orphaned = []
         for cache in caches:
             cache.put("pre-fork", b"v")
-            cache._lock.acquire()  # _is_owned(): the hook resets it, as for a hold orphaned at fork
-            orphaned.append(cache._lock)
+            cache._state.lock.acquire()  # _is_owned(): the hook resets it, as for a hold orphaned at fork
+            orphaned.append(cache._state.lock)
 
         class RaiseOnDropWarning(logging.Filter):
             def filter(self, record: logging.LogRecord) -> bool:
@@ -467,7 +504,7 @@ class TestCleanupThreadAfterFork:
         finally:
             l1_cache.logger.removeFilter(raising)
 
-        assert [cache._lock is lock for cache, lock in zip(caches, orphaned, strict=True)] == [False, False]
+        assert [cache._state.lock is lock for cache, lock in zip(caches, orphaned, strict=True)] == [False, False]
         assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
         assert manager._locks_reset_pid == os.getpid()
 
@@ -481,27 +518,179 @@ class TestCleanupThreadAfterFork:
         assert manager._cleanup_thread is None
         assert manager._owner_pid == os.getpid()
 
-    def test_orphaned_cache_lock_drop_is_exclusive_and_logged(self, caplog):
+    def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs(self, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("orphan-ns")
         cache.put("pre-fork", b"v")
-        held_bytes = cache._current_memory_bytes
+        old = cache._state
+        held_bytes = old.memory_bytes
         _as_if_forked(manager, parent_ran_cleanup=False)
-        orphaned = cache._lock
-        orphaned.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
+        old.lock.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
+        try:
+            with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
+                cache.put("k", b"v")
+        finally:
+            old.lock.release()
 
-        class ClearUnderOrphanedLock(OrderedDict):
-            def clear(self) -> None:
-                assert cache._lock is orphaned  # a fresh lock here would let a get() in mid-clear
-                super().clear()
-
-        cache._cache = ClearUnderOrphanedLock(cache._cache)
-        with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
-            cache.put("k", b"v")
-
+        assert cache._state is not old
+        # A holder still inside a critical section finds its state as it left it.
+        assert list(old.cache) == ["pre-fork"] and old.memory_bytes == held_bytes
         assert not cache.get("pre-fork")[0] and cache.get("k")[0]
-        # Logged after the clear, but with what the cache held before it.
         assert any(f"dropped 1 entries ({held_bytes} bytes)" in r.message for r in caplog.records)
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_fork_inside_a_critical_section_lets_the_child_finish_it(self, monkeypatch):
+        """A fork from a signal handler or finalizer inside get(): the child returns into it."""
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("fork-in-get-ns")
+        cache.put("k", b"v")
+        real = CacheEntry.is_expired
+        parent, (r, w) = os.getpid(), os.pipe()
+        child = 0
+
+        def fork_here(entry: CacheEntry) -> bool:  # runs inside get()'s critical section
+            nonlocal child
+            monkeypatch.setattr(CacheEntry, "is_expired", real)
+            child = os.fork()
+            return real(entry)
+
+        monkeypatch.setattr(CacheEntry, "is_expired", fork_here)
+        try:
+            found = cache.get("k")
+        except BaseException as e:
+            if os.getpid() != parent:
+                _report(w, {"error": repr(e)})  # the reset emptied the dict under the in-flight get()
+            raise
+        if os.getpid() != parent:
+            try:
+                outcome = {
+                    "found": found,
+                    "consistent": _consistent(cache),
+                    "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                }
+            except BaseException as e:
+                outcome = {"error": repr(e)}
+            _report(w, outcome)
+        os.close(w)
+
+        assert child, "get() no longer calls CacheEntry.is_expired"
+        assert _child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_fork_inside_a_critical_section_the_child_never_leaves(self, monkeypatch):
+        """multiprocessing's child runs its target, then os._exit()s without unwinding to the critical section."""
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("fork-never-returns-ns")
+        cache.put("pre-fork", b"v")
+        real = CacheEntry.is_expired
+        r, w = os.pipe()
+        child = 0
+
+        def fork_here(entry: CacheEntry) -> bool:
+            nonlocal child
+            monkeypatch.setattr(CacheEntry, "is_expired", real)
+            child = os.fork()
+            if child == 0:
+                try:  # this thread holds the old lock for good, so new threads must not need it
+                    outcome = {
+                        "pre_fork": _on_new_thread(lambda: cache.get("pre-fork")),
+                        "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                    }
+                except BaseException as e:
+                    outcome = {"error": repr(e)}
+                _report(w, outcome)
+            return real(entry)
+
+        monkeypatch.setattr(CacheEntry, "is_expired", fork_here)
+        assert cache.get("pre-fork") == (True, b"v")
+        os.close(w)
+        assert child, "get() no longer calls CacheEntry.is_expired"
+
+        # The fork dropped the namespace's entries; L2 still has them.
+        assert _child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_hookless_take_over_past_a_live_holder_leaves_it_unharmed(self, monkeypatch):
+        """Without hooks (uWSGI), a child thread stalled inside get() past the 1 s probe looks orphaned."""
+        import weakref
+
+        from cachekit import l1_cache
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet())  # hide it from the at-fork hook
+        cache = manager.get_cache("slow-holder-ns")
+        cache.put("pre-fork", b"v")
+        r, w = os.pipe()
+        child = os.fork()
+        if child == 0:
+            try:
+                stalled, resume = threading.Event(), threading.Event()
+                real = CacheEntry.is_expired
+
+                def stall(entry: CacheEntry) -> bool:
+                    if threading.current_thread().name == "holder":
+                        stalled.set()
+                        resume.wait(10)
+                    return real(entry)
+
+                CacheEntry.is_expired = stall  # child-only, so nothing to restore
+                got: list[object] = []
+
+                def hold() -> None:
+                    try:
+                        got.append(cache.get("pre-fork"))
+                    except BaseException as e:  # the reset emptied the dict under the stalled get()
+                        got.append(repr(e))
+
+                holder = threading.Thread(target=hold, name="holder")
+                holder.start()
+                assert stalled.wait(5)
+                cache.put("k", b"v")  # the first put: the take-over probes for 1 s, then resets
+                resume.set()
+                holder.join(5)
+                outcome = {"holder": got, "found": cache.get("k"), "consistent": _consistent(cache)}
+            except BaseException as e:
+                outcome = {"error": repr(e)}
+            _report(w, outcome)
+        os.close(w)
+
+        assert _child_outcome(child, r) == {"holder": [(True, b"v")], "found": (True, b"v"), "consistent": True}
+
+    def test_invalidation_queued_behind_a_replaced_lock_reaches_the_fresh_state(self):
+        cache = L1Cache(namespace="requeue-ns")
+        old = cache._state
+        real_lock = old.lock
+        held, waiting, release = threading.Event(), threading.Event(), threading.Event()
+
+        class SignalOnWait:  # the old lock, announcing when the invalidating thread queues on it
+            def __enter__(self) -> None:
+                waiting.set()
+                real_lock.acquire()
+
+            def __exit__(self, *exc: object) -> None:
+                real_lock.release()
+
+        def hold() -> None:
+            with real_lock:
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        assert held.wait(5)
+        old.lock = SignalOnWait()  # type: ignore[assignment]
+        invalidator = threading.Thread(target=cache.invalidate, args=("k",))
+        invalidator.start()
+        assert waiting.wait(5)
+        old.lock = real_lock  # the reset probes it directly
+        cache._reset_lock_after_fork(timeout=0)  # a take-over judging the live hold orphaned
+        cache.put("k", b"stale")  # read from L2 before the invalidation, stored after the reset
+        release.set()
+        holder.join(5)
+        invalidator.join(5)
+
+        assert not invalidator.is_alive()
+        assert cache.get("k") == (False, None)
 
     def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
