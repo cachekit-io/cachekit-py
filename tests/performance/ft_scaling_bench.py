@@ -22,11 +22,13 @@ Cells, each at 1, 4 and 16 threads:
 
 Every thread starts at a barrier, warms up, then counts calls for a fixed time. Counts are summed
 after the threads join, so no lock sits in the timed loop. The primary metric is scaling: calls/s at
-N threads over calls/s at 1 thread, within one process. The summary prints the median and min-max
-over reps and each arm's difference from ft-nogil with a 95% bootstrap CI. It drops any process whose
-GIL state changed while the cells ran, and flags a cell TAINTED when a timed call was not a hit (a
-backend error falls back to computing). A difference counts only if its CI excludes 0 and it is
-larger than the ft-nogil-aa difference.
+N threads over calls/s at 1 thread, within one process. It drops any process whose GIL state changed
+while the cells ran, and flags a cell TAINTED, and leaves it out of every statistic, when a timed call
+was not a hit or a backend call raised: such a cell measures fallback throughput, not cache hits. The
+summary prints the median and min-max over clean reps. Each rep is a session block that holds every
+arm, so each arm's difference from ft-nogil is paired by rep, and its 95% CI resamples whole reps;
+with fewer than MIN_CLEAN_PAIRS clean pairs it prints "insufficient clean reps" instead. A difference
+counts only if its CI excludes 0 and it is larger than the ft-nogil-aa difference.
 
 The free-threaded interpreter should come from an environment without the [data] and [json] extras,
 for example ``uv sync --python 3.14t --no-default-groups --group test``: some of their builds
@@ -65,6 +67,8 @@ ARMS = {
 }
 EXPECTED_GIL = {"ft-nogil": False, "ft-nogil-aa": False, "ft-gil": True, "gil-build": True}
 CELL_TIMEOUT_S = 600
+BOOTSTRAP_RESAMPLES = 2000
+MIN_CLEAN_PAIRS = 5  # below this a bootstrap CI over reps is not worth printing
 
 
 def _gil_enabled() -> bool:
@@ -348,27 +352,35 @@ def summarise(path: Path) -> None:
     loads = [r["load_start"][0] for r in kept] + [r["load_end"][0] for r in kept]
     if kept:
         print(f"1-min load average {min(loads):.1f}-{max(loads):.1f}; cpus allowed {sorted({r['cpus_allowed'] for r in kept})}")
-    calls: dict[tuple[str, str, int], list[float]] = defaultdict(list)
-    scaling: dict[tuple[str, str, int], list[float]] = defaultdict(list)
+    # Only clean cells (every timed call a hit, no backend raise) enter the statistics; a tainted cell
+    # measures fallback throughput, not cache-hit scaling. A ratio needs its 1-thread cell clean too.
+    calls: dict[tuple[str, str, int], dict[int, float]] = defaultdict(dict)
+    scaling: dict[tuple[str, str, int], dict[int, float]] = defaultdict(dict)
     gil: dict[str, set[bool]] = defaultdict(set)
+    tainted: dict[tuple[str, str, int], list[int]] = defaultdict(lambda: [0, 0, 0])
     for r in kept:
         gil[r["arm"]].add(r["gil_before_cells"])
-        by_cell = {(c["scenario"], c["threads"]): c["calls_per_s"] for c in r["results"]}
-        for (scenario, n), value in by_cell.items():
-            calls[(r["arm"], scenario, n)].append(value)
-            if by_cell[(scenario, 1)]:  # a 1-thread cell with no completed call has no ratio
-                scaling[(r["arm"], scenario, n)].append(value / by_cell[(scenario, 1)])
+        clean = {}
+        for c in r["results"]:
+            key = (r["arm"], c["scenario"], c["threads"])
+            if c["misses"] or c["backend_errors"]:
+                counts = tainted[key]
+                counts[0] += 1
+                counts[1] += c["misses"]
+                counts[2] += c["backend_errors"]
+            else:
+                clean[(c["scenario"], c["threads"])] = c["calls_per_s"]
+        for (scenario, n), value in clean.items():
+            calls[(r["arm"], scenario, n)][r["rep"]] = value
+            if clean.get((scenario, 1)):  # a 1-thread cell with no completed call has no ratio
+                scaling[(r["arm"], scenario, n)][r["rep"]] = value / clean[(scenario, 1)]
     arms = [arm for arm in ARMS if arm in gil]
     print("arm GIL state during the cells: " + ", ".join(f"{arm}={sorted(gil[arm])}" for arm in arms))
-    tainted: dict[tuple[str, str, int], list[int]] = defaultdict(lambda: [0, 0])
-    for r in kept:
-        for c in r["results"]:
-            counts = tainted[(r["arm"], c["scenario"], c["threads"])]
-            counts[0] += c["misses"]
-            counts[1] += c["backend_errors"]
-    for (arm, scenario, n), (misses, errors) in sorted(tainted.items()):
-        if misses or errors:
-            print(f"TAINTED {arm} {scenario} {n}t: {misses} timed calls were not hits, {errors} backend calls raised")
+    for (arm, scenario, n), (reps, misses, errors) in sorted(tainted.items()):
+        print(
+            f"TAINTED {arm} {scenario} {n}t: excluded from {reps} reps "
+            f"({misses} timed calls were not hits, {errors} backend calls raised)"
+        )
     for r in kept:
         for c in r["results"]:
             if (c.get("fake_busiest_worker") or 0) > 0.8:
@@ -377,31 +389,34 @@ def summarise(path: Path) -> None:
                     f"{c['fake_busiest_worker']:.0%} busy, so the fake may set this cell's ceiling"
                 )
     for title, table, fmt in (("calls/s", calls, ",.0f"), ("scaling vs 1 thread", scaling, ".2f")):
-        print(f"\n{title}: median (min-max) over reps")
-        print(f"{'scenario':<11}{'thr':>4}  " + "".join(f"{arm:>28}" for arm in arms))
+        print(f"\n{title}: median (min-max) over clean reps, [n clean]")
+        print(f"{'scenario':<11}{'thr':>4}  " + "".join(f"{arm:>32}" for arm in arms))
         for scenario in SCENARIOS:
             for n in THREADS:
-                cells = [_spread(table[(arm, scenario, n)], fmt) if table[(arm, scenario, n)] else "-" for arm in arms]
-                print(f"{scenario:<11}{n:>4}  " + "".join(f"{cell:>28}" for cell in cells))
+                values = [list(table[(arm, scenario, n)].values()) for arm in arms]
+                cells = [f"{_spread(v, fmt)} [{len(v)}]" if v else "- [0]" for v in values]
+                print(f"{scenario:<11}{n:>4}  " + "".join(f"{cell:>32}" for cell in cells))
     if "ft-nogil" not in arms:
         return
-    print("\nscaling, arm minus ft-nogil: median difference [95% bootstrap CI over reps]")
+    print(
+        f"\nscaling, arm minus ft-nogil: median of per-rep paired differences [95% CI, {BOOTSTRAP_RESAMPLES} "
+        "resamples of whole reps]"
+    )
+    print("each rep is a session block holding every arm; only reps where both cells are clean pair up")
     print("the ft-nogil-aa row is the A/A floor: a difference counts only if its CI excludes 0 and it exceeds the floor")
     rng = random.Random(0)
+    lo, hi = int(BOOTSTRAP_RESAMPLES * 0.025), int(BOOTSTRAP_RESAMPLES * 0.975) - 1
     for arm in [a for a in arms if a != "ft-nogil"]:
         for scenario in SCENARIOS:
             parts = []
             for n in THREADS[1:]:
                 ref, other = scaling[("ft-nogil", scenario, n)], scaling[(arm, scenario, n)]
-                if not ref or not other:
-                    parts.append(f"{n}t -")
+                paired = [other[rep] - ref[rep] for rep in sorted(ref.keys() & other.keys())]
+                if len(paired) < MIN_CLEAN_PAIRS:
+                    parts.append(f"{n}t insufficient clean reps ({len(paired)} < {MIN_CLEAN_PAIRS})")
                     continue
-                diffs = sorted(
-                    statistics.median(rng.choices(other, k=len(other))) - statistics.median(rng.choices(ref, k=len(ref)))
-                    for _ in range(2000)
-                )
-                diff = statistics.median(other) - statistics.median(ref)
-                parts.append(f"{n}t {diff:+.2f} [{diffs[50]:+.2f}, {diffs[1949]:+.2f}]")
+                boot = sorted(statistics.median(rng.choices(paired, k=len(paired))) for _ in range(BOOTSTRAP_RESAMPLES))
+                parts.append(f"{n}t {statistics.median(paired):+.2f} [{boot[lo]:+.2f}, {boot[hi]:+.2f}] n={len(paired)}")
             print(f"  {arm:<12}{scenario:<11}" + "  ".join(parts))
 
 
@@ -411,7 +426,7 @@ def main() -> None:
     parser.add_argument("--gil-python", help="default (GIL) build with cachekit installed; adds the gil-build arm")
     parser.add_argument("--arms", help=f"comma-separated subset of {','.join(ARMS)} (default: all available)")
     parser.add_argument("--reps", type=int, default=5)
-    parser.add_argument("--out", default="ft-scaling.jsonl", help="JSONL results, appended to")
+    parser.add_argument("--out", default="ft-scaling.jsonl", help="JSONL results file; must not exist yet")
     parser.add_argument("--dur", type=float, default=1.2, help="seconds counted per cell")
     parser.add_argument("--warm", type=float, default=0.25, help="seconds of warm-up per cell")
     parser.add_argument("--cpus", help="taskset CPU list for the arm processes, e.g. 0-15")

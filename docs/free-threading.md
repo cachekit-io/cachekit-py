@@ -168,15 +168,19 @@ python tests/performance/ft_scaling_bench.py --ft-python <ft-env>/bin/python \
 ```
 
 The primary metric is scaling: calls/s at N threads over calls/s at one
-thread, within one process. The summary gives the median and min–max over
-repetitions, and each arm's difference from `ft-nogil` with a 95% bootstrap
-CI. A difference counts only if its CI excludes zero and it is larger than the
-`ft-nogil-aa` floor. The driver stops if an arm ran under the wrong GIL state
-or `--ft-python` is not a free-threaded build, and refuses an existing `--out`
-file so two sessions are never pooled. The summary drops a process whose GIL
-state changed while the cells ran, and flags a cell as `TAINTED` when a timed
-call was not a hit, which usually means the backend raised and the call fell
-back to computing.
+thread, within one process. A cell is `TAINTED` when a timed call was not a
+hit or a backend call raised, which usually means the backend failed and the
+call fell back to computing; a tainted cell measures that fallback, so it is
+left out of every statistic. The summary gives the median and min–max over
+clean repetitions. Each repetition is a session block that holds every arm,
+so each arm's difference from `ft-nogil` is paired by repetition, with a 95%
+bootstrap CI that resamples whole repetitions; with fewer than five clean
+pairs it prints "insufficient clean reps" instead of a CI. A difference counts
+only if its CI excludes zero and it is larger than the `ft-nogil-aa` floor.
+The driver stops if an arm ran under the wrong GIL state or `--ft-python` is
+not a free-threaded build, and refuses an existing `--out` file so two
+sessions are never pooled. The summary also drops a process whose GIL state
+changed while the cells ran.
 
 Today the CachekitIO cell is tainted under no-GIL. Threads that share one
 backend share one HTTP/2 connection, and httpcore's sync HTTP/2 send path
