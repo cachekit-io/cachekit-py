@@ -197,6 +197,8 @@ class AsyncMetricsCollector:
         self._queue = None
         self._stopped = None
         self._worker_thread = None
+        # The process that owns the queue, stop event, worker and pool lock; see _take_over_if_forked.
+        self._owner_pid = os.getpid()
         self._dropped_metrics = 0
         # Keyed by pid, like _metrics_locks: a child forked while a thread was mid-switch must not wait
         # on the copy of the lock that thread still holds, because the thread does not exist in the child.
@@ -230,7 +232,7 @@ class AsyncMetricsCollector:
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
 
-        if self._sync_mode:
+        if self._sync_mode or not self._may_enqueue():
             self._record_cache_operation_sync(operation, namespace, success, duration_ms, serializer, size_bytes)
         else:
             self._record_cache_operation_async(operation, namespace, success, duration_ms, serializer, size_bytes)
@@ -242,7 +244,7 @@ class AsyncMetricsCollector:
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
 
-        if self._sync_mode:
+        if self._sync_mode or not self._may_enqueue():
             self._record_circuit_breaker_sync(namespace, state, transitions)
         else:
             self._record_circuit_breaker_async(namespace, state, transitions)
@@ -270,7 +272,7 @@ class AsyncMetricsCollector:
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
 
-        if self._sync_mode:
+        if self._sync_mode or not self._may_enqueue():
             self._record_counter_sync(metric_name, labels or {}, value)
         else:
             self._record_counter_async(metric_name, labels or {}, value)
@@ -298,7 +300,7 @@ class AsyncMetricsCollector:
         if self.auto_detect_mode and self._should_check_mode():
             self._maybe_switch_mode()
 
-        if self._sync_mode:
+        if self._sync_mode or not self._may_enqueue():
             self._record_histogram_sync(metric_name, value, labels or {})
         else:
             self._record_histogram_async(metric_name, value, labels or {})
@@ -578,10 +580,19 @@ class AsyncMetricsCollector:
         }
 
     def shutdown(self, timeout: float = 5.0):
-        """Gracefully shutdown the metrics collector."""
+        """Stop the batching worker, waiting up to ``timeout`` seconds for it to flush every record queued so far.
+
+        The collector then records synchronously: a later record reaches its metric on the caller's thread, and no
+        mode check starts a worker again. A record that another thread was already queueing as this ran can land
+        after the worker's final drain, and is never flushed; that loses at most one record per such thread.
+        """
+        # A forked child must not set its parent's stop event or join its parent's worker.
+        self._take_over_if_forked()
         # Under the mode lock, so a switch back to batched mode cannot restart the worker after this stops it.
         with self._mode_lock():
             self._shutdown_requested = True
+            # Before stopping the worker, so a record made from here on cannot queue behind it.
+            self._sync_mode = True
             if self._stopped is not None:
                 self._stopped.set()
             worker = self._worker_thread
@@ -594,7 +605,8 @@ class AsyncMetricsCollector:
 
         Returns False, starting nothing, while the previous worker is still alive: a stopped worker keeps
         reading the queue until its exit drain finishes, and that drain assumes it is the only consumer.
-        The queue is reused, never replaced, so producers always have one to put on.
+        Within a process the queue is reused, never replaced, so producers always have one to put on. Only
+        ``_take_over_if_forked`` replaces it, which a mode switch runs first.
         """
         if self._queue is None or self._stopped is None:
             self._queue = queue.Queue(maxsize=self.max_queue_size)
@@ -616,6 +628,40 @@ class AsyncMetricsCollector:
             lock = self._mode_locks.setdefault(pid, threading.Lock())
         return lock
 
+    def _take_over_if_forked(self) -> None:
+        """In a forked child, replace the batching state inherited from the parent and fall back to sync mode.
+
+        Threads do not survive ``fork()``, so the parent's worker is gone from the child. A parent thread may
+        also have held the queue's mutex, the stop event's lock or the pool lock at the fork, and the child
+        would then wait on it forever. The child gets a fresh queue, stop event and pool lock, and no worker,
+        and records synchronously until a mode check starts a worker of its own. With auto-detect off it stays
+        synchronous. A changed PID is the signal: ``Thread.is_alive()`` and at-fork hooks can miss a fork made
+        from C, as uWSGI's is without ``--py-call-osafterfork``.
+        """
+        pid = os.getpid()
+        if self._owner_pid == pid:
+            return
+        with self._mode_lock():  # per PID, so no parent thread can have held it
+            if self._owner_pid == pid:
+                return
+            self._sync_mode = True
+            self._queue = queue.Queue(maxsize=self.max_queue_size)
+            self._stopped = threading.Event()
+            self._worker_thread = None
+            self._pool_lock = threading.Lock()
+            # Last, so a thread that sees this process as the owner also sees its fresh state.
+            self._owner_pid = pid
+
+    def _may_enqueue(self) -> bool:
+        """Return whether a producer that read batched mode may queue its record, rather than record it now.
+
+        Only the batched record path calls this, so the sync path pays no ``getpid()``.
+        """
+        self._take_over_if_forked()
+        # Re-read: a take-over, by this thread or a racing one, leaves sync mode set and no worker running. Only a
+        # mode switch clears it again, and that starts this process's worker first.
+        return not self._sync_mode
+
     def _should_check_mode(self) -> bool:
         """Check if we should evaluate mode switching."""
         now = time.time()
@@ -635,6 +681,8 @@ class AsyncMetricsCollector:
 
         ops_per_second = self._operation_count / elapsed
 
+        # Both switches touch the batching state: one reuses the queue, the other sets the stop event.
+        self._take_over_if_forked()
         # Two producers can pass the mode check at once; the lock keeps them from starting two workers.
         with self._mode_lock():
             # Switch to async mode if high frequency (>100 ops/sec)

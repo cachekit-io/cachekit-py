@@ -1,12 +1,16 @@
-"""Auto mode switching must leave exactly one live worker on the queue whenever the collector is batched."""
+"""Whenever the collector is batched, exactly one live worker of its own process must be reading its queue."""
 
+import multiprocessing
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,6 +18,7 @@ from cachekit.reliability import async_metrics
 from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, AsyncMetricsCollector
 
 pytestmark = pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
+needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 
 
 def _steer(collector: AsyncMetricsCollector, ops_per_second: float) -> None:
@@ -149,7 +154,7 @@ def test_concurrent_switches_start_one_worker(monkeypatch):
     collector.shutdown()
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@needs_fork
 def test_child_forked_mid_switch_can_still_switch(monkeypatch):
     namespace = f"mode-switch-fork-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(flush_interval=0.05)
@@ -204,6 +209,160 @@ def test_mode_switch_after_shutdown_starts_no_worker():
     # shutdown() is final: a later rise in the rate must not bring a worker back.
     assert collector._sync_mode
     assert collector._worker_thread is not None and not collector._worker_thread.is_alive()
+
+
+@pytest.mark.parametrize("ops_per_second", [None, 500], ids=["auto-detect-off", "high-rate"])
+def test_records_after_shutdown_reach_their_metric(ops_per_second):
+    n = 15
+    namespace = f"after-shutdown-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(
+        flush_interval=0.05, max_queue_size=10, sync_mode=False, auto_detect_mode=ops_per_second is not None
+    )
+    collector.shutdown()
+
+    # More records than the queue holds: queued behind the stopped worker, the last five would be dropped.
+    for _ in range(n):
+        if ops_per_second is not None:
+            _steer(collector, ops_per_second)
+        _record(collector, namespace)
+
+    assert collector._sync_mode
+    assert _flushed(namespace) == n
+    assert collector.get_dropped_metrics_count() == 0
+
+
+def test_sync_records_make_no_getpid_call(monkeypatch):
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    namespace = f"sync-no-getpid-{uuid.uuid4().hex}"
+    _record(collector, namespace)  # creating a metric looks up this process's lock; recording into it does not
+    calls = []
+
+    def getpid():
+        calls.append(None)
+        return os.getpid()
+
+    monkeypatch.setattr(async_metrics, "os", SimpleNamespace(getpid=getpid))
+    for _ in range(10):
+        _record(collector, namespace)
+
+    # The fork check costs a syscall, so it stays on the paths that touch batching state.
+    assert calls == []
+
+
+def _in_child_forked_holding(lock: Any, child: Callable[[], Any]) -> Any:
+    """Return what ``child`` returns in a process forked while a thread of this one holds ``lock``."""
+    ctx = multiprocessing.get_context("fork")
+    results = ctx.Queue()
+    with lock:
+        process = ctx.Process(target=lambda: results.put(child()), daemon=True)
+        process.start()
+    try:
+        return results.get(timeout=10)
+    except queue.Empty:
+        process.kill()
+        pytest.fail("the forked child hung on a lock it inherited held")
+    finally:
+        process.join(timeout=5)
+
+
+@needs_fork
+@pytest.mark.parametrize("held", ["queue", "pool"])
+def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held):
+    namespace = f"fork-batched-{held}-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    assert collector._queue is not None
+    lock = collector._queue.mutex if held == "queue" else collector._pool_lock
+
+    def child():
+        collector._last_mode_check = time.time()  # the first record takes the batched path, not a mode check
+        _record(collector, namespace)
+        first = _flushed(namespace)  # recorded synchronously: the child has no worker yet to flush a queued one
+        _steer(collector, 500)
+        _record(collector, namespace)  # batched again, on a queue and pool of the child's own
+        batched = not collector._sync_mode
+        collector.shutdown()
+        return first, batched, _flushed(namespace)
+
+    # The parent's worker did not survive the fork, and no thread in the child will ever release the lock.
+    assert _in_child_forked_holding(lock, child) == (1, True, 2)
+    collector.shutdown()
+
+
+@needs_fork
+@pytest.mark.parametrize("first_call", ["switch-to-sync", "shutdown"])
+def test_child_of_a_batched_parent_stops_batching_past_a_held_stop_event(first_call):
+    namespace = f"fork-stop-event-{first_call}-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05)
+    _steer(collector, 500)
+    _record(collector, f"{namespace}-parent")
+    assert not collector._sync_mode and collector._stopped is not None
+
+    def child():
+        if first_call == "shutdown":
+            collector.shutdown()
+        else:
+            _steer(collector, 1)
+        _record(collector, namespace)
+        return collector._sync_mode, _flushed(namespace)
+
+    # Both calls set the stop event, whose Condition lock a parent thread holds at the fork.
+    assert _in_child_forked_holding(collector._stopped._cond, child) == (True, 1)
+    collector.shutdown()
+
+
+@needs_fork
+def test_child_of_a_parent_back_in_sync_mode_batches_on_a_queue_of_its_own():
+    namespace = f"fork-old-queue-{uuid.uuid4().hex}"
+    other = f"fork-old-queue-other-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05)
+    _steer(collector, 500)
+    _record(collector, other)
+    worker = collector._worker_thread
+    _steer(collector, 1)
+    _record(collector, other)
+    assert collector._sync_mode and worker is not None
+    worker.join(timeout=5.0)
+    assert not worker.is_alive() and collector._queue is not None
+
+    def child():
+        _steer(collector, 500)
+        _record(collector, namespace)
+        batched = not collector._sync_mode
+        collector.shutdown()  # the child's own worker flushes the record on its way out
+        return batched, _flushed(namespace)
+
+    # The parent no longer batches but still owns its old queue, which a switch in the child would otherwise reuse.
+    assert _in_child_forked_holding(collector._queue.mutex, child) == (True, 1)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+def test_child_of_a_hookless_fork_batches_with_a_worker_of_its_own():
+    """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-osafterfork."""
+    import ctypes
+
+    namespace = f"fork-hookless-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    inherited_worker, q = collector._worker_thread, collector._queue
+    assert inherited_worker is not None and q is not None
+    libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
+
+    with q.mutex:
+        pid = libc_fork()
+        if pid == 0:  # child: SIGALRM kills it if it waits on the parent's queue
+            try:
+                signal.alarm(5)
+                if not inherited_worker.is_alive():
+                    os._exit(3)  # the dead worker must still look alive here, or this tests nothing
+                _steer(collector, 500)
+                _record(collector, namespace)
+                batched = not collector._sync_mode
+                collector.shutdown()
+                os._exit(0 if batched and _flushed(namespace) == 1 else 1)
+            finally:
+                os._exit(2)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    collector.shutdown()
 
 
 def test_shutdown_during_a_switch_to_batched_stops_the_new_worker():
