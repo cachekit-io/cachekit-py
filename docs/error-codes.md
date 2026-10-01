@@ -34,12 +34,47 @@ def get_sensitive_data():
 export CACHEKIT_MASTER_KEY=$(openssl rand -hex 32)
 ```
 
+Exporting it makes every preset except `@cache.secure` and `@cache.local` that states no encryption
+intent raise ([below](#master-key-present-no-encryption-intent)); passing `master_key=`
+to `@cache.secure` instead affects only that cache.
+
 **Verification**:
 ```bash
 # Verify key is set and correct length
 python -c "import os; k = os.getenv('CACHEKIT_MASTER_KEY', ''); print(f'Key length: {len(k)} (need 64)')"
 # Output: Key length: 64 (need 64)
 ```
+
+---
+
+### Master key present, no encryption intent
+
+**Message**: `A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...` (or `(master_key=)` when the key was passed)
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied
+
+**Cause**: a master key is available — `CACHEKIT_MASTER_KEY` is set, or `master_key=` was passed (flat on bare `@cache`, or `EncryptionConfig(master_key=...)`) — but the cache states no encryption intent: no `encryption=`, or an `EncryptionConfig` without `enabled=`. A key is a key source, not an activation switch, so cachekit refuses to guess between encrypting and storing plaintext. This applies to every preset except `@cache.secure` and `@cache.local`, including `backend=None` and caches with a tenant extractor ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)).
+
+**When it occurs**:
+```python notest
+# CACHEKIT_MASTER_KEY is set in the environment
+@cache.production(ttl=600)  # Raises ConfigurationError here, at decoration time
+def get_catalog():
+    return fetch_catalog()
+```
+
+**Solution**: state the intent on each such cache.
+```python notest
+@cache.production(ttl=600, encryption=False)  # plaintext; stale ciphertext still decrypts on read
+def get_catalog():
+    return fetch_catalog()
+
+@cache.production(ttl=600, encryption=EncryptionConfig(enabled=True, single_tenant_mode=True))  # encrypt
+def get_orders():
+    return fetch_orders()
+```
+
+Or use `@cache.secure(...)` for the encrypted ones. On bare `@cache` the flat spelling is `encryption=True, single_tenant_mode=True`.
 
 ---
 
@@ -378,10 +413,10 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **Exception**: none: while the breaker is open, a function with an L2 backend still serves L1 hits, skips L2, and runs uncached on an L1 miss, sync or async. An L1 hit is never a probe and records no outcome, so it neither holds the breaker open nor closes it. In L1-only mode (`backend=None`) the breaker is never consulted.
 
-**Cause**: Five failures in total since the breaker last closed or the process started (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts, except that a `BackendError` from the function reruns it without the lock, and a failure of that rerun counts); a failure to generate the cache key or to create the backend client; and, for async functions only, a result that fails to serialize or encrypt for the cache write. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
+**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts, except that a `BackendError` from the function reruns it without the lock, and a failure of that rerun counts); a failure to create the backend client; and, for async functions only, a result that fails to serialize or encrypt for the cache write. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function has raised, or another failure listed under **Cause** has occurred, `failure_threshold` times in total (five by default) since the breaker last closed or the process started
+- Your function has raised, or another failure listed under **Cause** has occurred, `failure_threshold` times (five by default) within 60 seconds
 - Calls to this function that miss L1 run uncached until the breaker recovers; L1 hits are still served. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which admits up to three probe calls (`half_open_requests`) while further calls run uncached. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
 
 **Solutions**:

@@ -126,21 +126,23 @@ def get_user_ssn(user_id):
 
 ## Activation: the Master Key Is a Source, Not a Switch
 
-From the next minor release encryption turns on only where the code says so —
-`@cache.secure(...)`, or an explicit encryption option on another preset (exact spellings
-below). `CACHEKIT_MASTER_KEY` supplies the key for those spellings and decrypts stale
-ciphertext on read (not in an interop cache — see the `encryption=False` row); in this
-release its presence can still auto-activate encryption where no intent is stated (the deprecated row, with its exceptions) and logs a warning once per process. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
+Encryption turns on only where the code says so — `@cache.secure(...)`, or an explicit
+encryption option on another preset (exact spellings below). `CACHEKIT_MASTER_KEY` supplies
+the key for those spellings and decrypts stale ciphertext on read (not in an interop cache —
+see the `encryption=False` row). A master key present with no stated intent is an error at
+construction, not a default. Contract: [`protocol/spec/intent-presets.md` § Encryption Activation](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#encryption-activation).
 
-| Call site | `CACHEKIT_MASTER_KEY` unset | `CACHEKIT_MASTER_KEY` set |
+| Call site | No key (neither `master_key=` nor `CACHEKIT_MASTER_KEY`) | Key available (`master_key=` or `CACHEKIT_MASTER_KEY`) |
 |---|---|---|
 | `@cache.secure(...)` | **Fails closed** — `ValueError` at decoration | Encrypts |
 | `@cache(encryption=True, single_tenant_mode=True)`; on a preset `encryption=EncryptionConfig(enabled=True, single_tenant_mode=True)` | **Fails closed** — `ConfigurationError` at decoration | Encrypts |
 | `encryption=False` | Plaintext | Plaintext; stale ciphertext is still decrypted on read (each stale key logs one config-drift warning and counts on `cachekit_config_drift_reads_total` until it expires — expected after switching to plaintext). Not in an [interop cache](#turning-encryption-off-in-an-interop-cache): its stale entries are never decrypted |
-| No `encryption=` — `@cache`, `.minimal`, `.production`, `.io`, … | Plaintext | **Deprecated (0.20.0):** encrypts and logs a warning once per process, except that an L1-only cache (explicit `backend=None`) warns but stores raw objects, unencrypted. The next minor release raises at construction instead. `@cache.local` never encrypts and never warns. |
-| No `encryption=`, but `master_key=` or `tenant_extractor=` passed | Plaintext | Plaintext, no warning; the next minor release raises at construction |
+| No encryption intent — no `encryption=`, or an `EncryptionConfig` without `enabled=` — on `@cache`, `.minimal`, `.production`, `.io`, `.dev`, `.test`, including `backend=None` and caches with a tenant extractor (flat `tenant_extractor=` on bare `@cache`, inside `EncryptionConfig` on a preset) | Plaintext | **Raises** `ConfigurationError` at decoration, naming the explicit spellings. `@cache.local` never encrypts and never raises. |
 
-The deprecated row was the earlier "fleet-wide convenience" guidance. It goes because a
+The raising row replaces the earlier "fleet-wide convenience" rule, under which the key's
+presence auto-enabled encryption wherever no `master_key=` or `tenant_extractor=` was passed
+(deprecated with a warning in 0.20.0; those two stayed plaintext, and `backend=None` caches
+stored raw objects). It went because a
 call site's encryption state was unreadable from the code — it depended on which pod
 carried which variable — and a pod *missing* the variable wrote plaintext to the backend
 with no error (issue #128). Migrate by writing the intent. Both explicit spellings fail closed
@@ -279,7 +281,8 @@ redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DE
 redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
 
 # FLUSHDB is only safe when the database is dedicated to cachekit
-# then deploy with CACHEKIT_MASTER_KEY set
+# then deploy the encrypting decorator (@cache.secure or an explicit encryption= option),
+# with CACHEKIT_MASTER_KEY set if it supplies the key
 ```
 
 ### L1 Cache Conflict

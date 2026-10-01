@@ -92,7 +92,7 @@ No API changes. No code rewrite. Same decorator, same function signature.
 - Shared across processes: No (per-process only)
 - Persistence: No (lost on restart)
 - TTL support: Yes
-- Encryption: No — `@cache.secure(master_key=…)` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either.
+- Encryption: No — `@cache.secure(master_key=…)` / `encryption=True` / `EncryptionWrapper` with `backend=None` raise `ConfigurationError` (raw objects cannot be ciphertext). A fleet-wide `CACHEKIT_MASTER_KEY` does not encrypt L1-only caches either: with the key set, `@cache(backend=None)` must state `encryption=False`, or it raises the no-intent `ConfigurationError`.
 - Metrics: Yes (if monitoring configured)
 
 ---

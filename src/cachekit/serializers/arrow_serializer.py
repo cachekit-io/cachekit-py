@@ -402,29 +402,39 @@ class ArrowSerializer:
         Raises:
             SerializationError: If data is malformed, Arrow deserialization fails, or checksum validation fails
         """
-        try:
-            # Detect the envelope by sniffing the Arrow IPC file magic (b"ARROW1") rather
-            # than trusting an integrity flag — this auto-handles checksummed, raw (legacy
-            # integrity-off), and version-mismatch data, and never feeds a checksum prefix
-            # into the IPC reader (which previously leaked a bare OSError). memoryview slicing
-            # avoids the full-body copy that `data[8:]` used to make.
-            mv = memoryview(data)
-            n = mv.nbytes
-            if n >= 14 and bytes(mv[8:14]) == b"ARROW1":
-                # [8-byte xxHash3-64 checksum][Arrow IPC]
-                expected_checksum = bytes(mv[:8])
-                body = mv[8:]
-                if xxhash.xxh3_64_digest(body) != expected_checksum:
-                    raise SerializationError("Checksum validation failed - data corruption detected")
-            elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
-                # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry)
-                body = mv
-            else:
-                raise SerializationError(
-                    f"Invalid data: not a recognized Arrow envelope "
-                    f"(expected [8-byte checksum][Arrow IPC] or raw Arrow IPC); got {n} bytes"
-                )
+        # Detect the envelope by sniffing the Arrow IPC file magic (b"ARROW1") rather
+        # than trusting an integrity flag — this auto-handles checksummed, raw (legacy
+        # integrity-off), and version-mismatch data, and never feeds a checksum prefix
+        # into the IPC reader (which previously leaked a bare OSError). memoryview slicing
+        # avoids the full-body copy that `data[8:]` used to make.
+        mv = memoryview(data)
+        n = mv.nbytes
+        if n >= 14 and bytes(mv[8:14]) == b"ARROW1":
+            # [8-byte xxHash3-64 checksum][Arrow IPC]
+            expected_checksum = bytes(mv[:8])
+            body = mv[8:]
+            if xxhash.xxh3_64_digest(body) != expected_checksum:
+                raise SerializationError("Checksum validation failed - data corruption detected")
+        elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
+            # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry)
+            body = mv
+        else:
+            raise SerializationError(
+                f"Invalid data: not a recognized Arrow envelope "
+                f"(expected [8-byte checksum][Arrow IPC] or raw Arrow IPC); got {n} bytes"
+            )
+        return self._read_verified_ipc(body)
 
+    def _read_verified_ipc(self, body: memoryview) -> Any:
+        """Decode an Arrow IPC ``body`` whose checksum the caller has ALREADY verified.
+
+        Never hashes: :meth:`deserialize` verifies before calling this, and
+        ``AutoSerializer.deserialize`` calls it only after its routing gate has checked the same
+        digest, so a healthy read hashes the body once instead of twice. Every caller must hand
+        it gate-verified or bare (legacy, unchecksummed) bytes — an unverified body passed here
+        is decoded as-is.
+        """
+        try:
             # pa.py_buffer over the memoryview is zero-copy; open_file decompresses transparently.
             reader = pa.ipc.open_file(pa.py_buffer(body))
             table = reader.read_all()

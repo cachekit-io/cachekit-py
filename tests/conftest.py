@@ -431,12 +431,10 @@ def reset_call_counters(*mock_objects):
 def setup_redis_env():
     """Legacy fixture for backward compatibility.
 
-    Previously also set CACHEKIT_MASTER_KEY for every test. That broke after the
-    PR #127 auto-detect: any cached settings singleton that captured the env-set
-    master key turned encryption on globally, which the v0.6.0 cross-SDK rule
-    then rejected for non-default serializers (serializer='auto', custom
-    instances). Tests that need encryption now set CACHEKIT_MASTER_KEY locally
-    via monkeypatch.setenv.
+    Deliberately does NOT set CACHEKIT_MASTER_KEY: a present key with no stated
+    encryption= intent raises ConfigurationError at construction, so a global key
+    would break every test that builds a cache without one. Tests that need a key
+    set CACHEKIT_MASTER_KEY locally via monkeypatch.setenv and state their intent.
 
     reset_settings() brackets each test so the singleton never carries env
     state across test boundaries.

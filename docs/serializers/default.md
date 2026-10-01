@@ -86,7 +86,7 @@ Both are handled by the Rust ByteStorage layer and are on by default. With `inte
 > **Corruption detection, not tamper resistance.** xxHash3-64 is non-cryptographic: an
 > attacker with backend write access can forge a valid checksum for arbitrary bytes. The
 > checksum catches bit rot and storage bugs. For tamper resistance, use encryption
-> (`@cache.secure` / `CACHEKIT_MASTER_KEY`), which authenticates every byte with AES-256-GCM.
+> (`@cache.secure`, or an explicit `encryption=` option), which authenticates every byte with AES-256-GCM.
 
 ```python
 @cache

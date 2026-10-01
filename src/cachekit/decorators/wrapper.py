@@ -451,12 +451,10 @@ def create_cache_wrapper(
                    - SerializerProtocol instance: Custom serializer implementing the protocol
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
-                   - None (default): no intent stated. DEPRECATED activation path: with
-                     CACHEKIT_MASTER_KEY set this release can still auto-enable encryption and
-                     warn once, though not every cache ends up encrypted (see the activation
-                     table in docs/features/zero-knowledge-encryption.md). The next minor
-                     release raises at construction whenever a master key is present and
-                     encryption is unset.
+                   - None (default): no intent stated. Plaintext when no master key is present;
+                     ConfigurationError at construction when one is, from master_key= or
+                     CACHEKIT_MASTER_KEY (see the activation table in
+                     docs/features/zero-knowledge-encryption.md).
                    - True: force encryption ON (key inline or from CACHEKIT_MASTER_KEY).
                    - False: explicit per-function opt-out — never encrypts, even when
                      CACHEKIT_MASTER_KEY is set (issue #128).
@@ -650,9 +648,9 @@ def create_cache_wrapper(
     # L1-only ObjectCache path below never serializes — so @cache.secure(backend=None)
     # reported encryption.enabled=True while holding plaintext. Refuse at decoration; a
     # "serialized L1 without L2" mode does not exist and a warning would keep the leak.
-    # `encryption` is the pre-resolution tri-state: None (env auto-detect, live in
-    # cache_handler.py until LAB-4642 removes it) is deliberately NOT refused — the spec
-    # says key presence never activates, so it must not activate a refusal either.
+    # `encryption` is the pre-resolution tri-state: None is not refused here. With a master
+    # key present, None is refused by CacheSerializationHandler instead (no stated intent,
+    # L1-only included); with no key, it is plaintext, which L1-only stores correctly.
     _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
         isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
     )
@@ -668,9 +666,6 @@ def create_cache_wrapper(
     # If explicit backend provided, use it; otherwise get from provider on first use
     _backend = backend if backend is not None else None
 
-    # Decoration-time stale_ttl validation runs BEFORE the serialization handler is
-    # built: the handler spends the once-per-process encryption auto-activation
-    # warning on success, so a decorator rejected after it would consume the warning.
     # ---- Backed-mode stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate) ----
     # Past-TTL SWR: the backend keeps serving an entry for a stale-grace window past
     # its fresh TTL and labels the read stale; we return the stale value immediately
