@@ -207,9 +207,6 @@ CACHEKIT_FILE_MAX_VALUE_MB=100
 
 # Maximum number of cache entries (default: 10000, range: 100-1,000,000)
 CACHEKIT_FILE_MAX_ENTRY_COUNT=10000
-
-# Lock acquisition timeout in seconds (default: 5.0, range: 0.5-30.0)
-CACHEKIT_FILE_LOCK_TIMEOUT_SECONDS=5.0
 ```
 
 ### Memcached Backend Environment Variables

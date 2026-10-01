@@ -93,7 +93,7 @@ class BaseBackend(Protocol):
 | Backend | Latency | Persistence | Cross-Process | TTL | Locking |
 |---------|---------|-------------|---------------|-----|---------|
 | **L1 (In-Memory)** | ~50ns | No | No | No | No |
-| **[File](file.md)** | 100μs–5ms | Yes (disk) | No | Yes | File locks |
+| **[File](file.md)** | get <1ms; set ms, grows with entry count ([numbers](file.md#performance-characteristics)) | Yes (disk) | Format shared; one writer process | Yes | File locks |
 | **[Redis](redis.md)** | 1–7ms | Yes (RDB/AOF) | Yes | Yes | Yes |
 | **[Memcached](memcached.md)** | 1–5ms | No | Yes | Yes (max 30d) | No |
 | **[CachekitIO](cachekitio.md)** | ~10–50ms | Yes | Yes | Yes | Yes |
@@ -357,7 +357,7 @@ Other changes you may notice:
 | Backend | Latency | Use Case | Notes |
 |---------|---------|----------|-------|
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
-| **File** | 100μs-5ms | Single-process local caching | Development, scripts, CLI tools |
+| **File** | get <1ms; set ms, grows with entries | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Production default |
 | **CachekitIO** | ~10-50ms | Managed SaaS, zero-ops | HTTP/2, region-dependent; closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |

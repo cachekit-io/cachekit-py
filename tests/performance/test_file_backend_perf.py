@@ -4,13 +4,14 @@ Comprehensive performance testing for file-based cache backend with:
 - Sequential read/write latency (p50/p95/p99)
 - Concurrent multi-threaded throughput
 - Large value handling (1MB)
-- LRU eviction performance
+- Set/get latency against the directory's entry count
+- Oldest-written-first eviction performance
 - Optional Redis comparison
 
-Performance targets (informational, not asserted):
-- p50: 100-500μs (SSD)
-- p99: 1-5ms
-- Throughput: 1000+ ops/s single-threaded
+Nothing here asserts a latency target; some tests carry catastrophe guards. Set latency is not a constant: every
+set() fsyncs, then scans the whole cache directory twice, so it is an fsync floor plus a
+per-entry cost. test_bench_set_scaling_with_entry_count measures both; the figures in
+docs/backends/file.md come from it. get() does no scan and stays flat.
 """
 
 from __future__ import annotations
@@ -114,6 +115,43 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
     # Just verify it's not wildly broken (>100ms)
     assert write_stats["p99_us"] < 100_000, f"Write p99 catastrophically high: {write_stats['p99_us']:.1f}μs"
     assert read_stats["p99_us"] < 100_000, f"Read p99 catastrophically high: {read_stats['p99_us']:.1f}μs"
+
+
+@pytest.mark.performance
+@pytest.mark.parametrize("entries", [0, 1_000, 5_000])
+def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> None:
+    """Set/get/delete latency with ``entries`` already in the cache directory.
+
+    The directory is prefilled by writing entry files directly: set() is itself O(entries),
+    so a set() loop would make the prefill quadratic. The timed loop cycles 10 keys through
+    set/get/delete, so the entry count stays at ``entries`` (+1) throughout. Run it on the
+    filesystem you care about with ``--basetemp``; repeat runs to see the run-to-run spread.
+    """
+    config = FileBackendConfig(cache_dir=tmp_path, max_size_mb=1024, max_value_mb=100, max_entry_count=10_000)
+    backend = FileBackend(config)
+    value = b"x" * 1024  # 1KB value
+    entry = FileBackend._build_header(0) + value
+    for i in range(entries):
+        Path(backend._key_to_path(f"fill:{i}")).write_bytes(entry)
+
+    iterations = 200
+    set_ns, get_ns, delete_ns = [], [], []
+    for i in range(iterations):
+        key = f"bench:{i % 10}"
+        start = time.perf_counter_ns()
+        backend.set(key, value)
+        set_ns.append(time.perf_counter_ns() - start)
+        start = time.perf_counter_ns()
+        assert backend.get(key) == value
+        get_ns.append(time.perf_counter_ns() - start)
+        start = time.perf_counter_ns()
+        backend.delete(key)
+        delete_ns.append(time.perf_counter_ns() - start)
+
+    stats = {op: _calculate_stats(ns) for op, ns in (("set", set_ns), ("get", get_ns), ("delete", delete_ns))}
+    print(f"\nentries={entries} value=1KB n={iterations}")
+    for op, st in stats.items():
+        print(f"  {op:<6} p50={st['p50_us'] / 1000:.3f}ms  p99={st['p99_us'] / 1000:.3f}ms")
 
 
 @pytest.mark.performance
@@ -287,8 +325,8 @@ def test_bench_large_value_1mb(tmp_path: Path) -> None:
 def test_bench_eviction_1000_files(tmp_path: Path) -> None:
     """Measure time to evict 1000 files when cache exceeds capacity.
 
-    LRU eviction is triggered when cache exceeds 90% capacity,
-    and evicts files until it reaches 70% capacity.
+    Eviction is triggered when cache exceeds 90% capacity, and evicts the
+    oldest-written files (by mtime) until it reaches 70% capacity.
     """
     # Small cache to trigger eviction (5MB)
     max_size_mb = 5
@@ -304,7 +342,7 @@ def test_bench_eviction_1000_files(tmp_path: Path) -> None:
     # 5MB * 0.9 = 4.5MB / 50 entries = ~90KB per entry
     value_size = 90 * 1024  # 90KB
 
-    print(f"\nBenchmarking LRU eviction (cache: {max_size_mb}MB max)...")
+    print(f"\nBenchmarking eviction (cache: {max_size_mb}MB max)...")
 
     # Fill cache to just under 90% capacity
     # At 90%+ capacity, eviction triggers
@@ -332,7 +370,7 @@ def test_bench_eviction_1000_files(tmp_path: Path) -> None:
     final_size_mb, final_count = backend._calculate_cache_size()
 
     print(f"\n{'=' * 70}")
-    print("FileBackend LRU Eviction Performance")
+    print("FileBackend Eviction Performance")
     print(f"{'=' * 70}")
     print(f"Initial cache: {initial_size_mb:.2f}MB ({100 * initial_size_mb / max_size_mb:.0f}%)")
     print(f"Initial files: {initial_count}")

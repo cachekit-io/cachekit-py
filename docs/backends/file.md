@@ -2,7 +2,7 @@
 
 # File Backend
 
-Store cache on the local filesystem with automatic LRU eviction. No infrastructure required — ideal for single-process applications, scripts, and local development.
+Store cache on the local filesystem with automatic oldest-written-first eviction. No infrastructure required — ideal for single-process applications, scripts, and local development.
 
 ## Basic Usage
 
@@ -31,9 +31,6 @@ export CACHEKIT_FILE_MAX_SIZE_MB=1024           # Default: 1024 MB
 export CACHEKIT_FILE_MAX_VALUE_MB=100           # Default: 100 MB (max single value)
 export CACHEKIT_FILE_MAX_ENTRY_COUNT=10000      # Default: 10,000 entries
 
-# Lock configuration
-export CACHEKIT_FILE_LOCK_TIMEOUT_SECONDS=5.0   # Default: 5.0 seconds
-
 # File permissions (octal, owner-only by default for security)
 export CACHEKIT_FILE_PERMISSIONS=0o600          # Default: 0o600 (owner read/write)
 export CACHEKIT_FILE_DIR_PERMISSIONS=0o700      # Default: 0o700 (owner rwx)
@@ -53,7 +50,6 @@ config = FileBackendConfig(
     max_size_mb=2048,
     max_value_mb=200,
     max_entry_count=50000,
-    lock_timeout_seconds=10.0,
     permissions=0o600,
     dir_permissions=0o700,
 )
@@ -78,11 +74,11 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: p50: 100–500μs, p99: 1–5ms
-- Throughput: 1000+ operations/second (single-threaded)
-- LRU eviction: Triggered at 90%, evicts to 70% capacity
+- Latency: `get` is sub-millisecond and flat; `set` grows with the number of cached entries (see [Performance Characteristics](#performance-characteristics))
+- Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
-- Cross-process: No (single-process only)
+- Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported
+- Locking: non-blocking. An operation that finds an entry's file lock held fails at once with a `TIMEOUT` `BackendError`; it does not wait
 - Platform support: Full on Linux/macOS, limited on Windows (no O_NOFOLLOW)
 
 ## Bounded-Memory Large Values (Arrow)
@@ -131,7 +127,7 @@ the cached payload is left untouched.
 
 ## Limitations and Security Notes
 
-1. **Single-process only**: FileBackend uses file locking that doesn't prevent concurrent access from multiple processes. Do NOT use with multi-process WSGI servers.
+1. **One writing process at a time**: FileBackend's file locking does not make concurrent writers in multiple processes safe, and eviction runs per process. Do NOT use with multi-process WSGI servers. Reading or handing over a cache directory between processes, or between cachekit-py and cachekit-rs, is supported: the on-disk format is the same.
 
 2. **File permissions**: Default permissions (0o600) restrict access to cache files to the owning user. Changing these permissions is a security risk and generates a warning.
 
@@ -139,26 +135,36 @@ the cached payload is left untouched.
 
 4. **Wall-clock TTL**: Expiration times rely on system time. Changes to system time (NTP, manual adjustments) may affect TTL accuracy.
 
-5. **Disk space**: FileBackend will evict least-recently-used entries when reaching 90% capacity. Ensure sufficient disk space beyond max_size_mb for temporary writes.
+5. **Disk space**: FileBackend will evict the oldest-written entries when reaching 90% capacity. Ensure sufficient disk space beyond max_size_mb for temporary writes.
 
-6. **Corruption vs. tampering**: `set()` writes every byte or raises `BackendError` (short `write(2)` calls are resumed until every byte lands, never silently truncated into a "successful" file). On read, an expired entry or a structurally broken file — short header, bad magic or version, or a payload shorter than the file's own `st_size` implies — is deleted and treated as a miss. Payload *content* is not checked here: a same-length modification is served as-is, and the serialization envelope (xxHash3 checksum, or the AES-256-GCM tag for encrypted values) decides whether it is corruption or tampering under your `encryption_fail_closed` policy. Eviction of an expired/corrupt entry is inode-guarded: the delete only fires when the file at that path still has the same `(st_dev, st_ino)` the read decided on. This *narrows*, but does not close, the window in which a `set()` from another writer that renamed a fresh entry into the same path could be deleted by mistake — it shrinks a function-body-wide race to the two syscalls between the guard's own `lstat` and the `unlink` (POSIX has no atomic "unlink iff inode matches"), so a rename landing in that gap can still delete a replacement. That residual window matches cachekit-rs's `unlink_if_same_inode` (relevant because the on-disk format is cross-SDK compatible); a delete lost this way is a rare, self-healing cache miss, not data loss.
+6. **Corruption vs. tampering**: `set()` writes every byte or raises `BackendError` (short `write(2)` calls are resumed until every byte lands, never silently truncated into a "successful" file). On read, an expired entry or a structurally broken file — short header, bad magic or version, or a payload shorter than the file's own `st_size` implies — is deleted and treated as a miss. An entry whose reserved header byte or flags field is nonzero is different: the format reserves those for future payload transforms, so every read path (`get`, `get_buffer`, `exists`, `get_ttl`, `refresh_ttl`) treats it as a miss and leaves the file untouched, expired or not. Payload *content* is not checked here: a same-length modification is served as-is, and the serialization envelope (xxHash3 checksum, or the AES-256-GCM tag for encrypted values) decides whether it is corruption or tampering under your `encryption_fail_closed` policy. Eviction of an expired/corrupt entry is inode-guarded: the delete only fires when the file at that path still has the same `(st_dev, st_ino)` the read decided on. This *narrows*, but does not close, the window in which a `set()` from another writer that renamed a fresh entry into the same path could be deleted by mistake — it shrinks a function-body-wide race to the two syscalls between the guard's own `lstat` and the `unlink` (POSIX has no atomic "unlink iff inode matches"), so a rename landing in that gap can still delete a replacement. That residual window matches cachekit-rs's `unlink_if_same_inode` (relevant because the on-disk format is cross-SDK compatible); a delete lost this way is a rare, self-healing cache miss, not data loss.
 
 ## Performance Characteristics
 
-```
-Sequential operations (single-threaded):
-- Write (set):   p50: 120μs, p99: 800μs
-- Read (get):    p50: 90μs, p99: 600μs
-- Delete:        p50: 70μs, p99: 400μs
+Every `set()` fsyncs the new file, then scans the whole cache directory twice (a capacity
+check and an eviction check). Its cost is therefore an fsync floor plus a per-entry scan cost,
+and grows linearly with the number of cached entries. `get()` and `delete()` do no scan.
 
-Concurrent operations (10 threads):
-- Throughput: ~887 ops/sec
-- Latency p99: ~30μs per operation
+Median (p50) latency, 1 KB values, n = 200 operations per cell, range across 3 runs:
 
-Large values (1MB):
-- Write p99: ~15μs per operation
-- Read p99: ~13μs per operation
+| Entries in cache | Filesystem | `set` p50 | `get` p50 | `delete` p50 |
+|---:|---|---:|---:|---:|
+| 0 | ext4, NVMe SSD | 4.2–6.4 ms | 0.12 ms | 0.12 ms |
+| 1,000 | ext4, NVMe SSD | 56–72 ms | 0.15 ms | 0.16–0.17 ms |
+| 5,000 | ext4, NVMe SSD | 237–316 ms | 0.16–0.19 ms | 0.17–0.18 ms |
+| 0 | tmpfs | 0.14–0.15 ms | 0.05 ms | 0.04 ms |
+| 1,000 | tmpfs | 23–77 ms | 0.13–0.14 ms | 0.06–0.07 ms |
+| 5,000 | tmpfs | 137–201 ms | 0.14 ms | 0.06–0.07 ms |
+
+These are indicative. They come from one shared, busy machine, so absolute values, the fsync
+floor especially, will differ on yours; the shape (a flat `get`, a `set` that grows with the
+entry count) does not. Reproduce them with the harness:
+
+```bash
+uv run pytest tests/performance/test_file_backend_perf.py -k scaling -s -m performance --basetemp=<dir on the filesystem to measure>
 ```
+
+If you write often to a large cache, keep `max_entry_count` low or use another backend.
 
 ## See Also
 

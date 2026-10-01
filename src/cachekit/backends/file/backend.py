@@ -1,9 +1,9 @@
-"""File-based backend implementation with thread-safe operations and LRU eviction.
+"""File-based backend implementation with thread-safe operations and oldest-written-first eviction.
 
 This module implements BaseBackend protocol for filesystem-based caching with:
 - Thread-safe operations using RLock and file-level locking (fcntl/msvcrt)
 - Atomic writes via write-then-rename pattern
-- LRU eviction triggered at 90% capacity, evicting to 70%
+- Oldest-written-first (mtime) eviction triggered at 90% capacity, evicting to 70%
 - TTL-based expiration with secure 14-byte header format
 - TTL inspection & refresh (TTLInspectableBackend): get_ttl / refresh_ttl off the header
 - Security features: O_NOFOLLOW, realpath resolution, permission enforcement
@@ -92,6 +92,18 @@ def _write_fully(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _has_unknown_transform(header: bytes) -> bool:
+    """True when the header's reserved byte or flags are nonzero.
+
+    The file-backend spec reserves these for future payload transforms. This reader implements
+    none, so such an entry MUST read as a miss and MUST NOT be deleted, rewritten or returned:
+    exposing transformed bytes as plaintext is the failure this guards. Check it after magic and
+    version (a wrong one is plain corruption) and before expiry (the spec's MUST NOT delete has no
+    expiry exception).
+    """
+    return header[3:6] != b"\x00\x00\x00"
+
+
 class _MmapHandle:
     """Owns a read-only mmap of a cache file plus a memoryview of its payload (past the 14-byte
     header). Zero-copy: the view aliases mapped pages, never a heap copy.
@@ -125,7 +137,7 @@ class FileBackend:
     """File-based backend for local disk caching.
 
     Implements BaseBackend protocol with thread-safe operations, atomic writes,
-    LRU eviction, and TTL-based expiration.
+    oldest-written-first eviction, and TTL-based expiration.
 
     Thread Safety:
         - Uses threading.RLock() for reentrant locking of internal state
@@ -138,10 +150,10 @@ class FileBackend:
         - Respects permissions and dir_permissions from config
         - Blake2b hashing prevents directory traversal attacks
 
-    LRU Eviction:
-        - Triggered when cache size exceeds 90% of max_size_mb
-        - Evicts least-recently-used files until cache is at 70% capacity
-        - Based on file mtime (modification time)
+    Eviction (oldest-written first):
+        - Triggered when cache size exceeds 90% of max_size_mb (or entries exceed 90% of max_entry_count)
+        - Evicts the files with the oldest mtime until cache is at 70% capacity
+        - Reads never touch mtime; set() and refresh_ttl() do
 
     Example:
         >>> from cachekit.backends.file import FileBackend  # doctest: +SKIP
@@ -220,7 +232,6 @@ class FileBackend:
                         # Parse header
                         magic = header[0:2]
                         version = header[2]
-                        # flags = struct.unpack(">H", header[4:6])[0]  # uint16 BE (reserved for future)
                         expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
 
                         # Validate magic and version
@@ -230,6 +241,9 @@ class FileBackend:
                             os.close(fd)
                             fd_closed = True
                             return None
+
+                        if _has_unknown_transform(header):
+                            return None  # miss, file left untouched
 
                         # Check expiration (0 means never expire)
                         if expiry_timestamp > 0 and time.time() > expiry_timestamp:
@@ -332,6 +346,8 @@ class FileBackend:
                     if len(header) < HEADER_SIZE or header[0:2] != MAGIC or header[2] != FORMAT_VERSION:
                         self._safe_unlink_if_same_inode(fd, file_path)
                         return None
+                    if _has_unknown_transform(header):
+                        return None  # miss, file left untouched
                     expiry_timestamp = struct.unpack(">Q", header[6:14])[0]
                     if expiry_timestamp > 0 and time.time() > expiry_timestamp:
                         self._safe_unlink_if_same_inode(fd, file_path)
@@ -614,6 +630,9 @@ class FileBackend:
                             fd_closed = True
                             return False
 
+                        if _has_unknown_transform(header_data):
+                            return False  # miss, file left untouched
+
                         # Check expiration
                         if expiry_timestamp > 0 and time.time() > expiry_timestamp:
                             # Expired, clean up
@@ -727,6 +746,8 @@ class FileBackend:
                             os.close(fd)
                             fd_closed = True
                             return None
+                        if _has_unknown_transform(header):
+                            return None  # miss, file left untouched
 
                         expiry_timestamp = struct.unpack(">Q", header[6:14])[0]  # uint64 BE
                         if expiry_timestamp == 0:
@@ -787,6 +808,8 @@ class FileBackend:
                             os.close(fd)
                             fd_closed = True
                             return False
+                        if _has_unknown_transform(header):
+                            return False  # miss, header and payload left untouched
 
                         current_expiry = struct.unpack(">Q", header[6:14])[0]
                         if current_expiry > 0 and time.time() > current_expiry:
@@ -996,9 +1019,9 @@ class FileBackend:
             return 0.0, 0
 
     def _maybe_evict(self) -> None:
-        """Trigger LRU eviction if cache exceeds 90% capacity.
+        """Trigger eviction if cache exceeds 90% capacity.
 
-        Evicts least-recently-used files (by mtime) until cache is at 70% capacity.
+        Evicts the oldest-written files (by mtime; reads do not refresh it) until cache is at 70% capacity.
         Respects both max_size_mb and max_entry_count limits.
         """
         import stat as stat_module
@@ -1068,7 +1091,7 @@ class FileBackend:
             exclusive: True for exclusive lock, False for shared lock
 
         Raises:
-            BackendError: If lock acquisition times out
+            BackendError: TIMEOUT at once if the lock is held (non-blocking, no wait)
         """
         if platform.system() == "Windows":
             # Windows: msvcrt.locking (always exclusive)

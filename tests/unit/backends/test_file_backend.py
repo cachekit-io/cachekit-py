@@ -5,7 +5,7 @@ Tests for backends/file/backend.py covering:
 - Basic operations (get, set, delete, exists, health_check)
 - TTL expiration and cleanup
 - Corruption handling (bad magic, version, truncated files)
-- LRU eviction at 90% capacity
+- Oldest-written-first eviction at 90% capacity
 - Temp file cleanup on startup
 - Key hashing (blake2b consistency)
 - Thread safety and file-level locking
@@ -352,8 +352,8 @@ class TestHealthCheck:
 
 
 @pytest.mark.unit
-class TestLRUEviction:
-    """Test LRU eviction behavior at capacity thresholds."""
+class TestEviction:
+    """Test oldest-written-first eviction at capacity thresholds."""
 
     def test_eviction_constants_defined(self) -> None:
         """Test that eviction constants are properly defined."""
@@ -377,27 +377,29 @@ class TestLRUEviction:
         assert size_mb <= 0.01  # Account for filesystem overhead
         assert count == 2
 
-    def test_lru_eviction_uses_mtime(self, tmp_path: Path) -> None:
-        """Test LRU eviction uses file modification time for ordering."""
-        config = FileBackendConfig(
-            cache_dir=tmp_path / "cache",
-            max_size_mb=100,
-            max_value_mb=50,
-            max_entry_count=100,
+    async def test_eviction_is_oldest_written_first(self, tmp_path: Path) -> None:
+        """Eviction removes the oldest-written entries; reads do not protect one, refresh_ttl does."""
+        backend = FileBackend(
+            FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=100, max_value_mb=50, max_entry_count=100)
         )
-        backend = FileBackend(config)
+        keys = [f"e{i}" for i in range(90)]  # 90 entries: at, not over, the 90% trigger
+        base = time.time() - 1000
+        for i, key in enumerate(keys):
+            backend.set(key, b"data")
+            # Distinct, ordered mtimes independent of the filesystem's timestamp granularity.
+            os.utime(backend._key_to_path(key), (base + i, base + i))
 
-        # Store keys with time delays to ensure different mtimes
-        for i in range(5):
-            backend.set(f"key_{i}", b"data")
-            time.sleep(0.01)
+        for _ in range(5):
+            for key in ("e1", "e2"):  # hot keys: read often, never rewritten
+                assert backend.get(key) == b"data"
+        assert await backend.refresh_ttl("e0", 3600)  # in-place header rewrite moves mtime to now
 
-        cache_dir = Path(config.cache_dir)
-        files = list(cache_dir.glob("*"))
+        backend.set("new", b"data")  # 91 entries > 90 triggers eviction down to 70
 
-        # Files should have different mtimes
-        mtimes = [f.stat().st_mtime for f in files]
-        assert len(set(mtimes)) == len(mtimes)  # All different
+        survivors = {key for key in [*keys, "new"] if backend.exists(key)}
+        # The 21 oldest-written go: e1..e21, hot reads included. e0 survives only because refresh_ttl
+        # rewrote it.
+        assert survivors == {"e0", "new", *keys[22:]}
 
     def test_cache_respects_max_size_and_entry_limits(self, tmp_path: Path) -> None:
         """Test that cache respects both size and entry count limits."""
