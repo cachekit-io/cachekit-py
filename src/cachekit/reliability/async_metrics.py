@@ -79,7 +79,7 @@ class _NoopMetric:
     def _ignore(self, amount=1):
         pass
 
-    inc = observe = set = _ignore
+    inc = dec = observe = set = _ignore
 
 
 # Metric objects are process-wide because prometheus_client's default registry is.
@@ -117,6 +117,38 @@ if hasattr(os, "register_at_fork"):
         after_in_parent=_release_metrics_lock,
         after_in_child=_metrics_locks.clear,
     )
+
+
+def get_shared_metric(name: str, metric_class: type, description: str, labels: list[str]) -> Any:
+    """Get or create the process-wide metric instance for ``name``.
+
+    Module-level so code outside the collector (the circuit breaker) records into the same
+    object without creating a collector.
+
+    Raises:
+        ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
+            does for a name registered twice. Otherwise the caller would call a method the cached
+            metric lacks.
+    """
+    metric = _metrics_cache.get(name)
+    if metric is None:
+        with _metrics_cache_lock():
+            metric = _metrics_cache.get(name)
+            if metric is None:
+                try:
+                    metric = metric_class(name, description, labels)
+                except ValueError as e:
+                    if "Duplicated timeseries" not in str(e):
+                        raise
+                    # The host application owns this name. Telemetry must not break cache
+                    # calls, and a renamed series would be invisible to the documented
+                    # queries, so drop this metric loudly instead.
+                    logger.warning(f"Metric {name!r} is already registered outside cachekit; not recording it")
+                    metric = _NoopMetric()
+                _metrics_cache[name] = metric
+    if not isinstance(metric, (metric_class, _NoopMetric)):
+        raise ValueError(f"metric {name} is already a {type(metric).__name__}, not a {metric_class.__name__}")
+    return metric
 
 
 class AsyncMetricsCollector:
@@ -531,32 +563,8 @@ class AsyncMetricsCollector:
                     )
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
-        """Get or create the process-wide metric instance for ``name``.
-
-        Raises:
-            ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
-                does for a name registered twice. Otherwise the caller would call a method the cached
-                metric lacks.
-        """
-        metric = _metrics_cache.get(name)
-        if metric is None:
-            with _metrics_cache_lock():
-                metric = _metrics_cache.get(name)
-                if metric is None:
-                    try:
-                        metric = metric_class(name, description, labels)
-                    except ValueError as e:
-                        if "Duplicated timeseries" not in str(e):
-                            raise
-                        # The host application owns this name. Telemetry must not break cache
-                        # calls, and a renamed series would be invisible to the documented
-                        # queries, so drop this metric loudly instead.
-                        logger.warning(f"Metric {name!r} is already registered outside cachekit; not recording it")
-                        metric = _NoopMetric()
-                    _metrics_cache[name] = metric
-        if not isinstance(metric, (metric_class, _NoopMetric)):
-            raise ValueError(f"metric {name} is already a {type(metric).__name__}, not a {metric_class.__name__}")
-        return metric
+        """Get or create the process-wide metric instance for ``name`` (see ``get_shared_metric``)."""
+        return get_shared_metric(name, metric_class, description, labels)
 
     def get_dropped_metrics_count(self) -> int:
         """Get count of dropped metrics due to queue overflow."""

@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -20,6 +21,7 @@ from typing import Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, Gauge, get_shared_metric
 
 # Import metrics from the metrics collection module
 from cachekit.reliability.metrics_collection import (
@@ -195,6 +197,33 @@ class CacheOperationMetrics:
         return self.errors / self.total_operations
 
 
+class _StateCount:
+    """One breaker's share of the Prometheus ``circuit_breaker_state`` gauge.
+
+    The gauge counts live breakers per namespace and state, so a healthy breaker cannot
+    mask an OPEN one in the same namespace. It is a separate object so a finalizer can
+    remove a collected breaker's count without holding the breaker alive.
+    """
+
+    def __init__(self, namespace: str):
+        self.namespace = namespace
+        self.state: Optional[CircuitState] = None
+
+    def move(self, state: Optional[CircuitState]) -> None:
+        """Move this breaker's count to ``state``; ``None`` removes it."""
+        if state is self.state:
+            return
+        if PROMETHEUS_AVAILABLE:
+            # The same object every AsyncMetricsCollector records into; a second Gauge
+            # under this name would raise Duplicated timeseries.
+            gauge = get_shared_metric("circuit_breaker_state", Gauge, "Circuit breaker state", ["namespace", "state"])
+            if self.state is not None:
+                gauge.labels(namespace=self.namespace, state=self.state.name).dec()
+            if state is not None:
+                gauge.labels(namespace=self.namespace, state=state.name).inc()
+        self.state = state
+
+
 class CircuitBreaker:
     """Production-ready circuit breaker with metrics.
 
@@ -237,8 +266,12 @@ class CircuitBreaker:
         self._half_open_since = 0.0  # When the current HALF_OPEN cycle started
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
-        # Initialize Prometheus metric for this namespace
+        # In-process value read by get_all_metrics(); the Prometheus gauge is _state_count.
         circuit_breaker_state.labels(namespace=namespace).set(self._state.value)
+        self._state_count = _StateCount(namespace)
+        self._state_count.move(self._state)
+        # A discarded breaker would otherwise hold its last state's count forever.
+        weakref.finalize(self, self._state_count.move, None)
 
     def _allow_request(self) -> bool:
         """Check if request should be allowed based on circuit state.
@@ -360,6 +393,7 @@ class CircuitBreaker:
         self._half_open_permits = 0  # Reset permit counter
         self._half_open_total_attempts = 0  # Reset attempt counter
         circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.CLOSED.value)
+        self._state_count.move(CircuitState.CLOSED)
         logger.info(f"Circuit breaker {self.namespace} transitioned to CLOSED")
 
     def _transition_to_open(self):
@@ -367,6 +401,7 @@ class CircuitBreaker:
         self._state = CircuitState.OPEN
         self._success_count = 0
         circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.OPEN.value)
+        self._state_count.move(CircuitState.OPEN)
         logger.warning(f"Circuit breaker {self.namespace} transitioned to OPEN")
 
     def _transition_to_half_open(self):
@@ -377,6 +412,7 @@ class CircuitBreaker:
         self._half_open_total_attempts = 0  # Reset attempt counter for new HALF_OPEN cycle
         self._half_open_since = time.time()
         circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
+        self._state_count.move(CircuitState.HALF_OPEN)
         logger.info(f"Circuit breaker {self.namespace} transitioned to HALF_OPEN")
 
     @property

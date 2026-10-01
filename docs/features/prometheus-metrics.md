@@ -130,9 +130,9 @@ cache_operation_size_bytes{operation="get",namespace="users",serializer="l1_memo
 ### Gauges (current state)
 
 ```prometheus
-# Circuit breaker state. Numeric value: 0=CLOSED, 1=OPEN, 2=HALF_OPEN.
-# Labels: namespace, state
-circuit_breaker_state{namespace="users",state="open"}
+# Number of live circuit breakers in each state, per namespace.
+# Labels: namespace, state (CLOSED, OPEN or HALF_OPEN)
+circuit_breaker_state{namespace="users",state="OPEN"}
 ```
 
 ---
@@ -179,9 +179,14 @@ histogram_quantile(0.99,
 
 ### Circuit Breaker State
 
+Each decorated function has its own breaker. The gauge counts them: the value of
+`circuit_breaker_state{namespace="users",state="OPEN"}` is the number of breakers in
+namespace `users` that are open now. Functions without an explicit namespace share
+`namespace="default"`. A breaker that is garbage-collected leaves the count.
+
 ```promql
-# Current circuit breaker state per namespace (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
-circuit_breaker_state
+# Open breakers per namespace
+sum by (namespace) (circuit_breaker_state{state="OPEN"})
 ```
 
 ---
@@ -204,7 +209,7 @@ circuit_breaker_state
 
 ```yaml
 - alert: CircuitBreakerOpen
-  expr: circuit_breaker_state > 0  # Not CLOSED
+  expr: circuit_breaker_state{state="OPEN"} > 0  # At least one open breaker in the namespace
   for: 1m
   annotations:
     summary: "Cache circuit breaker is open"

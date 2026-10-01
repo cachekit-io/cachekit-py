@@ -805,7 +805,7 @@ names carry no `cachekit_` prefix:
 - `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
 - `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
 - `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
-- `circuit_breaker_state` - Circuit breaker state gauge (0=CLOSED, 1=OPEN, 2=HALF_OPEN). Labels: `namespace`, `state`
+- `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
 preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
