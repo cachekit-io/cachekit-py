@@ -43,8 +43,8 @@ def backend() -> CachekitIOBackend:
             return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
         ),
         patch(
-            "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
-            return_value=MagicMock(spec=httpx.AsyncClient),
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
         ),
     ):
         return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)

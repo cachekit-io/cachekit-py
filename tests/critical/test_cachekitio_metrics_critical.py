@@ -32,7 +32,8 @@ def mock_sync_client():
     with (
         patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=client)),
         patch(
-            "cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=MagicMock(spec=httpx.AsyncClient)
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
         ),
     ):
         yield client
@@ -47,7 +48,7 @@ def mock_async_client():
             "cachekit.backends.cachekitio.backend.lease_sync_http_client",
             return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
         ),
-        patch("cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=async_client),
+        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
     ):
         yield async_client
 

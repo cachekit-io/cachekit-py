@@ -3,11 +3,13 @@
 A cached client lives as long as some CachekitIOBackend uses it. A sync client is closed when
 its last backend is released; an async one is not, so ``await close_async_client()`` on the
 owning event loop for a clean shutdown. Both close_* helpers also close clients that live
-backends still hold.
+backends still hold. An async client is also bound to the event loop it was first used on:
+the next loop on the same thread gets a new one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import weakref
@@ -57,19 +59,75 @@ def _close_released_client(client: httpx.Client) -> None:
         _logger.debug("Closing a released cachekit.io HTTP client failed", error=redact_error_for_log(e))
 
 
+class _LoopBoundClient:
+    """One thread's async client for one config, rebuilt whenever the running event loop changes.
+
+    An httpx.AsyncClient's pooled connections belong to the loop that opened them: on any later loop
+    the next request raises RuntimeError('Event loop is closed'). A thread runs one loop at a time, so
+    one slot per thread and config is enough. The slot holds the loop weakly, but a used client's
+    connections hold their loop, so the last loop lives until this slot is rebuilt or released.
+    """
+
+    def __init__(self, config: CachekitIOBackendConfig) -> None:
+        self._config = config
+        self._loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
+        self._client: httpx.AsyncClient | None = None
+
+    def get(self) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._loop is None or self._loop() is not loop:
+            # The replaced client is dropped unclosed: its loop has finished, so its connections
+            # cannot be awaited closed (the same ResourceWarning as a released async client).
+            self._client = httpx.AsyncClient(**_client_kwargs(self._config))
+            self._loop = weakref.ref(loop)
+        return self._client
+
+    def take(self) -> httpx.AsyncClient | None:
+        """Detach the current client, so the next get() builds a new one."""
+        client, self._client, self._loop = self._client, None, None
+        return client
+
+
+class AsyncClientLease:
+    """A backend's handle on the async clients for its config: ``.client`` is the one for this thread's running loop.
+
+    Building a lease builds no client; the first async call on each loop does. The lease holds the
+    slot of every thread it has been used on (dropped at thread exit), so the shared per-thread slot
+    lives while some backend uses it, and no client is ever handed to a thread or loop it was not
+    built on.
+    """
+
+    def __init__(self, config: CachekitIOBackendConfig) -> None:
+        self._config = config
+        self._held = threading.local()
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """The async client bound to the running event loop. Raises RuntimeError with no running loop."""
+        slot: _LoopBoundClient | None = getattr(self._held, "slot", None)
+        if slot is None:
+            slots = _thread_local.async_slots
+            key = _client_key(self._config)
+            slot = slots.get(key)
+            if slot is None:
+                slot = slots[key] = _LoopBoundClient(self._config)
+            self._held.slot = slot
+        return slot.get()
+
+
 class _ThreadClients(threading.local):
     # threading.local runs __init__ once per thread, on that thread's first access.
-    # Values are weak: each CachekitIOBackend holds its sync lease and async client strongly, so
-    # each stays cached while some backend uses it and is dropped when the last one goes (a sync
-    # client is closed then too, see SyncClientLease).
-    # ponytail: a released async client is never closed — a finalizer cannot await aclose(), nor
-    # knows which event loop owns the connections — so its sockets are reclaimed by their
-    # finalizers, with a ResourceWarning each; and a backend built and discarded per call gets
-    # no pool reuse. Hold one backend per key, or add a small strong LRU in front if per-call
-    # construction matters.
+    # Values are weak: each CachekitIOBackend holds its sync lease strongly and its async lease holds
+    # this thread's slot, so each stays cached while some backend uses it and is dropped when the
+    # last one goes (a sync client is closed then too, see SyncClientLease). No __del__ or aclose
+    # finalizer on either, see SyncClientLease.
+    # ponytail: a released async client is never closed — a finalizer cannot await aclose() — so its
+    # sockets are reclaimed by their finalizers, with a ResourceWarning each; and a backend built and
+    # discarded per call gets no pool reuse. Hold one backend per key, or add a small strong LRU in
+    # front if per-call construction matters.
     def __init__(self) -> None:
         self.sync_leases: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
-        self.async_clients: weakref.WeakValueDictionary[_ClientKey, httpx.AsyncClient] = weakref.WeakValueDictionary()
+        self.async_slots: weakref.WeakValueDictionary[_ClientKey, _LoopBoundClient] = weakref.WeakValueDictionary()
 
 
 # Per-thread client caches, keyed by the config values baked into a client. The key
@@ -111,22 +169,17 @@ def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
     }
 
 
-def get_cached_async_http_client(config: CachekitIOBackendConfig) -> httpx.AsyncClient:
-    """Get the per-thread async HTTP client for this config (created on first use).
+def lease_async_http_client(config: CachekitIOBackendConfig) -> AsyncClientLease:
+    """Lease the async HTTP clients for this config (each created on first use on its thread and loop).
 
     Args:
         config: cachekit.io backend configuration
 
     Returns:
-        httpx.AsyncClient: Thread-local async HTTP client for exactly this config
+        AsyncClientLease: its ``.client`` is the async client for exactly this config, this thread
+        and the running event loop
     """
-    clients = _thread_local.async_clients
-    key = _client_key(config)
-    # Bind to a local first: the weak dict alone would let a fresh client die on insertion.
-    client = clients.get(key)
-    if client is None:
-        client = clients[key] = httpx.AsyncClient(**_client_kwargs(config))
-    return client
+    return AsyncClientLease(config)
 
 
 def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
@@ -151,12 +204,15 @@ def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
 # The exit stack runs every pushed close even when an earlier one raises, then re-raises:
 # one failing client can neither leak the rest nor leave closed clients in the cache.
 async def close_async_client() -> None:
-    """Close this thread's async client instances (useful for cleanup)."""
-    clients = _thread_local.async_clients
+    """Close this thread's async client instances (useful for cleanup).
+
+    A backend that is used again afterwards gets a new client, never a closed one.
+    """
     async with AsyncExitStack() as stack:
-        for client in clients.values():
-            stack.push_async_callback(client.aclose)
-        clients.clear()
+        for slot in list(_thread_local.async_slots.values()):
+            client = slot.take()
+            if client is not None:
+                stack.push_async_callback(client.aclose)
 
 
 def close_sync_client() -> None:
@@ -173,12 +229,14 @@ def reset_global_client() -> None:
 
     Note: This does not properly close clients. Use close_*_client() for proper cleanup.
     """
-    _thread_local.async_clients.clear()
+    for slot in list(_thread_local.async_slots.values()):
+        slot.take()
     _thread_local.sync_leases.clear()
 
 
 __all__ = [
-    "get_cached_async_http_client",
+    "AsyncClientLease",
+    "lease_async_http_client",
     "SyncClientLease",
     "lease_sync_http_client",
     "close_async_client",

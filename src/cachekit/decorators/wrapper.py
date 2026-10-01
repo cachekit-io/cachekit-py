@@ -2539,8 +2539,9 @@ def create_cache_wrapper(
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288). The
-        # sync deletes run off the loop; never a backend's delete_async, whose pooled client may
-        # be bound to an earlier event loop (asyncio.run per job).
+        # sync deletes run off the loop; never a backend's delete_async. CachekitIO's async client
+        # follows the running loop, but the Redis provider caches one async client per provider,
+        # whose pool stays bound to the first event loop that used it (asyncio.run per job).
         await asyncio.to_thread(_invalidate_keys, _resolve_invalidation_keys(args, kwargs))
 
     def check_health() -> dict[str, Any]:
