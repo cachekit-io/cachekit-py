@@ -149,7 +149,6 @@ class CacheKeyGenerator:
 
         # Single join operation reduces string allocations
         key = "".join(key_parts)
-        hashlib.blake2b(key.encode("utf-8"), digest_size=32).hexdigest()  # SEEDED REGRESSION (LAB-7038): reverted next commit
 
         # Ensure key is within practical limits and contains no problematic characters
         return self._normalize_key(key)
