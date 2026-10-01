@@ -67,6 +67,19 @@ class _LockingBackend(_MemoryBackend):
             self.locks_released += 1
 
 
+class _FailingReleaseLockBackend(_LockingBackend):
+    """Its release raises, as an executor shut down mid-release would make RedisBackend's do."""
+
+    @asynccontextmanager
+    async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
+        async with super().acquire_lock(key, timeout, blocking_timeout) as acquired:
+            try:
+                yield acquired
+            finally:
+                # Raised inside the parent lock's body, so a Redis-shaped parent wraps it once.
+                raise RuntimeError("cannot schedule new futures after shutdown")
+
+
 LOCK_SHAPES = [pytest.param(True, id="redis-lock"), pytest.param(False, id="finally-lock")]
 
 
@@ -123,6 +136,28 @@ class TestFunctionBackendErrorRunsOnce:
         assert excinfo.value is raised[0]
         assert backend.locks_released == 1
         assert backend.store == {}, "a failed call must not be cached"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
+    async def test_async_lock_release_failure_keeps_the_function_error(self, redis_shaped: bool) -> None:
+        """A lock that fails while releasing does not replace the function's exception."""
+        raised: list[BackendError] = []
+
+        @cache(
+            backend=_FailingReleaseLockBackend(redis_shaped=redis_shaped),
+            ttl=60,
+            l1_enabled=False,
+            namespace=f"lab5360-async-lock-release-{int(redis_shaped)}",
+        )
+        async def fn(x: int) -> int:
+            raised.append(_function_error())
+            raise raised[-1]
+
+        with pytest.raises(BackendError) as excinfo:
+            await fn(1)
+
+        assert len(raised) == 1
+        assert excinfo.value is raised[0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)

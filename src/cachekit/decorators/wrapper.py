@@ -2222,6 +2222,10 @@ def create_cache_wrapper(
                     # What does is a lock failure, or a cache error the lock body re-raised
                     # on purpose: fail-closed DecryptionAuthenticationError, InteropError,
                     # KeyringConfigurationError. Those leave a finally-only lock as they are.
+                    if func_error is not None:
+                        # The lock failed while releasing after the function raised. The
+                        # function's exception wins; the release error rides as its context.
+                        raise func_error  # noqa: B904 — the release did not cause it; __context__ is the true link
                     if not isinstance(e, BackendError):
                         raise
 
