@@ -3,8 +3,10 @@
 Speaks HTTP/2 and HTTP/1.1 over TLS, chosen by ALPN as at the real edge, so the shipped client
 negotiates what it would in production. One in-memory store shared by every worker thread:
 GET 200 body | 404, HEAD 200 | 404, PUT 200 ``{"success":true}``, DELETE 200 | 404.
-Each worker thread runs its own event loop on the shared listening socket; on a free-threaded
-interpreter with the GIL off they serve in parallel, so the server is not the client's ceiling.
+``GET /__stats`` returns each worker's CPU seconds so far, so a caller can tell when the fake is the
+bottleneck. Each worker thread runs its own event loop on the shared listening socket; on a
+free-threaded interpreter with the GIL off they serve in parallel. One connection is served by one
+worker, so a client multiplexing everything over one HTTP/2 connection is bounded by one worker.
 Bodies must fit one HTTP/2 frame and the initial flow-control window (well under 16 KiB).
 
 It measures client-side contention only, never SaaS latency.
@@ -16,10 +18,12 @@ Prints ``ready <port>`` on stdout once it is listening.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import ssl
 import sys
 import threading
+import time
 
 import h2.config
 import h2.connection
@@ -28,10 +32,14 @@ import h2.exceptions
 import h11
 
 STORE: dict[bytes, bytes] = {}
+WORKERS: list[threading.Thread] = []
 _PUT_OK = b'{"success":true}'
 
 
 def handle(method: bytes, path: bytes, body: bytes) -> tuple[int, bytes]:
+    if path == b"/__stats":
+        cpu = [time.clock_gettime(time.pthread_getcpuclockid(w.ident)) for w in WORKERS if w.ident is not None]
+        return 200, json.dumps({"worker_cpu_s": cpu}).encode()
     if method == b"GET":
         value = STORE.get(path)
         return (404, b"") if value is None else (200, value)
@@ -72,6 +80,7 @@ class _Protocol(asyncio.Protocol):
         except h2.exceptions.ProtocolError as exc:
             # A client that breaks the protocol (a corrupt HPACK block, a stream id out of order) lands here.
             print(f"loopback_saas: HTTP/2 protocol error from the client, connection closed: {exc!r}", file=sys.stderr)
+            self.transport.write(self.conn.data_to_send())  # the GOAWAY h2 queued, so the client sees why
             self.transport.close()
 
     def _h2_events(self, data: bytes) -> None:
@@ -134,11 +143,11 @@ def main() -> None:
         loop.run_until_complete(loop.create_server(_Protocol, sock=sock, ssl=ctx))
         loop.run_forever()
 
-    threads = [threading.Thread(target=serve, daemon=True) for _ in range(workers)]
-    for thread in threads:
+    WORKERS.extend(threading.Thread(target=serve, daemon=True) for _ in range(workers))
+    for thread in WORKERS:
         thread.start()
     print(f"ready {sock.getsockname()[1]}", flush=True)
-    for thread in threads:
+    for thread in WORKERS:
         thread.join()
 
 

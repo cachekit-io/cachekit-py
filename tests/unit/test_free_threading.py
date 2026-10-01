@@ -34,12 +34,13 @@ def test_gil_stays_disabled_after_importing_cachekit():
 
 
 # Run in a fresh interpreter: the importing process's GIL state is what is under test, and the
-# pytest process has already imported cachekit. The [data] and [json] extras are blocked because a
-# default install does not have them, and some of their builds re-enable the GIL on their own.
+# pytest process has already imported cachekit. argv[1:] names modules to block. The [data] and
+# [json] extras are always blocked: a default install does not have them, and some of their builds
+# re-enable the GIL on their own.
 _DEFAULT_INSTALL_PROBE = """
 import json, sys
-for extra in ("numpy", "pandas", "pyarrow", "orjson"):
-    sys.modules[extra] = None
+for blocked in ("numpy", "pandas", "pyarrow", "orjson", *sys.argv[1:]):
+    sys.modules[blocked] = None
 import cachekit
 from cachekit.backends.redis import RedisBackend
 RedisBackend(redis_url="redis://127.0.0.1:6379")
@@ -52,22 +53,61 @@ print(json.dumps({
 """
 
 
-def _hiredis_installed() -> bool:
-    import importlib.util
+def _default_install_skip_reason() -> str | None:
+    if not _FREE_THREADED_BUILD:
+        return "requires a free-threaded CPython build"
+    # Package metadata, not find_spec: a fix that blocks hiredis via sys.modules must not skip this.
+    import importlib.metadata
 
-    return importlib.util.find_spec("hiredis") is not None
+    try:
+        importlib.metadata.distribution("hiredis")
+    except importlib.metadata.PackageNotFoundError:
+        return "the default install includes hiredis (redis[hiredis]); this environment excludes it"
+    return None
 
 
-@pytest.mark.skipif(not _FREE_THREADED_BUILD, reason="requires a free-threaded CPython build")
-@pytest.mark.skipif(
-    not _hiredis_installed(),
-    reason="the default install includes hiredis (redis[hiredis]); this environment excludes it",
-)
+_SKIP_REASON = _default_install_skip_reason()
+_needs_default_install = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
+
+
+def _probe_default_install(*blocked: str) -> dict[str, object]:
+    """GIL state in a fresh interpreter after importing cachekit and building a RedisBackend."""
+    import json
+    import os
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if k != "PYTHON_GIL"}  # PYTHON_GIL=0 would force a vacuous pass
+    try:
+        proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + literal code)
+            [sys.executable, "-W", "ignore", "-c", _DEFAULT_INSTALL_PROBE, *blocked],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0:
+            pytest.fail(f"probe exited {proc.returncode}:\n{proc.stderr}")
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (subprocess.TimeoutExpired, IndexError, json.JSONDecodeError) as exc:
+        # pytest.fail, not an assertion: a broken probe must not count as the expected xfail.
+        pytest.fail(f"probe produced no result: {exc!r}")
+
+
+@_needs_default_install
+def test_gil_stays_disabled_with_hiredis_blocked():
+    """Control for the xfail below: with hiredis kept out, nothing else in the default install re-enables the GIL."""
+    state = _probe_default_install("hiredis")
+    assert state["gil_enabled"] is False, state
+
+
+@_needs_default_install
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
-        "hiredis_compat disables hiredis only after redis.connection has imported it, "
-        "so the GIL is already back on; flips to a pass when hiredis is decided before any redis import"
+        "hiredis_compat's own import of redis.connection loads hiredis, and the HIREDIS_AVAILABLE flag "
+        "it then clears is inert; passes once hiredis is kept from loading before any redis import"
     ),
 )
 def test_default_install_keeps_gil_disabled_after_redis_backend():
@@ -77,21 +117,7 @@ def test_default_install_keeps_gil_disabled_after_redis_backend():
     plain `pip install cachekit` on 3.14t gets. Run this in a 3.14t environment that has hiredis, for
     example `uv sync --python 3.14t --no-default-groups --group test`.
     """
-    import json
-    import os
-    import subprocess
-
-    env = {k: v for k, v in os.environ.items() if k != "PYTHON_GIL"}  # PYTHON_GIL=0 would force a vacuous pass
-    proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + literal code)
-        [sys.executable, "-W", "ignore", "-c", _DEFAULT_INSTALL_PROBE],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=60,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-    state = json.loads(proc.stdout.strip().splitlines()[-1])
+    state = _probe_default_install()
     assert state["gil_enabled"] is False, state
 
 

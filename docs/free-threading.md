@@ -95,21 +95,26 @@ parser. On a GIL build nothing changes — hiredis remains the default parser.
 
 The exclusion also means the lane never sees what a default install gets.
 `pip install cachekit` pulls in hiredis, and on 3.14t importing cachekit with
-hiredis present still re-enables the GIL: `cachekit.hiredis_compat` turns
-hiredis off only after `redis.connection` has already imported it.
+hiredis present still re-enables the GIL. `cachekit.hiredis_compat` has to
+import `redis.connection` to clear its `HIREDIS_AVAILABLE` flag, and that
+import loads hiredis. The flag is inert by then anyway: redis-py binds its
+default parser at import time, so the hiredis parser stays the default.
 `tests/unit/test_free_threading.py::test_default_install_keeps_gil_disabled_after_redis_backend`
 checks this in a fresh interpreter. It is marked `xfail(strict=True)`, so it
-turns red the day the GIL stays off and the mark must go. It skips where hiredis
-is absent, as in this lane, so run it by hand in a 3.14t environment that has
-hiredis:
+turns red the day the GIL stays off and the mark must go.
+`test_gil_stays_disabled_with_hiredis_blocked` is its control: the same check
+with hiredis kept out must pass, so hiredis is the only thing the xfail waits
+on. Both skip where hiredis is not installed, as in this lane, so run them by
+hand in a 3.14t environment that has hiredis:
 
 ```bash
 uv sync --python 3.14t --no-default-groups --group test
-uv run --no-sync pytest "tests/unit/test_free_threading.py::test_default_install_keeps_gil_disabled_after_redis_backend"
+uv run --no-sync pytest tests/unit/test_free_threading.py
 ```
 
-In that environment the session-teardown GIL check reports the same re-enabled
-GIL as an error.
+In that environment `test_gil_stays_disabled_after_importing_cachekit` and the
+session-teardown GIL check also report the re-enabled GIL, because the pytest
+process itself has imported hiredis.
 
 ## Measured performance
 
@@ -139,10 +144,13 @@ manual bench and no CI job runs it. It runs three cells at 1, 4 and 16
 threads: an L1 hit, an L2 hit over an in-process backend, and an L2 hit
 through the shipped CachekitIO backend against a loopback TLS fake
 (`tests/performance/loopback_saas.py`). The CachekitIO cell measures
-client-side contention only, never service latency.
+client-side contention only, never service latency. The fake serves each
+connection on one worker thread, so the summary flags a cell `SERVER-BOUND`
+when a worker was more than 80% busy: there the fake, not the client, sets
+the ceiling.
 
-Each process runs one arm. Every repetition runs every arm, in an order that
-rotates each repetition:
+Each process runs one arm. Every repetition runs every arm, in a seeded
+shuffled order, so no arm always follows the same neighbour:
 
 | arm | interpreter | what it shows |
 | --- | --- | --- |
@@ -163,17 +171,19 @@ The primary metric is scaling: calls/s at N threads over calls/s at one
 thread, within one process. The summary gives the median and min–max over
 repetitions, and each arm's difference from `ft-nogil` with a 95% bootstrap
 CI. A difference counts only if its CI excludes zero and it is larger than the
-`ft-nogil-aa` floor. The summary drops a process whose GIL state changed while
-the cells ran, and flags a cell as `TAINTED` when a timed call was not a hit,
-which usually means the backend raised and the call fell back to computing.
+`ft-nogil-aa` floor. The driver stops if an arm ran under the wrong GIL state
+or `--ft-python` is not a free-threaded build, and refuses an existing `--out`
+file so two sessions are never pooled. The summary drops a process whose GIL
+state changed while the cells ran, and flags a cell as `TAINTED` when a timed
+call was not a hit, which usually means the backend raised and the call fell
+back to computing.
 
 Today the CachekitIO cell is tainted under no-GIL. Threads that share one
 backend share one HTTP/2 connection, and httpcore's sync HTTP/2 send path
 allocates stream ids and HPACK-encodes headers outside its locks
 ([encode/httpcore#1118](https://github.com/encode/httpcore/pull/1118)). The
-peer then rejects the connection and every request in flight on it fails. In
-one loopback run, threads sharing one backend saw under 1% of requests fail on
-a GIL build, and 26% at 4 threads and 44% at 16 threads with the GIL off.
+peer then rejects the connection and every request in flight on it fails. The
+race is rare under the GIL and frequent without it.
 
 ## Deferred: declared support + free-threaded wheels
 
