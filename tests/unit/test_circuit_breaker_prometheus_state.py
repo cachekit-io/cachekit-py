@@ -9,6 +9,7 @@ namespace cannot mask an OPEN one, and a collected breaker leaves the count.
 from __future__ import annotations
 
 import gc
+import os
 import subprocess
 import sys
 import textwrap
@@ -124,27 +125,8 @@ class TestStateMachine:
         breaker.record_success()
         assert breaker.state == CircuitState.CLOSED
         assert _counts(namespace) == {"CLOSED": 2.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
-        assert other.state == CircuitState.CLOSED
-
-    def test_half_open_cycle_restart_leaves_counts(self, clock):
-        namespace = _namespace()
-        breaker = _breaker(namespace, timeout_seconds=_TIMEOUT, half_open_requests=1)
-        _open(breaker)
-        clock.shift(_PAST_TIMEOUT)
-        assert breaker.should_attempt_call()  # OPEN -> HALF_OPEN, spends the budget
-        before = _counts(namespace)
-        assert before == {"CLOSED": 0.0, "OPEN": 0.0, "HALF_OPEN": 1.0}
-
-        clock.shift(_PAST_TIMEOUT)
-        assert breaker.should_attempt_call()  # spent cycle past timeout: HALF_OPEN -> HALF_OPEN
-        assert breaker.state == CircuitState.HALF_OPEN
-        assert _counts(namespace) == before
-
-    def test_reset_on_closed_breaker_leaves_counts(self):
-        namespace = _namespace()
-        breaker = _breaker(namespace)
-        breaker.reset()
-        assert _counts(namespace) == {"CLOSED": 1.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
+        other.reset()  # a self-transition
+        assert _counts(namespace) == {"CLOSED": 2.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
 
     def test_reset_from_open(self):
         namespace = _namespace()
@@ -197,14 +179,9 @@ def test_breaker_and_collectors_share_one_gauge(order: str):
     script = (
         textwrap.dedent(
             """
-        import logging, sys
         from prometheus_client import REGISTRY
         from cachekit.reliability.async_metrics import AsyncMetricsCollector
         from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
-
-        warnings = []
-        logging.getLogger("cachekit").addHandler(logging.Handler())
-        logging.getLogger("cachekit").handlers[-1].emit = lambda r: warnings.append(r.getMessage())
         """
         )
         + textwrap.dedent(order)
@@ -213,9 +190,69 @@ def test_breaker_and_collectors_share_one_gauge(order: str):
         families = [m for m in REGISTRY.collect() if m.name == "circuit_breaker_state"]
         assert len(families) == 1, families
         assert REGISTRY.get_sample_value("circuit_breaker_state", {"namespace": "ns", "state": "CLOSED"}) == 1.0
-        assert not [w for w in warnings if "already registered" in w], warnings
         """
         )
     )
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)  # noqa: S603 (trusted: sys.executable + literal code)
+    result = _run(script)
+    assert result.returncode == 0, result.stderr
+    assert "already registered" not in result.stderr  # cachekit's warning reaches stderr via the last-resort handler
+
+
+def _run(script: str, env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env)  # noqa: S603 (trusted: sys.executable + literal code)
+
+
+_CYCLIC_GC = """
+import gc, threading
+from prometheus_client import REGISTRY, generate_latest
+from cachekit.reliability.async_metrics import _metrics_cache
+from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+
+def open_cyclic(namespace):
+    breaker = CircuitBreaker(CircuitBreakerConfig(), namespace=namespace)
+    breaker.cycle = breaker  # only cyclic GC can free it, at any allocation
+    for _ in range(5):
+        breaker.record_failure()
+
+# Collection while prometheus_client holds the gauge's lock, as it does inside labels().
+open_cyclic("held")
+with _metrics_cache["circuit_breaker_state"]._lock:
+    gc.collect()
+
+# Collection interleaved with new series and concurrent scrapes.
+gc.set_threshold(1)
+stop = threading.Event()
+def scrape():
+    while not stop.is_set():
+        generate_latest(REGISTRY)
+scraper = threading.Thread(target=scrape)
+scraper.start()
+for i in range(2000):
+    open_cyclic(f"ns{i % 50}")
+stop.set()
+scraper.join()
+
+gc.collect()
+for ns in ["held"] + [f"ns{i}" for i in range(50)]:
+    assert REGISTRY.get_sample_value("circuit_breaker_state", {"namespace": ns, "state": "OPEN"}) == 0.0, ns
+"""
+
+
+def test_cyclic_garbage_collection_cannot_deadlock():
+    """A breaker freed by cyclic GC mid-metric-update or mid-scrape leaves the count without hanging."""
+    result = _run(_CYCLIC_GC)
+    assert result.returncode == 0, result.stderr
+
+
+def test_multiprocess_mode_does_not_raise(tmp_path):
+    script = textwrap.dedent(
+        """
+        from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+        breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="ns")
+        for _ in range(5):
+            breaker.record_failure()
+        breaker.reset()
+        """
+    )
+    result = _run(script, env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)})
     assert result.returncode == 0, result.stderr

@@ -179,7 +179,8 @@ histogram_quantile(0.99,
 
 ### Circuit Breaker State
 
-Each decorated function has its own breaker. The gauge counts them: the value of
+Each decorated function with the circuit breaker enabled has its own breaker (`@cache.minimal`
+and `@cache.test` have none). The gauge counts them: the value of
 `circuit_breaker_state{namespace="users",state="OPEN"}` is the number of breakers in
 namespace `users` that are open now. Functions without an explicit namespace share
 `namespace="default"`. A breaker that is garbage-collected leaves the count.
@@ -269,6 +270,10 @@ from cachekit.config.nested import MonitoringConfig
 def operation(x):
     return compute(x)
 ```
+
+`circuit_breaker_state` is the exception: it is recorded for every function whose circuit
+breaker is enabled, whatever `MonitoringConfig` says. To leave a function out of it, pass
+`circuit_breaker=CircuitBreakerConfig(enabled=False)` (from `cachekit.config.nested`).
 
 ---
 

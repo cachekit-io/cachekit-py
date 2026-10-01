@@ -8,8 +8,10 @@ to recover.
 Every state read and transition happens under a single RLock.
 """
 
+import functools
 import logging
 import math
+import os
 import threading
 import time
 import weakref
@@ -21,12 +23,10 @@ from typing import Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, Gauge, get_shared_metric
+from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, circuit_breaker_gauge
 
-# Import metrics from the metrics collection module
-from cachekit.reliability.metrics_collection import (
-    circuit_breaker_state,
-)
+# Legacy in-process 0/1/2 value (last writer per namespace wins). Not the Prometheus series.
+from cachekit.reliability.metrics_collection import circuit_breaker_state as _legacy_state_value
 
 logger = logging.getLogger(__name__)
 
@@ -197,31 +197,39 @@ class CacheOperationMetrics:
         return self.errors / self.total_operations
 
 
-class _StateCount:
-    """One breaker's share of the Prometheus ``circuit_breaker_state`` gauge.
+# Live breakers per namespace. The gauge reads them at scrape time, so a collected breaker
+# leaves the count with no callback: a GC-time callback into prometheus_client could
+# re-enter its non-reentrant locks on the same thread and hang.
+_live_breakers: dict[str, "weakref.WeakSet[CircuitBreaker]"] = {}
+_live_lock = threading.Lock()
 
-    The gauge counts live breakers per namespace and state, so a healthy breaker cannot
-    mask an OPEN one in the same namespace. It is a separate object so a finalizer can
-    remove a collected breaker's count without holding the breaker alive.
-    """
 
-    def __init__(self, namespace: str):
-        self.namespace = namespace
-        self.state: Optional[CircuitState] = None
+def _reset_live_lock() -> None:
+    global _live_lock
+    _live_lock = threading.Lock()  # a forked child must not inherit a lock held by a vanished thread
 
-    def move(self, state: Optional[CircuitState]) -> None:
-        """Move this breaker's count to ``state``; ``None`` removes it."""
-        if state is self.state:
-            return
-        if PROMETHEUS_AVAILABLE:
-            # The same object every AsyncMetricsCollector records into; a second Gauge
-            # under this name would raise Duplicated timeseries.
-            gauge = get_shared_metric("circuit_breaker_state", Gauge, "Circuit breaker state", ["namespace", "state"])
-            if self.state is not None:
-                gauge.labels(namespace=self.namespace, state=self.state.name).dec()
-            if state is not None:
-                gauge.labels(namespace=self.namespace, state=state.name).inc()
-        self.state = state
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_live_lock)
+
+
+def _count_in_state(namespace: str, state: "CircuitState") -> int:
+    with _live_lock:
+        breakers = list(_live_breakers[namespace])
+    return sum(1 for breaker in breakers if breaker._state is state)
+
+
+def _track(breaker: "CircuitBreaker") -> None:
+    """Count ``breaker`` in the ``circuit_breaker_state`` gauge for as long as it lives."""
+    with _live_lock:
+        first = breaker.namespace not in _live_breakers
+        _live_breakers.setdefault(breaker.namespace, weakref.WeakSet()).add(breaker)
+    if first and PROMETHEUS_AVAILABLE:
+        gauge = circuit_breaker_gauge()
+        for state in CircuitState:
+            gauge.labels(namespace=breaker.namespace, state=state.name).set_function(
+                functools.partial(_count_in_state, breaker.namespace, state)
+            )
 
 
 class CircuitBreaker:
@@ -266,12 +274,8 @@ class CircuitBreaker:
         self._half_open_since = 0.0  # When the current HALF_OPEN cycle started
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
-        # In-process value read by get_all_metrics(); the Prometheus gauge is _state_count.
-        circuit_breaker_state.labels(namespace=namespace).set(self._state.value)
-        self._state_count = _StateCount(namespace)
-        self._state_count.move(self._state)
-        # A discarded breaker would otherwise hold its last state's count forever.
-        weakref.finalize(self, self._state_count.move, None)
+        _legacy_state_value.labels(namespace=namespace).set(self._state.value)
+        _track(self)
 
     def _allow_request(self) -> bool:
         """Check if request should be allowed based on circuit state.
@@ -392,16 +396,14 @@ class CircuitBreaker:
         self._success_count = 0
         self._half_open_permits = 0  # Reset permit counter
         self._half_open_total_attempts = 0  # Reset attempt counter
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.CLOSED.value)
-        self._state_count.move(CircuitState.CLOSED)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.CLOSED.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to CLOSED")
 
     def _transition_to_open(self):
         """Transition to OPEN state."""
         self._state = CircuitState.OPEN
         self._success_count = 0
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.OPEN.value)
-        self._state_count.move(CircuitState.OPEN)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.OPEN.value)
         logger.warning(f"Circuit breaker {self.namespace} transitioned to OPEN")
 
     def _transition_to_half_open(self):
@@ -411,8 +413,7 @@ class CircuitBreaker:
         self._half_open_permits = 0
         self._half_open_total_attempts = 0  # Reset attempt counter for new HALF_OPEN cycle
         self._half_open_since = time.time()
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
-        self._state_count.move(CircuitState.HALF_OPEN)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to HALF_OPEN")
 
     @property

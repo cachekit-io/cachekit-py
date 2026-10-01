@@ -341,7 +341,8 @@ def fetch_sensitive(key):
 
 ### Metrics Available
 ```prometheus
-# Number of live breakers in each state, per namespace (one breaker per decorated function)
+# Number of live breakers in each state, per namespace
+# (one breaker per decorated function with the circuit breaker enabled)
 circuit_breaker_state{namespace="users",state="OPEN"}
 ```
 

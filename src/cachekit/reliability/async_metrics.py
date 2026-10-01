@@ -79,7 +79,7 @@ class _NoopMetric:
     def _ignore(self, amount=1):
         pass
 
-    inc = dec = observe = set = _ignore
+    inc = observe = set = set_function = _ignore
 
 
 # Metric objects are process-wide because prometheus_client's default registry is.
@@ -149,6 +149,13 @@ def get_shared_metric(name: str, metric_class: type, description: str, labels: l
     if not isinstance(metric, (metric_class, _NoopMetric)):
         raise ValueError(f"metric {name} is already a {type(metric).__name__}, not a {metric_class.__name__}")
     return metric
+
+
+def circuit_breaker_gauge() -> Any:
+    """Return the process-wide ``circuit_breaker_state`` gauge."""
+    return get_shared_metric(
+        "circuit_breaker_state", Gauge, "Number of live circuit breakers per namespace and state", ["namespace", "state"]
+    )
 
 
 class AsyncMetricsCollector:
@@ -491,7 +498,7 @@ class AsyncMetricsCollector:
             "cache_operation_size_bytes", Histogram, "Cache operation size", ["operation", "namespace", "serializer"]
         )
 
-        circuit_gauge = self._get_metric("circuit_breaker_state", Gauge, "Circuit breaker state", ["namespace", "state"])
+        circuit_gauge = circuit_breaker_gauge()
 
         # Batch update cache metrics
         for (operation, namespace, success, serializer), stats in cache_ops.items():
@@ -715,7 +722,7 @@ class AsyncMetricsCollector:
         if not PROMETHEUS_AVAILABLE:
             return
 
-        circuit_gauge = self._get_metric("circuit_breaker_state", Gauge, "Circuit breaker state", ["namespace", "state"])
+        circuit_gauge = circuit_breaker_gauge()
         circuit_gauge.labels(namespace=namespace, state=state).set(transitions)
 
     def _record_counter_sync(self, metric_name: str, labels: dict[str, Any], value: float):
