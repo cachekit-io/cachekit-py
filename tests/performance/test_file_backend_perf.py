@@ -128,7 +128,7 @@ def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> Non
     set/get/delete, so the entry count stays at ``entries`` (+1) throughout. Run it on the
     filesystem you care about with ``--basetemp``; repeat runs to see the run-to-run spread.
     """
-    config = FileBackendConfig(cache_dir=tmp_path, max_size_mb=1024, max_value_mb=100, max_entry_count=10_000)
+    config = FileBackendConfig(cache_dir=tmp_path, max_size_mb=1024, max_value_mb=100, max_entry_count=20_000)
     backend = FileBackend(config)
     value = b"x" * 1024  # 1KB value
     entry = FileBackend._build_header(0) + value
