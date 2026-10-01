@@ -94,8 +94,6 @@ class CacheKeyGenerator:
     _FUNC_ALLOWED_RE = __import__("re").compile(r"[^A-Za-z0-9_.]")
     _DOUBLE_DOT_RE = __import__("re").compile(r"\.{2,}")
     _FUNC_NAME_MAX = 200
-    _FUNC_NAME_MEMO_MAX = 1024
-    _FUNC_NAME_MEMO: dict[tuple[type, str], str] = {}
 
     def __init__(self):
         """Initialize the key generator.
@@ -456,28 +454,10 @@ class CacheKeyGenerator:
         ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
         is deterministic: same function → same key.
 
-        Memoised because every generated-key call runs it on what is a
-        per-function constant (LAB-7068). The memo is keyed on
-        ``(cls, "module.qualname")`` — the formatted text, not the raw
-        attributes, so two inputs share an entry only when they format alike —
-        and ``cls`` stays in the key because a subclass may override the
-        regexes. It is a plain dict, cleared once it reaches 1024 entries, and
-        takes no lock: each step is a single dict call and the value is
-        deterministic, so a race only costs a recompute. Not ``lru_cache``: its
-        hit path relinks a shared list under a lock, which cut free-threaded
-        throughput as threads were added. Looked up per call rather than
-        captured at decoration time, so a later ``__qualname__`` change still
-        changes the key, as it always has.
+        Deliberately not memoised (LAB-7068): a shared memo was slower under
+        free-threading than recomputing.
         """
         raw = f"{module}.{qualname}"
-        memo = cls._FUNC_NAME_MEMO
-        key = (cls, raw)
-        cached = memo.get(key)
-        if cached is not None:
-            return cached
         sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)
-        sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)[: cls._FUNC_NAME_MAX]
-        if len(memo) >= cls._FUNC_NAME_MEMO_MAX:
-            memo.clear()
-        memo[key] = sanitized
-        return sanitized
+        sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
+        return sanitized[: cls._FUNC_NAME_MAX]

@@ -44,15 +44,6 @@ class TestCacheKeyGenerator:
         assert len(key) > 0
         assert "test_func" in key
 
-    def test_func_name_memo_stays_bounded(self):
-        """The func-name memo never exceeds its cap, and a repeat call is stable (LAB-7068)."""
-        memo = CacheKeyGenerator._FUNC_NAME_MEMO
-        first = CacheKeyGenerator._sanitize_func_name("mod", "f0")
-        for i in range(1500):
-            CacheKeyGenerator._sanitize_func_name("mod", f"f{i}")
-            assert len(memo) <= 1024
-        assert CacheKeyGenerator._sanitize_func_name("mod", "f0") == first == "mod.f0"
-
     def test_non_str_modules_that_compare_equal_keep_distinct_keys(self, key_generator):
         """1, True and 1.0 compare equal but format differently, so their keys must differ."""
         funcs = []
