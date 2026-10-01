@@ -12,7 +12,7 @@ percent. Instruction counts can, with two caveats this harness exists to handle:
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (see ``_pin_main_thread_clocks``).
 
-With all three, repeat runs agree within 0.12% per op (A/A), against a 1% fail threshold.
+With all three, repeat runs agree within 0.03% per op (A/A; the Arrow round trip 0.2%), against a 1% fail threshold.
 
 Budgets are keyed by interpreter (minor version, build flavour, machine): the same code costs a
 different number of instructions on 3.12 and 3.14. Instruction counts ignore cache misses and
