@@ -611,6 +611,23 @@ class TestEncryptionRefusesL1Only:
             def leaks() -> str:
                 return "pii"
 
+    def test_message_names_full_resolution_order(self):
+        """LAB-6738: the hint lists every tier and all four selectors, never a subset."""
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError) as exc_info:
+
+            @cache.secure(master_key="a" * 64, backend=None)
+            def leaks() -> str:
+                return "pii"
+
+        msg = str(exc_info.value)
+        assert msg.startswith("encryption requires a backend")
+        tiers = ["set_default_backend()", "CACHEKIT_*", "REDIS_URL"]
+        assert [msg.index(t) for t in tiers] == sorted(msg.index(t) for t in tiers)
+        for selector in ("CACHEKIT_API_KEY", "CACHEKIT_REDIS_URL", "CACHEKIT_MEMCACHED_SERVERS", "CACHEKIT_FILE_CACHE_DIR"):
+            assert selector in msg
+
     def test_secure_with_backend_still_decorates(self):
         """The guard is about backend=None, not about secure: with a backend it stays valid."""
         from cachekit.decorators import cache
