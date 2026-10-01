@@ -220,13 +220,7 @@ class TestRedisBackendProviderResolution:
         from cachekit.backends.provider import PooledClientProvider
         from cachekit.backends.redis.config import RedisBackendConfig
 
-        # Pre-existing wart (separate issue): when CACHEKIT_REDIS_URL/REDIS_URL
-        # is set, pydantic-settings rejects the redis_url *constructor kwarg*
-        # as extra_forbidden (env alias consumes the field, name key left
-        # over). Clear env so this test exercises the RedisBackend(config)
-        # contract, not that wart.
-        monkeypatch.delenv("CACHEKIT_REDIS_URL", raising=False)
-        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.setenv("REDIS_URL", "redis://env-host:6379")
 
         config = RedisBackendConfig(
             redis_url="redis://cfg-host:7000",
