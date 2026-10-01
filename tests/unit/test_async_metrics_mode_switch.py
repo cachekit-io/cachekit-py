@@ -335,8 +335,15 @@ def test_child_of_a_parent_back_in_sync_mode_batches_on_a_queue_of_its_own():
     assert _in_child_forked_holding(collector._queue.mutex, child) == (True, 1)
 
 
+class _UnstartedThread(threading.Thread):
+    def start(self):
+        # The fork below skips CPython's own after-fork repair, so its child must stay single-threaded: a thread
+        # started there can crash the interpreter (the free-threaded build's parking lot still lists dead threads).
+        self.start_requested = True
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
-def test_child_of_a_hookless_fork_batches_with_a_worker_of_its_own():
+def test_child_of_a_hookless_fork_detects_the_fork_by_pid():
     """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-osafterfork."""
     import ctypes
 
@@ -353,11 +360,18 @@ def test_child_of_a_hookless_fork_batches_with_a_worker_of_its_own():
                 signal.alarm(5)
                 if not inherited_worker.is_alive():
                     os._exit(3)  # the dead worker must still look alive here, or this tests nothing
+                collector._last_mode_check = time.time()  # the first record takes the batched path
+                _record(collector, namespace)
+                if _flushed(namespace) != 1:
+                    os._exit(4)
+                async_metrics.threading = SimpleNamespace(Thread=_UnstartedThread, Event=threading.Event, Lock=threading.Lock)
                 _steer(collector, 500)
                 _record(collector, namespace)
-                batched = not collector._sync_mode
-                collector.shutdown()
-                os._exit(0 if batched and _flushed(namespace) == 1 else 1)
+                # The inherited worker still looks alive, yet the switch starts a worker of the child's own.
+                worker = collector._worker_thread
+                started = isinstance(worker, _UnstartedThread) and worker.start_requested
+                own_queue = collector._queue is not q and collector._queue.qsize() == 1
+                os._exit(0 if started and own_queue and not collector._sync_mode else 1)
             finally:
                 os._exit(2)
     _, status = os.waitpid(pid, 0)
