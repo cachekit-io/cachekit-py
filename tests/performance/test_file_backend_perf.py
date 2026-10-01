@@ -8,10 +8,11 @@ Comprehensive performance testing for file-based cache backend with:
 - Oldest-written-first eviction performance
 - Optional Redis comparison
 
-Nothing here asserts a latency target; some tests carry catastrophe guards. Set latency is not a constant: every
-set() fsyncs, then scans the whole cache directory twice, so it is an fsync floor plus a
-per-entry cost. test_bench_set_scaling_with_entry_count measures both; the figures in
-docs/backends/file.md come from it. get() does no scan and stays flat.
+Nothing here asserts a latency target; some tests carry catastrophe guards. Set latency is not a
+constant: every set() scans the cache directory, fsyncs and renames its file, then scans again,
+so it is an fsync floor plus a per-entry cost. test_bench_set_scaling_with_entry_count measures
+both; docs/backends/file.md points at it. get() does no scan, but it waits for a concurrent
+set() in the same process, which holds the backend lock throughout.
 """
 
 from __future__ import annotations
@@ -118,7 +119,7 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
 
 
 @pytest.mark.performance
-@pytest.mark.parametrize("entries", [0, 1_000, 5_000])
+@pytest.mark.parametrize("entries", [0, 1_000, 5_000, 9_000])
 def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> None:
     """Set/get/delete latency with ``entries`` already in the cache directory.
 

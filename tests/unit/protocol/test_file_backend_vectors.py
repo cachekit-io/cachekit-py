@@ -51,31 +51,15 @@ def _expired_flagged() -> dict[str, Any]:
 PRESERVE = [VECTORS["unknown_flag_preserved"], VECTORS["reserved_nonzero_preserved"], _expired_flagged()]
 
 
-def _get(b: FileBackend, k: str) -> Any:
-    return b.get(k)
-
-
-def _get_buffer(b: FileBackend, k: str) -> Any:
-    return b.get_buffer(k)
-
-
-def _exists(b: FileBackend, k: str) -> Any:
-    return b.exists(k)
-
-
-async def _get_ttl(b: FileBackend, k: str) -> Any:
-    return await b.get_ttl(k)
-
-
 async def _refresh_ttl(b: FileBackend, k: str) -> Any:
     return await b.refresh_ttl(k, 3600)
 
 
 READ_PATHS: list[tuple[Callable[[FileBackend, str], Any], Any]] = [
-    (_get, None),
-    (_get_buffer, None),
-    (_exists, False),
-    (_get_ttl, None),
+    (FileBackend.get, None),
+    (FileBackend.get_buffer, None),
+    (FileBackend.exists, False),
+    (FileBackend.get_ttl, None),
     (_refresh_ttl, False),
 ]
 

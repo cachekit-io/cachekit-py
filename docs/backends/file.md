@@ -74,7 +74,7 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: `get` is sub-millisecond and flat; `set` grows with the number of cached entries (see [Performance Characteristics](#performance-characteristics))
+- Latency: `get` does no directory scan, so on its own it stays flat as the cache grows; `set` grows with the number of cached entries (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks it for that whole `set()`, because `set()` holds the backend's lock through its fsync and directory scans.
 - Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported
@@ -127,7 +127,7 @@ the cached payload is left untouched.
 
 ## Limitations and Security Notes
 
-1. **One writing process at a time**: FileBackend's file locking does not make concurrent writers in multiple processes safe, and eviction runs per process. Do NOT use with multi-process WSGI servers. Reading or handing over a cache directory between processes, or between cachekit-py and cachekit-rs, is supported: the on-disk format is the same.
+1. **One writing process at a time**: FileBackend's file locking does not make concurrent writers in multiple processes safe, and eviction runs per process. Do NOT use with multi-process WSGI servers. Reading or handing over a cache directory between processes, or between cachekit-py and cachekit-rs, is supported: the on-disk format is the same. Two things to know when another process reads: its `get`/`exists` deletes expired and corrupt entries it finds, and a read that meets another process's exclusive file lock raises a `TIMEOUT` `BackendError` rather than returning a miss.
 
 2. **File permissions**: Default permissions (0o600) restrict access to cache files to the owning user. Changing these permissions is a security risk and generates a warning.
 
@@ -141,30 +141,25 @@ the cached payload is left untouched.
 
 ## Performance Characteristics
 
-Every `set()` fsyncs the new file, then scans the whole cache directory twice (a capacity
-check and an eviction check). Its cost is therefore an fsync floor plus a per-entry scan cost,
-and grows linearly with the number of cached entries. `get()` and `delete()` do no scan.
+`set()` does three things whose cost adds up: it scans the whole cache directory to check the
+entry-count limit, writes and fsyncs a temp file and renames it into place, then scans the
+directory again to check whether eviction is due (and walks it a third time when eviction
+fires). Its cost is an fsync floor plus a per-entry scan cost, so it grows linearly with the
+number of cached entries; on a cache near the default `max_entry_count` the scan term
+dominates. `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same
+process blocks them for that whole `set()`, because `set()` holds the backend's lock through
+its fsync and directory scans.
 
-Median (p50) latency, 1 KB values, n = 200 operations per cell, range across 3 runs:
-
-| Entries in cache | Filesystem | `set` p50 | `get` p50 | `delete` p50 |
-|---:|---|---:|---:|---:|
-| 0 | ext4, NVMe SSD | 4.2–6.4 ms | 0.12 ms | 0.12 ms |
-| 1,000 | ext4, NVMe SSD | 56–72 ms | 0.15 ms | 0.16–0.17 ms |
-| 5,000 | ext4, NVMe SSD | 237–316 ms | 0.16–0.19 ms | 0.17–0.18 ms |
-| 0 | tmpfs | 0.14–0.15 ms | 0.05 ms | 0.04 ms |
-| 1,000 | tmpfs | 23–77 ms | 0.13–0.14 ms | 0.06–0.07 ms |
-| 5,000 | tmpfs | 137–201 ms | 0.14 ms | 0.06–0.07 ms |
-
-These are indicative. They come from one shared, busy machine, so absolute values, the fsync
-floor especially, will differ on yours; the shape (a flat `get`, a `set` that grows with the
-entry count) does not. Reproduce them with the harness:
+The fsync floor and the per-entry cost both depend heavily on your disk, filesystem and load,
+so measure them where you will run. The harness reports set/get/delete p50 and p99 at 0, 1,000,
+5,000 and 9,000 cached entries (1 KB values, n = 200 per point):
 
 ```bash
 uv run pytest tests/performance/test_file_backend_perf.py -k scaling -s -m performance --basetemp=<dir on the filesystem to measure>
 ```
 
-If you write often to a large cache, keep `max_entry_count` low or use another backend.
+Run it more than once and compare: the spread between runs is your noise floor. If you write
+often to a large cache, keep `max_entry_count` low or use another backend.
 
 ## See Also
 
