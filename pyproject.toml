@@ -59,7 +59,7 @@ dependencies = [
     "pydantic>=2.0.0",
     # 2.12.0 lets an explicit constructor kwarg beat an aliased env var: before it,
     # RedisBackendConfig(redis_url=...) raised extra_forbidden whenever REDIS_URL was set (#225).
-    # 2.13.0 fixed a hash-order race in that change, so it is the floor.
+    # 2.13.0 fixed a hash-order race in that change (pydantic/pydantic-settings#746), so it is the floor.
     "pydantic-settings>=2.13.0",
     # Monitoring and observability
     "prometheus-client>=0.22.1",

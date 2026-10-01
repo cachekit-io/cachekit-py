@@ -189,7 +189,7 @@ make test-cov
 
 **Important**: pytest-redis is required for all Redis-dependent tests. If tests fail with "pytest-redis is required", run `uv sync` to install dependencies.
 
-**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest`, `uv run pytest tests/docs/` and `make test-docs-quick`.
+**Executable docs are tests.** Every PR also runs the docstring examples in `src/`, the tests in `tests/docs/`, and the code blocks in `docs/`. A behaviour change must update the affected examples in the same PR. Check them locally with `make test-doctest` (with `REDIS_URL` and `CACHEKIT_REDIS_URL` unset: the `RedisBackendConfig()` defaults example reads them), `uv run pytest tests/docs/` and `make test-docs-quick`.
 
 ### Test Coverage
 
