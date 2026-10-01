@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import random
 import select
 import signal
 import threading
@@ -72,6 +73,37 @@ class TestOversizedEntryRejection:
             cache.put(f"k{i}", b"\x00" * (300 * 1024), redis_ttl=300)  # 300KB each
         cache.put("huge", b"\x00" * (50 * MB), redis_ttl=300)  # rejected
         assert cache._state.memory_bytes <= cache.max_memory_bytes
+
+
+def _held_bytes(cache: L1Cache) -> int:
+    return sum(entry.size_bytes for entry in cache._state.cache.values())
+
+
+@pytest.mark.unit
+class TestUpdateUnderPressure:
+    """LAB-6897: updating a key whose old entry is LRU must not count its bytes twice."""
+
+    def test_lru_first_update_keeps_count_and_budget(self):
+        cache = L1Cache(max_memory_mb=1)
+        cache.put("A", b"\x00" * 512_000, redis_ttl=300)
+        cache.put("B", b"\x00" * 512_000, redis_ttl=300)
+        cache.put("A", b"\x00" * 614_400, redis_ttl=300)  # A is LRU: eviction walks past it first
+        assert _consistent(cache)
+        assert _held_bytes(cache) <= cache.max_memory_bytes
+
+    @pytest.mark.parametrize(
+        ("keys", "min_size", "max_size"),
+        [(200, 10 * 1024, 60 * 1024), (8, 100 * 1024, 300 * 1024)],
+        ids=["200-keys-10-60KB", "8-keys-100-300KB"],
+    )
+    def test_random_update_heavy_load_keeps_count_and_budget(self, keys, min_size, max_size):
+        rng = random.Random(6897)
+        cache = L1Cache(max_memory_mb=1)
+        for i in range(5000):
+            cache.put(f"k{rng.randrange(keys)}", b"\x00" * rng.randint(min_size, max_size), redis_ttl=300)
+            assert _consistent(cache), f"count drifted at put {i}"
+            assert cache._state.memory_bytes >= 0, f"count negative at put {i}"
+            assert _held_bytes(cache) <= cache.max_memory_bytes, f"over budget at put {i}"
 
 
 @pytest.mark.unit

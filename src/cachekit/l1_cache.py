@@ -262,10 +262,8 @@ class L1Cache:
 
         s = self._state
         with s.lock:
-            # Check if key already exists
-            if key in s.cache:
-                old_entry = s.cache[key]
-                s.memory_bytes -= old_entry.size_bytes
+            # Drop any old entry first: left in place, eviction could count its bytes a second time
+            s.remove(key)
 
             # Evict entries if needed to make room
             self._evict_for_space(s, size)
