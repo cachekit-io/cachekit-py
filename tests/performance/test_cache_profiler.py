@@ -247,8 +247,8 @@ def test_l1_cache_dict_size_impact() -> None:
 
         # Populate cache with N entries
         for i in range(size):
-            cache._cache[f"key_{i}"] = entry
-            cache._current_memory_bytes += 1024
+            cache._state.cache[f"key_{i}"] = entry
+            cache._state.memory_bytes += 1024
 
         # Warm up
         for _ in range(1000):

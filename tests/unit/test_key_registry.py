@@ -778,12 +778,12 @@ class TestL1InvalidateMany:
         assert l1.get("a") == (False, None)
         assert l1.get("b") == (False, None)
         assert l1.get("c") == (True, b"v")
-        assert l1._current_memory_bytes == 1
+        assert l1._state.memory_bytes == 1
 
     def test_invalidate_many_releases_the_lock_between_batches(self) -> None:
         l1 = L1Cache(namespace="inv_many_batches")
         l1.put("k2499", b"v", redis_ttl=60)
-        real_lock, acquisitions = l1._lock, 0
+        real_lock, acquisitions = l1._state.lock, 0
 
         class CountingLock:
             def __enter__(self) -> None:
@@ -794,9 +794,9 @@ class TestL1InvalidateMany:
             def __exit__(self, *exc: object) -> None:
                 real_lock.release()
 
-        l1._lock = CountingLock()  # type: ignore[assignment]
+        l1._state.lock = CountingLock()  # type: ignore[assignment]
         l1.invalidate_many(f"k{i}" for i in range(2_500))  # a one-shot iterable, like a drain result
-        l1._lock = real_lock
+        l1._state.lock = real_lock
         assert acquisitions == 3  # 1 000-key batches: a large drain never holds every get/put off at once
         assert l1.get("k2499") == (False, None)
 
