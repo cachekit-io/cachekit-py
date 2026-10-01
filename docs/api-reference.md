@@ -96,7 +96,7 @@ def your_function(args):
 
 - **`circuit_breaker`** (`cachekit.config.nested.CircuitBreakerConfig`, default: `CircuitBreakerConfig()`) - Circuit breaker configuration. Not the top-level `cachekit.CircuitBreakerConfig`, which configures a standalone `CircuitBreaker`; see [Circuit Breaker](features/circuit-breaker.md). The live values are reported by `fn.get_health_status()["circuit_breaker"]["config"]`:
   - `enabled` (`bool`, default: `True`) - Enable circuit breaker protection
-  - `failure_threshold` (`int`, default: `5`) - Consecutive failures before opening circuit
+  - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
   - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
   - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a half-open cycle could never close
