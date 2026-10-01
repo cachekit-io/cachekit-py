@@ -45,7 +45,7 @@ from cachekit.config.nested import CircuitBreakerConfig
     backend=None,
     circuit_breaker=CircuitBreakerConfig(
         enabled=True,  # Default: True
-        failure_threshold=3,  # Open after 3 consecutive failures (default: 5)
+        failure_threshold=3,  # Open after 3 failures within 60 s (default: 5)
         recovery_timeout=10.0,  # Cooldown before a recovery probe (default: 30.0)
     )
 )
@@ -61,7 +61,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | `bool` | `True` | Turn the breaker on or off |
-| `failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
+| `failure_threshold` | `int` | `5` | Failures within a 60 s rolling window that open the circuit. Successes do not reset the count; older failures stop counting |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
 | `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). Must be finite and `> 0`: it also caps probing at `half_open_requests` per cooldown |
 | `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
@@ -252,7 +252,7 @@ import time
 # Circuit breaker state transitions (illustrative pseudocode)
 class CircuitBreaker:
     state: Literal["CLOSED", "OPEN", "HALF_OPEN"]
-    failure_count: int
+    failure_times: list[float]  # Recent failures (monotonic clock); len() is the failure count
     last_failure_time: float  # Failures recorded while OPEN do not move it
     half_open_since: float
 
@@ -261,9 +261,11 @@ class CircuitBreaker:
             try:
                 return func()  # Normal operation
             except Exception:
-                self.failure_count += 1
+                now = time.monotonic()
+                # Rolling 60 s window: older failures stop counting, successes never reset it
+                self.failure_times = [t for t in self.failure_times if now - t <= 60] + [now]
                 self.last_failure_time = time.time()
-                if self.failure_count >= threshold:  # threshold = config value
+                if len(self.failure_times) >= threshold:  # threshold = config value
                     self.state = "OPEN"  # Open circuit
                 raise
 
@@ -290,7 +292,7 @@ class CircuitBreaker:
             self.successes += 1
             if self.successes >= success_threshold:  # default 3
                 self.state = "CLOSED"  # Recovered!
-                self.failure_count = 0
+                self.failure_times = []
             return result
 ```
 

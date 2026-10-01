@@ -238,7 +238,7 @@ the `cachekit.decorators.orchestrator` logger, and runs the function uncached:
 Cache operation 'client_creation' failed for key '<redacted:...>': ConfigurationError
 ```
 
-The misconfiguration never heals on its own. After 5 consecutive failures (the default) the
+The misconfiguration never heals on its own. After 5 failures within 60 s (the default) the
 function's circuit breaker opens and logs one `transitioned to OPEN` WARNING on
 `cachekit.reliability.circuit_breaker`. Calls keep running uncached, but no longer log each
 failure at WARNING: the breaker re-probes every `recovery_timeout` (30 s by default), and each
