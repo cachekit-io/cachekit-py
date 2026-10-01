@@ -100,6 +100,8 @@ class FakeMemcached:
                 if out:
                     conn.sendall(out)
         except (EOFError, OSError):
+            # The client hung up, or the server is closing. An unexpected socket error still
+            # surfaces: the client sees its connection drop and raises BackendError.
             pass
         finally:
             conn.close()

@@ -102,9 +102,11 @@ checks out its own connection, so threads sharing one backend never share a sock
 - **The pool does not wait.** An operation that would need connection `max_pool_size + 1`
   to one server, in one process, raises a TRANSIENT `BackendError` at once. pymemcache does
   not mark the server failed, and later operations succeed once connections are returned.
-  The cachekit circuit breaker does count the error as a failure, as it does every backend
-  error, so sustained pool exhaustion can open it. Set `max_pool_size` at or above the number
-  of threads that can hit one server at the same time.
+  Under `@cache` it is handled like any backend error: a failed read is a miss and the
+  function runs, and a failed write skips L2 only. Backend errors do not currently count
+  toward the [circuit breaker](../features/circuit-breaker.md#integration-with-caching), so
+  pool exhaustion does not open it. Set `max_pool_size` at or above the number of threads
+  that can hit one server at the same time.
 - **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
   sockets would be shared across processes. Create the backend (or make the first cached
   call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
