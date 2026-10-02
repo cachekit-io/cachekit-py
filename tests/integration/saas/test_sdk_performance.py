@@ -24,7 +24,6 @@ import pytest
 import requests
 
 from tests.performance.stats_utils import (
-    MIN_RUNS_FOR_INFERENCE,
     PerformanceResult,
     balanced_order,
     effect_size_significant,
@@ -204,15 +203,10 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
         print(f"  {tier:>10}: n={len(latencies):>3}  p50 {statistics.median(latencies):.1f} ms")
 
     # A run median needs two store-served hits. A run short of that (a block the edge served from
-    # l0, or a target that sends no tier header) drops out, and too few runs left means no A/A.
-    for arm in arms:
-        arms[arm] = [run for run in arms[arm] if len(run) >= 2]
-    if min(len(runs) for runs in arms.values()) < MIN_RUNS_FOR_INFERENCE:
-        print(
-            f"\nA/A inconclusive: {len(arms['A'])} (A) and {len(arms['B'])} (B) runs kept >= 2 store-served hits; "
-            f"inference needs >= {MIN_RUNS_FOR_INFERENCE} per arm. The tier table shows where the hits went."
-        )
-        return
+    # l0, or a target that sends no tier header) leaves no A/A: fail, after the tier table says why.
+    short = sum(len(run) < 2 for runs in arms.values() for run in runs)
+    if short:
+        pytest.fail(f"A/A inconclusive: {short} of {len(order)} runs had < 2 store-served hits; see the tier table")
 
     hit_a = summarize("L2 hit, arm A", arms["A"], unit="ms")
     hit_b = summarize("L2 hit, arm B", arms["B"], unit="ms")
