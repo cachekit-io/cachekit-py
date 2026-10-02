@@ -469,10 +469,12 @@ class L1CacheManager:
         self._fork_locks: dict[int, threading.Lock] = {}
         # PID in which _reset_cache_locks_after_fork already repaired the cache locks.
         self._locks_reset_pid: Optional[int] = None
+        # PID that a take-over found forked without at-fork hooks: no thread may start in it.
+        self._hookless_pid: Optional[int] = None
         _managers.add(self)
 
     def _take_over_if_forked(self) -> None:
-        """Take over inherited state in a forked child; restart cleanup if the parent ran it.
+        """Take over inherited state in a forked child; restart cleanup if the parent ran it and hooks ran.
 
         Threads don't survive fork(): a prefork child (Gunicorn --preload, Celery prefork)
         inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache state lock as
@@ -480,7 +482,7 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread. A thread the parent had stopped stays stopped. Decorated functions get() before
+        thread, unless no at-fork hook ran. A thread the parent had stopped stays stopped. Decorated functions get() before
         they put(), so _reset_cache_locks_after_fork repairs orphaned cache locks before that
         first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
@@ -489,6 +491,10 @@ class L1CacheManager:
         hooks it cannot tell a dead holder from a live child thread holding a cache lock past the
         1 s probe, and then drops that cache's entries; the holder finishes unharmed on the state
         it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
+        A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
+        a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
+        starts no cleanup thread in it, start_background_cleanup refuses there too, and expired
+        entries are evicted on read or under the memory bound instead.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -502,10 +508,18 @@ class L1CacheManager:
             self._stop_cleanup = threading.Event()
             # Only where no at-fork hook ran (uWSGI): after the hook, a held cache lock belongs to a
             # live child thread, and resetting it would drop that cache's entries for nothing.
-            if self._locks_reset_pid != pid:
+            hookless = self._locks_reset_pid != pid
+            self._hookless_pid = pid if hookless else None
+            if hookless:
                 for cache in self._caches.values():  # before the cleanup worker takes their locks
                     cache._reset_lock_after_fork()
-            if self._cleanup_thread is not None:
+            if self._cleanup_thread is not None and hookless:
+                self._cleanup_thread = None
+                logger.warning(
+                    "L1 cleanup thread not restarted after a fork that ran no at-fork hooks (uWSGI without "
+                    "--py-call-osafterfork), where starting a thread is unsafe; expired entries are now evicted only on read"
+                )
+            elif self._cleanup_thread is not None:
                 try:
                     self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
                 except RuntimeError as e:  # how Thread.start() refuses: "can't start new thread" at a pids cap
@@ -553,10 +567,15 @@ class L1CacheManager:
     def start_background_cleanup(self, interval_seconds: float = 30.0) -> None:
         """Start background thread to clean up expired entries.
 
+        Starts nothing in a child forked without at-fork hooks (see _take_over_if_forked).
+
         Args:
             interval_seconds: Cleanup interval in seconds
         """
         self._take_over_if_forked()
+        if self._hookless_pid == os.getpid():
+            logger.warning("L1 background cleanup not started: this process was forked without at-fork hooks")
+            return
         if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             logger.warning("Background cleanup already running")
             return

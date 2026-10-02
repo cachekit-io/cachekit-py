@@ -13,6 +13,7 @@ import os
 import random
 import select
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -297,10 +298,14 @@ def _consistent(cache: L1Cache) -> bool:
     return s.memory_bytes == sum(entry.size_bytes for entry in s.cache.values())
 
 
-def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
-    """Leave the manager in the state fork() hands a child: dead thread, foreign owner."""
+def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool, hooked: bool = True) -> None:
+    """Leave the manager in the state fork() hands a child: dead thread, foreign owner.
+
+    hooked=False is a fork the at-fork hook never reached (uWSGI without --py-call-osafterfork).
+    """
     manager._cleanup_thread = threading.Thread(target=lambda: None) if parent_ran_cleanup else None
     manager._owner_pid = -1
+    manager._locks_reset_pid = os.getpid() if hooked else None
 
 
 @pytest.mark.unit
@@ -383,8 +388,10 @@ class TestCleanupThreadAfterFork:
                 else:
                     put()
                 found = cache.get("live")[0]  # from the forking thread, never the holder's ident
-                swept = _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)
-                q.put({"found": found, "swept": swept})
+                if get_first:
+                    q.put({"found": found, "swept": _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)})
+                else:  # no hook ran, so the take-over started no cleanup thread (LAB-7271)
+                    q.put({"found": found, "cleanup_off": manager._cleanup_thread is None})
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -397,7 +404,7 @@ class TestCleanupThreadAfterFork:
                 if process.is_alive():  # a hung child would otherwise block pytest's exit
                     process.kill()
 
-            assert outcome == {"found": True, "swept": True}
+            assert outcome == ({"found": True, "swept": True} if get_first else {"found": True, "cleanup_off": True})
             assert process.exitcode == 0
         finally:
             release.set()
@@ -556,7 +563,7 @@ class TestCleanupThreadAfterFork:
         cache.put("pre-fork", b"v")
         old = cache._state
         held_bytes = old.memory_bytes
-        _as_if_forked(manager, parent_ran_cleanup=False)
+        _as_if_forked(manager, parent_ran_cleanup=False, hooked=False)
         old.lock.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
         try:
             with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
@@ -723,6 +730,58 @@ class TestCleanupThreadAfterFork:
 
         assert not invalidator.is_alive()
         assert cache.get("k") == (False, None)
+
+    def test_hookless_child_starts_no_cleanup_thread(self, monkeypatch, caplog):
+        """LAB-7271: a fork from C skips CPython's own after-fork repair, so no thread may start there."""
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("hookless-ns")
+        _as_if_forked(manager, parent_ran_cleanup=True, hooked=False)
+        starts: list[threading.Thread] = []
+        monkeypatch.setattr(threading.Thread, "start", lambda self: starts.append(self))
+        with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
+            cache.put("k", b"v")
+            manager.start_background_cleanup(interval_seconds=60)
+
+        assert starts == [] and manager._cleanup_thread is None
+        assert cache.get("k")[0]
+        assert sum("not restarted after a fork that ran no at-fork hooks" in r.message for r in caplog.records) == 1
+        assert sum("background cleanup not started" in r.message for r in caplog.records) == 1
+
+        _as_if_forked(manager, parent_ran_cleanup=False)  # its own child, forked with hooks
+        manager.start_background_cleanup(interval_seconds=60)
+        assert len(starts) == 1
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+    def test_child_of_a_c_fork_requests_no_thread_start(self):
+        """A real fork from C: the at-fork hook does not run, and neither take-over nor start may start a thread."""
+        import ctypes
+
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("c-fork-ns")  # captured pre-fork, like a decorator's _l1_cache
+        manager.start_background_cleanup(interval_seconds=60)
+        libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
+        r, w = os.pipe()
+        try:
+            child = libc_fork()
+            if child == 0:
+                try:
+                    os.close(r)
+                    requested: list[str] = []
+
+                    class _RecordingThread(threading.Thread):  # keeps the child single-threaded
+                        def start(self) -> None:
+                            requested.append(self.name)
+
+                    threading.Thread = _RecordingThread  # the child's copy only; it never returns to pytest
+                    cache.put("k", b"v")
+                    manager.start_background_cleanup(interval_seconds=60)
+                    _report(w, {"requested": requested, "thread": manager._cleanup_thread, "found": cache.get("k")[0]})
+                finally:
+                    os._exit(1)
+            os.close(w)
+            assert _child_outcome(child, r) == {"requested": [], "thread": None, "found": True}
+        finally:
+            manager.stop_background_cleanup()
 
     def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
