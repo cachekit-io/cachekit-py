@@ -110,8 +110,10 @@ def _release_metrics_lock() -> None:
     _metrics_cache_lock().release()
 
 
-# The last process whose metric locks _reset_metric_locks replaced, and the last child the at-fork hook ran in.
-_metric_locks_pid = os.getpid()
+# The process that imported this module, the last process whose metric locks _reset_metric_locks replaced, and the
+# last child the at-fork hook ran in.
+_import_pid = os.getpid()
+_metric_locks_pid = _import_pid
 _hooked_fork_pid: Optional[int] = None
 _LOCK_TYPE = type(threading.Lock())
 
@@ -143,9 +145,9 @@ def _reset_metric_locks() -> None:
 def _reset_metric_locks_once() -> None:
     """Run ``_reset_metric_locks`` in a child the at-fork hook below did not reach: a fork made from C.
 
-    A collector's take-over calls this, on the child's first batched record or mode check. That leaves one case
-    open: a synchronous collector's records make no fork check, so in such a child they use the inherited locks
-    until a mode check runs, and for good with auto-detect off, as they would without cachekit.
+    A collector built in such a child calls this, and so does an inherited collector's take-over, on its first
+    batched record or mode check. That leaves one case open: an inherited synchronous collector's records make no
+    fork check, so until one of those runs they use the inherited locks, and for good with auto-detect off.
     """
     if _metric_locks_pid == os.getpid():
         return
@@ -154,10 +156,20 @@ def _reset_metric_locks_once() -> None:
             _reset_metric_locks()
 
 
+def _in_hookless_child() -> bool:
+    """Return whether this process is the child of a fork made from C, which ran no at-fork hook.
+
+    Such a fork, as uWSGI's is without ``--py-call-osafterfork``, also skips CPython's own after-fork repair, so a
+    thread started in that child can hang or crash the interpreter. No collector starts one there.
+    """
+    pid = os.getpid()
+    return pid != _import_pid and pid != _hooked_fork_pid
+
+
 def _after_fork_in_child() -> None:
     """Repair the child of a fork made from Python, which runs this while it is single-threaded."""
     global _hooked_fork_pid
-    _metrics_locks.clear()  # the parent's copy is still held: _acquire_metrics_lock held it across the fork
+    _metrics_locks.clear()  # only frees the parent's entry: keyed by its PID, it is never looked up here
     _hooked_fork_pid = os.getpid()
     _reset_metric_locks()
 
@@ -227,9 +239,10 @@ class AsyncMetricsCollector:
             flush_interval: Maximum time between flushes in seconds (async mode only)
             max_queue_size: Maximum queue size before dropping metrics (async mode only)
             sync_mode: Force sync mode (True) or async mode (False). None for auto-detect. Whatever the mode, a
-                collector records synchronously after ``shutdown()``, and so does one inherited by a forked child,
-                until a mode check starts a worker of the child's own. That never happens with auto-detect off, or
-                in the child of a fork made from C.
+                collector records synchronously after ``shutdown()``. So does one inherited by a forked child,
+                until a mode check starts a worker of the child's own, which never happens with auto-detect off.
+                In the child of a fork made from C, every collector, inherited or built there, records
+                synchronously for good.
             auto_detect_mode: Automatically switch between sync/async based on frequency
         """
         self.batch_size = batch_size
@@ -265,6 +278,12 @@ class AsyncMetricsCollector:
         # Memory pool for reducing allocations
         self._metric_pool = []
         self._pool_lock = threading.Lock()
+
+        if _in_hookless_child():
+            # Built in the child of a fork made from C, so no take-over will ever run for it: apply its outcome now.
+            self._batching_disabled = True
+            self._sync_mode = True
+            _reset_metric_locks_once()
 
         # Initialize async mode if needed
         if not self._sync_mode:
@@ -697,7 +716,8 @@ class AsyncMetricsCollector:
         A changed PID is the signal. A fork made from C, as uWSGI's is without ``--py-call-osafterfork``, runs
         no at-fork hook, and the dead worker's ``Thread.is_alive()`` still returns True. It also skips CPython's
         own after-fork repair, so a thread started in that child can hang or crash the interpreter. A child the
-        at-fork hook did not reach therefore never starts a worker, and records synchronously for good.
+        at-fork hook did not reach therefore never starts a worker, and records synchronously for good; ``__init__``
+        does the same for a collector built there.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -710,7 +730,7 @@ class AsyncMetricsCollector:
             self._stopped = threading.Event()
             self._worker_thread = None
             self._pool_lock = threading.Lock()
-            if _hooked_fork_pid != pid:
+            if _in_hookless_child():
                 self._batching_disabled = True
             _reset_metric_locks_once()
             # Last, so a thread that sees this process as the owner also sees its fresh state.

@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -288,6 +289,9 @@ def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any]) -> Any:
                 signal.alarm(5)
                 os.write(write_end, repr(child()).encode())
                 os._exit(0)
+            except BaseException:
+                traceback.print_exc()
+                sys.stderr.flush()
             finally:
                 os._exit(2)
     os.close(write_end)
@@ -481,6 +485,56 @@ def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
     # CPython's own after-fork repair has not run in this child either, so the collector never starts a thread here.
     assert _in_c_forked_child_holding(q.mutex, child) == (True, 1, True, 0, 2, True)
     collector.shutdown()
+
+
+@needs_c_fork
+def test_collector_built_in_a_c_level_fork_child_records_synchronously_and_starts_no_thread():
+    namespace = f"fork-hookless-built-{uuid.uuid4().hex}"
+    AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False).record_cache_operation(
+        operation="get", namespace=namespace, success=True, duration_ms=1.0
+    )
+
+    def child():
+        # Built in the child, so no take-over ever runs for them: the shared global is created on first use, and
+        # every decorated function builds its own collector.
+        async_metrics.threading = SimpleNamespace(Thread=_UnstartedThread, Event=threading.Event, Lock=threading.Lock)
+        async_metrics._global_collector = None
+        collectors = [AsyncMetricsCollector(sync_mode=False), async_metrics.get_async_metrics_collector()]
+        for collector in collectors:
+            _steer(collector, 500)
+            _record(collector, namespace)
+        modes = [(c._sync_mode, c._batching_disabled) for c in collectors]
+        return len(_UnstartedThread.started), modes, _flushed(namespace)
+
+    # A parent thread holds the series lock, so a record into it hangs unless the child's locks are fresh.
+    held = _prometheus_lock("counter-series", namespace)
+    assert _in_c_forked_child_holding(held, child) == (0, [(True, True), (True, True)], 3)
+
+
+@needs_c_fork
+def test_child_of_a_c_level_fork_resets_metric_locks_once():
+    namespace = f"fork-hookless-reset-once-{uuid.uuid4().hex}"
+    inherited = [AsyncMetricsCollector(flush_interval=0.05, sync_mode=False) for _ in range(2)]
+    real_reset = async_metrics._reset_metric_locks
+
+    def child():
+        resets = []
+
+        def counting_reset():
+            resets.append(None)
+            real_reset()
+
+        async_metrics._reset_metric_locks = counting_reset
+        for collector in inherited:
+            collector._last_mode_check = time.time()  # each takes over on its first, batched record
+            _record(collector, namespace)
+        AsyncMetricsCollector(sync_mode=True)
+        # Replacing a lock another thread is using can cost that thread an update, so it happens once per process.
+        return len(resets), _flushed(namespace)
+
+    assert _in_c_forked_child_holding(inherited[0]._queue.mutex, child) == (1, 2)
+    for collector in inherited:
+        collector.shutdown()
 
 
 def test_shutdown_during_a_switch_to_batched_stops_the_new_worker():
