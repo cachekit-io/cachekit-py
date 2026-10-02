@@ -143,12 +143,14 @@ Three behavioural edges to design around:
    crashed — the expiry is the crash-recovery safety net (Redis key TTL /
    CachekitIO server-side expiry). Keep expensive functions well under 30 s,
    or split the work.
-3. **Lock backend errors degrade to no lock.** If lock acquisition or release
-   raises a backend error (lock backend outage, authentication failure), the
-   wrapper logs a warning and **executes the function without the lock** — for
-   every caller, i.e. a full stampede. The lock is best-effort stampede
-   mitigation, never load-bearing mutual exclusion: do not rely on it for
-   correctness of non-idempotent operations.
+3. **Lock backend errors degrade to no lock.** If lock acquisition raises a
+   backend error (lock backend outage, authentication failure), the wrapper
+   logs a warning and **executes the function without the lock** — for every
+   caller, i.e. a full stampede. A failed release never runs the function
+   again: the Redis and CachekitIO backends swallow a backend error on
+   release, and the lock may stay until its 30 s timeout. The lock is
+   best-effort stampede mitigation, never load-bearing mutual exclusion: do
+   not rely on it for correctness of non-idempotent operations.
 
 ---
 
