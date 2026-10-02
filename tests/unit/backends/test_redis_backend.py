@@ -211,13 +211,27 @@ class TestRedisPoolSizing:
             provider = RedisBackendProvider("redis://localhost:6379", pool_size=7)
         assert provider._pool.max_connections == 7
 
-    def test_sync_pool_waits_up_to_socket_timeout(self):
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [("redis://localhost:6379", 1.5), ("redis://localhost:6379?socket_timeout=0.1", 0.1)],
+    )
+    def test_sync_pool_waits_up_to_the_effective_socket_timeout(self, url, expected):
+        """A URL query option overrides the config's socket_timeout, and so bounds the pool wait too."""
         from cachekit.backends.redis.client import create_connection_pool
         from cachekit.backends.redis.config import RedisBackendConfig
 
-        pool = create_connection_pool("redis://localhost:6379", RedisBackendConfig(socket_timeout=1.5))
+        pool = create_connection_pool(url, RedisBackendConfig(socket_timeout=1.5))
         assert isinstance(pool, redis.BlockingConnectionPool)
-        assert pool.timeout == 1.5
+        assert pool.timeout == pool.connection_kwargs["socket_timeout"] == expected
+
+    @pytest.mark.parametrize(("method", "args", "command"), [("get_ttl", ("k",), "ttl"), ("refresh_ttl", ("k", 60), "expire")])
+    async def test_ttl_commands_run_off_the_event_loop(self, method, args, command):
+        """A full pool makes a sync command wait up to socket_timeout; on the loop thread it would stall every coroutine."""
+        threads = []
+        client = Mock()
+        getattr(client, command).side_effect = lambda *a: threads.append(threading.get_ident()) or 1
+        await getattr(PerRequestRedisBackend(client, "tenant"), method)(*args)
+        assert threads and threads[0] != threading.get_ident()
 
     def test_cachekitio_keeps_its_own_default(self, monkeypatch):
         """CACHEKIT_CONNECTION_POOL_SIZE also sizes the CachekitIO HTTP pool, whose default stays 10."""

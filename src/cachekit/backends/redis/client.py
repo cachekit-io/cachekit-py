@@ -88,10 +88,11 @@ def create_connection_pool(
     OS TCP timeout) and the configured TCP keepalive apply uniformly.
 
     The pool blocks: when every connection is checked out, an operation waits
-    up to socket_timeout for one to be released, then fails with a redis
-    ConnectionError. Executor threads share this pool, so a burst wider than
-    it is ordinary load; a non-blocking pool would turn it into errors and
-    cache misses.
+    up to the effective socket_timeout for one to be released, then fails
+    with a redis ConnectionError. Executor threads share this pool, so a
+    burst wider than it is ordinary load; a non-blocking pool would turn it
+    into errors and cache misses. A caller on an event loop must not run a
+    command from this pool on the loop thread: the wait would stall the loop.
 
     Args:
         redis_url: Redis connection URL the pool is bound to. Its query
@@ -107,15 +108,18 @@ def create_connection_pool(
     """
     redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inline (CWE-532)
     cfg = config or RedisBackendConfig.from_env()
-    return redis.BlockingConnectionPool.from_url(
+    pool = redis.BlockingConnectionPool.from_url(
         reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
-        timeout=cfg.socket_timeout,  # wait for a free connection, bounded like any other socket wait
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
         **_tcp_only_kwargs(redis_url, cfg),
     )
+    # Wait for a free connection no longer than one socket operation may take. Read the
+    # effective value back from the pool: a ?socket_timeout= query option overrides cfg.
+    pool.timeout = pool.connection_kwargs["socket_timeout"]
+    return pool
 
 
 def create_async_connection_pool(
