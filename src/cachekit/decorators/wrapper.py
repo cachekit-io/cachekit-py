@@ -103,9 +103,10 @@ _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
 # Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
 _TTL_REFRESH_MAX_CONCURRENT = 32
-# How long a refresh on a stopped event loop keeps its slot. A request it sent before the loop
-# stopped is still served, so the slot is not reused until such a request has had time to
-# settle: six times CachekitIO's default request timeout, and the same bound as the L2 SWR lease.
+# Lease on the slot and key of a refresh whose event loop has stopped, from admission; the same
+# lease length as L2 SWR. A stopped loop runs no timers, so its client timeout never fires and
+# this lease is what releases the slot. It is an assumption, not a server bound: a PATCH the
+# refresh already sent is assumed answered within it (see _schedule_ttl_refresh).
 _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS = 30.0
 
 
@@ -845,7 +846,8 @@ def create_cache_wrapper(
     # One background TTL refresh per key at a time: concurrent hits in the refresh window
     # would each send a billable PATCH until one lands. At most _TTL_REFRESH_MAX_CONCURRENT
     # run at once, so a burst over many keys can't pile up tasks against a slow backend;
-    # a hit at capacity skips its refresh (a later hit retries). Also holds the task refs.
+    # a hit at capacity skips its refresh (a later hit retries). Stopped loops get a weaker,
+    # best-effort bound: see _schedule_ttl_refresh. Also holds the task refs.
     _ttl_refresh_tasks: dict[str, tuple[asyncio.Task[None], float]] = {}  # flight key -> (task, admitted at)
     _ttl_refresh_lock = threading.Lock()  # the map is shared by every thread running an event loop
     _ttl_refresh_pid = os.getpid()  # owner process: a forked child starts with an empty map
@@ -861,14 +863,19 @@ def create_cache_wrapper(
         """Run _refresh_ttl_if_due as a background task, unless one for this key is running or the pool is full.
 
         The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
-        refreshes each tenant's entry. The cap and the per-key check span every thread's event
-        loop: before counting, a task is pruned once it is done, or once its loop is not running
-        and it was admitted at least _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS ago. A loop left
-        stopped (run_until_complete, never closed) cannot advance its task, but a request the
-        task already sent is still served, so the slot waits out the hold before reuse, and
-        the cap bounds requests that may still be in flight, not just running tasks. A pruned
-        task is cancelled: should its loop run again, it stops at its next await instead of
-        running beside the slot's new holder.
+        refreshes each tenant's entry. The guarantee has two tiers.
+
+        Hard, on running event loops: per decorated function, at most _TTL_REFRESH_MAX_CONCURRENT
+        refreshes, and one per flight key, are admitted at once, counted across every thread's
+        loop under the lock. A done task is pruned before counting.
+
+        Best-effort, on stopped loops: a loop left stopped (run_until_complete, never closed)
+        cannot advance its task, so the task keeps its slot and key for
+        _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS from admission, then is released and cancelled on
+        its own loop; should that loop run again, the task stops at its next await. A PATCH it
+        already sent is not recalled, so the bound on PATCHes still at the server assumes each is
+        answered within the hold. If the server holds one longer, that key can get one more PATCH
+        per expired hold, and the function at most one cap's worth per hold.
         """
         nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
         if _ttl_refresh_pid != os.getpid():
