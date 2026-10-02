@@ -174,7 +174,12 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 ## Characteristics
 
-- Latency: ~10–50ms L2 (HTTP/2, region-dependent)
+- Latency, measured per call as client wall time from a client entering Cloudflare at MEL, against the
+  dev environment (2026-10-03, `tests/integration/saas/test_sdk_performance.py`): an L2 hit served by
+  the store is p50 41ms (n=190); one served by the edge's short-lived in-memory tier is p50 22ms (n=10);
+  a miss, GET then SET, is p50 101ms (n=50). Your numbers depend on where your client enters Cloudflare,
+  the store's region and how many reads the edge serves. No p95 is published yet: these samples are
+  too few to claim one.
 - Sync and async support (hybrid client architecture)
 - Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed

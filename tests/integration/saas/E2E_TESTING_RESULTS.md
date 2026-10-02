@@ -1,5 +1,11 @@
 # SDK + SaaS E2E Testing - Complete Results
 
+> [!WARNING]
+> Historical record of a 2025-11 run, kept as written except for the corrections marked below.
+> The `test_l2_cache_latency` it reports timed one L1 hit and 19 misses, never an L2 hit, so its
+> L2 latency was never measured. The suite now targets dev by default; see [README.md](README.md)
+> and, for latency, [PERFORMANCE.md](PERFORMANCE.md).
+
 **Status**: Production Ready
 **Last Updated**: 2025-11-18
 **Total Tests**: 46 (45 passing, 1 skip)
@@ -14,7 +20,7 @@ The cachekit Python SDK (`@cache.io` decorator) has been comprehensively validat
 **Key Findings**:
 - All critical features (P0) working correctly
 - Graceful degradation verified across all error scenarios
-- Performance targets met (L1 <1ms, L2 <50ms localhost)
+- Performance targets met (L1 <1ms; the L2 figure was not measured, see the note above)
 - Data serialization handling 10+ types correctly
 - Multi-environment validation successful
 
@@ -88,7 +94,7 @@ The cachekit Python SDK (`@cache.io` decorator) has been comprehensively validat
 | Test | Status | Priority | Validates |
 |------|--------|----------|-----------|
 | `test_l1_cache_latency` | ✅ Pass | P1 | L1 cache hit p95 <1ms (in-memory) |
-| `test_l2_cache_latency` | ✅ Pass | P1 | L2 cache hit p95 <50ms (localhost HTTP roundtrip) |
+| `test_l2_cache_latency` | ✅ Pass | P1 | Claimed L2 hit p95 <50ms; it timed misses (corrected 2026-10-03; replaced by `test_l2_hit_latency_and_a_a_floor`) |
 | `test_cache_miss_latency` | ✅ Pass | P1 | Cache miss avg <100ms (10ms function + overhead) |
 | `test_concurrent_requests_performance` | ✅ Pass | P1 | 100 concurrent requests complete in <5s |
 | `test_connection_pool_reuse` | ✅ Pass | P2 | Subsequent requests reuse connection pool |
@@ -495,9 +501,7 @@ echo "✅ E2E tests passed - proceeding with deployment"
 
 ## Related Documentation
 
-- **Test Implementation Spec**: `/Users/68824/code/27B/cachekit-workspace/saas/tests/SDK_E2E_TESTING_SPEC.md`
-- **Testing Guide**: `/Users/68824/code/27B/cachekit-workspace/saas/tests/validation/README_SDK_E2E.md`
-- **HTTP API Tests**: `test_cache_integrity.py` (existing validation tests)
+- **Testing Guide**: [README.md](README.md)
 - **SDK Source**: `cachekit/src/cachekit/`
 - **SaaS Worker**: `saas/src/index.ts`
 - **Backend Implementation**: `cachekit/src/cachekit/backends/cachekitio/`

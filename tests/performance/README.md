@@ -110,14 +110,21 @@ serializer-only numbers can stay green while a backend read path regrows a full-
 
 ### 8. `stats_utils.py` - **Statistical Utilities**
 
-Provides rigorous performance measurement tools:
+The run, not the sample, is the unit of inference:
 
-- `benchmark_with_gc_handling()`: Multiple runs + GC filtering
-- `confidence_interval_95()`: Statistical confidence
-- `detect_gc_pauses()`: Outlier filtering
+- `benchmark_with_gc_handling()`: K independent runs, a forced collection before each, then `summarize()`
+- `summarize()`: p50/p95/p99 over every raw sample (nothing is trimmed; outliers are only counted),
+  and the mean of the per-run medians with a 95% t band at df = K - 1. Pure, so
+  `tests/unit/test_perf_stats_utils.py` checks it on synthetic data in the default unit run
+- `effect_size_significant()` / `noise_floor()`: a change counts only when it exceeds both a threshold
+  (default 5%) and each side's band; needs K >= 5. A synthetic A/A with 3% run-to-run drift calls a
+  change in at most 5% of trials, and a 10% shift is caught in at least 95%
+- `format_tail()`: a p95 is a claim only at n >= 400 from >= 10 runs (p99: n >= 2,000), with a
+  bootstrap CI over whole runs; below that it prints `inconclusive at n`
 - `measure_with_jit_warmup()`: Variance-based warmup
 
-**Key Insight**: Statistical rigor prevents misleading results.
+**Key Insight**: tens of thousands of samples from one run are not independent. Pooling them as if
+they were gives an interval a few ns wide that the next run will not reproduce.
 
 ---
 
@@ -223,19 +230,16 @@ uv run pytest tests/performance/test_production_realism.py::test_decorator_overh
 
 ## Next Steps
 
-1. ✅ Implement comprehensive test suite
-2. ⏳ Measure encryption overhead
-3. ⏳ Test Redis L2 roundtrip
-4. ⏳ Exercise circuit breaker under failures
-5. ⏳ Test backpressure limits
-6. ⏳ Update PROFILING_RESULTS.md
-7. ⏳ Update marketing materials
+1. ✅ Implement comprehensive test suite, including the encryption-overhead and Redis L2 guards
+2. ✅ Percentiles over every raw sample and run-level inference in `stats_utils.py`
+3. ⏳ Record results for the ⏳ rows above (encryption needs `CACHEKIT_MASTER_KEY`; reliability needs Redis)
+4. ⏳ Re-run `PROFILING_RESULTS.md` on the current stack
 
 ---
 
 ## References
 
-- [PRODUCTION_FINDINGS.md](PRODUCTION_FINDINGS.md) - Detailed performance analysis
+- [PROFILING_RESULTS.md](PROFILING_RESULTS.md) - Detailed performance analysis
 - [stats_utils.py](stats_utils.py) - Statistical measurement tools
 - [test_production_realism.py](test_production_realism.py) - Production-realistic tests
 - [test_reliability_under_load.py](test_reliability_under_load.py) - Reliability framework tests

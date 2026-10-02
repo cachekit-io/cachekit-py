@@ -1,149 +1,55 @@
-# Performance Statistics Tracking
+# SDK Latency Against cachekit.io
 
-The SaaS test suite automatically tracks and reports performance statistics for all cache operations.
+`test_sdk_performance.py` times the Python SDK's `@cache.io` path against a live target. It defaults
+to dev (`https://api.dev.cachekit.io`), and it skips unless `CACHEKIT_API_KEY` is set. Pass the key
+through 1Password, never a file in the repo:
 
-## Features
-
-- **Automatic tracking**: All HTTP operations (GET, SET, DELETE, LIST) are timed automatically
-- **Statistical rigor**: Reports mean, median, P95, P99, min, max, and standard deviation
-- **End-of-session summary**: Performance stats printed at the end of test runs
-
-## Output Example
-
-```
-================================================================================
-PERFORMANCE STATISTICS
-================================================================================
-HTTP_DELETE:
-  Count:         42
-  Mean:        125.34ms
-  Median:      118.56ms
-  P95:         187.23ms
-  P99:         203.45ms
-  Min:          95.12ms
-  Max:         215.67ms
-  StdDev:       28.91ms
-
-HTTP_GET:
-  Count:        156
-  Mean:        102.78ms
-  Median:       98.23ms
-  P95:         142.56ms
-  P99:         158.91ms
-  Min:          85.45ms
-  Max:         172.34ms
-  StdDev:       18.42ms
-
-HTTP_SET:
-  Count:        143
-  Mean:        135.67ms
-  Median:      130.12ms
-  P95:         178.34ms
-  P99:         195.67ms
-  Min:         110.23ms
-  Max:         208.91ms
-  StdDev:       22.15ms
-
-================================================================================
-OVERALL
-================================================================================
-  Total operations:      341
-  Mean latency:      118.26ms
-  Median latency:    115.34ms
-  P95 latency:       167.89ms
-  P99 latency:       189.23ms
-================================================================================
+```bash
+op run --env-file=<file with CACHEKIT_API_KEY=op://...> -- \
+    uv run pytest tests/integration/saas/test_sdk_performance.py -v -s
 ```
 
-## How It Works
+The directory stays out of CI. One run of the module makes about 425 paced requests.
 
-### Automatic Tracking
+## What it measures
 
-The `CacheClient` class in `test_cache_integrity.py` automatically wraps all operations with performance tracking:
+`test_l2_hit_latency_and_a_a_floor` runs with `l1_enabled=False`, so no call can be answered from
+memory. It has two arms:
 
-```python
-def get(self, namespace: str, key: str) -> requests.Response:
-    """GET a value from cache"""
-    url = f"{self.base_url}/cache/get/{namespace}/{key}"
-    with global_tracker.timed_operation("HTTP_GET"):
-        return self.session.get(url)
-```
+- **GET-miss + SET**: 50 never-seen keys, one call each (GET 404, run the function, SET).
+- **L2 hit**: 10 discarded warm-up calls, then 10 runs of 20 calls cycling the 50 primed keys. The
+  runs alternate between arms A and B in ABBA order. Both arms call the same function on the same
+  keys, so the difference between them is noise. That gives the A/A floor, the smallest change an
+  A/B from this vantage can claim.
 
-### Manual Tracking in Tests
+The test asserts what was timed, not how fast it was: `cache_info().l2_hits` must grow by exactly
+the number of timed calls, and `misses` must not grow. Each hit is also labelled with the serving
+tier from the `X-CacheKit-Store-Source` response header.
 
-You can also track custom operations in your tests using the `perf_tracker` fixture:
+Every network number is a reported value, never an assert, and carries the label
+`vantage=<colo>, client wall time, <env>`. The colo comes from `/cdn-cgi/trace` at run time. Only
+the in-process paths (L1 hits, `cache_info()`) keep sub-millisecond asserts.
 
-```python
-def test_custom_operation(perf_tracker):
-    """Test with custom performance tracking."""
-    with perf_tracker.timed_operation("CUSTOM_OP"):
-        # Your operation here
-        result = do_something()
-```
+## Statistics
 
-## Performance Targets
+The numbers come from `tests/performance/stats_utils.py`. A run of 20 calls is the unit of
+inference. The estimate is the mean of the run medians, and its band is a 95% t-interval at
+df = runs - 1. `effect_size_significant` calls a change only when it exceeds both 5% of the baseline
+and the wider of the two bands. A p95 is printed only at n >= 400 per arm from at least 10 runs, and
+a p99 at n >= 2,000, each with a bootstrap CI over whole runs. Below that the output says
+`inconclusive at n`. With one run's budget, every p95 here is still inconclusive.
 
-Based on the cachekit library's performance suite, we target:
+## First numbers (2026-10-03, vantage=MEL, client wall time, dev)
 
-| Operation | Target (P95) | Context |
-|-----------|--------------|---------|
-| HTTP GET (cache hit) | < 150ms | Network RTT to dev.cachekit.io |
-| HTTP SET | < 200ms | Network + serialization |
-| HTTP DELETE | < 150ms | Network RTT |
-| HTTP LIST | < 250ms | Network + pagination |
+| Arm | n | p50 | Run median ± band |
+|-----|---|-----|-------------------|
+| L2 hit, served by the store (`do`) | 190 | 41.0 ms | |
+| L2 hit, served by the edge's in-memory tier (`l0`) | 10 | 22.1 ms | |
+| L2 hit, both tiers | 200 | 40.9 ms | 40.6 ± 1.0 ms |
+| GET-miss + SET | 50 | 100.5 ms | 101.5 ± 2.8 ms |
 
-**Note**: These targets are for **network operations** to the SaaS backend, which are 50-100x slower than local L1 cache hits (~0.25ms).
+The A/A had arm A at 40.1 ± 2.3 ms and arm B at 41.2 ± 0.6 ms: a delta of +1.1 ms, which reads as no
+change. An L2-hit A/B from this vantage must move the run median by more than 2.3 ms before it counts.
 
-## Interpreting Results
-
-### Good Performance Indicators
-
-- **Low P95/P99 spread**: Indicates consistent latency (< 20% difference)
-- **Low StdDev**: < 20% of mean suggests stable performance
-- **P95 under target**: Meets service level objectives
-
-### Performance Issues
-
-- **High P99 spikes**: May indicate:
-  - Network congestion
-  - Cold start (Cloudflare Workers)
-  - Backend overload
-  - Rate limiting
-
-- **High StdDev**: May indicate:
-  - Inconsistent network conditions
-  - Variable backend load
-  - Measurement noise (run more samples)
-
-## Comparing Local vs Dev vs Prod
-
-The test suite shows which environment is being tested:
-
-```
-════════════════════════════════════════════════════════════════
-🔥 SMOKE TEST
-════════════════════════════════════════════════════════════════
-📦 Package source: Local editable install (../../../cachekit)
-🌐 Target API:     https://api.dev.cachekit.io
-🔑 API key:        ck_sdk_DubdzW2...
-════════════════════════════════════════════════════════════════
-```
-
-**Expected latency differences**:
-- **Local** (`http://localhost:8787`): 1-5ms (loopback, no TLS)
-- **Dev** (`https://api.dev.cachekit.io`): 50-150ms (internet, Cloudflare edge)
-- **Prod** (`https://api.cachekit.io`): 50-150ms (similar to dev, may vary by region)
-
-## Statistical Significance
-
-Performance measurements use techniques from `cachekit/tests/performance/stats_utils.py`:
-
-- **Multiple samples**: Each operation measured individually
-- **Percentiles**: P95 and P99 show tail latency (important for SLAs)
-- **Standard deviation**: Measures consistency
-
-## Related
-
-- **Library performance**: See `cachekit/tests/performance/README.md`
-- **Load testing**: See `saas/tests/locust/` for sustained load tests
-- **Benchmarking**: Run `make smoke` or `make full-test` to see stats
+These numbers hold for this vantage only. They depend on where the client enters Cloudflare, the
+store's region and how many reads the edge serves.
