@@ -459,16 +459,51 @@ class TestListenerStart:
             starter.join(5)
         assert backend.pool_threads == []
 
-    async def test_async_start_runs_off_the_event_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_async_start_runs_off_the_loop_and_the_call_does_not_wait_for_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(invalidation, "_listener_flag", True)
         backend = _ListenerBackend(pool_error=redis.ConnectionError("down"))
+        connecting = threading.Event()
+        real_pool = backend.listener_pool
+
+        def slow_pool() -> Any:
+            connecting.wait(5)  # a start stuck on a slow connect
+            return real_pool()
+
+        backend.listener_pool = slow_pool  # type: ignore[method-assign]
 
         @cache(backend=backend, ttl=60, namespace="start-async")
         async def f(x: int) -> int:
             return x
 
-        await f(1)
+        began = time.monotonic()
+        assert await f(1) == 1
+        assert time.monotonic() - began < 2  # returned while the start was still connecting
+        connecting.set()
+        for _ in range(500):
+            if backend.pool_threads:
+                break
+            await asyncio.sleep(0.01)
         assert len(backend.pool_threads) == 1 and backend.pool_threads[0] is not threading.current_thread()
+
+    def test_flag_on_with_a_tracking_backend_that_cannot_clone_a_pool_warns_once(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A KeyTrackableBackend other than the tenant-scoped Redis backend has no listener pool."""
+        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        backend = TrackingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="start-tracking-no-pool")
+        def f(x: int) -> int:
+            return x
+
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            for x in range(3):
+                f(x)
+        (record,) = caplog.records
+        assert "TrackingBackend does not carry invalidation events" in record.getMessage()
+        assert invalidation._listener_pid is None and invalidation._start_retry_at == float("-inf")
 
     def test_child_forked_without_hooks_starts_nothing_and_logs_nothing(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

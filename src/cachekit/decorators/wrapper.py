@@ -2051,7 +2051,9 @@ def create_cache_wrapper(
                 ensure_interop_backend_compatible(_backend)
 
             if _l1_cache and invalidation.listener_start_due(_backend):
-                await asyncio.to_thread(invalidation.start_listener, _backend)  # connects and subscribes: off the loop
+                # Connects and subscribes: in an executor thread, and not awaited, so this call never
+                # waits on it. start_listener never raises; concurrent starts give way to the first.
+                asyncio.get_running_loop().run_in_executor(None, invalidation.start_listener, _backend)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

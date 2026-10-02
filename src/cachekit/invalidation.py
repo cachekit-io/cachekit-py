@@ -216,11 +216,15 @@ def listener_start_due(backend: object) -> bool:
     at-fork hooks (uWSGI without the options in _UWSGI_FORK_OPTIONS) runs no listener at all and
     this logs nothing there: a thread started in such a child can hang in Thread.start(), and a
     log call on a handler lock a parent thread held at fork hangs too. Its L1 heals by TTL.
+
+    Only a backend whose class keeps a key registry and can clone a listener pool carries events,
+    PerRequestRedisBackend; any other KeyTrackableBackend is told apart here, once, not by a start
+    failing every minute.
     """
     try:
         if not _listener_enabled() or _listener_pid == os.getpid() or l1_cache._forked_without_hooks():
             return False
-        if not supports_key_tracking(backend):
+        if not supports_key_tracking(backend) or not callable(getattr(type(backend), "listener_pool", None)):
             _warn_untrackable(backend)
             return False
         return time.monotonic() >= _start_retry_at
