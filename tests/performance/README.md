@@ -117,10 +117,12 @@ The run, not the sample, is the unit of inference:
   and the mean of the per-run medians with a 95% t band at df = K - 1. Pure, so
   `tests/unit/test_perf_stats_utils.py` checks it on synthetic data in the default unit run
 - `effect_size_significant()` / `noise_floor()`: a change counts only when it exceeds both a threshold
-  (default 5%) and each side's band; needs K >= 5. A synthetic A/A with 3% run-to-run drift calls a
-  change in at most 5% of trials, and a 10% shift is caught in at least 95%
-- `format_tail()`: a p95 is a claim only at n >= 400 from >= 10 runs (p99: n >= 2,000), with a
-  bootstrap CI over whole runs; below that it prints `inconclusive at n`
+  (default 5%), each side's band and Welch's 95% band on the difference; needs K >= 5. A synthetic
+  A/A with 3% run-to-run drift calls a change in at most 5% of trials, a 10% shift is caught in at
+  least 95%, and with no threshold the A/A rate stays near 5% at 5, 10 and 20 runs
+- `format_tail()`: a p95 is printed only at n >= 400 from >= 10 runs (p99: n >= 2,000), with a
+  bootstrap interval over whole runs (uncalibrated: it under-covers at the floor, so it is not
+  called a 95% CI); below that it prints `inconclusive at n`
 - `measure_with_jit_warmup()`: Variance-based warmup
 
 **Key Insight**: tens of thousands of samples from one run are not independent. Pooling them as if

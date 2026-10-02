@@ -174,7 +174,7 @@ def test_decorator_overhead_complex_dict() -> None:
 
     # Conservative target: <300μs for complex payloads (10KB)
     # This includes full stack: decorator + serialization + L1 + deserialization
-    # Raw p95 measured 14-16μs (2026-10-03); A/A floor: two back-to-back runs moved p95 by 10%.
+    # Raw p95 measured 14-16μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 10%.
     target_ns = 300_000
     if result.exceeded_target(target_ns):
         raise AssertionError(f"Complex payload overhead {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
@@ -214,7 +214,7 @@ def test_decorator_overhead_dataclass() -> None:
     print("  Stack: Decorator + msgpack + L1 + deserialize")
 
     # Target: <200μs for dataclass (smaller than 10KB dict)
-    # Raw p95 measured 14-15μs (2026-10-03); A/A floor: two back-to-back runs moved p95 by 6%.
+    # Raw p95 measured 14-15μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 6%.
     target_ns = 200_000
     if result.exceeded_target(target_ns):
         raise AssertionError(f"Dataclass overhead {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
@@ -261,7 +261,7 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     # Target: <10ms for DataFrame with msgpack
     # msgpack serialization of 400KB DataFrame is inherently slow (~1-5ms)
     # This test measures decorator overhead + L1 cache behavior, not serializer performance
-    # Raw p95 measured 13-15μs (2026-10-03); A/A floor: two back-to-back runs moved p95 by 11%.
+    # Raw p95 measured 13-15μs (2026-10-03); back-to-back drift: two identical runs moved p95 by 11%.
     target_us = 10_000
     if result.exceeded_target(target_us):
         raise AssertionError(f"DataFrame overhead {result.p95:.0f}μs exceeds {target_us}μs target (p95)")
@@ -451,7 +451,7 @@ def test_encryption_overhead() -> None:
 
     # Target: encryption overhead <3x (conservative)
     # Rust encryption is fast, but we allow headroom for key derivation
-    # Ratio measured 1.0-1.4x (2026-10-03); A/A floor: each side's p95 moved 49-95% between
+    # Ratio measured 1.0-1.4x (2026-10-03); back-to-back drift: each side's p95 moved 49-95% between
     # back-to-back runs on a loaded host, so only the ratio is a guard, never either p95 alone.
     max_ratio = 3.0
     actual_ratio = result_encrypted.p95 / result_plain.p95
@@ -531,7 +531,7 @@ def test_redis_l2_roundtrip() -> None:
     print(f"  Total measured:    {result.p95:.2f}μs")
 
     # Conservative target: <10ms for local Redis (includes network + deserialize)
-    # Raw p95 measured 1.5-3.0ms (2026-10-03); A/A floor: two back-to-back runs moved p95 by 101%
+    # Raw p95 measured 1.5-3.0ms (2026-10-03); back-to-back drift: two identical runs moved p95 by 101%
     # on a loaded host (the run-level median moved 5%), so the margin is what keeps this stable.
     target_us = 10_000
     if result.exceeded_target(target_us):

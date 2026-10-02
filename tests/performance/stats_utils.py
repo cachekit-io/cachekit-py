@@ -12,20 +12,23 @@ the next run. So:
   band. Each run median already shrugs off in-run spikes; one bad run widens the band, so it can
   only make a comparison more cautious.
 - ``effect_size_significant`` calls a change only when it clears both a practical threshold and
-  each side's band.
-- A tail percentile is a claim only with independent tail data: p95 at n >= 400 and p99 at
-  n >= 2,000, from at least 10 runs, with a bootstrap over whole runs. Below that the report
-  says "inconclusive at n".
+  the 95% bands: each side's, and Welch's t on the difference of the run medians.
+- A tail percentile is printed only with independent tail data: p95 at n >= 400 and p99 at
+  n >= 2,000, from at least 10 runs, with a bootstrap interval over whole runs. Below that the
+  report says "inconclusive at n". That interval is not calibrated: at 10 runs of 40 it covered
+  the true p95 in 82-91% of simulated trials, not 95%, so it is never labelled a 95% CI.
 """
 
 from __future__ import annotations
 
 import gc
+import math
 import random
 import statistics
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 
 # Two-sided 95% Student-t critical values, indexed by degrees of freedom (df = runs - 1).
 _T95 = (
@@ -45,19 +48,16 @@ _MAD_TO_SIGMA = 1.4826
 
 
 def t_critical_95(df: int) -> float:
-    """Two-sided 95% t critical value; past df = 30, a Cornish-Fisher expansion (error < 0.001).
+    """Two-sided 95% t critical value. Past df = 30 it stays at the df = 30 value, which is conservative.
 
     >>> t_critical_95(4)
     2.776
-    >>> round(t_critical_95(60), 3)
-    2.0
+    >>> t_critical_95(60)
+    2.042
     """
     if df < 1:
         raise ValueError(f"df must be >= 1, got {df}")
-    if df <= len(_T95):
-        return _T95[df - 1]
-    z = 1.959964
-    return z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+    return _T95[min(df, len(_T95)) - 1]
 
 
 def percentile(samples: Sequence[float], p: int) -> float:
@@ -74,7 +74,9 @@ def outlier_count(samples: Sequence[float]) -> int:
 
 
 def tail_ci(runs: Sequence[Sequence[float]], p: int, seed: int = 0) -> tuple[float, float] | None:
-    """95% CI of the p-th percentile by bootstrapping whole runs; None below the tail floors.
+    """2.5-97.5% bootstrap interval of the p-th percentile over whole runs; None below the tail floors.
+
+    Uncalibrated: it under-covers at the floor (see the module docstring).
 
     Costs BOOTSTRAP_RESAMPLES sorts of all samples, so it only runs once the floors are met.
     """
@@ -93,7 +95,7 @@ def format_tail(p: int, value: float, ci: tuple[float, float] | None, n: int, ru
     """
     if ci is None:
         return f"P{p}:  inconclusive at n={n}, runs={runs} (a claim needs n >= {TAIL_FLOORS[p]} from >= {MIN_TAIL_RUNS} runs)"
-    return f"P{p}:  {value:.2f} {unit}, 95% CI [{ci[0]:.2f}, {ci[1]:.2f}] (bootstrap over {runs} whole runs)"
+    return f"P{p}:  {value:.2f} {unit}, bootstrap 2.5-97.5% [{ci[0]:.2f}, {ci[1]:.2f}] over {runs} whole runs (uncalibrated)"
 
 
 @dataclass
@@ -112,11 +114,8 @@ class PerformanceResult:
     run_medians: list[float]
     center: float  # mean of the per-run medians: what effect_size_significant compares
     band: float  # 95% t half-width of center at df = runs - 1; 0.0 for a single run
-    ci_95_lower: float  # center - band
-    ci_95_upper: float  # center + band
     outlier_count: int  # diagnostic: samples above median + 3 robust sigmas; never filtered
-    p95_ci: tuple[float, float] | None  # whole-run bootstrap; None below the tail floors
-    p99_ci: tuple[float, float] | None
+    per_run: list[list[float]] = field(repr=False)  # the raw samples, kept for the tail intervals
     jit_stabilized: bool = False
     jit_warmup_samples: int = 0
 
@@ -134,6 +133,26 @@ class PerformanceResult:
             f"  Outliers:    {self.outlier_count} above median + 3 robust sigmas (diagnostic)\n"
             f"  JIT stable:  {self.jit_stabilized}"
         )
+
+    @cached_property
+    def p95_ci(self) -> tuple[float, float] | None:
+        """Whole-run bootstrap interval of p95; None below the tail floors. Computed on first use."""
+        return tail_ci(self.per_run, 95)
+
+    @cached_property
+    def p99_ci(self) -> tuple[float, float] | None:
+        """Whole-run bootstrap interval of p99; None below the tail floors. Computed on first use."""
+        return tail_ci(self.per_run, 99)
+
+    @property
+    def ci_95_lower(self) -> float:
+        """Lower end of the 95% t-interval on center."""
+        return self.center - self.band
+
+    @property
+    def ci_95_upper(self) -> float:
+        """Upper end of the 95% t-interval on center."""
+        return self.center + self.band
 
     def exceeded_target(self, target: float) -> bool:
         """Check if p95 over all raw samples reaches the target (conservative: p95, not mean)."""
@@ -166,11 +185,8 @@ def summarize(name: str, runs: Sequence[Sequence[float]], unit: str = "ns") -> P
         run_medians=run_medians,
         center=center,
         band=band,
-        ci_95_lower=center - band,
-        ci_95_upper=center + band,
         outlier_count=sum(outlier_count(r) for r in runs),
-        p95_ci=tail_ci(runs, 95),
-        p99_ci=tail_ci(runs, 99),
+        per_run=[list(r) for r in runs],
     )
 
 
@@ -263,20 +279,34 @@ def benchmark_with_gc_handling(
     return result
 
 
+def difference_band(baseline: PerformanceResult, current: PerformanceResult) -> float:
+    """95% half-width on ``current.center - baseline.center``: Welch's t over the two sets of run medians."""
+    va = statistics.variance(baseline.run_medians) / baseline.runs
+    vb = statistics.variance(current.run_medians) / current.runs
+    if va + vb == 0:
+        return 0.0
+    df = (va + vb) ** 2 / (va**2 / (baseline.runs - 1) + vb**2 / (current.runs - 1))
+    return t_critical_95(max(1, int(df))) * math.sqrt(va + vb)
+
+
 def noise_floor(baseline: PerformanceResult, current: PerformanceResult, threshold: float = 0.05) -> float:
     """The smallest change in ``center`` that effect_size_significant calls, in the result's unit.
 
-    It is the larger of the practical threshold (a fraction of the baseline) and either side's band.
+    The largest of: the practical threshold (a fraction of the baseline), either side's band, and
+    the band on the difference itself. The difference band is what holds the A/A false-positive
+    rate near 5% at any run count; the wider of the two side bands alone let it climb to 9% at
+    10 runs and 12% at 20.
     """
-    return max(threshold * baseline.center, baseline.band, current.band)
+    return max(threshold * baseline.center, baseline.band, current.band, difference_band(baseline, current))
 
 
 def effect_size_significant(baseline: PerformanceResult, current: PerformanceResult, threshold: float = 0.05) -> bool:
     """Call a change only when the run-level estimates differ by more than ``noise_floor``.
 
     Compares ``center`` (the mean of per-run medians) and requires the difference to exceed both
-    ``threshold`` x baseline and each side's 95% t band, so neither a small drift nor one noisy
-    side reads as a change. Both sides need at least MIN_RUNS_FOR_INFERENCE runs. Alternate
+    ``threshold`` x baseline and the 95% bands (each side's, and Welch's on the difference), so
+    neither a small drift nor run-to-run noise reads as a change. A difference exactly at the floor is not called. Both sides
+    need at least MIN_RUNS_FOR_INFERENCE runs. Alternate
     baseline and candidate runs in one process where you can, so slow host drift hits both.
 
     No Cohen's d: per-run medians are few, and the question is "beyond run-to-run noise", not
@@ -307,71 +337,3 @@ def coefficient_of_variation(samples: list[float]) -> float:
         return 0.0
 
     return stdev / mean
-
-
-def speedup_ratio(baseline_samples: list[float], optimized_samples: list[float]) -> tuple[float, str]:
-    """Calculate speedup ratio between baseline and optimized runs.
-
-    Returns (ratio, interpretation) where ratio = baseline_mean / optimized_mean.
-    - ratio > 2.0: Significant speedup (2x faster)
-    - ratio > 1.5: Good speedup (50% faster)
-    - ratio > 1.0: Measurable speedup
-    - ratio ≈ 1.0: No meaningful difference
-    """
-    baseline_mean = statistics.mean(baseline_samples)
-    optimized_mean = statistics.mean(optimized_samples)
-
-    if optimized_mean == 0:
-        return 0.0, "ERROR: optimized mean is zero"
-
-    ratio = baseline_mean / optimized_mean
-
-    if ratio >= 2.0:
-        interpretation = f"{ratio:.1f}x faster (excellent)"
-    elif ratio >= 1.5:
-        interpretation = f"{ratio:.1f}x faster (good)"
-    elif ratio > 1.0:
-        interpretation = f"{ratio:.1f}x faster (measurable)"
-    else:
-        interpretation = "No speedup (optimized is slower)"
-
-    return ratio, interpretation
-
-
-def validate_measurement_accuracy(
-    expected_duration_ns: float, measured_samples: list[int], tolerance: float = 0.20
-) -> tuple[bool, str]:
-    """Validate that measured samples match expected duration within tolerance.
-
-    This catches cases where timing overhead inflates measurements.
-    For example, if we expect 1000ns but measure 5000ns, our measurement is wrong.
-
-    Args:
-        expected_duration_ns: Expected operation duration in nanoseconds
-        measured_samples: List of measured latencies in nanoseconds
-        tolerance: Allow ±tolerance ratio (default 20% = 0.20)
-
-    Returns:
-        (is_valid, message) tuple
-    """
-    if not measured_samples:
-        return False, "No samples provided"
-
-    mean = statistics.mean(measured_samples)
-    min_allowed = expected_duration_ns * (1 - tolerance)
-    max_allowed = expected_duration_ns * (1 + tolerance)
-
-    is_valid = min_allowed <= mean <= max_allowed
-    percent_error = ((mean - expected_duration_ns) / expected_duration_ns) * 100
-
-    if is_valid:
-        message = (
-            f"✓ Measurement accuracy valid: {mean:.0f}ns (expected {expected_duration_ns:.0f}ns, error {percent_error:+.1f}%)"
-        )
-    else:
-        message = (
-            f"✗ Measurement accuracy INVALID: {mean:.0f}ns (expected {expected_duration_ns:.0f}ns, "
-            f"error {percent_error:+.1f}%, tolerance ±{tolerance * 100:.0f}%)"
-        )
-
-    return is_valid, message

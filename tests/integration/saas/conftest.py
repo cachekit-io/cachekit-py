@@ -78,7 +78,7 @@ def enforce_worker_availability(worker_health_check):
 
 
 @pytest.fixture
-def cache_io_decorator(sdk_config, worker_health_check):
+def cache_io_decorator(sdk_config, worker_health_check, monkeypatch):
     """Configured @cache.io decorator.
 
     Sets environment variables for SDK configuration and returns
@@ -93,9 +93,10 @@ def cache_io_decorator(sdk_config, worker_health_check):
     """
     # Set SDK environment variables. Only api.cachekit.io and api.staging.cachekit.io are on the
     # SDK's host allowlist, so dev (or any other target) needs the custom-host opt-in.
-    os.environ["CACHEKIT_API_URL"] = sdk_config["api_url"]
-    os.environ["CACHEKIT_API_KEY"] = sdk_config["api_key"]
-    os.environ["CACHEKIT_ALLOW_CUSTOM_HOST"] = "true"
+    # monkeypatch restores all three after the test, so the allowlist opt-in never outlives it.
+    monkeypatch.setenv("CACHEKIT_API_URL", sdk_config["api_url"])
+    monkeypatch.setenv("CACHEKIT_API_KEY", sdk_config["api_key"])
+    monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")
 
     # Import here to pick up environment variables
     from cachekit import cache

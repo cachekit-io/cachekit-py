@@ -10,7 +10,13 @@ import random
 
 import pytest
 
-from tests.performance.stats_utils import PerformanceResult, effect_size_significant, noise_floor, summarize
+from tests.performance.stats_utils import (
+    PerformanceResult,
+    difference_band,
+    effect_size_significant,
+    noise_floor,
+    summarize,
+)
 
 BASE = 1000.0
 OUTLIER = 10 * BASE
@@ -69,6 +75,22 @@ def test_a_a_with_three_percent_run_drift_rarely_calls_a_change() -> None:
     assert false_positives / 200 <= 0.05
 
 
+@pytest.mark.parametrize("runs", [5, 10, 20])
+def test_a_a_on_the_band_alone_stays_under_five_percent(runs: int) -> None:
+    # threshold=0 is the floor the SaaS harness reports, so only the bands guard it. A 95% band
+    # on the difference has an A/A rate of 5% by construction (4-5% measured across seeds), so the
+    # bound allows two standard errors of 1,000-trial noise. The wider side band alone, the old
+    # rule, measured 5.1%, 6.9% and 11.1% at 5, 10 and 20 runs: it grows with the run count.
+    rng = random.Random(10 + runs)
+
+    def arm() -> PerformanceResult:
+        levels = [BASE * rng.gauss(1.0, 0.06) for _ in range(runs)]
+        return summarize("arm", [[rng.gauss(level, 10) for _ in range(20)] for level in levels])
+
+    false_positives = sum(effect_size_significant(arm(), arm(), threshold=0.0) for _ in range(1000))
+    assert false_positives / 1000 <= 0.065
+
+
 def test_a_ten_percent_shift_is_detected() -> None:
     rng = random.Random(4)
     detected = sum(effect_size_significant(_arm(rng), _arm(rng, shift=1.10)) for _ in range(200))
@@ -78,8 +100,15 @@ def test_a_ten_percent_shift_is_detected() -> None:
 def test_the_floor_is_the_threshold_or_the_wider_band() -> None:
     rng = random.Random(6)
     a, b = _arm(rng), _arm(rng)
-    assert noise_floor(a, b) == max(0.05 * a.center, a.band, b.band)
-    assert noise_floor(a, b, threshold=0.0) == max(a.band, b.band)
+    assert noise_floor(a, b) == max(0.05 * a.center, a.band, b.band, difference_band(a, b))
+    assert noise_floor(a, b, threshold=0.0) == max(a.band, b.band, difference_band(a, b))
+
+
+def test_difference_band_is_welch_t_over_run_medians() -> None:
+    a = summarize("a", [[m, m] for m in (1.0, 2.0, 3.0, 4.0, 5.0)])
+    b = summarize("b", [[m, m] for m in (2.0, 3.0, 4.0, 5.0, 6.0)])
+    # equal variances 2.5, so Welch's df = 8: t = 2.306, SE = sqrt(2.5/5 + 2.5/5) = 1
+    assert difference_band(a, b) == pytest.approx(2.306)
 
 
 def test_inference_needs_five_runs() -> None:
@@ -108,4 +137,4 @@ def test_tails_at_the_floor_carry_a_whole_run_bootstrap_ci() -> None:
     result = summarize("thick", [[rng.gauss(BASE, 50) for _ in range(40)] for _ in range(10)])
     assert result.p95_ci is not None and result.p99_ci is None
     assert result.p95_ci[0] <= result.p95 <= result.p95_ci[1]
-    assert "bootstrap over 10 whole runs" in str(result)
+    assert "over 10 whole runs (uncalibrated)" in str(result)

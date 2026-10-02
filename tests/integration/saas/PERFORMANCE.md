@@ -24,7 +24,9 @@ memory. It has two arms:
 
 The test asserts what was timed, not how fast it was: `cache_info().l2_hits` must grow by exactly
 the number of timed calls, and `misses` must not grow. Each hit is also labelled with the serving
-tier from the `X-CacheKit-Store-Source` response header.
+tier from the `X-CacheKit-Store-Source` response header, and only store-served (`do`) hits enter the A/A
+arms. The timed cycle starts past the warm-up keys, so no timed read falls in the edge's few-second
+in-memory window of a warm-up read.
 
 Every network number is a reported value, never an assert, and carries the label
 `vantage=<colo>, client wall time, <env>`. The colo comes from `/cdn-cgi/trace` at run time. Only
@@ -34,22 +36,24 @@ the in-process paths (L1 hits, `cache_info()`) keep sub-millisecond asserts.
 
 The numbers come from `tests/performance/stats_utils.py`. A run of 20 calls is the unit of
 inference. The estimate is the mean of the run medians, and its band is a 95% t-interval at
-df = runs - 1. `effect_size_significant` calls a change only when it exceeds both 5% of the baseline
-and the wider of the two bands. A p95 is printed only at n >= 400 per arm from at least 10 runs, and
-a p99 at n >= 2,000, each with a bootstrap CI over whole runs. Below that the output says
+df = runs - 1. `effect_size_significant` calls a change only when it exceeds 5% of the baseline, each
+side's band, and Welch's 95% band on the difference. A p95 is printed only at n >= 400 per arm from at least 10 runs, and
+a p99 at n >= 2,000, each with a bootstrap interval over whole runs (uncalibrated, so not called a CI). Below that the output says
 `inconclusive at n`. With one run's budget, every p95 here is still inconclusive.
 
 ## First numbers (2026-10-03, vantage=MEL, client wall time, dev)
 
 | Arm | n | p50 | Run median ± band |
 |-----|---|-----|-------------------|
-| L2 hit, served by the store (`do`) | 190 | 41.0 ms | |
-| L2 hit, served by the edge's in-memory tier (`l0`) | 10 | 22.1 ms | |
-| L2 hit, both tiers | 200 | 40.9 ms | 40.6 ± 1.0 ms |
-| GET-miss + SET | 50 | 100.5 ms | 101.5 ± 2.8 ms |
+| L2 hit, store-served (`do`) | 200 | 43.7 ms | 43.7 ± 0.6 ms |
+| GET-miss + SET | 50 | 112.7 ms | 112.4 ± 1.9 ms |
 
-The A/A had arm A at 40.1 ± 2.3 ms and arm B at 41.2 ± 0.6 ms: a delta of +1.1 ms, which reads as no
-change. An L2-hit A/B from this vantage must move the run median by more than 2.3 ms before it counts.
+The A/A had arm A at 43.5 ± 1.2 ms and arm B at 43.9 ± 0.8 ms: a delta of +0.4 ms, which reads as no
+change. An L2-hit A/B from this vantage must move the run median by more than 1.3 ms before it counts
+(2.2 ms to be called at the default 5% threshold). Every timed hit was store-served.
+
+A run about an hour earlier read 100.5 ms for the miss arm. That 12 ms gap between sessions is larger
+than either run's band, so compare arms only inside one session, interleaved, never across sessions.
 
 These numbers hold for this vantage only. They depend on where the client enters Cloudflare, the
 store's region and how many reads the edge serves.

@@ -47,9 +47,8 @@ You need an API key to run these tests:
 ```bash
 # 1. Create account at https://app.dev.cachekit.io
 # 2. Generate API key in dashboard
-# 3. Export it:
-export CACHEKIT_API_KEY="ck_sdk_your_key_here"
-export CACHEKIT_API_URL="https://api.dev.cachekit.io"  # or your custom URL
+# 3. Store it in 1Password and put its reference in an env file that holds no secret:
+#      CACHEKIT_API_KEY=op://<vault>/<item>/credential
 ```
 
 ### 3. Install Dependencies
@@ -170,30 +169,12 @@ Provides:
 
 ## Running Against Different Environments
 
-### Development Environment
+The key always comes through `op run` (see [Target and credentials](#target-and-credentials)).
+Pick the target with `CACHEKIT_API_URL`; dev is the default:
 
 ```bash
-export CACHEKIT_API_KEY="ck_sdk_dev_key"
-export CACHEKIT_API_URL="https://api.dev.cachekit.io"
-uv run pytest -v
-```
-
-### Staging Environment
-
-```bash
-export CACHEKIT_API_KEY="ck_sdk_staging_key"
-export CACHEKIT_API_URL="https://api.staging.cachekit.io"
-uv run pytest -v
-```
-
-### Production Environment
-
-```bash
-export CACHEKIT_API_KEY="ck_sdk_prod_key"
-export CACHEKIT_API_URL="https://api.cachekit.io"
-
-# Use stricter test settings for production
-uv run pytest -v --timeout=60
+op run --env-file=<key file> -- uv run pytest -v                                                  # dev
+CACHEKIT_API_URL=https://api.staging.cachekit.io op run --env-file=<key file> -- uv run pytest -v # staging
 ```
 
 ---
@@ -291,13 +272,8 @@ jobs:
 
 **Fix**:
 ```bash
-# Check your API key
-echo $CACHEKIT_API_KEY
-
-# Regenerate in dashboard
-# Then export and retry:
-export CACHEKIT_API_KEY="ck_sdk_new_key"
-uv run pytest -v
+# Regenerate the key in the dashboard, update the 1Password item, then retry:
+op run --env-file=<key file> -- uv run pytest -v
 ```
 
 ### Issue: "Connection refused" or "Network error"
@@ -403,7 +379,6 @@ wrangler deploy --env production
 ## Related Documentation
 
 - [cachekit SDK Documentation](../../../README.md)
-- [SaaS API Documentation](../../../saas/README.md)
 - [SDK Unit Tests](../../../tests/)
 - [pytest Documentation](https://docs.pytest.org/)
 - [uv Documentation](https://docs.astral.sh/uv/)

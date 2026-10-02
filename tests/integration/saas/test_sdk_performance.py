@@ -78,6 +78,15 @@ def _timed_ms(fn, arg) -> float:
     return (time.perf_counter() - start) * 1000
 
 
+def _timed_hit(fn, arg, response_headers: list) -> tuple[float, str]:
+    """Time one call and return it with the serving tier of the response it caused."""
+    seen = len(response_headers)
+    latency = _timed_ms(fn, arg)
+    if len(response_headers) == seen:
+        return latency, "none"
+    return latency, response_headers[-1].get("x-cachekit-store-source", "unlabelled")
+
+
 def _report(result: PerformanceResult, label: str) -> None:
     print(f"\n{result.name} [{label}]")
     print(f"  n={result.samples} in {result.runs} runs; p50 {result.median:.1f} ms")
@@ -157,17 +166,19 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
         time.sleep(PACE_S)
     before = l2_function.cache_info()
 
+    # The timed cycle starts past the warm-up keys, so no timed read lands inside the edge's
+    # few-second in-memory window of a warm-up read. Only store-served (`do`) hits enter the A/A
+    # arms; any other tier is reported on its own line, so one tier never inflates a band.
     arms: dict[str, list[list[float]]] = {"A": [], "B": []}
     tiers: dict[str, list[float]] = {}
-    call = 0
+    call = WARMUP_CALLS
     for arm in BLOCK_ORDER:
         run = []
         for _ in range(BLOCK):
-            seen = len(response_headers)
-            latency = _timed_ms(l2_function, call % KEYS)
-            run.append(latency)
-            tier = response_headers[-1].get("x-cachekit-store-source", "unlabelled") if len(response_headers) > seen else "none"
+            latency, tier = _timed_hit(l2_function, call % KEYS, response_headers)
             tiers.setdefault(tier, []).append(latency)
+            if tier == "do":
+                run.append(latency)
             call += 1
             time.sleep(PACE_S)
         arms[arm].append(run)
@@ -191,18 +202,19 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
 
     changed = effect_size_significant(hit_a, hit_b)
     print(
-        f"\nA/A (same function, same keys, ABBA runs): delta {hit_b.center - hit_a.center:+.1f} ms, "
+        f"\nA/A (same function, same keys, ABBA runs, store-served hits): delta {hit_b.center - hit_a.center:+.1f} ms, "
         f"{'CHANGE' if changed else 'no change'} at the default 5% threshold.\n"
         f"Floor it sets: an L2-hit A/B from this vantage must move the run median by more than "
-        f"{noise_floor(hit_a, hit_b, threshold=0.0):.1f} ms (the wider run band), and by more than "
+        f"{noise_floor(hit_a, hit_b, threshold=0.0):.1f} ms (the 95% bands), and by more than "
         f"{noise_floor(hit_a, hit_b):.1f} ms to be called at 5%."
     )
 
 
-def test_connection_pool_reuse(cache_io_decorator, performance_timer, vantage):
+def test_connection_pool_reuse(cache_io_decorator, response_headers, vantage):
     """Report the first and the following L2 hits on one client; the pool keeps them on one connection.
 
-    Reported, not asserted: a remote target's RTT dominates both numbers.
+    Reported, not asserted: a remote target's RTT dominates both numbers. One key read every
+    ~0.15 s is mostly served from the edge's in-memory tier, so every number carries its tier.
     """
 
     @cache_io_decorator(ttl=300, l1_enabled=False, namespace=f"pool_{uuid.uuid4().hex[:8]}")
@@ -212,17 +224,19 @@ def test_connection_pool_reuse(cache_io_decorator, performance_timer, vantage):
     pooled_function(1000)  # prime: GET miss + SET
     before = pooled_function.cache_info()
 
-    latencies = []
+    hits = []
     for _ in range(11):
-        with performance_timer() as timer:
-            pooled_function(1000)
-        latencies.append(timer.elapsed_ms)
+        hits.append(_timed_hit(pooled_function, 1000, response_headers))
         time.sleep(PACE_S)
 
     after = pooled_function.cache_info()
     assert after.l2_hits - before.l2_hits == 11 and after.misses == before.misses, f"{before} -> {after}"
 
-    print(f"\nFirst L2 hit: {latencies[0]:.1f}ms; median of the next 10: {statistics.median(latencies[1:]):.1f}ms [{vantage}]")
+    following: dict[str, list[float]] = {}
+    for latency, tier in hits[1:]:
+        following.setdefault(tier, []).append(latency)
+    medians = ", ".join(f"{t} n={len(v)} p50 {statistics.median(v):.1f}ms" for t, v in sorted(following.items()))
+    print(f"\nFirst L2 hit: {hits[0][0]:.1f}ms ({hits[0][1]}); the next 10: {medians} [{vantage}]")
 
 
 # ============================================================================
