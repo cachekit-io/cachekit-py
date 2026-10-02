@@ -878,9 +878,9 @@ def create_cache_wrapper(
     _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
-    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None) -> None:
+    def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None, *, twin: str | None) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
-        then record the key in _cached_keys.
+        then record the key, and its pre-0.20.0 twin if it has one (_twin_key), in _cached_keys.
 
         Recording after the put makes "in L1 => in _cached_keys" hold by construction, so a
         whole-function invalidation that trims _cached_keys before evicting L1 cannot miss an
@@ -888,16 +888,19 @@ def create_cache_wrapper(
         value): _cached_keys also drives the L2 deletes of process-local invalidation.
 
         Every open _watch_records() set is told about the key BEFORE it is recorded, so a
-        concurrent whole-function invalidation cannot drop a record it was not told about.
+        concurrent whole-function invalidation cannot drop a record it was not told about. The
+        twin is recorded in the same step: recorded separately, a trim could keep a rewritten
+        key and drop its twin, which a later no-args invalidation would then miss.
         """
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
             _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
-        entry = (_l2_scope(), cache_key)
+        scope = _l2_scope()
+        entries = [(scope, cache_key)] if twin is None else [(scope, cache_key), (scope, twin)]
         if _drain_watches:
             for watch in _drain_watches.copy().values():
-                watch.add(entry)
-        _cached_keys.add(entry)
+                watch.update(entries)
+        _cached_keys.update(entries)
 
     def _is_trackable() -> bool:
         """Whether the backend as RESOLVED so far keeps a server-side key registry.
@@ -980,7 +983,9 @@ def create_cache_wrapper(
             return hit if hit is not None else (None, False, None)
         return await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs), False, None
 
-    def _l1_backfill_from_l2(cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None) -> None:
+    def _l1_backfill_from_l2(
+        cache_key: str, cached_data: Any, is_stale: bool, fresh_for: int | None, *, twin: str | None
+    ) -> None:
         """Backfill L1 from an L2 hit's raw envelope, holding both LAB-557
         invariants at every call site in lockstep: a stale-labelled hit is never
         recorded (spec: local caches MUST NOT record stale as fresh), and a
@@ -995,7 +1000,7 @@ def create_cache_wrapper(
         if not (_l1_cache and cache_key and cached_data and not is_stale):
             return
         try:
-            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for))
+            _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin)
         except TypeError as exc:
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
 
@@ -1116,7 +1121,7 @@ def create_cache_wrapper(
             cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
         )
         # Refresh L1 with the new fresh bytes (mirrors the miss-path store).
-        _put_l1(cache_key, serialized_data, ttl)
+        _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs))
         if stored:
             await _track_and_record_async(cache_key)
 
@@ -1154,7 +1159,7 @@ def create_cache_wrapper(
             stored = operation_handler.cache_handler.set(  # type: ignore[attr-defined]
                 cache_key, serialized_data, ttl=ttl, stale_ttl=_stale_ttl
             )
-            _put_l1(cache_key, serialized_data, ttl)
+            _put_l1(cache_key, serialized_data, ttl, twin=_twin_key(call_args, call_kwargs))
             if stored:
                 _track_and_record(cache_key)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
@@ -1281,19 +1286,15 @@ def create_cache_wrapper(
         and key_generator.serializer_code(serialization_handler.serializer_key_name) != key_generator.serializer_code("default")
     )
 
-    def _track_twin(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
-        """Record cache_key's pre-0.20.0 twin in _cached_keys, so a no-args invalidation deletes it.
+    def _twin_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str | None:
+        """The call's pre-0.20.0 twin key for _put_l1 to record, or None when the key has none.
 
-        Both whole-function paths read _cached_keys, so the twin is deleted, counted when its
-        delete fails and kept for retry like any recorded key. Call once the backend is resolved:
-        the entry needs the calling tenant's scope. A key already tracked skips the derivation;
-        its twin was recorded with it, or deleted by the invalidation that last trimmed it.
+        Recorded, a twin is deleted by a no-args invalidation on either path, counted when its
+        delete fails and kept for retry, like any recorded key.
         """
-        scope = _l2_scope()
-        if (scope, cache_key) in _cached_keys:
-            return
-        twin = operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-        _cached_keys.add((scope, twin))
+        if not _records_twin:
+            return None
+        return operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
 
     # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every entry it
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
@@ -1687,8 +1688,7 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
                 raise
 
-        if _records_twin:
-            _track_twin(cache_key, args, kwargs)
+        twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
@@ -1756,7 +1756,7 @@ def create_cache_wrapper(
 
                 # Backfill L1 with the L2 envelope for subsequent fast access — stale-exclusion
                 # + remaining-freshness bound (LAB-557), as on the async path (LAB-348).
-                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for)
+                _l1_backfill_from_l2(cache_key, cached_data, _sync_l2_stale, _sync_l2_fresh_for, twin=twin_key)
 
                 # Record L2 hit with latency for cache_info()
                 duration_ms = duration * 1000
@@ -1814,7 +1814,7 @@ def create_cache_wrapper(
                 outcome = operation_handler.store_result(cache_key, result, ttl, args, kwargs, stale_ttl=_stale_ttl)
 
                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                _put_l1(cache_key, outcome.envelope, ttl)
+                _put_l1(cache_key, outcome.envelope, ttl, twin=twin_key)
                 if outcome.stored:
                     _track_and_record(cache_key)
 
@@ -2056,8 +2056,7 @@ def create_cache_wrapper(
             if interop is not None and not interop_checked:
                 ensure_interop_backend_compatible(_backend)
 
-            if _records_twin:
-                _track_twin(cache_key, args, kwargs)
+            twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
@@ -2098,7 +2097,7 @@ def create_cache_wrapper(
 
                     # Update L1 cache with the L2 value (serialized bytes) for subsequent
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
-                    _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
+                    _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for, twin=twin_key)
 
                     # Handle TTL refresh if configured and threshold met
                     if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
@@ -2177,7 +2176,7 @@ def create_cache_wrapper(
                                     result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                     _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
                                     return result
                             except (DecryptionAuthenticationError, KeyringConfigurationError):
                                 # Fail-closed tamper raise from get_cached_value_async
@@ -2211,7 +2210,7 @@ def create_cache_wrapper(
                                     result, cached_data = cached_result.value, cached_result.envelope
                                     _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
                                     _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for)
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
                                     return result
                             except (DecryptionAuthenticationError, KeyringConfigurationError):
                                 # Same as the lock-acquired double-check above.
@@ -2247,7 +2246,7 @@ def create_cache_wrapper(
                                 )
 
                                 # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                                _put_l1(cache_key, serialized_data, ttl)
+                                _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
                                 if stored:
                                     await _track_and_record_async(cache_key)
 
@@ -2347,7 +2346,7 @@ def create_cache_wrapper(
                     )
 
                     # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    _put_l1(cache_key, serialized_data, ttl)
+                    _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
                     if stored:
                         await _track_and_record_async(cache_key)
 

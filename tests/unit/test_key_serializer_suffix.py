@@ -731,3 +731,47 @@ class TestNoArgsInvalidationReachesPre020Keys:
         backend.fail_on = set()
         fn.invalidate_cache()
         assert backend.store == {}, "the next no-args invalidation did not retry the failed twin delete"
+
+    @pytest.mark.parametrize("path", ["local_sweep", "registry_drain"])
+    def test_rewrite_during_invalidation_keeps_the_twin_tracked(self, path: str):
+        """A key rewritten while a no-args invalidation runs stays tracked, and so does its twin.
+
+        The rewrite lands after the invalidation deleted both keys and before it trims them.
+        The trim keeps the rewritten key; if it dropped the twin, a twin an old replica writes
+        afterwards would survive the next no-args invalidation.
+        """
+        rewrite: list[Callable[[], Any]] = []
+
+        class _RewriteMidSweep(_RecordingBackend):
+            def delete(self, key: str) -> bool:
+                deleted = super().delete(key)
+                if rewrite and _suffix(key) == "1a":
+                    rewrite.pop()()
+                return deleted
+
+        class _RewriteMidDrain(TrackingBackend):
+            def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+                drained = super().drain_tracked(registry_id, local_keys)
+                if rewrite:
+                    rewrite.pop()()
+                return drained
+
+        backend = _RewriteMidSweep() if path == "local_sweep" else _RewriteMidDrain()
+
+        # L1 off, so the rewrite misses L1 and writes through, as a call on another thread would.
+        @cache(backend=backend, ttl=None, namespace=f"twin-r{path[0]}", serializer="auto", l1_enabled=False)
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        current_key, legacy_key = self._write_and_seed_twin(fn, backend)
+        rewrite.append(lambda: fn(1))
+
+        fn.invalidate_cache()
+
+        assert not rewrite, "the rewrite hook never ran"
+        assert list(backend.store) == [current_key], "the rewrite did not land after the delete"
+        backend.store[legacy_key] = b"written by an old replica after the invalidation"
+
+        fn.invalidate_cache()
+
+        assert backend.store == {}, "the twin of a key rewritten mid-invalidation was no longer tracked"

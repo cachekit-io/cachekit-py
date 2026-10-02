@@ -760,7 +760,7 @@ class TestSingleL1WriteSite:
             for n in ast.walk(put_l1)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "add"
+            and n.func.attr in {"add", "update"}  # update: the key with its pre-0.20.0 twin
             and isinstance(n.func.value, ast.Name)
             and n.func.value.id == "_cached_keys"
         ]
