@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, with one caveat: `@cache` treats a `BackendError` raised by your function as a backend failure and may call the function a second time, so the caller gets the second call's result or exception. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many within 60 seconds open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count, except that a `BackendError` reruns it without the lock, and a failure of that rerun counts.
+Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many within 60 seconds open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count.
 
 </details>
 
