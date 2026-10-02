@@ -17,9 +17,11 @@ from .nested import (
     L1CacheConfig,
     MonitoringConfig,
 )
-from .validation import ConfigurationError
+from .validation import ConfigurationError, hide_secret, reveal_secret
 
 if TYPE_CHECKING:
+    from pydantic import SecretStr
+
     from cachekit.backends.base import BaseBackend
     from cachekit.decorators.tenant_context import TenantContextExtractor
     from cachekit.serializers.base import SerializerProtocol
@@ -363,7 +365,9 @@ class DecoratorConfig:
         return cls(**(defaults | kwargs))
 
     @classmethod
-    def secure(cls, master_key: str, tenant_extractor: TenantContextExtractor | None = None, **kwargs: Any) -> DecoratorConfig:
+    def secure(
+        cls, master_key: str | SecretStr, tenant_extractor: TenantContextExtractor | None = None, **kwargs: Any
+    ) -> DecoratorConfig:
         """Security profile: Encryption REQUIRED, encrypted-at-rest everywhere, full audit trail, integrity NON-NEGOTIABLE.
 
         Use cases: PII, medical data, financial records and other regulated data (encryption can support
@@ -403,6 +407,7 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
+        master_key = hide_secret(master_key)  # unwrapped only into the EncryptionConfig (CWE-532)
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
         deployment_uuid = kwargs.pop("deployment_uuid", None)
@@ -448,7 +453,7 @@ class DecoratorConfig:
         return cls(
             encryption=EncryptionConfig(
                 enabled=True,
-                master_key=master_key,
+                master_key=reveal_secret(master_key),
                 tenant_extractor=tenant_extractor,
                 single_tenant_mode=single_tenant_mode,
                 deployment_uuid=deployment_uuid,
@@ -546,7 +551,7 @@ class DecoratorConfig:
         return cls(**(defaults | kwargs))
 
     @classmethod
-    def io(cls, api_key: str | None = None, **kwargs: Any) -> DecoratorConfig:
+    def io(cls, api_key: str | SecretStr | None = None, **kwargs: Any) -> DecoratorConfig:
         """cachekit.io SaaS backend profile: HTTP-based caching via api.cachekit.io.
 
         Use cases: Zero-infrastructure caching, edge caching, multi-region deployments
@@ -586,6 +591,7 @@ class DecoratorConfig:
             >>> DecoratorConfig.io(api_key="ck_test_key", ttl=300).ttl  # pragma: allowlist secret
             300
         """
+        api_key = hide_secret(api_key)  # passed down wrapped (CWE-532)
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 

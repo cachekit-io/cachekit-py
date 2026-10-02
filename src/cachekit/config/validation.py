@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
 
-from pydantic import GetCoreSchemaHandler, ValidationError
+from pydantic import GetCoreSchemaHandler, SecretStr, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
 from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 _BUILTIN_ERROR_TYPES = frozenset(get_args(ErrorType))
 
 _T = TypeVar("_T")
+
+
+def hide_secret(value: str | _T) -> SecretStr | _T:
+    """Wrap a raw secret string in SecretStr; anything else, None or an already-wrapped secret included,
+    passes through.
+
+    A function that takes a secret rebinds its parameter through this before anything can raise, and
+    unwraps it only inside the expression that needs the raw value, so no frame on an error's traceback
+    holds it in a local (CWE-532). Error trackers capture frame locals by default (Sentry's
+    include_local_variables) and render SecretStr as its masked repr.
+    """
+    return SecretStr(value) if isinstance(value, str) else value
+
+
+def reveal_secret(value: SecretStr | _T) -> str | _T:
+    """The raw value of a SecretStr; anything else passes through. Call it inline, never into a local."""
+    return value.get_secret_value() if isinstance(value, SecretStr) else value
 
 
 class ConfigurationError(Exception):
@@ -222,7 +239,7 @@ def _redacted_copy(error: ValidationError) -> ValidationError:
     return ValidationError.from_exception_data(error.title, sanitized, input_type="json", hide_input=True)
 
 
-def validate_encryption_config(encryption: bool | None = False, master_key: str | None = None) -> None:
+def validate_encryption_config(encryption: bool | None = False, master_key: str | SecretStr | None = None) -> None:
     """Validate encryption configuration when encryption is enabled.
 
     Checks for a master key: first from the explicit parameter, then from
@@ -250,17 +267,17 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
 
         >>> validate_encryption_config(encryption=True)  # doctest: +SKIP
     """
+    master_key = hide_secret(master_key)
     # Only validate if encryption is explicitly enabled
     if not encryption:
         return
 
-    # Resolve master key: explicit param > env var via settings
+    # Resolve master key: explicit param > env var via settings. Kept wrapped: unwrapped only inline below.
     resolved_key = master_key
     if not resolved_key:
         from cachekit.config.singleton import get_settings
 
-        settings = get_settings()
-        resolved_key = settings.master_key.get_secret_value() if settings.master_key else None
+        resolved_key = get_settings().master_key
 
     if not resolved_key:
         raise ConfigurationError(
@@ -281,14 +298,14 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
                 "(HashiCorp Vault, AWS Secrets Manager, etc.)."
             )
 
-    # Validate key format and length
+    # Validate key format and length (only the length is bound: the decoded key never is)
     try:
-        key_bytes = bytes.fromhex(resolved_key)
-        if len(key_bytes) < 32:
-            raise ConfigurationError(
-                f"CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). "
-                f"Got {len(key_bytes)} bytes. "
-                "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
-            )
+        key_length = len(bytes.fromhex(resolved_key.get_secret_value()))
     except ValueError as e:
         raise ConfigurationError(f"CACHEKIT_MASTER_KEY must be hex-encoded: {e}") from e
+    if key_length < 32:
+        raise ConfigurationError(
+            f"CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). "
+            f"Got {key_length} bytes. "
+            "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
+        )

@@ -33,7 +33,7 @@ from ..cache_handler import (
     supports_ttl_inspection,
     warn_ttl_refresh_unsupported,
 )
-from ..config.validation import ConfigurationError
+from ..config.validation import ConfigurationError, hide_secret
 from ..interop import (
     InteropError,
     bind_flat_args,
@@ -59,6 +59,8 @@ from .orchestrator import FeatureOrchestrator
 from .tenant_context import TenantContextExtractor
 
 if TYPE_CHECKING:
+    from pydantic import SecretStr
+
     from ..backends.base import BaseBackend
     from ..serializers.base import SerializerProtocol
 
@@ -422,7 +424,7 @@ def create_cache_wrapper(
     tenant_extractor: TenantContextExtractor | None = None,
     single_tenant_mode: bool = False,
     deployment_uuid: str | None = None,
-    master_key: str | None = None,
+    master_key: str | SecretStr | None = None,
     encryption_fail_closed: bool | None = None,
     # Performance features
     refresh_ttl_on_get: bool = False,
@@ -563,7 +565,7 @@ def create_cache_wrapper(
         tenant_extractor = config.encryption.tenant_extractor  # type: ignore[assignment]
         single_tenant_mode = config.encryption.single_tenant_mode
         deployment_uuid = config.encryption.deployment_uuid
-        master_key = config.encryption.master_key
+        master_key = hide_secret(config.encryption.master_key)
         encryption_fail_closed = config.encryption.fail_closed
 
         # Custom key function (escape hatch for complex types)

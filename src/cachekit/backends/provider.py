@@ -14,6 +14,7 @@ from cachekit.hash_utils import redact_key_for_log
 if TYPE_CHECKING:
     import redis
     import redis.asyncio as redis_async
+    from pydantic import SecretStr
 
     from cachekit.backends.redis.config import RedisBackendConfig
 
@@ -125,12 +126,15 @@ class PooledClientProvider(CacheClientProvider):
     No connection is made at construction time; pools connect lazily on first use.
     """
 
-    def __init__(self, redis_url: str, config: Optional[RedisBackendConfig] = None) -> None:
+    def __init__(self, redis_url: str | SecretStr, config: Optional[RedisBackendConfig] = None) -> None:
         import redis
 
         from cachekit.backends.redis.client import create_connection_pool
         from cachekit.backends.redis.config import RedisBackendConfig
+        from cachekit.config.validation import hide_secret
 
+        # The URL may carry a password: kept wrapped and unwrapped only inside the pool builders (CWE-532)
+        redis_url = hide_secret(redis_url)
         self._redis_url = redis_url
         self._config = config or RedisBackendConfig.from_env()
         self._pool = create_connection_pool(redis_url, self._config)

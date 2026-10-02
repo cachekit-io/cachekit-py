@@ -13,6 +13,8 @@ Architectural Note:
 import logging
 from typing import Any, Optional
 
+from pydantic import SecretBytes
+
 # Import zero-knowledge encryption from Rust
 from cachekit._rust_serializer import (
     Keyring,
@@ -23,6 +25,24 @@ from cachekit._rust_serializer import (
 from cachekit.config import get_settings
 
 from .base import SerializationError, SerializationMetadata, SerializerProtocol
+
+
+def _hide_key(key: object) -> SecretBytes:
+    """Wrap a key so no frame on an error's traceback holds it raw in a local (CWE-532); see
+    cachekit.config.validation.hide_secret. Unwrapped only inline, where the Rust bindings take them.
+
+    Never raises, whatever the type: every key must be wrapped before any is checked, or a bad one would
+    raise while its raw neighbours are still bound. _require_bytes checks the wrapped value afterwards.
+    """
+    if isinstance(key, SecretBytes):
+        return key
+    return SecretBytes(bytes(key) if isinstance(key, (bytearray, memoryview)) else key)  # type: ignore[arg-type]
+
+
+def _require_bytes(key: SecretBytes) -> None:
+    if not isinstance(key.get_secret_value(), bytes):
+        raise TypeError(f"master keys must be bytes, got {type(key.get_secret_value()).__name__}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -161,10 +181,10 @@ class EncryptionWrapper:
     def __init__(
         self,
         serializer: Optional[SerializerProtocol] = None,
-        master_key: Optional[bytes] = None,
+        master_key: bytes | SecretBytes | None = None,
         tenant_id: str = "default",
         fail_closed: bool = False,
-        previous_master_keys: Optional[list[bytes]] = None,
+        previous_master_keys: list[bytes] | list[SecretBytes] | None = None,
     ):
         """Initialize encryption wrapper.
 
@@ -189,6 +209,12 @@ class EncryptionWrapper:
                 stay readable — selected by exact derived-key fingerprint
                 match, never by trial decryption. Writes always use master_key.
         """
+        master_key = None if master_key is None else _hide_key(master_key)
+        if previous_master_keys is not None:
+            previous_master_keys = [_hide_key(key) for key in previous_master_keys]
+        for key in [master_key, *(previous_master_keys or ())]:
+            if key is not None:
+                _require_bytes(key)
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
 
@@ -208,8 +234,8 @@ class EncryptionWrapper:
         # self.encryption_key_fingerprint, self._keyring, self._keyring_fingerprints
         self._setup_encryption(master_key, previous_master_keys)
 
-    def _setup_encryption(self, master_key: Optional[bytes], previous_master_keys: Optional[list[bytes]]) -> None:
-        """Setup encryption components with key derivation."""
+    def _setup_encryption(self, master_key: SecretBytes | None, previous_master_keys: list[SecretBytes] | None) -> None:
+        """Setup encryption components with key derivation. Keys arrive wrapped and are unwrapped only inline."""
         # Get master key from settings if not provided
         if master_key is None:
             settings = get_settings()
@@ -218,7 +244,7 @@ class EncryptionWrapper:
                     "Master key required. Set CACHEKIT_MASTER_KEY environment variable or pass master_key parameter."
                 )
             try:
-                master_key = bytes.fromhex(settings.master_key.get_secret_value())
+                master_key = SecretBytes(bytes.fromhex(settings.master_key.get_secret_value()))
             except ValueError as e:
                 raise EncryptionError(f"Invalid master key format in configuration: {e}") from e
 
@@ -244,7 +270,7 @@ class EncryptionWrapper:
         # at a read site as often as at a write.
         if previous_master_keys is None:
             settings = get_settings()
-            previous_master_keys = [bytes.fromhex(key.get_secret_value()) for key in settings.previous_master_keys]
+            previous_master_keys = [SecretBytes(bytes.fromhex(key.get_secret_value())) for key in settings.previous_master_keys]
 
         for position, previous_key in enumerate(previous_master_keys):
             if len(previous_key) < 32:
@@ -261,11 +287,11 @@ class EncryptionWrapper:
         # behind the FFI for wrappers constructed with explicit parameters;
         # violations raise KeyringConfigurationError from the binding and
         # propagate as-is (see the config-error taxonomy note above).
-        self._keyring = Keyring(master_key, list(previous_master_keys))
+        self._keyring = Keyring(master_key.get_secret_value(), [key.get_secret_value() for key in previous_master_keys])
 
         # Derive tenant-specific keys with domain separation
         try:
-            self.tenant_keys = derive_tenant_keys(master_key, self.tenant_id)
+            self.tenant_keys = derive_tenant_keys(master_key.get_secret_value(), self.tenant_id)
 
             # Get key fingerprints for metadata (fingerprints are safe to expose)
             self.encryption_key_fingerprint = self.tenant_keys.encryption_fingerprint().hex()

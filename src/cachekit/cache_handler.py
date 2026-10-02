@@ -13,6 +13,8 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
+from pydantic import SecretBytes, SecretStr
+
 from cachekit.backends.base import (
     BackendError,
     BaseBackend,
@@ -30,6 +32,7 @@ from cachekit.backends.provider import (
     LoggerProvider,
 )
 from cachekit.config import ConfigurationError, get_settings
+from cachekit.config.validation import hide_secret, reveal_secret
 from cachekit.di import DIContainer
 
 # Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
@@ -578,7 +581,7 @@ class CacheSerializationHandler:
         tenant_extractor: Any | None = None,
         single_tenant_mode: bool = False,
         deployment_uuid: Optional[str] = None,
-        master_key: Optional[str] = None,
+        master_key: str | SecretStr | None = None,
         enable_integrity_checking: bool = True,
         encryption_fail_closed: bool | None = None,
         interop_mode: bool = False,
@@ -631,6 +634,7 @@ class CacheSerializationHandler:
             No shared-key fallback: If encryption=True and tenant_extractor provided
             but extraction fails, ValueError propagates to caller (no fallback to shared key).
         """
+        master_key = hide_secret(master_key)
         self.serializer_name = serializer_name
         self.enable_integrity_checking = enable_integrity_checking
         self.interop_mode = interop_mode
@@ -698,7 +702,7 @@ class CacheSerializationHandler:
         self.tenant_extractor = tenant_extractor
         self.single_tenant_mode = single_tenant_mode
         self.deployment_uuid = deployment_uuid
-        self.master_key = master_key
+        self.master_key = reveal_secret(master_key)
 
         # Tri-state fail-closed resolution (mirrors the `encryption` tri-state, issue #128):
         # an explicit True/False from EncryptionConfig wins; None defers to the fleet-wide
@@ -907,9 +911,6 @@ class CacheSerializationHandler:
             # Create new EncryptionWrapper
             from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 
-            # Convert master_key from hex string to bytes if provided
-            master_key_bytes = bytes.fromhex(self.master_key) if self.master_key else None
-
             # Issue #134: thread the user's base serializer into the wrapper so a
             # cross-SDK-compatible serializer (Arrow/orjson) is actually used under
             # encryption instead of being silently replaced by StandardSerializer.
@@ -919,7 +920,8 @@ class CacheSerializationHandler:
             wrapper = EncryptionWrapper(
                 serializer=self._base_serializer,
                 tenant_id=tenant_id,
-                master_key=master_key_bytes,
+                # hex string to bytes, wrapped inline: no local holds the decoded key
+                master_key=SecretBytes(bytes.fromhex(self.master_key)) if self.master_key else None,
                 fail_closed=self.encryption_fail_closed,
             )
 

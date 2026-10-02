@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
+from ..config.validation import hide_secret, reveal_secret
 from .wrapper import create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -121,6 +122,12 @@ def cache(
         Decorated function with intelligent caching
     """
 
+    # Secrets stay wrapped from here down, so no frame on an error's traceback holds them raw in a local or
+    # in this dict (CWE-532); each is unwrapped only where it is used.
+    for _secret in ("master_key", "api_key"):
+        if _secret in manual_overrides:
+            manual_overrides[_secret] = hide_secret(manual_overrides[_secret])
+
     def decorator(f: F) -> F:
         # LOCAL INTENT: short-circuit before any DecoratorConfig resolution.
         # Must be first — backend pop and l1_enabled mapping below would
@@ -200,7 +207,9 @@ def cache(
                 for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
                     if _k in manual_overrides:
                         enc_overrides[_k] = manual_overrides.pop(_k)
-                manual_overrides["encryption"] = replace(EncryptionConfig(), **enc_overrides)
+                manual_overrides["encryption"] = replace(
+                    EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()}
+                )
 
         # RORO config takes highest precedence
         if config is not None:
@@ -232,9 +241,7 @@ def cache(
             if not master_key:
                 from cachekit.config.singleton import get_settings
 
-                settings_key = get_settings().master_key
-                if settings_key:
-                    master_key = settings_key.get_secret_value()
+                master_key = get_settings().master_key
             if not master_key:
                 raise ValueError("cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable")
             resolved_config = DecoratorConfig.secure(

@@ -9,10 +9,12 @@ import time
 from typing import Any, Optional, Union
 
 import redis
+from pydantic import SecretStr
 
 from cachekit.backends.base import BackendError
 from cachekit.backends.provider import CacheClientProvider, PooledClientProvider
 from cachekit.backends.redis.config import RedisBackendConfig
+from cachekit.config.validation import hide_secret, reveal_secret
 from cachekit.di import DIContainer
 
 
@@ -45,7 +47,7 @@ class RedisBackend:
 
     def __init__(
         self,
-        redis_url: Optional[Union[str, RedisBackendConfig]] = None,
+        redis_url: Optional[Union[str, SecretStr, RedisBackendConfig]] = None,
         client_provider: Optional[CacheClientProvider] = None,
     ) -> None:
         """Initialize RedisBackend.
@@ -68,14 +70,16 @@ class RedisBackend:
         Raises:
             BackendError: If no Redis URL can be resolved
         """
+        # The URL may carry a password: no local here holds it raw (CWE-532), it is unwrapped only inline.
+        redis_url = hide_secret(redis_url)
         if isinstance(redis_url, RedisBackendConfig):
             redis_config = redis_url
-            explicit_url: Optional[str] = redis_config.redis_url
+            explicit_url: Optional[SecretStr] = hide_secret(redis_config.redis_url)
         else:
             redis_config = RedisBackendConfig.from_env()
             explicit_url = redis_url
 
-        self._redis_url = explicit_url or redis_config.redis_url
+        self._redis_url = reveal_secret(explicit_url) or redis_config.redis_url
 
         # Validate a Redis URL is configured
         if not self._redis_url:

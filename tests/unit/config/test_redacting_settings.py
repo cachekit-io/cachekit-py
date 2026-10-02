@@ -20,13 +20,20 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError, ValidationI
 from pydantic_core import PydanticCustomError
 
 import cachekit
+from cachekit import DecoratorConfig, cache
+from cachekit._rust_serializer import KeyringConfigurationError
 from cachekit.backends.base_config import BaseBackendConfig
+from cachekit.backends.cachekitio import CachekitIOBackend
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.file.config import FileBackendConfig
 from cachekit.backends.memcached.config import MemcachedBackendConfig
+from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis.config import RedisBackendConfig
-from cachekit.config import singleton
+from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.config import ConfigurationError, singleton, validate_encryption_config
+from cachekit.config.nested import EncryptionConfig
 from cachekit.config.settings import CachekitConfig
+from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 
 _KEY_HEX = "ab" * 32
 
@@ -548,24 +555,63 @@ class TestRedactingSettings:
 _CACHEKIT_SRC = pathlib.Path(cachekit.__file__).resolve().parent
 
 
-def _cachekit_locals_holding(exc: BaseException, secret: str, *, below_caller: bool = False) -> list[str]:
-    """Every ``frame:local`` under src/cachekit/ on ``exc``'s traceback whose repr contains ``secret``, or with
-    ``below_caller`` every frame but this test file's, pydantic's included.
+def _secret_forms(secret: str | bytes) -> tuple[list[str], list[bytes]]:
+    """``secret`` as text and as bytes: a str also as its UTF-8 bytes and, when it is hex, the bytes it
+    decodes to; bytes also as their hex."""
+    if isinstance(secret, bytes):
+        return [secret.hex()], [secret]
+    as_bytes = [secret.encode()]
+    try:
+        as_bytes.append(bytes.fromhex(secret))
+    except ValueError:
+        pass
+    return [secret], as_bytes
 
-    Error trackers capture frame locals by default (Sentry's ``include_local_variables``), and their
-    scrubbers match top-level key names, so a raw key held in any local is a key sent off-host.
+
+def _holds(value: object, texts: list[str], raw: list[bytes], depth: int = 0) -> bool:
+    """Whether ``value`` carries the secret the way a frame-locals reporter serialises it: str and bytes by
+    content, dict/list/tuple/set by recursing into their items (keys too), anything else by its repr."""
+    if isinstance(value, str):
+        return any(t in value for t in texts)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return any(r in bytes(value) for r in raw)
+    if isinstance(value, dict) and depth < 10:
+        return any(_holds(k, texts, raw, depth + 1) or _holds(v, texts, raw, depth + 1) for k, v in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)) and depth < 10:
+        return any(_holds(item, texts, raw, depth + 1) for item in value)
+    return any(t in repr(value) for t in texts)
+
+
+def _cachekit_locals_holding(exc: BaseException, secret: str | bytes, *, below_caller: bool = False) -> list[str]:
+    """Every ``frame:local`` under src/cachekit/ that holds ``secret`` on the traceback of ``exc`` or of any
+    exception chained to it (``__cause__``/``__context__``), or with ``below_caller`` every frame but this
+    test file's, pydantic's included.
+
+    Error trackers capture frame locals by default (Sentry's ``include_local_variables``) and serialise
+    containers item by item, and their scrubbers match top-level key names, so a raw key held in any local,
+    or inside a dict or list in one, is a key sent off-host. A str secret is matched as text, as UTF-8
+    bytes and, when hex, as the bytes it decodes to.
     """
     this_file = pathlib.Path(__file__).resolve()
-    found = []
-    tb = exc.__traceback__
-    while tb is not None:
-        code = tb.tb_frame.f_code
-        path = pathlib.Path(code.co_filename).resolve()
-        if path != this_file if below_caller else path.is_relative_to(_CACHEKIT_SRC):
-            for name, value in tb.tb_frame.f_locals.items():
-                if secret in repr(value):
-                    found.append(f"{code.co_name}:{name}")
-        tb = tb.tb_next
+    texts, raw = _secret_forms(secret)
+    found: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending += [current.__cause__, current.__context__]
+        tb = current.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            path = pathlib.Path(code.co_filename).resolve()
+            if path != this_file if below_caller else path.is_relative_to(_CACHEKIT_SRC):
+                for name, value in tb.tb_frame.f_locals.items():
+                    if _holds(value, texts, raw):
+                        found.append(f"{code.co_name}:{name}")
+            tb = tb.tb_next
     return found
 
 
@@ -636,3 +682,202 @@ class TestRedactingSettingsFrameLocals:
             build()
 
         assert _cachekit_locals_holding(exc_info.value, _KEY_HEX, below_caller=True) == []
+
+
+_API_KEY = "ck_test_frameLocalsApiKey0123456789"  # pragma: allowlist secret
+_SHORT_KEY_HEX = "cd" * 16
+_REDIS_PASSWORD = "frameLocalsRedisPassword"  # pragma: allowlist secret
+
+
+def _cached() -> int:
+    return 1
+
+
+def _lazy_wrapper_build() -> object:
+    """N7: the handler builds its EncryptionWrapper on first use, after the settings it reads went bad."""
+    handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=_KEY_HEX)
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("CACHEKIT_MAX_VALUE_SIZE", "-1")
+        singleton.reset_settings()
+        return handler.serialize_data({"v": 1})
+
+
+# (env, call, raised, secret) per public entry point that takes a secret or reads one from the environment.
+_ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[BaseException], str | bytes]] = {
+    "io-backend-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY, timeout=-1), ConfigurationError, _API_KEY),
+    "io-backend-env-timeout": (
+        {"CACHEKIT_TIMEOUT": "-1"},
+        lambda: CachekitIOBackend(api_key=_API_KEY),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "io-backend-url": (
+        {},
+        lambda: CachekitIOBackend(api_key=_API_KEY, api_url="https://example.com"),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "io-backend-bad-token": ({}, lambda: CachekitIOBackend(api_key=_API_KEY + "\n"), ConfigurationError, _API_KEY),
+    "io-backend-with-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY).with_timeout(-1), ConfigurationError, _API_KEY),
+    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), TypeError, _API_KEY),
+    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), TypeError, _API_KEY),
+    "io-intent-env-timeout": (
+        {"CACHEKIT_TIMEOUT": "-1"},
+        lambda: cache.io(api_key=_API_KEY)(_cached),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "secure-intent-ttl": ({}, lambda: cache.secure(master_key=_KEY_HEX, ttl=-5)(_cached), ValueError, _KEY_HEX),
+    "secure-intent-env-size": (
+        {"CACHEKIT_MAX_VALUE_SIZE": "-1"},
+        lambda: cache.secure(master_key=_KEY_HEX)(_cached),
+        ValidationError,
+        _KEY_HEX,
+    ),
+    "secure-intent-env-fail-closed": (
+        {"CACHEKIT_ENCRYPTION_FAIL_CLOSED": "notbool"},
+        lambda: cache.secure(master_key=_KEY_HEX)(_cached),
+        ValidationError,
+        _KEY_HEX,
+    ),
+    "bare-encryption-no-tenant": (
+        {},
+        lambda: cache(encryption=True, master_key=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "bare-encryption-env-size": (
+        {"CACHEKIT_MAX_VALUE_SIZE": "-1"},
+        lambda: cache(encryption=True, single_tenant_mode=True, master_key=_KEY_HEX)(_cached),
+        ValidationError,
+        _KEY_HEX,
+    ),
+    "handler-env-fail-closed": (
+        {"CACHEKIT_ENCRYPTION_FAIL_CLOSED": "notbool"},
+        lambda: CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=_KEY_HEX),
+        ValidationError,
+        _KEY_HEX,
+    ),
+    "wrapper-env-size": (
+        {"CACHEKIT_MAX_VALUE_SIZE": "-1"},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)),
+        ValidationError,
+        _KEY_HEX,
+    ),
+    "wrapper-short-previous": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX), previous_master_keys=[b"\x01" * 16]),
+        KeyringConfigurationError,
+        _KEY_HEX,
+    ),
+    "wrapper-invalid-later-previous": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX), previous_master_keys=[b"\x01" * 32, None]),  # type: ignore[list-item]
+        TypeError,
+        b"\x01" * 32,
+    ),
+    "wrapper-str-key": ({}, lambda: EncryptionWrapper(master_key=_KEY_HEX), TypeError, _KEY_HEX),  # type: ignore[arg-type]
+    "redis-backend-env-pool": (
+        {"CACHEKIT_CONNECTION_POOL_SIZE": "notint"},
+        lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@localhost:6379/0"),
+        ValidationError,
+        _REDIS_PASSWORD,
+    ),
+    "redis-backend-bad-port": (
+        {},
+        lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@localhost:notaport/0"),
+        ValueError,
+        _REDIS_PASSWORD,
+    ),
+    "redis-backend-bad-scheme": (
+        {},
+        lambda: RedisBackend(redis_url=f"bogus://:{_REDIS_PASSWORD}@localhost:6379/0"),
+        ValueError,
+        _REDIS_PASSWORD,
+    ),
+    "redis-backend-bad-ipv6": (
+        {},
+        lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@[::1/0"),
+        ValueError,
+        _REDIS_PASSWORD,
+    ),
+    "secure-config-ttl": ({}, lambda: DecoratorConfig.secure(master_key=_KEY_HEX, ttl=-5), ValueError, _KEY_HEX),
+    "secure-intent-env-key-ttl": (
+        {"CACHEKIT_MASTER_KEY": _KEY_HEX},
+        lambda: cache.secure(ttl=-5)(_cached),
+        ValueError,
+        _KEY_HEX,
+    ),
+    "bare-no-intent": ({}, lambda: cache(master_key=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "handler-no-intent": ({}, lambda: CacheSerializationHandler(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "production-no-intent": (
+        {},
+        lambda: cache.production(encryption=EncryptionConfig(master_key=_KEY_HEX))(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "wrapper-env-key-short-previous": (
+        {"CACHEKIT_MASTER_KEY": _KEY_HEX},
+        lambda: EncryptionWrapper(previous_master_keys=[b"\x01" * 16]),
+        KeyringConfigurationError,
+        _KEY_HEX,
+    ),
+    "handler-lazy-wrapper": ({}, _lazy_wrapper_build, ValidationError, _KEY_HEX),
+    "secure-intent-l1-only": (
+        {},
+        lambda: cache.secure(master_key=_KEY_HEX, backend=None)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "wrapper-env-previous-is-current": (
+        {"CACHEKIT_PREVIOUS_MASTER_KEYS": _KEY_HEX},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)),
+        KeyringConfigurationError,
+        _KEY_HEX,
+    ),
+    "secure-intent-short-key": (
+        {},
+        lambda: cache.secure(master_key=_SHORT_KEY_HEX)(_cached),
+        ConfigurationError,
+        _SHORT_KEY_HEX,
+    ),
+    "secure-intent-non-hex-key": ({}, lambda: cache.secure(master_key="zz" * 32)(_cached), ConfigurationError, "zz" * 32),
+    "bare-encryption-short-key": (
+        {},
+        lambda: cache(encryption=True, single_tenant_mode=True, master_key=_SHORT_KEY_HEX)(_cached),
+        ConfigurationError,
+        _SHORT_KEY_HEX,
+    ),
+    "validate-env-short-key": (
+        {"CACHEKIT_MASTER_KEY": _SHORT_KEY_HEX},
+        lambda: validate_encryption_config(True),
+        ConfigurationError,
+        _SHORT_KEY_HEX,
+    ),
+}
+
+
+@pytest.mark.unit
+class TestEntryPointFrameLocals:
+    """No cachekit frame on an error raised from a public entry point holds a secret it was passed or read
+    from the environment (CWE-532): not the raw value, not inside a dict or list, not as bytes."""
+
+    @pytest.mark.parametrize(("env", "call", "raised", "secret"), _ENTRY_POINT_ROWS.values(), ids=_ENTRY_POINT_ROWS.keys())
+    def test_raised_error_leaves_no_frame_local(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env: dict[str, str],
+        call: Callable[[], object],
+        raised: type[BaseException],
+        secret: str | bytes,
+    ) -> None:
+        for name in ("CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS", "CACHEKIT_API_KEY", "CACHEKIT_MAX_VALUE_SIZE"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        singleton.reset_settings()
+
+        with pytest.raises(raised) as exc_info:
+            call()
+
+        assert _cachekit_locals_holding(exc_info.value, secret) == []

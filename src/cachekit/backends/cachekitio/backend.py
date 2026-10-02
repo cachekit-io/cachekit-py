@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
 import httpx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from cachekit.backends.cachekitio.client import get_cached_async_http_client, lease_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.redis.provider import _await_uninterrupted
-from cachekit.config.validation import ConfigurationError
+from cachekit.config.validation import ConfigurationError, hide_secret
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
@@ -210,7 +210,7 @@ class CachekitIOBackend:
     def __init__(
         self,
         api_url: str | None = None,
-        api_key: str | None = None,
+        api_key: str | SecretStr | None = None,
         timeout: float | None = None,
     ) -> None:
         """Initialize cachekit.io backend.
@@ -228,6 +228,7 @@ class CachekitIOBackend:
             ConfigurationError: missing or empty API key, one that is not an RFC 6750 bearer token, or an API URL that fails
                 validation (credentials in the URL, non-HTTPS, private address, host not in the allowlist).
         """
+        api_key = hide_secret(api_key)  # the config takes it wrapped; no local here holds it raw (CWE-532)
         overrides: dict[str, Any] = {"api_url": api_url, "api_key": api_key, "timeout": timeout}
         errors = None
         try:
@@ -880,6 +881,6 @@ class CachekitIOBackend:
         """
         return CachekitIOBackend(
             api_url=self._config.api_url,
-            api_key=self._config.api_key.get_secret_value(),
+            api_key=self._config.api_key,
             timeout=timeout,
         )
