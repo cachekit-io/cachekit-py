@@ -67,8 +67,9 @@ end
 return members
 """
 
-# The invalidation listener's connection PINGs after this many idle seconds, so a half-open
-# socket is found within about that long instead of never.
+# The invalidation listener's connection PINGs after this many idle seconds, which keeps idle-timeout
+# proxies and NAT gateways from dropping it. redis-py does not wait for the reply, so a connection
+# that dies silently is still found only when TCP gives up on it.
 _LISTENER_HEALTH_CHECK_SECONDS = 10
 
 # No with_timeout() window is open on the backend.
@@ -704,9 +705,9 @@ class PerRequestRedisBackend:
         The clone keeps the configured ``socket_timeout`` even inside a ``with_timeout()`` window.
 
         The listener holds its one connection for the life of the process, so the connection PINGs
-        when idle and finds a half-open socket within about 10 s, and a TCP or TLS connection also
-        sets TCP keepalive (a Unix socket takes no keepalive option). Replies stay bytes, whatever
-        the backend's client decodes: events are MessagePack.
+        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive (a Unix socket takes
+        no keepalive option): idle-timeout proxies keep it. Replies stay bytes, whatever the backend's
+        client decodes: events are MessagePack.
 
         Examples:
             >>> import redis
