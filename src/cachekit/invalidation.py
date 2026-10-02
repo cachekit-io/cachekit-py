@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import threading
 import time
 import weakref
@@ -48,6 +49,8 @@ _MAX_EVENT_BYTES = 4096
 # A listener that failed to start is retried by a cache operation this much later, not by every
 # one: during an outage each attempt can wait out a connect timeout.
 _START_RETRY_SECONDS = 60.0
+# How long a start waits for Redis to confirm the subscription.
+_SUBSCRIBE_CONFIRM_SECONDS = 5.0
 
 # uWSGI options under which a worker runs Python's at-fork hooks, or imports the app after the fork.
 _UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
@@ -257,6 +260,7 @@ def start_listener(backend: Any) -> None:
         try:
             pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
             pubsub.subscribe(**{CHANNEL: _on_message})
+            _confirm_subscription(pubsub)
             thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
         except Exception as e:
             if pubsub is not None:
@@ -280,6 +284,15 @@ def start_listener(backend: Any) -> None:
     logger.info("Invalidation listener started: pid=%d channel=%s", os.getpid(), CHANNEL)
 
 
+def _confirm_subscription(pubsub: Any) -> None:
+    """Wait for Redis to confirm the SUBSCRIBE. redis-py only sends it, so a subscription Redis refuses
+    (an ACL without the channel, the Redis 7 default for a new user) would otherwise surface later,
+    in the worker thread, with this process believing it listens."""
+    reply = pubsub.get_message(timeout=_SUBSCRIBE_CONFIRM_SECONDS)  # raises on a refusal (NoPermissionError)
+    if reply is None or reply.get("type") != "subscribe":
+        raise redis.ConnectionError("Redis did not confirm the subscription")
+
+
 def _on_message(message: dict[str, Any]) -> None:
     """Handle one event in the listener thread. Never raises: a bad event is dropped and the
     listener keeps running. Never logs the registry id or key: a forged event carries the sender's
@@ -297,10 +310,33 @@ def _on_message(message: dict[str, Any]) -> None:
 
 
 def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
-    """Called by redis-py's worker thread instead of dying. Its next read reconnects; wait a second
-    first so a Redis that is down is not spun on. Events published meanwhile are lost."""
+    """Called by redis-py's worker thread instead of dying. Events published meanwhile are lost.
+
+    A connection error: the thread's next read reconnects and re-subscribes, after a second's wait so
+    a Redis that is down is not spun on. A command Redis refused, above all a re-subscription an ACL
+    now denies: redis-py would send it again only on its next reconnect, so the listener is retired,
+    and a cache operation starts a new one, which confirms its subscription, _START_RETRY_SECONDS later.
+    """
+    if isinstance(error, redis.ResponseError):
+        _retire(thread)
+        logger.warning(
+            "Invalidation listener stopped: Redis refused it; a cache operation retries in %d s: %s",
+            _START_RETRY_SECONDS,
+            redact_error_for_log(error),
+        )
+        return
     logger.warning("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
     time.sleep(1.0)
+
+
+def _retire(thread: Any) -> None:
+    """Stop ``thread``'s loop and, if it is this process's listener, forget it so a cache operation
+    can start another after the retry window."""
+    global _listener, _listener_pid, _start_retry_at
+    thread.stop()
+    if _listener is not None and _listener[1] is thread:
+        _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
+        _listener, _listener_pid = None, None
 
 
 def _stop_listener() -> None:
@@ -319,14 +355,12 @@ def _warn_if_uwsgi_skips_fork_hooks() -> None:
     uWSGI forks its workers from C and runs no Python at-fork hook unless told to, so a worker
     keeps its master's L1 entries and runs no invalidation listener. Called once, at import, which
     is in the master before any worker exists: a worker forked without hooks must not log at all.
+    uWSGI registers its ``uwsgi`` module before it imports the app, so this looks it up rather than
+    importing it: an import outside uWSGI would run any ``uwsgi.py`` on ``sys.path``.
     """
     if l1_cache._forked_without_hooks():
         return
-    try:
-        import uwsgi  # type: ignore[import-not-found]  # importable only inside a uWSGI process
-    except ImportError:
-        return
-    options = getattr(uwsgi, "opt", None)
+    options = getattr(sys.modules.get("uwsgi"), "opt", None)
     if not isinstance(options, dict) or any(name in options for name in _UWSGI_FORK_OPTIONS):
         return
     logger.warning(

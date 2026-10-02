@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -72,8 +73,10 @@ return members
 # that dies silently is still found only when TCP gives up on it.
 _LISTENER_HEALTH_CHECK_SECONDS = 10
 
-# No with_timeout() window is open on the backend.
-_NO_WINDOW = object()
+# Pool -> (the socket_timeout it had before its outermost open with_timeout() window, that window's
+# token), so listener_pool() clones the configured value, never a window's, whichever backend object
+# opened the window on the shared pool. Weak: pools come and go with their clients.
+_open_windows: weakref.WeakKeyDictionary[Any, tuple[Any, object]] = weakref.WeakKeyDictionary()
 
 
 async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
@@ -228,10 +231,6 @@ class PerRequestRedisBackend:
 
         # Registered on first drain. Per instance, not module-global: a Script holds its client.
         self._drain_script: Optional[Script] = None
-
-        # The socket_timeout an open with_timeout() window displaced from the shared pool, so
-        # listener_pool() clones the configured value, never the window's.
-        self._displaced_socket_timeout: Any = _NO_WINDOW
 
     @property
     def key_prefix(self) -> str:
@@ -722,13 +721,14 @@ class PerRequestRedisBackend:
             (True, 10)
         """
         source = self._client.connection_pool
+        window = _open_windows.get(source)  # first: a closing window restores the kwargs before it leaves
         kwargs = {
             **source.connection_kwargs,
             "health_check_interval": _LISTENER_HEALTH_CHECK_SECONDS,
             "decode_responses": False,
         }
-        if self._displaced_socket_timeout is not _NO_WINDOW:
-            kwargs["socket_timeout"] = self._displaced_socket_timeout
+        if window is not None:
+            kwargs["socket_timeout"] = window[0]
         if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
             kwargs["socket_keepalive"] = True
         return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
@@ -755,9 +755,8 @@ class PerRequestRedisBackend:
         # This is a best-effort implementation (coarser-grained)
         original_timeout = self._client.connection_pool.connection_kwargs.get("socket_timeout")
         timeout_sec = timeout_ms / 1000.0
-        outermost = self._displaced_socket_timeout is _NO_WINDOW
-        if outermost:
-            self._displaced_socket_timeout = original_timeout
+        pool, token = self._client.connection_pool, object()
+        outermost = _open_windows.setdefault(pool, (original_timeout, token))[1] is token
 
         try:
             # Set socket timeout
@@ -772,7 +771,7 @@ class PerRequestRedisBackend:
             else:
                 self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
             if outermost:
-                self._displaced_socket_timeout = _NO_WINDOW
+                _open_windows.pop(pool, None)
 
 
 class RedisBackendProvider:

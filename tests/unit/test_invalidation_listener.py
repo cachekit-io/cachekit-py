@@ -500,6 +500,52 @@ class TestListenerStart:
         assert "Invalidation listener check failed: ValueError" in caplog.text
 
 
+class _FakeWorker:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        pass
+
+
+@pytest.mark.unit
+class TestListenerErrors:
+    """What the worker thread's exception handler does with each kind of failure."""
+
+    def test_a_refused_command_retires_the_listener_for_a_later_restart(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        worker = _FakeWorker()
+        monkeypatch.setattr(invalidation, "_listener", (object(), worker))
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._on_listener_error(redis.exceptions.NoPermissionError("NOPERM no channel"), None, worker)
+        assert worker.stopped and invalidation._listener is None and invalidation._listener_pid is None
+        assert invalidation._start_retry_at > time.monotonic() + 50  # a cache operation restarts it later
+        assert "Invalidation listener stopped" in caplog.text and "NOPERM" not in caplog.text
+
+    def test_a_connection_error_keeps_the_listener_and_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worker, slept = _FakeWorker(), []
+        listener = (object(), worker)
+        monkeypatch.setattr(invalidation, "_listener", listener)
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
+        monkeypatch.setattr(invalidation.time, "sleep", slept.append)
+        invalidation._on_listener_error(redis.ConnectionError("lost"), None, worker)
+        assert slept == [1.0] and not worker.stopped
+        assert invalidation._listener is listener and invalidation._listener_pid == os.getpid()
+
+    def test_a_retired_thread_never_forgets_a_newer_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        old, new = _FakeWorker(), _FakeWorker()
+        current = (object(), new)
+        monkeypatch.setattr(invalidation, "_listener", current)
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
+        invalidation._on_listener_error(redis.exceptions.ResponseError("ERR"), None, old)
+        assert old.stopped and invalidation._listener is current and invalidation._listener_pid == os.getpid()
+
+
 def _hold(lock: threading.Lock, held: threading.Event, release: threading.Event) -> None:
     with lock:
         held.set()
@@ -592,6 +638,14 @@ class TestListenerPool:
         assert backend.listener_pool().connection_kwargs["socket_timeout"] == configured
         assert backend._client.connection_pool.connection_kwargs["socket_timeout"] == configured
 
+    async def test_window_opened_through_another_backend_on_the_same_pool(self) -> None:
+        """RedisBackendProvider hands out a new backend object per call over one shared pool."""
+        client = redis.Redis(connection_pool=create_connection_pool("redis://cache.example:6379/0"))
+        shared, per_request = PerRequestRedisBackend(client, "default"), PerRequestRedisBackend(client, "tenant-a")
+        configured = client.connection_pool.connection_kwargs["socket_timeout"]
+        async with per_request.with_timeout("get", 50):
+            assert shared.listener_pool().connection_kwargs["socket_timeout"] == configured
+
 
 @pytest.mark.unit
 class TestUwsgiWarning:
@@ -634,6 +688,16 @@ class TestUwsgiWarning:
             sys.modules["uwsgi"] = types.ModuleType("uwsgi")  # importable, but no opt: not uWSGI
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         assert caplog.records == []
+
+    def test_a_uwsgi_module_on_the_path_is_never_imported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "uwsgi.py").write_text("raise RuntimeError('imported a project file named uwsgi.py')\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.delitem(sys.modules, "uwsgi", raising=False)
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()  # outside uWSGI: no import, no raise
+        assert "uwsgi" not in sys.modules and caplog.records == []
 
     @pytest.mark.parametrize(("opt", "expected"), [("{}", 1), ("{'py-call-osafterfork': True}", 0)])
     def test_import_warns_once(self, opt: str, expected: int) -> None:
