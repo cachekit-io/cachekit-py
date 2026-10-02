@@ -17,18 +17,19 @@ class User(BaseModel):
     name: str
     email: str
 
-# WRONG - Raises TypeError
+# WRONG - never cached: runs on every call
 @cache
 def get_user(user_id: int) -> User:
-    return fetch_user_from_db(user_id)  # Raises: User is not serializable
+    return fetch_user_from_db(user_id)
 ```
+
+Nothing raises. The default serializer cannot encode a Pydantic model, so each call returns the model, stores nothing, and logs an ERROR and a WARNING. See [Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors). Only interop mode raises, with `InteropError`. L1-only (`backend=None`) differs: it stores the model object itself, so the model is cached, by reference, until you add a backend ([L1-Only Mode → Upgrade Path](../backends/none.md#upgrade-path)).
 
 **Why we don't auto-detect Pydantic models:**
 
 1. **Explicit is better than implicit** - Converting models to dicts without your knowledge is surprising
 2. **Loss of fidelity** - `model.model_dump()` discards validators, computed fields, and methods
 3. **Scope creep prevention** - Auto-detection for Pydantic opens the door to SQLAlchemy, dataclasses, ORMs, etc.
-4. **Clear error messages** - The error tells you exactly what's wrong and how to fix it
 
 ## Recommended: Cache the Data, Not the Model
 
@@ -59,45 +60,41 @@ print(data["name"])  # Works fine
 - Explicit about what's being cached
 - No validators/methods to lose
 - Best performance (dict is optimal for MessagePack)
-- Works with any serializer (Default, OrJSON, Arrow)
+- Works with the default, `orjson` and `auto` serializers
 
-## Alternative: Use StandardSerializer for Full Model Instances
+## Alternative: Rebuild the Model After the Cache
 
-If you need the cached object to be a full Pydantic model instance with all methods:
+If callers need a model instance with its methods, cache the dict and rebuild the model outside the cached function:
 
-```python notest
+```python
+import tempfile
+from pathlib import Path
+
 from pydantic import BaseModel
 from cachekit import cache
-from cachekit.serializers import StandardSerializer
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
 
 class User(BaseModel):
     id: int
     name: str
-    email: str
 
     def is_admin(self) -> bool:
-        return self.id < 10  # Example computed property
+        return self.id < 10
 
-# Cache the model data (note: methods not preserved, only data)
-@cache(serializer=StandardSerializer(), ttl=3600, backend=None)
+@cache(backend=FileBackend(FileBackendConfig(cache_dir=Path(tempfile.mkdtemp()))), ttl=3600)
+def get_user_data(user_id: int) -> dict:
+    return User(id=user_id, name="Alice").model_dump()  # cache the data
+
 def get_user(user_id: int) -> User:
-    return fetch_user_from_db(user_id)  # illustrative - not defined
+    return User.model_validate(get_user_data(user_id))  # rebuild on every call
 
-# Usage
-user = get_user(123)  # Returns: User(id=123, name="Alice", email="alice@example.com")
-print(user.is_admin())  # Works - model reconstructed with methods
+get_user(1)
+user = get_user(1)  # served from the cache, rebuilt as a model
+assert isinstance(user, User) and user.is_admin()
 ```
 
-**Trade-offs:**
-- ✅ Secure MessagePack serialization
-- ✅ Portable across Python versions
-- ✅ Pydantic models reconstructed correctly with all methods
-- ❌ Larger serialized size
-
-**When to use this approach:**
-- You need model methods after deserialization
-- You trust the cache source (internal Redis, not user-controlled)
-- You're comfortable with Python-only serialization
+`model_validate` runs validation on every call, hit or miss. That is the price of getting a model back from a backend that stores bytes.
 
 ## Advanced: Custom PydanticSerializer
 
