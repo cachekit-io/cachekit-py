@@ -21,7 +21,7 @@ def classify_http_error(
     """Classify HTTP exception into BackendError with error_type.
 
     Maps HTTP status codes and network exceptions to BackendErrorType
-    categories for circuit breaker and retry logic.
+    categories for the circuit breaker. Each request is sent once; nothing retries it.
 
     Args:
         exc: Original exception
@@ -33,13 +33,13 @@ def classify_http_error(
         BackendError with appropriate error_type classification
 
     Classification rules:
-        - HTTP 401/403: AUTHENTICATION (alert ops, don't retry)
-        - HTTP 429: TRANSIENT (rate limit, exponential backoff)
+        - HTTP 401/403: AUTHENTICATION (alert ops)
+        - HTTP 429: TRANSIENT (rate limit)
         - HTTP 413: PERMANENT (value too large — retrying never helps)
-        - HTTP 5xx: TRANSIENT (server error, retry)
-        - HTTP 4xx: PERMANENT (client error, don't retry)
-        - TimeoutException: TIMEOUT (configurable retry)
-        - ConnectError: TRANSIENT (network issue, retry)
+        - HTTP 5xx: TRANSIENT (server error)
+        - HTTP 4xx: PERMANENT (client error)
+        - TimeoutException: TIMEOUT (request exceeded time limit)
+        - ConnectError: TRANSIENT (network issue)
         - All others: UNKNOWN (log and investigate)
     """
     # HTTP status code classification
@@ -56,7 +56,7 @@ def classify_http_error(
                 key=key,
             )
 
-        # TRANSIENT: Rate limiting (exponential backoff)
+        # TRANSIENT: Rate limiting
         if status == 429:
             return BackendError(
                 "Rate limit exceeded",
@@ -66,7 +66,7 @@ def classify_http_error(
                 key=key,
             )
 
-        # TRANSIENT: Server errors (retry with backoff)
+        # TRANSIENT: Server errors
         if 500 <= status < 600:
             return BackendError(
                 f"Server error: HTTP {status}",
@@ -89,7 +89,7 @@ def classify_http_error(
                 key=key,
             )
 
-        # PERMANENT: Client errors (don't retry)
+        # PERMANENT: Client errors
         if 400 <= status < 500:
             return BackendError(
                 f"Client error: HTTP {status}",
@@ -112,7 +112,7 @@ def classify_http_error(
             key=key,
         )
 
-    # TRANSIENT: Connection failures (retry). Type-only message — httpx text can echo
+    # TRANSIENT: Connection failures. Type-only message — httpx text can echo
     # the request URL (raw key in path), and str(e) reaches log sinks (CWE-532).
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
         return BackendError(

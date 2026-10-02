@@ -1,7 +1,7 @@
 """Reliability components for backend cache operations.
 
 Provides async metrics collection, health checks, circuit breakers,
-and reliability profiles.
+error classification and backpressure control.
 """
 
 from .async_metrics import AsyncMetricsCollector, get_async_metrics_collector
@@ -13,12 +13,6 @@ from .circuit_breaker import (
 )
 from .error_classification import BackendErrorClassifier
 from .load_control import BackpressureController
-from .profiles import (
-    ProfileConfig,
-    ReliabilityProfile,
-    get_profile_config,
-    recommend_profile,
-)
 
 __all__ = [
     "AsyncMetricsCollector",
@@ -28,9 +22,5 @@ __all__ = [
     "CircuitBreaker",
     "CircuitBreakerConfig",
     "CircuitState",
-    "ProfileConfig",
-    "ReliabilityProfile",
     "get_async_metrics_collector",
-    "get_profile_config",
-    "recommend_profile",
 ]

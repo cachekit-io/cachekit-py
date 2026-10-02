@@ -410,26 +410,19 @@ class TestDelete:
         call_args = mock_sync_client.request.call_args
         assert call_args[0][0] == "DELETE"
 
-    def test_delete_404_returns_false(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
-        """404 on DELETE returns False (key didn't exist)."""
-        exc_404 = _make_status_error(404)
-        backend_error = BackendError(
-            "Client error: HTTP 404",
-            error_type=BackendErrorType.PERMANENT,
-            original_exception=exc_404,
-        )
-        real_response = _make_response(404)
+    def test_delete_404_raises(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
+        """The server answers DELETE with 200 whether or not the key existed, so a 404 is not a miss."""
+        mock_sync_client.request.return_value = _make_response(404)
+        with pytest.raises(BackendError) as exc_info:
+            backend.delete("missing-key")
+        assert exc_info.value.error_type == BackendErrorType.PERMANENT
 
-        def side_effect_raise(*args: Any, **kwargs: Any) -> httpx.Response:
-            return real_response
-
-        mock_sync_client.request.side_effect = side_effect_raise
-
-        with patch("cachekit.backends.cachekitio.backend.classify_http_error", return_value=backend_error):
-            with patch.object(real_response, "raise_for_status", side_effect=exc_404):
-                result = backend.delete("missing-key")
-
-        assert result is False
+    async def test_delete_async_404_raises(self, backend: CachekitIOBackend) -> None:
+        """Async twin of test_delete_404_raises."""
+        backend._async_lease.client.request = AsyncMock(return_value=_make_response(404))
+        with pytest.raises(BackendError) as exc_info:
+            await backend.delete_async("missing-key")
+        assert exc_info.value.error_type == BackendErrorType.PERMANENT
 
     def test_delete_server_error_reraises(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
         """Non-404 BackendError from DELETE propagates."""
@@ -663,13 +656,12 @@ _MISS_CALLS = [
     ("get", None),
     ("get_with_freshness", None),
     ("exists", False),
-    ("delete", False),
 ]
 
 
 @pytest.mark.unit
 class TestMissWithoutException:
-    """A 404 on a key read, exists or delete returns the miss without raising (LAB-7066).
+    """A 404 on a key read or exists returns the miss without raising (LAB-7066).
 
     The miss path must never build HTTPStatusError or a BackendError: that round-trip
     is pure CPU on every cache miss.

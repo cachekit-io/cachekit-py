@@ -73,7 +73,8 @@ below are the **actual** series names — none carry a `cachekit_` prefix.
 > The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
 > preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` is the value
 > recorded when the emitting call site passes no serializer (an instrumentation gap, not a
-> tier).
+> tier). Only failure records (`success="False"`) can carry `unknown`: every success record
+> names its tier.
 
 ### Counters (always increasing)
 

@@ -1234,7 +1234,8 @@ def create_cache_wrapper(
         # Standard key generation with type-aware handling
         if _generated_key_mode:
             return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-        # Interop mode takes priority (mutually exclusive with key= and fast_mode)
+        # Interop: decoration rejects it together with key= or fast_mode, so it never
+        # competes with the branches below
         if interop is not None:
             return _interop_cache_key(call_args, call_kwargs)
         # Custom key function (escape hatch for complex types)
@@ -1243,7 +1244,8 @@ def create_cache_wrapper(
             if not isinstance(custom_key, str):
                 raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
             return f"{namespace or 'default'}:{custom_key}"
-        # fast_mode: minimal key generation - no string formatting overhead (10-50μs savings)
+        # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
+        # Minimal key generation - no string formatting overhead (10-50μs savings)
         from ..hash_utils import cache_key_hash
 
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
