@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): exceptions raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): exceptions raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
 - Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
@@ -371,12 +371,10 @@ The errors cachekit raises or logs, with whether each reaches your code, are in 
 <details>
 <summary><strong>Cache Invalidation</strong></summary>
 
-**Clear entire cache**:
-```bash
-redis-cli FLUSHDB
-```
+**One entry or one function**: call the decorated function's invalidation method. With
+arguments it derives the key the call used, including a custom `key=`, and deletes it from
+L1 and L2:
 
-**Clear by namespace** (if implemented):
 ```python notest
 from cachekit import cache
 
@@ -384,34 +382,18 @@ from cachekit import cache
 def get_user(user_id):
     return fetch_user(user_id)
 
-# Manual invalidation
-# Note: Current cachekit doesn't provide built-in invalidation
-# Clear Redis and re-cache on next call
-```
-
-```bash
-redis-cli FLUSHDB
-```
-
-**Per-function cache clearing** (workaround):
-```python notest
-from cachekit import cache
-import redis
-
-r = redis.from_url("redis://localhost:6379/0")
-
-def invalidate_user_cache(user_id):
-    key = f"users:get_user:{user_id}"
-    r.delete(key)
-
-@cache(namespace="users")
-def get_user(user_id):
-    return fetch_user(user_id)
-
-# Invalidate when user data changes
 user = update_user(user_id, data)
-invalidate_user_cache(user_id)
+get_user.invalidate_cache(user_id)  # an async function: await get_user.ainvalidate_cache(user_id)
+
+get_user.invalidate_cache()  # every get_user entry
 ```
+
+How far the no-argument form reaches depends on the backend: see
+[Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation).
+
+**By prefix**: run the `scan_iter` + `unlink` script under *Option 3: Data corruption* in
+[Decryption failed](error-codes.md#decryption-failed---authentication-tag-mismatch).
+Flush the database (`redis-cli FLUSHDB`) only if it is dedicated to cachekit.
 
 </details>
 

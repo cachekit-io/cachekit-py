@@ -267,23 +267,13 @@ For large caches, choose between lazy migration and eager eviction based on your
 workload: lazy migration spreads recomputation over reads (each legacy entry pays one
 recompute on first access), while an eager flush concentrates it into a cold-start miss
 wave — throttle or batch the eviction if the recompute cost is high. Either way, scope
-eviction to cachekit's keys so unrelated data in the same Redis database survives:
-
-```bash
-# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
-# (an int or UUID tenant as its str() first):
-# tenant org:123 is stored as t:org%3A123:...
-# Evict only this function's or namespace's cachekit entries.
-# Namespaced function (@cache.secure(namespace="users", ...)):
-redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
-# No namespace (the default): keys start with func:<module>.<qualname>
-redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
-
-# FLUSHDB is only safe when the database is dedicated to cachekit
-# then deploy the encrypting decorator (@cache.secure or an explicit encryption= option),
-# with CACHEKIT_MASTER_KEY set if it supplies the key
-```
+eviction to cachekit's keys so unrelated data in the same Redis database survives: run the
+`scan_iter` + `unlink` script under *Option 3: Data corruption* in
+[Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch), once per
+namespace or function, and evict functions with a custom `key=` as it describes.
+`FLUSHDB` is only safe when the database is dedicated to cachekit. Then deploy the encrypting
+decorator (`@cache.secure` or an explicit `encryption=` option), with `CACHEKIT_MASTER_KEY` set
+if it supplies the key.
 
 ### L1 Cache Conflict
 ```python notest

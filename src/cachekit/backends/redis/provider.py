@@ -216,7 +216,6 @@ class PerRequestRedisBackend:
 
         # Fix #2: URL-encode tenant ID to prevent ':' collision
         self._tenant_id = _encode_tenant(tenant_id)
-        self._original_tenant_id = tenant_id
         self._follow_context = follow_context
 
         # Registered on first drain. Per instance, not module-global: a Script holds its client.

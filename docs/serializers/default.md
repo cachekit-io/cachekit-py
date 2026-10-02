@@ -54,6 +54,8 @@ StandardSerializer can be referenced by alias when configuring serializers:
 
 ## Type Support Matrix
 
+❌ means `serialize()` raises `TypeError` when you call the serializer directly. A `@cache`-decorated call with a backend does not raise: it returns the value, caches nothing, and logs the failure ([Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors)).
+
 | Type | Supported | Notes |
 |------|-----------|-------|
 | `dict` | ✅ | Nested structures |
@@ -66,12 +68,12 @@ StandardSerializer can be referenced by alias when configuring serializers:
 | `None` | ✅ | |
 | `bytes` | ✅ | Binary data — only serializer that handles raw bytes |
 | `datetime` | ✅ | Via MessagePack extension |
-| `numpy.ndarray` | ❌ | Raises `TypeError`; use [AutoSerializer](./auto.md) (`serializer="auto"`) |
-| `pandas.DataFrame` | ❌ | Raises `TypeError`; use [ArrowSerializer](./arrow.md) or [AutoSerializer](./auto.md) |
-| `pandas.Series` | ❌ | Raises `TypeError`; use [AutoSerializer](./auto.md) |
+| `numpy.ndarray` | ❌ | Use [AutoSerializer](./auto.md) (`serializer="auto"`) |
+| `pandas.DataFrame` | ❌ | Use [ArrowSerializer](./arrow.md) or [AutoSerializer](./auto.md) |
+| `pandas.Series` | ❌ | Use [AutoSerializer](./auto.md) |
 | Pydantic models | ❌ | See [Caching Pydantic Models](./pydantic.md) |
 | `set` / `frozenset` | ❌ | Convert to `list` first |
-| Custom classes | ❌ | Implement `__dict__` or use custom serializer |
+| Custom classes | ❌ | Convert to a dict (`dataclasses.asdict`, `model_dump`) or use a [custom serializer](./custom.md) |
 
 ## Compression and Integrity
 
