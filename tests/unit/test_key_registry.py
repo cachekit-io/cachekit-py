@@ -281,7 +281,7 @@ class TestTrackingSites:
         with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
             for i in range(50):
                 assert f(i) == i
-            monkeypatch.setattr(wrapper_module, "_TRACK_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(wrapper_module, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert f(50) == 50
         warnings = [r.getMessage() for r in caplog.records if "Key tracking failed" in r.getMessage()]
         # A registry outage is one WARNING per window, not one per write, and none is lost from the count.
@@ -342,7 +342,7 @@ class TestTrackingSites:
             writer.join(5)
             q.put(not writer.is_alive())
 
-        with _closure_cell(f, "_track_warn_lock").cell_contents:  # a parent writer is mid-claim at fork
+        with _closure_cell(f, "_track_warn").cell_contents._lock:  # a parent writer is mid-claim at fork
             process = ctx.Process(target=child, args=(queue,))
             process.start()
         try:
