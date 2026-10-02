@@ -266,6 +266,8 @@ make build  # Standard build
 ```bash
 make perf               # Full battery: env fingerprint + timer calibration, serializer benchmarks, GIL scaling
 make perf-compare       # Regression gate: fail on >10% median serializer regression vs baseline
+make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind)
+make perf-ir-update     # Ratchet the committed instruction budgets down to the measured figures
 
 make benchmark          # Serializer benchmarks only + save a local baseline
 make benchmark-compare  # Re-run and fail on >10% median regression vs that baseline
@@ -278,6 +280,12 @@ Baselines are written to `.benchmarks/` (gitignored, per-machine), so regression
 comparison is a local developer tool — wall-clock benchmarks deliberately do not gate
 CI. `make perf` first prints a system fingerprint + environment verdict and
 self-calibrates the timer, so numbers come with the context needed to trust them.
+
+`make perf-ir` is the deterministic one: it counts main-thread instructions per call under
+valgrind against budgets committed in `tests/performance/ir_baselines.json`, so a 1% regression
+is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
+different interpreter, extension or C library, record a baseline on `main` first. Method and
+budgets: [docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 
