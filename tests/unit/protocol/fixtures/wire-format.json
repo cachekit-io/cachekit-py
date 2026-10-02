@@ -1,13 +1,140 @@
 {
   "checksum": "xxHash3-64, 8 bytes big-endian, computed on uncompressed input",
   "compression": "LZ4 block format (NOT frame)",
+  "constructed_vectors": [
+    {
+      "name": "envelope_ratio_product_wraps_32_bits",
+      "description": "canonical bin envelope whose compressed_data is 4294968 B = ceil(2^32/1000), the first size at which 1000 * compressed_size overflows unsigned 32 bits. original_size is larger than compressed_size and well inside the 1000:1 bound, so readers MUST accept it and return the constructed input. A reader that computes the product in 32-bit width gets 704 instead (signed or unsigned wrap alike) and rejects it as a ratio bomb; so does one that rejects on 32-bit overflow, and a 32-bit one that skips the product when original_size <= compressed_size. A pointer-width product passes it on a 64-bit host, so a pass there proves nothing about a 32-bit target. spec/wire-format.md#decompression-bomb-detection says which implementations must run it and on which targets.",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 8523079,
+      "compressed_size": 4294968,
+      "envelope_size": 4295001,
+      "checksum_hex": "6d8571f174e2b890",
+      "envelope_construction": [
+        {
+          "hex": "94c600418938ff",
+          "count": 1
+        },
+        {
+          "hex": "ff",
+          "count": 16711
+        },
+        {
+          "hex": "d7c600820d42",
+          "count": 1
+        },
+        {
+          "hex": "00",
+          "count": 4261530
+        },
+        {
+          "hex": "0100",
+          "count": 1
+        },
+        {
+          "hex": "ff",
+          "count": 16711
+        },
+        {
+          "hex": "d7500000000000986dcc8571ccf174cce2ccb8cc90ce00820d47a76d73677061636b",
+          "count": 1
+        }
+      ],
+      "input_construction": [
+        {
+          "hex": "c600820d42",
+          "count": 1
+        },
+        {
+          "hex": "00",
+          "count": 8523074
+        }
+      ]
+    }
+  ],
+  "construction_note": "constructed_vectors are too large to pin as hex. To build envelope or input bytes, repeat each segment's hex `count` times and concatenate the segments in order (the same list form as interop-v2.json). Readers MUST decode the constructed envelope to the constructed input.",
   "envelope_format": "MessagePack positional array (rmp_serde::to_vec): [compressed_data, checksum, original_size, format]. Vectors without an 'envelope_encoding' field use the legacy array-of-integers encoding for compressed_data and are retained forever as legacy-read proof; their '*_bin' twins use msgpack bin (canonical for protocol 1.1+ writers). checksum always encodes as an array of 8 integers. Normative rules: spec/wire-format.md, 'Byte Layout' / 'Encoding compatibility'.",
-  "generator": "six original legacy vectors: cachekit-core v0.2.0; width_boundary_bin16 legacy vector: cachekit-core v0.5.0 real writer; *_bin vectors: tools/wire-format-reference.py generate - deterministic re-encode of the legacy fields, byte-verified against rmp-serde 1.3.1 + serde_bytes 0.11.19 output (LAB-783)",
+  "generator": "six original legacy vectors: cachekit-core v0.2.0; width_boundary_bin16 legacy vector: cachekit-core v0.5.0 real writer; *_bin vectors: tools/wire-format-reference.py generate - deterministic re-encode of the legacy fields, byte-verified against rmp-serde 1.3.1 + serde_bytes 0.11.19 output (LAB-783); constructed_vectors: tools/wire-format-reference.py generate - stdlib construction, checksum by xxhash 4.0.1 (xxHash 0.8.3); reject_vectors: tools/wire-format-reference.py generate - canonical bin re-encode of legacy base fields with one check broken",
   "limits": {
     "max_compressed_size": 536870912,
     "max_compression_ratio": 1000,
     "max_uncompressed_size": 536870912
   },
+  "reject_vectors": [
+    {
+      "name": "reject_original_size_over_cap",
+      "description": "original_size 536870913 B, one byte over the 512 MiB max_uncompressed_size, with a 1000 B compressed_data that is not a valid LZ4 block (a literal-length extension that never ends). Readers MUST reject it. An SDK test asserts the size-cap error, and that the read's allocation high-water stayed below original_size (spec/wire-format.md#reject-vectors). The reference reader rejects it at Retrieve Flow step 4. A reader without step 4 rejects it at step 5, by the ratio bound. One that decompresses first with a strict decoder and lets its error propagate never raises the size-cap error, and one that allocates an output sized from original_size first fails the allocation bound.",
+      "reject_step": 4,
+      "derived_from": "simple_string",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 536870913,
+      "compressed_size": 1000,
+      "envelope_hex": "94c503e8f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff986dcc8a34ccb63a3c52ccd3ce20000001a76d73677061636b",
+      "envelope_size": 1029
+    },
+    {
+      "name": "reject_original_size_wraps_u32",
+      "description": "simple_string's compressed_data and checksum with original_size 2^32 + 16 = 4294967312 B, encoded as msgpack uint64. Readers MUST reject it before decompression. An SDK test asserts the size-cap error, or a Retrieve Flow step-2 error from a range-checked decode into a narrower type; never a length or checksum error. The reference reader rejects it at step 4. A reader that truncates original_size to its low 32 bits reads 16 and accepts it; one that joins the two 32-bit halves reads 17 and rejects it only with a length error.",
+      "reject_step": 4,
+      "derived_from": "simple_string",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 4294967312,
+      "compressed_size": 18,
+      "envelope_hex": "94c412f00168656c6c6f2c2063616368656b697421986dcc8a34ccb63a3c52ccd3cf0000000100000010a76d73677061636b",
+      "envelope_size": 50
+    },
+    {
+      "name": "reject_zero_length_compressed_data",
+      "description": "empty compressed_data with original_size 0 and the checksum of the empty input. Readers MUST reject it. An SDK test asserts the zero-length error; the ratio bound cannot raise it, because 0 <= 1000 * 0. The reference reader rejects it at Retrieve Flow step 5. A reader without the zero-length check hands an empty block to its LZ4 decoder, which rejects it at step 6 if it refuses an empty block, as liblz4 does, and accepts it if it decodes one to empty output.",
+      "reject_step": 5,
+      "derived_from": "empty",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 0,
+      "compressed_size": 0,
+      "envelope_hex": "94c400982d06cc800538ccd3cc94ccc200a76d73677061636b",
+      "envelope_size": 25
+    },
+    {
+      "name": "reject_ratio_bomb",
+      "description": "original_size 1000001 B = 1000 * 1000 + 1, one byte past the 1000:1 bound, with a 1000 B compressed_data that is not a valid LZ4 block. Readers MUST reject it. An SDK test asserts the ratio error, and that the read's allocation high-water stayed below original_size (spec/wire-format.md#reject-vectors). The reference reader rejects it at Retrieve Flow step 5. A reader without the ratio check, or one that decompresses first with a strict decoder and lets its error propagate, never raises the ratio error, and one that allocates an output sized from original_size first fails the allocation bound.",
+      "reject_step": 5,
+      "derived_from": "simple_string",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 1000001,
+      "compressed_size": 1000,
+      "envelope_hex": "94c503e8f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff986dcc8a34ccb63a3c52ccd3ce000f4241a76d73677061636b",
+      "envelope_size": 1029
+    },
+    {
+      "name": "reject_decompressed_length_mismatch",
+      "description": "simple_string's compressed_data and checksum with original_size 17 B, one more than the 16 B the block decodes to, and inside every size and ratio bound. Readers MUST reject it. An SDK test asserts a length error, at Retrieve Flow step 6 or step 9, and not a checksum error. The reference reader's decoder (tools/wire-format-reference.py) rejects any output length other than original_size, at step 6. A reader whose decoder returns a shorter output without error, as liblz4 does, rejects it at step 9; both conform. A reader with neither check accepts it, because the checksum matches the decoded bytes. A reader that zero-pads the output to original_size fails the checksum, or accepts it if it checksums before padding; neither is a length error.",
+      "reject_step": 6,
+      "derived_from": "simple_string",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 17,
+      "compressed_size": 18,
+      "envelope_hex": "94c412f00168656c6c6f2c2063616368656b697421986dcc8a34ccb63a3c52ccd311a76d73677061636b",
+      "envelope_size": 42
+    },
+    {
+      "name": "reject_checksum_mismatch",
+      "description": "simple_string's envelope with the first and last checksum bytes flipped (xor 0x01). Readers MUST reject it; an SDK test asserts the rejection. The reference reader rejects it at Retrieve Flow step 8. A reader without step 8 accepts it.",
+      "reject_step": 8,
+      "derived_from": "simple_string",
+      "format": "msgpack",
+      "envelope_encoding": "bin",
+      "original_size": 16,
+      "compressed_size": 18,
+      "envelope_hex": "94c412f00168656c6c6f2c2063616368656b697421986ccc8a34ccb63a3c52ccd210a76d73677061636b",
+      "envelope_size": 42
+    }
+  ],
   "vectors": [
     {
       "description": "Zero-length payload",
@@ -150,5 +277,5 @@
       "derived_from": "width_boundary_bin16"
     }
   ],
-  "version": "1.1.1"
+  "version": "1.3.0"
 }
