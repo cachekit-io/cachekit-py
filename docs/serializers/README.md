@@ -162,8 +162,11 @@ def get_data():
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no
-> bulk delete — `cache_clear()` reaches only keys this release tracked, never a pre-upgrade
-> one — so flush on
+> bulk delete. On a function that takes parameters, `cache_clear()` reaches only keys this
+> release tracked. The only pre-upgrade key among them is one whose delete failed during
+> `invalidate_cache(args)`: it stays tracked, and the next no-argument call retries it. (On
+> a function with no parameters, `cache_clear()` deletes the one key and its pre-upgrade
+> twin.) So flush on
 > the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
 > matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries

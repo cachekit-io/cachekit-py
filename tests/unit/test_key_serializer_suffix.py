@@ -497,3 +497,74 @@ class TestInvalidationReachesPre020Keys:
         backend.fail_on = set()
         fn.invalidate_cache()
         assert backend.store == {}, "no-args invalidation did not retry the failed legacy delete"
+
+
+# A raw key over 250 characters is stored as a prefix plus a hash of the whole key, so its
+# pre-0.20.0 twin cannot be read off the current key's suffix the way _pre_020_key does.
+# This literal is the key cachekit 0.19.0 wrote for `fn(1)` under the fixed module, qualname
+# and namespace below, taken from the 0.19.0 wheel:
+#   CacheKeyGenerator().generate_key(fn, (1,), {}, _LONG_NAMESPACE, True)
+_LONG_NAMESPACE = "lab6361_" + "n" * 292
+_V019_LONG_KEY = "ns:lab6361_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn:8c42af11facf9cd7e05b02ead5c9bdfc"
+
+
+def _pin_identity(fn: Any) -> Any:
+    """Fix the identity the key hashes, so the literal does not depend on how pytest imports this file."""
+    fn.__module__ = "lab6361"
+    fn.__qualname__ = "fn"
+    return fn
+
+
+@pytest.mark.unit
+class TestHashedLegacyKeyMatchesV019:
+    """The legacy twin of a hashed key is byte-identical to the key 0.19.0 wrote (LAB-6361).
+
+    Both tests pin one identity, so they share a key: L1 is off, or the second would hit the
+    first one's process-wide L1 entry and never reach the backend.
+    """
+
+    def test_sync_invalidate_deletes_the_v019_hashed_key(self):
+        backend = _RecordingBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=None, namespace=_LONG_NAMESPACE, serializer="auto", l1_enabled=False)
+        @_pin_identity
+        def fn(x: int) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"v": x}
+
+        fn(1)
+        (current_key,) = backend.store
+        assert current_key != _V019_LONG_KEY
+        backend.store[_V019_LONG_KEY] = b"0.19.0 copy"
+
+        fn.invalidate_cache(1)
+
+        assert _V019_LONG_KEY not in backend.store, "the key 0.19.0 wrote survived invalidation"
+        assert backend.store == {}
+        fn(1)
+        assert calls == 2
+
+    async def test_async_invalidate_deletes_the_v019_hashed_key(self):
+        backend = _RecordingBackend()
+        calls = 0
+
+        @cache(backend=backend, ttl=None, namespace=_LONG_NAMESPACE, serializer="auto", l1_enabled=False)
+        @_pin_identity
+        async def fn(x: int) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"v": x}
+
+        await fn(1)
+        (current_key,) = backend.store
+        assert current_key != _V019_LONG_KEY
+        backend.store[_V019_LONG_KEY] = b"0.19.0 copy"
+
+        await fn.ainvalidate_cache(1)
+
+        assert _V019_LONG_KEY not in backend.store, "the key 0.19.0 wrote survived invalidation"
+        assert backend.store == {}
+        await fn(1)
+        assert calls == 2
