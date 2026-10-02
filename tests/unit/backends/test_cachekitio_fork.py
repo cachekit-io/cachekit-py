@@ -13,12 +13,14 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import logging
 import os
 import shutil
 import signal
 import ssl
 import subprocess
 import sys
+import threading
 import traceback
 import uuid
 from collections.abc import Callable, Iterator
@@ -199,6 +201,36 @@ def test_a_fork_that_skips_at_fork_hooks_is_detected(
     backend = _backend(monkeypatch, fake_saas, http2)
     results = _run(backend, "child-then-parent", fork=_libc_fork)
     assert results == [_CLEAN, _CLEAN]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+@pytest.mark.parametrize("http2", _PROTOCOLS)
+def test_a_fork_from_c_while_a_parent_thread_holds_the_logging_lock(
+    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool
+) -> None:
+    """A fork from C also skips logging's at-fork lock reset, so the child's re-lease must not take that lock.
+
+    The child inherits logging's module lock held by a thread that does not exist there; building its new
+    client must not wait on it (the child's alarm ends a hang).
+    """
+    backend = _backend(monkeypatch, fake_saas, http2)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with logging._lock:  # type: ignore[attr-defined]  # a parent thread inside logging at fork
+            held.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert held.wait(5)
+        child = _Child(lambda: _exchange(backend, f"{uuid.uuid4().hex}-child"), _libc_fork)
+    finally:
+        release.set()
+        holder.join(5)
+    child.go()
+    assert child.result() == _CLEAN
 
 
 @pytest.mark.parametrize("http2", _PROTOCOLS)

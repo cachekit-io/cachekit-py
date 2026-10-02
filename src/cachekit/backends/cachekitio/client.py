@@ -169,14 +169,19 @@ def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
     return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
 
 
+# Looked up once: getLogger() takes logging's module lock, and a fork from C (uWSGI) skips logging's at-fork
+# reset, so a child re-leasing its clients would hang on a lock a parent thread held at fork. Reading the
+# level takes no lock, and the parent pinned it when it built the client being replaced.
+_hpack_logger = logging.getLogger("hpack")
+
+
 def _pin_hpack_logger() -> None:
     # hpack (httpx's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
     # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
     # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
     # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
-    hpack_logger = logging.getLogger("hpack")
-    if hpack_logger.level == logging.NOTSET:
-        hpack_logger.setLevel(logging.INFO)
+    if _hpack_logger.level == logging.NOTSET:
+        _hpack_logger.setLevel(logging.INFO)
 
 
 def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
