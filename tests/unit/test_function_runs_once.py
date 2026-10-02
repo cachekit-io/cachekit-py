@@ -13,6 +13,7 @@ one that only releases in ``finally``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -139,8 +140,13 @@ class TestFunctionBackendErrorRunsOnce:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
-    async def test_async_lock_release_failure_keeps_the_function_error(self, redis_shaped: bool) -> None:
-        """A lock that fails while releasing does not replace the function's exception."""
+    async def test_async_lock_release_failure_keeps_the_function_error(
+        self, redis_shaped: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A lock that fails while releasing neither replaces the function's exception nor its context.
+
+        The release failure is logged instead: the lock may outlive the call until its timeout.
+        """
         raised: list[BackendError] = []
 
         @cache(
@@ -150,14 +156,19 @@ class TestFunctionBackendErrorRunsOnce:
             namespace=f"lab5360-async-lock-release-{int(redis_shaped)}",
         )
         async def fn(x: int) -> int:
-            raised.append(_function_error())
-            raise raised[-1]
+            try:
+                raise KeyError(x)
+            except KeyError:
+                raised.append(_function_error())
+                raise raised[-1]  # noqa: B904 — the KeyError context is what the test pins
 
-        with pytest.raises(BackendError) as excinfo:
+        with caplog.at_level(logging.WARNING, logger="cachekit"), pytest.raises(BackendError) as excinfo:
             await fn(1)
 
         assert len(raised) == 1
         assert excinfo.value is raised[0]
+        assert isinstance(excinfo.value.__context__, KeyError), "the release error must not replace the context"
+        assert any("Lock release failed" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)

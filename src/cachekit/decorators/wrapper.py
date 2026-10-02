@@ -2224,20 +2224,23 @@ def create_cache_wrapper(
                     # KeyringConfigurationError. Those leave a finally-only lock as they are.
                     if func_error is not None:
                         # The lock failed while releasing after the function raised. The
-                        # function's exception wins; the release error rides as its context.
-                        raise func_error  # noqa: B904 — the release did not cause it; __context__ is the true link
-                    if not isinstance(e, BackendError):
+                        # function's exception wins and is raised below, outside this handler:
+                        # raised in here, it would take the release error as its __context__.
+                        logger().warning(
+                            f"Lock release failed for {redact_cache_key(cache_key)} after the function raised; "
+                            f"the lock may be held until its timeout: {redact_error_for_log(e)}"
+                        )
+                    elif not isinstance(e, BackendError):
                         raise
-
-                    # A Redis lock wraps them in a BackendError; unwrap and re-raise the original.
-                    if e.original_exception and not isinstance(e.original_exception, BackendError):
+                    elif e.original_exception and not isinstance(e.original_exception, BackendError):
+                        # A Redis lock wraps them in a BackendError; unwrap and re-raise the original.
                         raise e.original_exception from e
-
-                    # Lock operation failed - execute without lock
-                    logger().warning(
-                        f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
-                    )
-                    # Fall through to execute without locking
+                    else:
+                        # Lock operation failed - execute without lock
+                        logger().warning(
+                            f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
+                        )
+                        # Fall through to execute without locking
 
                 if func_error is not None:
                     # The function's own exception, unchanged and never recorded (as before).
