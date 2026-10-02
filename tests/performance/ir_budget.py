@@ -243,7 +243,13 @@ def interpreter_key() -> str:
 
 def main_thread_ir(out_file: Path) -> int:
     """Total Ir of thread 1 from a ``--separate-threads=yes`` callgrind run."""
-    for line in Path(f"{out_file}-01").read_text().splitlines():
+    thread_one = Path(f"{out_file}-01")
+    try:
+        text = thread_one.read_text()
+    except FileNotFoundError:
+        written = sorted(p.name for p in out_file.parent.glob(f"{out_file.name}*")) or "nothing"
+        raise RuntimeError(f"no main-thread file {thread_one.name}: callgrind wrote {written}") from None
+    for line in text.splitlines():
         if line.startswith("totals:"):
             return int(line.split()[1])
     raise RuntimeError(f"no totals line in {out_file}-01")
@@ -275,8 +281,9 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
     put hundreds of thousands of Ir/op of noise into a fresh venv. So every path first runs once
     natively, serially, to fill the bytecode cache, and the measured runs never write bytecode.
 
-    The process environment is fixed, not inherited, so no shell setting (CACHEKIT_* included)
-    reaches the measured process and its size cannot move the layout.
+    The process environment is fixed, not inherited: its size moves the stack and heap layout,
+    which moved a small path by up to 0.4% per op. No shell setting (CACHEKIT_* included) reaches
+    the measured process; the two CACHEKIT_* settings below keep cachekit's background threads asleep.
     """
     env = {
         "PATH": "/usr/bin:/bin",
