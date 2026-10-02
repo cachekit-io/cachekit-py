@@ -617,7 +617,7 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
-One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to `CACHEKIT_SOCKET_TIMEOUT` for one, then fails as a cache miss.
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins.
 
 ```bash
 # Tune connection pool size based on concurrency

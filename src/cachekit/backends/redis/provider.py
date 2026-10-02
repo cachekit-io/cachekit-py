@@ -745,7 +745,7 @@ class RedisBackendProvider:
         redis_url: str,
         pool_size: Optional[int] = None,
         config: Optional[RedisBackendConfig] = None,
-    ):
+    ) -> None:
         """Initialize provider with singleton connection pool.
 
         Fix #1: Creates pool ONCE (expensive operation).
