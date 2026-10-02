@@ -2,7 +2,7 @@
 
 # L1 Cache Invalidation and Stale-While-Revalidate (SWR)
 
-> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL). On the tenant-scoped Redis backend (env auto-detection, or a backend from `RedisBackendProvider`), whole-function invalidation also deletes the L2 entries *other* processes wrote for the calling tenant ([key registry](#whole-function-invalidation)). In L1-only mode (`backend=None`) invalidation is purely local. There is no cross-instance L1 invalidation broadcast — see [Multi-Instance Semantics](#multi-instance-semantics).
+> L1 invalidation and SWR freshness management are **process-local**. When an L2 backend is configured, invalidating a key also deletes it from shared L2 — but other processes keep serving their own L1 copy until it expires (L1 TTL), unless they run the opt-in [invalidation listener](#cross-process-l1-eviction). On the tenant-scoped Redis backend (env auto-detection, or a backend from `RedisBackendProvider`), whole-function invalidation also deletes the L2 entries *other* processes wrote for the calling tenant ([key registry](#whole-function-invalidation)), and the listener runs only on that backend. In L1-only mode (`backend=None`) invalidation is purely local. See [Multi-Instance Semantics](#multi-instance-semantics).
 
 > [!IMPORTANT]
 > The within-TTL SWR described on this page runs **only in L1-only mode** (`backend=None`): past the freshness threshold, the SDK serves the cached value and **re-runs your function** in the background. With a backend configured (Redis, File, Memcached), `swr_enabled` has no effect — there is no within-TTL SWR in backed modes. The one backed SWR that exists is `@cache.io`'s past-TTL [`stale_ttl` mode](../configuration.md#stale-while-revalidate-stale_ttl), which uses the CachekitIO backend's read-side freshness signal.
@@ -202,8 +202,8 @@ get_user.invalidate_cache()
 Things to know:
 
 - **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster and sharding proxies (one endpoint in front of several shards) are not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A drain removes a key from the set only after deleting it, so tracked keys a failed drain did not reach stay in the set for the next drain, unless the set expires first.
-- **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation.
-- **Invalidation announcements.** Once an invalidation's L2 change has succeeded, cachekit publishes one message on the Redis pub/sub channel `cachekit:py:invalidate:v1`: after a no-args drain returns, and after an `invalidate_cache(args)` whose delete of the key returned. A failed delete, or a failed drain that falls back to this process's own keys, publishes nothing. The message carries the function's registry id and, for `invalidate_cache(args)`, the invalidated key. A custom `key=` function's key is never sent, because it can embed caller identifiers; its message names only the function. Anyone allowed to `SUBSCRIBE` to the channel can see which functions are invalidated and which generated keys, and a generated key carries a hash of the arguments, not the arguments. A restricted ACL user needs the `publish` command and access to the channel (`&cachekit:py:invalidate:v1`). Without them the invalidation still completes, and cachekit logs a WARNING `Invalidation announcement failed` on each invalidation.
+- **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation, unless they run the [invalidation listener](#cross-process-l1-eviction).
+- **Invalidation announcements.** Once an invalidation's L2 change has succeeded, cachekit publishes one message on the Redis pub/sub channel `cachekit:py:invalidate:v1`, which processes running the [invalidation listener](#cross-process-l1-eviction) act on: after a no-args drain returns, and after an `invalidate_cache(args)` whose delete of the key returned. A failed delete, or a failed drain that falls back to this process's own keys, publishes nothing. The message carries the function's registry id and, for `invalidate_cache(args)`, the invalidated key. A custom `key=` function's key is never sent, because it can embed caller identifiers; its message names only the function. Anyone allowed to `SUBSCRIBE` to the channel can see which functions are invalidated and which generated keys, and a generated key carries a hash of the arguments, not the arguments. A restricted ACL user needs the `publish` command and access to the channel (`&cachekit:py:invalidate:v1`). Without them the invalidation still completes, and cachekit logs a WARNING `Invalidation announcement failed` on each invalidation.
 - **Set lifetime.** A tracking set expires 7 days after the last tracked write to its function; each write whose tracking round-trip succeeds refreshes that expiry. While the set exists, a key leaves it only when a no-args drain deletes it: the key's own expiry and `invalidate_cache(args)` do not remove it. A zero-parameter function has no drain — its `invalidate_cache()` deletes its one key directly and leaves that key's member in the set until the set expires. A parameterised function that is written continuously and never invalidated with no args therefore grows its set by one member per distinct key. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
 - **Tenants.** The set is tenant-scoped like every other key. Each write is tracked in the set of the tenant in `tenant_context` for that call, and a drain empties only the calling tenant's set and can only delete keys inside that tenant's prefix — `default` when no tenant is set (see **Tenant scope** below). The INFO line `Key registry drained N keys` shows how many keys a drain deleted.
 - **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
@@ -230,16 +230,32 @@ CacheKit does **not** ship cross-instance L1 invalidation in Python. When runnin
 
 - `invalidate_cache(args...)` deletes the key from shared L2, so any pod's next **L1 miss** fetches fresh data.
 - `invalidate_cache()` with no arguments does the same for every key the calling tenant has for the function on the tenant-scoped Redis backend ([key registry](#whole-function-invalidation)); on other backends it reaches only the keys the calling process knows.
-- Pods that still hold the entry in L1 keep serving it until their **L1 TTL** expires (L1 expires 1 second before L2 by design).
-- Worst-case staleness after an invalidation is therefore bounded by the entry's remaining TTL. Size TTLs accordingly for data where cross-pod staleness matters.
+- Pods that still hold the entry in L1 keep serving it until their **L1 TTL** expires (L1 expires 1 second before L2 by design), unless they run the [invalidation listener](#cross-process-l1-eviction).
+- Without the listener, worst-case staleness after an invalidation is therefore bounded by the entry's remaining TTL. Size TTLs accordingly for data where cross-pod staleness matters.
 
-The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel; Python has no equivalent yet. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for current per-SDK support.
+### Cross-Process L1 Eviction
+
+On the tenant-scoped Redis backend, a process can also evict its L1 copies when another process invalidates them. Set one environment variable in that process:
+
+```bash
+export CACHEKIT_INVALIDATION_LISTENER_ENABLED=true
+```
+
+The process then runs one invalidation listener: a background thread with its own Redis connection, subscribed to the channel that every invalidation is [announced on](#whole-function-invalidation). It starts on the process's first cache operation that reaches Redis. When another process's `invalidate_cache(args)` deletes a key, the listener evicts that key from this process's L1. When another process's no-args `invalidate_cache()` drains a function, the listener evicts every key this process cached for that function. Eviction is tenant-blind, like L1 itself: an invalidation under any tenant evicts the one shared L1 entry.
+
+- **Off by default.** No preset and no decorator argument turns it on. With the variable unset, a process opens no thread and no extra connection. Every process on this backend announces its own invalidations either way, so a cron job or an operator shell that calls `invalidate_cache()` needs no setting for listening workers to evict.
+- **Delivery.** At most once. A subscribed process usually evicts within milliseconds, and cachekit's tests hold it to one second. An event sent while the listener is not subscribed is lost, and that L1 copy expires by its L1 TTL as before: before the process's first cache operation, and while the listener reconnects. The listener's connection PINGs Redis when idle, so a dead connection is noticed within about 10 seconds. The listener reconnects and subscribes again on its own, logging a WARNING `Invalidation listener error` while Redis is unreachable.
+- **Backends.** Only the tenant-scoped Redis backend carries events (`CACHEKIT_REDIS_URL` / `REDIS_URL` without `backend=`, or a backend from `RedisBackendProvider`). With the variable set, a function cached on any other backend, such as a `RedisBackend` passed as `backend=`, File, Memcached or CachekitIO, gets no cross-process eviction, and cachekit logs one WARNING per process, `... does not carry invalidation events`. A process has one listener, on the Redis server of the first cache operation that starts it, so give every function in a listening process the same Redis.
+- **Redis permissions.** A restricted ACL user also needs the `subscribe` command, `ping` for the idle check, and access to the channel (`&cachekit:py:invalidate:v1`). A refused subscription is a WARNING `Invalidation listener error`.
+- **One Redis, several apps.** Redis delivers pub/sub messages across database numbers, so apps on different databases of one Redis server see each other's events. An event names its function by namespace and `module.qualname`, so the most it costs another app is an extra L1 miss on a function with the same name and namespace.
+- **Untrusted messages.** Anyone allowed to publish on the channel can make listening processes evict L1 entries, and nothing more: each message is size-checked before it is decoded, and a malformed one is dropped with a WARNING `Invalidation event dropped`.
+- **Python only.** The channel is cachekit-py's own. The TypeScript SDK's opt-in channel uses a different channel and format, and the two do not interoperate. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for per-SDK support.
 
 ### Forked Processes
 
-A process created by `fork()`, such as a `multiprocessing` fork-context worker or a Gunicorn or Celery prefork worker, starts with an empty L1. None of its parent's L1 entries carry over, and the child refills from L2 on first use. A master that warmed L1 before forking (Gunicorn `--preload`) therefore no longer passes that warmth to its workers.
+A process created by `fork()`, such as a `multiprocessing` fork-context worker or a Gunicorn or Celery prefork worker, starts with an empty L1. None of its parent's L1 entries carry over, and the child refills from L2 on first use. A master that warmed L1 before forking (Gunicorn `--preload`) therefore no longer passes that warmth to its workers. With the listener enabled, each child runs its own, on its own connection, from its first cache operation; it never shares its parent's.
 
-uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-uwsgi-fork-hooks` (uWSGI 2.0.21 or later) or `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; any one of them keeps the rule above. Without one, a uWSGI worker keeps the L1 entries its master held at fork and runs no background sweep of expired L1 entries. An expired entry is still never served: it is evicted when it is read.
+uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-uwsgi-fork-hooks` (uWSGI 2.0.21 or later) or `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; any one of them keeps the rule above. Without one, a uWSGI worker keeps the L1 entries its master held at fork, runs no background sweep of expired L1 entries, and runs no invalidation listener, so its L1 heals by TTL. An expired entry is still never served: it is evicted when it is read. Under uWSGI with none of these options, cachekit logs one WARNING `uWSGI forks its workers without running Python's at-fork hooks` when it is imported.
 
 ---
 
@@ -344,7 +360,7 @@ def update_user(user_id: int, data: dict):
     return {"status": "updated"}
 ```
 
-In multi-pod deployments, other pods pick up the fresh value on their next L1 miss; until then they may serve their L1 copy for at most the remaining TTL (see [Multi-Instance Semantics](#multi-instance-semantics)).
+In multi-pod deployments, other pods pick up the fresh value on their next L1 miss; until then they may serve their L1 copy for at most the remaining TTL (see [Multi-Instance Semantics](#multi-instance-semantics)). Pods that run the [invalidation listener](#cross-process-l1-eviction) evict their copy as soon as the announcement arrives.
 
 ### Pattern 2: Bulk Invalidation per Function
 
@@ -361,7 +377,7 @@ def apply_category_discount(category_id: int, discount: float):
     get_product.invalidate_cache()
 ```
 
-On the tenant-scoped Redis backend this deletes every process's L2 entries for `get_product` under the calling tenant (`default` when none is set); to clear several tenants, call it once under each tenant's `tenant_context`. On other backends it deletes only the entries this process wrote or read, so for bulk updates where cross-process consistency matters there, prefer short TTLs over relying on invalidation. Either way, other processes' L1 copies live until their L1 TTL.
+On the tenant-scoped Redis backend this deletes every process's L2 entries for `get_product` under the calling tenant (`default` when none is set); to clear several tenants, call it once under each tenant's `tenant_context`. On other backends it deletes only the entries this process wrote or read, so for bulk updates where cross-process consistency matters there, prefer short TTLs over relying on invalidation. Either way, other processes' L1 copies live until their L1 TTL, unless they run the [invalidation listener](#cross-process-l1-eviction).
 
 ---
 
@@ -386,9 +402,18 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 ### Problem: Another pod serves stale data after invalidation
 
-**Cause:** Expected behavior — L1 invalidation is process-local. The invalidating process deletes the key from shared L2, but other pods keep their L1 copy until it expires.
+**Cause:** Expected behavior without the [invalidation listener](#cross-process-l1-eviction) — L1 invalidation is process-local. The invalidating process deletes the key from shared L2, but other pods keep their L1 copy until it expires.
 
-**Solution:** Bound acceptable staleness with the entry's TTL. If a class of data cannot tolerate any cross-pod staleness window, don't cache it in L1 (`l1=L1CacheConfig(enabled=False)`).
+**Solution:** On the tenant-scoped Redis backend, set `CACHEKIT_INVALIDATION_LISTENER_ENABLED=true` in the pods that serve reads. Otherwise, bound acceptable staleness with the entry's TTL. If a class of data cannot tolerate any cross-pod staleness window, don't cache it in L1 (`l1=L1CacheConfig(enabled=False)`): the listener's delivery is at most once.
+
+### Problem: The listener is enabled but a pod still serves stale data
+
+**Cause and diagnosis**, by the WARNING each case logs:
+
+- `... does not carry invalidation events`: the function's backend is not the tenant-scoped Redis backend, so no event reaches it.
+- `uWSGI forks its workers without running Python's at-fork hooks`: the workers run no listener; set one of the uWSGI options under [Forked Processes](#forked-processes).
+- `Invalidation listener failed to start` or `Invalidation listener error`: Redis was unreachable or refused the subscription (see **Redis permissions** under [Cross-Process L1 Eviction](#cross-process-l1-eviction)). Events sent meanwhile are lost, and those L1 copies expire by TTL.
+- No WARNING: the event was published before the pod's listener subscribed, which happens on the pod's first cache operation, or the invalidating process published nothing because its L2 delete or drain failed (an ERROR or WARNING in that process).
 
 ### Problem: SWR refresh failing
 

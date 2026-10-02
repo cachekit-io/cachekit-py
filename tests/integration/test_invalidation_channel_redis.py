@@ -1,10 +1,19 @@
-"""Invalidation channel on real Redis: what the decorator publishes on cachekit:py:invalidate:v1."""
+"""Invalidation channel on real Redis: what the decorator publishes on cachekit:py:invalidate:v1, and how
+a listening process evicts its L1 on other processes' events (two processes, forks, reconnects)."""
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import multiprocessing
+import os
+import signal
+import subprocess
+import sys
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import msgpack
@@ -15,7 +24,9 @@ from cachekit import cache, invalidation
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import provider as provider_module
 from cachekit.backends.redis.provider import PerRequestRedisBackend
+from cachekit.l1_cache import L1Cache, get_l1_cache
 from tests.integration import _key_registry_worker as worker
+from tests.unit.test_l1_memory_bounds import _child_outcome, _report
 
 pytestmark = pytest.mark.integration
 
@@ -199,3 +210,315 @@ class TestSingleKeyAnnouncement:
         fn.invalidate_cache(1)
 
         assert _received(subscriber) == [{"r": rid}]
+
+
+# ---- The listener ----
+
+
+@pytest.fixture
+def listening(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """CACHEKIT_INVALIDATION_LISTENER_ENABLED for this process; the listener is stopped afterwards."""
+    monkeypatch.setattr(invalidation, "_listener_flag", True)
+    monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))
+    invalidation._stop_listener()
+    yield
+    invalidation._stop_listener()
+
+
+def _redis_url(client: redis.Redis) -> str:
+    conn = client.connection_pool.connection_kwargs
+    db = conn.get("db", 0)
+    return f"unix://{conn['path']}?db={db}" if "path" in conn else f"redis://{conn['host']}:{conn['port']}/{db}"
+
+
+def _run_peer(client: redis.Redis, call: str) -> float:
+    """Run ``call`` from the worker module in another process with no listener; returns the
+    time.time() at which its last invalidation returned."""
+    env = {k: v for k, v in os.environ.items() if k != "CACHEKIT_INVALIDATION_LISTENER_ENABLED"}
+    proc = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
+        [sys.executable, "-c", f"from tests.integration._key_registry_worker import invalidate; {call}"],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**env, "CK_TEST_REDIS_URL": _redis_url(client)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return float(proc.stdout.strip().splitlines()[-1])
+
+
+def _subscribers(client: redis.Redis) -> int:
+    ((_, count),) = client.pubsub_numsub(invalidation.CHANNEL)
+    return count
+
+
+def _wait_for(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _spy_evictions(l1: L1Cache, monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, Any]]:
+    """Record (time.time(), keys) for every eviction of ``l1``."""
+    seen: list[tuple[float, Any]] = []
+    invalidate, invalidate_many = l1.invalidate, l1.invalidate_many
+
+    def one(key: str) -> None:
+        seen.append((time.time(), key))
+        invalidate(key)
+
+    def many(keys: Any) -> None:
+        keys = set(keys)
+        seen.append((time.time(), keys))
+        invalidate_many(keys)
+
+    monkeypatch.setattr(l1, "invalidate", one)
+    monkeypatch.setattr(l1, "invalidate_many", many)
+    return seen
+
+
+def _l1_keys(namespace: str) -> set[str]:
+    return set(get_l1_cache(namespace)._state.cache)
+
+
+class TestListenerAcrossProcesses:
+    """The listener in this process evicts what a process without one invalidates."""
+
+    def test_peer_single_key_invalidation_evicts_it_within_a_second(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ns = "chan_xproc_one"
+        fn = worker.cached_lookup(client, namespace=ns)
+        fn(1)  # the first cache operation starts the listener
+        fn(2)
+        assert invalidation._listener_pid == os.getpid()
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        before = _l1_keys(ns)
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+
+        announced_at = _run_peer(client, f"invalidate([1], {ns!r})")
+
+        assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+        evicted_at, evicted_key = evictions[0]
+        assert evicted_at - announced_at <= 1.0
+        assert _l1_keys(ns) == before - {evicted_key} and len(_l1_keys(ns)) == 1
+
+    def test_peer_drain_evicts_every_key_within_a_second(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The peer has no listener flag: it still publishes, and this listening process evicts."""
+        ns = "chan_xproc_drain"
+        fn = worker.cached_lookup(client, namespace=ns)
+        for x in range(3):
+            fn(x)
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        cached = _l1_keys(ns)
+        assert len(cached) == 3
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+
+        announced_at = _run_peer(client, f"invalidate([], {ns!r})")
+
+        assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+        evicted_at, evicted_keys = evictions[0]
+        assert evicted_at - announced_at <= 1.0
+        assert evicted_keys == cached and _l1_keys(ns) == set()
+
+
+class TestListenerAndFork:
+    """A forked child never shares its parent's subscription."""
+
+    def test_multiprocessing_child_runs_its_own_listener_and_leaves_the_parents_alone(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ns = "chan_fork_mp"
+        fn = worker.cached_lookup(client, namespace=ns)
+        fn(1)
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        (parent_conn,) = client.client_list(_type="pubsub")
+        parent_listener = invalidation._listener
+
+        ctx = multiprocessing.get_context("fork")
+        results, done = ctx.Queue(), ctx.Event()
+
+        def child(q: Any, release: Any) -> None:
+            outcome = {"l1_empty": _l1_keys(ns) == set(), "inherited": invalidation._listener_pid == os.getppid()}
+            fn(2)  # the child's first cache operation starts the child's own listener
+            outcome["own"] = invalidation._listener_pid == os.getpid() and invalidation._listener[1].is_alive()
+            q.put(outcome)
+            release.wait(20)  # stay subscribed while the parent counts
+
+        process = ctx.Process(target=child, args=(results, done))
+        process.start()
+        try:
+            outcome = results.get(timeout=30)
+            assert _wait_for(lambda: _subscribers(client) == 2)  # the child's connection beside the parent's
+        finally:
+            done.set()
+            process.join(timeout=20)
+            if process.is_alive():
+                process.kill()
+        assert outcome == {"l1_empty": True, "inherited": True, "own": True}
+        assert process.exitcode == 0
+
+        # The child dropped its inherited copy of the parent's PubSub without touching the socket.
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        assert [c["id"] for c in client.client_list(_type="pubsub")] == [parent_conn["id"]]
+        assert invalidation._listener is parent_listener and invalidation._listener_pid == os.getpid()
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+        _run_peer(client, f"invalidate([1], {ns!r})")
+        assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+    def test_child_of_a_c_fork_starts_no_listener_and_logs_nothing(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fork made from C runs no at-fork hook (uWSGI without its fork options): the child runs
+        without a listener, starts no thread for one and logs nothing, and the parent keeps its own."""
+        ns = "chan_fork_c"
+        fn = worker.cached_lookup(client, namespace=ns)
+        fn(1)
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        records: list[logging.LogRecord] = []
+
+        class Recording(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = Recording(level=logging.DEBUG)
+        channel_logger = logging.getLogger(invalidation.__name__)
+        monkeypatch.setattr(channel_logger, "level", logging.DEBUG)
+        channel_logger.addHandler(handler)
+        try:
+            parent = os.getpid()
+            r, w = os.pipe()
+            child = ctypes.PyDLL(None).fork()  # PyDLL keeps the GIL through the call
+            if child == 0:
+                try:
+                    signal.alarm(10)  # a hang on a lock a parent thread held ends the child instead
+                    os.close(r)
+                    started: list[str] = []
+                    threading.Thread.start = lambda self: started.append(type(self).__name__)  # type: ignore[method-assign]
+                    del records[:]
+                    value = fn(2)  # a cache operation that reaches the backend
+                    _report(
+                        w,
+                        {
+                            "value": value,
+                            "started": started,
+                            "records": [rec.getMessage() for rec in records],
+                            "listener_pid_is_parents": invalidation._listener_pid == parent,
+                        },
+                    )
+                finally:
+                    os._exit(1)
+            os.close(w)
+            assert _child_outcome(child, r) == {
+                "value": 20,
+                "started": [],
+                "records": [],
+                "listener_pid_is_parents": True,
+            }
+        finally:
+            channel_logger.removeHandler(handler)
+        assert [c["id"] for c in client.client_list(_type="pubsub")] != []
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+        _run_peer(client, f"invalidate([1], {ns!r})")
+        assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+
+
+class TestListenerResilience:
+    def test_forged_events_are_dropped_and_the_listener_keeps_working(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        ns = "chan_forged"
+        fn = worker.cached_lookup(client, namespace=ns)
+        fn(1)
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        rid = _registry_id(client)
+        (key,) = _l1_keys(ns)
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+        forged = [
+            b"SECRET" * 1000,  # oversize
+            b"\x81\xa1a" * 1300 + b"\xc0",  # nested past the decoder's stack
+            msgpack.packb(["SECRET-array"]),  # not a map
+            msgpack.packb({"r": 7, "k": "SECRET-key"}),  # registry id not a string
+        ]
+        with caplog.at_level(logging.DEBUG, logger=invalidation.__name__):
+            for payload in forged:
+                client.publish(invalidation.CHANNEL, payload)
+            client.publish(invalidation.CHANNEL, msgpack.packb({"r": "ck:reg:SECRET:unknown", "k": "SECRET-key"}))
+            client.publish(invalidation.CHANNEL, invalidation.encode_event(rid, key))  # a real one, last
+            assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+
+        assert evictions[0][1] == key and _l1_keys(ns) == set()
+        assert invalidation._listener[1].is_alive()
+        messages = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == invalidation.__name__]
+        assert sum(m.startswith("Invalidation event dropped") for level, m in messages if level == logging.WARNING) == 4
+        assert any("does not cache" in m for level, m in messages if level == logging.DEBUG)
+        assert "SECRET" not in caplog.text
+
+    def test_listener_reconnects_and_resubscribes(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ns = "chan_reconnect"
+        fn = worker.cached_lookup(client, namespace=ns)
+        fn(1)
+        assert _wait_for(lambda: _subscribers(client) == 1)
+        (before,) = client.client_list(_type="pubsub")
+
+        assert client.client_kill_filter(_type="pubsub") == 1
+        assert _wait_for(lambda: [c["id"] for c in client.client_list(_type="pubsub")] not in ([], [before["id"]]), timeout=20)
+        assert _wait_for(lambda: _subscribers(client) == 1, timeout=20)
+
+        evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+        _run_peer(client, f"invalidate([1], {ns!r})")
+        assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+
+
+class TestListenerConfiguration:
+    def test_flag_on_with_a_direct_redis_backend_warns_once_and_starts_nothing(
+        self, client: redis.Redis, listening: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from cachekit.backends.redis.backend import RedisBackend
+        from tests.fixtures.backend_providers import TestCacheClientProvider
+
+        backend = RedisBackend(client_provider=TestCacheClientProvider(sync_client=client))
+        fn = cache(backend=backend, ttl=300, namespace="chan_direct")(worker.lookup)
+        with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
+            for x in range(3):
+                fn(x)
+        warnings = [r.getMessage() for r in caplog.records if r.name == invalidation.__name__]
+        assert len(warnings) == 1 and "RedisBackend does not carry invalidation events" in warnings[0]
+        assert invalidation._listener_pid is None and _subscribers(client) == 0
+
+    def test_flag_unset_opens_no_connection(self, client: redis.Redis) -> None:
+        assert invalidation._listener_enabled() is False  # the default
+        fn = worker.cached_lookup(client, namespace="chan_flag_off")
+        before = len(client.client_list())
+        for x in range(3):
+            fn(x)
+        assert invalidation._listener_pid is None and _subscribers(client) == 0
+        assert len(client.client_list()) == before  # no dedicated connection (the shared pool's is reused)
+        assert not [t for t in threading.enumerate() if t.name == "cachekit-invalidation-listener"]
+
+    def test_subscription_refused_by_acl_is_a_warning(
+        self, client: redis.Redis, listening: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        user, password = "ck-chan-nosub", "ck-chan-nosub-pw"  # pragma: allowlist secret - throwaway ACL user
+        client.acl_setuser(
+            user, enabled=True, passwords=[f"+{password}"], keys=["*"], channels=["*"], commands=["+@all", "-subscribe"]
+        )
+        try:
+            restricted = _client_as(client, user, password)
+            fn = worker.cached_lookup(restricted, namespace="chan_acl_sub")
+            with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
+                assert fn(1) == 10  # the cache operation is unaffected
+                assert _wait_for(lambda: "Invalidation listener error" in caplog.text, timeout=5)
+            assert "NoPermissionError" in caplog.text and _subscribers(client) == 0
+            invalidation._stop_listener()
+            restricted.close()
+        finally:
+            client.acl_deluser(user)

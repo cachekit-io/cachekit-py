@@ -1,9 +1,17 @@
-"""Cross-process invalidation events on Redis pub/sub.
+"""Cross-process L1 invalidation on Redis pub/sub.
 
-After an invalidation's L2 change succeeded on a key-tracking backend, the decorator announces it
-with one ``PUBLISH`` on :data:`CHANNEL`, on the backend's own client: no knob, no new connection,
-no thread. The event is a MessagePack map of two strings, ``r`` (the function's registry id) and
-``k`` (the invalidated cache key, absent when every key of the function was invalidated).
+Publishing. After an invalidation's L2 change succeeded on a key-tracking backend, the decorator
+announces it with one ``PUBLISH`` on :data:`CHANNEL`, on the backend's own client: no knob, no new
+connection, no thread. The event is a MessagePack map of two strings, ``r`` (the function's registry
+id) and ``k`` (the invalidated cache key, absent when every key of the function was invalidated).
+
+Listening. A process with ``CACHEKIT_INVALIDATION_LISTENER_ENABLED`` set runs one listener: redis-py's
+own pub/sub worker thread on a one-connection pool cloned from the backend's
+(``PerRequestRedisBackend.listener_pool``), started by the first cache operation that reaches such a
+backend. Each event is decoded under a size and shape bound, because the bytes are untrusted, and
+handed to the evictors registered for its registry id: one per decorated function with an L1.
+Delivery is at most once. An event sent while a listener is not subscribed is lost, and the entry
+expires by its L1 TTL.
 
 The channel is local to cachekit-py: no other SDK reads or writes it, and a format change takes a
 new channel name, never a field negotiation.
@@ -11,11 +19,20 @@ new channel name, never a field negotiation.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import threading
+import time
+import weakref
+from collections.abc import Callable
 from typing import Any, Optional
 
 import msgpack
+import redis
 
+from cachekit import l1_cache
+from cachekit.cache_handler import supports_key_tracking
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
@@ -25,6 +42,17 @@ CHANNEL = "cachekit:py:invalidate:v1"
 # Cap on each field, in UTF-8 bytes. A receiver rejects longer strings, so a longer key is
 # announced as the whole function, which receivers already handle.
 _MAX_FIELD_BYTES = 1024
+# Cap on a whole event, checked before decoding. Two capped fields fit well inside it.
+_MAX_EVENT_BYTES = 4096
+
+# A listener that failed to start is retried by a cache operation this much later, not by every
+# one: during an outage each attempt can wait out a connect timeout.
+_START_RETRY_SECONDS = 60.0
+
+# uWSGI options under which a worker runs Python's at-fork hooks, or imports the app after the fork.
+_UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
+
+Evictor = Callable[[Optional[str]], None]
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -53,6 +81,44 @@ def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
     if key is not None and len(key.encode("utf-8")) <= _MAX_FIELD_BYTES:
         event["k"] = key
     return msgpack.packb(event)
+
+
+def decode_event(data: object) -> tuple[str, Optional[str]]:
+    """The registry id and key (``None``: every key) an event carries. Raises on anything else.
+
+    The bytes are untrusted: any client allowed to ``PUBLISH`` on this Redis can send them. So the
+    size is bounded before decoding, and MessagePack may build only maps of at most 4 entries and
+    strings of at most 1024 bytes: no bin, array or ext values, and nesting deep enough to exhaust
+    the decoder's stack raises. A forged event that passes costs evictions from L1, never more.
+
+    Examples:
+        >>> decode_event(encode_event("ck:reg:ns:00ff", "ns:ns:func:m.f:args:ab:1s"))
+        ('ck:reg:ns:00ff', 'ns:ns:func:m.f:args:ab:1s')
+        >>> decode_event(encode_event("ck:reg:ns:00ff", None))
+        ('ck:reg:ns:00ff', None)
+        >>> decode_event(b"\\x91\\x01")  # an array
+        Traceback (most recent call last):
+            ...
+        ValueError: 1 exceeds max_array_len(0)
+    """
+    if not isinstance(data, bytes) or len(data) > _MAX_EVENT_BYTES:
+        raise ValueError(f"not an event: bytes of at most {_MAX_EVENT_BYTES} expected")
+    event = msgpack.unpackb(
+        data,
+        raw=False,
+        use_list=False,
+        max_map_len=4,
+        max_str_len=_MAX_FIELD_BYTES,
+        max_bin_len=0,
+        max_array_len=0,
+        max_ext_len=0,
+    )
+    if not isinstance(event, dict) or not isinstance(event.get("r"), str):
+        raise ValueError("not an event: a map with a string registry id expected")
+    key = event.get("k")
+    if "k" in event and not isinstance(key, str):
+        raise ValueError("not an event: the key is not a string")
+    return event["r"], key
 
 
 def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
@@ -86,3 +152,188 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
         )
         return
     logger.debug("Invalidation announced to %s listener(s)", receivers)
+
+
+def _pid_lock(locks: dict[int, threading.Lock]) -> threading.Lock:
+    """This process's lock in ``locks``. A child gets its own, so a lock a parent thread held at
+    fork, and which no thread in the child will ever release, is never waited on; ``setdefault``
+    is atomic with or without the GIL, so the threads of one process share one lock."""
+    pid = os.getpid()
+    lock = locks.get(pid)
+    return lock if lock is not None else locks.setdefault(pid, threading.Lock())
+
+
+# ---- Dispatch: registry id -> the evictors of every live decorated function with that id ----
+# Weak: a decorated function holds its own evictor, so one that is discarded drops out.
+_evictors: dict[str, weakref.WeakSet[Evictor]] = {}
+_dispatch_locks: dict[int, threading.Lock] = {}  # guards _evictors; see _pid_lock
+
+
+def register(registry_id: str, evict: Evictor) -> None:
+    """Route events for ``registry_id`` to ``evict``, called with the key or ``None`` (every key).
+
+    ``evict`` is held weakly: the caller keeps it alive for as long as it should receive events.
+    """
+    with _pid_lock(_dispatch_locks):
+        _evictors.setdefault(registry_id, weakref.WeakSet()).add(evict)
+
+
+def _evictors_for(registry_id: str) -> list[Evictor]:
+    """A snapshot, taken under the lock register() takes: iterating the live set while a decoration
+    adds to it would raise, and drop the event."""
+    with _pid_lock(_dispatch_locks):
+        evictors = _evictors.get(registry_id)
+        return list(evictors) if evictors is not None else []
+
+
+# ---- Listener: one per process, started by a cache operation (owner-PID check, no fork hook) ----
+_listener_flag: Optional[bool] = None  # CACHEKIT_INVALIDATION_LISTENER_ENABLED, read on first use
+_listener_pid: Optional[int] = None  # the process the running listener belongs to
+_listener: Any = None  # (PubSub, worker thread) of that listener
+_start_locks: dict[int, threading.Lock] = {}  # see _pid_lock
+_start_retry_at = float("-inf")  # time.monotonic() before which a failed start is not retried
+_untrackable_warned: dict[int, object] = {}  # PID -> marker: one WARNING per process
+
+
+def _listener_enabled() -> bool:
+    global _listener_flag
+    if _listener_flag is None:
+        from cachekit.config.singleton import get_settings
+
+        _listener_flag = get_settings().invalidation_listener_enabled
+    return _listener_flag
+
+
+def listener_start_due(backend: object) -> bool:
+    """Whether this cache operation should start the process's listener. Never raises.
+
+    With the flag unset, the default, this reads one cached bool. With it set, it compares the
+    process id with the listener's owner, so a forked child starts its own listener instead of
+    believing it has its parent's; the parent's socket is the parent's. A child forked without
+    at-fork hooks (uWSGI without the options in _UWSGI_FORK_OPTIONS) runs no listener at all and
+    this logs nothing there: a thread started in such a child can hang in Thread.start(), and a
+    log call on a handler lock a parent thread held at fork hangs too. Its L1 heals by TTL.
+    """
+    try:
+        if not _listener_enabled() or _listener_pid == os.getpid() or l1_cache._forked_without_hooks():
+            return False
+        if not supports_key_tracking(backend):
+            _warn_untrackable(backend)
+            return False
+        return time.monotonic() >= _start_retry_at
+    except Exception as e:  # a listener must never fail a cache operation
+        if not l1_cache._forked_without_hooks():
+            logger.warning("Invalidation listener check failed: %s", redact_error_for_log(e))
+        return False
+
+
+def _warn_untrackable(backend: object) -> None:
+    marker = object()
+    if _untrackable_warned.setdefault(os.getpid(), marker) is marker:
+        logger.warning(
+            "CACHEKIT_INVALIDATION_LISTENER_ENABLED is set, but %s does not carry invalidation events: "
+            "functions cached on it get no cross-process L1 eviction. Only the tenant-scoped Redis "
+            "backend (CACHEKIT_REDIS_URL / REDIS_URL, or RedisBackendProvider) does.",
+            type(backend).__name__,
+        )
+
+
+def start_listener(backend: Any) -> None:
+    """Start this process's listener on ``backend``'s Redis, unless another thread is starting it.
+
+    Never raises and never waits for another thread. Sync; async callers run it through
+    asyncio.to_thread, as it connects and subscribes. A failed start is a WARNING, and a cache
+    operation retries it _START_RETRY_SECONDS later. Once started, reconnecting is redis-py's: the
+    worker thread's next read reconnects, and the connection's on_connect callback re-subscribes.
+    """
+    global _listener, _listener_pid, _start_retry_at
+    lock = _pid_lock(_start_locks)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        if _listener_pid == os.getpid():
+            return
+        pubsub = None
+        try:
+            pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
+            pubsub.subscribe(**{CHANNEL: _on_message})
+            thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
+        except Exception as e:
+            if pubsub is not None:
+                with contextlib.suppress(Exception):
+                    pubsub.close()
+            _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
+            logger.warning(
+                "Invalidation listener failed to start; a cache operation retries in %d s: %s",
+                _START_RETRY_SECONDS,
+                redact_error_for_log(e),
+            )
+            return
+        thread.name = "cachekit-invalidation-listener"  # no function or key metadata (CWE-532)
+        # Replaces a parent's listener in a forked child. Dropping that one does no I/O on the
+        # parent's socket: redis-py shuts a connection's socket down only in the process that opened
+        # it, and a PubSub reset sends no UNSUBSCRIBE.
+        _listener = (pubsub, thread)
+        _listener_pid = os.getpid()
+    finally:
+        lock.release()
+    logger.info("Invalidation listener started: pid=%d channel=%s", os.getpid(), CHANNEL)
+
+
+def _on_message(message: dict[str, Any]) -> None:
+    """Handle one event in the listener thread. Never raises: a bad event is dropped and the
+    listener keeps running. Never logs the registry id or key: a forged event carries the sender's
+    text."""
+    try:
+        registry_id, key = decode_event(message.get("data"))
+        evictors = _evictors_for(registry_id)
+        if not evictors:
+            logger.debug("Invalidation event for a function this process does not cache: dropped")
+            return
+        for evict in evictors:
+            evict(key)
+    except Exception as e:
+        logger.warning("Invalidation event dropped: %s", redact_error_for_log(e))
+
+
+def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
+    """Called by redis-py's worker thread instead of dying. Its next read reconnects; wait a second
+    first so a Redis that is down is not spun on. Events published meanwhile are lost."""
+    logger.warning("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
+    time.sleep(1.0)
+
+
+def _stop_listener() -> None:
+    """Stop and forget this process's listener (tests)."""
+    global _listener, _listener_pid
+    listener, _listener, _listener_pid = _listener, None, None
+    if listener is not None:
+        _, thread = listener
+        thread.stop()  # its loop closes the PubSub on its way out
+        thread.join(timeout=5)
+
+
+def _warn_if_uwsgi_skips_fork_hooks() -> None:
+    """One WARNING when this process runs under uWSGI with none of _UWSGI_FORK_OPTIONS set.
+
+    uWSGI forks its workers from C and runs no Python at-fork hook unless told to, so a worker
+    keeps its master's L1 entries and runs no invalidation listener. Called once, at import, which
+    is in the master before any worker exists: a worker forked without hooks must not log at all.
+    """
+    if l1_cache._forked_without_hooks():
+        return
+    try:
+        import uwsgi  # type: ignore[import-not-found]  # importable only inside a uWSGI process
+    except ImportError:
+        return
+    options = getattr(uwsgi, "opt", None)
+    if not isinstance(options, dict) or any(name in options for name in _UWSGI_FORK_OPTIONS):
+        return
+    logger.warning(
+        "uWSGI forks its workers without running Python's at-fork hooks: each worker keeps the "
+        "master's L1 entries and runs no invalidation listener. Set py-call-uwsgi-fork-hooks "
+        "(uWSGI 2.0.21+), py-call-osafterfork or lazy-apps."
+    )
+
+
+_warn_if_uwsgi_skips_fork_hooks()

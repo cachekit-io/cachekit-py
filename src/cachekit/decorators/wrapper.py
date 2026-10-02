@@ -1274,6 +1274,21 @@ def create_cache_wrapper(
         """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
         return getattr(_backend, "key_prefix", None) or ""
 
+    def _evict(key: str | None) -> None:
+        """Another process's invalidation, from the listener thread: evict ``key``, or every key
+        this wrapper recorded (``None``), from L1.
+
+        Never trims _cached_keys. The event is tenant-blind and can race a re-record of the same key
+        (see _watch_records), so a trim could drop this process's only record of a live L2 entry;
+        a record left behind costs one redundant delete later.
+        """
+        if _l1_cache is None:  # never registered without one
+            return
+        if key is not None:
+            _l1_cache.invalidate(key)
+        else:
+            _l1_cache.invalidate_many({cached for _, cached in set(_cached_keys)})
+
     # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every entry it
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
@@ -1666,6 +1681,9 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
                 raise
 
+        if _l1_cache and invalidation.listener_start_due(_backend):
+            invalidation.start_listener(_backend)
+
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
         start_time = time.time()
@@ -2031,6 +2049,9 @@ def create_cache_wrapper(
             # First interop call: the check above had no backend to check (see there).
             if interop is not None and not interop_checked:
                 ensure_interop_backend_compatible(_backend)
+
+            if _l1_cache and invalidation.listener_start_due(_backend):
+                await asyncio.to_thread(invalidation.start_listener, _backend)  # connects and subscribes: off the loop
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(
@@ -2677,7 +2698,14 @@ def create_cache_wrapper(
             )
         invalidate_cache()
 
+    # Other processes' invalidations reach this function's L1 through the process's listener. Only a
+    # backed wrapper with an L1 registers: in L1-only mode nothing is shared, so nothing is announced.
+    # Registered weakly: the wrapper's _cachekit_evict attribute is what keeps _evict alive.
+    if _l1_cache is not None and not _l1_only_mode:
+        invalidation.register(_registry_id, _evict)
+
     if inspect.iscoroutinefunction(func):
+        async_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
         async_wrapper.invalidate_cache = ainvalidate_cache  # type: ignore[attr-defined]
         async_wrapper.ainvalidate_cache = ainvalidate_cache  # async version  # type: ignore[attr-defined]
         async_wrapper.check_health = acheck_health  # async version  # type: ignore[attr-defined]
@@ -2687,6 +2715,7 @@ def create_cache_wrapper(
         async_wrapper.__wrapped__ = func  # type: ignore[attr-defined]
         return async_wrapper  # type: ignore[return-value]
     else:
+        sync_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
         sync_wrapper.invalidate_cache = invalidate_cache  # type: ignore[attr-defined]
         sync_wrapper.check_health = check_health  # type: ignore[attr-defined]
         sync_wrapper.get_health_status = get_health_status  # type: ignore[attr-defined]

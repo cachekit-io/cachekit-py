@@ -67,6 +67,13 @@ end
 return members
 """
 
+# The invalidation listener's connection PINGs after this many idle seconds, so a half-open
+# socket is found within about that long instead of never.
+_LISTENER_HEALTH_CHECK_SECONDS = 10
+
+# No with_timeout() window is open on the backend.
+_NO_WINDOW = object()
+
 
 async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
     """Await ``fut`` to completion even if the current task is cancelled meanwhile.
@@ -220,6 +227,10 @@ class PerRequestRedisBackend:
 
         # Registered on first drain. Per instance, not module-global: a Script holds its client.
         self._drain_script: Optional[Script] = None
+
+        # The socket_timeout an open with_timeout() window displaced from the shared pool, so
+        # listener_pool() clones the configured value, never the window's.
+        self._displaced_socket_timeout: Any = _NO_WINDOW
 
     @property
     def key_prefix(self) -> str:
@@ -683,6 +694,44 @@ class PerRequestRedisBackend:
         )
         return out
 
+    def listener_pool(self) -> redis.ConnectionPool:
+        """A one-connection pool for the invalidation listener, cloned from this backend's pool.
+
+        A clone, never a pool rebuilt from the URL or from ``connection_kwargs`` alone: redis-py
+        keeps the transport in ``connection_class`` (``SSLConnection`` for ``rediss://``,
+        ``UnixDomainSocketConnection`` for ``unix://``), outside ``connection_kwargs``, so a rebuilt
+        pool would fall back to a plaintext TCP ``Connection`` and send the password in the clear.
+        The clone keeps the configured ``socket_timeout`` even inside a ``with_timeout()`` window.
+
+        The listener holds its one connection for the life of the process, so the connection PINGs
+        when idle and finds a half-open socket within about 10 s, and a TCP or TLS connection also
+        sets TCP keepalive (a Unix socket takes no keepalive option). Replies stay bytes, whatever
+        the backend's client decodes: events are MessagePack.
+
+        Examples:
+            >>> import redis
+            >>> pool = redis.ConnectionPool.from_url("rediss://:pw@cache.example:6380/0")  # pragma: allowlist secret
+            >>> backend = PerRequestRedisBackend(redis.Redis(connection_pool=pool), "default")
+            >>> clone = backend.listener_pool()  # no connection is made until the listener subscribes
+            >>> clone.connection_class is redis.SSLConnection, clone.max_connections
+            (True, 1)
+            >>> clone.connection_kwargs["password"] == pool.connection_kwargs["password"]
+            True
+            >>> clone.connection_kwargs["socket_keepalive"], clone.connection_kwargs["health_check_interval"]
+            (True, 10)
+        """
+        source = self._client.connection_pool
+        kwargs = {
+            **source.connection_kwargs,
+            "health_check_interval": _LISTENER_HEALTH_CHECK_SECONDS,
+            "decode_responses": False,
+        }
+        if self._displaced_socket_timeout is not _NO_WINDOW:
+            kwargs["socket_timeout"] = self._displaced_socket_timeout
+        if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
+            kwargs["socket_keepalive"] = True
+        return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
+
     @asynccontextmanager
     async def with_timeout(
         self,
@@ -705,6 +754,9 @@ class PerRequestRedisBackend:
         # This is a best-effort implementation (coarser-grained)
         original_timeout = self._client.connection_pool.connection_kwargs.get("socket_timeout")
         timeout_sec = timeout_ms / 1000.0
+        outermost = self._displaced_socket_timeout is _NO_WINDOW
+        if outermost:
+            self._displaced_socket_timeout = original_timeout
 
         try:
             # Set socket timeout
@@ -718,6 +770,8 @@ class PerRequestRedisBackend:
                 self._client.connection_pool.connection_kwargs["socket_timeout"] = original_timeout
             else:
                 self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
+            if outermost:
+                self._displaced_socket_timeout = _NO_WINDOW
 
 
 class RedisBackendProvider:
