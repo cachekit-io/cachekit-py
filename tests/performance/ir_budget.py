@@ -36,7 +36,6 @@ import json
 import os
 import platform
 import shutil
-import statistics
 import subprocess
 import sys
 import sysconfig
@@ -47,11 +46,13 @@ from pathlib import Path
 from typing import Any
 
 N_LO, N_HI = 1000, 3000
-# Heap layout moves per-op counts: holding 16-1,400 extra objects before the workload moved the
-# orjson round trip between 23,404 and 23,827 Ir/op (1.8%), the minimal L1 hit by 0.5%, the L2
-# hit by 0.2%. Any code change shifts the layout the same way, so a single run can fail an
-# untouched path or hide a real regression. Each path is measured at these layout shifts (extra
-# objects held) and the median is its figure.
+# Heap layout moves per-op counts: the allocators take longer paths in some heap states (the
+# orjson round trip's 1 KB buffer goes to glibc malloc and cost up to 2.2% more in some layouts).
+# Any code change shifts the layout, even an edit to this file's comments, so a single run can
+# fail an untouched path or hide a real regression. Each path runs at these layout shifts (extra
+# objects held) and its figure is the cheapest: layout only ever adds allocator work, while a
+# regression raises every layout. Across code and layout changes that figure moved 0.13% at most;
+# the median moved 1.2%.
 LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
 WARN_PCT = 0.2  # above the A/A floor (0.03%): report but pass
@@ -153,7 +154,7 @@ def _build_workload(path: str) -> Callable[[], object]:
             # Do what the worker does with a record: take it off the queue and return its dict to
             # the pool. Queue and pool then hold one item each, as a keeping-up worker leaves them,
             # so every call takes the pool-hit branch a busy process takes and the heap stops
-            # growing (a growing queue tripled the layout spread). Under 1.6k Ir of the figure.
+            # growing (a growing queue widened the layout spread). Under 1.6k Ir of the figure.
             collector._metric_pool.append(collector._queue.queue.popleft())
             return result
 
@@ -320,7 +321,7 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
             for p, n, shift in runs
         }
         ir = {key: future.result() for key, future in futures.items()}
-    return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
+    return {p: min(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS) for p in paths}
 
 
 def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str], bool]:
