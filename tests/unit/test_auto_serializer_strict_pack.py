@@ -104,6 +104,33 @@ class LenTrapTuple(tuple):
         raise RuntimeError("no len")
 
 
+class _HintEatsOne:
+    """An iterator whose __length_hint__ consumes an item: list(it) would drop it, a comprehension never asks."""
+
+    def __init__(self, items: Any) -> None:
+        self._it = iter(list.__iter__(items) if isinstance(items, list) else tuple.__iter__(items))
+
+    def __iter__(self) -> _HintEatsOne:
+        return self
+
+    def __next__(self) -> Any:
+        return next(self._it)
+
+    def __length_hint__(self) -> int:
+        next(self._it, None)
+        return 0
+
+
+class HintTrapList(list):
+    def __iter__(self) -> Any:
+        return _HintEatsOne(self)
+
+
+class HintTrapTuple(tuple):
+    def __iter__(self) -> Any:
+        return _HintEatsOne(self)
+
+
 class MyStr(Tagged, str):
     def __str__(self) -> str:  # msgpack packs the code points, never str(); so must the default
         return "overridden"
@@ -157,6 +184,7 @@ CORPUS: dict[str, Any] = {
     ],
     "subclass-keys": {MyStr("k"): 1, Mood.HAPPY: 2, Color.RED: 3},
     "len-raising-subclasses": {"l": LenTrapList([1, (2,)]), "t": LenTrapTuple((3, [4]))},
+    "hint-consuming-iterators": {"l": HintTrapList([1, (2,)]), "t": HintTrapTuple((3, [4]))},
     "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc), date(2026, 1, 2), time(3, 4), UUID(int=7)],
     "sets-of-scalars": [{1, 2, 3}, frozenset({"a", "b"})],
     "scalars": [None, True, False, 0, -1, 2**63, -(2**63), 1.0, -0.0, float("inf"), "", "ü", b""],
