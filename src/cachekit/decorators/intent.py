@@ -163,7 +163,8 @@ def cache(
 
         # Refuse an encrypting serializer= before the preset resolves, ahead of the presets' own key checks: a
         # caller who put the key inside the EncryptionWrapper would otherwise be told the decorator has no key.
-        # backend=None is left to create_cache_wrapper, where the L1-only refusal fires first.
+        # backend=None skips this check, so create_cache_wrapper's L1-only refusal keeps its message. That refusal runs
+        # after the preset's own checks, so one of those (a missing key or tenant mode, say) can still fire first.
         if not _explicit_l1_only and _is_encrypting_serializer(manual_overrides.get("serializer")):
             raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 

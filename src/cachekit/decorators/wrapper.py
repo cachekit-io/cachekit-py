@@ -735,8 +735,9 @@ def create_cache_wrapper(
 
     # ENCRYPTING SERIALIZER, ANY MODE (why: _ENCRYPTING_SERIALIZER_REFUSAL). Placed after the L1-only check, so
     # backend=None keeps that message, and before the handler is built, so it fires ahead of the handler's own
-    # errors (no stated intent, cross-SDK serializer, missing key), none of which names this fix. The decorator
-    # front end (intent.py) refuses a serializer= keyword earlier still; this covers config= and direct callers.
+    # errors (no stated intent, cross-SDK serializer, missing key), none of which names this fix. Except with
+    # backend=None, the decorator front end (intent.py) refuses a serializer= keyword earlier still; this check
+    # covers config= and direct callers.
     if _encrypting_serializer:
         raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
