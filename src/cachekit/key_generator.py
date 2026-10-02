@@ -458,11 +458,9 @@ class CacheKeyGenerator:
         it could not change the name (LAB-7405); the checks keep no state.
         """
         raw = f"{module}.{qualname}"
-        # An ASCII identifier with dots for underscores holds only [A-Za-z0-9_.], so a name that
-        # passes, with no "..", is returned unchanged by both passes: every ordinary module-level
-        # function or method. "<" goes first because <locals> and <lambda> are the usual misses,
-        # and it rejects them before replace() allocates. A name that fails merely takes the
-        # regex path, so the check need only be sufficient. It encodes the _FUNC_ALLOWED_RE charset.
+        # Dots mapped to "_", an ASCII identifier holds only [A-Za-z0-9_.]: with no "..", both passes
+        # are no-ops (encodes the _FUNC_ALLOWED_RE charset; a miss just takes the regex path). "<" is
+        # tested first so <locals>/<lambda> names fail before replace() allocates; the gate needs it.
         if "<" not in raw and raw.isascii() and raw.replace(".", "_").isidentifier() and ".." not in raw:
             return raw[: cls._FUNC_NAME_MAX]
         sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)

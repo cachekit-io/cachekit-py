@@ -871,7 +871,7 @@ class TestFuncNameSanitization:
             ("app", "ＡＢ"),  # fullwidth letters
             ("app", "a..b"),  # double dot
             ("app.", "f"),  # trailing dot makes ".."
-            ("app", "1f"),  # digit after a dot: misses the shortcut, still clean
+            ("1app", "f"),  # leading digit: all allowed chars, misses the shortcut, regex path keeps it
             ("app", ""),  # empty qualname: "app."
             (None, "f"),  # __module__ can be None
             ("app", "outer.<locals>.inner"),
@@ -883,7 +883,9 @@ class TestFuncNameSanitization:
     def test_shortcut_matches_regex_path(self, module, qualname):
         """The pass-skipping checks (LAB-7405) return exactly what the two regex passes would."""
         raw = f"{module}.{qualname}"
-        expected = CacheKeyGenerator._DOUBLE_DOT_RE.sub(".", CacheKeyGenerator._FUNC_ALLOWED_RE.sub("_", raw))[:200]
+        expected = CacheKeyGenerator._DOUBLE_DOT_RE.sub(".", CacheKeyGenerator._FUNC_ALLOWED_RE.sub("_", raw))[
+            : CacheKeyGenerator._FUNC_NAME_MAX
+        ]
         assert CacheKeyGenerator._sanitize_func_name(module, qualname) == expected
 
     def test_deterministic_for_same_function(self, key_generator):
