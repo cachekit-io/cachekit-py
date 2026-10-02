@@ -2,7 +2,7 @@
 
 Speaks HTTP/2 and HTTP/1.1 over TLS, chosen by ALPN as at the real edge, so the shipped client
 negotiates what it would in production. One in-memory store shared by every worker thread:
-GET 200 body | 404, HEAD 200 | 404, PUT 200 ``{"success":true}``, DELETE 200 | 404.
+GET 200 body | 404, HEAD 200 | 404, PUT and DELETE 200 ``{"success":true}``.
 ``GET /__stats`` returns each worker's CPU seconds so far, so a caller can tell when the fake is the
 bottleneck. Each worker thread runs its own event loop on the shared listening socket; on a
 free-threaded interpreter with the GIL off they serve in parallel. One connection is served by one
@@ -50,7 +50,8 @@ def handle(method: bytes, path: bytes, body: bytes) -> tuple[int, bytes]:
         STORE[path] = body
         return 200, _PUT_OK
     if method == b"DELETE":
-        return (200, _PUT_OK) if STORE.pop(path, None) is not None else (404, b"")
+        STORE.pop(path, None)
+        return 200, _PUT_OK
     return 405, b""
 
 
