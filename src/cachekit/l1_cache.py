@@ -276,7 +276,7 @@ class L1Cache:
             # Move to end (most recently used)
             s.cache.move_to_end(key)
 
-    def _reset_lock_after_fork(self, timeout: float = 1.0) -> None:
+    def _reset_lock_after_fork(self, timeout: float = 1.0, log: bool = True) -> None:
         """Replace the state if its lock is unavailable after fork; call only from a fork take-over or hook.
 
         A parent thread holding the lock at fork does not exist in the child, so it never releases.
@@ -288,6 +288,7 @@ class L1Cache:
         past the timeout. So the reset never clears or swaps anything in use. It publishes a fresh
         empty state, and whichever thread holds the old lock finishes on the old state. The entries
         are dropped either way (an orphaned holder may have left them half-updated); L2 still has them.
+        log=False drops them silently, for a child logging's own at-fork lock reset never reached.
         """
         s = self._state
         owned = s.lock._is_owned()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
@@ -295,6 +296,8 @@ class L1Cache:
             s.lock.release()
             return
         self._state = _L1State()
+        if not log:
+            return
         # Log only once repaired: a raising logging Filter escapes Logger.handle.
         logger.warning(
             "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
@@ -467,12 +470,10 @@ class L1CacheManager:
         # them calls _take_over_if_forked() first, or a forked child uses parent state.
         self._owner_pid = os.getpid()
         self._fork_locks: dict[int, threading.Lock] = {}
-        # PID in which _reset_cache_locks_after_fork already repaired the cache locks.
-        self._locks_reset_pid: Optional[int] = None
         _managers.add(self)
 
     def _take_over_if_forked(self) -> None:
-        """Take over inherited state in a forked child; restart cleanup if the parent ran it.
+        """Take over inherited state in a forked child; restart cleanup if the parent ran it and hooks ran.
 
         Threads don't survive fork(): a prefork child (Gunicorn --preload, Celery prefork)
         inherits _cleanup_thread dead, and _lock/_stop_cleanup and each L1Cache state lock as
@@ -480,15 +481,21 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread. A thread the parent had stopped stays stopped. Decorated functions get() before
+        thread, unless no at-fork hook ran. A thread the parent had stopped stays stopped. Decorated functions get() before
         they put(), so _reset_cache_locks_after_fork repairs orphaned cache locks before that
         first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
         The take-over resets cache locks only when that hook did not run in this PID
-        (_locks_reset_pid): after it, a held cache lock belongs to a live child thread. Without
+        (_forked_without_hooks): after it, a held cache lock belongs to a live child thread. Without
         hooks it cannot tell a dead holder from a live child thread holding a cache lock past the
         1 s probe, and then drops that cache's entries; the holder finishes unharmed on the state
         it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
+        A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
+        a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
+        starts no cleanup thread in it, start_background_cleanup refuses there too (also for a manager
+        first built in that child, which never takes over), and expired entries are evicted on read or
+        under the memory bound instead. None of it logs, the lock reset's drop included: the same fork
+        skips logging's at-fork reset, so a handler lock a parent thread held would hang the child.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -502,10 +509,11 @@ class L1CacheManager:
             self._stop_cleanup = threading.Event()
             # Only where no at-fork hook ran (uWSGI): after the hook, a held cache lock belongs to a
             # live child thread, and resetting it would drop that cache's entries for nothing.
-            if self._locks_reset_pid != pid:
-                for cache in self._caches.values():  # before the cleanup worker takes their locks
-                    cache._reset_lock_after_fork()
-            if self._cleanup_thread is not None:
+            if _forked_without_hooks():
+                for cache in self._caches.values():
+                    cache._reset_lock_after_fork(log=False)  # the fork skipped logging's at-fork lock reset too
+                self._cleanup_thread = None  # dead, and no thread may start here
+            elif self._cleanup_thread is not None:
                 try:
                     self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
                 except RuntimeError as e:  # how Thread.start() refuses: "can't start new thread" at a pids cap
@@ -553,10 +561,14 @@ class L1CacheManager:
     def start_background_cleanup(self, interval_seconds: float = 30.0) -> None:
         """Start background thread to clean up expired entries.
 
+        Starts nothing in a child forked without at-fork hooks (see _take_over_if_forked).
+
         Args:
             interval_seconds: Cleanup interval in seconds
         """
         self._take_over_if_forked()
+        if _forked_without_hooks():
+            return
         if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             logger.warning("Background cleanup already running")
             return
@@ -622,6 +634,21 @@ class L1CacheManager:
 # Every live manager, for the at-fork hook. Weak: tests and callers may create and drop managers.
 _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
+# The processes a thread may start in: the one that imported this module, and the latest child
+# _reset_cache_locks_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
+# So import cachekit before any fork made from C: a process that first imports it after such a fork
+# (uWSGI --lazy-apps without --py-call-osafterfork) is taken for safe, and cleanup starts a thread there.
+# No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
+# thread idents match a fresh process's, and a fresh process may import on any thread.
+_import_pid = os.getpid()
+_hooked_pid: Optional[int] = None
+
+
+def _forked_without_hooks() -> bool:
+    """Whether this process was forked without at-fork hooks (uWSGI unless --py-call-osafterfork)."""
+    pid = os.getpid()
+    return pid != _import_pid and pid != _hooked_pid
+
 
 def _reset_cache_locks_after_fork() -> None:
     """Replace the state of every cache whose lock is unavailable after fork, before the child's first get().
@@ -632,9 +659,11 @@ def _reset_cache_locks_after_fork() -> None:
     A lock the forking thread holds (it forked inside a critical section) is replaced too: a child
     that never returns there, like multiprocessing's, would keep it held for good, and one that
     does return finishes on the state it bound. Only the locks: starting the cleanup thread stays
-    with _take_over_if_forked, outside the hook.
+    with _take_over_if_forked, outside the hook. Logging's own at-fork hook ran first (registered at
+    its import, which precedes this module's), so the handler locks are repaired and the drop warning
+    is safe here.
     """
-    pid = os.getpid()
+    global _hooked_pid
     error: Optional[Exception] = None
     for manager in list(_managers):
         for cache in list(manager._caches.values()):
@@ -642,7 +671,7 @@ def _reset_cache_locks_after_fork() -> None:
                 cache._reset_lock_after_fork(timeout=0)
             except Exception as e:  # its drop warning, logged after the repair: repair the rest too
                 error = error or e
-        manager._locks_reset_pid = pid
+    _hooked_pid = os.getpid()  # last: a hook cut short leaves the child hookless, so the take-over still resets
     if error is not None:
         raise error  # only now; Python reports an at-fork hook's exception and carries on
 
