@@ -835,6 +835,35 @@ def create_cache_wrapper(
     _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
+    # One background TTL refresh per key at a time: concurrent hits in the refresh window
+    # would each send a billable PATCH until one lands. Also holds the task references.
+    _ttl_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+
+    async def _refresh_ttl_if_due(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        if remaining is None:
+            remaining = await backend.get_ttl(cache_key)
+            if not remaining or remaining >= refresh_to * ttl_refresh_threshold:
+                return
+        await backend.refresh_ttl(cache_key, refresh_to)
+
+    def _schedule_ttl_refresh(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        """Run _refresh_ttl_if_due as a background task unless one for this key is running on this loop.
+
+        The loop check lets a task orphaned by fork or by a closed loop be replaced.
+        """
+        running = _ttl_refresh_tasks.get(cache_key)
+        if running is not None and not running.done() and running.get_loop() is asyncio.get_running_loop():
+            return
+        task = asyncio.create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
+        _ttl_refresh_tasks[cache_key] = task
+
+        def _done(t: asyncio.Task[None]) -> None:
+            if _ttl_refresh_tasks.get(cache_key) is t:
+                del _ttl_refresh_tasks[cache_key]
+            _ttl_refresh_done_callback(t, cache_key)
+
+        task.add_done_callback(_done)
+
     def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
         then record the key in _cached_keys.
@@ -2038,17 +2067,15 @@ def create_cache_wrapper(
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
-                    # Handle TTL refresh if configured and threshold met
+                    # TTL refresh, never on the caller's path (LAB-7074). Decide from the
+                    # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
+                    # it only drops below the threshold after fresh_until, when the PATCH
+                    # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
+                    # tier copy (saas-api.md), so it falls back to GET /ttl like no header.
                     if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
-                        try:
-                            remaining_ttl = await _backend.get_ttl(cache_key)
-                            if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
-                                # Refresh TTL in background with error callback
-                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
-                                task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
-                        except Exception as e:
-                            # TTL refresh is optional, don't fail on error
-                            _logger.debug("TTL refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                        _fresh_for = _l2_fresh_for or None
+                        if not _l2_is_stale and (_fresh_for is None or _fresh_for < ttl * ttl_refresh_threshold):
+                            _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
                     elif refresh_ttl_on_get and ttl:
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.

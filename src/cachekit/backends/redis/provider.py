@@ -423,7 +423,7 @@ class PerRequestRedisBackend:
         """
         scoped_key = self._scoped_key(key)
         try:
-            ttl = self._client.ttl(scoped_key)
+            ttl = await asyncio.to_thread(self._client.ttl, scoped_key)  # sync client: keep the round trip off the loop
             if not isinstance(ttl, int):
                 raise BackendError(
                     message=f"Redis TTL returned unexpected type: {type(ttl).__name__}",
@@ -455,7 +455,7 @@ class PerRequestRedisBackend:
         """
         scoped_key = self._scoped_key(key)
         try:
-            result = self._client.expire(scoped_key, ttl)
+            result = await asyncio.to_thread(self._client.expire, scoped_key, ttl)
             # Redis EXPIRE returns 1 if TTL was set, 0 if key doesn't exist
             return bool(result)
         except Exception as exc:
