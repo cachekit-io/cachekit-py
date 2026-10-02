@@ -16,7 +16,8 @@ import redis
 from cachekit import cache
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import provider as provider_module
-from cachekit.backends.redis.provider import PerRequestRedisBackend, tenant_context
+from cachekit.backends.redis.provider import PerRequestRedisBackend
+from tests.fixtures.tenant import as_tenant
 from tests.integration import _key_registry_worker as worker
 
 pytestmark = pytest.mark.integration
@@ -319,18 +320,14 @@ class TestDecoratorOnRedis:
         def f(x: int) -> int:
             return x
 
-        def as_tenant(tenant, fn, *args):
-            token = tenant_context.set(tenant)
-            try:
-                return fn(*args)
-            finally:
-                tenant_context.reset(token)
+        with as_tenant("tenant-a"):
+            f(1)
+            f(2)
+        with as_tenant("tenant-b"):
+            f(3)  # not f(1): L1 is tenant-blind, so f(1) would hit a's L1 entry
 
-        as_tenant("tenant-a", f, 1)
-        as_tenant("tenant-a", f, 2)
-        as_tenant("tenant-b", f, 3)  # not f(1): L1 is tenant-blind, so f(1) would hit a's L1 entry
-
-        as_tenant("tenant-a", f.invalidate_cache)
+        with as_tenant("tenant-a"):
+            f.invalidate_cache()
         assert _cache_keys(client, "tenant-a") == set()
         assert not client.keys("t:tenant-a:ck:reg:*")
         assert len(_cache_keys(client, "tenant-b")) == 1

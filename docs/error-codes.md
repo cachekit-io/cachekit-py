@@ -184,25 +184,99 @@ await get_data.ainvalidate_cache(user_id)  # async function
 
 Called with no arguments on the tenant-scoped Redis backend it deletes every
 process's L2 entries for the calling tenant; on other backends it evicts only the
-keys this process has cached, not the fleet's. It does not cover a function with a custom `key=`: delete that
-entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
-with `<tenant>` percent-encoded as shown below.
+keys this process has cached, not the fleet's. A function with a custom `key=`
+works the same way: `invalidate_cache(<args>)` derives the key `key=` wrote (see
+[Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation)
+for the no-argument form).
 
-For bulk eviction, delete by prefix:
+For bulk eviction on Redis, delete one namespace's or one function's generated
+keys with the redis-py client cachekit installs, not a `redis-cli --scan` pipeline:
+a line-based pipeline can stop at a key containing a quote and splits a key
+containing a newline into names that match nothing, and it still exits 0 with keys
+left behind. `scan_iter` returns each key whole. A `SCAN` pattern alone cannot
+scope the delete either, because a namespace may contain `:` or glob characters:
+pattern `ns:users:*` also matches namespace `users:admin`. The script below uses
+`SCAN` only to find candidates and deletes a key only if it has exactly the shape
+cachekit generates for that namespace or function. Shape is all a key carries, so
+the script cannot tell a generated key from a custom one of the same shape (see
+below).
 
-```bash
-# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
-# (an int or UUID tenant as its str() first):
-# tenant org:123 is stored as t:org%3A123:...
-# Namespaced function (@cache.secure(namespace="users", ...)):
-redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
-# No namespace (the default): keys start with func:<module>.<qualname>
-redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
+```python notest
+# Needs a live Redis: set the URL, including the database number cachekit uses.
+import re
+from urllib.parse import quote
 
-# Only if this Redis database is dedicated to cachekit:
-# redis-cli FLUSHDB
+import redis
+
+r = redis.Redis.from_url("redis://localhost:6379/0")
+
+# The Redis backend stores keys under t:<tenant>: with <tenant> "default" unless
+# you set one, percent-encoded (an int or UUID tenant as its str() first).
+# A RedisBackend you pass as backend= adds no prefix: set prefix = "".
+prefix = "t:" + quote("default", safe="") + ":"
+# The namespace exactly as passed to @cache(namespace=...), or None (or "") for none.
+namespace = "users"
+# One function's name as it appears in the key (see below), or None for every
+# function in the namespace (or, with namespace None, every un-namespaced one).
+function = None
+
+# The key builder replaces spaces, \r and \n with _.
+ns = "" if not namespace else "ns:" + re.sub(r"[ \r\n]", "_", namespace) + ":"
+fn = r"[A-Za-z0-9_.]+" if function is None else re.escape(function)
+generated = re.compile(re.escape(prefix + ns + "func:") + fn + r":args:[0-9a-f]{64}:[^:]+")
+# A key over 250 characters is stored as its first 50, ":" and a hash (see below).
+head = (ns + "func:" + ("" if function is None else function + ":args:"))[:50]
+shortened = re.compile(re.escape(prefix + head) + f".{{{50 - len(head)}}}:[0-9a-f]{{32}}")
+candidates = prefix + ("ns:*" if namespace else "func:*")
+
+
+def matching():
+    for key in r.scan_iter(match=candidates, count=1000):
+        if generated.fullmatch(key.decode("utf-8", "replace")):
+            yield key
+
+
+batch = []
+for key in matching():
+    batch.append(key)
+    if len(batch) == 1000:
+        r.unlink(*batch)
+        batch.clear()
+if batch:
+    r.unlink(*batch)
+
+left = sum(1 for _ in matching())
+print(f"{left} generated keys left")  # expect 0
+stale = sum(1 for k in r.scan_iter(match=candidates, count=1000) if shortened.fullmatch(k.decode("utf-8", "replace")))
+if stale:
+    print(f"{stale} shortened keys may belong here: evict them with invalidate_cache(<args>)")
 ```
+
+A function's name in the key is `<module>.<qualname>` with every character outside
+`A-Z a-z 0-9 _ .` replaced by `_`, so `outer.<locals>.inner` becomes
+`outer._locals_.inner`.
+
+The script reaches the keys cachekit generates from a call's arguments, up to 250
+characters long before the `t:<tenant>:` prefix. The key builder stores a longer
+key as its first 50 characters, `:` and a hash, which nothing can tie back to its
+function. That happens when the namespace and the function's name together run
+past about 170 characters. The script counts keys of that shape under the same
+first 50 characters and prints a warning instead of deleting them, because another
+namespace or function can share those characters.
+
+A function with a custom `key=` stores its entries at
+`t:<tenant>:<namespace, or default>:<your key>`, and one with `fast_mode=True` or
+`interop=` uses its own key shape, so the script normally leaves them alone. Evict
+them with `invalidate_cache(<args>)` or a no-argument
+[whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
+The exception is a custom entry whose stored key, `<namespace>:<your key>`, itself
+has the generated shape. That needs a custom-`key=` namespace of `ns` or `func`, or
+one starting `ns:` or `func:`, such as `ns:users` with a key
+`func:<name>:args:<64 hex>:1s`. It is the very key a generated function could
+write, so the script deletes it with namespace `users`. Do not give a custom-`key=`
+function such a namespace if it shares a database with generated keys.
+
+Flush the database (`FLUSHDB`) only if it is dedicated to cachekit.
 
 The function recomputes and re-caches on the next call.
 
@@ -422,7 +496,7 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **Exception**: none: while the breaker is open, a function with an L2 backend still serves L1 hits, skips L2, and runs uncached on an L1 miss, sync or async. An L1 hit is never a probe and records no outcome, so it neither holds the breaker open nor closes it. In L1-only mode (`backend=None`) the breaker is never consulted.
 
-**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts); a failure to create the backend client; and, for async functions only, a result that fails to serialize or encrypt for the cache write. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
+**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts); a failure to create the backend client; and, for async functions only, a result too large to cache (over `max_value_size`) or a multi-tenant encrypted write whose tenant id cannot be extracted. A result that fails to serialize or encrypt for the cache write never counts, sync or async: the write is skipped with an ERROR and a WARNING log line, and the function's result is returned uncached. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
 
 **What it means**:
 - Your function has raised, or another failure listed under **Cause** has occurred, `failure_threshold` times (five by default) within 60 seconds
