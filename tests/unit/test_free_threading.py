@@ -244,6 +244,47 @@ def test_unparseable_disable_hiredis_setting_is_not_logged(monkeypatch, caplog):
     assert "supersecret" not in caplog.text
 
 
+_LOADED = object()  # stands in for an already-imported hiredis module
+
+
+@pytest.mark.parametrize(
+    ("setting", "free_threaded", "gil_on", "hiredis", "blocked", "warns"),
+    [
+        ("false", True, False, None, False, None),
+        (None, False, True, None, False, None),
+        ("true", False, True, None, True, None),
+        (None, True, False, None, True, None),
+        (None, True, True, None, False, None),
+        ("true", False, True, _LOADED, False, "keeps the hiredis parser"),
+        (None, True, True, _LOADED, False, "GIL is already on"),
+    ],
+    ids=["false", "unset-gil", "true-gil", "unset-ft", "unset-ft-gil-on", "loaded-gil", "loaded-ft"],
+)
+def test_configure_hiredis_decision(monkeypatch, caplog, setting, free_threaded, gil_on, hiredis, blocked, warns):
+    """The decision table in-process: when hiredis is blocked, and the warning when it already loaded."""
+    import sysconfig
+
+    from cachekit import hiredis_compat
+
+    if setting is None:
+        monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
+    else:
+        monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", setting)
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda name: 1 if free_threaded else 0)
+    monkeypatch.setattr(sys, "_is_gil_enabled", lambda: gil_on, raising=False)
+    monkeypatch.setitem(sys.modules, "hiredis", hiredis)  # recorded first, so teardown restores the real entry
+    if hiredis is None:
+        monkeypatch.delitem(sys.modules, "hiredis")
+
+    with caplog.at_level("WARNING", logger="cachekit.hiredis_compat"):
+        assert hiredis_compat.configure_hiredis_for_free_threading() is blocked
+    if blocked:
+        assert sys.modules["hiredis"] is None
+    elif hiredis is None:
+        assert "hiredis" not in sys.modules
+    assert (warns in caplog.text) if warns else not caplog.text
+
+
 def test_session_init_hammer_no_partial_publish_observed():
     """Many threads racing first-touch session init never observe a partial identity.
 
