@@ -122,11 +122,11 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def get_shared_metric(name: str, metric_class: type, description: str, labels: list[str]) -> Any:
+def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str]) -> Any:
     """Get or create the process-wide metric instance for ``name``.
 
-    Module-level so code outside the collector (the circuit breaker) records into the same
-    object without creating a collector.
+    Module-level so ``circuit_breaker_gauge()`` returns the collectors' object without
+    creating a collector.
 
     Raises:
         ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
@@ -156,7 +156,7 @@ def get_shared_metric(name: str, metric_class: type, description: str, labels: l
 
 def circuit_breaker_gauge() -> Any:
     """Return the process-wide ``circuit_breaker_state`` gauge."""
-    return get_shared_metric(
+    return _get_shared_metric(
         "circuit_breaker_state", Gauge, "Number of live circuit breakers per namespace and state", ["namespace", "state"]
     )
 
@@ -573,8 +573,8 @@ class AsyncMetricsCollector:
                     )
 
     def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
-        """Get or create the process-wide metric instance for ``name`` (see ``get_shared_metric``)."""
-        return get_shared_metric(name, metric_class, description, labels)
+        """Get or create the process-wide metric instance for ``name`` (see ``_get_shared_metric``)."""
+        return _get_shared_metric(name, metric_class, description, labels)
 
     def get_dropped_metrics_count(self) -> int:
         """Get count of dropped metrics due to queue overflow."""

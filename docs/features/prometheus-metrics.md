@@ -183,7 +183,8 @@ Each decorated function with the circuit breaker enabled has its own breaker (`@
 and `@cache.test` have none). The gauge counts them: the value of
 `circuit_breaker_state{namespace="users",state="OPEN"}` is the number of breakers in
 namespace `users` that are open now. Functions without an explicit namespace share
-`namespace="default"`. A breaker that is garbage-collected leaves the count.
+`namespace="default"`. A breaker that is garbage-collected leaves the count. The gauge is not exported in
+prometheus_client multiprocess mode (`PROMETHEUS_MULTIPROC_DIR` set).
 
 ```promql
 # Open breakers per namespace

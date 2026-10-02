@@ -5,7 +5,8 @@ the classic Circuit Breaker pattern. The circuit breaker monitors error rates
 and temporarily blocks requests when a service is struggling, giving it time
 to recover.
 
-Every state read and transition happens under a single RLock.
+Every state read and transition happens under a single RLock, except the Prometheus
+scrape, which reads each live breaker's ``_state`` as a single lock-free attribute read.
 """
 
 import functools
@@ -201,7 +202,9 @@ class CacheOperationMetrics:
 # leaves the count with no callback: a GC-time callback into prometheus_client could
 # re-enter its non-reentrant locks on the same thread and hang.
 _live_breakers: dict[str, "weakref.WeakSet[CircuitBreaker]"] = {}
-_live_lock = threading.Lock()
+# One lock per process, keyed by pid: a C-level fork skips at-fork hooks, so a child must
+# never take a lock it inherited, possibly held by a thread that is gone.
+_live_locks: dict[int, threading.Lock] = {}
 # Namespaces that lost a breaker. Appended at GC time, which must take no lock;
 # deque.append takes none. _track drains it to retire namespaces with no live breaker.
 _lost_breaker: deque[str] = deque()
@@ -213,17 +216,22 @@ def _on_collected(namespace: str, ref: "weakref.ref[CircuitBreaker]") -> None:
     _lost_breaker.append(namespace)
 
 
-def _reset_live_lock() -> None:
-    global _live_lock
-    _live_lock = threading.Lock()  # a forked child must not inherit a lock held by a vanished thread
+def _live_lock() -> threading.Lock:
+    pid = os.getpid()
+    lock = _live_locks.get(pid)
+    if lock is None:
+        lock = _live_locks.setdefault(pid, threading.Lock())  # atomic, so racing threads share one
+    return lock
 
 
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_live_lock)
+def _multiprocess_mode() -> bool:
+    # prometheus_client's own switch. Its multiprocess collector would export a function
+    # gauge as 0, a false "healthy", so the gauge is left out there instead.
+    return bool(os.environ.get("PROMETHEUS_MULTIPROC_DIR") or os.environ.get("prometheus_multiproc_dir"))
 
 
 def _count_in_state(namespace: str, state: "CircuitState") -> int:
-    with _live_lock:
+    with _live_lock():
         # .get: a scrape can call a series that _track retired after the scrape copied it.
         breakers = list(_live_breakers.get(namespace, ()))
     return sum(1 for breaker in breakers if breaker._state is state)
@@ -237,8 +245,8 @@ def _track(breaker: "CircuitBreaker") -> None:
     dead namespace exports zeros until the next breaker is created. Gauge calls stay under
     _live_lock so a retirement cannot remove a namespace another thread is re-registering.
     """
-    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE else None
-    with _live_lock:
+    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE and not _multiprocess_mode() else None
+    with _live_lock():
         _breaker_refs.add(weakref.ref(breaker, functools.partial(_on_collected, breaker.namespace)))
         lost = set()
         while _lost_breaker:

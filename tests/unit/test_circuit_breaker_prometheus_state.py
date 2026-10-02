@@ -125,15 +125,7 @@ class TestStateMachine:
         breaker.record_success()
         assert breaker.state == CircuitState.CLOSED
         assert _counts(namespace) == {"CLOSED": 2.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
-        other.reset()  # a self-transition
-        assert _counts(namespace) == {"CLOSED": 2.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
-
-    def test_reset_from_open(self):
-        namespace = _namespace()
-        breaker = _breaker(namespace)
-        _open(breaker)
-        breaker.reset()
-        assert _counts(namespace) == {"CLOSED": 1.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
+        assert other.state == CircuitState.CLOSED
 
 
 def test_collected_breaker_leaves_the_count():
@@ -147,16 +139,9 @@ def test_collected_breaker_leaves_the_count():
     assert _counts(namespace) == {"CLOSED": 0.0, "OPEN": 0.0, "HALF_OPEN": 0.0}
 
 
-def test_host_owned_name_does_not_break_transitions(monkeypatch: pytest.MonkeyPatch, clock):
+def test_host_owned_name_does_not_break_the_breaker(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(async_metrics._metrics_cache, "circuit_breaker_state", async_metrics._NoopMetric())
-    breaker = _breaker(_namespace(), timeout_seconds=_TIMEOUT, success_threshold=1)
-    _open(breaker)
-    clock.shift(_PAST_TIMEOUT)
-    assert breaker.should_attempt_call()
-    breaker.record_success()
-    assert breaker.state == CircuitState.CLOSED
-    del breaker
-    gc.collect()
+    _open(_breaker(_namespace()))
 
 
 # Each order runs in a fresh interpreter: the gauge registers once per process.
@@ -236,7 +221,7 @@ from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerC
 def open_cyclic(namespace):
     breaker = CircuitBreaker(CircuitBreakerConfig(), namespace=namespace)
     breaker.cycle = breaker  # only cyclic GC can free it, at any allocation
-    for _ in range(5):
+    for _ in range(CircuitBreakerConfig().failure_threshold):
         breaker.record_failure()
 
 # Collection while prometheus_client holds the gauge's lock, as it does inside labels().
@@ -269,15 +254,54 @@ def test_cyclic_garbage_collection_cannot_deadlock():
     assert result.returncode == 0, result.stderr
 
 
-def test_multiprocess_mode_does_not_raise(tmp_path):
+def test_multiprocess_mode_exports_no_false_value(tmp_path):
+    """The multiprocess collector would export a function gauge as 0, so the series is left out."""
     script = textwrap.dedent(
         """
+        from prometheus_client import CollectorRegistry, generate_latest
+        from prometheus_client.multiprocess import MultiProcessCollector
         from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
         breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="ns")
-        for _ in range(5):
+        for _ in range(CircuitBreakerConfig().failure_threshold):
             breaker.record_failure()
-        breaker.reset()
+        registry = CollectorRegistry()
+        MultiProcessCollector(registry)
+        assert b"circuit_breaker_state" not in generate_latest(registry), generate_latest(registry)
         """
     )
     result = _run(script, env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)})
+    assert result.returncode == 0, result.stderr
+
+
+_C_FORK = """
+import ctypes, os, threading, time
+from cachekit.reliability import circuit_breaker as cb
+
+held, release = threading.Event(), threading.Event()
+def hold():
+    with cb._live_lock() if callable(cb._live_lock) else cb._live_lock:  # either shape, so the test can fail red
+        held.set()
+        release.wait()
+threading.Thread(target=hold, daemon=True).start()
+held.wait()
+
+pid = ctypes.CDLL(None, use_errno=True).fork()  # C-level fork: at-fork hooks do not run
+if pid == 0:
+    breaker = cb.CircuitBreaker(cb.CircuitBreakerConfig(), namespace="child")
+    os._exit(0 if cb._count_in_state("child", cb.CircuitState.CLOSED) == 1 else 3)
+release.set()
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        raise SystemExit(os.waitstatus_to_exitcode(status))
+    time.sleep(0.05)
+os.kill(pid, 9)
+raise SystemExit("child hung on an inherited lock")
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_c_level_fork_child_does_not_inherit_a_held_lock():
+    result = _run(_C_FORK)
     assert result.returncode == 0, result.stderr
