@@ -8,7 +8,7 @@ from collections import Counter
 
 import pytest
 
-from tests.performance import ir_budget
+from tests.performance import ir_budget, ir_workload
 from tests.performance.ir_budget import PATHS, compare, main_thread_ir, per_op, ratchet
 
 
@@ -108,7 +108,7 @@ def test_batched_metrics_path_queues_every_call_and_never_records_synchronously(
 
     for mode in ("sync", "async"):
         monkeypatch.setattr(AsyncMetricsCollector, f"_record_cache_operation_{mode}", counting(mode))
-    op = ir_budget._build_workload("l2_hit_async_metrics")
+    op = ir_workload.build_workload("l2_hit_async_metrics")
     calls.clear()
     for _ in range(20):
         op()
@@ -120,7 +120,7 @@ def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> Non
         monkeypatch.setattr(time, name, getattr(time, name))
         monkeypatch.setattr(time, f"{name}_ns", getattr(time, f"{name}_ns"))
     monkeypatch.setattr("random.seed", lambda *_: None)  # leave the suite's RNG alone
-    ir_budget._pin_main_thread_clocks()
+    ir_workload.pin_main_thread_clocks()
 
     a, b = time.perf_counter(), time.perf_counter()
     assert b - a == pytest.approx(1e-6, abs=1e-9)
