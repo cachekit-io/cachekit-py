@@ -15,6 +15,22 @@
         "serializer_orjson": 23803
       },
       "python": "3.12.12"
+    },
+    "cpython-3.14-x86_64": {
+      "budgets": {
+        "l1_hit": 81463,
+        "l2_hit": 366546,
+        "l2_hit_async_metrics": 311417,
+        "minimal_l1_hit": 79582,
+        "miss": 349575,
+        "secure_l1_hit": 300398,
+        "serializer_arrow": 1953760,
+        "serializer_auto": 113611,
+        "serializer_default": 62675,
+        "serializer_encrypted": 118023,
+        "serializer_orjson": 23851
+      },
+      "python": "3.14.3"
     }
   },
   "method": "main-thread callgrind Ir per op, (Ir[3000] - Ir[1000]) / 2000, fixed env (PYTHONHASHSEED=0, one BLAS/OMP thread), pinned clocks; written by tests/performance/ir_budget.py --update"
