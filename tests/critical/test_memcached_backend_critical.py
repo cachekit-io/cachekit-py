@@ -19,7 +19,7 @@ Marked with @pytest.mark.critical for fast CI runs.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -27,6 +27,7 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.backends.memcached.backend import MemcachedBackend
 from cachekit.backends.memcached.config import MAX_MEMCACHED_TTL, MemcachedBackendConfig
 from cachekit.backends.memcached.error_handler import classify_memcached_error
+from tests.utils.memcached_helpers import mock_hash_client as _mock_hash_client
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def mock_hash_client(mock_store):
     Wires get/set/delete/stats to a plain dict.
     """
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
-        instance = MagicMock()
+        instance = _mock_hash_client()
 
         def _set(key, value, expire=0, noreply=True):
             mock_store[key] = value
@@ -292,7 +293,7 @@ def test_intent_decorators_with_memcached_backend(mock_store):
     from cachekit import cache
 
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
-        instance = MagicMock()
+        instance = _mock_hash_client()
         instance.set.side_effect = lambda k, v, expire=0, noreply=True: mock_store.__setitem__(k, v)
         instance.get.side_effect = lambda k: mock_store.get(k)
         instance.delete.side_effect = lambda k, noreply=True: mock_store.pop(k, None) is not None
@@ -320,7 +321,7 @@ def test_set_default_backend_with_memcached_backend(mock_store):
     from cachekit.config.decorator import get_default_backend, set_default_backend
 
     with patch("pymemcache.client.hash.HashClient") as mock_cls:
-        instance = MagicMock()
+        instance = _mock_hash_client()
         instance.set.side_effect = lambda k, v, expire=0, noreply=True: mock_store.__setitem__(k, v)
         instance.get.side_effect = lambda k: mock_store.get(k)
         instance.delete.side_effect = lambda k, noreply=True: mock_store.pop(k, None) is not None

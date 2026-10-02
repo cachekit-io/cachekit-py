@@ -111,6 +111,12 @@ checks out its own connection, so threads sharing one backend never share a sock
   While a failed server is being retried, concurrent operations on it can raise a spurious
   `BackendError` wrapping a `KeyError`, whether or not the command itself ran. Under `@cache`
   it degrades like any other backend error.
+- **A failed server is skipped for 1 second.** After a connection error, pymemcache sends
+  nothing to that server until its retry timeout passes. In that window `get` returns a
+  miss; `set`, `delete`, `exists` and `refresh_ttl` raise a TRANSIENT `BackendError`
+  rather than report "stored", "absent" or "not found"; and `health_check` reports
+  unhealthy. Under `@cache`, an `invalidate_cache()` whose delete was skipped keeps the key
+  tracked, so the next `invalidate_cache()` retries it.
 - **Not fork-safe.** A child process must not reuse a backend its parent created: the pooled
   sockets would be shared across processes. Create the backend (or make the first cached
   call) after `fork()`, for example in a pre-fork server's post-fork worker hook.
