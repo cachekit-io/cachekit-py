@@ -92,6 +92,18 @@ class MyTuple(Tagged, tuple):
     pass
 
 
+class LenTrapList(list):
+    """Iterates fine but raises on len(): the old pre-pass only iterated, so it packed."""
+
+    def __len__(self) -> int:
+        raise RuntimeError("no len")
+
+
+class LenTrapTuple(tuple):
+    def __len__(self) -> int:
+        raise RuntimeError("no len")
+
+
 class MyStr(Tagged, str):
     def __str__(self) -> str:  # msgpack packs the code points, never str(); so must the default
         return "overridden"
@@ -144,6 +156,7 @@ CORPUS: dict[str, Any] = {
         MyBytearray(b"arr"),
     ],
     "subclass-keys": {MyStr("k"): 1, Mood.HAPPY: 2, Color.RED: 3},
+    "len-raising-subclasses": {"l": LenTrapList([1, (2,)]), "t": LenTrapTuple((3, [4]))},
     "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc), date(2026, 1, 2), time(3, 4), UUID(int=7)],
     "sets-of-scalars": [{1, 2, 3}, frozenset({"a", "b"})],
     "scalars": [None, True, False, 0, -1, 2**63, -(2**63), 1.0, -0.0, float("inf"), "", "ü", b""],

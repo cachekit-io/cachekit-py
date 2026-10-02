@@ -261,13 +261,14 @@ def _auto_default(obj: Any) -> Any:
     # methods (str.__str__, int.__int__, ...) read the stored value and ignore a subclass override,
     # as the C packer does; plain str() would emit an Enum member's name. An int outside msgpack's
     # 64-bit range, exact or subclass, falls through to the error below, as the non-strict packer
-    # sent it here on overflow.
+    # sent it here on overflow. Sequences are copied through iter(), never list(obj), which asks a
+    # subclass's __len__: the old pre-pass only iterated, so a subclass whose __len__ raises packed.
     if isinstance(obj, tuple):
-        return {"__tuple__": True, "value": list(obj)}
+        return {"__tuple__": True, "value": list(iter(obj))}
     if isinstance(obj, dict):
         return dict(obj.items())
     if isinstance(obj, list):
-        return list(obj)
+        return list(iter(obj))
     if isinstance(obj, str):
         return str.__str__(obj)
     if isinstance(obj, int) and type(obj) is not int and -(2**63) <= int.__int__(obj) < 2**64:
