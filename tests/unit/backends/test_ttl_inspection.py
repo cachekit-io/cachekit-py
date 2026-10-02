@@ -368,6 +368,49 @@ class TestFileRefreshEndToEnd:
             thread_a.join(10)
             loop_a.close()
 
+    def test_refresh_on_stopped_loop_frees_key_and_slot(
+        self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh left pending on a loop that stopped without closing (sync code calling
+        run_until_complete) holds neither its key nor a pool slot: a later hit on another loop
+        refreshes another key, then the same key (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 1)
+        get_ttl_calls: list[str] = []
+
+        async def parked_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await asyncio.sleep(3600)  # never answers: the refresh stays pending
+            return None
+
+        file_backend.get_ttl = parked_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        async def hit(x: int) -> None:
+            assert await fetch(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(fetch(0))  # misses: store
+        asyncio.run(fetch(1))
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(hit(0))  # key 0's refresh parks on a loop that is then left stopped
+            asyncio.run(hit(1))  # the parked refresh holds no slot
+            asyncio.run(hit(0))  # nor its key
+            assert len(get_ttl_calls) == 3
+        finally:
+            pending = asyncio.all_tasks(stopped)
+            for t in pending:
+                t.cancel()
+            if pending:
+                stopped.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            stopped.close()
+
     async def test_decorator_refresh_ttl_on_get_slides_file_expiry(self, file_backend: FileBackend) -> None:
         """Behavioural e2e through the real @cache decorator: a hit past the ORIGINAL expiry
         is still served (not recomputed) because refresh_ttl_on_get slid the File TTL forward.

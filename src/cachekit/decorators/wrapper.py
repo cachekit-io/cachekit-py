@@ -858,7 +858,10 @@ def create_cache_wrapper(
 
         The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
         refreshes each tenant's entry. The cap and the per-key check span every thread's event
-        loop: only tasks that are done, or whose loop is closed, are pruned before counting.
+        loop: before counting, a task is pruned only once it is done or its loop is not running.
+        A loop left stopped (run_until_complete, never closed) cannot advance its task, so that
+        task must not hold its key or a slot; should the loop run again, its own references
+        still carry the task to completion.
         """
         nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
         if _ttl_refresh_pid != os.getpid():
@@ -867,7 +870,7 @@ def create_cache_wrapper(
         flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
         with _ttl_refresh_lock:
             for key, t in list(_ttl_refresh_tasks.items()):
-                if t.done() or t.get_loop().is_closed():
+                if t.done() or not t.get_loop().is_running():
                     del _ttl_refresh_tasks[key]
             if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
                 return
