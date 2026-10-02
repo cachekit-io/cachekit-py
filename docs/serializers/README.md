@@ -175,7 +175,13 @@ def get_data():
 > the backend: on Redis, run the `scan_iter` + `unlink` script under *Option 3: Data
 > corruption* in [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch)
 > once per namespace or function (no single `SCAN` pattern both carries the default
-> backend's `t:<tenant>:` key prefix and stops at the namespace boundary); the File backend stores one file per hashed key in `cache_dir`, so the only flush
+> backend's `t:<tenant>:` key prefix and stops at the namespace boundary). The script does
+> not delete shortened keys (a namespace plus function name past about 170 characters):
+> when it prints `shortened keys may belong here`, the namespace is not yet erased. Evict
+> them with `invalidate_cache(<args>)`; if you do not know the arguments, delete the keys
+> its `shortened` pattern matches only once no other namespace or function shares their
+> first 50 characters, or flush the database if it is dedicated to cachekit. The File
+> backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
 > there retire only by TTL. During a rolling deploy, flush **after the last replica still
 > writing the old keys is gone** — anything written behind the flush is orphaned.
