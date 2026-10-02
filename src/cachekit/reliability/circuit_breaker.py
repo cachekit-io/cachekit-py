@@ -198,22 +198,22 @@ class CacheOperationMetrics:
         return self.errors / self.total_operations
 
 
-# Live breakers per namespace. The gauge reads them at scrape time, so a collected breaker
-# leaves the count with no callback: a GC-time callback into prometheus_client could
-# re-enter its non-reentrant locks on the same thread and hang.
+# Live breakers per namespace. The gauge reads them at scrape time, so nothing calls into
+# prometheus_client at GC time, where it could re-enter its non-reentrant locks on the same
+# thread and hang. The only GC-time work is _on_collected's deque append.
 _live_breakers: dict[str, "weakref.WeakSet[CircuitBreaker]"] = {}
 # One lock per process, keyed by pid: a C-level fork skips at-fork hooks, so a child must
 # never take a lock it inherited, possibly held by a thread that is gone.
 _live_locks: dict[int, threading.Lock] = {}
 # Namespaces that lost a breaker. Appended at GC time, which must take no lock;
 # deque.append takes none. _track drains it to retire namespaces with no live breaker.
-_lost_breaker: deque[str] = deque()
+_lost_namespaces: deque[str] = deque()
 _breaker_refs: set["weakref.ref[CircuitBreaker]"] = set()
 
 
 def _on_collected(namespace: str, ref: "weakref.ref[CircuitBreaker]") -> None:
     _breaker_refs.discard(ref)
-    _lost_breaker.append(namespace)
+    _lost_namespaces.append(namespace)
 
 
 def _live_lock() -> threading.Lock:
@@ -249,8 +249,8 @@ def _track(breaker: "CircuitBreaker") -> None:
     with _live_lock():
         _breaker_refs.add(weakref.ref(breaker, functools.partial(_on_collected, breaker.namespace)))
         lost = set()
-        while _lost_breaker:
-            lost.add(_lost_breaker.popleft())
+        while _lost_namespaces:
+            lost.add(_lost_namespaces.popleft())
         lost.discard(breaker.namespace)
         dead = [ns for ns in lost if ns in _live_breakers and not _live_breakers[ns]]
         for ns in dead:

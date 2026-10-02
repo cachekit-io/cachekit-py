@@ -141,7 +141,10 @@ def test_collected_breaker_leaves_the_count():
 
 def test_host_owned_name_does_not_break_the_breaker(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(async_metrics._metrics_cache, "circuit_breaker_state", async_metrics._NoopMetric())
-    _open(_breaker(_namespace()))
+    retired = _breaker(_namespace())
+    del retired
+    gc.collect()
+    _open(_breaker(_namespace()))  # retires the dead namespace through _NoopMetric.remove
 
 
 # Each order runs in a fresh interpreter: the gauge registers once per process.
@@ -193,7 +196,7 @@ def series():
 
 for i in range(2000):
     breaker = CircuitBreaker(CircuitBreakerConfig(), namespace=f"tenant{i}")
-    breaker.cycle = breaker  # freed by cyclic GC as well as by refcount below
+    breaker.cycle = breaker  # only cyclic GC frees it
     del breaker
 gc.collect()
 CircuitBreaker(CircuitBreakerConfig(), namespace="tenant0")  # the next breaker retires the dead ones
@@ -279,7 +282,7 @@ from cachekit.reliability import circuit_breaker as cb
 
 held, release = threading.Event(), threading.Event()
 def hold():
-    with cb._live_lock() if callable(cb._live_lock) else cb._live_lock:  # either shape, so the test can fail red
+    with cb._live_lock():
         held.set()
         release.wait()
 threading.Thread(target=hold, daemon=True).start()

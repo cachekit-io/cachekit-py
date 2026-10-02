@@ -459,10 +459,10 @@ class DecoratorConfig:
 
     @classmethod
     def dev(cls, **kwargs: Any) -> DecoratorConfig:
-        """Development profile: Verbose logging, easy debugging, no Prometheus, integrity checking ON.
+        """Development profile: Verbose logging, easy debugging, no Prometheus except circuit_breaker_state, integrity checking ON.
 
         Use cases: Local development, debugging production issues
-        Trade-offs: Verbose logs, Prometheus disabled for simplicity
+        Trade-offs: Verbose logs, Prometheus metrics disabled for simplicity except circuit_breaker_state
 
         Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
 
