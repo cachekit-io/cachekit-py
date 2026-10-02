@@ -14,7 +14,8 @@ so asserting on a hand-fed argument would pin nothing.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import pytest
 
@@ -507,8 +508,10 @@ class TestInvalidationReachesPre020Keys:
 _LONG_NAMESPACE = "lab6361_" + "n" * 292
 _V019_LONG_KEY = "ns:lab6361_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn:8c42af11facf9cd7e05b02ead5c9bdfc"
 
+_F = TypeVar("_F", bound=Callable[..., Any])
 
-def _pin_identity(fn: Any) -> Any:
+
+def _pin_identity(fn: _F) -> _F:
     """Fix the identity the key hashes, so the literal does not depend on how pytest imports this file."""
     fn.__module__ = "lab6361"
     fn.__qualname__ = "fn"
