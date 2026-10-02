@@ -15,6 +15,8 @@ elsewhere via the `--benchmark-skip` default in `pyproject.toml`.
 fingerprint, an environment pre-flight check (throttling / load), and a timer
 self-calibration (`test_measurement_calibration.py`) — run before trusting any number.
 `gil_benchmark.py` reports serializer thread-scaling under the current interpreter.
+`ft_scaling_bench.py` reports decorated-call thread-scaling, GIL vs no-GIL, in interleaved
+arms (manual; see [docs/free-threading.md](../../docs/free-threading.md#decorated-call-scaling)).
 Run the whole battery with `make perf`; gate regressions with `make perf-compare`.
 
 ---

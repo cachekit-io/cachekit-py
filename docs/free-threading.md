@@ -93,9 +93,32 @@ hiredis is excluded because it does not declare free-threaded support (no
 `Py_mod_gil` slot); redis-py transparently falls back to its pure-Python
 parser. On a GIL build nothing changes — hiredis remains the default parser.
 
+The exclusion also means the lane never sees what a default install gets.
+`pip install cachekit` pulls in hiredis, and on 3.14t importing cachekit with
+hiredis present still re-enables the GIL. `cachekit.hiredis_compat` has to
+import `redis.connection` to clear its `HIREDIS_AVAILABLE` flag, and that
+import loads hiredis. The flag is inert by then anyway: redis-py binds its
+default parser at import time, so the hiredis parser stays the default.
+`tests/unit/test_free_threading.py::test_default_install_keeps_gil_disabled_after_redis_backend`
+checks this in a fresh interpreter. It is marked `xfail(strict=True)`, so it
+turns red the day the GIL stays off and the mark must go.
+`test_gil_stays_disabled_with_hiredis_blocked` is its control: the same check
+with hiredis kept out must pass, so hiredis is the only thing the xfail waits
+on. Both skip where hiredis is not installed, as in this lane, so run them by
+hand in a 3.14t environment that has hiredis:
+
+```bash
+uv sync --python 3.14t --no-default-groups --group test
+uv run --no-sync pytest tests/unit/test_free_threading.py
+```
+
+In that environment `test_gil_stays_disabled_after_importing_cachekit` and the
+session-teardown GIL check also report the re-enabled GIL, because the pytest
+process itself has imported hiredis.
+
 ## Measured performance
 
-A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, CPython 3.14.3 free-threaded build, eight logical CPUs, pinned with `taskset -c 0-7` on a Ryzen 9 5950X) compared no-GIL and GIL cache throughput:
+A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, CPython 3.14.3 free-threaded build, eight logical CPUs, pinned with `taskset -c 0-7` on a Ryzen 9 5950X) compared no-GIL and GIL serializer throughput: `tests/performance/gil_benchmark.py`, which times `StandardSerializer.serialize` alone, not decorated cache calls:
 
 | threads | no-GIL median s (min–max) | GIL median s (min–max) | GIL / no-GIL |
 | --: | --: | --: | --: |
@@ -104,13 +127,68 @@ A post-merge benchmark run (commit `bda770bce822d9a6eff98e555c5f6fd92e509a9c`, C
 | 4 | 1.3402 (1.1175–1.9018) | 3.5293 (3.4629–4.8231) | 2.63x |
 | 8 | 1.1550 (0.8962–1.4837) | 3.6749 (3.5853–4.7236) | 3.18x |
 
-**Measurement conditions:** Five isolated repetitions each; 16,000-operation workload; harness built-in warmup; GIL state asserted via `sys._is_gil_enabled()` at runtime. See [verification comment](https://github.com/cachekit-io/cachekit-py/pull/188#issuecomment-5557418229) for full details.
+**Measurement conditions:** Five isolated repetitions each; 16,000 `serialize` calls (2,000 per thread at eight threads); harness built-in warmup; GIL state asserted via `sys._is_gil_enabled()` at runtime. See [verification comment](https://github.com/cachekit-io/cachekit-py/pull/188#issuecomment-5557418229) for full details.
 
 **Key findings:**
 - **Threaded throughput confirmed.** no-GIL reaches 2.57x one→four-thread scaling (64.2% efficiency) and is 2.63x faster than the GIL arm at four threads.
 - **Single-thread cost confirmed.** no-GIL is 12.6% slower at the single-thread median; however, the ranges overlap (GIL max 3.3807 vs no-GIL min 2.7822).
 
 **Cross-library comparison:** The benchmark measures cachekit operations only. Cross-library throughput (orjson, numpy, pandas, pyarrow) was not run. It waits on orjson, which does not publish free-threaded (`cp314t`) wheels as of 2026-09-29; cross-stack performance will be measured once it does.
+
+### Decorated-call scaling
+
+`tests/performance/ft_scaling_bench.py` measures whole decorated calls, so it
+sees the shared state a real call touches: the L1 lock, per-function stats,
+the metrics path, the Rust `ByteStorage` and the backend client. It is a
+manual bench and no CI job runs it. It runs three cells at 1, 4 and 16
+threads: an L1 hit, an L2 hit over an in-process backend, and an L2 hit
+through the shipped CachekitIO backend against a loopback TLS fake
+(`tests/performance/loopback_saas.py`). The CachekitIO cell measures
+client-side contention only, never service latency. The fake serves each
+connection on one worker thread, so the summary flags a cell `SERVER-BOUND`
+when a worker was more than 80% busy: there the fake, not the client, sets
+the ceiling.
+
+Each process runs one arm. Every repetition runs every arm, in a seeded
+shuffled order, so no arm always follows the same neighbour:
+
+| arm | interpreter | what it shows |
+| --- | --- | --- |
+| `ft-nogil` | free-threaded build, `PYTHON_GIL=0` | the no-GIL result |
+| `ft-nogil-aa` | the same again | the A/A noise floor of this session |
+| `ft-gil` | the same binary, `PYTHON_GIL=1` | the clean GIL vs no-GIL comparison |
+| `ft-default` | the same binary, `PYTHON_GIL` unset | the GIL state the imports leave behind |
+| `gil-build` | a default GIL build | context only: a different binary |
+
+```bash
+uv sync --python 3.14t --no-default-groups --group test   # FT env (UV_PROJECT_ENVIRONMENT=... to keep it apart)
+uv sync --python 3.14 --no-default-groups --group test    # GIL env
+python tests/performance/ft_scaling_bench.py --ft-python <ft-env>/bin/python \
+    --gil-python <gil-env>/bin/python --reps 7 --cpus 0-15 --server-cpus 16-23 --out ft-scaling.jsonl
+```
+
+The primary metric is scaling: calls/s at N threads over calls/s at one
+thread, within one process. A cell is `TAINTED` when a timed call was not a
+hit or a backend call raised, which usually means the backend failed and the
+call fell back to computing; a tainted cell measures that fallback, so it is
+left out of every statistic. The summary gives the median and min–max over
+clean repetitions. Each repetition is a session block that holds every arm,
+so each arm's difference from `ft-nogil` is paired by repetition, with a 95%
+bootstrap CI that resamples whole repetitions; with fewer than five clean
+pairs it prints "insufficient clean reps" instead of a CI. A difference counts
+only if its CI excludes zero and it is larger than the `ft-nogil-aa` floor.
+The driver stops if an arm ran under the wrong GIL state, if `--ft-python` is
+not a free-threaded build, or if `--gil-python` is one. It refuses an existing
+`--out` file so two sessions are never pooled, and the summary refuses a file
+that repeats an arm's repetition. The summary also drops a process whose GIL
+state changed while the cells ran.
+
+Today the CachekitIO cell is tainted under no-GIL. Threads that share one
+backend share one HTTP/2 connection, and httpcore's sync HTTP/2 send path
+allocates stream ids and HPACK-encodes headers outside its locks
+([encode/httpcore#1118](https://github.com/encode/httpcore/pull/1118)). The
+peer then rejects the connection and every request in flight on it fails. The
+race is rare under the GIL and frequent without it.
 
 ## Deferred: declared support + free-threaded wheels
 
