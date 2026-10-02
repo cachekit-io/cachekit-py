@@ -22,6 +22,8 @@ import time_machine
 
 prometheus_client = pytest.importorskip("prometheus_client")
 
+from prometheus_client.samples import Sample  # noqa: E402
+
 from cachekit import cache  # noqa: E402
 from cachekit.decorators import wrapper as wrapper_module  # noqa: E402
 from cachekit.reliability import async_metrics  # noqa: E402
@@ -147,7 +149,7 @@ def test_host_owned_name_does_not_break_the_breaker(monkeypatch: pytest.MonkeyPa
     _open(_breaker(_namespace()))  # retires the dead namespace through _NoopMetric.remove
 
 
-def _namespace_samples(namespace: str) -> list[Any]:
+def _namespace_samples(namespace: str) -> list[Sample]:
     families = (m for m in prometheus_client.REGISTRY.collect() if m.name == "circuit_breaker_state")
     return [s for m in families for s in m.samples if s.labels.get("namespace") == namespace]
 
