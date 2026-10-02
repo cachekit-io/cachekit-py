@@ -17,18 +17,19 @@ class BackendErrorType(str, Enum):
     """Error classification for circuit breaker decisions.
 
     Inherits from str for JSON serialization and string comparisons.
-    The type decides whether the error counts as a circuit breaker failure:
+    By default the circuit breaker counts every type as a failure; list types in
+    ``CircuitBreakerConfig.excluded_error_types`` to stop them counting.
 
-    - TRANSIENT: Temporary failure, counts as a circuit breaker failure
-    - PERMANENT: Unfixable error, does not count as a circuit breaker failure
-    - TIMEOUT: Operation exceeded time limit, counts as a circuit breaker failure
-    - AUTHENTICATION: Credential/auth issue, alert operations team; does not count
-    - UNKNOWN: Unclassified error, counted like transient and logged for investigation
+    - TRANSIENT: Temporary failure (connection lost, rate limit, server error)
+    - PERMANENT: Unfixable error (bad input, client error)
+    - TIMEOUT: Operation exceeded time limit
+    - AUTHENTICATION: Credential/auth issue, alert operations team
+    - UNKNOWN: Unclassified error, log for investigation
 
     Example:
         >>> error = BackendError("Connection lost", error_type=BackendErrorType.TRANSIENT)
         >>> if error.is_transient:
-        ...     # Counts toward opening the circuit breaker
+        ...     # Temporary: the next request may succeed
         ...     pass
     """
 
@@ -115,36 +116,36 @@ class BackendError(Exception):
 
     @property
     def is_transient(self) -> bool:
-        """Temporary failure; counts as a circuit breaker failure.
+        """Temporary failure; the next request may succeed.
 
         Example:
             >>> error = BackendError("Temp failure", error_type=BackendErrorType.TRANSIENT)
             >>> if error.is_transient:
-            ...     # Counts toward opening the circuit breaker
+            ...     # Temporary: the next request may succeed
             ...     pass
         """
         return self.error_type == BackendErrorType.TRANSIENT
 
     @property
     def is_permanent(self) -> bool:
-        """Unfixable error; does not count as a circuit breaker failure.
+        """Unfixable error; repeating the request fails the same way.
 
         Example:
             >>> error = BackendError("Invalid key", error_type=BackendErrorType.PERMANENT)
             >>> if error.is_permanent:
-            ...     # Log and alert; the circuit breaker ignores it
+            ...     # Log and alert
             ...     pass
         """
         return self.error_type == BackendErrorType.PERMANENT
 
     @property
     def is_timeout(self) -> bool:
-        """Operation exceeded its time limit; counts as a circuit breaker failure.
+        """Operation exceeded its time limit.
 
         Example:
             >>> error = BackendError("Operation timeout", error_type=BackendErrorType.TIMEOUT)
             >>> if error.is_timeout:
-            ...     # Counts toward opening the circuit breaker
+            ...     # Check backend latency and timeout settings
             ...     pass
         """
         return self.error_type == BackendErrorType.TIMEOUT
@@ -156,7 +157,7 @@ class BackendError(Exception):
         Example:
             >>> error = BackendError("Invalid creds", error_type=BackendErrorType.AUTHENTICATION)
             >>> if error.is_authentication:
-            ...     # Alert ops; the circuit breaker ignores it
+            ...     # Alert ops
             ...     pass
         """
         return self.error_type == BackendErrorType.AUTHENTICATION
