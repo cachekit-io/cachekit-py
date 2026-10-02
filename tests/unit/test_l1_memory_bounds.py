@@ -432,7 +432,9 @@ class TestCleanupThreadAfterFork:
             queue = ctx.Queue()
 
             def child(q) -> None:
-                lock = busy._state.lock  # the hook found it free at fork and kept it
+                busy._state.cache["child-entry"] = CacheEntry(b"v", time.time() + 60, 1)  # no put: no take-over yet
+                busy._state.memory_bytes += 1
+                lock = busy._state.lock  # the hook's fresh state
                 held, release = threading.Event(), threading.Event()
 
                 def hold() -> None:
@@ -446,7 +448,7 @@ class TestCleanupThreadAfterFork:
                 other.put("k", b"v")  # first put runs the take-over while a live child thread holds busy-ns
                 release.set()
                 holder.join(5)
-                q.put({"same_lock": busy._state.lock is lock, "found": busy.get("pre-fork")[0]})
+                q.put({"same_lock": busy._state.lock is lock, "found": busy.get("child-entry")[0]})
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -464,7 +466,8 @@ class TestCleanupThreadAfterFork:
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     @pytest.mark.parametrize("two_managers", [False, True], ids=["one-manager", "two-managers"])
-    def test_at_fork_hook_repairs_every_cache_when_its_warning_raises(self, two_managers):
+    def test_forked_child_starts_with_an_empty_l1(self, two_managers):
+        """Every cache is empty in the child: one whose lock was free at fork, and one a parent thread held."""
         import multiprocessing
         import queue as queue_mod
 
@@ -472,36 +475,34 @@ class TestCleanupThreadAfterFork:
 
         first = L1CacheManager(default_max_memory_mb=10)
         second = L1CacheManager(default_max_memory_mb=10) if two_managers else first
-        caches = [first.get_cache("raising-ns"), second.get_cache("later-ns")]
+        free, held_ns = first.get_cache("free-at-fork-ns"), second.get_cache("held-at-fork-ns")
+        caches = [free, held_ns]
+        for cache in caches:
+            cache.put("pre-fork", b"v", redis_ttl=60)
+        held, release = threading.Event(), threading.Event()
 
-        class RaiseOnDropWarning(logging.Filter):
-            def filter(self, record: logging.LogRecord) -> bool:
-                # Only this test's first cache: a drop warning from any other live manager passes.
-                if record.args and record.args[0] == "raising-ns":
-                    raise RuntimeError("filter failed")
-                return True
-
-        raising = RaiseOnDropWarning()
-        l1_cache.logger.addFilter(raising)
-        held, release = [threading.Event() for _ in caches], threading.Event()
-
-        def hold(cache: L1Cache, done: threading.Event) -> None:
-            with cache._state.lock:
-                done.set()
+        def hold() -> None:
+            with held_ns._state.lock:  # a parent thread mid-critical-section when the fork lands
+                held.set()
                 release.wait()
 
-        holders = [threading.Thread(target=hold, args=pair, daemon=True) for pair in zip(caches, held, strict=True)]
-        for holder in holders:
-            holder.start()
-        assert all(event.wait(5) for event in held)
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert held.wait(5)
         try:
             ctx = multiprocessing.get_context("fork")
             queue = ctx.Queue()
 
             def child(q) -> None:
                 # From the child's main thread: a lock the hook left orphaned hangs here for good.
-                found = [cache.get("k")[0] for cache in caches]
-                q.put({"found": found, "hooked": l1_cache._hooked_pid == os.getpid()})
+                outcome = {
+                    "found": [cache.get("pre-fork")[0] for cache in caches],
+                    "bytes": [cache._state.memory_bytes for cache in caches],
+                    "hooked": l1_cache._hooked_pid == os.getpid(),
+                }
+                free.put("child", b"v")
+                outcome["child_put"] = free.get("child")
+                q.put(outcome)
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -514,15 +515,15 @@ class TestCleanupThreadAfterFork:
                 if process.is_alive():  # a hung child would otherwise block pytest's exit
                     process.kill()
 
-            assert outcome == {"found": [False, False], "hooked": True}
+            assert outcome == {"found": [False, False], "bytes": [0, 0], "hooked": True, "child_put": (True, b"v")}
             assert process.exitcode == 0
+            assert free.get("pre-fork") == (True, b"v")  # the parent keeps its own entries
         finally:
-            l1_cache.logger.removeFilter(raising)
             release.set()
-            for holder in holders:
-                holder.join(5)
+            holder.join(5)
 
-    def test_at_fork_hook_reraises_only_after_repairing_every_cache(self, monkeypatch):
+    def test_at_fork_hook_publishes_fresh_states_without_taking_a_lock(self, monkeypatch):
+        """The hook replaces each state in one store: no clear in place, no lock acquired."""
         import weakref
 
         from cachekit import l1_cache
@@ -530,28 +531,28 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet([manager]))  # leave the global manager alone
         monkeypatch.setattr(l1_cache, "_hooked_pid", None)  # restored after the in-process hook call
-        caches = [manager.get_cache("raising-ns"), manager.get_cache("later-ns")]
-        orphaned = []
+        caches = [manager.get_cache("free-ns"), manager.get_cache("held-ns")]
         for cache in caches:
             cache.put("pre-fork", b"v")
-            cache._state.lock.acquire()  # _is_owned(): the hook resets it, as for a hold orphaned at fork
-            orphaned.append(cache._state.lock)
+        old = [cache._state for cache in caches]
+        held, release = threading.Event(), threading.Event()
 
-        class RaiseOnDropWarning(logging.Filter):
-            def filter(self, record: logging.LogRecord) -> bool:
-                if record.args and record.args[0] == "raising-ns":
-                    raise RuntimeError("filter failed")
-                return True
+        def hold() -> None:
+            with old[1].lock:  # another thread's hold: acquiring it would block the hook
+                held.set()
+                release.wait(10)
 
-        raising = RaiseOnDropWarning()
-        l1_cache.logger.addFilter(raising)
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert held.wait(5)
         try:
-            with pytest.raises(RuntimeError, match="filter failed"):  # reported, not swallowed
-                l1_cache._reset_cache_locks_after_fork()
+            assert _on_new_thread(l1_cache._empty_caches_after_fork, timeout=5) is None  # returned, never blocked
         finally:
-            l1_cache.logger.removeFilter(raising)
+            release.set()
+            holder.join(5)
 
-        assert [cache._state.lock is lock for cache, lock in zip(caches, orphaned, strict=True)] == [False, False]
+        assert [cache._state is state for cache, state in zip(caches, old, strict=True)] == [False, False]
+        assert [list(state.cache) for state in old] == [["pre-fork"], ["pre-fork"]]  # a holder finishes on its own
         assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
         assert l1_cache._hooked_pid == os.getpid()
 
