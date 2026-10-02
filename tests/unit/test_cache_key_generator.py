@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID
 
@@ -43,6 +43,29 @@ class TestCacheKeyGenerator:
         assert isinstance(key, str)
         assert len(key) > 0
         assert "test_func" in key
+
+    def test_non_str_modules_that_compare_equal_keep_distinct_keys(self, key_generator):
+        """1, True and 1.0 compare equal but format differently, so their keys must differ."""
+        funcs = []
+        for module in (1, True, 1.0):
+
+            def g():
+                pass
+
+            g.__module__ = module
+            funcs.append(g)
+        keys = {key_generator.generate_key(g, (), {}) for g in funcs}
+        assert len(keys) == 3
+
+    def test_qualname_change_still_changes_key(self, key_generator):
+        """A later ``__qualname__`` change still changes the key; guards against capturing the name at decoration time."""
+
+        def func(x):
+            return x
+
+        before = key_generator.generate_key(func, (1,), {})
+        func.__qualname__ = "renamed"
+        assert key_generator.generate_key(func, (1,), {}) != before
 
     def test_key_includes_function_module_and_name(self, key_generator):
         """Test that key includes function module and name."""
@@ -405,6 +428,46 @@ class TestExtendedTypeNormalization:
 
         assert key1 == key2
         assert key1 != key3
+
+    def test_int_and_str_enum_members_normalize_to_plain_value(self, key_generator):
+        """IntEnum and str-mixin Enums are int/str subclasses but must take the Enum branch.
+
+        The primitive fast path matches exact types only; an isinstance match would
+        return the member itself, which msgpack strict_types rejects (LAB-7068).
+        """
+
+        class Level(IntEnum):
+            LOW = 1
+
+        class Mode(str, Enum):
+            FAST = "fast"
+
+        assert type(key_generator._normalize(Level.LOW)) is int
+        assert type(key_generator._normalize(Mode.FAST)) is str
+
+        def func(x):
+            return x
+
+        assert key_generator.generate_key(func, (Level.LOW,), {}) == key_generator.generate_key(func, (1,), {})
+        assert key_generator.generate_key(func, (Mode.FAST,), {}) == key_generator.generate_key(func, ("fast",), {})
+
+    def test_float_subclass_with_unhashable_metaclass_still_normalizes(self, key_generator):
+        """The fast path must not hash the argument's type (LAB-7068).
+
+        A float subclass whose metaclass is unhashable keys like 0.0 on the slow path;
+        a set-membership type check would raise TypeError instead.
+        """
+
+        class UnhashableType(type):
+            __hash__ = None  # type: ignore[assignment]
+
+        class NegativeZero(float, metaclass=UnhashableType):
+            pass
+
+        def func(x):
+            return x
+
+        assert key_generator.generate_key(func, (NegativeZero(-0.0),), {}) == key_generator.generate_key(func, (0.0,), {})
 
     def test_datetime_utc_only(self, key_generator):
         """Datetime normalizes to ISO format (UTC required)."""

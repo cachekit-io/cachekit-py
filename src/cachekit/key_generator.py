@@ -237,6 +237,15 @@ class CacheKeyGenerator:
         if _array_bytes_seen is None:
             _array_bytes_seen = [0]
 
+        # Fast path: exact primitives skip the isinstance ladder below (LAB-7068). Matched by
+        # exact type, not isinstance(): subclasses (IntEnum, StrEnum, str-mixin Enums) must still
+        # reach the Enum branch so their keys stay what they are today. float is excluded because
+        # -0.0 must reach the float branch to be normalised to 0.0. Identity checks, not set
+        # membership, so the type is never hashed or compared through a metaclass __eq__.
+        t = type(obj)  # pyright: ignore[reportUnknownVariableType]
+        if t is int or t is str or t is bytes or t is bool or obj is None:
+            return obj
+
         # === COLLECTIONS (recursive) ===
         if isinstance(obj, dict):
             return {k: self._normalize(v, _array_bytes_seen) for k, v in sorted(obj.items())}
@@ -443,6 +452,9 @@ class CacheKeyGenerator:
         This replaces every disallowed char with ``_``, collapses runs of
         ``..`` into a single ``.``, and truncates to 200 chars.  The mapping
         is deterministic: same function → same key.
+
+        Deliberately not memoised (LAB-7068): a shared memo was slower under
+        free-threading than recomputing.
         """
         raw = f"{module}.{qualname}"
         sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)
