@@ -511,39 +511,79 @@ class _FakeWorker:
         pass
 
 
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.disconnects = 0
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+
+
+class _FakePubSub:
+    """A PubSub whose worker hits ``error`` before run_in_thread() returns, the earliest it can."""
+
+    def __init__(self, error: Optional[BaseException] = None) -> None:
+        self.connection = _FakeConnection()
+        self.error = error
+        self.worker = _FakeWorker()
+
+    def subscribe(self, **handlers: Any) -> None:
+        pass
+
+    def run_in_thread(self, sleep_time: float, daemon: bool, exception_handler: Any) -> _FakeWorker:
+        if self.error is not None:
+            exception_handler(self.error, self, self.worker)
+        return self.worker
+
+    def close(self) -> None:
+        pass
+
+
 @pytest.mark.unit
 class TestListenerErrors:
-    """What the worker thread's exception handler does with each kind of failure."""
+    """The worker thread's exception handler: it retries and never changes who owns the listener."""
 
-    def test_a_refused_command_retires_the_listener_for_a_later_restart(
+    def test_a_refused_subscription_waits_then_reconnects_to_subscribe_again(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        worker = _FakeWorker()
-        monkeypatch.setattr(invalidation, "_listener", (object(), worker))
-        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
-        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
-            invalidation._on_listener_error(redis.exceptions.NoPermissionError("NOPERM no channel"), None, worker)
-        assert worker.stopped and invalidation._listener is None and invalidation._listener_pid is None
-        assert invalidation._start_retry_at > time.monotonic() + 50  # a cache operation restarts it later
-        assert "Invalidation listener stopped" in caplog.text and "NOPERM" not in caplog.text
-
-    def test_a_connection_error_keeps_the_listener_and_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        worker, slept = _FakeWorker(), []
-        listener = (object(), worker)
+        pubsub, slept = _FakePubSub(), []
+        listener = (pubsub, pubsub.worker)
         monkeypatch.setattr(invalidation, "_listener", listener)
         monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
         monkeypatch.setattr(invalidation.time, "sleep", slept.append)
-        invalidation._on_listener_error(redis.ConnectionError("lost"), None, worker)
-        assert slept == [1.0] and not worker.stopped
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._on_listener_error(redis.exceptions.NoPermissionError("NOPERM no channel"), pubsub, pubsub.worker)
+        assert slept == [invalidation._RESUBSCRIBE_SECONDS] and pubsub.connection.disconnects == 1
+        assert not pubsub.worker.stopped  # the thread's next read reconnects, and on_connect subscribes again
+        assert invalidation._listener is listener and invalidation._listener_pid == os.getpid()
+        assert "Invalidation listener refused by Redis" in caplog.text and "NOPERM" not in caplog.text
+
+    def test_a_connection_error_waits_a_second_and_keeps_the_connection_to_redis_py(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pubsub, slept = _FakePubSub(), []
+        listener = (pubsub, pubsub.worker)
+        monkeypatch.setattr(invalidation, "_listener", listener)
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
+        monkeypatch.setattr(invalidation.time, "sleep", slept.append)
+        invalidation._on_listener_error(redis.ConnectionError("lost"), pubsub, pubsub.worker)
+        assert slept == [1.0] and pubsub.connection.disconnects == 0 and not pubsub.worker.stopped
         assert invalidation._listener is listener and invalidation._listener_pid == os.getpid()
 
-    def test_a_retired_thread_never_forgets_a_newer_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        old, new = _FakeWorker(), _FakeWorker()
-        current = (object(), new)
-        monkeypatch.setattr(invalidation, "_listener", current)
-        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
-        invalidation._on_listener_error(redis.exceptions.ResponseError("ERR"), None, old)
-        assert old.stopped and invalidation._listener is current and invalidation._listener_pid == os.getpid()
+    def test_a_refusal_before_the_start_records_the_thread_leaves_a_listener_that_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worker can fail before run_in_thread() returns. Its handler changes no ownership, so
+        the start still records a live thread, and that thread keeps subscribing again."""
+        pubsub = _FakePubSub(error=redis.exceptions.NoPermissionError("NOPERM"))
+        monkeypatch.setattr(invalidation.redis, "Redis", lambda connection_pool: types.SimpleNamespace(pubsub=lambda: pubsub))
+        monkeypatch.setattr(invalidation.time, "sleep", lambda seconds: None)
+        backend = types.SimpleNamespace(listener_pool=lambda: None)
+
+        invalidation.start_listener(backend)
+
+        assert invalidation._listener == (pubsub, pubsub.worker) and invalidation._listener_pid == os.getpid()
+        assert not pubsub.worker.stopped and pubsub.connection.disconnects == 1
 
 
 def _hold(lock: threading.Lock, held: threading.Event, release: threading.Event) -> None:

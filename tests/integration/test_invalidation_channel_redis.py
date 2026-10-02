@@ -504,12 +504,13 @@ class TestListenerConfiguration:
         assert len(client.client_list()) == before  # no dedicated connection (the shared pool's is reused)
         assert not [t for t in threading.enumerate() if t.name == "cachekit-invalidation-listener"]
 
-    def test_refused_subscription_fails_the_start_and_a_later_grant_takes_effect(
+    def test_refused_subscription_is_retried_until_a_grant_with_no_cache_operation(
         self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Redis 7+ gives a new ACL user no channels: SUBSCRIBE is refused. The start waits for the
-        confirmation, so the process never believes it listens; granting the channel later takes
-        effect on the next start, with no restart."""
+        """Redis 7+ gives a new ACL user no channels, so its SUBSCRIBE is refused. The listener keeps
+        subscribing again on its own, so a later grant takes effect while the process serves nothing
+        but L1 hits."""
+        monkeypatch.setattr(invalidation, "_RESUBSCRIBE_SECONDS", 0.2)
         user, password = "ck-chan-nosub", "ck-chan-nosub-pw"  # pragma: allowlist secret - throwaway ACL user
         client.acl_setuser(user, enabled=True, passwords=[f"+{password}"], keys=["*"], commands=["+@all"], reset_channels=True)
         try:
@@ -518,13 +519,12 @@ class TestListenerConfiguration:
             fn = worker.cached_lookup(restricted, namespace=ns)
             with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
                 assert fn(1) == 10  # the cache operation is unaffected
-            assert "Invalidation listener failed to start" in caplog.text and "NoPermissionError" in caplog.text
-            assert invalidation._listener_pid is None and _subscribers(client) == 0
+                assert _wait_for(lambda: "Invalidation listener refused by Redis" in caplog.text, timeout=10)
+            assert "NoPermissionError" in caplog.text and _subscribers(client) == 0
+            assert invalidation._listener_pid == os.getpid()  # a listener that keeps trying
 
             client.acl_setuser(user, enabled=True, channels=[invalidation.CHANNEL])  # enabled: SETUSER defaults to off
-            monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))  # the retry window passed
-            assert fn(2) == 20  # a cache operation that reaches Redis starts it again
-            assert invalidation._listener_pid == os.getpid() and _wait_for(lambda: _subscribers(client) == 1)
+            assert _wait_for(lambda: _subscribers(client) == 1, timeout=10)  # no cache operation in between
             evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
             _run_peer(client, f"invalidate([1], {ns!r})")
             assert _wait_for(lambda: len(evictions) == 1, timeout=5)
@@ -533,9 +533,10 @@ class TestListenerConfiguration:
         finally:
             client.acl_deluser(user)
 
-    def test_subscription_revoked_while_running_retires_the_listener(
-        self, client: redis.Redis, listening: None, caplog: pytest.LogCaptureFixture
+    def test_subscription_revoked_while_running_comes_back_when_granted_again(
+        self, client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        monkeypatch.setattr(invalidation, "_RESUBSCRIBE_SECONDS", 0.2)
         user, password = "ck-chan-revoked", "ck-chan-revoked-pw"  # pragma: allowlist secret - throwaway ACL user
         client.acl_setuser(user, enabled=True, passwords=[f"+{password}"], keys=["*"], channels=["*"], commands=["+@all"])
         try:
@@ -545,8 +546,12 @@ class TestListenerConfiguration:
             assert invalidation._listener_pid == os.getpid() and _wait_for(lambda: _subscribers(client) == 1)
             with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
                 client.acl_setuser(user, enabled=True, reset_channels=True)  # Redis drops the now-forbidden subscription
-                assert _wait_for(lambda: "Invalidation listener stopped" in caplog.text, timeout=15)
-            assert invalidation._listener_pid is None and _subscribers(client) == 0
+                assert _wait_for(lambda: "Invalidation listener refused by Redis" in caplog.text, timeout=15)
+            assert _subscribers(client) == 0 and invalidation._listener_pid == os.getpid()
+
+            client.acl_setuser(user, enabled=True, channels=[invalidation.CHANNEL])
+            assert _wait_for(lambda: _subscribers(client) == 1, timeout=10)  # back, with no cache operation
+            invalidation._stop_listener()
             restricted.close()
         finally:
             client.acl_deluser(user)

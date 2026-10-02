@@ -49,8 +49,8 @@ _MAX_EVENT_BYTES = 4096
 # A listener that failed to start is retried by a cache operation this much later, not by every
 # one: during an outage each attempt can wait out a connect timeout.
 _START_RETRY_SECONDS = 60.0
-# How long a start waits for Redis to confirm the subscription.
-_SUBSCRIBE_CONFIRM_SECONDS = 5.0
+# A running listener whose subscription Redis refuses subscribes again this much later.
+_RESUBSCRIBE_SECONDS = 60.0
 
 # uWSGI options under which a worker runs Python's at-fork hooks, or imports the app after the fork.
 _UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
@@ -245,9 +245,10 @@ def start_listener(backend: Any) -> None:
     """Start this process's listener on ``backend``'s Redis, unless another thread is starting it.
 
     Never raises and never waits for another thread. Sync; async callers run it through
-    asyncio.to_thread, as it connects and subscribes. A failed start is a WARNING, and a cache
-    operation retries it _START_RETRY_SECONDS later. Once started, reconnecting is redis-py's: the
-    worker thread's next read reconnects, and the connection's on_connect callback re-subscribes.
+    asyncio.to_thread, as it connects and subscribes. A failed start (Redis unreachable) is a
+    WARNING, and a cache operation that reaches Redis retries it _START_RETRY_SECONDS later. Once
+    started, the listener is this process's until it exits, and its worker thread alone deals with
+    what Redis does next (_on_listener_error), a refused subscription included.
     """
     global _listener, _listener_pid, _start_retry_at
     lock = _pid_lock(_start_locks)
@@ -260,7 +261,6 @@ def start_listener(backend: Any) -> None:
         try:
             pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
             pubsub.subscribe(**{CHANNEL: _on_message})
-            _confirm_subscription(pubsub)
             thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
         except Exception as e:
             if pubsub is not None:
@@ -284,15 +284,6 @@ def start_listener(backend: Any) -> None:
     logger.info("Invalidation listener started: pid=%d channel=%s", os.getpid(), CHANNEL)
 
 
-def _confirm_subscription(pubsub: Any) -> None:
-    """Wait for Redis to confirm the SUBSCRIBE. redis-py only sends it, so a subscription Redis refuses
-    (an ACL without the channel, the Redis 7 default for a new user) would otherwise surface later,
-    in the worker thread, with this process believing it listens."""
-    reply = pubsub.get_message(timeout=_SUBSCRIBE_CONFIRM_SECONDS)  # raises on a refusal (NoPermissionError)
-    if reply is None or reply.get("type") != "subscribe":
-        raise redis.ConnectionError("Redis did not confirm the subscription")
-
-
 def _on_message(message: dict[str, Any]) -> None:
     """Handle one event in the listener thread. Never raises: a bad event is dropped and the
     listener keeps running. Never logs the registry id or key: a forged event carries the sender's
@@ -312,31 +303,28 @@ def _on_message(message: dict[str, Any]) -> None:
 def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
     """Called by redis-py's worker thread instead of dying. Events published meanwhile are lost.
 
-    A connection error: the thread's next read reconnects and re-subscribes, after a second's wait so
-    a Redis that is down is not spun on. A command Redis refused, above all a re-subscription an ACL
-    now denies: redis-py would send it again only on its next reconnect, so the listener is retired,
-    and a cache operation starts a new one, which confirms its subscription, _START_RETRY_SECONDS later.
+    It never stops the thread or touches who owns the listener, so it cannot race the start that
+    records the thread, and the retry needs no cache operation: a process serving only L1 hits
+    recovers too. A connection error: the thread's next read reconnects, and the connection's
+    on_connect callback subscribes again, after a second's wait so a Redis that is down is not spun
+    on. A command Redis refused, a SUBSCRIBE an ACL denies above all (Redis 7 gives a new ACL user no
+    channels): redis-py sends the SUBSCRIBE again only on a reconnect, so the thread waits
+    _RESUBSCRIBE_SECONDS and drops the connection, and its next read reconnects and subscribes again.
+    A grant therefore takes effect within that wait, with no restart.
     """
     if isinstance(error, redis.ResponseError):
-        _retire(thread)
         logger.warning(
-            "Invalidation listener stopped: Redis refused it; a cache operation retries in %d s: %s",
-            _START_RETRY_SECONDS,
+            "Invalidation listener refused by Redis; subscribing again in %d s: %s",
+            _RESUBSCRIBE_SECONDS,
             redact_error_for_log(error),
         )
+        time.sleep(_RESUBSCRIBE_SECONDS)
+        connection = pubsub.connection
+        if connection is not None:
+            connection.disconnect()
         return
     logger.warning("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
     time.sleep(1.0)
-
-
-def _retire(thread: Any) -> None:
-    """Stop ``thread``'s loop and, if it is this process's listener, forget it so a cache operation
-    can start another after the retry window."""
-    global _listener, _listener_pid, _start_retry_at
-    thread.stop()
-    if _listener is not None and _listener[1] is thread:
-        _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
-        _listener, _listener_pid = None, None
 
 
 def _stop_listener() -> None:
