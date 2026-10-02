@@ -6,6 +6,7 @@ Async methods mirror the same logic and are not duplicated here.
 
 from __future__ import annotations
 
+import os
 import string
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -58,11 +59,11 @@ def mock_sync_client() -> Any:
     client = MagicMock(spec=httpx.Client)
     with patch(
         "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-        return_value=MagicMock(client=client),
+        return_value=MagicMock(pid=os.getpid(), client=client),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
         ):
             yield client
 
@@ -256,11 +257,11 @@ class TestInit:
         monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
         with patch(
             "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
         ):
             with patch(
                 "cachekit.backends.cachekitio.backend.lease_async_http_client",
-                return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+                return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
             ):
                 b = CachekitIOBackend()
                 assert b._config.api_key.get_secret_value() == _TEST_API_KEY

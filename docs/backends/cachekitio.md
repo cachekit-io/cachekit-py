@@ -184,6 +184,9 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
   thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
   attempt. A sync-only caller never builds an async client
+- Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
+  opens its own connections on its first request and never reuses its parent's, so a backend built
+  before the fork works in every worker
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 
