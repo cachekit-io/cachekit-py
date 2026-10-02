@@ -51,6 +51,16 @@ def test_compare_thresholds(measured: int, verdict: str, ok: bool) -> None:
     assert passed is ok
 
 
+@pytest.mark.parametrize(
+    ("measured", "verdict", "ok"),
+    [(100_999, "ok", True), (101_000, "WARN", True), (101_999, "WARN", True), (102_000, "FAIL", False), (98_000, "LOWER", True)],
+)
+def test_compare_gates_orjson_at_its_own_tolerance(measured: int, verdict: str, ok: bool) -> None:
+    lines, passed = compare({"serializer_orjson": 100_000}, {"serializer_orjson": measured})
+    assert lines[0].split()[0] == verdict
+    assert passed is ok
+
+
 def test_compare_fails_a_path_without_a_budget() -> None:
     lines, passed = compare({}, {"l1_hit": 1})
     assert not passed

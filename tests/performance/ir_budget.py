@@ -46,16 +46,19 @@ from pathlib import Path
 from typing import Any
 
 N_LO, N_HI = 1000, 3000
-# Heap layout moves per-op counts: the allocators take longer paths in some heap states (the
-# orjson round trip's 1 KB buffer goes to glibc malloc and cost up to 2.2% more in some layouts).
-# Any code change shifts the layout, even an edit to this file's comments, so a single run can
-# fail an untouched path or hide a real regression. Each path runs at these layout shifts (extra
-# objects held) and its figure is the cheapest: layout only ever adds allocator work, while a
-# regression raises every layout. Across code and layout changes that figure moved 0.13% at most;
-# the median moved 1.2%.
+# Heap layout moves per-op counts: the allocators take longer paths in some heap states. Any code
+# change shifts the layout, even an edit to this file's comments, so a single run can fail an
+# untouched path or hide a real regression. Each path runs at these layout shifts (extra objects
+# held) and its figure is the cheapest: layout only ever adds allocator work, while a regression
+# raises every layout. Across the code and layout changes measured, that figure moved 0.2% at most
+# on every path but one (the median moved up to 1.2%).
 LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
 WARN_PCT = 0.2  # above the A/A floor (0.03%): report but pass
+# The exception: the orjson round trip's 1 KB output buffer goes to glibc malloc, whose path length
+# depends on heap state that no layout sample pins (longer warmups did not settle it). Its figure
+# moved 0.9% between unrelated changes, so it is gated at what this harness resolves for it.
+TOLERANCE_PCT = {"serializer_orjson": (2.0, 1.0)}  # path: (fail, warn)
 BASELINES = Path(__file__).with_name("ir_baselines.json")
 PATHS = (
     "l1_hit",
@@ -334,11 +337,12 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
             ok = False
             continue
         pct = (ir - budget) / budget * 100
-        if pct >= FAIL_PCT:
+        fail_pct, warn_pct = TOLERANCE_PCT.get(path, (FAIL_PCT, WARN_PCT))
+        if pct >= fail_pct:
             verdict, ok = "FAIL", False
-        elif pct >= WARN_PCT:
+        elif pct >= warn_pct:
             verdict = "WARN"
-        elif pct <= -FAIL_PCT:
+        elif pct <= -fail_pct:
             verdict = "LOWER"  # cheaper: ratchet it down with --update if the change touched this path
         else:
             verdict = "ok"

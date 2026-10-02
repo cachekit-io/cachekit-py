@@ -398,7 +398,7 @@ perf-compare: benchmark-compare ## Perf regression gate: fail on >10% median ser
 # Deterministic hot-path gate: main-thread callgrind instructions per op, fail at >=+1% vs the
 # budgets in tests/performance/ir_baselines.json (keyed per interpreter). Needs valgrind and the
 # release extension `uv sync` builds. See docs/performance.md, "Instruction budgets".
-perf-ir: ## Instruction-count gate: fail on >=1% per-op regression on any hot path (needs valgrind)
+perf-ir: ## Instruction-count gate: fail on >=1% per-op regression (orjson 2%; needs valgrind)
 	@uv run python tests/performance/ir_budget.py
 
 perf-ir-update: ## Ratchet instruction budgets down to the measured figures (never up)

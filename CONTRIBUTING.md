@@ -267,7 +267,7 @@ make build-pgo  # Profile-Guided Optimization (5-8% faster)
 ```bash
 make perf               # Full battery: env fingerprint + timer calibration, serializer benchmarks, GIL scaling
 make perf-compare       # Regression gate: fail on >10% median serializer regression vs baseline
-make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression on any hot path (needs valgrind)
+make perf-ir            # Instruction-count gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind)
 make perf-ir-update     # Ratchet the committed instruction budgets down to the measured figures
 
 make benchmark          # Serializer benchmarks only + save a local baseline
@@ -284,7 +284,9 @@ self-calibrates the timer, so numbers come with the context needed to trust them
 
 `make perf-ir` is the deterministic one: it counts main-thread instructions per call under
 valgrind against budgets committed in `tests/performance/ir_baselines.json`, so a 1% regression
-is visible on any machine. Method and budgets: [docs/performance.md](docs/performance.md#instruction-budgets).
+is visible however loaded the machine is. Budgets belong to the build that recorded them; on a
+different interpreter, extension or C library, record a baseline on `main` first. Method and
+budgets: [docs/performance.md](docs/performance.md#instruction-budgets).
 
 ### Formatting Code
 

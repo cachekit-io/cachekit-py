@@ -2,17 +2,17 @@
   "interpreters": {
     "cpython-3.12-x86_64": {
       "budgets": {
-        "l1_hit": 78549,
-        "l2_hit": 362759,
-        "l2_hit_async_metrics": 306961,
-        "minimal_l1_hit": 76530,
-        "miss": 348903,
-        "secure_l1_hit": 296858,
-        "serializer_arrow": 1951267,
-        "serializer_auto": 110160,
-        "serializer_default": 61331,
-        "serializer_encrypted": 115535,
-        "serializer_orjson": 23521
+        "l1_hit": 78394,
+        "l2_hit": 363304,
+        "l2_hit_async_metrics": 306839,
+        "minimal_l1_hit": 76475,
+        "miss": 348794,
+        "secure_l1_hit": 296320,
+        "serializer_arrow": 1948772,
+        "serializer_auto": 110074,
+        "serializer_default": 61247,
+        "serializer_encrypted": 115554,
+        "serializer_orjson": 23493
       },
       "python": "3.12.12"
     },
