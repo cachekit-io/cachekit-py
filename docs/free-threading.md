@@ -103,7 +103,7 @@ fails and it binds its pure-Python parser (`_RESP2Parser`). The decision reads
 
 | `CACHEKIT_DISABLE_HIREDIS` | GIL build | free-threaded build |
 |---|---|---|
-| unset | hiredis | pure-Python parser, GIL stays off |
+| unset | hiredis | pure-Python parser, GIL stays off (if the GIL is already on, for example `-X gil=1`: hiredis) |
 | `true` | pure-Python parser | pure-Python parser, GIL stays off |
 | `false` | hiredis | hiredis, GIL re-enabled for the process |
 

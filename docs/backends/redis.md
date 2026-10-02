@@ -63,7 +63,7 @@ Query options in `redis_url` override the pool fields above, because redis-py's 
 
 redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. `CACHEKIT_DISABLE_HIREDIS=true` keeps hiredis out and gives every connection redis-py's pure-Python parser. cachekit applies it at `import cachekit`, so import cachekit before redis; if hiredis is already loaded it logs a warning and the setting cannot take effect. The block is process-wide: any later `import hiredis` in the process raises `ImportError`.
 
-Unset, a GIL build keeps hiredis and a free-threaded build drops it, because importing hiredis there re-enables the GIL. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on both. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
+Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is already on (for example `-X gil=1`). A free-threaded build with the GIL still off drops it, because importing hiredis there re-enables the GIL. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on both. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
 
 ## When to Use
 
