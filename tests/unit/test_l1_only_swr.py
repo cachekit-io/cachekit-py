@@ -369,6 +369,39 @@ class TestL1OnlySWRFailureWarnings:
         (warning,) = _warnings(caplog, "L1-only SWR refresh failed")
         _assert_key_free(warning)
 
+    def test_function_metadata_never_reaches_the_warning(self, caplog):
+        """A dynamically created function's __qualname__ and __name__ can carry caller data.
+
+        The WARNING names the function by the digest of its module.qualname, so it stays
+        correlatable, and the record's thread name is static: a log format with
+        %(threadName)s must not leak the function name either.
+        """
+        from cachekit.hash_utils import redact_cache_key
+        from tests.unit.test_swr_decorator import _wait_for, _warnings
+
+        calls = 0
+
+        def source():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("down")
+            return calls
+
+        source.__qualname__ = "factory.<locals>.tenant-customer-42.fetch"
+        source.__name__ = "fetch_tenant-customer-42"
+        fn = cache(ttl=10, backend=None, l1=self._L1)(source)
+
+        assert fn() == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+            assert _wait_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (record,) = [r for r in caplog.records if "L1-only SWR refresh failed" in r.getMessage()]
+        assert "tenant-customer-42" not in record.getMessage()
+        assert "tenant-customer-42" not in record.threadName
+        assert f"in function {redact_cache_key(f'{__name__}.factory.<locals>.tenant-customer-42.fetch')}" in record.getMessage()
+
     def test_uncopyable_args_warn_that_refresh_ahead_cannot_run(self, caplog):
         from tests.unit.test_swr_decorator import _assert_key_free, _warnings
 

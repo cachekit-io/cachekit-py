@@ -389,7 +389,7 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 **Behavior:** The cached value continues to be served until its hard expiry, and the next qualifying hit retries the refresh. This is by design - a failed refresh never evicts a servable value. Arguments that cannot be copied fail the same way on every retry, so for that call refresh-ahead never runs and the value is recomputed in the foreground after expiry.
 
-**Diagnosis:** cachekit logs a WARNING `L1-only SWR refresh failed`, `L1-only SWR refresh skipped` or `L1-only SWR refresh could not be started`, with the function's name, the redacted key and the exception type (never its message). Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
+**Diagnosis:** cachekit logs a WARNING `L1-only SWR refresh failed`, `L1-only SWR refresh skipped` or `L1-only SWR refresh could not be started`, with the function and the key as `<redacted:…>` digests and the exception type (never its message). The function's digest is that of its `module.qualname`: `cachekit.hash_utils.redact_cache_key("app.sources.fetch")` gives the value to match. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 
 ### Problem: High memory usage despite max_size_mb limit
 

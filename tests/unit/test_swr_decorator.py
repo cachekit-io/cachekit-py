@@ -755,7 +755,8 @@ class TestRevalidationFailureWarnings:
             assert await _await_for(lambda: _warnings(caplog, "SWR revalidation failed"))
         (warning,) = _warnings(caplog, "SWR revalidation failed")
         _assert_key_free(warning)
-        assert "compute (1 since the last warning)" in warning  # names the function, not the key
+        assert "in function <redacted:" in warning and "(1 since the last warning)" in warning
+        assert "compute" not in warning  # the function by its digest only
 
     def test_sync_failure_warns_with_redacted_key_and_type(self, caplog: pytest.LogCaptureFixture) -> None:
         backend = FakeSWRBackend()

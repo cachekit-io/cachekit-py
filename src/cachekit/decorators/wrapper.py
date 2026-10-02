@@ -1059,15 +1059,17 @@ def create_cache_wrapper(
 
         The caller was already served the cached value and must never see the failure (spec:
         revalidation failure must never surface to callers), so this line is the only signal.
+        The function is named by its digest, like the key: a dynamically created function's
+        __qualname__ can carry caller data (CWE-532).
         """
         failures = throttle.claim()
         if not failures:
             _logger.debug("%s for %s%s: %s", event, redact_cache_key(cache_key), reason, redact_error_for_log(exc))
             return
         _logger.warning(
-            "%s in %s (%d since the last warning)%s; callers keep the cached value until it expires. Latest key %s: %s",
+            "%s in function %s (%d since the last warning)%s; callers keep the cached value until it expires. Latest key %s: %s",
             event,
-            function_identifier,
+            redact_cache_key(function_identifier),
             failures,
             reason,
             redact_cache_key(cache_key),
@@ -1453,7 +1455,7 @@ def create_cache_wrapper(
                             threading.Thread(
                                 target=_l1_swr_refresh_sync,
                                 args=(cache_key, version, refresh_args, refresh_kwargs),
-                                name=f"cachekit-swr-{func.__name__}",
+                                name="cachekit-swr-refresh",  # no function or key metadata (CWE-532)
                                 daemon=True,
                             ).start()
                         except RuntimeError as exc:
