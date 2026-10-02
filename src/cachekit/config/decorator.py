@@ -86,10 +86,11 @@ class DecoratorConfig:
     Intent-based presets with kwargs overrides for customization.
     - Frozen dataclass ensures immutability
     - Nested configs group related settings
-    - Backend auto-resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+    - Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit backend=,
+      then set_default_backend(), then one env selector at first call
 
     Examples:
-        # Zero-config (REDIS_URL env var)
+        # Zero-config (backend auto-detected from the environment at first call)
         @cache.minimal(ttl=300)
         def fast_function():
             return "value"
@@ -278,7 +279,8 @@ class DecoratorConfig:
         Use cases: Read-heavy workloads, non-critical caching, high-performance scenarios
         Trade-offs: Circuit breaker disabled, no monitoring, NO integrity checking
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
+              backend=, then set_default_backend(), then one env selector at first call.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -324,7 +326,8 @@ class DecoratorConfig:
         Use cases: Payment systems, APIs, production services, critical workloads
         Trade-offs: Additional latency from circuit breaker, monitoring, integrity validation
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
+              backend=, then set_default_backend(), then one env selector at first call.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -469,7 +472,8 @@ class DecoratorConfig:
         Use cases: Local development, debugging production issues
         Trade-offs: Verbose logs, Prometheus metrics disabled for simplicity except circuit_breaker_state
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
+              backend=, then set_default_backend(), then one env selector at first call.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,
@@ -513,7 +517,8 @@ class DecoratorConfig:
         Use cases: Unit tests, integration tests (with fakeredis)
         Trade-offs: No circuit breaker, no stats, no integrity (reproducible, fast)
 
-        Note: Backend resolved from REDIS_URL env var, set_default_backend(), or explicit backend= kwarg
+        Note: Backend resolves per docs/backends/README.md, "Backend Resolution Priority": explicit
+              backend=, then set_default_backend(), then one env selector at first call.
 
         Args:
             **kwargs: Overrides; each wins over the preset's value (ttl, namespace, backend,

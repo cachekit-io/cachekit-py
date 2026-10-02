@@ -327,7 +327,7 @@ def fetch(key):
 ```python notest
 @cache.secure(master_key=secret_key, ttl=300)  # Both features enabled
 def fetch_sensitive(key):
-    # Encryption happens before L2 write
+    # Encryption happens before L2 write; an encryption failure skips the write and never counts toward the breaker
     # If L2 fails → logged; the result still goes to L1; backend errors do not currently count toward the breaker
     # A decrypt/integrity failure on read never counts toward the breaker.
     # Fail-open (default): it is a cache miss and the function runs.
