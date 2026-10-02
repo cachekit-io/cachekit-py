@@ -36,7 +36,7 @@ Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson
 **Native type support:**
 - datetime → ISO-8601 strings (automatic conversion)
 - UUID → string representation
-- Dataclass → dict (with OPT_PASSTHROUGH_DATACLASS)
+- Dataclass → dict (encoded by default; a hit returns the dict, not the dataclass)
 - Sorted keys by default (deterministic caching)
 
 ## Basic Usage
