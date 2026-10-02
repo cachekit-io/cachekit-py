@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import threading
 import time
 
@@ -314,6 +315,91 @@ class TestL1OnlySWRBoundedConcurrency:
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.1)  # settle: catch any over-cap stragglers
         assert refresh_calls == n_keys + 32, f"expected exactly 32 refreshes, got {refresh_calls - n_keys}"
+
+
+@pytest.mark.unit
+class TestL1OnlySWRFailureWarnings:
+    """A refresh that fails or never runs reaches a default-level log: the caller never sees it.
+
+    Without the WARNING, a function whose upstream is down, or whose arguments cannot be
+    snapshotted, silently serves the cached value until ttl and then recomputes in the foreground.
+    """
+
+    _L1 = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.01)  # stale after ~0.1 s of ttl=10
+
+    async def test_async_failed_refresh_warns_with_redacted_key_and_type(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _await_for, _warnings
+
+        calls = 0
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("secret-detail")
+            return calls
+
+        assert await fn() == 1
+        await asyncio.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert await fn() == 1  # stale served; the refresh fails in the background
+            assert await _await_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (warning,) = _warnings(caplog, "L1-only SWR refresh failed")
+        _assert_key_free(warning)
+
+    def test_sync_failed_refresh_warns_with_redacted_key_and_type(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _wait_for, _warnings
+
+        calls = 0
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("secret-detail")
+            return calls
+
+        assert fn() == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+            assert _wait_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (warning,) = _warnings(caplog, "L1-only SWR refresh failed")
+        _assert_key_free(warning)
+
+    def test_uncopyable_args_warn_that_refresh_ahead_cannot_run(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _warnings
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", key=lambda lock: "k", l1=self._L1)
+        def fn(lock):
+            return 1
+
+        lock = threading.Lock()  # deepcopy(threading.Lock()) raises TypeError
+        assert fn(lock) == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn(lock) == 1  # stale served; the skip is logged before this returns
+        (warning,) = _warnings(caplog, "L1-only SWR refresh skipped")
+        assert "arguments not deep-copyable, so refresh-ahead cannot run for this call" in warning
+        _assert_key_free(warning, exc_type="TypeError")
+
+    def test_thread_start_failure_warns(self, monkeypatch, caplog):
+        import cachekit.decorators.wrapper as wrapper_mod
+        from tests.unit.test_swr_decorator import _assert_key_free, _failing_thread_shim, _warnings
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        def fn():
+            return 1
+
+        assert fn() == 1
+        time.sleep(0.15)
+        monkeypatch.setattr(wrapper_mod, "threading", _failing_thread_shim())
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+        (warning,) = _warnings(caplog, "L1-only SWR refresh could not be started")
+        _assert_key_free(warning)
 
 
 @pytest.mark.unit

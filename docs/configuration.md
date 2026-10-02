@@ -188,7 +188,7 @@ Rules and behavior:
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
 - **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
-- A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
+- A failed background recompute never reaches the caller: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path. It logs a WARNING `SWR revalidation failed`, as does a revalidation skipped because the call's arguments cannot be deep-copied (`SWR revalidation skipped`) or one that could not be scheduled. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
 - On the CachekitIO backend, every read (SWR-configured or not) also carries the server's remaining freshness (`X-CacheKit-Fresh-For`, [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#remaining-freshness)): an L2 hit backfilled into L1 lives at most `min(ttl, remaining)` locally (with `ttl=None`, L1's own 300-second default lifetime, capped by `remaining`), so a value read near the end of its server-side freshness window is never served fresh from L1 past the server's bound. Pre-signal servers omit the header and behavior is unchanged.
@@ -288,7 +288,13 @@ honored as follows:
   expiry rather than truly indefinitely, and can still be evicted earlier under
   byte pressure.
 - **Refresh failures are non-fatal**: the stale value keeps being served until hard
-  expiry, and the next qualifying hit retries the refresh.
+  expiry, and the next qualifying hit retries the refresh. The refresh runs on a deep copy
+  of the call's arguments; when they cannot be copied (a lock, an open connection), it is
+  skipped, so that call is only ever recomputed in the foreground after expiry.
+- **Failed and skipped refreshes log a WARNING** (`L1-only SWR refresh failed`, `… skipped`,
+  `… could not be started`) naming the function, the redacted key and the exception type.
+  Each fires at most once a minute per function and carries the count since the last one;
+  the occurrences in between log at DEBUG.
 
 ```python notest
 import asyncio
