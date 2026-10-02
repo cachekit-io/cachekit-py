@@ -211,7 +211,9 @@ def test_collected_namespaces_leave_no_series():
     assert result.returncode == 0, result.stderr
 
 
-def _run(script: str, env: Optional[dict[str, str]] = None, cwd: Any = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    script: str, env: Optional[dict[str, str]] = None, cwd: Optional[os.PathLike[str]] = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env, cwd=cwd)  # noqa: S603 (trusted: sys.executable + literal code)
 
 
