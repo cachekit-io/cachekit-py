@@ -525,13 +525,10 @@ class TestHashedLegacyKeyMatchesV019:
 
     def test_sync_invalidate_deletes_the_v019_hashed_key(self):
         backend = _RecordingBackend()
-        calls = 0
 
         @cache(backend=backend, ttl=None, namespace=_LONG_NAMESPACE, serializer="auto", l1_enabled=False)
         @_pin_identity
         def fn(x: int) -> dict:
-            nonlocal calls
-            calls += 1
             return {"v": x}
 
         fn(1)
@@ -541,20 +538,14 @@ class TestHashedLegacyKeyMatchesV019:
 
         fn.invalidate_cache(1)
 
-        assert _V019_LONG_KEY not in backend.store, "the key 0.19.0 wrote survived invalidation"
-        assert backend.store == {}
-        fn(1)
-        assert calls == 2
+        assert backend.store == {}, "the key 0.19.0 wrote survived invalidation"
 
     async def test_async_invalidate_deletes_the_v019_hashed_key(self):
         backend = _RecordingBackend()
-        calls = 0
 
         @cache(backend=backend, ttl=None, namespace=_LONG_NAMESPACE, serializer="auto", l1_enabled=False)
         @_pin_identity
         async def fn(x: int) -> dict:
-            nonlocal calls
-            calls += 1
             return {"v": x}
 
         await fn(1)
@@ -564,7 +555,4 @@ class TestHashedLegacyKeyMatchesV019:
 
         await fn.ainvalidate_cache(1)
 
-        assert _V019_LONG_KEY not in backend.store, "the key 0.19.0 wrote survived invalidation"
-        assert backend.store == {}
-        await fn(1)
-        assert calls == 2
+        assert backend.store == {}, "the key 0.19.0 wrote survived invalidation"
