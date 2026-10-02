@@ -19,7 +19,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -217,10 +217,22 @@ def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytes
         clients.append(backend._async_lease.client)
         assert await backend.get_ttl(_KEY) == 60
 
-    # result() re-raises a worker's failure here with its own traceback, and a hung worker as TimeoutError.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        for future in [pool.submit(asyncio.run, job()) for _ in range(2)]:
-            future.result(timeout=10)
+    def run(future: Future[None]) -> None:
+        # Forwarded, not handled: result() below re-raises it on the test thread with its own traceback.
+        try:
+            asyncio.run(job())
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
+
+    # Daemon threads, not a pool: a hung worker fails here as TimeoutError and is left behind, where a
+    # pool's shutdown would wait for it and hang the test.
+    futures: list[Future[None]] = [Future(), Future()]
+    for future in futures:
+        threading.Thread(target=run, args=(future,), daemon=True).start()
+    for future in futures:
+        future.result(timeout=10)
     assert len(clients) == 2
     assert clients[0] is not clients[1]
 
