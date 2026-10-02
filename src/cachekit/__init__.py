@@ -73,8 +73,8 @@ __version__ = "0.20.0"
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-# Configure hiredis compatibility BEFORE any Redis imports
-# This prevents GIL warnings in Python 3.13+ free-threading mode
+# Must run BEFORE any redis import: it decides whether to keep hiredis out, which on a
+# free-threaded build is what keeps the GIL off (see cachekit.hiredis_compat)
 try:
     from . import hiredis_compat
 except ImportError:

@@ -1,98 +1,70 @@
-"""Hiredis compatibility module for Python 3.13+ free-threading mode.
+"""Choose redis-py's reply parser before anything imports redis.
 
-This module must be imported before any redis imports to properly
-configure hiredis behavior in Python 3.13+ free-threading environments.
+redis-py imports hiredis when it is installed and binds its default parser at import time, and on a
+free-threaded CPython build importing hiredis re-enables the GIL for the whole process. The only way
+to opt out is to keep hiredis from loading before the first ``import redis``, so this module must be
+imported before any redis import and must not import anything that does: it reads
+``CACHEKIT_DISABLE_HIREDIS`` straight from the environment, not through ``RedisBackendConfig``.
+
+- ``CACHEKIT_DISABLE_HIREDIS=true`` blocks hiredis on every build.
+- ``CACHEKIT_DISABLE_HIREDIS=false`` keeps hiredis on every build, re-enabling the GIL on a
+  free-threaded one.
+- Unset: a free-threaded build with the GIL still off blocks hiredis; a GIL build keeps it.
+
+Blocking is process-wide: ``sys.modules["hiredis"] = None`` makes any later ``import hiredis`` in the
+process raise ImportError, and redis-py falls back to its pure-Python parser.
 """
 
 import logging
+import os
 import sys
-
-from cachekit.hash_utils import redact_error_for_log
+import sysconfig
 
 logger = logging.getLogger(__name__)
 
-
-def _get_disable_hiredis_setting() -> bool:
-    """Get disable_hiredis setting from RedisBackendConfig.
-
-    Returns:
-        bool: True if hiredis should be disabled
-    """
-    try:
-        from cachekit.backends.redis.config import RedisBackendConfig
-
-        redis_config = RedisBackendConfig.from_env()
-        return redis_config.disable_hiredis
-    except Exception as e:
-        logger.debug(f"Could not load Redis config for hiredis setting: {redact_error_for_log(e)}")
-        return False
+_SETTING = "CACHEKIT_DISABLE_HIREDIS"
+# Same spellings pydantic accepts for RedisBackendConfig.disable_hiredis.
+_TRUE = frozenset({"1", "on", "t", "true", "y", "yes"})
+_FALSE = frozenset({"0", "off", "f", "false", "n", "no"})
 
 
-def configure_hiredis_for_free_threading():
-    """Configure hiredis behavior for Python 3.13 free-threading mode.
-
-    In Python 3.13+, the GIL can be disabled for free-threading mode.
-    However, hiredis (a C extension) is not yet GIL-safe and will force
-    the GIL to be re-enabled, causing RuntimeWarnings.
-
-    This function provides control over hiredis usage based on:
-    1. CACHEKIT_DISABLE_HIREDIS configuration setting
-    2. Python version and GIL status detection
-    3. Enterprise preference for warning-free operation
-
-    Returns:
-        bool: True if hiredis was disabled
-    """
-    # Check explicit user preference first
-    if _get_disable_hiredis_setting():
-        logger.info("Hiredis disabled via CACHEKIT_DISABLE_HIREDIS configuration")
-        return _disable_hiredis()
-
-    # Note: We can't differentiate between explicit false vs default false
-    # This is acceptable - if user sets CACHEKIT_DISABLE_HIREDIS=false, we continue
-    # to auto-detection below
-
-    # Check if we're in Python 3.13+ with GIL disabled (free-threading mode)
-    if sys.version_info >= (3, 13):
-        try:
-            # Check if GIL is disabled (free-threading mode)
-            gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
-            if not gil_enabled:
-                logger.info(
-                    "Python 3.13+ free-threading detected (GIL disabled). "
-                    "Disabling hiredis to prevent GIL re-enabling and RuntimeWarnings. "
-                    "Set CACHEKIT_DISABLE_HIREDIS=false to override."
-                )
-                return _disable_hiredis()
-        except Exception as e:
-            logger.debug(f"Could not determine GIL status: {redact_error_for_log(e)}")
-            # If we can't determine GIL status, continue with default behavior
-
-    return False
-
-
-def _disable_hiredis():
-    """Disable hiredis parser to prevent GIL warnings."""
-    try:
-        # Import redis.connection to access HIREDIS_AVAILABLE
-        import redis.connection
-
-        # Store original state for potential restoration
-        getattr(redis.connection, "HIREDIS_AVAILABLE", None)
-
-        # Disable hiredis
-        redis.connection.HIREDIS_AVAILABLE = False  # type: ignore[attr-defined]
-
-        logger.debug("Hiredis parser disabled - using pure Python parser")
+def _disable_hiredis_setting() -> bool | None:
+    """CACHEKIT_DISABLE_HIREDIS as a bool, or None when unset (or unparseable, which is logged)."""
+    raw = os.environ.get(_SETTING)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _TRUE:
         return True
-
-    except Exception as e:
-        logger.warning(f"Failed to disable hiredis: {redact_error_for_log(e)}. GIL warnings may appear.")
+    if value in _FALSE:
         return False
+    logger.warning("Ignoring %s=%r: expected true or false", _SETTING, raw)
+    return None
 
 
-# Apply configuration when module is imported
-_hiredis_disabled = configure_hiredis_for_free_threading()
+def configure_hiredis_for_free_threading() -> bool:
+    """Block hiredis before redis loads when the setting or a GIL-free interpreter calls for it.
 
-# Export status for other modules
-HIREDIS_DISABLED = _hiredis_disabled
+    Returns:
+        bool: True if hiredis is blocked, so redis-py uses its pure-Python parser
+    """
+    disable = _disable_hiredis_setting()
+    if disable is False:
+        return False
+    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    if disable is None and not free_threaded:
+        return False
+    if sys.modules.get("hiredis") is not None:
+        logger.warning(
+            "hiredis was imported before cachekit, so redis-py keeps the hiredis parser%s",
+            " and the GIL is already on" if free_threaded else "",
+        )
+        return False
+    if disable is None and sys._is_gil_enabled():  # type: ignore[attr-defined]
+        return False  # Something else already re-enabled the GIL; hiredis would cost nothing more.
+    sys.modules.setdefault("hiredis", None)  # type: ignore[arg-type]  # None makes `import hiredis` raise ImportError
+    logger.debug("hiredis blocked - redis-py will use its pure-Python parser")
+    return True
+
+
+HIREDIS_DISABLED = configure_hiredis_for_free_threading()

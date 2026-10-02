@@ -53,15 +53,21 @@ print(json.dumps({
 """
 
 
-def _default_install_skip_reason() -> str | None:
-    if not _FREE_THREADED_BUILD:
-        return "requires a free-threaded CPython build"
-    # Package metadata, not find_spec: a fix that blocks hiredis via sys.modules must not skip this.
+def _hiredis_installed() -> bool:
+    # Package metadata, not find_spec: blocking hiredis via sys.modules must not make tests skip.
     import importlib.metadata
 
     try:
         importlib.metadata.distribution("hiredis")
     except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _default_install_skip_reason() -> str | None:
+    if not _FREE_THREADED_BUILD:
+        return "requires a free-threaded CPython build"
+    if not _hiredis_installed():
         return "the default install includes hiredis (redis[hiredis]); this environment excludes it"
     return None
 
@@ -72,14 +78,20 @@ _needs_default_install = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SK
 
 def _probe_default_install(*blocked: str) -> dict[str, object]:
     """GIL state in a fresh interpreter after importing cachekit and building a RedisBackend."""
+    return _run_probe(_DEFAULT_INSTALL_PROBE, *blocked, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
+
+
+def _run_probe(code: str, *args: str, env_drop: tuple[str, ...] = ()) -> dict[str, object]:
+    """Run `code` in a fresh interpreter and return the JSON object its last stdout line holds."""
     import json
     import os
     import subprocess
 
-    env = {k: v for k, v in os.environ.items() if k != "PYTHON_GIL"}  # PYTHON_GIL=0 would force a vacuous pass
+    # PYTHON_GIL=0 would force a vacuous pass
+    env = {k: v for k, v in os.environ.items() if k != "PYTHON_GIL" and k not in env_drop}
     try:
         proc = subprocess.run(  # noqa: S603 (trusted: sys.executable + literal code)
-            [sys.executable, "-W", "ignore", "-c", _DEFAULT_INSTALL_PROBE, *blocked],
+            [sys.executable, "-W", "ignore", "-c", code, *args],
             capture_output=True,
             text=True,
             env=env,
@@ -90,26 +102,18 @@ def _probe_default_install(*blocked: str) -> dict[str, object]:
             pytest.fail(f"probe exited {proc.returncode}:\n{proc.stderr}")
         return json.loads(proc.stdout.strip().splitlines()[-1])
     except (subprocess.TimeoutExpired, IndexError, json.JSONDecodeError) as exc:
-        # pytest.fail, not an assertion: a broken probe must not count as the expected xfail.
+        # pytest.fail, not an assertion: a broken probe must fail as broken, not as a GIL finding.
         pytest.fail(f"probe produced no result: {exc!r}")
 
 
 @_needs_default_install
 def test_gil_stays_disabled_with_hiredis_blocked():
-    """Control for the xfail below: with hiredis kept out, nothing else in the default install re-enables the GIL."""
+    """Control for the test below: with hiredis kept out, nothing else in the default install re-enables the GIL."""
     state = _probe_default_install("hiredis")
     assert state["gil_enabled"] is False, state
 
 
 @_needs_default_install
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "hiredis_compat's own import of redis.connection loads hiredis, and the HIREDIS_AVAILABLE flag "
-        "it then clears is inert; passes once hiredis is kept from loading before any redis import"
-    ),
-)
 def test_default_install_keeps_gil_disabled_after_redis_backend():
     """With the default dependency set (redis[hiredis] included), cachekit must leave the GIL off.
 
@@ -119,6 +123,105 @@ def test_default_install_keeps_gil_disabled_after_redis_backend():
     """
     state = _probe_default_install()
     assert state["gil_enabled"] is False, state
+    assert state["redis_parser"] == "_RESP2Parser", state
+
+
+# Runs in the CI lane without hiredis: what it pins is that hiredis is blocked before redis is imported.
+_ORDERING_PROBE = """
+import json, sys
+import cachekit
+import redis.connection
+print(json.dumps({
+    "hiredis_entry": repr(sys.modules.get("hiredis", "<absent>")),
+    "redis_parser": redis.connection.DefaultParser.__name__,
+}))
+"""
+
+
+@pytest.mark.skipif(not _FREE_THREADED_BUILD, reason="requires a free-threaded CPython build")
+def test_import_blocks_hiredis_before_redis_loads():
+    """With no override, `import cachekit` keeps hiredis out of redis-py, installed or not."""
+    state = _run_probe(_ORDERING_PROBE, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
+    assert state == {"hiredis_entry": "None", "redis_parser": "_RESP2Parser"}, state
+
+
+# Records, when redis or cachekit.backends is first imported, whether hiredis_compat had already finished.
+_DECISION_ORDER_PROBE = """
+import json, sys
+seen = {}
+class Spy:
+    def find_spec(self, name, path=None, target=None):
+        if name in ("redis", "cachekit.backends") and name not in seen:
+            compat = sys.modules.get("cachekit.hiredis_compat")
+            seen[name] = compat is not None and hasattr(compat, "HIREDIS_DISABLED")
+sys.meta_path.insert(0, Spy())
+import cachekit
+print(json.dumps(seen))
+"""
+
+
+def test_hiredis_decision_runs_before_redis_is_imported():
+    """hiredis_compat decides before anything imports redis, so it must not import cachekit.backends."""
+    assert _run_probe(_DECISION_ORDER_PROBE) == {"redis": True, "cachekit.backends": True}
+
+
+_PARSER_PROBE = """
+import json
+import cachekit
+import redis
+print(json.dumps({"parser": type(redis.Connection()._parser).__name__}))
+"""
+
+
+@pytest.mark.parametrize(
+    ("setting", "parser"),
+    [
+        ("true", "_RESP2Parser"),
+        pytest.param(
+            "false",
+            "_HiredisParser",
+            marks=pytest.mark.skipif(not _hiredis_installed(), reason="requires hiredis"),
+        ),
+        pytest.param(
+            None,
+            "_HiredisParser",
+            marks=pytest.mark.skipif(
+                _FREE_THREADED_BUILD or not _hiredis_installed(), reason="requires a GIL build with hiredis"
+            ),
+        ),
+    ],
+)
+def test_disable_hiredis_setting_selects_connection_parser(monkeypatch, setting, parser):
+    """CACHEKIT_DISABLE_HIREDIS picks the parser a new connection gets; unset, GIL builds keep hiredis."""
+    if setting is None:
+        monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
+    else:
+        monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", setting)
+    assert _run_probe(_PARSER_PROBE) == {"parser": parser}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("true", True),
+        (" YES ", True),
+        ("1", True),
+        ("false", False),
+        ("Off", False),
+        ("0", False),
+        ("maybe", None),
+    ],
+)
+def test_disable_hiredis_setting_parsing(monkeypatch, raw, expected):
+    """Unset and unparseable values are told apart from an explicit false."""
+    from cachekit.hiredis_compat import _disable_hiredis_setting
+
+    if raw is None:
+        monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
+    else:
+        monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", raw)
+    assert _disable_hiredis_setting() is expected
 
 
 def test_session_init_hammer_no_partial_publish_observed():

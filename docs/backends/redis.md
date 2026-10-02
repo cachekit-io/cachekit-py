@@ -41,7 +41,6 @@ config = RedisBackendConfig(
     connection_pool_size=25,
     socket_timeout=5.0,
     socket_connect_timeout=5.0,
-    disable_hiredis=False,
 )
 
 backend = RedisBackend(config)
@@ -56,9 +55,15 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 | `socket_timeout` | `5.0` | Socket read/write timeout in seconds (env: `CACHEKIT_SOCKET_TIMEOUT`) |
 | `socket_connect_timeout` | `5.0` | Socket connect timeout in seconds (env: `CACHEKIT_SOCKET_CONNECT_TIMEOUT`) |
 | `socket_keepalive` | `True` | Set `SO_KEEPALIVE` on TCP connections, using the OS keepalive timers (env: `CACHEKIT_SOCKET_KEEPALIVE`). Not applied to `unix://` URLs |
-| `disable_hiredis` | `False` | Use pure Python parser instead of hiredis |
+| `disable_hiredis` | `False` | Reports `CACHEKIT_DISABLE_HIREDIS`. The parser is chosen from that environment variable at `import cachekit`, before redis loads, so setting this field in code has no effect. See below |
 
 Query options in `redis_url` override the pool fields above, because redis-py's `from_url` lets querystring arguments win. For example, `redis://host:6379/0?socket_timeout=1&socket_keepalive=0` sets a 1 s timeout and turns keepalive off, whatever the config says.
+
+### hiredis and the reply parser
+
+redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. `CACHEKIT_DISABLE_HIREDIS=true` keeps hiredis out and gives every connection redis-py's pure-Python parser. cachekit applies it at `import cachekit`, so import cachekit before redis; if hiredis is already loaded it logs a warning and the setting cannot take effect. The block is process-wide: any later `import hiredis` in the process raises `ImportError`.
+
+Unset, a GIL build keeps hiredis and a free-threaded build drops it, because importing hiredis there re-enables the GIL. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on both. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
 
 ## When to Use
 
