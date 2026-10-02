@@ -2,33 +2,33 @@
   "interpreters": {
     "cpython-3.12-x86_64": {
       "budgets": {
-        "l1_hit": 78413,
-        "l2_hit": 362765,
-        "l2_hit_async_metrics": 306900,
-        "minimal_l1_hit": 76430,
-        "miss": 348923,
-        "secure_l1_hit": 296591,
-        "serializer_arrow": 1945821,
-        "serializer_auto": 110095,
-        "serializer_default": 61157,
-        "serializer_encrypted": 115274,
-        "serializer_orjson": 23533
+        "l1_hit": 78489,
+        "l2_hit": 362666,
+        "l2_hit_async_metrics": 306974,
+        "minimal_l1_hit": 76491,
+        "miss": 348751,
+        "secure_l1_hit": 296572,
+        "serializer_arrow": 1955014,
+        "serializer_auto": 110068,
+        "serializer_default": 61276,
+        "serializer_encrypted": 115708,
+        "serializer_orjson": 23655
       },
       "python": "3.12.12"
     },
     "cpython-3.14-x86_64": {
       "budgets": {
-        "l1_hit": 81354,
-        "l2_hit": 365373,
-        "l2_hit_async_metrics": 310887,
-        "minimal_l1_hit": 79531,
-        "miss": 349024,
-        "secure_l1_hit": 300016,
-        "serializer_arrow": 1957351,
-        "serializer_auto": 113603,
+        "l1_hit": 81458,
+        "l2_hit": 367331,
+        "l2_hit_async_metrics": 311202,
+        "minimal_l1_hit": 79549,
+        "miss": 350570,
+        "secure_l1_hit": 300139,
+        "serializer_arrow": 1953043,
+        "serializer_auto": 113597,
         "serializer_default": 62669,
-        "serializer_encrypted": 117871,
-        "serializer_orjson": 23787
+        "serializer_encrypted": 118136,
+        "serializer_orjson": 23817
       },
       "python": "3.14.3"
     }
