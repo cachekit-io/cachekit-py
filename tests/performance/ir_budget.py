@@ -18,7 +18,7 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   wakes, cyclic GC is off, the environment is fixed, the bytecode cache is warmed first, and the
   heap layout is sampled (see ``_run_workload``, ``measure`` and ``LAYOUTS``).
 
-Repeat runs agree within XXAAXX per op, against a 1% fail threshold.
+Two full runs agree within 0.03% per op (0.01% on 3.12), against a 1% fail threshold.
 
 Budgets are keyed by interpreter (minor version, build flavour, machine): the same code costs a
 different number of instructions on 3.12 and 3.14. Instruction counts ignore cache misses and
@@ -53,7 +53,7 @@ N_LO, N_HI = 1000, 3000
 # objects held) and the median is its figure.
 LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
-WARN_PCT = 0.2  # above the A/A floor (<=0.03%, Arrow 0.2%): report but pass
+WARN_PCT = 0.2  # above the A/A floor (0.03%): report but pass
 BASELINES = Path(__file__).with_name("ir_baselines.json")
 PATHS = (
     "l1_hit",

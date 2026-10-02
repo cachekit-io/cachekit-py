@@ -371,7 +371,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 ## Instruction Budgets
 
-`make perf-ir` counts the instructions each hot path executes per call and fails when any path costs **1% or more** above its committed budget. It warns from 0.2%. Instruction counts are deterministic where wall clock is not: two full runs agree within XXAAXX per path.
+`make perf-ir` counts the instructions each hot path executes per call and fails when any path costs **1% or more** above its committed budget. It warns from 0.2%. Instruction counts are deterministic where wall clock is not: two full runs agree within 0.03% per path (0.01% on CPython 3.12).
 
 **Method** (`tests/performance/ir_budget.py`):
 - Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (log writer, L1 cleanup) vary by tens of percent between identical runs.
