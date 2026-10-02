@@ -795,6 +795,12 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ValueError,
         _REDIS_PASSWORD,
     ),
+    "redis-backend-bad-ipv6": (
+        {},
+        lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@[::1/0"),
+        ValueError,
+        _REDIS_PASSWORD,
+    ),
     "secure-config-ttl": ({}, lambda: DecoratorConfig.secure(master_key=_KEY_HEX, ttl=-5), ValueError, _KEY_HEX),
     "secure-intent-env-key-ttl": (
         {"CACHEKIT_MASTER_KEY": _KEY_HEX},

@@ -63,14 +63,14 @@ def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -
     return override
 
 
-def _tcp_only_kwargs(redis_url: str, cfg: RedisBackendConfig) -> dict[str, bool]:
+def _tcp_only_kwargs(redis_url: SecretStr, cfg: RedisBackendConfig) -> dict[str, bool]:
     """Pool kwargs that only TCP connections accept.
 
     redis-py's from_url builds a UnixDomainSocketConnection for exactly the unix
     scheme, and that class raises TypeError on socket_keepalive, with either
-    value, every time the pool makes a connection.
+    value, every time the pool makes a connection. The URL arrives wrapped: urlparse can raise on it.
     """
-    if urlparse(redis_url).scheme == "unix":
+    if urlparse(redis_url.get_secret_value()).scheme == "unix":
         return {}
     return {"socket_keepalive": cfg.socket_keepalive}
 
@@ -99,7 +99,7 @@ def create_connection_pool(
         redis.ConnectionPool bound to redis_url (no connection is made here;
         the pool connects lazily on first use)
     """
-    redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only into from_url (CWE-532)
+    redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inline (CWE-532)
     cfg = config or RedisBackendConfig.from_env()
     return redis.ConnectionPool.from_url(
         reveal_secret(redis_url),
