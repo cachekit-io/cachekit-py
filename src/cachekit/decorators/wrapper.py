@@ -2249,6 +2249,9 @@ def create_cache_wrapper(
                                     cache_key=cache_key or "unknown",
                                     namespace=namespace or "default",
                                     duration_ms=set_duration_ms,
+                                    # A value the serializer (or encryption) rejects is not a
+                                    # backend failure; the sync write does not count it either.
+                                    count_toward_breaker=not isinstance(e, SerializationError),
                                 )
 
                             return result
@@ -2345,6 +2348,7 @@ def create_cache_wrapper(
                         cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
+                        count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
                     )
 
                 return result
