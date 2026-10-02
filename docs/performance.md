@@ -119,7 +119,7 @@ This measures the decorator machinery alone:
 
 **About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
 
-The deterministic figure is **78,323 instructions per call** on CPython 3.12 (81,463 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
+The deterministic figure is **78,413 instructions per call** on CPython 3.12 (81,354 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
 **About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
 
@@ -378,7 +378,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 - Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped.
 - The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day log flush and L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
 - Nothing that runs on real time lands in the measured loop: no background thread wakes, cyclic GC is off, and the GIL switch interval is long enough that the main thread gives up the GIL only where the code releases it.
-- Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the cheapest. Any code change moves the layout, even a comment edit in the harness, and the allocators take longer paths in some heap states: single runs of the orjson round trip moved by up to 2.2%. Layout only ever adds allocator work while a regression raises every layout, so the cheapest layout tracks the path's own cost: across the code and layout changes measured it moved 0.2% at most on every path but the orjson round trip, where the median moved up to 1.2%.
+- Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the cheapest. Any code change moves the layout, even a comment edit in the harness, and the allocators take longer paths in some heap states: single runs of the orjson round trip moved by up to 2.2%. Layout only ever adds allocator work while a regression raises every layout, so the cheapest layout tracks the path's own cost. Across the code and layout changes measured, it moved 0.35% at most on every path but the orjson round trip.
 - The L2 paths use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
 - The metrics collector starts synchronous and switches to batched mode (each call queues its record for a worker thread) when its 5 s check sees more than 100 records/s. Pinned clocks never reach that check, so the plain paths measure synchronous recording, and `l2_hit_async_metrics` measures the batched mode a busy long-lived process runs. Every metrics path records once per call through the same method, so one batched path covers that mode.
 
@@ -386,26 +386,26 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 78,323 | 81,463 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,633 | 79,582 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 362,974 | 366,546 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 348,894 | 349,575 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,467 | 300,398 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 307,183 | 311,417 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 61,335 | 62,675 |
-| `serializer_auto` | `AutoSerializer` round trip | 110,146 | 113,611 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 23,803 | 23,851 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,950,883 | 1,953,760 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,658 | 118,023 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 78,413 | 81,354 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,430 | 79,531 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 362,765 | 365,373 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 348,923 | 349,024 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,591 | 300,016 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 306,900 | 310,887 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 61,157 | 62,669 |
+| `serializer_auto` | `AutoSerializer` round trip | 110,095 | 113,603 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 23,533 | 23,787 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,945,821 | 1,957,351 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,274 | 117,871 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 55,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
 
-**Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,800 to 5,000 instructions (`l1_hit` +6.3%, `l2_hit_async_metrics` +1.6%) and failed the gate, while the serializer paths stayed within 0.1%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
+**Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,500 to 4,800 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%) and failed the gate, while the serializer paths, which generate no key, passed (within 0.2%, orjson within its tolerance). An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
-**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 0.9% between unrelated changes; it is gated at 2%. Other changes can still move a path by up to 0.2% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
+**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.1% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path by up to 0.35% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; 110 valgrind runs, several minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 110 valgrind runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 
