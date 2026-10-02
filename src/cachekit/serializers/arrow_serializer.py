@@ -267,7 +267,10 @@ class ArrowSerializer:
                 for name, column in obj.items():
                     # pa.table iterates these instead of rejecting them, storing a wrong column:
                     # a str as its characters, bytes as byte values, a dict as its keys only.
-                    if isinstance(column, (str, bytes, bytearray, Mapping)):
+                    # A value with an Arrow array protocol is converted through it, not iterated.
+                    if isinstance(column, (str, bytes, bytearray, Mapping)) and not (
+                        hasattr(column, "__arrow_array__") or hasattr(column, "__arrow_c_array__")
+                    ):
                         raise TypeError(f"value for {name!r} is {type(column).__name__}, not a list or array")
                 return pa.table(obj)
             except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as e:

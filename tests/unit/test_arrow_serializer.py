@@ -6,6 +6,7 @@ Tests DataFrame serialization, return_format variants, error handling, and perfo
 from __future__ import annotations
 
 import io
+from collections.abc import Mapping
 
 import pytest
 
@@ -26,6 +27,33 @@ def _serialize_via(path: str, serializer: ArrowSerializer, obj: object) -> tuple
     sink = io.BytesIO()
     metadata = serializer.serialize_to_sink(obj, sink)
     return sink.getvalue(), metadata
+
+
+class _KeysMapping(Mapping):
+    """A Mapping whose iteration yields its keys, so pa.table alone would store ["k1", "k2"]."""
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(["k1", "k2"])
+
+    def __len__(self):
+        return 2
+
+
+class _ArrowArrayMapping(_KeysMapping):
+    """Also an Arrow column adapter: pyarrow converts it through ``__arrow_array__`` to [10, 20]."""
+
+    def __arrow_array__(self, type=None):
+        return pa.array([10, 20])
+
+
+class _ArrowCArrayMapping(_KeysMapping):
+    """Same adapter through the Arrow PyCapsule protocol (``__arrow_c_array__``)."""
+
+    def __arrow_c_array__(self, requested_schema=None):
+        return pa.array([10, 20]).__arrow_c_array__(requested_schema)
 
 
 class TestArrowSerializerBasics:
@@ -271,6 +299,17 @@ class TestErrorHandling:
         error_msg = str(exc_info.value)
         assert "Got a dict that is not convertible to an Arrow table" in error_msg
         assert f"{detail}, not a list or array" in error_msg
+
+    @pytest.mark.parametrize("path", ["buffered", "streaming"])
+    @pytest.mark.parametrize("adapter", [_ArrowArrayMapping, _ArrowCArrayMapping], ids=["arrow_array", "arrow_c_array"])
+    def test_mapping_with_arrow_array_protocol_round_trips(self, path, adapter):
+        """pyarrow converts a value through its Arrow array protocol rather than iterating it,
+        so a Mapping that implements one is a correct column and is not rejected."""
+        serializer = ArrowSerializer()
+
+        data, metadata = _serialize_via(path, serializer, {"c": adapter()})
+
+        assert serializer.deserialize(data, metadata).to_dict("list") == {"c": [10, 20]}
 
     def test_rejected_dict_writes_nothing_to_sink(self):
         """The streaming path rejects the value before writing a byte."""
