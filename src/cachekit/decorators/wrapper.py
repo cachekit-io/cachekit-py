@@ -1273,6 +1273,28 @@ def create_cache_wrapper(
         """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
         return getattr(_backend, "key_prefix", None) or ""
 
+    # Whether a generated key differs from its pre-0.20.0 twin: only when the serializer code is
+    # not the default's. Fixed at decoration, so the default serializer pays nothing per call.
+    _records_twin = (
+        _generated_key_mode
+        and not _l1_only_mode
+        and key_generator.serializer_code(serialization_handler.serializer_key_name) != key_generator.serializer_code("default")
+    )
+
+    def _track_twin(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+        """Record cache_key's pre-0.20.0 twin in _cached_keys, so a no-args invalidation deletes it.
+
+        Both whole-function paths read _cached_keys, so the twin is deleted, counted when its
+        delete fails and kept for retry like any recorded key. Call once the backend is resolved:
+        the entry needs the calling tenant's scope. A key already tracked skips the derivation;
+        its twin was recorded with it, or deleted by the invalidation that last trimmed it.
+        """
+        scope = _l2_scope()
+        if (scope, cache_key) in _cached_keys:
+            return
+        twin = operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
+        _cached_keys.add((scope, twin))
+
     # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every entry it
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
@@ -1665,6 +1687,9 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
                 raise
 
+        if _records_twin:
+            _track_twin(cache_key, args, kwargs)
+
         # Continue with the rest of the sync wrapper logic...
         # Try to get cached value with optional TTL refresh
         start_time = time.time()
@@ -2030,6 +2055,9 @@ def create_cache_wrapper(
             # First interop call: the check above had no backend to check (see there).
             if interop is not None and not interop_checked:
                 ensure_interop_backend_compatible(_backend)
+
+            if _records_twin:
+                _track_twin(cache_key, args, kwargs)
 
             # Update operation handler with the backend (sync or async)
             handler = StandardCacheHandler(

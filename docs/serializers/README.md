@@ -73,13 +73,15 @@ or by any replica after a rollback to v0.19, deletes only the `:{integrity_flag}
 copy that a v0.20.0 replica wrote under the new key survives. Re-issue any erasure made during
 the rollout once the last v0.19 replica is retired, or cover it with the flush below.
 
-**What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
-arguments you never invalidate. On a function that takes parameters, no-argument
-`invalidate_cache()` / `cache_clear()` does not reach them either: it deletes the keys this process tracked plus, on the tenant-scoped Redis
-backend, the keys in the server-side key registry, and releases before v0.20.0 recorded their
-keys in neither. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
-entry gone rather than aging out, follow the flush procedure in the retention warning
-[below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
+**What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry it never
+recorded. On a function that takes parameters, no-argument `invalidate_cache()` /
+`await fn.ainvalidate_cache()` / `cache_clear()` deletes every key this process recorded since
+it started, each with its pre-v0.20.0 `:{integrity_flag}s` twin, plus, on the tenant-scoped
+Redis backend, the keys in the server-side key registry. It misses the twin of any key only
+another process, or this process before a restart, recorded: the registry holds keys, not
+their twins, and releases before v0.20.0 recorded their keys nowhere. So if you cache personal
+data under `ttl=None`, or otherwise need every pre-upgrade entry gone rather than aging out,
+follow the flush procedure in the retention warning [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
 writing `:{integrity_flag}s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
 orphans the old keyspace rather than deleting it; the retention step still applies.
@@ -162,16 +164,18 @@ def get_data():
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no bulk delete. On a function that
-> takes parameters, `cache_clear()` reaches a pre-upgrade `:{integrity_flag}s` twin only
-> where that exact key was tracked, in two cases. A twin whose delete failed during
-> `invalidate_cache(args)` is re-tracked in that process's memory, and that process's next
-> no-argument call retries it. A restart, or a call from another process, does not. And on
-> the tenant-scoped Redis backend, a v0.20.0 decorator on the default serializer for the
-> same function and namespace registers that key in the server-side key registry, which
-> every decorator of that function and namespace drains. A twin only a v0.19 release ever
-> wrote is in neither. On a sync function with no parameters, `cache_clear()` deletes the
-> key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and
-> `await fn.ainvalidate_cache()` deletes both. So flush on
+> takes parameters, no-argument `cache_clear()` (on an async function with a backend,
+> `await fn.ainvalidate_cache()`; `cache_clear()` raises `TypeError` there) deletes the
+> pre-upgrade `:{integrity_flag}s` twin of every key this process recorded since it started,
+> and a twin whose delete fails stays tracked for that process's next call. It misses the
+> twin of a key only another process, or this process before a restart, recorded. On the
+> tenant-scoped Redis backend the server-side key registry drains those keys but not their
+> twins, with one exception: a v0.20.0 decorator on the default serializer for the same
+> function and namespace registers its `:{integrity_flag}s` key there like any key it
+> writes. That registration lapses seven days after the last tracked write to the
+> function's registry, and a `ttl=None` entry outlives it. On a function with no
+> parameters, single-key and no-argument invalidation are one call and delete the key and
+> its twin. So flush on
 > the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
 > matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
