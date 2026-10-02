@@ -36,6 +36,7 @@ import json
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import sysconfig
@@ -46,19 +47,19 @@ from pathlib import Path
 from typing import Any
 
 N_LO, N_HI = 1000, 3000
-# Heap layout moves per-op counts: the allocators take longer paths in some heap states. Any code
-# change shifts the layout, even an edit to this file's comments, so a single run can fail an
-# untouched path or hide a real regression. Each path runs at these layout shifts (extra objects
-# held) and its figure is the cheapest: layout only ever adds allocator work, while a regression
-# raises every layout. Unrelated changes still move figures a little; docs/performance.md has the
-# measured ranges.
+# Heap layout moves per-op counts: the allocators take shorter or longer paths in some heap
+# states. Any code change shifts the layout, even an edit to this file's comments, so a single run
+# can fail an untouched path or hide a real regression. Each path runs at these layout shifts
+# (extra objects held) and its figure is the median, which one or two odd layouts cannot move.
+# The cheapest layout is not used: a lucky one sits up to 1% below the rest, and a budget recorded
+# there makes every later run look like a regression. docs/performance.md has the measured ranges.
 LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
 WARN_PCT = 0.2  # above the A/A floor: report but pass
 # The exception: the orjson round trip's 1 KB output buffer goes to glibc malloc, whose path length
 # depends on heap state that no layout sample pins (longer warmups did not settle it). Its figure
-# moves by about the 1% threshold between unrelated changes, so it is gated at what this harness
-# resolves for it.
+# moves by more than the 1% threshold between unrelated changes, so it is gated at what this
+# harness resolves for it.
 TOLERANCE_PCT = {"serializer_orjson": (2.0, 1.0)}  # path: (fail, warn)
 # Callgrind runs at a time by default. Each holds about half a gigabyte, so the default stays small
 # enough to share the machine with other work rather than growing with its core count; --jobs
@@ -329,7 +330,7 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
             for p, n, shift in runs
         }
         ir = {key: future.result() for key, future in futures.items()}
-    return {p: min(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS) for p in paths}
+    return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
 
 
 def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str], bool]:
