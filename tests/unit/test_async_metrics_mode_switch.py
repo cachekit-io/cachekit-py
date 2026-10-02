@@ -32,11 +32,16 @@ def _record(collector: AsyncMetricsCollector, namespace: str) -> None:
     collector.record_cache_operation(operation="get", namespace=namespace, success=True, duration_ms=1.0)
 
 
-def _flushed(namespace: str) -> float:
+def _sample(name: str, labels: dict[str, str] | None = None) -> float:
     from prometheus_client import REGISTRY
 
-    labels = {"operation": "get", "namespace": namespace, "success": "True", "serializer": "unknown"}
-    return REGISTRY.get_sample_value("cache_operations_total", labels) or 0.0
+    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
+
+
+def _flushed(namespace: str) -> float:
+    return _sample(
+        "cache_operations_total", {"operation": "get", "namespace": namespace, "success": "True", "serializer": "unknown"}
+    )
 
 
 def test_records_after_returning_to_batched_mode_reach_their_metric():
@@ -265,9 +270,64 @@ def _in_child_forked_holding(lock: Any, child: Callable[[], Any]) -> Any:
         process.join(timeout=5)
 
 
+def _in_c_forked_child_holding(lock: Any, child: Callable[[], Any]) -> Any:
+    """Like ``_in_child_forked_holding``, but fork from C, skipping Python's after-fork handling as uWSGI can.
+
+    ``child`` must not start a thread: CPython's own after-fork repair has not run either, so a thread started
+    there can hang or crash the interpreter.
+    """
+    import ast
+    import ctypes
+
+    libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
+    read_end, write_end = os.pipe()
+    with lock:
+        pid = libc_fork()
+        if pid == 0:  # child: SIGALRM kills it if it waits on a lock it inherited held
+            try:
+                signal.alarm(5)
+                os.write(write_end, repr(child()).encode())
+                os._exit(0)
+            finally:
+                os._exit(2)
+    os.close(write_end)
+    with os.fdopen(read_end) as pipe:
+        result = pipe.read()
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+        pytest.fail(f"the child of a fork made from C hung or failed (exit code {os.waitstatus_to_exitcode(status)})")
+    return ast.literal_eval(result)
+
+
+needs_c_fork = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
+FORKS = [
+    pytest.param(_in_child_forked_holding, id="fork", marks=needs_fork),
+    pytest.param(_in_c_forked_child_holding, id="c-fork", marks=needs_c_fork),
+]
+
+
+def _metric_name(namespace: str) -> str:
+    return namespace.replace("-", "_")
+
+
+# Each entry point, how to read its series, and the value after one record in the child and one more batched.
+ENTRY_POINTS = {
+    "cache-operation": (_record, _flushed, 2),
+    "circuit-breaker": (
+        lambda c, n: c.record_circuit_breaker_state(namespace=n, state="open", transitions=1),
+        lambda n: _sample("circuit_breaker_state", {"namespace": n, "state": "open"}),
+        1,
+    ),
+    "counter": (lambda c, n: c.record_counter(_metric_name(n)), lambda n: _sample(f"{_metric_name(n)}_total"), 2),
+    "histogram": (lambda c, n: c.record_histogram(_metric_name(n), 1.0), lambda n: _sample(f"{_metric_name(n)}_count"), 2),
+}
+
+
 @needs_fork
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
 @pytest.mark.parametrize("held", ["queue", "pool"])
-def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held):
+def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held, entry):
+    record, read, after_batched = ENTRY_POINTS[entry]
     namespace = f"fork-batched-{held}-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
     assert collector._queue is not None
@@ -275,16 +335,54 @@ def test_child_of_a_batched_parent_records_past_a_lock_held_at_fork(held):
 
     def child():
         collector._last_mode_check = time.time()  # the first record takes the batched path, not a mode check
-        _record(collector, namespace)
-        first = _flushed(namespace)  # recorded synchronously: the child has no worker yet to flush a queued one
+        record(collector, namespace)
+        first = read(namespace)  # recorded synchronously: the child has no worker yet to flush a queued one
         _steer(collector, 500)
-        _record(collector, namespace)  # batched again, on a queue and pool of the child's own
+        record(collector, namespace)  # batched again, on a queue and pool of the child's own
         batched = not collector._sync_mode
         collector.shutdown()
-        return first, batched, _flushed(namespace)
+        return first, batched, read(namespace)
 
     # The parent's worker did not survive the fork, and no thread in the child will ever release the lock.
-    assert _in_child_forked_holding(lock, child) == (1, True, 2)
+    assert _in_child_forked_holding(lock, child) == (1, True, after_batched)
+    collector.shutdown()
+
+
+def _prometheus_lock(held: str, namespace: str) -> Any:
+    """Return the prometheus_client lock named by ``held``, for the series a cache operation in ``namespace`` updates."""
+    from prometheus_client import REGISTRY
+
+    if held == "registry":
+        return REGISTRY._lock
+    counter = async_metrics._metrics_cache["cache_operations_total"]
+    if held == "counter":
+        return counter._lock  # taken by labels()
+    if held == "counter-series":
+        return counter.labels(operation="get", namespace=namespace, success="True", serializer="unknown")._value._lock
+    duration = async_metrics._metrics_cache["cache_operation_duration_ms"]
+    series = duration.labels(operation="get", namespace=namespace, serializer="unknown")
+    return series._sum._lock if held == "histogram-sum" else series._buckets[0]._lock
+
+
+@pytest.mark.parametrize("fork_holding", FORKS)
+@pytest.mark.parametrize("held", ["counter", "counter-series", "histogram-sum", "histogram-bucket", "registry"])
+def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
+    namespace = f"fork-prometheus-{held}-{uuid.uuid4().hex}"
+    # Create the series first, as a parent that has recorded before has; its worker updates them under these locks.
+    AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False).record_cache_operation(
+        operation="get", namespace=namespace, success=True, duration_ms=1.0
+    )
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+
+    def child():
+        collector._last_mode_check = time.time()  # the first record takes the batched path, so the child takes over
+        _record(collector, namespace)
+        # A metric the parent never created registers in prometheus_client's registry, under the registry lock.
+        collector.record_counter(_metric_name(namespace))
+        return _flushed(namespace), _sample(f"{_metric_name(namespace)}_total")
+
+    # prometheus_client resets none of its locks after a fork, so the child must not use the parent's copies.
+    assert fork_holding(_prometheus_lock(held, namespace), child) == (2, 1)
     collector.shutdown()
 
 
@@ -336,46 +434,33 @@ def test_child_of_a_parent_back_in_sync_mode_batches_on_a_queue_of_its_own():
 
 
 class _UnstartedThread(threading.Thread):
+    started = []
+
     def start(self):
-        # The fork below skips CPython's own after-fork repair, so its child must stay single-threaded: a thread
-        # started there can crash the interpreter (the free-threaded build's parking lot still lists dead threads).
-        self.start_requested = True
+        # Record the start instead of making it: in the child of a fork made from C, a real one can hang or crash.
+        self.started.append(self)
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
-def test_child_of_a_hookless_fork_detects_the_fork_by_pid():
+@needs_c_fork
+def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
     """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-osafterfork."""
-    import ctypes
-
     namespace = f"fork-hookless-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
     inherited_worker, q = collector._worker_thread, collector._queue
     assert inherited_worker is not None and q is not None
-    libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
 
-    with q.mutex:
-        pid = libc_fork()
-        if pid == 0:  # child: SIGALRM kills it if it waits on the parent's queue
-            try:
-                signal.alarm(5)
-                if not inherited_worker.is_alive():
-                    os._exit(3)  # the dead worker must still look alive here, or this tests nothing
-                collector._last_mode_check = time.time()  # the first record takes the batched path
-                _record(collector, namespace)
-                if _flushed(namespace) != 1:
-                    os._exit(4)
-                async_metrics.threading = SimpleNamespace(Thread=_UnstartedThread, Event=threading.Event, Lock=threading.Lock)
-                _steer(collector, 500)
-                _record(collector, namespace)
-                # The inherited worker still looks alive, yet the switch starts a worker of the child's own.
-                worker = collector._worker_thread
-                started = isinstance(worker, _UnstartedThread) and worker.start_requested
-                own_queue = collector._queue is not q and collector._queue.qsize() == 1
-                os._exit(0 if started and own_queue and not collector._sync_mode else 1)
-            finally:
-                os._exit(2)
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+    def child():
+        stale = inherited_worker.is_alive()  # the dead worker still looks alive, so only the PID shows the fork
+        collector._last_mode_check = time.time()  # the first record takes the batched path
+        _record(collector, namespace)
+        first = _flushed(namespace)
+        async_metrics.threading = SimpleNamespace(Thread=_UnstartedThread, Event=threading.Event, Lock=threading.Lock)
+        _steer(collector, 500)  # the inherited rate alone would trip a switch to batched mode
+        _record(collector, namespace)
+        return stale, first, collector._sync_mode, len(_UnstartedThread.started), _flushed(namespace)
+
+    # CPython's own after-fork repair has not run in this child either, so the collector never starts a thread here.
+    assert _in_c_forked_child_holding(q.mutex, child) == (True, 1, True, 0, 2)
     collector.shutdown()
 
 
