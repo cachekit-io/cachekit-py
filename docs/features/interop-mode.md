@@ -4,6 +4,9 @@
 
 **Released** — see the [changelog](../../CHANGELOG.md) for the interop entry · Implements [interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)
 
+> [!NOTE]
+> **Canonical reference:** the cross-SDK rules live in the docs.cachekit.io guide [Using Interop Mode](https://docs.cachekit.io/concepts/using-interop-mode/) and the normative [interop/v1 specification](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md). This page covers the Python API in detail; where it and those two disagree, they win.
+
 ## TL;DR
 
 Interop mode is the opt-in path that lets cachekit-py share cache entries **byte-identically** with cachekit-rs and cachekit-ts. Keys become `{namespace}:{operation}:{args_hash}` and values become one plain MessagePack document — no Python-internal framing, readable by any language with a MessagePack library.
@@ -41,7 +44,7 @@ Default behavior is completely unchanged: functions that don't pass `interop=` k
 | `@cache.production(interop=..., ...)` | ✅ Spec-identical | **Recommended.** Reliability profile (circuit breaker, monitoring) affects runtime only, never bytes |
 | `@cache.minimal(interop=..., ...)` | ✅ Spec-identical | Its `integrity_checking=False` is a no-op here — see [Encryption](#encryption) |
 | `@cache.secure(interop=..., ...)` | ✅ Spec-identical ciphertext | Encrypted interop bytes; cross-SDK readable with the same master key (and the same explicit tenant, if one is configured) |
-| `@cache.io(interop=..., ...)` | ✅ Composes in code | ⚠️ Don't run against CachekitIO until the saas#91 validator deploy is live — see the note at the bottom |
+| `@cache.io(interop=..., ...)` | ✅ Spec-identical | The CachekitIO key validator accepts interop keys ([spec → SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations)) |
 | `@cache.local(...)` / `@cache(backend=None)` | ❌ Rejected loudly | No shared medium: `.local` raises `TypeError` (it accepts no `interop=`), `backend=None` raises `ConfigurationError` at decoration time |
 
 **Recommended form** — spec-identical bytes plus the production reliability profile:
@@ -143,4 +146,4 @@ assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 
 Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 34 key vectors, 4 value vectors, 11 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
-> **CachekitIO note**: the deployed api.cachekit.io cache-key validator predates interop keys and rejects them until the saas#91 validator shrink is live in production. Redis and other self-hosted backends are unaffected.
+> **CachekitIO note**: the api.cachekit.io cache-key validator accepts interop keys. The segment rules above (reserved `ns`/`nsapi` namespaces, no `..`) are what keep every interop key inside what it accepts — see the spec's [SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations).
