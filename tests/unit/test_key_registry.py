@@ -48,10 +48,25 @@ def _closure_cell(fn: Any, name: str) -> Any:
     raise LookupError(name)
 
 
+class FakeRedisClient:
+    """The slice of redis.Redis the invalidation channel publishes through: records each PUBLISH."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes]] = []
+        self.fail_publish: Optional[BaseException] = None
+
+    def publish(self, channel: str, message: bytes) -> int:
+        if self.fail_publish is not None:
+            raise self.fail_publish
+        self.published.append((channel, message))
+        return 0
+
+
 class TrackingBackend:
     """In-memory L2 with a key registry: sets of raw keys per registry id."""
 
     def __init__(self) -> None:
+        self._client = FakeRedisClient()  # where PerRequestRedisBackend keeps its shared client
         self.store: dict[str, bytes] = {}
         self.sets: dict[str, set[str]] = {}
         self.track_calls: list[tuple[str, str]] = []

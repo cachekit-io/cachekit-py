@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
 
+from .. import invalidation
 from ..backends.errors import BackendError, UnsupportedTenantError
 from ..cache_handler import (
     CacheHit,
@@ -2477,6 +2478,10 @@ def create_cache_wrapper(
         may carry a value written after the drain unlinked it, and if that write's track_key
         failed, this process's record is the only thing left that can reach it: it stays in
         _cached_keys for the next drain.
+
+        A drain that returned is announced once, whatever the legacy set's drain did; the local
+        fallback is never announced: peers evicting their L1 would re-read the L2 entries it
+        could not reach.
         """
         if not _is_trackable():
             _local_invalidate_all()
@@ -2505,10 +2510,12 @@ def create_cache_wrapper(
         except Exception as e:
             _logger.warning("Key registry drain failed, invalidating local keys only: %s", redact_error_for_log(e))
             _local_invalidate_all()
+        else:
+            invalidation.publish(_backend, _registry_id, None)
 
-    def _invalidate_key(cache_key: str) -> None:
+    def _invalidate_key(cache_key: str) -> bool:
         """Single-key invalidation: untrack, L2 delete, then L1. Sync; ainvalidate_cache runs it
-        via asyncio.to_thread, like _drain_all.
+        via asyncio.to_thread, like _drain_all. Returns whether the L2 delete returned normally.
 
         Untrack BEFORE the delete: every write path calls _put_l1, which re-tracks the key, after
         its L2 set, so a concurrent write landing after the delete can never be left in L2 untracked.
@@ -2517,9 +2524,9 @@ def create_cache_wrapper(
         """
         entry = (_l2_scope(), cache_key)
         _cached_keys.discard(entry)
+        deleted = False
         try:
             if _backend and not _l1_only_mode:
-                deleted = False
                 try:
                     _backend.delete(cache_key)
                     deleted = True
@@ -2535,11 +2542,22 @@ def create_cache_wrapper(
                 _object_cache.delete(cache_key)
             elif _l1_cache:
                 _l1_cache.invalidate(cache_key)
+        return deleted
 
     def _invalidate_keys(cache_keys: list[str]) -> None:
-        """_invalidate_key per key: each logs its own failure, so one never skips the next."""
-        for cache_key in cache_keys:
-            _invalidate_key(cache_key)
+        """_invalidate_key per key: each logs its own failure, so one never skips the next.
+
+        Announced once, for the first (current-format) key and only if its L2 delete returned
+        normally: L1 only ever holds current-format keys, and a peer evicting after a failed
+        delete would re-read the entry it left. The pre-0.20.0 twin's delete neither adds nor
+        gates the announcement. A key= function's key embeds caller identifiers, so its event
+        names the whole function instead.
+        """
+        current_deleted = _invalidate_key(cache_keys[0])
+        for twin in cache_keys[1:]:
+            _invalidate_key(twin)
+        if current_deleted and _is_trackable():
+            invalidation.publish(_backend, _registry_id, None if custom_key_func is not None else cache_keys[0])
 
     def invalidate_cache(*args: Any, **kwargs: Any) -> None:
         nonlocal _backend
