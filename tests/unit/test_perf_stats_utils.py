@@ -12,6 +12,7 @@ import pytest
 
 from tests.performance.stats_utils import (
     PerformanceResult,
+    balanced_order,
     difference_band,
     effect_size_significant,
     noise_floor,
@@ -138,3 +139,19 @@ def test_tails_at_the_floor_carry_a_whole_run_bootstrap_ci() -> None:
     assert result.p95_ci is not None and result.p99_ci is None
     assert result.p95_ci[0] <= result.p95 <= result.p95_ci[1]
     assert "over 10 whole runs (uncalibrated)" in str(result)
+
+
+def test_a_balanced_random_order_does_not_alias_a_periodic_host() -> None:
+    # Identical arms on a host that is slow on blocks 0 and 3 of every 4: the ABBA pattern puts
+    # every slow block in arm A. A shuffled balanced order spreads them.
+    rng = random.Random(11)
+
+    def a_a(order: str) -> bool:
+        arms: dict[str, list[list[float]]] = {"A": [], "B": []}
+        for i, arm in enumerate(order):
+            level = 50.0 if i % 4 in (0, 3) else 40.0
+            arms[arm].append([rng.gauss(level, 1.0) for _ in range(20)])
+        return effect_size_significant(summarize("A", arms["A"]), summarize("B", arms["B"]))
+
+    assert a_a("ABBAABBAAB")
+    assert sum(a_a(balanced_order(5, rng)) for _ in range(500)) / 500 <= 0.05

@@ -13,6 +13,7 @@ Run with:
         uv run pytest tests/integration/saas/test_sdk_performance.py -v -s
 """
 
+import random
 import statistics
 import time
 import uuid
@@ -24,6 +25,7 @@ import requests
 
 from tests.performance.stats_utils import (
     PerformanceResult,
+    balanced_order,
     effect_size_significant,
     format_tail,
     noise_floor,
@@ -37,8 +39,11 @@ pytestmark = [pytest.mark.performance, pytest.mark.sdk_e2e]
 KEYS = 50  # primed keys; each is revisited every KEYS calls, well past the edge's few-second L0
 WARMUP_CALLS = 10
 BLOCK = 20  # calls per run; runs alternate between the two A/A arms
-BLOCK_ORDER = "ABBAABBAAB"  # 5 runs per arm, 200 timed hits in total
+RUNS_PER_ARM = 5  # in a random balanced order: 10 runs, 200 timed hits in total
 PACE_S = 0.1  # sleep between calls: a few requests per second, far inside the dev limiter
+# One fresh namespace per module run: keys a previous run left on the target would turn this
+# run's first calls into L2 hits whose L1 copies expire with the old entry's remaining TTL.
+NAMESPACE = f"perf_{uuid.uuid4().hex[:8]}"
 
 
 @pytest.fixture(scope="module")
@@ -109,7 +114,7 @@ def test_l1_cache_latency(cache_io_decorator, performance_timer):
     - Multiple hits maintain performance
     """
 
-    @cache_io_decorator
+    @cache_io_decorator(namespace=NAMESPACE)
     def fast_function(x: int) -> int:
         return x * 2
 
@@ -143,8 +148,8 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
 
     Arms:
     - GET-miss + SET: priming KEYS never-seen keys, one call each.
-    - L2 hit: WARMUP_CALLS discarded, then BLOCK_ORDER runs of BLOCK calls cycling the primed keys.
-      Runs alternate between arms A and B in ABBA order; both arms call the same function on the
+    - L2 hit: WARMUP_CALLS discarded, then 2 x RUNS_PER_ARM runs of BLOCK calls cycling the primed
+      keys, in a random balanced order of arms A and B; both arms call the same function on the
       same keys, so any difference effect_size_significant calls is noise: the A/A floor.
     """
     namespace = f"perf_{uuid.uuid4().hex[:8]}"
@@ -172,7 +177,10 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
     arms: dict[str, list[list[float]]] = {"A": [], "B": []}
     tiers: dict[str, list[float]] = {}
     call = WARMUP_CALLS
-    for arm in BLOCK_ORDER:
+    seed = random.SystemRandom().randrange(2**32)
+    order = balanced_order(RUNS_PER_ARM, random.Random(seed))
+    print(f"\nRun order {order} (seed {seed})")
+    for arm in order:
         run = []
         for _ in range(BLOCK):
             latency, tier = _timed_hit(l2_function, call % KEYS, response_headers)
@@ -184,7 +192,7 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
         arms[arm].append(run)
 
     after = l2_function.cache_info()
-    timed = len(BLOCK_ORDER) * BLOCK
+    timed = len(order) * BLOCK
     assert after.l2_hits - before.l2_hits == timed, f"not every timed call was an L2 hit: {before} -> {after}"
     assert after.misses == before.misses, f"a timed call missed: {before} -> {after}"
     assert after.l1_hits == 0, "L1 served a call with l1_enabled=False"
@@ -202,7 +210,7 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
 
     changed = effect_size_significant(hit_a, hit_b)
     print(
-        f"\nA/A (same function, same keys, ABBA runs, store-served hits): delta {hit_b.center - hit_a.center:+.1f} ms, "
+        f"\nA/A (same function, same keys, shuffled runs, store-served hits): delta {hit_b.center - hit_a.center:+.1f} ms, "
         f"{'CHANGE' if changed else 'no change'} at the default 5% threshold.\n"
         f"Floor it sets: an L2-hit A/B from this vantage must move the run median by more than "
         f"{noise_floor(hit_a, hit_b, threshold=0.0):.1f} ms (the 95% bands), and by more than "
@@ -253,7 +261,7 @@ def test_concurrent_requests_performance(cache_io_decorator):
     - Reasonable total time (< 5 seconds; 10 keys, so most calls are L1 hits)
     """
 
-    @cache_io_decorator
+    @cache_io_decorator(namespace=NAMESPACE)
     def concurrent_function(x: int) -> int:
         return x * 5
 
@@ -293,7 +301,7 @@ def test_l1_cache_memory_limit(cache_io_decorator):
     NOTE: This test validates SDK behavior, not Worker behavior. 20 entries keep it to 40 requests.
     """
 
-    @cache_io_decorator
+    @cache_io_decorator(namespace=NAMESPACE)
     def large_function(x: int) -> str:
         # Return 1KB string
         return "X" * 1024
@@ -331,7 +339,7 @@ def test_throughput_sustained(cache_io_decorator):
     - No performance degradation over time
     """
 
-    @cache_io_decorator
+    @cache_io_decorator(namespace=NAMESPACE)
     def throughput_function(x: int) -> int:
         return x * 7
 
@@ -366,7 +374,7 @@ def test_cache_info_performance(cache_io_decorator, performance_timer):
     - No HTTP roundtrip required for stats
     """
 
-    @cache_io_decorator
+    @cache_io_decorator(namespace=NAMESPACE)
     def info_function(x: int) -> int:
         return x * 8
 

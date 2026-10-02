@@ -18,7 +18,8 @@ memory. It has two arms:
 
 - **GET-miss + SET**: 50 never-seen keys, one call each (GET 404, run the function, SET).
 - **L2 hit**: 10 discarded warm-up calls, then 10 runs of 20 calls cycling the 50 primed keys. The
-  runs alternate between arms A and B in ABBA order. Both arms call the same function on the same
+  runs go to arms A and B in a random balanced order, printed with its seed: a fixed pattern such as
+  ABBA would line up with any periodic latency and load one arm. Both arms call the same function on the same
   keys, so the difference between them is noise. That gives the A/A floor, the smallest change an
   A/B from this vantage can claim.
 
@@ -43,17 +44,20 @@ a p99 at n >= 2,000, each with a bootstrap interval over whole runs (uncalibrate
 
 ## First numbers (2026-10-03, vantage=MEL, client wall time, dev)
 
-| Arm | n | p50 | Run median ± band |
-|-----|---|-----|-------------------|
-| L2 hit, store-served (`do`) | 200 | 43.7 ms | 43.7 ± 0.6 ms |
-| GET-miss + SET | 50 | 112.7 ms | 112.4 ± 1.9 ms |
+Three runs of the module, minutes apart. Every timed hit in all three was store-served (`do`).
 
-The A/A had arm A at 43.5 ± 1.2 ms and arm B at 43.9 ± 0.8 ms: a delta of +0.4 ms, which reads as no
-change. An L2-hit A/B from this vantage must move the run median by more than 1.3 ms before it counts
-(2.2 ms to be called at the default 5% threshold). Every timed hit was store-served.
+| Run | L2 hit p50 (n=200) | Hit run median ± band | GET-miss + SET p50 (n=50) | A/A delta | A/A floor (95% bands) |
+|-----|--------------------|-----------------------|---------------------------|-----------|-----------------------|
+| 1 (ABBA order) | 43.7 ms | 43.7 ± 0.6 ms | 112.7 ms | +0.4 ms | 1.3 ms |
+| 2 (shuffled) | 41.5 ms | 41.5 ± 0.4 ms | 115.5 ms | -0.1 ms | 0.8 ms |
+| 3 (shuffled) | 44.6 ms | 62.8 ± 28.1 ms | 111.9 ms | +12.5 ms | 63.5 ms |
 
-A run about an hour earlier read 100.5 ms for the miss arm. That 12 ms gap between sessions is larger
-than either run's band, so compare arms only inside one session, interleaved, never across sessions.
+Every A/A read as no change. In run 3 a few runs of 20 calls were slow from start to end, so the run
+medians spread and the floor widened to 63.5 ms. The band absorbed it; it did not turn into a false
+change. Use the floor of the session you compare in, never a floor from another session.
+
+An earlier session the same day read 100.5 ms for the miss arm, about 12 ms away from these. That gap
+is larger than any one session's miss band, so compare arms only inside one session, interleaved.
 
 These numbers hold for this vantage only. They depend on where the client enters Cloudflare, the
 store's region and how many reads the edge serves.

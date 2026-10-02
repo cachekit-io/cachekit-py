@@ -279,6 +279,21 @@ def benchmark_with_gc_handling(
     return result
 
 
+def balanced_order(runs_per_arm: int, rng: random.Random, arms: str = "AB") -> str:
+    """A random run order with ``runs_per_arm`` runs of each arm, for interleaving A/B or A/A runs.
+
+    Random, not a fixed pattern like ABBA: any periodic latency on the host or service that lines
+    up with a fixed pattern loads one arm with the slow runs every time (a period-4 cycle against
+    ABBAABBAAB called a change in every trial; a shuffled order, in about 1%).
+
+    >>> sorted(balanced_order(5, random.Random(0)))
+    ['A', 'A', 'A', 'A', 'A', 'B', 'B', 'B', 'B', 'B']
+    """
+    order = list(arms * runs_per_arm)
+    rng.shuffle(order)
+    return "".join(order)
+
+
 def difference_band(baseline: PerformanceResult, current: PerformanceResult) -> float:
     """95% half-width on ``current.center - baseline.center``: Welch's t over the two sets of run medians."""
     va = statistics.variance(baseline.run_medians) / baseline.runs
