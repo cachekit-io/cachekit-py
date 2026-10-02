@@ -1209,8 +1209,7 @@ class CacheSerializationHandler:
             # fail-closed check, so convert here or a corrupt header bypasses the L2
             # `except SerializationError` eviction and survives to TTL (LAB-4075).
             try:
-                serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
-                metadata = SerializationMetadata.from_dict(metadata_dict)
+                serialized_data, metadata, serializer_name = SerializationWrapper.unwrap_metadata(data)
             except (AttributeError, KeyError, TypeError, ValueError) as e:
                 raise SerializationError(f"Corrupt cache envelope: {bounded_error(e)}") from e
 

@@ -217,3 +217,116 @@ class TestEncryptionThroughFrame:
             {"data": base64.b64encode(inner).decode("ascii"), "metadata": meta, "serializer": name, "version": "2.0"}
         ).encode("utf-8")
         assert enc_handler.deserialize_data(legacy, cache_key=self.KEY) == {"old": "secret"}
+
+
+def _frame(header: bytes, payload: bytes = b"p") -> bytes:
+    return b"CK\x03" + len(header).to_bytes(4, "big") + header + payload
+
+
+class TestHeaderMemo:
+    """unwrap_metadata parses each distinct header once (LAB-7069). The key is untrusted bytes from
+    the backend, so only validated parses are kept, the memo is bounded, and every check the read
+    path runs on the parsed metadata still runs on every read."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_memo(self):
+        from cachekit.serializers import wrapper
+
+        wrapper._parse_header_memo.cache_clear()
+        wrapper._encode_prefix_memo.cache_clear()
+
+    def test_repeat_reads_share_one_read_only_parse(self):
+        frame = SerializationWrapper.wrap(PAYLOAD, {"format": "msgpack", "compressed": True}, "default")
+        p1, m1, n1 = SerializationWrapper.unwrap_metadata(frame)
+        p2, m2, n2 = SerializationWrapper.unwrap_metadata(frame)
+        assert m1 is m2 and (n1, n2) == ("default", "default") and bytes(p1) == bytes(p2) == PAYLOAD
+        assert m1.compressed is True and m1.format.value == "msgpack"
+        with pytest.raises(AttributeError, match="read-only"):
+            m1.compressed = False
+        with pytest.raises(AttributeError, match="read-only"):
+            del m1.encrypted
+
+    def test_unwrap_returns_a_fresh_dict_the_memo_never_sees(self):
+        frame = SerializationWrapper.wrap(PAYLOAD, {"format": "msgpack", "encrypted": True, "tenant_id": "t"}, "default")
+        SerializationWrapper.unwrap_metadata(frame)
+        _, meta, _ = SerializationWrapper.unwrap(frame)
+        meta["encrypted"] = False
+        assert SerializationWrapper.unwrap_metadata(frame)[1].encrypted is True
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b'{"m": {"format": "msgpack"}, "v": "2.0"}',  # no serializer name
+            b'{"s": "", "m": {"format": "msgpack"}}',
+            b'{"s": "default", "m": {"format": "pickle"}}',  # not a SerializationFormat
+            b'{"s": "default", "m": {}}',  # no format
+            b'["s", "default"]',
+            b"{not json",
+        ],
+        ids=["no-name", "empty-name", "bad-format", "no-format", "not-an-object", "not-json"],
+    )
+    def test_a_header_that_fails_validation_is_never_kept(self, header):
+        from cachekit.serializers import wrapper
+
+        for _ in range(2):
+            with pytest.raises((AttributeError, KeyError, TypeError, ValueError)):
+                SerializationWrapper.unwrap_metadata(_frame(header))
+        assert wrapper._parse_header_memo.cache_info().currsize == 0
+
+    def test_a_header_past_the_cap_is_parsed_but_not_kept(self):
+        from cachekit.serializers import wrapper
+
+        meta = {"format": "msgpack", "original_type": "x" * 600}
+        frame = SerializationWrapper.wrap(PAYLOAD, meta, "default")
+        _, parsed, _ = SerializationWrapper.unwrap_metadata(frame)
+        assert parsed.original_type == "x" * 600
+        assert wrapper._parse_header_memo.cache_info().currsize == 0
+
+    def test_the_memo_stays_bounded_when_headers_vary_per_tenant(self):
+        from cachekit.serializers import wrapper
+
+        for i in range(1000):
+            meta = {"format": "msgpack", "encrypted": True, "tenant_id": f"tenant-{i}"}
+            assert (
+                SerializationWrapper.unwrap_metadata(SerializationWrapper.wrap(b"", meta, "default"))[1].tenant_id
+                == f"tenant-{i}"
+            )
+        assert wrapper._parse_header_memo.cache_info().currsize == wrapper._MEMO_ENTRIES
+        assert wrapper._encode_prefix_memo.cache_info().currsize == wrapper._MEMO_ENTRIES
+
+    def test_a_memoized_plaintext_header_still_trips_the_downgrade_guard(self, monkeypatch):
+        """CWE-757: the guard runs on the parsed metadata, so a cached parse cannot skip it."""
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.config.singleton import reset_settings
+        from cachekit.serializers.base import SuspiciousCacheEntryError
+
+        plain = CacheSerializationHandler(serializer_name="default", encryption=False)
+        blob = plain.serialize_data({"k": "v"}, cache_key="k")
+        assert plain.deserialize_data(blob, cache_key="k") == {"k": "v"}  # fills the memo
+        reset_settings()
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        enc = CacheSerializationHandler(serializer_name="default", encryption=True, single_tenant_mode=True)
+        for _ in range(2):
+            with pytest.raises(SuspiciousCacheEntryError):
+                enc.deserialize_data(blob, cache_key="k")
+        reset_settings()
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {"format": "msgpack", "compressed": True},
+            {"format": "msgpack", "compressed": 1},  # == True: must not share True's bytes
+            {"format": "msgpack", "n": 0.0},
+            {"format": "msgpack", "n": -0.0},  # == 0.0, renders differently: not memoized
+            {"format": "msgpack", "nested": {"a": [1]}},  # unhashable: not memoized
+            {"format": "msgpack", "tenant_id": "ü"},
+            {"format": "arrow", "compressed": None},
+        ],
+    )
+    def test_the_write_prefix_is_byte_identical_to_json(self, meta):
+        expected_header = json.dumps({"s": "default", "m": meta, "v": "2.0"}, ensure_ascii=False).encode("utf-8")
+        expected = b"CK\x03" + len(expected_header).to_bytes(4, "big") + expected_header
+        SerializationWrapper.wrap_prefix({"format": "msgpack", "compressed": True}, "default")  # a True entry first
+        SerializationWrapper.wrap_prefix({"format": "msgpack", "n": 0.0}, "default")
+        assert SerializationWrapper.wrap_prefix(meta, "default") == expected
+        assert SerializationWrapper.wrap_prefix(meta, "default") == expected

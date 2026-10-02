@@ -55,6 +55,8 @@ AutoSerializer uses **type markers** in the serialized data to preserve Python t
 {"__tuple__": True, "value": [1, 2]}
 ```
 
+Tuples keep their marker at any depth, including inside a set or frozenset, so `frozenset({(1, 2)})` reads back as written. A tuple used as a dict key is not supported.
+
 These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP) will see them as plain dicts, not as the original types.
 
 ## When to Use
