@@ -10,6 +10,7 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import fields, replace
 
 import pytest
@@ -348,7 +349,11 @@ class TestIoPreset:
         assert isinstance(a, CachekitIOBackend) and isinstance(b, CachekitIOBackend)
         assert a._sync_client.headers["authorization"] == "Bearer ck_tenant_a"
         assert b._sync_client.headers["authorization"] == "Bearer ck_tenant_b"
-        assert b._async_client.headers["authorization"] == "Bearer ck_tenant_b"
+
+        async def async_auth() -> str:
+            return b._async_lease.client.headers["authorization"]
+
+        assert asyncio.run(async_auth()) == "Bearer ck_tenant_b"
 
     @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
     def test_backend_kwarg_rejected(self, backend: object) -> None:

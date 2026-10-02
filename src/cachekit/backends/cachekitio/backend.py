@@ -16,7 +16,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import SecretStr, ValidationError
 
-from cachekit.backends.cachekitio.client import get_cached_async_http_client, lease_sync_http_client
+from cachekit.backends.cachekitio.client import lease_async_http_client, lease_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -246,10 +246,11 @@ class CachekitIOBackend:
         # Get HTTP clients (hybrid sync/async architecture)
         # Sync client: per-thread, thread-safe, no event loop required. _sync_lease is never read:
         # it is held only to keep the client open, and dropping it closes the client.
-        # Async client: per-thread, event loop safe
+        # Async client: per thread and running event loop, built on first async use; asyncio.run per job
+        # gets a fresh client each time, never one whose connections belong to a closed loop.
         self._sync_lease = lease_sync_http_client(self._config)
         self._sync_client = self._sync_lease.client
-        self._async_client = get_cached_async_http_client(self._config)
+        self._async_lease = lease_async_http_client(self._config)
 
     @staticmethod
     def _encode_key(key: str) -> str:
@@ -393,7 +394,7 @@ class CachekitIOBackend:
 
         url = f"/v1/cache/{endpoint}"
         try:
-            response = await self._async_client.request(method, url, **kwargs)
+            response = await self._async_lease.client.request(method, url, **kwargs)
             if miss_on_404 and response.status_code == 404:
                 return response
             response.raise_for_status()

@@ -4,12 +4,15 @@ Tests for backends/cachekitio/client.py covering:
 - Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
 - Sync client lifecycle: open while its lease is held, closed once the lease is dropped
 - Client configuration (base_url, timeout, Authorization header)
+- Async clients bound to the running event loop (multi-loop behaviour: test_cachekitio_event_loops.py)
 - Cleanup via close_sync_client() and close_async_client()
-- reset_global_client() clears thread-local references
+- reset_global_client() drops thread-local references
 - New client created after reset
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import httpx
 import pytest
@@ -19,7 +22,7 @@ from pydantic import SecretStr
 from cachekit.backends.cachekitio.client import (
     close_async_client,
     close_sync_client,
-    get_cached_async_http_client,
+    lease_async_http_client,
     lease_sync_http_client,
     reset_global_client,
 )
@@ -87,23 +90,41 @@ class TestLeaseSyncHttpClient:
 
 
 @pytest.mark.unit
-class TestGetCachedAsyncHttpClient:
+class TestLeaseAsyncHttpClient:
     """Async HTTP client factory behaviour."""
 
-    def test_returns_httpx_async_client(self, config: CachekitIOBackendConfig) -> None:
-        """Factory returns an httpx.AsyncClient instance."""
-        client = get_cached_async_http_client(config)
-        assert isinstance(client, httpx.AsyncClient)
+    async def test_returns_httpx_async_client(self, config: CachekitIOBackendConfig) -> None:
+        """The lease's client is an httpx.AsyncClient instance."""
+        assert isinstance(lease_async_http_client(config).client, httpx.AsyncClient)
 
-    def test_same_instance_on_repeated_calls(self, config: CachekitIOBackendConfig) -> None:
-        """Thread-local caching: same object returned every time within a thread."""
-        c1 = get_cached_async_http_client(config)
-        c2 = get_cached_async_http_client(config)
-        assert c1 is c2
+    async def test_same_instance_on_one_loop(self, config: CachekitIOBackendConfig) -> None:
+        """Per-thread caching: every live lease for this config hands out one client on this loop."""
+        l1, l2 = lease_async_http_client(config), lease_async_http_client(config)
+        assert l1.client is l2.client
 
-    def test_authorization_header(self, config: CachekitIOBackendConfig) -> None:
+    def test_new_instance_on_each_loop(self, config: CachekitIOBackendConfig) -> None:
+        """A client is never handed to a loop other than the one it was built on."""
+        lease = lease_async_http_client(config)
+
+        async def get() -> httpx.AsyncClient:
+            return lease.client
+
+        assert asyncio.run(get()) is not asyncio.run(get())
+
+    def test_no_client_without_a_running_loop(self, config: CachekitIOBackendConfig) -> None:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            lease_async_http_client(config).client  # noqa: B018 — the access is the test
+
+    async def test_distinct_keys_get_distinct_clients(self, config: CachekitIOBackendConfig) -> None:
+        other = CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=1.0)  # noqa: S106
+        l1, l2 = lease_async_http_client(config), lease_async_http_client(other)
+        c1, c2 = l1.client, l2.client
+        assert c1 is not c2
+        assert c2.headers["authorization"] == "Bearer ck_other_key"
+
+    async def test_authorization_header(self, config: CachekitIOBackendConfig) -> None:
         """Authorization header is Bearer <api_key>."""
-        client = get_cached_async_http_client(config)
+        client = lease_async_http_client(config).client
         auth_header = client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
 
@@ -155,14 +176,14 @@ class TestCloseSurvivesAFailingClient:
         del leases[fail_idx].client.close  # else the release finalizer later hits _raise
 
     async def test_async(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
-        from cachekit.backends.cachekitio import client as client_module
-
-        clients = [get_cached_async_http_client(config), get_cached_async_http_client(other)]
+        leases = [lease_async_http_client(config), lease_async_http_client(other)]
+        clients = [lease.client for lease in leases]
         clients[fail_idx].aclose = _araise  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="close failed"):
             await close_async_client()
         assert clients[1 - fail_idx].is_closed
-        assert not client_module._thread_local.async_clients
+        # Neither closed client is handed out again.
+        assert all(lease.client is not client for lease, client in zip(leases, clients, strict=True))
 
 
 @pytest.mark.unit
@@ -174,12 +195,16 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
     from cachekit.backends.cachekitio import client as client_module
     from cachekit.backends.cachekitio.backend import CachekitIOBackend
 
+    async def use_async(backend: CachekitIOBackend) -> None:
+        assert backend._async_lease.client is not None
+
     live = CachekitIOBackend(api_key="ck_test_live_backend")  # pragma: allowlist secret
+    asyncio.run(use_async(live))
     for i in range(20):
-        CachekitIOBackend(api_key=f"ck_test_rotated_{i}")  # pragma: allowlist secret
+        asyncio.run(use_async(CachekitIOBackend(api_key=f"ck_test_rotated_{i}")))  # pragma: allowlist secret
     gc.collect()
     assert list(client_module._thread_local.sync_leases.values()) == [live._sync_lease]
-    assert list(client_module._thread_local.async_clients.values()) == [live._async_client]
+    assert list(client_module._thread_local.async_slots.values()) == [live._async_lease._held.slot]
 
 
 @pytest.mark.unit
@@ -275,10 +300,11 @@ async def test_rebuilt_backend_never_inherits_a_dying_async_client() -> None:
     from cachekit.backends.cachekitio.backend import CachekitIOBackend
 
     released = CachekitIOBackend(api_key="ck_test_rebuilt")  # pragma: allowlist secret
+    assert released._async_lease.client is not None  # built, so the release has a client to drop
     del released
     rebuilt = CachekitIOBackend(api_key="ck_test_rebuilt")  # pragma: allowlist secret
     await asyncio.sleep(0)
-    assert not rebuilt._async_client.is_closed
+    assert not rebuilt._async_lease.client.is_closed
 
 
 @pytest.mark.unit
@@ -294,13 +320,12 @@ class TestResetGlobalClient:
         assert not client_module._thread_local.sync_leases
         assert not lease.client.is_closed
 
-    def test_clears_async_thread_local(self, config: CachekitIOBackendConfig) -> None:
-        """After reset, this thread's async client cache is empty."""
-        from cachekit.backends.cachekitio import client as client_module
-
-        client = get_cached_async_http_client(config)  # held, so only the reset can empty the cache
+    async def test_drops_async_clients(self, config: CachekitIOBackendConfig) -> None:
+        """After reset, a held lease hands out a fresh client, and the old one is not closed."""
+        lease = lease_async_http_client(config)  # held, so only the reset can drop its client
+        client = lease.client
         reset_global_client()
-        assert not client_module._thread_local.async_clients
+        assert lease.client is not client
         assert not client.is_closed
 
     def test_new_sync_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
@@ -310,9 +335,9 @@ class TestResetGlobalClient:
         l2 = lease_sync_http_client(config)
         assert l1.client is not l2.client
 
-    def test_new_async_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
+    async def test_new_async_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh async client (different object)."""
-        c1 = get_cached_async_http_client(config)
+        c1 = lease_async_http_client(config).client
         reset_global_client()
-        c2 = get_cached_async_http_client(config)
+        c2 = lease_async_http_client(config).client
         assert c1 is not c2

@@ -176,10 +176,14 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 - Latency: ~10–50ms L2 (HTTP/2, region-dependent)
 - Sync and async support (hybrid client architecture)
-- Connection pooling built-in (default: 10 connections). Backends created on the same thread with the
+- Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
   when the last one is released; the async pool is not, and Python reclaims its sockets with a
   `ResourceWarning` each. Create one backend per key and reuse it
+- Safe across event loops: the async pool belongs to the thread's running event loop and is built on
+  the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
+  thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
+  attempt. A sync-only caller never builds an async client
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 

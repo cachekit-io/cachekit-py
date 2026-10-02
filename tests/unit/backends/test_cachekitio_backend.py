@@ -61,8 +61,8 @@ def mock_sync_client() -> Any:
         return_value=MagicMock(client=client),
     ):
         with patch(
-            "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
-            return_value=MagicMock(spec=httpx.AsyncClient),
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
         ):
             yield client
 
@@ -259,8 +259,8 @@ class TestInit:
             return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
         ):
             with patch(
-                "cachekit.backends.cachekitio.backend.get_cached_async_http_client",
-                return_value=MagicMock(spec=httpx.AsyncClient),
+                "cachekit.backends.cachekitio.backend.lease_async_http_client",
+                return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
             ):
                 b = CachekitIOBackend()
                 assert b._config.api_key.get_secret_value() == _TEST_API_KEY
@@ -686,7 +686,7 @@ class TestMissWithoutException:
 
     @pytest.mark.parametrize(("method", "expected"), [(m, e) for m, e in _MISS_CALLS if m != "get_with_freshness"])
     async def test_async_miss_skips_error_path(self, backend: CachekitIOBackend, method: str, expected: Any) -> None:
-        backend._async_client.request = AsyncMock(return_value=_make_response(404))
+        backend._async_lease.client.request = AsyncMock(return_value=_make_response(404))
         with patch("cachekit.backends.cachekitio.backend.classify_http_error") as classify:
             assert await getattr(backend, f"{method}_async")("missing-key") is expected
         classify.assert_not_called()

@@ -233,7 +233,7 @@ def backend(gate: _Gate) -> Iterator[CachekitIOBackend]:
     async_client = httpx.AsyncClient(base_url=_API_URL, transport=httpx.MockTransport(gate.async_handler))
     with (
         patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=sync_client)),
-        patch("cachekit.backends.cachekitio.backend.get_cached_async_http_client", return_value=async_client),
+        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
     ):
         yield CachekitIOBackend(api_url=_API_URL, api_key=_API_KEY)
     sync_client.close()
