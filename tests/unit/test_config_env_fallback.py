@@ -25,7 +25,7 @@ class TestRedisBackendConfigEnv:
 
         config = RedisBackendConfig()
         assert config.redis_url == "redis://localhost:6379"
-        assert config.connection_pool_size == 10
+        assert config.connection_pool_size == 50
         assert config.socket_keepalive is True
         assert config.disable_hiredis is False
 

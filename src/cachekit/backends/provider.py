@@ -248,7 +248,7 @@ class DefaultBackendProvider(BackendProviderInterface):
             from cachekit.backends.redis.provider import RedisBackendProvider
 
             redis_config = RedisBackendConfig.from_env()
-            self._redis_backend = RedisBackendProvider(redis_url=redis_config.redis_url).get_shared_backend()
+            self._redis_backend = RedisBackendProvider(redis_config.redis_url, config=redis_config).get_shared_backend()
         return self._redis_backend
 
 

@@ -52,7 +52,7 @@ An explicit `redis_url` (or config) gets its own per-instance connection pool bo
 | Field | Default | Description |
 |-------|---------|-------------|
 | `redis_url` | `redis://localhost:6379` | Redis connection URL |
-| `connection_pool_size` | `10` | Maximum connections in the pool |
+| `connection_pool_size` | `50` | Maximum connections in the pool (env: `CACHEKIT_CONNECTION_POOL_SIZE`). When all are in use, an operation waits up to `socket_timeout` for one |
 | `socket_timeout` | `5.0` | Socket read/write timeout in seconds (env: `CACHEKIT_SOCKET_TIMEOUT`) |
 | `socket_connect_timeout` | `5.0` | Socket connect timeout in seconds (env: `CACHEKIT_SOCKET_CONNECT_TIMEOUT`) |
 | `socket_keepalive` | `True` | Set `SO_KEEPALIVE` on TCP connections, using the OS keepalive timers (env: `CACHEKIT_SOCKET_KEEPALIVE`). Not applied to `unix://` URLs |
@@ -93,7 +93,7 @@ When the decorator resolves Redis from `CACHEKIT_REDIS_URL` / `REDIS_URL` (no `b
 1. **Network dependency**: Every L2 operation requires a network round-trip. Use L1 cache to mitigate (enabled by default).
 2. **Redis instance required**: Unlike FileBackend, RedisBackend requires a running Redis server.
 3. **No TTL inspection**: The base RedisBackend does not expose remaining TTL on cached keys.
-4. **Connection pool exhaustion**: Under very high concurrency, the connection pool (`connection_pool_size=10`) can become a bottleneck. Increase via config or env var.
+4. **Connection pool exhaustion**: When all `connection_pool_size` connections (default 50) are in use, an operation waits up to `socket_timeout` for one to be released. If none is released in time, the operation fails with a `BackendError` and the decorator treats it as a cache miss. Async decorated calls run their L2 operations on the default executor's threads (at most 32), which share one pool. Raise the size via config or `CACHEKIT_CONNECTION_POOL_SIZE` if more threads than that share one backend.
 
 ## See Also
 
