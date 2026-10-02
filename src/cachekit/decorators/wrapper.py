@@ -860,8 +860,9 @@ def create_cache_wrapper(
         refreshes each tenant's entry. The cap and the per-key check span every thread's event
         loop: before counting, a task is pruned only once it is done or its loop is not running.
         A loop left stopped (run_until_complete, never closed) cannot advance its task, so that
-        task must not hold its key or a slot; should the loop run again, its own references
-        still carry the task to completion.
+        task gives up its key and slot and is cancelled: should the loop run again, the task
+        stops at its next await instead of running beside the slot's new holder. A request it
+        sent before its loop stopped is not recalled.
         """
         nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
         if _ttl_refresh_pid != os.getpid():
@@ -870,8 +871,13 @@ def create_cache_wrapper(
         flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
         with _ttl_refresh_lock:
             for key, t in list(_ttl_refresh_tasks.items()):
-                if t.done() or not t.get_loop().is_running():
+                if t.done():
                     del _ttl_refresh_tasks[key]
+                elif not t.get_loop().is_running():
+                    del _ttl_refresh_tasks[key]
+                    # Its slot is free for reuse now, so the task must not run on if its loop resumes.
+                    with contextlib.suppress(RuntimeError):  # a closed loop never runs it again
+                        t.get_loop().call_soon_threadsafe(t.cancel)
             if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
                 return
             task = asyncio.get_running_loop().create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))

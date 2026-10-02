@@ -411,6 +411,53 @@ class TestFileRefreshEndToEnd:
                 stopped.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             stopped.close()
 
+    def test_refresh_pruned_from_stopped_loop_does_not_resume(
+        self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh that gave up its slot because its loop stopped is cancelled, so loops that
+        resume after pausing between run_until_complete calls do not run more refreshes than the
+        pool holds (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
+
+        async def parked_get_ttl(key: str) -> int | None:
+            await asyncio.sleep(3600)  # never answers: the refresh stays pending
+            return None
+
+        file_backend.get_ttl = parked_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        async def hits() -> None:
+            for x in (0, 1):
+                assert await fetch(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def settle() -> int:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return sum(not t.done() for t in asyncio.all_tasks() if t is not asyncio.current_task())
+
+        asyncio.run(fetch(0))  # misses: store
+        asyncio.run(fetch(1))
+        loops = [asyncio.new_event_loop() for _ in range(3)]
+        try:
+            for loop in loops:
+                loop.run_until_complete(hits())  # each pauses with its refreshes pending
+            assert sum(loop.run_until_complete(settle()) for loop in loops) == 2  # resumed: the pool's 2, not 6
+        finally:
+            for loop in loops:
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
     async def test_decorator_refresh_ttl_on_get_slides_file_expiry(self, file_backend: FileBackend) -> None:
         """Behavioural e2e through the real @cache decorator: a hit past the ORIGINAL expiry
         is still served (not recomputed) because refresh_ttl_on_get slid the File TTL forward.
