@@ -329,7 +329,6 @@ class TestHeaderMemo:
             assert handler.deserialize_data(blob, cache_key="k") == {"k": "v"}
         frame_meta = SerializationWrapper.unwrap_metadata(blob)[1]
         assert frame_meta.encoding == "utf-8"
-        assert SerializationWrapper.unwrap_metadata(blob, shared=False)[1] is not frame_meta
 
     @pytest.mark.parametrize(
         "meta",

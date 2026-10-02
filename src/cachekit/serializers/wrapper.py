@@ -42,10 +42,13 @@ _HEADER_LEN_BYTES = 4  # u32 big-endian header length
 _PREFIX_LEN = len(_MAGIC) + 1 + _HEADER_LEN_BYTES  # magic(2) + version(1) + hdrlen(4) = 7
 
 # A process sees a handful of distinct headers (serializer + format flags, plus tenant and key
-# fingerprint when encrypted), so every read and write re-did the same json work: ~3 us per read,
-# ~2.5 us per write. Both are memoized, bounded by entry count. Read-side keys are untrusted bytes
-# from the backend: only headers that parse and validate are cached, and a header longer than any
-# cachekit writes is never cached, so a forged entry costs at most today's parse.
+# fingerprint when encrypted), so every read and write would re-do the same json work. Both are
+# memoized, bounded by entry count. Read-side keys are untrusted bytes from the backend: only
+# headers that parse and validate are cached, and a header longer than _MEMO_MAX_HEADER_BYTES is
+# parsed on every read and never cached, so 256 forged multi-MB headers cannot stay resident and a
+# forged entry costs at most an uncached parse. A default header is about 120 bytes; a tenant id
+# of a few hundred characters (tenant extractors set no length limit) pushes an encrypted header
+# past the cap, and those reads simply skip the memo.
 _MEMO_ENTRIES = 256
 _MEMO_MAX_HEADER_BYTES = 512
 # Header values whose equality implies identical json: the cache key compares by equality, so a
@@ -75,10 +78,16 @@ class _SharedMetadata(SerializationMetadata):
         raise AttributeError("memoized SerializationMetadata is shared across reads and read-only")
 
 
-def _parse_header(header: bytes) -> tuple[SerializationMetadata, str]:
+def _load_header(header: bytes) -> tuple[dict[str, Any], str]:
+    """(metadata dict, serializer name) of a v3 frame header: the one validation of its untrusted bytes."""
     parsed = json.loads(header)
     name = _require_serializer_name(parsed.get("s"))
-    return SerializationMetadata.from_dict(parsed.get("m", {})), name
+    return parsed.get("m", {}), name
+
+
+def _parse_header(header: bytes) -> tuple[SerializationMetadata, str]:
+    metadata, name = _load_header(header)
+    return SerializationMetadata.from_dict(metadata), name
 
 
 def _with_class(metadata: SerializationMetadata, cls: type[SerializationMetadata]) -> SerializationMetadata:
@@ -215,8 +224,8 @@ class SerializationWrapper:
             frame = _split_frame(wrapped_data)
             if frame is not None:
                 header_bytes, payload = frame
-                header = json.loads(header_bytes)
-                return payload, header.get("m", {}), _require_serializer_name(header.get("s"))
+                metadata, name = _load_header(header_bytes)
+                return payload, metadata, name
 
         # Legacy base64+JSON envelope (pre-v3 entries; backward compatible read path).
         if isinstance(wrapped_data, (bytes, bytearray, memoryview)):
@@ -235,8 +244,8 @@ class SerializationWrapper:
     ) -> tuple[Union[bytes, memoryview], SerializationMetadata, str]:
         """:meth:`unwrap` with the header already parsed into :class:`SerializationMetadata`.
 
-        The cache read path's entry point. A v3 frame header of at most 512 bytes is parsed once
-        per distinct header and the result reused, so with ``shared=True`` the returned metadata
+        The cache read path's entry point. A v3 frame header of at most ``_MEMO_MAX_HEADER_BYTES``
+        is parsed once per distinct header and the result reused, so with ``shared=True`` the returned metadata
         may be shared with other reads and raises AttributeError on assignment. ``shared=False``
         returns a plain copy the caller owns, for code that may write to it (a custom serializer).
         Validation and errors are exactly :meth:`unwrap` followed by ``SerializationMetadata.from_dict``.

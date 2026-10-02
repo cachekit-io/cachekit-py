@@ -4,7 +4,8 @@ The old write path copied every list and dict in ``_wrap_tuples`` just to find t
 with ``strict_types=False``. Now msgpack hands every tuple and builtin subclass to ``_auto_default``,
 which must reproduce the old bytes exactly. ``_legacy_packb`` below is the old path, kept verbatim
 as the reference. It uses today's ``_auto_default``: without strict_types msgpack packs every
-builtin subclass natively, so the new branches at the top of the default are unreachable there.
+builtin subclass natively, so the reference reaches the default only for non-msgpack types and for
+ints that overflow 64 bits, which the new branches leave to the same error as before.
 
 Two inputs change bytes on purpose. A tuple inside a set or frozenset, and a tuple used as a dict
 key, packed as a bare array before; neither could be read back. The set case now round-trips.
@@ -63,6 +64,10 @@ class Color(enum.IntEnum):
 class Perm(enum.IntFlag):
     R = 4
     W = 2
+
+
+class Huge(enum.IntFlag):
+    X = 2**64
 
 
 class Mood(str, enum.Enum):
@@ -200,6 +205,8 @@ _UNSUPPORTED: dict[str, Any] = {
     "custom-class": Tagged(),
     "int-past-u64": 2**64,
     "int-below-i64": -(2**63) - 1,
+    "int-subclass-past-u64": MyInt(2**70),
+    "int-flag-past-u64": Huge.X,
 }
 if np is not None:
     _UNSUPPORTED["np-int64"] = np.int64(1)
@@ -243,3 +250,35 @@ def test_round_trip_preserves_types() -> None:
     out = s.deserialize(data, meta)
     assert out == {"t": (1, (2,)), "nt": (1, 2), "e": 1, "od": {"b": (2, 3), "c": [4], "a": 1}, "f": 0.5}
     assert type(out["t"]) is tuple and list(out["od"]) == ["b", "c", "a"]
+
+
+def _columnar_cases() -> dict[str, Any]:
+    pd = pytest.importorskip("pandas")
+    multi = pd.MultiIndex.from_tuples([("a", 1), ("b", 2)])
+    return {
+        "series-tuple-name": pd.Series([1, 2], name=("a", "b")),
+        "series-multiindex": pd.Series([1.5, 2.5], index=multi),
+        "frame-tuple-column": pd.DataFrame({("x", "y"): [1, 2], "z": ["p", "q"]}),
+    }
+
+
+@pytest.mark.parametrize("case", ["series-tuple-name", "series-multiindex", "frame-tuple-column"])
+def test_columnar_documents_keep_the_non_strict_bytes(case: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The DataFrame/Series documents never ran the tuple pre-pass, so a tuple label packs as an array.
+    They must keep the non-strict packer: under strict_types these exact documents pack differently."""
+    value = _columnar_cases()[case]
+    real_packb = msgpack.packb
+    documents: list[Any] = []
+
+    def spy(obj: Any, **opts: Any) -> bytes:
+        documents.append(obj)
+        return real_packb(obj, **opts)
+
+    monkeypatch.setattr(msgpack, "packb", spy)
+    s = AutoSerializer(enable_integrity_checking=False)
+    # With pyarrow installed serialize() sends a DataFrame to Arrow; the columnar writer is the fallback.
+    stored = s._serialize_series(value) if value.ndim == 1 else s._serialize_dataframe(value)
+    monkeypatch.undo()
+    (document,) = documents
+    assert stored == msgpack.packb(document, use_bin_type=True, strict_types=False, default=_auto_default)
+    assert stored != msgpack.packb(document, use_bin_type=True, strict_types=True, default=_auto_default)

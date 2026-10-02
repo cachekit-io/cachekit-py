@@ -234,6 +234,8 @@ def _auto_default(obj: Any) -> Any:
     """Custom encoder for types not natively supported by MessagePack.
 
     Handles:
+    - tuple → dict with a ``__tuple__`` marker (the packer runs with strict_types=True)
+    - builtin subclasses (IntEnum, (str, Enum), OrderedDict, namedtuple, np.float64, ...) → their exact base type
     - datetime/date/time → ISO-8601 strings
     - UUID → string representation
     - set/frozenset → list (with type marker for roundtrip)
@@ -257,8 +259,9 @@ def _auto_default(obj: Any) -> Any:
     # instead of being packed natively. Each is reduced to its exact base type and packs to the bytes
     # the non-strict packer gave it. Tuples get the marker _auto_object_hook restores. The base-type
     # methods (str.__str__, int.__int__, ...) read the stored value and ignore a subclass override,
-    # as the C packer does; plain str() would emit an Enum member's name. An exact int arrives only
-    # when it overflows 64 bits and falls through to the error below.
+    # as the C packer does; plain str() would emit an Enum member's name. An int outside msgpack's
+    # 64-bit range, exact or subclass, falls through to the error below, as the non-strict packer
+    # sent it here on overflow.
     if isinstance(obj, tuple):
         return {"__tuple__": True, "value": list(obj)}
     if isinstance(obj, dict):
@@ -267,7 +270,7 @@ def _auto_default(obj: Any) -> Any:
         return list(obj)
     if isinstance(obj, str):
         return str.__str__(obj)
-    if isinstance(obj, int) and type(obj) is not int:
+    if isinstance(obj, int) and type(obj) is not int and -(2**63) <= int.__int__(obj) < 2**64:
         return int.__int__(obj)
     if isinstance(obj, float):
         return float.__float__(obj)
