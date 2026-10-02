@@ -48,6 +48,27 @@ With `backend=None`, cachekit skips L2 entirely. The data flow is:
 
 No network calls. No serialization to bytes. No backend initialization.
 
+## Callers Share the Cached Object
+
+> [!WARNING]
+> L1-only returns the cached object by reference. Every caller gets the same object until the entry expires, so a mutation by one caller is seen by every later caller.
+
+```python
+from cachekit import cache
+
+@cache(backend=None)
+def get_roles(user_id: int) -> list:
+    return ["reader"]
+
+roles = get_roles(1)
+roles.append("admin")  # mutates the cached object
+
+assert get_roles(1) == ["reader", "admin"]  # the next caller sees the change
+assert get_roles(1) is roles
+```
+
+Treat a cached result as read-only: return an immutable value, or copy it (`copy.deepcopy`) before you change it. Adding a backend changes this; see [Upgrade Path](#upgrade-path).
+
 ## With Intent Presets
 
 `@cache.minimal`, `@cache.production`, `@cache.dev` and `@cache.test` accept `backend=None`:
@@ -84,7 +105,67 @@ def get_user(user_id: int) -> dict:
     return db.fetch(user_id)
 ```
 
-No API changes. No code rewrite. Same decorator, same function signature.
+The decorator and the function signature stay the same. What a call returns does not, because a backend stores serialized bytes instead of the object itself:
+
+1. **Each call gets a fresh copy.** A hit decodes the stored bytes, so a caller's mutation no longer reaches other callers.
+2. **Tuples come back as lists** under the default serializer, which has no tuple type. The call that computes the value returns your tuple; later hits return a list. `serializer="auto"` keeps tuples.
+3. **Unsupported return types stop being cached.** L1-only caches any object. With a backend, a value the serializer cannot encode (a Pydantic model, a dataclass, a custom class, or a `set` under the default serializer) is returned to the caller but never stored, so the function runs on every call and each call logs the failure. See [Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors).
+
+Each change, on a `FileBackend` in a temporary directory:
+
+```python
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from cachekit import cache
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
+
+def temp_backend() -> FileBackend:
+    return FileBackend(FileBackendConfig(cache_dir=Path(tempfile.mkdtemp())))
+
+# 1. Each call gets a fresh copy
+@cache(backend=temp_backend())
+def get_roles(user_id: int) -> list:
+    return ["reader"]
+
+roles = get_roles(1)
+roles.append("admin")
+assert get_roles(1) == ["reader"]  # the change stayed with the first caller
+
+# 2. Tuples come back as lists under the default serializer
+@cache(backend=temp_backend())
+def get_point() -> tuple:
+    return (1, 2)
+
+assert get_point() == (1, 2)  # miss: the function's own tuple
+assert get_point() == [1, 2]  # hit: decoded as a list
+
+@cache(backend=temp_backend(), serializer="auto")
+def get_point_auto() -> tuple:
+    return (1, 2)
+
+get_point_auto()
+assert get_point_auto() == (1, 2)  # hit: still a tuple
+
+# 3. Unsupported return types stop being cached
+@dataclass
+class Point:
+    x: int
+    y: int
+
+calls = []
+
+@cache(backend=temp_backend())
+def get_origin() -> Point:
+    calls.append(1)
+    return Point(0, 0)
+
+get_origin()
+get_origin()
+assert len(calls) == 2  # ran on both calls: nothing was stored
+```
 
 ## Characteristics
 

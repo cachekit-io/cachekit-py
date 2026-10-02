@@ -95,10 +95,12 @@ ArrowSerializer supports:
 - `polars.DataFrame` (via `__arrow_c_stream__` interface)
 - `dict` of arrays (converted to DataFrame)
 
-**Not supported:**
-- Scalar values (int, str, float) → raises `TypeError`
-- Nested dictionaries → raises `TypeError`
-- Lists of objects → raises `TypeError`
+**Not supported.** Calling `serialize()` directly raises `TypeError` for these. A `@cache`-decorated call with a backend does not raise: it returns the value, caches nothing, and logs the failure ([Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors)).
+- Scalar values (int, str, float)
+- Lists of objects
+- Dicts with a number or bool value (`{"id": 1}`)
+
+Every dict value must be a list or an array. A string or dict value is not rejected, but it is stored wrong: a string becomes a column of its characters, and a nested dict a column of its keys, with its values lost. Flatten nested dicts into columns first, or use [AutoSerializer](./auto.md).
 
 **Type checking example:**
 ```python

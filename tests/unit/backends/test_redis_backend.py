@@ -49,7 +49,7 @@ from redis.lock import Lock
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis import provider as provider_module
-from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider, tenant_context
+from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider
 from tests.fixtures.tenant import as_tenant
 
 
@@ -745,14 +745,6 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
     provider-issued backend must scope each operation to the calling context's tenant."""
 
     @staticmethod
-    def _as_tenant(tenant, fn, *args):
-        token = tenant_context.set(tenant)
-        try:
-            return fn(*args)
-        finally:
-            tenant_context.reset(token)
-
-    @staticmethod
     def _tenants(fake: _FakeRedis) -> set[str]:
         return {key.split(":", 2)[1] for key in fake._store}
 
@@ -772,7 +764,8 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
     def test_accepted_tenant_ids_encode_to_their_canonical_form(self, tenant, wire):
         shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
         assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
-        assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
+        with as_tenant(tenant):
+            assert shared.key_prefix == f"t:{wire}:"
 
     @pytest.mark.parametrize(
         "tenant", [object(), True, False, enum.IntEnum("Org", "A").A], ids=["object", "True", "False", "IntEnum"]
@@ -785,8 +778,8 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         with pytest.raises(TypeError):
             PerRequestRedisBackend(client, tenant)
         shared = PerRequestRedisBackend(client, "default", follow_context=True)
-        with pytest.raises(TypeError):
-            self._as_tenant(tenant, shared.get, "k")
+        with as_tenant(tenant), pytest.raises(TypeError):
+            shared.get("k")
         client.get.assert_not_called()
 
     def test_a_context_without_a_tenant_falls_back_to_default_or_the_call_time_tenant(self):
@@ -795,12 +788,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         try:
             # An empty context (e.g. a thread that inherited none) has no tenant: get_shared_backend()
             # falls back to "default", get_backend() to the tenant current at the call.
-            shared = self._as_tenant("tenant-x", provider.get_shared_backend)
+            with as_tenant("tenant-x"):
+                shared = provider.get_shared_backend()
             assert contextvars.Context().run(lambda: shared.key_prefix) == "t:default:"
-            assert self._as_tenant("tenant-y", lambda: shared.key_prefix) == "t:tenant-y:"
-            backend = self._as_tenant("tenant-x", provider.get_backend)
+            with as_tenant("tenant-y"):
+                assert shared.key_prefix == "t:tenant-y:"
+            with as_tenant("tenant-x"):
+                backend = provider.get_backend()
             assert contextvars.Context().run(lambda: backend.key_prefix) == "t:tenant-x:"
-            assert self._as_tenant("tenant-y", lambda: backend.key_prefix) == "t:tenant-y:"
+            with as_tenant("tenant-y"):
+                assert backend.key_prefix == "t:tenant-y:"
         finally:
             provider.close()
 
@@ -813,12 +810,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         def lookup(x):
             return x
 
-        self._as_tenant("tenant-a", lookup, 1)
-        self._as_tenant("tenant-b", lookup, 1)
+        with as_tenant("tenant-a"):
+            lookup(1)
+        with as_tenant("tenant-b"):
+            lookup(1)
 
-        self._as_tenant("tenant-a", lookup.invalidate_cache)
+        with as_tenant("tenant-a"):
+            lookup.invalidate_cache()
         assert self._tenants(fake) == {"tenant-b"}
-        self._as_tenant("tenant-b", lookup.invalidate_cache)  # tenant-b's entry stayed tracked
+        with as_tenant("tenant-b"):
+            lookup.invalidate_cache()  # tenant-b's entry stayed tracked
         assert fake._store == {}
 
     async def test_async_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self, monkeypatch):
@@ -831,16 +832,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         async def lookup(x):
             return x
 
-        async def as_tenant(tenant, fn, *args):
-            tenant_context.set(tenant)  # each create_task below runs this in its own context copy
-            await fn(*args)
+        with as_tenant("tenant-a"):
+            await lookup(1)
+        with as_tenant("tenant-b"):
+            await lookup(1)
 
-        await asyncio.create_task(as_tenant("tenant-a", lookup, 1))
-        await asyncio.create_task(as_tenant("tenant-b", lookup, 1))
-
-        await asyncio.create_task(as_tenant("tenant-a", lookup.ainvalidate_cache))
+        with as_tenant("tenant-a"):
+            await lookup.ainvalidate_cache()
         assert self._tenants(fake) == {"tenant-b"}
-        await asyncio.create_task(as_tenant("tenant-b", lookup.ainvalidate_cache))
+        with as_tenant("tenant-b"):
+            await lookup.ainvalidate_cache()
         assert fake._store == {}
 
 
