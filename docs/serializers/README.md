@@ -16,7 +16,7 @@ Each serializer integrates transparently with the `@cache` decorator. You can co
 | [AutoSerializer](auto.md) | Fast | Python-only — preserves sets, frozensets, datetime, UUID, NumPy, pandas |
 | [OrjsonSerializer](orjson.md) | Very Fast (JSON) | JSON-heavy APIs, cross-language interop, human-readable |
 | [ArrowSerializer](arrow.md) | Very Fast (DataFrames) | Large pandas/polars DataFrames (10K+ rows) |
-| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching; may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
+| [EncryptionWrapper](encryption.md) | Adds ~3-5 μs | Zero-knowledge caching: `@cache.secure(master_key=..., serializer=...)` wraps any serializer above (not itself a `serializer=` value); may support a HIPAA/PCI DSS scope-reduction argument ([details](../features/zero-knowledge-encryption.md#compliance-implications)) |
 | [Custom Serializers](custom.md) | Varies | Specialized data types not covered above |
 
 > **OrjsonSerializer** requires the `[json]` extra: `pip install 'cachekit[json]'` (or `uv add 'cachekit[json]'`).

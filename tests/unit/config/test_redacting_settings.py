@@ -829,6 +829,18 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ConfigurationError,
         _KEY_HEX,
     ),
+    "secure-intent-encrypting-serializer": (
+        {},
+        lambda: cache.secure(master_key=_KEY_HEX, serializer=EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)))(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "bare-encrypting-serializer": (
+        {},
+        lambda: cache(serializer=EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)))(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "wrapper-env-previous-is-current": (
         {"CACHEKIT_PREVIOUS_MASTER_KEYS": _KEY_HEX},
         lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)),

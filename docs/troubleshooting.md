@@ -179,6 +179,7 @@ lsof -i :6379
 ```
 cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable
 A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...
+EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...
 CACHEKIT_MASTER_KEY must be hex-encoded: ...
 CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ...
 Decryption failed: ...
@@ -191,9 +192,10 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 **Common causes**:
 1. Master key not set when using `@cache.secure()`
 2. Master key set, but a cache states no encryption intent — add `encryption=False` for plaintext ([details](error-codes.md#master-key-present-no-encryption-intent))
-3. Master key format invalid (not hex-encoded)
-4. Master key rotated (can't decrypt old cached data)
-5. Data corruption during storage/retrieval
+3. An `EncryptionWrapper` passed as a decorator's `serializer=` — pass its inner serializer to `@cache.secure(master_key=..., serializer=...)` instead ([details](error-codes.md#encrypting-serializer-on-a-decorator))
+4. Master key format invalid (not hex-encoded)
+5. Master key rotated (can't decrypt old cached data)
+6. Data corruption during storage/retrieval
 
 **Quick fix**:
 ```bash

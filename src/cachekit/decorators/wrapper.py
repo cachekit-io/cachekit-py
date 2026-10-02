@@ -498,6 +498,8 @@ def create_cache_wrapper(
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
+                   An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
+                   encrypt with encryption=True (@cache.secure) and pass the inner serializer here.
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
                    - None (default): no intent stated. Plaintext when no master key is present;
@@ -712,6 +714,21 @@ def create_cache_wrapper(
             "CACHEKIT_FILE_CACHE_DIR, else REDIS_URL / localhost Redis; see "
             "docs/backends/README.md) or pass one explicitly to keep @cache.secure / "
             "encryption=True."
+        )
+
+    # ENCRYPTING SERIALIZER, ANY MODE. EncryptionWrapper binds each ciphertext to its cache key, but the
+    # handler never passes a key to the serializer it is given, so every store would raise and the function
+    # would run on every call. Encryption on a decorator is encryption=True / @cache.secure: the handler then
+    # builds the wrapper itself, behind its tenant-mode and cross-SDK serializer checks. Placed after the
+    # L1-only check, so backend=None keeps that message, and before the handler is built, so it fires ahead
+    # of the handler's own errors (no stated intent, cross-SDK serializer, missing key), none of which names
+    # this fix.
+    if _encrypting_serializer:
+        raise ConfigurationError(
+            "EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: "
+            "the decorator never gives it the cache key each ciphertext is bound to, so it would never store an "
+            "entry. To encrypt, use @cache.secure(master_key=..., serializer=...) with the inner serializer "
+            "(omit serializer= for the default MessagePack); it builds the EncryptionWrapper itself."
         )
 
     # Store backend and handler type for consistent access

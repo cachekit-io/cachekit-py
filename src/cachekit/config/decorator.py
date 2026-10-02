@@ -112,6 +112,8 @@ class DecoratorConfig:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
                    Default: "default" (MessagePack+LZ4+xxHash3-64 via Rust)
+                   An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError when
+                   the decorator is applied: encrypt with secure(master_key=..., serializer=<inner>).
         integrity_checking: Enable checksums for corruption detection (default: True)
                            All serializers use xxHash3-64 (8 bytes).
                            Set to False for @cache.minimal (speed-first, no integrity guarantee)

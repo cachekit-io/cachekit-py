@@ -169,8 +169,8 @@ def get_serializer(name: str, enable_integrity_checking: bool = True) -> Seriali
 def get_available_serializers() -> dict[str, Any]:
     """Get all available serializer classes.
 
-    Note: EncryptionWrapper is not included as it's a wrapper requiring
-    a base serializer, not a standalone serializer type.
+    Note: includes "encrypted" (EncryptionWrapper), which no cache decorator accepts as
+    serializer=: encrypt with @cache.secure(master_key=..., serializer=<inner>) instead.
     """
     return SERIALIZER_REGISTRY.copy()
 

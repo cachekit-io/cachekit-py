@@ -177,9 +177,8 @@ class TestSerializerCodeTable:
 
         codes = CacheKeyGenerator.SERIALIZER_CODES
         aliases = CacheKeyGenerator.SERIALIZER_NAME_ALIASES
-        # "encrypted" is registered but unreachable as a serializer name: without a master key
-        # CacheSerializationHandler raises EncryptionError, and with one, an unstated intent raises
-        # and encryption=True's CROSS_SDK_SERIALIZER_NAMES check rejects it. It has no keyspace to protect.
+        # "encrypted" is registered but unreachable as a serializer name: every cache decorator refuses
+        # it with ConfigurationError when applied. It has no keyspace to protect.
         unreachable = {"encrypted"}
         for name in SERIALIZER_REGISTRY:
             if name in unreachable:
