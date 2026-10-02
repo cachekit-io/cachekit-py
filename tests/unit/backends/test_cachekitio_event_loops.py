@@ -19,6 +19,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -209,7 +210,6 @@ def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytes
     _point_clients_at(monkeypatch, saas, keepalive_expiry=5.0)
     backend = CachekitIOBackend(api_key=_api_key())
     clients: list[httpx.AsyncClient] = []
-    errors: list[Exception] = []
     ready = threading.Barrier(2)
 
     async def job() -> None:
@@ -217,18 +217,10 @@ def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytes
         clients.append(backend._async_lease.client)
         assert await backend.get_ttl(_KEY) == 60
 
-    def run() -> None:
-        try:
-            asyncio.run(job())
-        except Exception as exc:  # noqa: BLE001 — surfaced on the main thread below
-            errors.append(exc)
-
-    threads = [threading.Thread(target=run) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(10)
-    assert errors == []
+    # result() re-raises a worker's failure here with its own traceback, and a hung worker as TimeoutError.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(asyncio.run, job()) for _ in range(2)]:
+            future.result(timeout=10)
     assert len(clients) == 2
     assert clients[0] is not clients[1]
 
