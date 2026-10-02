@@ -3,13 +3,13 @@
     "cpython-3.12-x86_64": {
       "budgets": {
         "l1_hit": 67527,
-        "l2_hit": 352884,
-        "l2_hit_async_metrics": 297245,
+        "l2_hit": 320633,
+        "l2_hit_async_metrics": 264455,
         "minimal_l1_hit": 65660,
-        "miss": 338765,
-        "secure_l1_hit": 287024,
+        "miss": 316498,
+        "secure_l1_hit": 248284,
         "serializer_arrow": 1946487,
-        "serializer_auto": 110227,
+        "serializer_auto": 69424,
         "serializer_default": 61356,
         "serializer_encrypted": 115652,
         "serializer_orjson": 23792
