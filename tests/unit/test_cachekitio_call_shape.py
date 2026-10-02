@@ -425,42 +425,6 @@ class TestAsyncCallShape:
         shape = await gate.run_async(fn(1))
         assert shape == _Shape(blocking=["GET"], background=["GET /ttl", "PATCH /ttl"])
 
-    async def test_refresh_ttl_on_get_concurrent_hits_send_one_patch(
-        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS
-    ) -> None:
-        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
-        async def fn(x: int) -> int:
-            return x * 2
-
-        await gate.run_async(fn(1))
-        saas.fresh_for = 10
-
-        async def two_hits() -> None:
-            await asyncio.gather(fn(1), fn(1))
-
-        shape = await gate.run_async(two_hits())
-        assert _op_counts(shape) == {"GET": 2, "PATCH /ttl": 1}
-
-    async def test_refresh_ttl_on_get_bounds_concurrent_refreshes(
-        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Hits on more distinct keys than the pool holds send one PATCH per slot; the rest skip."""
-        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
-
-        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
-        async def fn(x: int) -> int:
-            return x * 2
-
-        for x in range(3):
-            await gate.run_async(fn(x))
-        saas.fresh_for = 10
-
-        async def three_keys() -> None:
-            await asyncio.gather(*(fn(x) for x in range(3)))
-
-        shape = await gate.run_async(three_keys())
-        assert _op_counts(shape) == {"GET": 3, "PATCH /ttl": 2}
-
     async def test_refresh_ttl_on_get_single_flight_is_per_key_prefix(
         self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
     ) -> None:

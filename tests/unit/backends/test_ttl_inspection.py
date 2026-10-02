@@ -295,6 +295,79 @@ class TestFileRefreshEndToEnd:
             await handler.get_async("k", refresh_ttl=100)
             assert await file_backend.get_ttl("k") == 90
 
+    async def test_refresh_concurrency_is_capped(self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """While every refresh is still in flight, a second hit on a key starts no second refresh, and
+        hits on more distinct keys than the pool holds start one refresh per slot (LAB-7074)."""
+        from cachekit import cache
+
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
+        release = asyncio.Event()
+        get_ttl_calls: list[str] = []
+
+        async def held_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await release.wait()
+            return None
+
+        file_backend.get_ttl = held_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch(x: int) -> int:
+            return x
+
+        for x in range(3):
+            await fetch(x)  # misses: store
+        for x in (0, 0, 1, 2):
+            assert await fetch(x) == x  # hits; the second hit on key 0 joins its running refresh
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(get_ttl_calls) == 2
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def test_refresh_single_flight_spans_event_loops(self, file_backend: FileBackend) -> None:
+        """A refresh still running on one thread's event loop is not pruned by a hit on another
+        loop: the second loop sends no duplicate refresh for the same key (LAB-7074)."""
+        import threading
+
+        from cachekit import cache
+
+        release = threading.Event()
+        get_ttl_calls: list[str] = []
+        real_get_ttl = file_backend.get_ttl
+
+        async def slow_get_ttl(key: str) -> int | None:
+            get_ttl_calls.append(key)
+            await asyncio.to_thread(release.wait, 10)
+            return await real_get_ttl(key)
+
+        file_backend.get_ttl = slow_get_ttl  # type: ignore[method-assign]
+
+        @cache(backend=file_backend, ttl=100, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fetch() -> int:
+            return 1
+
+        asyncio.run(fetch())  # miss: store
+        loop_a = asyncio.new_event_loop()
+        thread_a = threading.Thread(target=loop_a.run_forever, daemon=True)
+        thread_a.start()
+        try:
+            assert asyncio.run_coroutine_threadsafe(fetch(), loop_a).result(10) == 1  # hit: refresh parked on loop A
+
+            async def hit_on_loop_b() -> None:
+                assert await fetch() == 1
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+            asyncio.run(hit_on_loop_b())
+            assert len(get_ttl_calls) == 1
+        finally:
+            release.set()
+            loop_a.call_soon_threadsafe(loop_a.stop)
+            thread_a.join(10)
+            loop_a.close()
+
     async def test_decorator_refresh_ttl_on_get_slides_file_expiry(self, file_backend: FileBackend) -> None:
         """Behavioural e2e through the real @cache decorator: a hit past the ORIGINAL expiry
         is still served (not recomputed) because refresh_ttl_on_get slid the File TTL forward.
