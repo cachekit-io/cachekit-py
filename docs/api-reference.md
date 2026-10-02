@@ -427,12 +427,14 @@ result = compute_results(123)  # Multi-language compatible
 - Collections: `list`, `tuple`, `dict`
 - Dates: `datetime`, `date`, `time` (ISO-8601 format via MessagePack extension)
 
-**Explicitly NOT supported** (raises `TypeError`):
+**Explicitly NOT supported**:
 - NumPy arrays → Use `serializer="auto"`
 - pandas DataFrames/Series → Use `serializer="arrow"`
 - UUID, set, frozenset → Use `serializer="auto"`
 - Pydantic models, ORM models → Convert to dict first
 - Custom classes → Convert to dict first
+
+With a backend, a decorated call that returns one of these does not raise. It returns the result, caches nothing, and logs an ERROR and a WARNING on every call; see [Troubleshooting → Serialization Failures](troubleshooting.md#common-errors). Only interop mode raises, with `InteropError`. Calling `StandardSerializer.serialize` directly raises `TypeError`.
 
 ### Using AutoSerializer (Python-Only)
 
