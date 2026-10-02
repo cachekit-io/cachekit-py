@@ -537,6 +537,104 @@ def test_child_of_a_c_level_fork_resets_metric_locks_once():
         collector.shutdown()
 
 
+# The fork tests above run the fork handling in a child process, which coverage does not measure. The tests below run
+# the same code in this process, making it look like a forked child through the PIDs the module compares.
+_PARENT_PID = -1
+
+
+def _batched_collector_as_a_child_inherits_it() -> AsyncMetricsCollector:
+    """Return a batched collector as its copy in a forked child looks: the parent's PID and a worker that never runs."""
+    collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+    assert collector._worker_thread is not None and collector._stopped is not None
+    # A child inherits the worker's Thread object, not the thread. The real one would read whatever queue the
+    # collector holds, the child's fresh one included, so stop it.
+    collector._stopped.set()
+    collector._worker_thread.join(5)
+    collector._owner_pid = _PARENT_PID
+    return collector
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_take_over_replaces_the_inherited_batching_state(entry):
+    record, read, after_batched = ENTRY_POINTS[entry]
+    namespace = f"take-over-{entry}-{uuid.uuid4().hex}"
+    collector = _batched_collector_as_a_child_inherits_it()
+    inherited_worker = collector._worker_thread
+    inherited = (collector._queue, collector._stopped, collector._pool_lock)
+
+    collector._last_mode_check = time.time()  # the first record takes the batched path, so it takes over
+    record(collector, namespace)
+    # Queued on the inherited queue instead, with no worker to flush it, the record would never reach its metric.
+    assert (collector._sync_mode, collector._worker_thread, read(namespace)) == (True, None, 1)
+    fresh = (collector._queue, collector._stopped, collector._pool_lock)
+    assert all(new is not old for new, old in zip(fresh, inherited, strict=True))
+
+    _steer(collector, 500)
+    record(collector, namespace)  # batched again, on the child's own queue and worker
+    assert not collector._sync_mode and collector._worker_thread not in (None, inherited_worker)
+    collector.shutdown()
+    assert read(namespace) == after_batched
+
+
+@pytest.mark.parametrize("origin", ["inherited", "built"])
+def test_collector_in_a_child_of_a_c_level_fork_never_batches(origin, monkeypatch):
+    namespace = f"hookless-{origin}-{uuid.uuid4().hex}"
+    inherited = _batched_collector_as_a_child_inherits_it() if origin == "inherited" else None
+    # Neither the process that imported the module nor one the at-fork hook ran in: a child of a fork made from C.
+    monkeypatch.setattr(async_metrics, "_import_pid", _PARENT_PID)
+    monkeypatch.setattr(async_metrics, "_hooked_fork_pid", None)
+    collector = inherited or AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
+
+    collector._last_mode_check = time.time()
+    _record(collector, namespace)
+    _steer(collector, 500)  # the rate alone would trip a switch to batched mode
+    _record(collector, namespace)
+    assert (collector._sync_mode, collector._batching_disabled, collector._worker_thread) == (True, True, None)
+    assert _flushed(namespace) == 2
+
+
+def test_metric_locks_are_replaced_once_in_a_child_of_a_c_level_fork(monkeypatch):
+    from prometheus_client import CollectorRegistry, Counter, Histogram
+
+    # A registry and metrics of the test's own, so no other test's metric gets a new lock while it records.
+    registry = CollectorRegistry()
+    counter = Counter("reset_counter", "test", ["k"], registry=registry)
+    histogram = Histogram("reset_histogram", "test", ["k"], registry=registry)
+    counter_series, histogram_series = counter.labels(k="v"), histogram.labels(k="v")
+    monkeypatch.setattr(async_metrics, "REGISTRY", registry)
+    monkeypatch.setattr(async_metrics, "_metrics_cache", {"counter": counter, "histogram": histogram})
+    monkeypatch.setattr(async_metrics, "_metric_locks_pid", _PARENT_PID)
+    guarded = [registry, counter, counter_series._value, histogram, histogram_series._sum, *histogram_series._buckets]
+    inherited = [obj._lock for obj in guarded]
+    for lock in inherited:
+        lock.acquire()  # as a parent thread can hold each at the fork
+    try:
+        async_metrics._reset_metric_locks_once()
+        fresh = [obj._lock for obj in guarded]
+        assert all(new is not old and not new.locked() for new, old in zip(fresh, inherited, strict=True))
+        # A lock replaced while another thread uses it can cost that thread an update, so it happens once.
+        async_metrics._reset_metric_locks_once()
+        assert all(obj._lock is lock for obj, lock in zip(guarded, fresh, strict=True))
+    finally:
+        for lock in inherited:
+            lock.release()
+
+
+def test_at_fork_hook_marks_the_child_and_resets_its_locks(monkeypatch):
+    resets = []
+    monkeypatch.setattr(async_metrics, "_import_pid", _PARENT_PID)
+    monkeypatch.setattr(async_metrics, "_metrics_locks", {_PARENT_PID: threading.Lock()})
+    monkeypatch.setattr(async_metrics, "_hooked_fork_pid", None)
+    assert async_metrics._in_hookless_child()  # until the hook runs, this process looks like a C-level fork's child
+    monkeypatch.setattr(async_metrics, "_reset_metric_locks", lambda: resets.append(None))
+
+    async_metrics._after_fork_in_child()
+
+    # Marked as hooked, so a collector here may start a worker; _in_hookless_child decides that per process.
+    assert (async_metrics._metrics_locks, async_metrics._hooked_fork_pid, len(resets)) == ({}, os.getpid(), 1)
+    assert not async_metrics._in_hookless_child()
+
+
 def test_shutdown_during_a_switch_to_batched_stops_the_new_worker():
     namespace = f"mode-switch-shutdown-race-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
