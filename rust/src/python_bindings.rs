@@ -360,21 +360,6 @@ impl PyZeroKnowledgeEncryptor {
     pub fn get_nonce_counter(&self) -> u64 {
         self.inner.get_nonce_counter()
     }
-
-    /// Get metrics from last encryption/decryption operation
-    #[pyo3(name = "get_last_metrics")]
-    pub fn get_last_metrics(&self) -> PyResult<Py<PyOperationMetrics>> {
-        let metrics = self.inner.get_last_metrics();
-        let py_metrics = PyOperationMetrics {
-            compression_time_micros: metrics.compression_time_micros,
-            compression_ratio: metrics.compression_ratio,
-            checksum_time_micros: metrics.checksum_time_micros,
-            encryption_time_micros: metrics.encryption_time_micros,
-            hardware_accelerated: metrics.hardware_accelerated,
-        };
-        // pyo3 0.29 renamed Python::with_gil -> Python::attach (GIL/free-threaded terminology).
-        Python::attach(|py| Py::new(py, py_metrics))
-    }
 }
 
 /// Python wrapper for TenantKeys
@@ -403,34 +388,6 @@ impl PyTenantKeys {
     #[pyo3(name = "authentication_fingerprint")]
     pub fn authentication_fingerprint(&self) -> Vec<u8> {
         self.inner.authentication_fingerprint().to_vec()
-    }
-}
-
-/// Python wrapper for OperationMetrics
-#[pyclass(name = "OperationMetrics")]
-pub struct PyOperationMetrics {
-    #[pyo3(get)]
-    pub compression_time_micros: u64,
-    #[pyo3(get)]
-    pub compression_ratio: f64,
-    #[pyo3(get)]
-    pub checksum_time_micros: u64,
-    #[pyo3(get)]
-    pub encryption_time_micros: Option<u64>,
-    #[pyo3(get)]
-    pub hardware_accelerated: bool,
-}
-
-#[pymethods]
-impl PyOperationMetrics {
-    pub fn __repr__(&self) -> String {
-        format!(
-            "OperationMetrics(compression_time={}, ratio={:.2}, encryption_time={:?}, hw_accel={})",
-            self.compression_time_micros,
-            self.compression_ratio,
-            self.encryption_time_micros,
-            self.hardware_accelerated
-        )
     }
 }
 
@@ -628,7 +585,6 @@ pub fn verify_checksum_py(
 pub fn register_encryption_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZeroKnowledgeEncryptor>()?;
     m.add_class::<PyTenantKeys>()?;
-    m.add_class::<PyOperationMetrics>()?;
     m.add_class::<PyKeyring>()?;
     let keyring_config_error = m.py().get_type::<KeyringConfigurationError>();
     // create_exception! sets __module__ to the bare "_rust_serializer"; without
