@@ -157,24 +157,6 @@ class TestSimpleLogger:
 
         mock_logger.debug.assert_called_once_with(f"Cached result for key: {redact_cache_key('key:222')} with TTL 3600")
 
-    def test_cache_invalidated_default_source(self) -> None:
-        """Test cache invalidation logging with default source."""
-        mock_logger = mock.MagicMock()
-        logger = SimpleLogger(mock_logger)
-
-        logger.cache_invalidated("key:333")
-
-        mock_logger.debug.assert_called_once_with(f"Invalidated Redis cache for key: {redact_cache_key('key:333')}")
-
-    def test_cache_invalidated_custom_source(self) -> None:
-        """Test cache invalidation logging with custom source."""
-        mock_logger = mock.MagicMock()
-        logger = SimpleLogger(mock_logger)
-
-        logger.cache_invalidated("key:444", source="L1")
-
-        mock_logger.debug.assert_called_once_with(f"Invalidated L1 cache for key: {redact_cache_key('key:444')}")
-
 
 @pytest.mark.unit
 class TestDefaultLoggerProvider:
