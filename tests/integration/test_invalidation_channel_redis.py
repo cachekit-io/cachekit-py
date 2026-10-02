@@ -25,6 +25,14 @@ def client(redis_test_client: redis.Redis) -> redis.Redis:
     return redis_test_client
 
 
+@pytest.fixture(autouse=True)
+def fresh_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test opens its own WARNING windows: the throttles are process-wide."""
+    from cachekit.hash_utils import WarnThrottle
+
+    monkeypatch.setattr(invalidation, "_publish_failed_warn", WarnThrottle())
+
+
 @pytest.fixture
 def subscriber(client: redis.Redis) -> Iterator[redis.client.PubSub]:
     """A raw subscription to the channel, confirmed before the test publishes anything."""
