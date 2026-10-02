@@ -744,8 +744,7 @@ class TestCleanupThreadAfterFork:
 
         assert starts == [] and manager._cleanup_thread is None
         assert cache.get("k")[0]
-        assert sum("not restarted after a fork that ran no at-fork hooks" in r.message for r in caplog.records) == 1
-        assert sum("background cleanup not started" in r.message for r in caplog.records) == 1
+        assert caplog.records == []  # logging's own locks may be orphaned in this child
 
         _as_if_forked(manager, parent_ran_cleanup=False)  # its own child, forked with hooks
         manager.start_background_cleanup(interval_seconds=60)
@@ -753,18 +752,38 @@ class TestCleanupThreadAfterFork:
 
     @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
     def test_child_of_a_c_fork_requests_no_thread_start(self):
-        """A real fork from C: the at-fork hook does not run, and neither take-over nor start may start a thread."""
+        """A real fork from C: the at-fork hook does not run, and neither take-over nor start may start a thread.
+
+        A parent thread holds a logging handler's lock at fork, which a fork from C leaves held in the
+        child: the take-over and the refusal must not log, or the child's first put() hangs.
+        """
         import ctypes
 
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("c-fork-ns")  # captured pre-fork, like a decorator's _l1_cache
         manager.start_background_cleanup(interval_seconds=60)
+        l1_logger = logging.getLogger("cachekit.l1_cache")
+        handler = logging.StreamHandler(open(os.devnull, "w"))  # noqa: SIM115 - closed below
+        old_level = l1_logger.level
+        l1_logger.addHandler(handler)
+        l1_logger.setLevel(logging.DEBUG)
+        held, release = threading.Event(), threading.Event()
+
+        def hold_handler_lock() -> None:
+            with handler.lock:  # a parent thread mid-emit when the fork lands
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold_handler_lock, daemon=True)
+        holder.start()
+        assert held.wait(5)
         libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
         r, w = os.pipe()
         try:
             child = libc_fork()
             if child == 0:
                 try:
+                    signal.alarm(5)  # a log call on the inherited handler lock hangs; end the child instead
                     os.close(r)
                     requested: list[str] = []
 
@@ -781,6 +800,11 @@ class TestCleanupThreadAfterFork:
             os.close(w)
             assert _child_outcome(child, r) == {"requested": [], "thread": None, "found": True}
         finally:
+            release.set()
+            holder.join(5)
+            l1_logger.removeHandler(handler)
+            l1_logger.setLevel(old_level)
+            handler.stream.close()
             manager.stop_background_cleanup()
 
     def test_restart_failure_is_logged_once_and_put_still_stores(self, monkeypatch, caplog):

@@ -494,7 +494,8 @@ class L1CacheManager:
         A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
         a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
         starts no cleanup thread in it, start_background_cleanup refuses there too, and expired
-        entries are evicted on read or under the memory bound instead.
+        entries are evicted on read or under the memory bound instead. Neither logs: the same fork
+        skips logging's at-fork reset, so a handler lock a parent thread held would hang the child.
         """
         pid = os.getpid()
         if self._owner_pid == pid:
@@ -513,12 +514,8 @@ class L1CacheManager:
             if hookless:
                 for cache in self._caches.values():  # before the cleanup worker takes their locks
                     cache._reset_lock_after_fork()
-            if self._cleanup_thread is not None and hookless:
-                self._cleanup_thread = None
-                logger.warning(
-                    "L1 cleanup thread not restarted after a fork that ran no at-fork hooks (uWSGI without "
-                    "--py-call-osafterfork), where starting a thread is unsafe; expired entries are now evicted only on read"
-                )
+            if hookless:
+                self._cleanup_thread = None  # no log either: the fork skipped logging's at-fork lock reset too
             elif self._cleanup_thread is not None:
                 try:
                     self._spawn_cleanup_thread(self._cleanup_interval)  # replaces the dead thread on success
@@ -574,7 +571,6 @@ class L1CacheManager:
         """
         self._take_over_if_forked()
         if self._hookless_pid == os.getpid():
-            logger.warning("L1 background cleanup not started: this process was forked without at-fork hooks")
             return
         if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
             logger.warning("Background cleanup already running")
