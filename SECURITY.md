@@ -241,6 +241,12 @@ Six keys cannot be encoded safely at all, so they are **rejected client-side** w
 
 Encode-once matches the SaaS validator's single decode, so a canonical key round-trips byte-for-byte. Python's `quote(key, safe="")` is byte-identical to cachekit-rs `urlencoding::encode`, and resolves to the same server-side key as cachekit-ts `encodeURIComponent` after that single decode, so cross-SDK cache lookups still coincide.
 
+### Invalidation Channel (Redis Pub/Sub)
+
+On the tenant-scoped Redis backend, every successful invalidation is announced on the Redis pub/sub channel `cachekit:py:invalidate:v1` ([Invalidation announcements](docs/features/l1-invalidation.md#whole-function-invalidation)). Redis delivers pub/sub messages to every subscriber whatever its database number, and ACL channel rights are granted apart from key patterns, so the channel is a trust boundary of its own.
+
+**What a subscriber learns.** Each message names a function by its namespace and a hash of its `module.qualname`. For `invalidate_cache(args)` on a generated or fast-mode key it also carries the key, which spells out the namespace and the function and holds an unkeyed hash of the arguments: guessable arguments can be recovered from it, exactly as **Digest strength** describes above. A custom `key=` key, which can embed caller identifiers, is never sent, and neither is the tenant prefix. Grant `subscribe` on the channel only to your application's own Redis users; with Redis 7+ ACLs, give every other user `resetchannels`.
+
 ---
 
 ## FFI Boundary Security
