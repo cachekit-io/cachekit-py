@@ -21,6 +21,12 @@ def test_main_thread_ir_reads_thread_one_totals(tmp_path) -> None:
     assert main_thread_ir(tmp_path / "cg") == 1234567
 
 
+def test_main_thread_ir_without_thread_one_names_what_callgrind_wrote(tmp_path) -> None:
+    (tmp_path / "cg-02").write_text("totals: 1\n")
+    with pytest.raises(RuntimeError, match=r"no main-thread file cg-01: callgrind wrote \['cg-02'\]"):
+        main_thread_ir(tmp_path / "cg")
+
+
 def test_main_thread_ir_without_totals_raises(tmp_path) -> None:
     (tmp_path / "cg-01").write_text("events: Ir\n")
     with pytest.raises(RuntimeError, match="no totals"):

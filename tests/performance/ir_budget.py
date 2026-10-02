@@ -173,7 +173,13 @@ def interpreter_key() -> str:
 
 def main_thread_ir(out_file: Path) -> int:
     """Total Ir of thread 1 from a ``--separate-threads=yes`` callgrind run."""
-    for line in Path(f"{out_file}-01").read_text().splitlines():
+    thread_one = Path(f"{out_file}-01")
+    try:
+        text = thread_one.read_text()
+    except FileNotFoundError:
+        written = sorted(p.name for p in out_file.parent.glob(f"{out_file.name}*")) or "nothing"
+        raise RuntimeError(f"no main-thread file {thread_one.name}: callgrind wrote {written}") from None
+    for line in text.splitlines():
         if line.startswith("totals:"):
             return int(line.split()[1])
     raise RuntimeError(f"no totals line in {out_file}-01")
@@ -205,7 +211,9 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
     natively, serially, to fill the bytecode cache, and the measured runs never write bytecode.
 
     The process environment is fixed, not inherited: its size moves the stack and heap layout,
-    which moved a small path by up to 0.4% per op. It also keeps CACHEKIT_* settings out.
+    which moved a small path by up to 0.4% per op. It also keeps CACHEKIT_* settings out, bar one:
+    the L1 cleanup thread reads the real clock against expiries the pinned main thread wrote, so
+    each sweep evicts the ``secure_l1_hit`` entry. A one-day interval keeps sweeps out of every run.
     """
     env = {
         "PATH": "/usr/bin:/bin",
@@ -214,6 +222,7 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
+        "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
     for path in paths:
         _run([], path, 1, env)
