@@ -105,7 +105,8 @@ ENVELOPE_SHAPED = [
 class TestDataFrameSeriesReadRoutes:
     """Every route a DataFrame/Series read can take must reconstruct the value: with metadata
     on both integrity settings, and — the decorator read path may carry none — from the
-    verified envelope's own format_id (LAB-2503 moved that route under the fail-closed guard).
+    envelope's own format_id, which sits outside the checksum that verifies the payload
+    (LAB-2503 moved that route under the fail-closed guard).
     """
 
     @pytest.mark.parametrize("value", [FRAME, SERIES], ids=["dataframe", "series"])

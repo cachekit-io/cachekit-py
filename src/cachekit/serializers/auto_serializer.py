@@ -703,7 +703,7 @@ class AutoSerializer:
                 the other just moves the hole to the other field, so instead: ``format_id``
                 must be one :meth:`serialize` can write, and a header claim that is present
                 must equal it. A disagreement is corruption -> raise -> evict and recompute.
-                An integrity-on header that lost its claim leaves the verified ``format_id`` to decide.
+                An integrity-on header that lost its claim leaves ``format_id``, which the checksum does not cover, to decide.
 
                 With integrity OFF there is no envelope, so the header claim is the only copy and
                 is held to the same "a format :meth:`serialize` can write" rule instead: a claim
@@ -804,7 +804,7 @@ class AutoSerializer:
             # steer the decode: an unknown or absent claim matched no branch below and returned a
             # stored Series as its columnar dict. Refuse any claim serialize() cannot write. Runs
             # after the structural routes, so an Arrow/NumPy entry that lost its claim still decodes.
-            # Integrity on, the envelope's verified format decides instead — see Raises:.
+            # Integrity on, the envelope's format (outside the checksum) decides instead — see Raises:.
             if not self.enable_integrity_checking and header_format not in _HEADER_FORMATS:
                 raise SerializationError(f"Cache entry header claims format {header_format!r:.40}, which no writer emits")
             # _deserialize_numpy strips + verifies the optional xxHash3-64 checksum prefix itself.

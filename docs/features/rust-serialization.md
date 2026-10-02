@@ -63,13 +63,18 @@ ByteStorage LZ4 compression of serialized envelopes (MessagePack, orjson) runs a
 
 ## xxHash3-64 Integrity
 
-Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On retrieval:
+Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian), computed over the original
+uncompressed payload bytes only. On retrieval:
 
-1. Checksum of retrieved bytes is computed
+1. The payload is decompressed and its checksum is computed
 2. Stored checksum is compared
 3. Mismatch → `SerializationError` at the serializer layer (corrupted data, never returned to caller); a normal `@cache`-decorated read catches it, evicts the entry, and recomputes rather than propagating it to your code
 
-This protects against Redis memory corruption, storage bugs, and bit rot. A corrupt frame header
+This protects the payload against Redis memory corruption, storage bugs, and bit rot. It does not
+cover the envelope's `format` field: the checksum covers the payload bytes only, so a rotted `format`
+passes it, and the checksum gives a reader that routes on `format` no protection for that field.
+`AutoSerializer` validates `format` separately — see *Deserialization failed* in
+[error-codes.md](../error-codes.md#deserialization-failed). A corrupt frame header
 (truncated, bad version/length, unparseable JSON) takes the same path: `SerializationError`, evict, recompute.
 
 > **Non-cryptographic — corruption detection only.** xxHash3-64 is not a cryptographic
