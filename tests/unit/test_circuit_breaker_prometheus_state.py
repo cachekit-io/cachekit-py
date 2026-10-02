@@ -211,8 +211,8 @@ def test_collected_namespaces_leave_no_series():
     assert result.returncode == 0, result.stderr
 
 
-def _run(script: str, env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env)  # noqa: S603 (trusted: sys.executable + literal code)
+def _run(script: str, env: Optional[dict[str, str]] = None, cwd: Any = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env, cwd=cwd)  # noqa: S603 (trusted: sys.executable + literal code)
 
 
 _CYCLIC_GC = """
@@ -274,6 +274,33 @@ def test_multiprocess_mode_exports_no_false_value(tmp_path):
     )
     result = _run(script, env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)})
     assert result.returncode == 0, result.stderr
+
+
+_FOLLOWS_PROMETHEUS_CLIENT = """
+import os
+from prometheus_client import REGISTRY, values
+from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+
+os.environ.setdefault("PROMETHEUS_MULTIPROC_DIR", os.getcwd())  # after import: too late to matter
+breaker = CircuitBreaker(CircuitBreakerConfig(), namespace="ns")
+for _ in range(CircuitBreakerConfig().failure_threshold):
+    breaker.record_failure()
+print(values.ValueClass is not values.MutexValue,
+      REGISTRY.get_sample_value("circuit_breaker_state", {"namespace": "ns", "state": "OPEN"}))
+"""
+
+
+@pytest.mark.parametrize(
+    ("at_start", "expected"),
+    [({"PROMETHEUS_MULTIPROC_DIR": ""}, "True None"), ({}, "False 1.0")],
+    ids=["empty-at-start", "set-after-import"],
+)
+def test_multiprocess_detection_follows_prometheus_client(tmp_path, at_start: dict[str, str], expected: str):
+    """prometheus_client picks its mode once, at import, by whether the variable is present."""
+    env = {k: v for k, v in os.environ.items() if k.lower() != "prometheus_multiproc_dir"}
+    result = _run(_FOLLOWS_PROMETHEUS_CLIENT, env={**env, **at_start}, cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
 
 
 _C_FORK = """

@@ -224,10 +224,10 @@ def _live_lock() -> threading.Lock:
     return lock
 
 
-def _multiprocess_mode() -> bool:
-    # prometheus_client's own switch. Its multiprocess collector would export a function
-    # gauge as 0, a false "healthy", so the gauge is left out there instead.
-    return bool(os.environ.get("PROMETHEUS_MULTIPROC_DIR") or os.environ.get("prometheus_multiproc_dir"))
+# prometheus_client's own switch, made once when it is imported: either variable present,
+# even empty. Its multiprocess collector would export a function gauge as 0, a false
+# "healthy", so the gauge is left out there instead.
+_MULTIPROCESS_MODE = "PROMETHEUS_MULTIPROC_DIR" in os.environ or "prometheus_multiproc_dir" in os.environ
 
 
 def _count_in_state(namespace: str, state: "CircuitState") -> int:
@@ -245,7 +245,7 @@ def _track(breaker: "CircuitBreaker") -> None:
     dead namespace exports zeros until the next breaker is created. Gauge calls stay under
     _live_lock so a retirement cannot remove a namespace another thread is re-registering.
     """
-    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE and not _multiprocess_mode() else None
+    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE and not _MULTIPROCESS_MODE else None
     with _live_lock():
         _breaker_refs.add(weakref.ref(breaker, functools.partial(_on_collected, breaker.namespace)))
         lost = set()
