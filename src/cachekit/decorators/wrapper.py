@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
-from cachekit.hash_utils import redact_error_for_log
+from cachekit.hash_utils import WarnThrottle, redact_error_for_log
 
 from .. import invalidation
 from ..backends.errors import BackendError, UnsupportedTenantError
@@ -91,11 +91,6 @@ _logger = logging.getLogger(__name__)
 # the refresh is skipped (stale keeps being served) and a later hit retries.
 _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
 
-# At most one WARNING per wrapped function per window for each background failure the caller
-# never sees (key tracking, a failed refresh, a refresh that could not run); failures in
-# between log at DEBUG and are counted into the next WARNING. A registry outage fails every L2
-# write and a failing upstream every refresh, so one WARNING each would be a log flood.
-_WARN_INTERVAL_SECONDS = 60.0
 # Why a refresh never ran when its arguments cannot be snapshotted: every call of that shape
 # skips it, so the entry is recomputed only in the foreground once it expires.
 _NOT_DEEP_COPYABLE = ": arguments not deep-copyable, so refresh-ahead cannot run for this call"
@@ -126,43 +121,6 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
-
-
-class _WarnThrottle:
-    """One WARNING per _WARN_INTERVAL_SECONDS for one kind of failure; claim() counts the rest.
-
-    Fork-safe by the owner-PID idiom (see _l2_swr_try_begin): a forked child's first claim
-    replaces the lock, which a parent thread that did not survive the fork may hold, and drops
-    the parent's count. Sibling threads racing that swap cost at worst one extra WARNING, once
-    per fork.
-    """
-
-    __slots__ = ("_count", "_lock", "_pid", "_warned_at")
-
-    def __init__(self) -> None:
-        self._reset()
-
-    def _reset(self) -> None:
-        self._lock = threading.Lock()
-        self._warned_at, self._count = float("-inf"), 0
-        self._pid = os.getpid()
-
-    def claim(self) -> int:
-        """Count one failure. Returns 0 if it should log at DEBUG, else the failures since the
-        last WARNING, this one included, for the WARNING it should log.
-
-        The window is claimed under the lock and the caller logs outside it: concurrent
-        failures then emit one WARNING, and a slow log sink never serializes the failing callers.
-        """
-        if self._pid != os.getpid():
-            self._reset()
-        with self._lock:
-            self._count += 1
-            now = time.monotonic()
-            if now - self._warned_at < _WARN_INTERVAL_SECONDS:
-                return 0
-            count, self._count, self._warned_at = self._count, 0, now
-            return count
 
 
 class CacheInfo(NamedTuple):
@@ -915,7 +873,7 @@ def create_cache_wrapper(
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
         _cached_keys, and this process's next drain by the same tenant deletes it from there.
         Other processes' drains cannot see it, so the failure is a WARNING — throttled to one per
-        _WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
+        WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
         if not _is_trackable():
             return
@@ -1055,7 +1013,7 @@ def create_cache_wrapper(
             # letting the caller demote this hit into a recompute.
             logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
-    def _warn_refresh(throttle: _WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
+    def _warn_refresh(throttle: WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
         """Log a background refresh that failed or never ran: a throttled WARNING, DEBUG between.
 
         The caller was already served the cached value and must never see the failure (spec:
@@ -1278,10 +1236,10 @@ def create_cache_wrapper(
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
     # Background-failure WARNING throttles, one per kind, so a frequent kind never hides a rarer one.
-    _track_warn = _WarnThrottle()  # key tracking failed
-    _refresh_failed_warn = _WarnThrottle()  # a background refresh raised
-    _refresh_skipped_warn = _WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
-    _refresh_unstarted_warn = _WarnThrottle()  # the refresh thread or task could not be started
+    _track_warn = WarnThrottle()  # key tracking failed
+    _refresh_failed_warn = WarnThrottle()  # a background refresh raised
+    _refresh_skipped_warn = WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
+    _refresh_unstarted_warn = WarnThrottle()  # the refresh thread or task could not be started
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
