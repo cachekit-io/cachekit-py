@@ -21,9 +21,9 @@ The backend stores opaque ciphertext values only; the cache key stays cleartext 
 
 On a decorated function, `@cache.secure` applies `EncryptionWrapper` for you: pass the inner
 serializer as `serializer=`. Passing an `EncryptionWrapper` instance, or the `"encrypted"` serializer
-name, to `@cache(serializer=...)` or any other cache decorator raises `ConfigurationError` when the
-decorator is applied: the decorator never gives it the cache key each ciphertext is bound to, so it
-could not store an entry. `EncryptionWrapper` stays available for direct use outside a decorator.
+name, to `@cache(serializer=...)` or to any preset that takes `serializer=` raises `ConfigurationError`
+when the decorator is applied: the decorator never gives it the cache key each ciphertext is bound to,
+so it could not store an entry. `EncryptionWrapper` stays available for direct use outside a decorator.
 
 ```python fixture:master_key_env
 import os

@@ -84,7 +84,7 @@ Or use `@cache.secure(...)` for the encrypted ones. On bare `@cache` the flat sp
 
 **Exception**: `ConfigurationError`, raised when the decorator is applied
 
-**Cause**: an `EncryptionWrapper` instance, or the `"encrypted"` serializer name, was passed as `serializer=` to a cache decorator: bare `@cache`, any preset (`@cache.secure` included), or a `DecoratorConfig`. The decorator never gives that serializer the cache key each ciphertext is bound to, so it could not store an entry. Earlier releases accepted some of these spellings and ran the function on every call. With `backend=None`, the L1-only `encryption requires a backend` error fires first.
+**Cause**: an `EncryptionWrapper` instance, or the `"encrypted"` serializer name, was passed as `serializer=` to a cache decorator: bare `@cache`, any preset that takes `serializer=` (`@cache.secure` included), or a `DecoratorConfig`. The decorator never gives that serializer the cache key each ciphertext is bound to, so it could not store an entry. Earlier releases accepted some of these spellings and ran the function on every call. With `backend=None`, the L1-only `encryption requires a backend` error fires first.
 
 **Solution**: pass the master key and the inner serializer to `@cache.secure`, which applies `EncryptionWrapper` itself. Omit `serializer=` for the default MessagePack.
 ```python notest
