@@ -473,10 +473,13 @@ def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
         async_metrics.threading = SimpleNamespace(Thread=_UnstartedThread, Event=threading.Event, Lock=threading.Lock)
         _steer(collector, 500)  # the inherited rate alone would trip a switch to batched mode
         _record(collector, namespace)
-        return stale, first, collector._sync_mode, len(_UnstartedThread.started), _flushed(namespace)
+        started = time.monotonic()
+        collector.shutdown(timeout=2.0)  # must not wait on the dead worker that still looks alive
+        prompt_shutdown = time.monotonic() - started < 1.0
+        return stale, first, collector._sync_mode, len(_UnstartedThread.started), _flushed(namespace), prompt_shutdown
 
     # CPython's own after-fork repair has not run in this child either, so the collector never starts a thread here.
-    assert _in_c_forked_child_holding(q.mutex, child) == (True, 1, True, 0, 2)
+    assert _in_c_forked_child_holding(q.mutex, child) == (True, 1, True, 0, 2, True)
     collector.shutdown()
 
 
