@@ -5,15 +5,27 @@ Tests DataFrame serialization, return_format variants, error handling, and perfo
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 # ArrowSerializer requires the [data] extra — absent e.g. in the free-threaded
 # CI lane until pandas/pyarrow ship free-threaded wheels (LAB-511).
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
+np = pytest.importorskip("numpy")
 
 from cachekit.serializers.arrow_serializer import ArrowSerializer  # noqa: E402
 from cachekit.serializers.base import SerializationError, SerializationFormat, SerializationMetadata  # noqa: E402
+
+
+def _serialize_via(path: str, serializer: ArrowSerializer, obj: object) -> tuple[bytes, SerializationMetadata]:
+    """Serialize through the buffered (``serialize``) or streaming (``serialize_to_sink``) path."""
+    if path == "buffered":
+        return serializer.serialize(obj)
+    sink = io.BytesIO()
+    metadata = serializer.serialize_to_sink(obj, sink)
+    return sink.getvalue(), metadata
 
 
 class TestArrowSerializerBasics:
@@ -205,6 +217,21 @@ class TestDictOfArrays:
         assert isinstance(result, pa.Table)
         assert result.column_names == ["a", "b"]
 
+    @pytest.mark.parametrize("path", ["buffered", "streaming"])
+    @pytest.mark.parametrize(
+        "make_column",
+        [list, np.array, pd.Series, pa.array],
+        ids=["list", "numpy", "series", "pyarrow"],
+    )
+    def test_dict_of_columns_round_trips_on_both_paths(self, path, make_column):
+        """Every accepted column container round-trips, buffered and streamed."""
+        serializer = ArrowSerializer()
+        data_dict = {"n": make_column([1, 2, 3]), "s": make_column(["x", "y", "z"])}
+
+        data, metadata = _serialize_via(path, serializer, data_dict)
+
+        assert serializer.deserialize(data, metadata).to_dict("list") == {"n": [1, 2, 3], "s": ["x", "y", "z"]}
+
 
 class TestErrorHandling:
     """Test error handling for unsupported types and corrupted data."""
@@ -221,16 +248,61 @@ class TestErrorHandling:
         assert "Got: int" in error_msg
         assert "For scalar values or nested dicts, use AutoSerializer" in error_msg
 
-    def test_non_columnar_dict_successfully_serialized(self):
-        """Arrow can handle certain dict structures (converts to struct/list types)."""
+    @pytest.mark.parametrize("path", ["buffered", "streaming"])
+    @pytest.mark.parametrize(
+        ("obj", "detail"),
+        [
+            ({"name": "Alice"}, "value for 'name' is str"),
+            ({"b": b"ab"}, "value for 'b' is bytes"),
+            ({"b": bytearray(b"ab")}, "value for 'b' is bytearray"),
+            ({"user": {"name": "x"}}, "value for 'user' is dict"),
+            ({"ok": [1, 2], "name": "Alice"}, "value for 'name' is str"),
+        ],
+        ids=["str", "bytes", "bytearray", "dict", "one-bad-column"],
+    )
+    def test_non_column_dict_value_raises_type_error(self, path, obj, detail):
+        """pyarrow would iterate these values into a wrong column (a str into its characters,
+        bytes into their byte values, a dict into its keys), so they are rejected instead."""
         serializer = ArrowSerializer()
-        nested = {"key": {"nested": "value"}}
 
-        # Arrow will convert this successfully (struct/list types)
-        # This is actually valid - Arrow has flexible schema support
-        data, metadata = serializer.serialize(nested)
-        assert isinstance(data, bytes)
-        assert isinstance(metadata, SerializationMetadata)
+        with pytest.raises(TypeError) as exc_info:
+            _serialize_via(path, serializer, obj)
+
+        error_msg = str(exc_info.value)
+        assert "Got a dict that is not convertible to an Arrow table" in error_msg
+        assert f"{detail}, not a list or array" in error_msg
+
+    def test_rejected_dict_writes_nothing_to_sink(self):
+        """The streaming path rejects the value before writing a byte."""
+        sink = io.BytesIO()
+
+        with pytest.raises(TypeError):
+            ArrowSerializer().serialize_to_sink({"name": "Alice"}, sink)
+
+        assert sink.getvalue() == b""
+
+    def test_decorator_reruns_instead_of_returning_a_wrong_hit(self, tmp_path):
+        """Through @cache with a File backend, a rejected dict is never cached, so the
+        second call runs the function and returns the original dict, not a DataFrame."""
+        from cachekit import cache
+        from cachekit.backends.file import FileBackend
+        from cachekit.backends.file.config import FileBackendConfig
+
+        backend = FileBackend(FileBackendConfig(cache_dir=str(tmp_path), max_size_mb=10, max_value_mb=5))
+        calls = 0
+
+        @cache(serializer="arrow", backend=backend, ttl=60)
+        def load_user() -> dict:
+            nonlocal calls
+            calls += 1
+            return {"name": "Alice"}
+
+        assert load_user() == {"name": "Alice"}
+        second = load_user()
+
+        assert calls == 2
+        assert isinstance(second, dict)
+        assert second == {"name": "Alice"}
 
     def test_string_raises_type_error(self):
         """String value raises TypeError."""

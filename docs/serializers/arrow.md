@@ -99,8 +99,9 @@ ArrowSerializer supports:
 - Scalar values (int, str, float)
 - Lists of objects
 - Dicts with a number or bool value (`{"id": 1}`)
+- Dicts with a string, bytes or dict value (`{"name": "Alice"}`, `{"user": {"name": "x"}}`)
 
-Every dict value must be a list or an array. A string or dict value is not rejected, but it is stored wrong: a string becomes a column of its characters, and a nested dict a column of its keys, with its values lost. Flatten nested dicts into columns first, or use [AutoSerializer](./auto.md).
+Every dict value must be a list or an array. Flatten nested dicts into columns first, or use [AutoSerializer](./auto.md).
 
 **Type checking example:**
 ```python
@@ -117,7 +118,7 @@ try:
     serializer.serialize({"key": "value"})
 except TypeError as e:
     print(e)
-    # "ArrowSerializer only supports DataFrames. Use StandardSerializer for dict types."
+    # "... Got a dict that is not convertible to an Arrow table: value for 'key' is str, not a list or array. ..."
 ```
 
 ## Performance Benchmarks

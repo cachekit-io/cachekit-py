@@ -22,6 +22,7 @@ Type checker cannot statically verify optional imports; suppressed via pyright c
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .base import SerializationError, SerializationFormat, SerializationMetadata
@@ -263,6 +264,11 @@ class ArrowSerializer:
             # (e.g. dict-of-scalars -> "'int' object is not iterable") into the
             # documented TypeError so callers get a consistent, actionable message.
             try:
+                for name, column in obj.items():
+                    # pa.table iterates these instead of rejecting them, storing a wrong column:
+                    # a str as its characters, bytes as byte values, a dict as its keys only.
+                    if isinstance(column, (str, bytes, bytearray, Mapping)):
+                        raise TypeError(f"value for {name!r} is {type(column).__name__}, not a list or array")
                 return pa.table(obj)
             except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as e:
                 raise TypeError(
