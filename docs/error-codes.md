@@ -184,25 +184,61 @@ await get_data.ainvalidate_cache(user_id)  # async function
 
 Called with no arguments on the tenant-scoped Redis backend it deletes every
 process's L2 entries for the calling tenant; on other backends it evicts only the
-keys this process has cached, not the fleet's. It does not cover a function with a custom `key=`: delete that
-entry's exact stored key, `t:<tenant>:<namespace, or default>:<your key>`,
-with `<tenant>` percent-encoded as shown below.
+keys this process has cached, not the fleet's. A function with a custom `key=`
+works the same way: `invalidate_cache(<args>)` derives the key `key=` wrote (see
+[Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation)
+for the no-argument form).
 
-For bulk eviction, delete by prefix:
+For bulk eviction on Redis, delete by prefix with the redis-py client cachekit
+installs, not a `redis-cli --scan` pipeline: a line-based pipeline can stop at a
+key containing a quote and splits a key containing a newline into names that match
+nothing, and it still exits 0 with keys left behind. `scan_iter` returns each key
+whole.
 
-```bash
-# The Redis backend stores keys as t:<tenant>:... — <tenant> is "default"
-# unless you set one, percent-encoded as urllib.parse.quote(tenant, safe="")
-# (an int or UUID tenant as its str() first):
-# tenant org:123 is stored as t:org%3A123:...
+```python notest
+# Needs a live Redis: set the URL, including the database number cachekit uses.
+import re
+from urllib.parse import quote
+
+import redis
+
+r = redis.Redis.from_url("redis://localhost:6379/0")
+
+# The Redis backend stores keys as t:<tenant>:... with <tenant> "default" unless
+# you set one, percent-encoded (an int or UUID tenant as its str() first).
+tenant = quote("default", safe="")
+# SCAN patterns are globs: escape * ? [ ] \ in a namespace.
+namespace = re.sub(r"([*?\[\]\\])", r"\\\1", "users")
+
 # Namespaced function (@cache.secure(namespace="users", ...)):
-redis-cli --scan --pattern 't:<tenant>:ns:<namespace>:*' | xargs -r redis-cli DEL
-# No namespace (the default): keys start with func:<module>.<qualname>
-redis-cli --scan --pattern 't:<tenant>:func:<module>.<qualname>:*' | xargs -r redis-cli DEL
+pattern = f"t:{tenant}:ns:{namespace}:func:*"
+# No namespace (the default): keys start with func:<module>.<qualname>, with each
+# character outside A-Z a-z 0-9 _ . replaced by _ (outer.<locals>.inner becomes
+# outer._locals_.inner):
+# pattern = f"t:{tenant}:func:myapp.users.get_user:*"
 
-# Only if this Redis database is dedicated to cachekit:
-# redis-cli FLUSHDB
+batch = []
+for key in r.scan_iter(match=pattern, count=1000):
+    batch.append(key)
+    if len(batch) == 1000:
+        r.unlink(*batch)
+        batch.clear()
+if batch:
+    r.unlink(*batch)
+
+left = sum(1 for _ in r.scan_iter(match=pattern, count=1000))
+print(f"{left} keys left matching {pattern}")  # expect 0
 ```
+
+Both patterns match only the keys cachekit generates from a call's arguments. A
+function with a custom `key=` stores its entries at
+`t:<tenant>:<namespace, or default>:<your key>`, and one with `fast_mode=True` or
+`interop=` uses its own key shape, so neither pattern reaches them: evict those with
+`invalidate_cache(<args>)` or a no-argument
+[whole-function invalidation](features/l1-invalidation.md#whole-function-invalidation).
+A `RedisBackend` you pass as `backend=` stores keys without the `t:<tenant>:`
+prefix, so drop it from the pattern. Flush the database (`FLUSHDB`) only if it is
+dedicated to cachekit.
 
 The function recomputes and re-caches on the next call.
 
