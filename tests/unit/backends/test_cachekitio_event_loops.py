@@ -209,7 +209,7 @@ def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytes
     _point_clients_at(monkeypatch, saas, keepalive_expiry=5.0)
     backend = CachekitIOBackend(api_key=_api_key())
     clients: list[httpx.AsyncClient] = []
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     ready = threading.Barrier(2)
 
     async def job() -> None:
@@ -220,7 +220,7 @@ def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytes
     def run() -> None:
         try:
             asyncio.run(job())
-        except BaseException as exc:  # noqa: BLE001 — surfaced on the main thread below
+        except Exception as exc:  # noqa: BLE001 — surfaced on the main thread below
             errors.append(exc)
 
     threads = [threading.Thread(target=run) for _ in range(2)]
@@ -243,6 +243,6 @@ def test_construction_builds_no_async_client(monkeypatch: pytest.MonkeyPatch) ->
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spy)
-    backend = CachekitIOBackend(api_key="ck_test_sync_only")  # pragma: allowlist secret
+    backend = CachekitIOBackend(api_key=_api_key())
     assert backend._sync_client is not None
     assert built == []
