@@ -840,7 +840,7 @@ def create_cache_wrapper(
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
     # L1CacheConfig is honored here (#207): max_size_mb bounds bytes (best-effort
-    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio
+    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio/swr_retry_interval
     # drive background refresh via get_with_swr.
     from ..config.nested import L1CacheConfig
     from ..config.singleton import get_settings
@@ -857,6 +857,7 @@ def create_cache_wrapper(
             max_entries=None,
             max_size_bytes=_l1_budget_mb * 1024 * 1024,
             swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+            swr_retry_interval=_l1_config.swr_retry_interval,
         )
         if _l1_only_mode and l1_enabled
         else None
@@ -1350,7 +1351,10 @@ def create_cache_wrapper(
             try:
                 result = await func(*call_args, **call_kwargs)
             except BaseException:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
+                # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
+                # apart from cancelling this task. Backing off after a real cancellation only delays
+                # the next refresh by one interval; the held value is still served.
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
                 raise  # logged by _l1_swr_task_done
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -1366,7 +1370,7 @@ def create_cache_wrapper(
             try:
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
                 _warn_refresh(_refresh_failed_warn, "L1-only SWR refresh failed", cache_key, exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
