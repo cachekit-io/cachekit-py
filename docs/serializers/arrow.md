@@ -101,7 +101,7 @@ ArrowSerializer supports:
 - Dicts with a number or bool value (`{"id": 1}`)
 - Dicts with a string, bytes or dict value (`{"name": "Alice"}`, `{"user": {"name": "x"}}`)
 
-Every dict value must be a list or an array. Flatten nested dicts into columns first, or use [AutoSerializer](./auto.md).
+Every dict value must be a column Arrow can convert: a list, tuple, NumPy array, pandas Series, pyarrow array or typed `memoryview`, or any object that implements the Arrow array protocol (`__arrow_array__` or `__arrow_c_array__`), a `Mapping` included. A `memoryview` is read as its element type, so a memoryview of `bytes` stores byte values. Flatten nested dicts into columns first, or use [AutoSerializer](./auto.md).
 
 **Type checking example:**
 ```python
