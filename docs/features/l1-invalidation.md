@@ -239,7 +239,7 @@ The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel; Python ha
 
 A process created by `fork()`, such as a `multiprocessing` fork-context worker or a Gunicorn or Celery prefork worker, starts with an empty L1. None of its parent's L1 entries carry over, and the child refills from L2 on first use. A master that warmed L1 before forking (Gunicorn `--preload`) therefore no longer passes that warmth to its workers.
 
-uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; either one keeps the rule above. Without either, a uWSGI worker keeps the L1 entries its master held at fork and runs no background sweep of expired L1 entries. An expired entry is still never served: it is evicted when it is read.
+uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-uwsgi-fork-hooks` (uWSGI 2.0.21 or later) or `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; any one of them keeps the rule above. Without one, a uWSGI worker keeps the L1 entries its master held at fork and runs no background sweep of expired L1 entries. An expired entry is still never served: it is evicted when it is read.
 
 ---
 
