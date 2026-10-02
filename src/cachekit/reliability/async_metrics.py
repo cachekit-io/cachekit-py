@@ -141,7 +141,12 @@ def _reset_metric_locks() -> None:
 
 
 def _reset_metric_locks_once() -> None:
-    """Run ``_reset_metric_locks`` in a child the at-fork hook below did not reach: a fork made from C."""
+    """Run ``_reset_metric_locks`` in a child the at-fork hook below did not reach: a fork made from C.
+
+    A collector's take-over calls this, on the child's first batched record or mode check. That leaves one case
+    open: a synchronous collector's records make no fork check, so in such a child they use the inherited locks
+    until a mode check runs, and for good with auto-detect off, as they would without cachekit.
+    """
     if _metric_locks_pid == os.getpid():
         return
     with _metrics_cache_lock():  # per PID, so no parent thread can have held it
@@ -712,10 +717,10 @@ class AsyncMetricsCollector:
             self._owner_pid = pid
 
     def _may_enqueue(self) -> bool:
-        """In a forked child, take over the batching state first; then return whether a producer that read
-        batched mode may queue its record, rather than record it now.
+        """Take over the batching state if this is a forked child, then return whether a batched record may queue.
 
-        Only the batched record path calls this, so the sync path pays no per-record ``getpid()``. The PID test is
+        A producer that read batched mode calls this; on False it records synchronously instead. Only the batched
+        record path calls this, so the sync path pays no per-record ``getpid()``. The PID test is
         inlined because this runs on every batched record.
         """
         if self._owner_pid != os.getpid():

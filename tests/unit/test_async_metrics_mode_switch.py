@@ -387,6 +387,22 @@ def test_child_records_past_a_prometheus_lock_held_at_fork(held, fork_holding):
 
 
 @needs_fork
+@pytest.mark.parametrize("held", ["counter", "counter-series", "histogram-sum", "histogram-bucket", "registry"])
+def test_child_of_a_sync_parent_records_past_a_prometheus_lock_held_at_fork(held):
+    namespace = f"fork-prometheus-sync-{held}-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(sync_mode=True, auto_detect_mode=False)
+    _record(collector, namespace)
+
+    def child():
+        # A synchronous record makes no fork check, so only the at-fork hook can have replaced these locks.
+        _record(collector, namespace)
+        collector.record_counter(_metric_name(namespace))
+        return _flushed(namespace), _sample(f"{_metric_name(namespace)}_total")
+
+    assert _in_child_forked_holding(_prometheus_lock(held, namespace), child) == (2, 1)
+
+
+@needs_fork
 @pytest.mark.parametrize("first_call", ["switch-to-sync", "shutdown"])
 def test_child_of_a_batched_parent_stops_batching_past_a_held_stop_event(first_call):
     namespace = f"fork-stop-event-{first_call}-{uuid.uuid4().hex}"
