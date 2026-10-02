@@ -5,13 +5,17 @@ the classic Circuit Breaker pattern. The circuit breaker monitors error rates
 and temporarily blocks requests when a service is struggling, giving it time
 to recover.
 
-Every state read and transition happens under a single RLock.
+Every state read and transition happens under a single RLock, except the Prometheus
+scrape, which reads each live breaker's ``_state`` as a single lock-free attribute read.
 """
 
+import functools
 import logging
 import math
+import os
 import threading
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -20,11 +24,10 @@ from typing import Optional
 
 # Import backend error types for failure detection
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.reliability.async_metrics import PROMETHEUS_AVAILABLE, circuit_breaker_gauge
 
-# Import metrics from the metrics collection module
-from cachekit.reliability.metrics_collection import (
-    circuit_breaker_state,
-)
+# Legacy in-process 0/1/2 value (last writer per namespace wins). Not the Prometheus series.
+from cachekit.reliability.metrics_collection import circuit_breaker_state as _legacy_state_value
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +198,76 @@ class CacheOperationMetrics:
         return self.errors / self.total_operations
 
 
+# Live breakers per namespace. The gauge reads them at scrape time, so nothing calls into
+# prometheus_client at GC time, where it could re-enter its non-reentrant locks on the same
+# thread and hang. The only GC-time work is _on_collected's deque append.
+_live_breakers: dict[str, "weakref.WeakSet[CircuitBreaker]"] = {}
+# One lock per process, keyed by pid: a C-level fork skips at-fork hooks, so a child must
+# never take a lock it inherited, possibly held by a thread that is gone.
+_live_locks: dict[int, threading.Lock] = {}
+# Namespaces that lost a breaker. Appended at GC time, which must take no lock;
+# deque.append takes none. _track drains it to retire namespaces with no live breaker.
+_lost_namespaces: deque[str] = deque()
+_breaker_refs: set["weakref.ref[CircuitBreaker]"] = set()
+
+
+def _on_collected(namespace: str, ref: "weakref.ref[CircuitBreaker]") -> None:
+    _breaker_refs.discard(ref)
+    _lost_namespaces.append(namespace)
+
+
+def _live_lock() -> threading.Lock:
+    pid = os.getpid()
+    lock = _live_locks.get(pid)
+    if lock is None:
+        lock = _live_locks.setdefault(pid, threading.Lock())  # atomic, so racing threads share one
+    return lock
+
+
+# prometheus_client's own switch, made once when it is imported: either variable present,
+# even empty. Its multiprocess collector would export a function gauge as 0, a false
+# "healthy", so the gauge is left out there instead.
+_MULTIPROCESS_MODE = "PROMETHEUS_MULTIPROC_DIR" in os.environ or "prometheus_multiproc_dir" in os.environ
+
+
+def _count_in_state(namespace: str, state: "CircuitState") -> int:
+    with _live_lock():
+        # .get: a scrape can call a series that _track retired after the scrape copied it.
+        breakers = list(_live_breakers.get(namespace, ()))
+    return sum(1 for breaker in breakers if breaker._state is state)
+
+
+def _track(breaker: "CircuitBreaker") -> None:
+    """Count ``breaker`` in the ``circuit_breaker_state`` gauge for as long as it lives.
+
+    Also retires namespaces whose breakers have all been collected, so transient namespaces
+    do not leave series behind. That happens here, on an ordinary call, never at GC time; a
+    dead namespace exports zeros until the next breaker is created. Gauge calls stay under
+    _live_lock so a retirement cannot remove a namespace another thread is re-registering.
+    """
+    gauge = circuit_breaker_gauge() if PROMETHEUS_AVAILABLE and not _MULTIPROCESS_MODE else None
+    with _live_lock():
+        _breaker_refs.add(weakref.ref(breaker, functools.partial(_on_collected, breaker.namespace)))
+        lost = set()
+        while _lost_namespaces:
+            lost.add(_lost_namespaces.popleft())
+        lost.discard(breaker.namespace)
+        dead = [ns for ns in lost if ns in _live_breakers and not _live_breakers[ns]]
+        for ns in dead:
+            del _live_breakers[ns]
+        first = breaker.namespace not in _live_breakers
+        _live_breakers.setdefault(breaker.namespace, weakref.WeakSet()).add(breaker)
+        if gauge is None:
+            return
+        for state in CircuitState:
+            for ns in dead:
+                gauge.remove(ns, state.name)
+            if first:
+                gauge.labels(namespace=breaker.namespace, state=state.name).set_function(
+                    functools.partial(_count_in_state, breaker.namespace, state)
+                )
+
+
 class CircuitBreaker:
     """Production-ready circuit breaker with metrics.
 
@@ -237,8 +310,8 @@ class CircuitBreaker:
         self._half_open_since = 0.0  # When the current HALF_OPEN cycle started
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
-        # Initialize Prometheus metric for this namespace
-        circuit_breaker_state.labels(namespace=namespace).set(self._state.value)
+        _legacy_state_value.labels(namespace=namespace).set(self._state.value)
+        _track(self)
 
     def _allow_request(self) -> bool:
         """Check if request should be allowed based on circuit state.
@@ -359,14 +432,14 @@ class CircuitBreaker:
         self._success_count = 0
         self._half_open_permits = 0  # Reset permit counter
         self._half_open_total_attempts = 0  # Reset attempt counter
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.CLOSED.value)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.CLOSED.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to CLOSED")
 
     def _transition_to_open(self):
         """Transition to OPEN state."""
         self._state = CircuitState.OPEN
         self._success_count = 0
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.OPEN.value)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.OPEN.value)
         logger.warning(f"Circuit breaker {self.namespace} transitioned to OPEN")
 
     def _transition_to_half_open(self):
@@ -376,7 +449,7 @@ class CircuitBreaker:
         self._half_open_permits = 0
         self._half_open_total_attempts = 0  # Reset attempt counter for new HALF_OPEN cycle
         self._half_open_since = time.time()
-        circuit_breaker_state.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
+        _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to HALF_OPEN")
 
     @property

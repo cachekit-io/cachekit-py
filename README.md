@@ -171,11 +171,13 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Encryption | - | - | - | - | ✅ Required |
 | L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
 | L1 Invalidation | - | - | - | ✅ | ✅ |
-| Prometheus Metrics | - | - | - | ✅ | ✅ |
+| Prometheus Metrics | - | -¹ | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
 | **Use Case** | High throughput | Local debugging | Deterministic tests | Production reliability | Compliance/security |
 
+> ¹ `@cache.dev` exports no Prometheus metrics except `circuit_breaker_state`, which is recorded for every function whose circuit breaker is enabled.
+>
 > 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
 >
 > **Default TTL** follows the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) (`@cache.io` 3600 s) — the same numbers as cachekit-rs and cachekit-ts. `ttl=` overrides it; `ttl=None` is the explicit never-expire opt-in ([details](docs/configuration.md#intent-presets)).
@@ -190,7 +192,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 See the comparison table above for the exact feature set of each preset.
 
 ```python
-# Development: verbose logging, integrity checks on, Prometheus off
+# Development: verbose logging, integrity checks on, Prometheus off except circuit_breaker_state
 @cache.dev
 def debug_expensive_call():
     return complex_computation()

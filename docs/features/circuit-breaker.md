@@ -341,15 +341,13 @@ def fetch_sensitive(key):
 
 ### Metrics Available
 ```prometheus
-cachekit_circuit_breaker_state{function="fetch_user"}
-  0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN
-
-cachekit_circuit_breaker_failures_total{function="fetch_user"}
-  # Number of failures before circuit opened
-
-cachekit_circuit_breaker_recoveries_total{function="fetch_user"}
-  # Number of times circuit recovered from OPEN
+# Number of live breakers in each state, per namespace
+# (one breaker per decorated function with the circuit breaker enabled)
+circuit_breaker_state{namespace="users",state="OPEN"}
 ```
+
+Alert on `circuit_breaker_state{state="OPEN"} > 0`. See the
+[Prometheus Metrics guide](prometheus-metrics.md) for exposition setup.
 
 ### Debugging Circuit State
 ```python notest

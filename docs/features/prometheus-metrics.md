@@ -130,9 +130,9 @@ cache_operation_size_bytes{operation="get",namespace="users",serializer="l1_memo
 ### Gauges (current state)
 
 ```prometheus
-# Circuit breaker state. Numeric value: 0=CLOSED, 1=OPEN, 2=HALF_OPEN.
-# Labels: namespace, state
-circuit_breaker_state{namespace="users",state="open"}
+# Number of live circuit breakers in each state, per namespace.
+# Labels: namespace, state (CLOSED, OPEN or HALF_OPEN)
+circuit_breaker_state{namespace="users",state="OPEN"}
 ```
 
 ---
@@ -179,9 +179,16 @@ histogram_quantile(0.99,
 
 ### Circuit Breaker State
 
+Each decorated function with the circuit breaker enabled has its own breaker (`@cache.minimal`
+and `@cache.test` have none). The gauge counts them: the value of
+`circuit_breaker_state{namespace="users",state="OPEN"}` is the number of breakers in
+namespace `users` that are open now. Functions without an explicit namespace share
+`namespace="default"`. A breaker that is garbage-collected leaves the count. The gauge is not exported in
+prometheus_client multiprocess mode (`PROMETHEUS_MULTIPROC_DIR` set).
+
 ```promql
-# Current circuit breaker state per namespace (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
-circuit_breaker_state
+# Open breakers per namespace
+sum by (namespace) (circuit_breaker_state{state="OPEN"})
 ```
 
 ---
@@ -204,7 +211,7 @@ circuit_breaker_state
 
 ```yaml
 - alert: CircuitBreakerOpen
-  expr: circuit_breaker_state > 0  # Not CLOSED
+  expr: circuit_breaker_state{state="OPEN"} > 0  # At least one open breaker in the namespace
   for: 1m
   annotations:
     summary: "Cache circuit breaker is open"
@@ -264,6 +271,10 @@ from cachekit.config.nested import MonitoringConfig
 def operation(x):
     return compute(x)
 ```
+
+`circuit_breaker_state` is the exception: it is recorded for every function whose circuit
+breaker is enabled, whatever `MonitoringConfig` says. To leave a function out of it, pass
+`circuit_breaker=CircuitBreakerConfig(enabled=False)` (from `cachekit.config.nested`).
 
 ---
 
