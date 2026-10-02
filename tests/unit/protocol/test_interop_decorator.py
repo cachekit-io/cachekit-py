@@ -69,6 +69,18 @@ def _decorate(backend: DictBackend, **kwargs: Any):
     return apply
 
 
+def _patch_backend_provider(get_backend: Any):
+    """Patch the wrapper's lazy DI provider: ``get_backend`` returns the given backend, or raises it if it is an exception."""
+    from unittest.mock import Mock, patch
+
+    provider = Mock()
+    if isinstance(get_backend, BaseException):
+        provider.get_backend.side_effect = get_backend
+    else:
+        provider.get_backend.return_value = get_backend
+    return patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider)
+
+
 class TestInteropKeysAndValues:
     def test_key_and_stored_bytes_match_vectors(self, backend: DictBackend):
         """The wire key and stored bytes are the byte-pinned interop forms."""
@@ -469,8 +481,6 @@ class TestInteropRejections:
     async def test_async_lazy_provider_prefixing_backend_fails_closed(self):
         """Lazy DI resolution (backend unknown at decoration) still runs the
         guard before the first async call touches L1 or executes the function."""
-        from unittest.mock import Mock, patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         calls: list[int] = []
@@ -481,9 +491,7 @@ class TestInteropRejections:
 
         wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
-        provider = Mock()
-        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(DictBackend(key_prefix="t:default:")):
             with pytest.raises(ConfigurationError, match="prefix"):
                 await wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
@@ -492,8 +500,6 @@ class TestInteropRejections:
         """Sync twin (LAB-5351): the guard still runs on the first sync call, when the backend is
         resolved lazily behind admission. Checking before resolution alone would be a no-op
         (``ensure_interop_backend_compatible(None)`` returns) and run the function."""
-        from unittest.mock import Mock, patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         calls: list[int] = []
@@ -504,9 +510,7 @@ class TestInteropRejections:
 
         wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
-        provider = Mock()
-        provider.get_backend.return_value = DictBackend(key_prefix="t:default:")
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(DictBackend(key_prefix="t:default:")):
             with pytest.raises(ConfigurationError, match="prefix"):
                 wrapped(1)
         assert calls == [], "function must NOT run against an incompatible backend"
@@ -516,7 +520,7 @@ class TestInteropRejections:
         """Invalidation runs the same guard as reads and writes. Without it, an invalidate-only
         caller on a key-prefixing backend deletes {prefix}{key} and returns normally, while the
         bare interop entry other SDKs read stays cached."""
-        from unittest.mock import Mock, patch
+        from unittest.mock import patch
 
         from cachekit.decorators.wrapper import create_cache_wrapper
 
@@ -528,9 +532,7 @@ class TestInteropRejections:
             return user_id
 
         wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
-        provider = Mock()
-        provider.get_backend.return_value = prefixed
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(prefixed):
             if not call_args:
                 # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
                 prefixed._key_prefix = ""
@@ -545,7 +547,7 @@ class TestInteropRejections:
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
     async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
         """Async mirror of test_invalidate_on_lazy_prefixing_backend_fails_closed."""
-        from unittest.mock import Mock, patch
+        from unittest.mock import patch
 
         from cachekit.decorators.wrapper import create_cache_wrapper
 
@@ -557,9 +559,7 @@ class TestInteropRejections:
             return user_id
 
         wrapped = create_cache_wrapper(get_user, interop="get_user", namespace="users")
-        provider = Mock()
-        provider.get_backend.return_value = prefixed
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(prefixed):
             if not call_args:
                 # No registry on DictBackend: a no-args call deletes only tracked keys, so track one first.
                 prefixed._key_prefix = ""
@@ -575,8 +575,6 @@ class TestInteropRejections:
         """Backend-creation failure degrades to uncached execution (same
         contract as the sync interop path) — loud failure is reserved for
         out-of-model arguments/values, not backend unavailability."""
-        from unittest.mock import Mock, patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         async def f(x: int):
@@ -584,9 +582,7 @@ class TestInteropRejections:
 
         wrapped = create_cache_wrapper(f, interop="op", namespace="users")
 
-        provider = Mock()
-        provider.get_backend.side_effect = RuntimeError("backend down")
-        with patch("cachekit.decorators.wrapper.get_backend_provider", return_value=provider):
+        with _patch_backend_provider(RuntimeError("backend down")):
             assert await wrapped(3) == 6
 
     def test_tenant_scoped_redis_wrapper_fails_closed(self):
