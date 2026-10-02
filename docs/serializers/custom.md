@@ -21,7 +21,7 @@ The protocol requires two methods:
 ## Implementation Guide
 
 ```python
-from cachekit.serializers.base import SerializerProtocol, SerializationMetadata
+from cachekit.serializers.base import SerializationFormat, SerializationMetadata
 from typing import Any, Tuple
 
 class CustomSerializer:
@@ -32,22 +32,22 @@ class CustomSerializer:
         # Your serialization logic here
         data = custom_encode(obj)
         metadata = SerializationMetadata(
-            format="custom",
+            serialization_format=SerializationFormat.MSGPACK,
             compressed=False,
             encrypted=False,
-            size_bytes=len(data)
         )
         return data, metadata
 
-    def deserialize(self, data: bytes) -> Any:
+    def deserialize(self, data: bytes, metadata: Any = None) -> Any:
         """Deserialize bytes back to object."""
         # Your deserialization logic here
         return custom_decode(data)
 ```
 
 **Requirements:**
-- Implement `serialize(obj) -> (bytes, SerializationMetadata)` method
-- Implement `deserialize(bytes) -> Any` method
+- Implement `serialize(self, obj) -> (bytes, SerializationMetadata)` method
+- Implement `deserialize(self, data, metadata=None) -> Any` method. The decorator passes the stored metadata on every read, so a `deserialize` without the `metadata` parameter never returns a cache hit.
+- Set `serialization_format=` to a `SerializationFormat` member (`MSGPACK`, `ORJSON` or `ARROW`). A string such as `"custom"` fails every write.
 - Ensure round-trip fidelity: `deserialize(serialize(obj)[0]) == obj`
 
 ## Registration and Usage
@@ -93,38 +93,7 @@ _registry["custom"] = CustomSerializer
 
 ## Example: Pydantic Serializer
 
-A practical example — a serializer that auto-converts Pydantic models:
-
-```python
-from pydantic import BaseModel
-from cachekit.serializers.base import SerializerProtocol, SerializationMetadata
-import msgpack
-from typing import Any, Tuple
-
-class PydanticSerializer:
-    """Serializer that handles Pydantic models explicitly."""
-
-    def serialize(self, obj: Any) -> Tuple[bytes, SerializationMetadata]:
-        """Convert Pydantic models to dict before serializing."""
-        if isinstance(obj, BaseModel):
-            obj = obj.model_dump()
-
-        data = msgpack.packb(obj)
-        metadata = SerializationMetadata(
-            format="MSGPACK",
-            original_type="pydantic" if isinstance(obj, BaseModel) else "msgpack"
-        )
-        return data, metadata
-
-    def deserialize(self, data: bytes, metadata: Any = None) -> Any:
-        """Deserialize MessagePack bytes."""
-        return msgpack.unpackb(data)
-
-@cache(serializer=PydanticSerializer())
-def get_user(user_id: int) -> dict:
-    user = fetch_user_from_db(user_id)
-    return user.model_dump()
-```
+A serializer that converts Pydantic models to dicts before packing them, with an example that checks the second call is a cache hit, is in [Caching Pydantic Models → Advanced: Custom PydanticSerializer](pydantic.md#advanced-custom-pydanticserializer).
 
 ---
 

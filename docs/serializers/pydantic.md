@@ -101,10 +101,16 @@ assert isinstance(user, User) and user.is_admin()
 If you have strong opinions about Pydantic handling, implement a custom serializer:
 
 ```python
-from pydantic import BaseModel
-from cachekit.serializers.base import SerializerProtocol, SerializationMetadata
-import msgpack
+import tempfile
+from pathlib import Path
 from typing import Any, Tuple
+
+import msgpack
+from pydantic import BaseModel
+from cachekit import cache
+from cachekit.backends.file import FileBackend
+from cachekit.backends.file.config import FileBackendConfig
+from cachekit.serializers.base import SerializationFormat, SerializationMetadata
 
 class PydanticSerializer:
     """Serializer that handles Pydantic models explicitly."""
@@ -115,22 +121,32 @@ class PydanticSerializer:
             obj = obj.model_dump()
 
         data = msgpack.packb(obj)
-        metadata = SerializationMetadata(
-            format="MSGPACK",
-            original_type="pydantic" if isinstance(obj, BaseModel) else "msgpack"
-        )
+        metadata = SerializationMetadata(serialization_format=SerializationFormat.MSGPACK)
         return data, metadata
 
     def deserialize(self, data: bytes, metadata: Any = None) -> Any:
         """Deserialize MessagePack bytes."""
         return msgpack.unpackb(data)
 
+class User(BaseModel):
+    id: int
+    name: str
+
 # Usage
-@cache(serializer=PydanticSerializer())
-def get_user(user_id: int) -> dict:
-    user = fetch_user_from_db(user_id)
-    return user.model_dump()
+backend = FileBackend(FileBackendConfig(cache_dir=Path(tempfile.mkdtemp())))
+calls = []
+
+@cache(serializer=PydanticSerializer(), backend=backend, ttl=3600)
+def get_user(user_id: int) -> User:
+    calls.append(user_id)
+    return User(id=user_id, name="Alice")
+
+assert get_user(1) == User(id=1, name="Alice")  # miss: the model the function built
+assert get_user(1) == {"id": 1, "name": "Alice"}  # hit: the dict the serializer stored
+assert calls == [1]  # the body ran once
 ```
+
+A hit returns the dict, not the model. If callers need the model, rebuild it outside the cached function, as in [Rebuild the Model After the Cache](#alternative-rebuild-the-model-after-the-cache).
 
 ## Migration Path: Pydantic v1 → v2
 
