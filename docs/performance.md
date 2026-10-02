@@ -376,7 +376,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 **Method** (`tests/performance/ir_budget.py`):
 - Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (log writer, L1 cleanup) vary by tens of percent between identical runs.
 - Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel.
-- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower.
+- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
 - The L2 paths use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
 
 **Budgets** (instructions per call, `tests/performance/ir_baselines.json`):
