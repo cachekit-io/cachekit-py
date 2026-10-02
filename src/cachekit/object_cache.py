@@ -61,6 +61,7 @@ class _Entry:
     cached_at: float  # time.monotonic() write timestamp (SWR freshness clock)
     size_bytes: int  # 0 when the cache is not byte-bounded
     generation: int  # anti-resurrection token: allocated per stored entry, never reused
+    refresh_failed_at: float | None = None  # time.monotonic() of the last failed SWR refresh (retry back-off)
 
 
 class ObjectCache:
@@ -79,8 +80,11 @@ class ObjectCache:
     Stale-while-revalidate (SWR): ``get_with_swr`` serves a fresh-enough entry
     while flagging it for background refresh once past
     ``ttl * swr_threshold_ratio`` (±10% jitter). The caller runs the refresh and
-    finishes the cycle with ``complete_refresh`` (or ``cancel_refresh`` on
-    failure). Each stored entry carries a generation token from a monotonic
+    finishes the cycle with ``complete_refresh``, ``fail_refresh`` when the
+    refresh ran and raised, or ``cancel_refresh`` when it never ran. After a
+    failure no refresh is flagged for that entry until ``swr_retry_interval``
+    seconds have passed, so a failing upstream is not called on every read.
+    The failure time lives on the entry, so it goes when the entry goes. Each stored entry carries a generation token from a monotonic
     counter; a refresh only lands if the same entry (same generation) is still
     live, so a refresh that completes after an invalidation, eviction, or
     replacement can never resurrect stale data — without retaining any per-key
@@ -108,6 +112,7 @@ class ObjectCache:
         max_entries: int | None = 256,
         max_size_bytes: int | None = None,
         swr_threshold_ratio: float = 0.5,
+        swr_retry_interval: float = 0.0,
     ) -> None:
         """Initialise the object cache.
 
@@ -118,10 +123,14 @@ class ObjectCache:
                 disable the byte bound. At least one bound must be set.
             swr_threshold_ratio: Fraction of TTL after which ``get_with_swr``
                 flags an entry for background refresh. Must be in (0.0, 1.0].
+            swr_retry_interval: Seconds after a failed refresh before
+                ``get_with_swr`` flags that entry again. 0 retries on the next
+                stale read. Must be >= 0.
 
         Raises:
-            ValueError: If both bounds are None, a bound is < 1, or
-                swr_threshold_ratio is outside (0.0, 1.0].
+            ValueError: If both bounds are None, a bound is < 1,
+                swr_threshold_ratio is outside (0.0, 1.0], or
+                swr_retry_interval is negative or NaN.
         """
         if max_entries is None and max_size_bytes is None:
             raise ValueError("ObjectCache requires at least one bound: max_entries or max_size_bytes")
@@ -131,10 +140,13 @@ class ObjectCache:
             raise ValueError(f"max_size_bytes must be >= 1, got {max_size_bytes}")
         if not (0.0 < swr_threshold_ratio <= 1.0):
             raise ValueError(f"swr_threshold_ratio must be in (0.0, 1.0], got {swr_threshold_ratio}")
+        if not swr_retry_interval >= 0:  # also rejects NaN
+            raise ValueError(f"swr_retry_interval must be >= 0, got {swr_retry_interval}")
 
         self._max_entries = max_entries
         self._max_size_bytes = max_size_bytes
         self._swr_threshold_ratio = swr_threshold_ratio
+        self._swr_retry_interval = swr_retry_interval
         self._store: OrderedDict[str, _Entry] = OrderedDict()
         self._lock = threading.RLock()
         self._hits = 0
@@ -191,7 +203,9 @@ class ObjectCache:
 
         Once an entry is older than ``ttl * swr_threshold_ratio`` (±10% jitter
         to stagger refreshes), the first caller is told to refresh it in the
-        background while the cached value keeps being served. When
+        background while the cached value keeps being served. Within
+        ``swr_retry_interval`` of a failed refresh nobody is told to refresh;
+        the cached value is still served until it hard-expires. When
         ``needs_refresh`` is True, the key is marked as refreshing — the caller
         MUST finish the cycle with ``complete_refresh`` or ``cancel_refresh``,
         otherwise no further refresh is ever flagged for that key.
@@ -226,7 +240,12 @@ class ObjectCache:
             needs_refresh = False
             # ±10% jitter staggers refreshes when many keys cross the threshold together
             jitter = random.uniform(0.9, 1.1)  # noqa: S311 - not cryptographic
-            if (now - entry.cached_at) > ttl * self._swr_threshold_ratio * jitter and key not in self._refreshing:
+            backing_off = entry.refresh_failed_at is not None and now - entry.refresh_failed_at < self._swr_retry_interval
+            if (
+                (now - entry.cached_at) > ttl * self._swr_threshold_ratio * jitter
+                and key not in self._refreshing
+                and not backing_off
+            ):
                 self._refreshing[key] = entry.generation
                 needs_refresh = True
 
@@ -284,6 +303,7 @@ class ObjectCache:
             entry.cached_at = now
             entry.expires_at = now + ttl
             entry.size_bytes = size
+            entry.refresh_failed_at = None  # success ends any retry back-off
             self._store.move_to_end(key)
             # New value may be larger — restore the byte bound by evicting LRU others
             self._evict(extra_bytes=0, need_slot=False)
@@ -303,6 +323,26 @@ class ObjectCache:
         with self._lock:
             if self._refreshing.get(key) == version:
                 del self._refreshing[key]
+
+    def fail_refresh(self, key: str, version: int) -> None:
+        """Finish a background refresh that ran and raised.
+
+        Releases the in-flight marker like ``cancel_refresh`` and also records
+        the failure time on the entry, so ``get_with_swr`` flags no new refresh
+        for it until ``swr_retry_interval`` has passed. Ownership rules match
+        ``cancel_refresh``: a stale refresh (older generation) changes nothing.
+
+        Args:
+            key: Cache key whose refresh failed.
+            version: Version token returned by ``get_with_swr``.
+        """
+        with self._lock:
+            if self._refreshing.get(key) != version:
+                return
+            del self._refreshing[key]
+            # The marker invariant guarantees the live entry has this generation
+            entry = self._store[key]
+            entry.refresh_failed_at = time.monotonic()
 
     def put(self, key: str, value: Any, ttl: int) -> None:
         """Store a value in the cache.

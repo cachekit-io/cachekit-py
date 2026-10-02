@@ -265,6 +265,7 @@ def my_function():
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) — [L1-only mode](#l1-only-mode-backendnone) only |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` — L1-only mode only |
+| `swr_retry_interval` | float | `10.0` | Seconds after a failed background refresh before that key is refreshed again, `>= 0`; `0` retries on the next stale read — L1-only mode only |
 
 **L1 Cache Concepts:**
 - **Freshness**: When to serve stale data + trigger background refresh (SWR, [L1-only mode](#l1-only-mode-backendnone) only — with a backend configured these fields have no effect)
@@ -288,8 +289,13 @@ honored as follows:
   is ever scheduled — they are stored with a one-year (31,536,000&nbsp;s) sentinel
   expiry rather than truly indefinitely, and can still be evicted earlier under
   byte pressure.
-- **Refresh failures are non-fatal**: the stale value keeps being served until hard
-  expiry, and the next qualifying hit retries the refresh. The refresh runs on a deep copy
+- **Refresh failures are non-fatal and back off**: the stale value keeps being served
+  until hard expiry. After a refresh raises, no background refresh for that key starts
+  again until `swr_retry_interval` seconds (default 10) have passed, so a failing
+  upstream gets at most one background call per key per interval rather than one per
+  read. A successful refresh, or the entry leaving the cache, ends the back-off; past
+  the `ttl` the next call runs the function in the foreground as usual and sees its
+  exception. Set `swr_retry_interval=0` to retry on every stale hit. The refresh runs on a deep copy
   of the call's arguments; when they cannot be copied (a lock, an open connection), it is
   skipped, so that call is only ever recomputed in the foreground after expiry.
 - **Failed and skipped refreshes log a WARNING** (`L1-only SWR refresh failed`, `… skipped`,
