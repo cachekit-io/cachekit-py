@@ -861,6 +861,31 @@ class TestFuncNameSanitization:
         assert "_top_level_for_key_test" in func_part
         assert "<" not in func_part
 
+    @pytest.mark.parametrize(
+        ("module", "qualname"),
+        [
+            ("app.billing", "compute_total"),  # clean: takes the no-regex shortcut
+            ("app", "C.method"),
+            ("a" * 150, "b" * 100),  # clean but over 200 chars: the shortcut still truncates
+            ("app", "café"),  # non-ASCII identifier: isidentifier() alone would wrongly pass it
+            ("app", "ＡＢ"),  # fullwidth letters
+            ("app", "a..b"),  # double dot
+            ("app.", "f"),  # trailing dot makes ".."
+            ("app", "1f"),  # digit after a dot: misses the shortcut, still clean
+            ("app", ""),  # empty qualname: "app."
+            (None, "f"),  # __module__ can be None
+            ("app", "outer.<locals>.inner"),
+            ("app", "a b-c:d"),
+            ("app..x", "<lambda>"),  # dirty and double dot: both passes run
+            ("app", "a...b<x>"),
+        ],
+    )
+    def test_shortcut_matches_regex_path(self, module, qualname):
+        """The pass-skipping checks (LAB-7405) return exactly what the two regex passes would."""
+        raw = f"{module}.{qualname}"
+        expected = CacheKeyGenerator._DOUBLE_DOT_RE.sub(".", CacheKeyGenerator._FUNC_ALLOWED_RE.sub("_", raw))[:200]
+        assert CacheKeyGenerator._sanitize_func_name(module, qualname) == expected
+
     def test_deterministic_for_same_function(self, key_generator):
         """Same function must always produce the same sanitized key."""
 

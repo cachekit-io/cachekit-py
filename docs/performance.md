@@ -11,7 +11,7 @@
 > [!TIP]
 > **Key numbers (p95 latency):**
 > - **L1 cache hit**: 500ns (pure dict lookup)
-> - **Decorator + L1 hit**: ~5.6μs median, CPython 3.12 (indicative wall clock; 78k instructions per call, see [Instruction Budgets](#instruction-budgets))
+> - **Decorator + L1 hit**: ~5.6μs median, CPython 3.12 (indicative wall clock; 61k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Complex payload (10KB dict)**: 242μs with serialization
 > - **DataFrame (10K rows, Arrow)**: 800μs total roundtrip
 > - **Concurrent access (10 threads)**: 231μs (minimal contention)
@@ -119,7 +119,7 @@ This measures the decorator machinery alone:
 
 **About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
 
-The deterministic figure is **78,368 instructions per call** on CPython 3.12 (81,212 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
+The deterministic figure is **61,244 instructions per call** on CPython 3.12 (62,415 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
 **About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
 
@@ -387,12 +387,12 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 78,368 | 81,212 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,335 | 79,325 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 362,785 | 366,419 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 349,201 | 351,292 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,646 | 300,581 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 306,710 | 311,742 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 61,244 | 62,415 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,292 | 60,482 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 346,876 | 348,273 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 332,060 | 332,697 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 281,500 | 282,257 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 290,734 | 293,554 |
 | `serializer_default` | `StandardSerializer` round trip, small dict | 61,356 | 62,663 |
 | `serializer_auto` | `AutoSerializer` round trip | 110,227 | 113,600 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,792 | 23,833 |

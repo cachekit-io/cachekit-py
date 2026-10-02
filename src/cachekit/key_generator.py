@@ -454,9 +454,20 @@ class CacheKeyGenerator:
         is deterministic: same function → same key.
 
         Deliberately not memoised (LAB-7068): a shared memo was slower under
-        free-threading than recomputing.
+        free-threading than recomputing. Instead each regex pass is skipped when
+        it could not change the name (LAB-7405); the checks keep no state.
         """
         raw = f"{module}.{qualname}"
+        # An ASCII identifier with dots for underscores holds only [A-Za-z0-9_.], so a name that
+        # passes, with no "..", is returned unchanged by both passes: every ordinary module-level
+        # function or method. "<" goes first because <locals> and <lambda> are the usual misses,
+        # and it rejects them before replace() allocates. A name that fails merely takes the
+        # regex path, so the check need only be sufficient. It encodes the _FUNC_ALLOWED_RE charset.
+        if "<" not in raw and raw.isascii() and raw.replace(".", "_").isidentifier() and ".." not in raw:
+            return raw[: cls._FUNC_NAME_MAX]
         sanitized = cls._FUNC_ALLOWED_RE.sub("_", raw)
-        sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
+        # The first pass writes only "_", so it never creates a "..": with none in raw, the
+        # collapse pass would find nothing.
+        if ".." in raw:
+            sanitized = cls._DOUBLE_DOT_RE.sub(".", sanitized)
         return sanitized[: cls._FUNC_NAME_MAX]
