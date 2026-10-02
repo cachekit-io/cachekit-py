@@ -408,24 +408,6 @@ build: setup-logs ## Build package
 	fi
 	@echo "$(GREEN)✓ Package built in dist/$(RESET)"
 
-build-pgo: setup-logs ## Build with Profile-Guided Optimization (5-8% faster)
-	@echo "$(BLUE)Building with Profile-Guided Optimization...$(RESET)"
-	@echo "$(YELLOW)This will take several minutes but results in 5-8% performance improvement$(RESET)"
-	@echo "$(YELLOW)Logging to $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log$(RESET)"
-	@if [ -f "scripts/build_with_pgo.sh" ]; then \
-		if ! bash scripts/build_with_pgo.sh 2>&1 | tee $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log; then \
-			echo "$(YELLOW)❌ PGO build failed$(RESET)"; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(YELLOW)⚠️  scripts/build_with_pgo.sh not found, running standard build$(RESET)"; \
-		if ! uv build 2>&1 | tee $(LOG_BUILD_DIR)/build-pgo_$(TIMESTAMP).log; then \
-			echo "$(YELLOW)❌ Build failed$(RESET)"; \
-			exit 1; \
-		fi; \
-	fi
-	@echo "$(GREEN)✓ Build complete$(RESET)"
-
 build-multiarch-linux: ## Build Linux wheels for amd64 + arm64 using Docker (local Mac)
 	@bash scripts/build-multiarch-linux.sh
 
