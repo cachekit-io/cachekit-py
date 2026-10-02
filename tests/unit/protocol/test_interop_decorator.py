@@ -9,8 +9,10 @@ round-trip, and auto-mode remaining byte-identical for non-opted-in callers.
 from __future__ import annotations
 
 import json
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Optional
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -69,10 +71,8 @@ def _decorate(backend: DictBackend, **kwargs: Any):
     return apply
 
 
-def _patch_backend_provider(get_backend: Any):
+def _patch_backend_provider(get_backend: DictBackend | BaseException) -> AbstractContextManager[Mock]:
     """Patch the wrapper's lazy DI provider: ``get_backend`` returns the given backend, or raises it if it is an exception."""
-    from unittest.mock import Mock, patch
-
     provider = Mock()
     if isinstance(get_backend, BaseException):
         provider.get_backend.side_effect = get_backend
@@ -520,8 +520,6 @@ class TestInteropRejections:
         """Invalidation runs the same guard as reads and writes. Without it, an invalidate-only
         caller on a key-prefixing backend deletes {prefix}{key} and returns normally, while the
         bare interop entry other SDKs read stays cached."""
-        from unittest.mock import patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         key = KEY_VECTORS["single_int"]["expected_key"]
@@ -547,8 +545,6 @@ class TestInteropRejections:
     @pytest.mark.parametrize("call_args", [(42,), ()], ids=["single-key", "whole-function"])
     async def test_ainvalidate_on_lazy_prefixing_backend_fails_closed(self, call_args: tuple[int, ...]):
         """Async mirror of test_invalidate_on_lazy_prefixing_backend_fails_closed."""
-        from unittest.mock import patch
-
         from cachekit.decorators.wrapper import create_cache_wrapper
 
         key = KEY_VECTORS["single_int"]["expected_key"]
@@ -590,8 +586,6 @@ class TestInteropRejections:
         tenant-scoping wrapper (t:{tenant}:{key} on the wire) — it must expose
         key_prefix so the interop guard rejects it instead of silently diverging
         from the bare keys other SDKs use."""
-        from unittest.mock import Mock
-
         from cachekit.backends.redis.provider import PerRequestRedisBackend
         from cachekit.interop import ensure_interop_backend_compatible
 
