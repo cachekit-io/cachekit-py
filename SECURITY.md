@@ -247,6 +247,10 @@ On the tenant-scoped Redis backend, every successful invalidation is announced o
 
 **What a subscriber learns.** Each message names a function by its namespace and a hash of its `module.qualname`. For `invalidate_cache(args)` on a generated or fast-mode key it also carries the key, which spells out the namespace and the function and holds an unkeyed hash of the arguments: guessable arguments can be recovered from it, exactly as **Digest strength** describes above. A custom `key=` key, which can embed caller identifiers, is never sent, and neither is the tenant prefix. Grant `subscribe` on the channel only to your application's own Redis users; with Redis 7+ ACLs, give every other user `resetchannels`.
 
+**What a publisher can do.** A process that sets `CACHEKIT_INVALIDATION_LISTENER_ENABLED` treats each message as untrusted input. It is size-checked (4096 bytes) before MessagePack decoding, which builds only a small map of short strings, so a forged message can neither run code nor stop the listener; at most it evicts L1 entries in every listening process. A publisher can also spend listeners' resources. Redis delivers a message whole before cachekit sees its size, so a large message costs each listener its size in memory, and one beyond Redis's pub/sub output-buffer limit (32 MB by default) makes Redis drop every listener's connection until it reconnects. A whole-function event costs time in proportion to the keys the process recorded for the function, and each malformed message logs one WARNING. Grant `publish` on the channel only to your application's own Redis users.
+
+**The listener's connection** is a clone of the backend's connection pool that keeps its connection class, so the listener of a `rediss://` backend uses TLS too, never plaintext.
+
 ---
 
 ## FFI Boundary Security
