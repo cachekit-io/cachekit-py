@@ -261,13 +261,15 @@ def _auto_default(obj: Any) -> Any:
     # methods (str.__str__, int.__int__, ...) read the stored value and ignore a subclass override,
     # as the C packer does; plain str() would emit an Enum member's name. An int outside msgpack's
     # 64-bit range, exact or subclass, falls through to the error below, as the non-strict packer
-    # sent it here on overflow. A sequence subclass is copied with a comprehension, as the old
-    # pre-pass did: list(obj) and list(iter(obj)) also call __len__ or the iterator's
-    # __length_hint__, which a subclass can make raise or consume items. An exact tuple's are builtin.
+    # sent it here on overflow. Containers are copied with a comprehension, as the old pre-pass did:
+    # list(obj), list(iter(obj)) and dict(obj.items()) also consult __len__, the iterator's
+    # __length_hint__ or a keys() on the items() result, which a subclass can make raise or alter
+    # the value. An exact tuple's hooks are builtin. Bytes are read from their own storage, never
+    # through the buffer protocol, which a subclass can override from 3.12 (PEP 688, __buffer__).
     if isinstance(obj, tuple):
         return {"__tuple__": True, "value": list(obj) if type(obj) is tuple else [x for x in obj]}  # noqa: C416 - see above
     if isinstance(obj, dict):
-        return dict(obj.items())
+        return {k: v for k, v in obj.items()}  # noqa: C416 - dict(obj.items()) can read it as a mapping
     if isinstance(obj, list):
         return [x for x in obj]  # noqa: C416 - list(obj) would call __len__ / __length_hint__
     if isinstance(obj, str):
@@ -276,8 +278,10 @@ def _auto_default(obj: Any) -> Any:
         return int.__int__(obj)
     if isinstance(obj, float):
         return float.__float__(obj)
-    if isinstance(obj, (bytes, bytearray)):
-        return bytes(memoryview(obj))
+    if isinstance(obj, bytes):
+        return bytes.__getitem__(obj, slice(None))
+    if isinstance(obj, bytearray):
+        return bytes(bytearray.copy(obj))
 
     # Existing: datetime/date/time support (KEEP)
     if isinstance(obj, datetime):

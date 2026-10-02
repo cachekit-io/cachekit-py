@@ -107,8 +107,8 @@ class LenTrapTuple(tuple):
 class _HintEatsOne:
     """An iterator whose __length_hint__ consumes an item: list(it) would drop it, a comprehension never asks."""
 
-    def __init__(self, items: Any) -> None:
-        self._it = iter(list.__iter__(items) if isinstance(items, list) else tuple.__iter__(items))
+    def __init__(self, it: Any) -> None:
+        self._it = it
 
     def __iter__(self) -> _HintEatsOne:
         return self
@@ -123,12 +123,95 @@ class _HintEatsOne:
 
 class HintTrapList(list):
     def __iter__(self) -> Any:
-        return _HintEatsOne(self)
+        return _HintEatsOne(list.__iter__(self))
 
 
 class HintTrapTuple(tuple):
     def __iter__(self) -> Any:
-        return _HintEatsOne(self)
+        return _HintEatsOne(tuple.__iter__(self))
+
+
+class _MappingTrapPairs(list):
+    """An items() result that also looks like a mapping: dict(it) reads it through keys()/__getitem__."""
+
+    def keys(self) -> list[str]:
+        return ["x"]
+
+    def __getitem__(self, key: Any) -> Any:
+        return "MAPPED"
+
+
+class Hostile:
+    """Overrides every hook a copy of a builtin subclass could consult. The non-strict packer read each
+    value's own storage and the old pre-pass only iterated (items() for a dict), so none may change bytes."""
+
+    def __iter__(self) -> Any:
+        return _HintEatsOne(super().__iter__())  # type: ignore[misc]
+
+    def __len__(self) -> int:
+        raise RuntimeError("no len")
+
+    def items(self) -> Any:
+        return _MappingTrapPairs(super().items())  # type: ignore[misc]
+
+    def keys(self) -> list[str]:
+        return ["x"]
+
+    def __getitem__(self, key: Any) -> Any:
+        return "MAPPED"
+
+    def __buffer__(self, flags: int) -> memoryview:  # PEP 688: honoured from 3.12
+        return memoryview(b"EVIL")
+
+    def __bytes__(self) -> bytes:
+        return b"EVIL"
+
+    def __str__(self) -> str:
+        return "EVIL"
+
+    def __int__(self) -> int:
+        return 666
+
+    def __index__(self) -> int:
+        return 666
+
+    def __float__(self) -> float:
+        return 6.66
+
+    def copy(self) -> Any:
+        return "EVIL"
+
+
+class HostileList(Hostile, list):
+    pass
+
+
+class HostileTuple(Hostile, tuple):
+    pass
+
+
+class HostileDict(Hostile, dict):
+    pass
+
+
+class HostileStr(Hostile, str):
+    pass
+
+
+class HostileInt(Hostile, int):
+    pass
+
+
+class HostileFloat(Hostile, float):
+    pass
+
+
+class HostileBytes(Hostile, bytes):
+    pass
+
+
+class HostileBytearray(Hostile, bytearray):
+    pass
 
 
 class MyStr(Tagged, str):
@@ -185,6 +268,14 @@ CORPUS: dict[str, Any] = {
     "subclass-keys": {MyStr("k"): 1, Mood.HAPPY: 2, Color.RED: 3},
     "len-raising-subclasses": {"l": LenTrapList([1, (2,)]), "t": LenTrapTuple((3, [4]))},
     "hint-consuming-iterators": {"l": HintTrapList([1, (2,)]), "t": HintTrapTuple((3, [4]))},
+    "hostile-list": HostileList([1, (2,)]),
+    "hostile-tuple": HostileTuple((3, [4])),
+    "hostile-dict": HostileDict(a=1, b=(2,)),
+    "hostile-str": HostileStr("good"),
+    "hostile-int": HostileInt(7),
+    "hostile-float": HostileFloat(2.5),
+    "hostile-bytes": HostileBytes(b"good"),
+    "hostile-bytearray": HostileBytearray(b"good"),
     "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc), date(2026, 1, 2), time(3, 4), UUID(int=7)],
     "sets-of-scalars": [{1, 2, 3}, frozenset({"a", "b"})],
     "scalars": [None, True, False, 0, -1, 2**63, -(2**63), 1.0, -0.0, float("inf"), "", "ü", b""],
