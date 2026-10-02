@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 
 import pytest
 
@@ -72,6 +73,31 @@ def test_every_path_has_a_committed_budget() -> None:
     data = json.loads(ir_budget.BASELINES.read_text())
     for key, entry in data["interpreters"].items():
         assert set(entry["budgets"]) == set(PATHS), key
+
+
+def test_batched_metrics_path_queues_every_call_and_never_records_synchronously(monkeypatch) -> None:
+    """``l2_hit_async_metrics`` claims to budget batched mode; a collector change must not turn it synchronous."""
+    pytest.importorskip("pandas")  # the workload builder makes the Arrow path's DataFrame too
+    from cachekit.reliability.async_metrics import AsyncMetricsCollector
+
+    calls: Counter[str] = Counter()
+
+    def counting(mode: str):
+        real = getattr(AsyncMetricsCollector, f"_record_cache_operation_{mode}")
+
+        def record(self, *args, **kwargs):
+            calls[mode] += 1
+            return real(self, *args, **kwargs)
+
+        return record
+
+    for mode in ("sync", "async"):
+        monkeypatch.setattr(AsyncMetricsCollector, f"_record_cache_operation_{mode}", counting(mode))
+    op = ir_budget._build_workload("l2_hit_async_metrics")
+    calls.clear()
+    for _ in range(20):
+        op()
+    assert calls == {"async": 20}
 
 
 def test_pinned_clocks_tick_per_read_on_the_main_thread_only(monkeypatch) -> None:

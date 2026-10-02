@@ -119,7 +119,7 @@ This measures the decorator machinery alone:
 
 **About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
 
-The deterministic figure is **78,344 instructions per call** on CPython 3.12 (81,539 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, metrics and the decorator's own bookkeeping are all inside that count.
+The deterministic figure is **78,323 instructions per call** on CPython 3.12 (81,463 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
 **About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
 
@@ -371,37 +371,41 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 ## Instruction Budgets
 
-`make perf-ir` counts the instructions each hot path executes per call and fails when any path costs **1% or more** above its committed budget. It warns from 0.2%. Instruction counts are deterministic where wall clock is not: repeat runs agree within 0.03% on every path except the Arrow round trip, which agrees within 0.2%.
+`make perf-ir` counts the instructions each hot path executes per call and fails when any path costs **1% or more** above its committed budget. It warns from 0.2%. Instruction counts are deterministic where wall clock is not: two full runs agree within XXAAXX per path.
 
 **Method** (`tests/performance/ir_budget.py`):
 - Each path runs under `valgrind --tool=callgrind --separate-threads=yes`, and only the main thread is counted. cachekit's background threads (log writer, L1 cleanup) vary by tens of percent between identical runs.
-- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel.
-- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
+- Per-call cost is `(Ir[3000 calls] - Ir[1000 calls]) / 2000`, so interpreter startup (~2 billion instructions) and warmup cancel. Interpreter teardown is skipped.
+- The measured process has a fixed environment (`PYTHONHASHSEED=0`, one BLAS/OpenMP thread, a one-day log flush and L1 cleanup interval, nothing inherited), seeded log sampling, and main-thread clocks that advance 1μs per read. Code that records its own duration otherwise executes more instructions when it runs slower. The cleanup sweep reads the real clock, so inside a run it would evict entries stamped with the pinned one.
+- Nothing that runs on real time lands in the measured loop: no background thread wakes, cyclic GC is off, and the GIL switch interval is long enough that the main thread gives up the GIL only where the code releases it.
+- Each path runs at five heap layouts (0 to 880 extra objects held before the workload) and its figure is the median. Any code change moves the layout, which moved single runs by up to 2.2% on the orjson round trip; with every layout shifted, the medians moved 0.25% at most (CPython 3.12).
 - The L2 paths use an in-process dict backend, so they cost instructions only: no sockets, retries or timeouts.
+- The metrics collector starts synchronous and switches to batched mode (each call queues its record for a worker thread) when its 5 s check sees more than 100 records/s. Pinned clocks never reach that check, so the plain paths measure synchronous recording, and `l2_hit_async_metrics` measures the batched mode a busy long-lived process runs. Every metrics path records once per call through the same method, so one batched path covers that mode.
 
 **Budgets** (instructions per call, `tests/performance/ir_baselines.json`):
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 78,344 | 81,539 |
-| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,601 | 80,032 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 369,551 | 377,674 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 354,670 | 361,640 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,708 | 299,628 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 61,354 | 62,618 |
-| `serializer_auto` | `AutoSerializer` round trip | 110,228 | 113,486 |
-| `serializer_orjson` | `OrjsonSerializer` round trip | 23,758 | 23,728 |
-| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,961,754 | 1,958,074 |
-| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,946 | 118,078 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 78,323 | 81,463 |
+| `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 76,633 | 79,582 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 362,974 | 366,546 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 348,894 | 349,575 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 296,467 | 300,398 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 307,183 | 311,417 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 61,335 | 62,675 |
+| `serializer_auto` | `AutoSerializer` round trip | 110,146 | 113,611 |
+| `serializer_orjson` | `OrjsonSerializer` round trip | 23,803 | 23,851 |
+| `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,950,883 | 1,953,760 |
+| `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,658 | 118,023 |
 
-Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, with the release extension that `uv sync` builds.
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, with the release extension that `uv sync` builds. Batched mode costs the caller about 55,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
 
-**Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by about 4,800 instructions (`l1_hit` +6.1%) and failed the gate, while the serializer paths stayed within 0.1%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
+**Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,800 to 5,000 instructions (`l1_hit` +6.3%, `l2_hit_async_metrics` +1.6%) and failed the gate, while the serializer paths stayed within 0.1%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
-**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered.
+**Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. A `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; a few minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (needs valgrind; 110 valgrind runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 
