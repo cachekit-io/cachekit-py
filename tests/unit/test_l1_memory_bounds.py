@@ -298,14 +298,18 @@ def _consistent(cache: L1Cache) -> bool:
     return s.memory_bytes == sum(entry.size_bytes for entry in s.cache.values())
 
 
-def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool, hooked: bool = True) -> None:
-    """Leave the manager in the state fork() hands a child: dead thread, foreign owner.
-
-    hooked=False is a fork the at-fork hook never reached (uWSGI without --py-call-osafterfork).
-    """
+def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
+    """Leave the manager in the state fork() hands a child: dead thread, foreign owner."""
     manager._cleanup_thread = threading.Thread(target=lambda: None) if parent_ran_cleanup else None
     manager._owner_pid = -1
-    manager._locks_reset_pid = os.getpid() if hooked else None
+
+
+def _as_if_hookless(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make this process a child the at-fork hook never reached (uWSGI without --py-call-osafterfork)."""
+    from cachekit import l1_cache
+
+    monkeypatch.setattr(l1_cache, "_import_pid", -1)
+    monkeypatch.setattr(l1_cache, "_hooked_pid", None)
 
 
 @pytest.mark.unit
@@ -375,6 +379,9 @@ class TestCleanupThreadAfterFork:
             queue = ctx.Queue()
 
             def child(q) -> None:
+                if not get_first:
+                    l1_cache._hooked_pid = None  # and undo the mark the hook still left on this process
+
                 def put() -> None:
                     if get_first:  # a decorator's first call: get() before any put() runs the take-over
                         assert cache.get("pre-fork") == (False, None)  # dropped: the holder may have torn it
@@ -494,7 +501,7 @@ class TestCleanupThreadAfterFork:
             def child(q) -> None:
                 # From the child's main thread: a lock the hook left orphaned hangs here for good.
                 found = [cache.get("k")[0] for cache in caches]
-                q.put({"found": found, "reset": [m._locks_reset_pid == os.getpid() for m in (first, second)]})
+                q.put({"found": found, "hooked": l1_cache._hooked_pid == os.getpid()})
 
             process = ctx.Process(target=child, args=(queue,))
             process.start()
@@ -507,7 +514,7 @@ class TestCleanupThreadAfterFork:
                 if process.is_alive():  # a hung child would otherwise block pytest's exit
                     process.kill()
 
-            assert outcome == {"found": [False, False], "reset": [True, True]}
+            assert outcome == {"found": [False, False], "hooked": True}
             assert process.exitcode == 0
         finally:
             l1_cache.logger.removeFilter(raising)
@@ -522,6 +529,7 @@ class TestCleanupThreadAfterFork:
 
         manager = L1CacheManager(default_max_memory_mb=10)
         monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet([manager]))  # leave the global manager alone
+        monkeypatch.setattr(l1_cache, "_hooked_pid", None)  # restored after the in-process hook call
         caches = [manager.get_cache("raising-ns"), manager.get_cache("later-ns")]
         orphaned = []
         for cache in caches:
@@ -545,7 +553,7 @@ class TestCleanupThreadAfterFork:
 
         assert [cache._state.lock is lock for cache, lock in zip(caches, orphaned, strict=True)] == [False, False]
         assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
-        assert manager._locks_reset_pid == os.getpid()
+        assert l1_cache._hooked_pid == os.getpid()
 
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)
@@ -557,13 +565,14 @@ class TestCleanupThreadAfterFork:
         assert manager._cleanup_thread is None
         assert manager._owner_pid == os.getpid()
 
-    def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs(self, caplog):
+    def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs_nothing(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("orphan-ns")
         cache.put("pre-fork", b"v")
         old = cache._state
         held_bytes = old.memory_bytes
-        _as_if_forked(manager, parent_ran_cleanup=False, hooked=False)
+        _as_if_forked(manager, parent_ran_cleanup=False)
+        _as_if_hookless(monkeypatch)
         old.lock.acquire()  # _is_owned(): how a child thread reusing the dead holder's ident sees the hold
         try:
             with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
@@ -575,7 +584,7 @@ class TestCleanupThreadAfterFork:
         # A holder still inside a critical section finds its state as it left it.
         assert list(old.cache) == ["pre-fork"] and old.memory_bytes == held_bytes
         assert not cache.get("pre-fork")[0] and cache.get("k")[0]
-        assert any(f"dropped 1 entries ({held_bytes} bytes)" in r.message for r in caplog.records)
+        assert caplog.records == []  # logging's own locks may be orphaned in this child
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_fork_inside_a_critical_section_lets_the_child_finish_it(self, monkeypatch):
@@ -663,6 +672,7 @@ class TestCleanupThreadAfterFork:
         child = os.fork()
         if child == 0:
             try:
+                l1_cache._hooked_pid = None  # and undo the mark the hook still left on this process
                 stalled, resume = threading.Event(), threading.Event()
                 real = CacheEntry.is_expired
 
@@ -733,20 +743,26 @@ class TestCleanupThreadAfterFork:
 
     def test_hookless_child_starts_no_cleanup_thread(self, monkeypatch, caplog):
         """LAB-7271: a fork from C skips CPython's own after-fork repair, so no thread may start there."""
+        from cachekit import l1_cache
+
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("hookless-ns")
-        _as_if_forked(manager, parent_ran_cleanup=True, hooked=False)
+        _as_if_forked(manager, parent_ran_cleanup=True)
+        _as_if_hookless(monkeypatch)
         starts: list[threading.Thread] = []
         monkeypatch.setattr(threading.Thread, "start", lambda self: starts.append(self))
         with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
             cache.put("k", b"v")
             manager.start_background_cleanup(interval_seconds=60)
+            born = L1CacheManager(default_max_memory_mb=10)  # first built in the child: no take-over runs
+            born.start_background_cleanup(interval_seconds=60)
 
-        assert starts == [] and manager._cleanup_thread is None
+        assert starts == [] and manager._cleanup_thread is None and born._cleanup_thread is None
         assert cache.get("k")[0]
         assert caplog.records == []  # logging's own locks may be orphaned in this child
 
-        _as_if_forked(manager, parent_ran_cleanup=False)  # its own child, forked with hooks
+        monkeypatch.setattr(l1_cache, "_hooked_pid", os.getpid())  # its own child, forked with hooks
+        _as_if_forked(manager, parent_ran_cleanup=False)
         manager.start_background_cleanup(interval_seconds=60)
         assert len(starts) == 1
 
@@ -754,32 +770,39 @@ class TestCleanupThreadAfterFork:
     def test_child_of_a_c_fork_requests_no_thread_start(self):
         """A real fork from C: the at-fork hook does not run, and neither take-over nor start may start a thread.
 
-        A parent thread holds a logging handler's lock at fork, which a fork from C leaves held in the
-        child: the take-over and the refusal must not log, or the child's first put() hangs.
+        Parent threads hold a cache lock and a logging handler's lock at fork, which a fork from C leaves
+        held in the child: the take-over's lock reset and the refusal must not log, or the child's first
+        put() hangs. A manager first built in the child, as a worker's first get_l1_cache() builds the
+        global one, must refuse a thread too.
         """
         import ctypes
 
+        from cachekit import l1_cache
+
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("c-fork-ns")  # captured pre-fork, like a decorator's _l1_cache
-        manager.start_background_cleanup(interval_seconds=60)
+        cache.put("pre-fork", b"v")
         l1_logger = logging.getLogger("cachekit.l1_cache")
-        handler = logging.StreamHandler(open(os.devnull, "w"))  # noqa: SIM115 - closed below
         old_level = l1_logger.level
-        l1_logger.addHandler(handler)
-        l1_logger.setLevel(logging.DEBUG)
-        held, release = threading.Event(), threading.Event()
+        handler = logging.StreamHandler(open(os.devnull, "w"))  # noqa: SIM115 - closed below
+        held, release = [threading.Event(), threading.Event()], threading.Event()
 
-        def hold_handler_lock() -> None:
-            with handler.lock:  # a parent thread mid-emit when the fork lands
-                held.set()
+        def hold(lock: threading.RLock, done: threading.Event) -> None:
+            with lock:  # a parent thread mid-critical-section when the fork lands
+                done.set()
                 release.wait(10)
 
-        holder = threading.Thread(target=hold_handler_lock, daemon=True)
-        holder.start()
-        assert held.wait(5)
-        libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
-        r, w = os.pipe()
+        locks = (handler.lock, cache._state.lock)
+        holders = [threading.Thread(target=hold, args=pair, daemon=True) for pair in zip(locks, held, strict=True)]
         try:
+            manager.start_background_cleanup(interval_seconds=60)
+            l1_logger.addHandler(handler)
+            l1_logger.setLevel(logging.DEBUG)
+            for holder in holders:
+                holder.start()
+            assert all(event.wait(5) for event in held)
+            libc_fork = ctypes.PyDLL(None).fork  # PyDLL keeps the GIL through the call
+            r, w = os.pipe()
             child = libc_fork()
             if child == 0:
                 try:
@@ -792,16 +815,35 @@ class TestCleanupThreadAfterFork:
                             requested.append(self.name)
 
                     threading.Thread = _RecordingThread  # the child's copy only; it never returns to pytest
-                    cache.put("k", b"v")
+                    cache.put("k", b"v")  # the take-over probes the held cache lock for 1 s, then resets it
                     manager.start_background_cleanup(interval_seconds=60)
-                    _report(w, {"requested": requested, "thread": manager._cleanup_thread, "found": cache.get("k")[0]})
+                    l1_cache._global_l1_manager = None
+                    born = l1_cache.get_l1_cache_manager()  # starts its cleanup unless refused
+                    _report(
+                        w,
+                        {
+                            "requested": requested,
+                            "thread": manager._cleanup_thread,
+                            "born_thread": born._cleanup_thread,
+                            "found": cache.get("k")[0],
+                            "pre_fork": cache.get("pre-fork")[0],
+                        },
+                    )
                 finally:
                     os._exit(1)
             os.close(w)
-            assert _child_outcome(child, r) == {"requested": [], "thread": None, "found": True}
+            assert _child_outcome(child, r) == {
+                "requested": [],
+                "thread": None,
+                "born_thread": None,
+                "found": True,
+                "pre_fork": False,  # dropped with the orphaned lock; L2 still has it
+            }
         finally:
             release.set()
-            holder.join(5)
+            for holder in holders:
+                if holder.is_alive():  # join() raises on a thread that never started
+                    holder.join(5)
             l1_logger.removeHandler(handler)
             l1_logger.setLevel(old_level)
             handler.stream.close()
