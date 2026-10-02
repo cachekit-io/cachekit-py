@@ -11,13 +11,14 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   warmup cancel.
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (see ``_pin_main_thread_clocks``).
-  Pinned clocks never let the metrics collector's 5 s mode check fire, so each path that records
-  a metric also runs as a ``*_async_metrics`` variant, starting in the batching mode a busy
-  long-lived process switches to.
-- Cyclic GC is disabled in the measured loop, the environment is fixed and the bytecode cache is
-  warmed first (see ``_run_workload`` and ``measure``).
+  Pinned clocks never let the metrics collector's 5 s mode check fire, so the collector stays
+  synchronous; ``l2_hit_async_metrics`` measures the batched mode a busy long-lived process
+  switches to (see ``_build_workload``).
+- Anything else that runs on real time is kept off the measured loop: no background thread
+  wakes, cyclic GC is off, the environment is fixed, the bytecode cache is warmed first, and the
+  heap layout is sampled (see ``_run_workload``, ``measure`` and ``LAYOUTS``).
 
-Repeat runs agree within A_A_FLOOR per op, against a 1% fail threshold.
+Repeat runs agree within XXAAXX per op, against a 1% fail threshold.
 
 Budgets are keyed by interpreter (minor version, build flavour, machine): the same code costs a
 different number of instructions on 3.12 and 3.14. Instruction counts ignore cache misses and
@@ -61,8 +62,6 @@ PATHS = (
     "miss",
     "secure_l1_hit",
     "l2_hit_async_metrics",
-    "miss_async_metrics",
-    "secure_l1_hit_async_metrics",
     "serializer_default",
     "serializer_auto",
     "serializer_orjson",
@@ -78,8 +77,6 @@ def _build_workload(path: str) -> Callable[[], object]:
 
     Imports happen here, so importing this module stays cheap.
     """
-    import functools
-
     import pandas as pd
 
     import cachekit.decorators.orchestrator as orchestrator
@@ -120,33 +117,47 @@ def _build_workload(path: str) -> Callable[[], object]:
     def body(uid: int, kind: str) -> dict:
         return value
 
-    def async_metrics(decorate: Callable[[], Callable[..., dict]]) -> Callable[..., dict]:
-        """Decorate with the metrics collector already in its batching (async) mode.
+    def batched_metrics(decorate: Callable[[], Callable[..., dict]]) -> Callable[..., dict]:
+        """Decorate with the metrics collector in batched mode, where a busy long-lived process runs.
 
-        A collector starts synchronous and, checking every 5 s, switches to a queue plus worker
-        thread above 100 ops/s, which is a long-lived service's steady state. The pinned clocks
-        never let 5 s pass, so the sync-mode paths cannot reach it; these variants start there.
+        A collector starts synchronous. At a mode check (every 5 s) that sees more than 100
+        records/s it switches to batched mode: each call puts its record on a queue and a worker
+        thread updates Prometheus. Pinned clocks never let 5 s pass, so this variant starts the
+        collector batched. It then stops the worker, which drains the queue on real time and would
+        otherwise change the main thread's count with host load. The budget covers the caller's
+        side, putting the record on the queue; the worker's flush runs on its own thread.
         """
-        real = orchestrator.AsyncMetricsCollector
-        orchestrator.AsyncMetricsCollector = functools.partial(real, sync_mode=False, auto_detect_mode=False)  # type: ignore[misc]
+        made: list[Any] = []
+
+        class Batched(orchestrator.AsyncMetricsCollector):
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(sync_mode=False, **kwargs)
+                made.append(self)
+
+        real, orchestrator.AsyncMetricsCollector = orchestrator.AsyncMetricsCollector, Batched
         try:
-            return decorate()
+            fn = decorate()
         finally:
-            orchestrator.AsyncMetricsCollector = real  # type: ignore[misc]
+            orchestrator.AsyncMetricsCollector = real
+        (collector,) = made
+        collector._stopped.set()
+        collector._worker_thread.join()
+        queued = collector._queue.qsize()
+        fn(42, "user-profile")
+        if collector._sync_mode or collector._queue.qsize() <= queued:
+            raise RuntimeError("l2_hit_async_metrics: the call did not queue its metric, so batched mode is not measured")
+        return fn
 
     l2 = lambda: cache(backend=DictBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
-    miss = lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
-    secure = lambda: cache.secure(master_key=master_key, backend=DictBackend(), ttl=300)(body)  # noqa: E731
-    # Every path that records a metric has a sync- and an async-mode variant; the L1-only hits record none.
+    # Every metrics path records through the same AsyncMetricsCollector.record_cache_operation, once
+    # per call, so one batched-mode variant covers that mode; the L1-only hits record no metric.
     decorated: dict[str, Callable[[], Callable[..., dict]]] = {
         "l1_hit": lambda: cache(backend=None, ttl=300)(body),
         "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
         "l2_hit": l2,
-        "miss": miss,
-        "secure_l1_hit": secure,
-        "l2_hit_async_metrics": lambda: async_metrics(l2),
-        "miss_async_metrics": lambda: async_metrics(miss),
-        "secure_l1_hit_async_metrics": lambda: async_metrics(secure),
+        "miss": lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body),
+        "secure_l1_hit": lambda: cache.secure(master_key=master_key, backend=DictBackend(), ttl=300)(body),
+        "l2_hit_async_metrics": lambda: batched_metrics(l2),
     }
     if path in decorated:
         fn = decorated[path]()
@@ -198,23 +209,27 @@ def _pin_main_thread_clocks() -> None:
 
 
 def _run_workload(path: str, n: int) -> None:
-    _pin_main_thread_clocks()
-    _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS)
-    op = _build_workload(path)
     import gc
 
     # Background threads' allocations count toward the main thread's GC trigger, so when a
-    # collection lands in the loop varies run to run: 0.3% per op on the orjson round trip.
-    # Cyclic-GC cost is therefore outside the budget; allocation and refcount cost stay in it.
+    # collection lands varies run to run (0.3% per op on the orjson round trip), and a full
+    # collection landing in one loop size but not the other would swamp the difference. Off from
+    # the start: allocation and refcount cost stay in the budget, cyclic-GC cost is outside it.
     gc.disable()
-    # A background thread waiting on the GIL makes the main thread drop it every switch interval
-    # of REAL time, so a slower (more loaded) run pays for more handoffs. With a long interval
-    # the GIL changes hands only where the code releases it itself, which is the same every run.
-    sys.setswitchinterval(100.0)
+    # A thread waiting on the GIL makes the main thread drop it after every switch interval of
+    # REAL time, so a slower (more loaded) run pays for more handoffs. With a long interval the
+    # main thread gives up the GIL only where the code releases it itself.
+    sys.setswitchinterval(1e6)
+    _pin_main_thread_clocks()
+    _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS)
+    op = _build_workload(path)
     for _ in range(50):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel
         op()
     for _ in range(n):
         op()
+    # Skip interpreter teardown: what it frees grows with n (l2_hit_async_metrics's queue holds
+    # every record) and would leak into the per-op difference.
+    os._exit(0)
 
 
 # ── gate ────────────────────────────────────────────────────────────────────────────────────
@@ -270,6 +285,12 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
         "PYTHONNOUSERSITE": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",  # pyarrow converts on a thread pool otherwise: +-0.5% per op
+        # cachekit's log writer wakes every 1 s and its L1 sweeper every 30 s of real time. A woken
+        # thread takes the GIL at a load-dependent moment, and the sweeper compares expiry times
+        # stamped by the pinned main-thread clock against the real one, so it evicts live entries
+        # mid-run. A day-long interval keeps both asleep for the whole run.
+        "CACHEKIT_LOG_FLUSH_INTERVAL": "86400",
+        "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
     for path in paths:
         _run([], path, 1, env)
