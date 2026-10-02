@@ -1,7 +1,7 @@
 """Per-op instruction budgets for the cachekit hot paths (``make perf-ir``).
 
 Wall-clock benchmarks on a shared host cannot gate a 1% regression: run-to-run noise is several
-percent. Instruction counts can, with two caveats this harness exists to handle:
+percent. Instruction counts can, once these sources of run-to-run noise are handled:
 
 - ``import cachekit`` starts background threads (the log writer, the L1 cleanup worker) whose
   counts swing by tens of percent between identical runs. Only the MAIN thread is counted
@@ -11,8 +11,13 @@ percent. Instruction counts can, with two caveats this harness exists to handle:
   warmup cancel.
 - Code that observes its own wall-clock duration executes more instructions when it runs
   slower, so the measured process pins its main-thread clocks (see ``_pin_main_thread_clocks``).
+  Pinned clocks never let the metrics collector's 5 s mode check fire, so each path that records
+  a metric also runs as a ``*_async_metrics`` variant, starting in the batching mode a busy
+  long-lived process switches to.
+- Cyclic GC is disabled in the measured loop, the environment is fixed and the bytecode cache is
+  warmed first (see ``_run_workload`` and ``measure``).
 
-With all three, repeat runs agree within 0.03% per op (A/A; the Arrow round trip 0.2%), against a 1% fail threshold.
+Repeat runs agree within A_A_FLOOR per op, against a 1% fail threshold.
 
 Budgets are keyed by interpreter (minor version, build flavour, machine): the same code costs a
 different number of instructions on 3.12 and 3.14. Instruction counts ignore cache misses and
@@ -29,6 +34,7 @@ import json
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import sysconfig
@@ -39,8 +45,14 @@ from pathlib import Path
 from typing import Any
 
 N_LO, N_HI = 1000, 3000
+# Heap layout moves per-op counts: holding 16-1,400 extra objects before the workload moved the
+# orjson round trip between 23,404 and 23,827 Ir/op (1.8%), the minimal L1 hit by 0.5%, the L2
+# hit by 0.2%. Any code change shifts the layout the same way, so a single run can fail an
+# untouched path or hide a real regression. Each path is measured at these layout shifts (extra
+# objects held) and the median is its figure.
+LAYOUTS = (0, 48, 80, 336, 880)
 FAIL_PCT = 1.0  # regression at or above this fails the gate
-WARN_PCT = 0.2  # A/A floor is ~0.13%; above this, report but pass
+WARN_PCT = 0.2  # above the A/A floor (<=0.03%, Arrow 0.2%): report but pass
 BASELINES = Path(__file__).with_name("ir_baselines.json")
 PATHS = (
     "l1_hit",
@@ -48,6 +60,9 @@ PATHS = (
     "l2_hit",
     "miss",
     "secure_l1_hit",
+    "l2_hit_async_metrics",
+    "miss_async_metrics",
+    "secure_l1_hit_async_metrics",
     "serializer_default",
     "serializer_auto",
     "serializer_orjson",
@@ -58,10 +73,16 @@ PATHS = (
 # ── measured process ────────────────────────────────────────────────────────────────────────
 
 
-def _build_workloads() -> dict[str, Callable[[], object]]:
-    """Every path as a zero-arg callable. Imports happen here, so importing this module stays cheap."""
+def _build_workload(path: str) -> Callable[[], object]:
+    """One path as a zero-arg callable. Only that path is built, so no other path's threads run.
+
+    Imports happen here, so importing this module stays cheap.
+    """
+    import functools
+
     import pandas as pd
 
+    import cachekit.decorators.orchestrator as orchestrator
     from cachekit import cache
     from cachekit.serializers import EncryptionWrapper, get_serializer
 
@@ -99,14 +120,37 @@ def _build_workloads() -> dict[str, Callable[[], object]]:
     def body(uid: int, kind: str) -> dict:
         return value
 
-    decorated = {
-        "l1_hit": cache(backend=None, ttl=300)(body),
-        "minimal_l1_hit": cache.minimal(backend=None, ttl=300)(body),
-        "l2_hit": cache(backend=DictBackend(), l1_enabled=False, ttl=300)(body),
-        "miss": cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body),
-        "secure_l1_hit": cache.secure(master_key=master_key, backend=DictBackend(), ttl=300)(body),
+    def async_metrics(decorate: Callable[[], Callable[..., dict]]) -> Callable[..., dict]:
+        """Decorate with the metrics collector already in its batching (async) mode.
+
+        A collector starts synchronous and, checking every 5 s, switches to a queue plus worker
+        thread above 100 ops/s, which is a long-lived service's steady state. The pinned clocks
+        never let 5 s pass, so the sync-mode paths cannot reach it; these variants start there.
+        """
+        real = orchestrator.AsyncMetricsCollector
+        orchestrator.AsyncMetricsCollector = functools.partial(real, sync_mode=False, auto_detect_mode=False)  # type: ignore[misc]
+        try:
+            return decorate()
+        finally:
+            orchestrator.AsyncMetricsCollector = real  # type: ignore[misc]
+
+    l2 = lambda: cache(backend=DictBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
+    miss = lambda: cache(backend=MissBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
+    secure = lambda: cache.secure(master_key=master_key, backend=DictBackend(), ttl=300)(body)  # noqa: E731
+    # Every path that records a metric has a sync- and an async-mode variant; the L1-only hits record none.
+    decorated: dict[str, Callable[[], Callable[..., dict]]] = {
+        "l1_hit": lambda: cache(backend=None, ttl=300)(body),
+        "minimal_l1_hit": lambda: cache.minimal(backend=None, ttl=300)(body),
+        "l2_hit": l2,
+        "miss": miss,
+        "secure_l1_hit": secure,
+        "l2_hit_async_metrics": lambda: async_metrics(l2),
+        "miss_async_metrics": lambda: async_metrics(miss),
+        "secure_l1_hit_async_metrics": lambda: async_metrics(secure),
     }
-    workloads: dict[str, Callable[[], object]] = {name: (lambda fn=fn: fn(42, "user-profile")) for name, fn in decorated.items()}
+    if path in decorated:
+        fn = decorated[path]()
+        return lambda: fn(42, "user-profile")
 
     def roundtrip(serializer: Any, obj: object, **key: str) -> Callable[[], object]:
         def op() -> object:
@@ -115,12 +159,12 @@ def _build_workloads() -> dict[str, Callable[[], object]]:
 
         return op
 
-    for name in ("default", "auto", "orjson"):
-        workloads[f"serializer_{name}"] = roundtrip(get_serializer(name), value)
-    workloads["serializer_arrow"] = roundtrip(get_serializer("arrow"), frame)
-    encrypted = EncryptionWrapper(master_key=bytes.fromhex(master_key), previous_master_keys=[])
-    workloads["serializer_encrypted"] = roundtrip(encrypted, value, cache_key="ns:bench:func:m.f:args:" + "0" * 64 + ":0")
-    return workloads
+    if path == "serializer_arrow":
+        return roundtrip(get_serializer("arrow"), frame)
+    if path == "serializer_encrypted":
+        encrypted = EncryptionWrapper(master_key=bytes.fromhex(master_key), previous_master_keys=[])
+        return roundtrip(encrypted, value, cache_key="ns:bench:func:m.f:args:" + "0" * 64 + ":0")
+    return roundtrip(get_serializer(path.removeprefix("serializer_")), value)
 
 
 def _pin_main_thread_clocks() -> None:
@@ -155,7 +199,18 @@ def _pin_main_thread_clocks() -> None:
 
 def _run_workload(path: str, n: int) -> None:
     _pin_main_thread_clocks()
-    op = _build_workloads()[path]
+    _shift = [object() for _ in range(int(os.environ.get("IR_BUDGET_LAYOUT", "0")))]  # noqa: F841 (held: see LAYOUTS)
+    op = _build_workload(path)
+    import gc
+
+    # Background threads' allocations count toward the main thread's GC trigger, so when a
+    # collection lands in the loop varies run to run: 0.3% per op on the orjson round trip.
+    # Cyclic-GC cost is therefore outside the budget; allocation and refcount cost stay in it.
+    gc.disable()
+    # A background thread waiting on the GIL makes the main thread drop it every switch interval
+    # of REAL time, so a slower (more loaded) run pays for more handoffs. With a long interval
+    # the GIL changes hands only where the code releases it itself, which is the same every run.
+    sys.setswitchinterval(100.0)
     for _ in range(50):  # identical warmup at both N: first-call costs (L1 fill, lazy imports) cancel
         op()
     for _ in range(n):
@@ -191,6 +246,7 @@ def _run(prefix: list[str], path: str, n: int, env: dict[str, str]) -> None:
 
 
 def _measure_one(path: str, n: int, workdir: Path, env: dict[str, str]) -> int:
+    workdir.mkdir(exist_ok=True)
     out = workdir / f"{path}.{n}.cg"
     valgrind = shutil.which("valgrind") or "valgrind"
     _run([valgrind, "--tool=callgrind", "--separate-threads=yes", f"--callgrind-out-file={out}"], path, n, env)
@@ -204,8 +260,8 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
     put hundreds of thousands of Ir/op of noise into a fresh venv. So every path first runs once
     natively, serially, to fill the bytecode cache, and the measured runs never write bytecode.
 
-    The process environment is fixed, not inherited: its size moves the stack and heap layout,
-    which moved a small path by up to 0.4% per op. It also keeps CACHEKIT_* settings out.
+    The process environment is fixed, not inherited, so no shell setting (CACHEKIT_* included)
+    reaches the measured process and its size cannot move the layout.
     """
     env = {
         "PATH": "/usr/bin:/bin",
@@ -218,9 +274,14 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
     for path in paths:
         _run([], path, 1, env)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
     with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
-        futures = {(p, n): pool.submit(_measure_one, p, n, Path(tmp), env) for p in paths for n in (N_LO, N_HI)}
-        return {p: per_op(futures[(p, N_LO)].result(), futures[(p, N_HI)].result()) for p in paths}
+        futures = {
+            (p, n, shift): pool.submit(_measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)})
+            for p, n, shift in runs
+        }
+        ir = {key: future.result() for key, future in futures.items()}
+    return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
 
 
 def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str], bool]:
@@ -229,7 +290,7 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
     for path, ir in measured.items():
         budget = budgets.get(path)
         if budget is None:
-            lines.append(f"FAIL  {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
+            lines.append(f"FAIL  {path:28} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
             ok = False
             continue
         pct = (ir - budget) / budget * 100
@@ -241,7 +302,7 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
             verdict = "LOWER"  # a real improvement: ratchet the budget down with --update
         else:
             verdict = "ok"
-        lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  budget {budget:>9,}  {pct:+.2f}%")
+        lines.append(f"{verdict:5} {path:28} {ir:>9,} Ir/op  budget {budget:>9,}  {pct:+.2f}%")
     return lines, ok
 
 
@@ -259,7 +320,7 @@ def _main() -> int:
     parser.add_argument("--path", action="append", choices=PATHS, help="measure only this path (repeatable)")
     parser.add_argument("--update", action="store_true", help="write lower measured figures back as budgets")
     parser.add_argument("--allow-increase", action="store_true", help="with --update, also raise budgets")
-    parser.add_argument("--jobs", type=int, default=min(len(PATHS) * 2, os.cpu_count() or 1))
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     args = parser.parse_args()
 
     if shutil.which("valgrind") is None:
