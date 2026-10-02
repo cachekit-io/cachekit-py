@@ -172,8 +172,10 @@ def get_data():
 > wrote is in neither. On a sync function with no parameters, `cache_clear()` deletes the
 > key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and
 > `await fn.ainvalidate_cache()` deletes both. So flush on
-> the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
-> matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
+> the backend: on Redis, run the `scan_iter` + `unlink` script under *Option 3: Data
+> corruption* in [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch)
+> once per namespace or function (no single `SCAN` pattern both carries the default
+> backend's `t:<tenant>:` key prefix and stops at the namespace boundary); the File backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
 > there retire only by TTL. During a rolling deploy, flush **after the last replica still
 > writing the old keys is gone** — anything written behind the flush is orphaned.
