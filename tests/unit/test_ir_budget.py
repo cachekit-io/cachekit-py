@@ -78,6 +78,11 @@ def test_ratchet_only_lowers_unless_increase_allowed() -> None:
     assert budgets == {"l1_hit": 100, "miss": 100}  # input untouched
 
 
+def test_default_parallelism_stays_small_on_a_big_machine() -> None:
+    """Each callgrind run holds about half a gigabyte, so the default must not grow with the core count."""
+    assert 1 <= ir_budget.JOBS <= 8
+
+
 def test_every_path_has_a_committed_budget() -> None:
     """A new path must land with its budget, or `make perf-ir` fails on every machine."""
     data = json.loads(ir_budget.BASELINES.read_text())

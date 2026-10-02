@@ -60,6 +60,10 @@ WARN_PCT = 0.2  # above the A/A floor: report but pass
 # moves by about the 1% threshold between unrelated changes, so it is gated at what this harness
 # resolves for it.
 TOLERANCE_PCT = {"serializer_orjson": (2.0, 1.0)}  # path: (fail, warn)
+# Callgrind runs at a time by default. Each holds about half a gigabyte, so the default stays small
+# enough to share the machine with other work rather than growing with its core count; --jobs
+# overrides it.
+JOBS = min(8, os.cpu_count() or 1)
 BASELINES = Path(__file__).with_name("ir_baselines.json")
 PATHS = (
     "l1_hit",
@@ -365,7 +369,7 @@ def _main() -> int:
     parser.add_argument("--path", action="append", choices=PATHS, help="measure only this path (repeatable)")
     parser.add_argument("--update", action="store_true", help="write lower measured figures back as budgets")
     parser.add_argument("--allow-increase", action="store_true", help="with --update, also raise budgets")
-    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("--jobs", type=int, default=JOBS, help=f"callgrind runs at a time (default {JOBS}; each holds ~0.5 GB)")
     args = parser.parse_args()
 
     if shutil.which("valgrind") is None:
