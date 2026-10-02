@@ -70,7 +70,7 @@ Configure Redis backend through environment variables:
 ```bash
 # Redis Connection
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
-CACHEKIT_CONNECTION_POOL_SIZE=10
+CACHEKIT_CONNECTION_POOL_SIZE=50  # default 50; a full pool waits CACHEKIT_SOCKET_TIMEOUT for a connection
 CACHEKIT_SOCKET_TIMEOUT=1.0
 CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
@@ -126,6 +126,7 @@ CACHEKIT_API_URL=https://api.cachekit.io
 CACHEKIT_TIMEOUT=5.0
 
 # Optional: HTTP connection pool size (default: 10, must be > 0)
+# The same variable sizes the Redis pool, whose default is 50
 CACHEKIT_CONNECTION_POOL_SIZE=10
 
 # Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
@@ -140,7 +141,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool. The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
 **Security notes:**
@@ -422,7 +423,7 @@ For production with Redis:
 
 ```bash
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
-export CACHEKIT_CONNECTION_POOL_SIZE=20
+export CACHEKIT_CONNECTION_POOL_SIZE=50
 export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
@@ -608,9 +609,11 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to `CACHEKIT_SOCKET_TIMEOUT` for one, then fails as a cache miss.
+
 ```bash
 # Tune connection pool size based on concurrency
-export CACHEKIT_CONNECTION_POOL_SIZE=20  # Default is 10
+export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 10
 
 # Higher for:
 # - Many concurrent requests

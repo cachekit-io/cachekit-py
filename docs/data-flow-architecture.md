@@ -666,7 +666,7 @@ class RedisBackend:
 `RedisBackendConfig` defaults (full table: [Redis backend](backends/redis.md)):
 
 ```yaml
-connection_pool_size: 10     # CACHEKIT_CONNECTION_POOL_SIZE
+connection_pool_size: 50     # CACHEKIT_CONNECTION_POOL_SIZE; a full pool waits socket_timeout
 socket_timeout: 5.0          # seconds, CACHEKIT_SOCKET_TIMEOUT
 socket_connect_timeout: 5.0  # seconds, CACHEKIT_SOCKET_CONNECT_TIMEOUT
 socket_keepalive: true       # SO_KEEPALIVE on TCP connections, not unix://

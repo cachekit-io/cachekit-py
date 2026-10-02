@@ -319,18 +319,15 @@ ping redis-server.example.com
 
 ### Connection pool exhausted
 
-**Message**: `Too many connections` (redis-py)
+**Message**: `No connection available.` (redis-py)
 
-**Exception**: none — `redis.exceptions.MaxConnectionsError` (a `ConnectionError` subclass; the asyncio client raises plain `ConnectionError`), logged as above
+**Exception**: none — `redis.exceptions.ConnectionError`, logged as above. The pool waits up to `CACHEKIT_SOCKET_TIMEOUT` for a connection to be released before raising it. An asyncio client from `get_async_client()` does not wait: it raises `ConnectionError: Too many connections` at once
 
-**Cause**: Too many concurrent requests exceeding connection pool size
+**Cause**: More concurrent Redis operations than the pool size, each holding its connection longer than the timeout
 
 **Solution**:
 ```bash
-# Increase connection pool size (default 10)
-export CACHEKIT_CONNECTION_POOL_SIZE=50
-
-# For high-concurrency applications
+# Increase connection pool size (Redis default 50)
 export CACHEKIT_CONNECTION_POOL_SIZE=100
 ```
 

@@ -79,13 +79,19 @@ def create_connection_pool(
     redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
     max_connections: Optional[int] = None,
-) -> redis.ConnectionPool:
+) -> redis.BlockingConnectionPool:
     """Create a sync connection pool bound to an explicit URL.
 
     Single source of truth for pool kwargs: every sync pool in cachekit is
     built here so binary-safety (decode_responses=False), finite socket
     timeouts (fail fast on an unreachable Redis instead of blocking on the
     OS TCP timeout) and the configured TCP keepalive apply uniformly.
+
+    The pool blocks: when every connection is checked out, an operation waits
+    up to socket_timeout for one to be released, then fails with a redis
+    ConnectionError. Executor threads share this pool, so a burst wider than
+    it is ordinary load; a non-blocking pool would turn it into errors and
+    cache misses.
 
     Args:
         redis_url: Redis connection URL the pool is bound to. Its query
@@ -96,15 +102,16 @@ def create_connection_pool(
         max_connections: Override for config.connection_pool_size
 
     Returns:
-        redis.ConnectionPool bound to redis_url (no connection is made here;
-        the pool connects lazily on first use)
+        redis.BlockingConnectionPool bound to redis_url (no connection is made
+        here; the pool connects lazily on first use)
     """
     redis_url = hide_secret(redis_url)  # may carry a password: unwrapped only inline (CWE-532)
     cfg = config or RedisBackendConfig.from_env()
-    return redis.ConnectionPool.from_url(
+    return redis.BlockingConnectionPool.from_url(
         reveal_secret(redis_url),
         decode_responses=False,  # cached payloads are raw bytes (LZ4/Arrow/AES) — never UTF-8 decode
         max_connections=_resolve_max_connections(max_connections, cfg),
+        timeout=cfg.socket_timeout,  # wait for a free connection, bounded like any other socket wait
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
         **_tcp_only_kwargs(redis_url, cfg),
