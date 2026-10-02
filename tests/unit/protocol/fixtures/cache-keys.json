@@ -1,9 +1,9 @@
 {
-  "version": "1.0.0",
-  "generator": "cachekit-py v0.12.0",
+  "version": "1.1.0",
+  "generator": "cachekit-py v0.20.0",
   "ci_verification": "Vendored (sha256-pinned) and byte-verified against CacheKeyGenerator in cachekit-py default CI: tests/unit/protocol/test_cache_key_vectors.py",
-  "note": "Keys include __main__ module because vectors were generated at top level. Cross-SDK implementations should substitute their own module path \u2014 only the args hash portion must match.",
-  "key_format": "ns:{namespace}:func:{module}.{qualname}:args:{blake2b_256_hex}:{ic_flag}{serializer_code}",
+  "note": "Python-SDK-only conformance vectors. The 7-segment auto-mode key embeds a language-specific func: segment (__main__ here because the vectors were generated at top level), so no other SDK can reproduce these keys or share the cache entries they name; cross-SDK validation uses test-vectors/interop-mode.json (Interop Mode). The 7-segment shape is SDK-internal convention: the CachekitIO server accepts any key passing its security-only checks (length, charset, namespace prefix shape), including TS/Rust {ns}:{hash} and interop-mode keys.",
+  "key_format": "ns:{namespace}:func:{module}.{qualname}:args:{blake2b_256_hex}:{ic_flag}{serializer_code} (Python SDK convention — server validates security-only, see spec/cache-key-format.md#server-side-requirements)",
   "hash_algorithm": "blake2b-256 of msgpack([normalized_args, sorted_kwargs])",
   "vectors": [
     {
@@ -148,6 +148,97 @@
       "integrity_checking": true,
       "serializer_type": "std",
       "expected_key": "ns:test:func:__main__.get_user:args:14a3433f54d70b4cc452c3a140f8c3a0979acb3dc2baf7238dc4e6675265f3a8:1s"
+    },
+    {
+      "name": "serializer_default",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "default",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1s"
+    },
+    {
+      "name": "serializer_auto",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "auto",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1a"
+    },
+    {
+      "name": "serializer_pythonic_alias",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "pythonic",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1a"
+    },
+    {
+      "name": "serializer_orjson",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "orjson",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1o"
+    },
+    {
+      "name": "serializer_arrow",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "arrow",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1w"
+    },
+    {
+      "name": "serializer_local",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "local",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1l"
+    },
+    {
+      "name": "serializer_custom_identity",
+      "namespace": "test",
+      "function_module": "__main__",
+      "function_qualname": "get_user",
+      "args": [
+        42
+      ],
+      "kwargs": {},
+      "integrity_checking": true,
+      "serializer_type": "<custom>:ArrowSerializer",
+      "expected_key": "ns:test:func:__main__.get_user:args:3870b2ea5735ae639ded9450ef117768db676f037bec636503796c5b81095153:1x2263"
     }
   ]
 }

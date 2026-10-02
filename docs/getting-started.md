@@ -234,7 +234,7 @@ export REDIS_URL="redis://localhost:6379"
 
 # Optional: explicit Redis configuration
 export CACHEKIT_REDIS_URL="redis://localhost:6379"
-export CACHEKIT_CONNECTION_POOL_SIZE=20
+export CACHEKIT_CONNECTION_POOL_SIZE=50
 
 # CachekitIO Cloud (closed beta). CACHEKIT_API_KEY is also a backend selector: set it
 # INSTEAD of CACHEKIT_REDIS_URL, never both (two selectors leave caches that rely on env
@@ -409,7 +409,7 @@ Create a `.env` file in your project root:
 ```bash
 # Redis Configuration
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
-CACHEKIT_CONNECTION_POOL_SIZE=20
+CACHEKIT_CONNECTION_POOL_SIZE=50
 CACHEKIT_SOCKET_TIMEOUT=1.0
 CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 

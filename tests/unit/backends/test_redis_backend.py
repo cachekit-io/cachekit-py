@@ -76,7 +76,7 @@ class TestRedisPoolDecodeResponses:
         rc = self._reset(monkeypatch)
         from cachekit.config.singleton import reset_settings
 
-        with patch("redis.ConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
+        with patch("redis.BlockingConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
             try:
                 rc.get_cached_redis_client()
             finally:
@@ -101,7 +101,7 @@ class TestRedisPoolDecodeResponses:
         rc = self._reset(monkeypatch)
         from cachekit.config.singleton import reset_settings
 
-        with patch("redis.ConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
+        with patch("redis.BlockingConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
             try:
                 rc.get_cached_redis_client()
             finally:
@@ -165,6 +165,80 @@ class TestRedisPoolSocketKeepalive:
         pool = self._pool(build, "unix:///tmp/cachekit-no-such.sock?db=0", keepalive)
         assert "socket_keepalive" not in pool.connection_kwargs
         pool.make_connection()  # raised TypeError when the kwarg leaked through
+
+
+@pytest.mark.unit
+class TestRedisPoolSizing:
+    """Every Redis pool path is sized by RedisBackendConfig.connection_pool_size (default 50).
+
+    The default executor runs min(32, cpu_count + 4) L2 operations at once, so a smaller
+    pool raised on ordinary async load. The live wait/timeout behaviour is covered against
+    a real Redis in tests/integration/test_redis_backend.py.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        for var in (
+            "CACHEKIT_CONNECTION_POOL_SIZE",
+            "CACHEKIT_API_KEY",
+            "CACHEKIT_MEMCACHED_SERVERS",
+            "CACHEKIT_FILE_CACHE_DIR",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_default_pool_size_is_50(self):
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        assert RedisBackendConfig().connection_pool_size == 50
+
+    def test_explicit_backend_default_pool(self):
+        assert RedisBackend(redis_url="redis://localhost:6379")._client_provider._pool.max_connections == 50
+
+    @pytest.mark.parametrize(("env_size", "expected"), [(None, 50), ("3", 3)])
+    def test_env_resolved_backend_pool_follows_config(self, monkeypatch, env_size, expected):
+        from cachekit.backends.provider import DefaultBackendProvider
+
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://localhost:6379")
+        if env_size is not None:
+            monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", env_size)
+        with patch.object(redis.Redis, "ping"):
+            backend = DefaultBackendProvider().get_backend()
+        assert backend._client.connection_pool.max_connections == expected
+
+    def test_provider_pool_size_argument_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", "3")
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379", pool_size=7)
+        assert provider._pool.max_connections == 7
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [("redis://localhost:6379", 1.5), ("redis://localhost:6379?socket_timeout=0.1", 0.1)],
+    )
+    def test_sync_pool_waits_up_to_the_effective_socket_timeout(self, url, expected):
+        """A URL query option overrides the config's socket_timeout, and so bounds the pool wait too."""
+        from cachekit.backends.redis.client import create_connection_pool
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        pool = create_connection_pool(url, RedisBackendConfig(socket_timeout=1.5))
+        assert isinstance(pool, redis.BlockingConnectionPool)
+        assert pool.timeout == pool.connection_kwargs["socket_timeout"] == expected
+
+    @pytest.mark.parametrize(("method", "args", "command"), [("get_ttl", ("k",), "ttl"), ("refresh_ttl", ("k", 60), "expire")])
+    async def test_ttl_commands_run_off_the_event_loop(self, method, args, command):
+        """A full pool makes a sync command wait up to socket_timeout; on the loop thread it would stall every coroutine."""
+        threads = []
+        client = Mock()
+        getattr(client, command).side_effect = lambda *a: threads.append(threading.get_ident()) or 1
+        await getattr(PerRequestRedisBackend(client, "tenant"), method)(*args)
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_cachekitio_keeps_its_own_default(self, monkeypatch):
+        """CACHEKIT_CONNECTION_POOL_SIZE also sizes the CachekitIO HTTP pool, whose default stays 10."""
+        from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
+
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_123")  # pragma: allowlist secret
+        assert CachekitIOBackendConfig.from_env().connection_pool_size == 10
 
 
 @pytest.mark.unit

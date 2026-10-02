@@ -28,6 +28,7 @@ from redis.exceptions import LockNotOwnedError
 
 from cachekit.backends.base import BaseBackend
 from cachekit.backends.errors import BackendError, UnsupportedTenantError
+from cachekit.backends.redis.config import RedisBackendConfig
 from cachekit.backends.redis.error_handler import classify_redis_error
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 
@@ -422,7 +423,7 @@ class PerRequestRedisBackend:
         """
         scoped_key = self._scoped_key(key)
         try:
-            ttl = self._client.ttl(scoped_key)
+            ttl = await asyncio.to_thread(self._client.ttl, scoped_key)  # sync client: keep the round trip off the loop
             if not isinstance(ttl, int):
                 raise BackendError(
                     message=f"Redis TTL returned unexpected type: {type(ttl).__name__}",
@@ -454,7 +455,7 @@ class PerRequestRedisBackend:
         """
         scoped_key = self._scoped_key(key)
         try:
-            result = self._client.expire(scoped_key, ttl)
+            result = await asyncio.to_thread(self._client.expire, scoped_key, ttl)
             # Redis EXPIRE returns 1 if TTL was set, 0 if key doesn't exist
             return bool(result)
         except Exception as exc:
@@ -739,14 +740,21 @@ class RedisBackendProvider:
     the last value, and operations follow it.
     """
 
-    def __init__(self, redis_url: str, pool_size: int = 50):
+    def __init__(
+        self,
+        redis_url: str,
+        pool_size: Optional[int] = None,
+        config: Optional[RedisBackendConfig] = None,
+    ) -> None:
         """Initialize provider with singleton connection pool.
 
         Fix #1: Creates pool ONCE (expensive operation).
 
         Args:
             redis_url: Redis connection URL
-            pool_size: Connection pool size (default: 50)
+            pool_size: Connection pool size; overrides config.connection_pool_size
+            config: Pool and socket settings; defaults to RedisBackendConfig.from_env().
+                Its redis_url field is ignored: the redis_url argument wins.
 
         Raises:
             BackendError: If Redis connection fails
@@ -757,7 +765,7 @@ class RedisBackendProvider:
             # unreachable Redis instead of blocking on the OS TCP timeout.
             from cachekit.backends.redis.client import create_connection_pool
 
-            self._pool = create_connection_pool(redis_url, max_connections=pool_size)
+            self._pool = create_connection_pool(redis_url, config, max_connections=pool_size)
 
             # Create singleton Redis client from pool
             self._client = redis.Redis(connection_pool=self._pool)

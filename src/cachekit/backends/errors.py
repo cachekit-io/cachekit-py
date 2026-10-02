@@ -1,8 +1,8 @@
 """Backend error types and classification.
 
 This module defines error hierarchies for backend operations, enabling
-circuit breaker and retry logic to make correct decisions without
-Redis-specific exception handling.
+the circuit breaker to make correct decisions without
+Redis-specific exception handling. cachekit does not retry a failed request.
 """
 
 from __future__ import annotations
@@ -14,21 +14,22 @@ from ..hash_utils import redact_cache_key
 
 
 class BackendErrorType(str, Enum):
-    """Error classification for circuit breaker and retry decisions.
+    """Error classification for circuit breaker decisions.
 
     Inherits from str for JSON serialization and string comparisons.
-    Each error type dictates a different retry/recovery strategy:
+    By default the circuit breaker counts every type as a failure; list types in
+    ``CircuitBreakerConfig.excluded_error_types`` to stop them counting.
 
-    - TRANSIENT: Temporary failure, retry with exponential backoff + jitter
-    - PERMANENT: Unfixable error, fail fast without retry
-    - TIMEOUT: Operation exceeded time limit, configurable retry strategy
+    - TRANSIENT: Temporary failure (connection lost, rate limit, server error)
+    - PERMANENT: Unfixable error (bad input, client error)
+    - TIMEOUT: Operation exceeded time limit
     - AUTHENTICATION: Credential/auth issue, alert operations team
-    - UNKNOWN: Unclassified error, assume transient and log for investigation
+    - UNKNOWN: Unclassified error, log for investigation
 
     Example:
         >>> error = BackendError("Connection lost", error_type=BackendErrorType.TRANSIENT)
         >>> if error.is_transient:
-        ...     # Retry with exponential backoff
+        ...     # Temporary: the next request may succeed
         ...     pass
     """
 
@@ -42,7 +43,7 @@ class BackendErrorType(str, Enum):
 class BackendError(Exception):
     """Base exception for all backend operations.
 
-    The error_type field enables circuit breaker and retry logic to make
+    The error_type field enables the circuit breaker to make
     correct decisions without inspecting exception types. This approach
     works with any backend (Redis, HTTP, DynamoDB, etc.).
 
@@ -85,7 +86,7 @@ class BackendError(Exception):
 
         Args:
             message: Human-readable error message
-            error_type: Error classification for retry/recovery logic
+            error_type: Error classification for circuit breaker decisions
             original_exception: The original exception that caused this error
             operation: The operation that failed (get, set, delete, exists)
             key: The cache key involved in the operation
@@ -115,36 +116,36 @@ class BackendError(Exception):
 
     @property
     def is_transient(self) -> bool:
-        """Should trigger exponential backoff retry.
+        """Temporary failure; the next request may succeed.
 
         Example:
             >>> error = BackendError("Temp failure", error_type=BackendErrorType.TRANSIENT)
             >>> if error.is_transient:
-            ...     # Retry with backoff
+            ...     # Temporary: the next request may succeed
             ...     pass
         """
         return self.error_type == BackendErrorType.TRANSIENT
 
     @property
     def is_permanent(self) -> bool:
-        """Should fail fast, no retry.
+        """Unfixable error; repeating the request fails the same way.
 
         Example:
             >>> error = BackendError("Invalid key", error_type=BackendErrorType.PERMANENT)
             >>> if error.is_permanent:
-            ...     # Don't retry, log and alert
+            ...     # Log and alert
             ...     pass
         """
         return self.error_type == BackendErrorType.PERMANENT
 
     @property
     def is_timeout(self) -> bool:
-        """Configurable retry strategy.
+        """Operation exceeded its time limit.
 
         Example:
             >>> error = BackendError("Operation timeout", error_type=BackendErrorType.TIMEOUT)
             >>> if error.is_timeout:
-            ...     # Retry with increased timeout
+            ...     # Check backend latency and timeout settings
             ...     pass
         """
         return self.error_type == BackendErrorType.TIMEOUT
@@ -156,7 +157,7 @@ class BackendError(Exception):
         Example:
             >>> error = BackendError("Invalid creds", error_type=BackendErrorType.AUTHENTICATION)
             >>> if error.is_authentication:
-            ...     # Alert ops, don't retry
+            ...     # Alert ops
             ...     pass
         """
         return self.error_type == BackendErrorType.AUTHENTICATION

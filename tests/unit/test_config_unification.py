@@ -45,6 +45,6 @@ class TestConfigSeparation:
         redis_config = RedisBackendConfig()
 
         assert redis_config.redis_url == "redis://localhost:6379"
-        assert redis_config.connection_pool_size == 10
+        assert redis_config.connection_pool_size == 50
         assert redis_config.socket_keepalive is True
         assert redis_config.disable_hiredis is False

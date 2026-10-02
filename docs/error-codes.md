@@ -300,7 +300,7 @@ None of these raise to a sync `@cache`-decorated caller, or to an async one whos
 - `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
 - `Backend error getting key ...: BackendError(...)` (ERROR)
 
-The redis-py exceptions below reach your code only when you use a Redis client directly.
+The redis-py exceptions below reach your code only when you use a Redis client directly. A direct call on a cachekit backend, such as `RedisBackend.get()`, raises the wrapping `BackendError`.
 
 ### Redis unreachable
 
@@ -393,18 +393,15 @@ ping redis-server.example.com
 
 ### Connection pool exhausted
 
-**Message**: `Too many connections` (redis-py)
+**Message**: `No connection available.` (redis-py)
 
-**Exception**: none — `redis.exceptions.MaxConnectionsError` (a `ConnectionError` subclass; the asyncio client raises plain `ConnectionError`), logged as above
+**Exception**: none — `redis.exceptions.ConnectionError`, logged as above. The pool waits up to the socket timeout for a connection to be released before raising it: `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins. An asyncio client from `get_async_client()` does not wait: it raises `ConnectionError: Too many connections` at once
 
-**Cause**: Too many concurrent requests exceeding connection pool size
+**Cause**: More concurrent Redis operations than the pool size, each holding its connection longer than the timeout
 
 **Solution**:
 ```bash
-# Increase connection pool size (default 10)
-export CACHEKIT_CONNECTION_POOL_SIZE=50
-
-# For high-concurrency applications
+# Increase connection pool size (Redis default 50)
 export CACHEKIT_CONNECTION_POOL_SIZE=100
 ```
 
