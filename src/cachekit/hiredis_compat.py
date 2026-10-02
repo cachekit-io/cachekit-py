@@ -29,8 +29,13 @@ _FALSE = frozenset({"0", "off", "f", "false", "n", "no"})
 
 
 def _disable_hiredis_setting() -> bool | None:
-    """CACHEKIT_DISABLE_HIREDIS as a bool, or None when unset (or unparseable, which is logged)."""
+    """CACHEKIT_DISABLE_HIREDIS as a bool, or None when unset (or unparseable, which is logged).
+
+    The name matches case-insensitively, as RedisBackendConfig (case_sensitive=False) reads it.
+    """
     raw = os.environ.get(_SETTING)
+    if raw is None:
+        raw = next((v for k, v in os.environ.items() if k.upper() == _SETTING), None)
     if raw is None:
         return None
     value = raw.strip().lower()
@@ -38,7 +43,8 @@ def _disable_hiredis_setting() -> bool | None:
         return True
     if value in _FALSE:
         return False
-    logger.warning("Ignoring %s=%r: expected true or false", _SETTING, raw)
+    # Never log the value: a mis-wired variable can hold a secret, such as a Redis URL with a password.
+    logger.warning("Ignoring %s: expected true or false", _SETTING)
     return None
 
 

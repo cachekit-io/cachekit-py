@@ -224,6 +224,26 @@ def test_disable_hiredis_setting_parsing(monkeypatch, raw, expected):
     assert _disable_hiredis_setting() is expected
 
 
+def test_disable_hiredis_setting_name_is_case_insensitive(monkeypatch):
+    """Matches RedisBackendConfig, which reads the variable case-insensitively."""
+    from cachekit.hiredis_compat import _disable_hiredis_setting
+
+    monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
+    monkeypatch.setenv("cachekit_disable_hiredis", "true")
+    assert _disable_hiredis_setting() is True
+
+
+def test_unparseable_disable_hiredis_setting_is_not_logged(monkeypatch, caplog):
+    """A mis-wired value can be a secret (a Redis URL with a password); the warning must not echo it."""
+    from cachekit.hiredis_compat import _disable_hiredis_setting
+
+    monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", "redis://:supersecret@cache.example:6379")
+    with caplog.at_level("WARNING", logger="cachekit.hiredis_compat"):
+        assert _disable_hiredis_setting() is None
+    assert "CACHEKIT_DISABLE_HIREDIS" in caplog.text
+    assert "supersecret" not in caplog.text
+
+
 def test_session_init_hammer_no_partial_publish_observed():
     """Many threads racing first-touch session init never observe a partial identity.
 
