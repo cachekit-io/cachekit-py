@@ -103,7 +103,7 @@ A serializer that converts Pydantic models to dicts before packing them, with an
 - [OrjsonSerializer](orjson.md) — JSON-optimized built-in serializer
 - [ArrowSerializer](arrow.md) — DataFrame-optimized built-in serializer
 - [Caching Pydantic Models](pydantic.md) — Patterns for Pydantic model caching
-- [API Reference](../api-reference.md) — SerializationMetadata fields and options
+- [API Reference](../api-reference.md#serializers) — Serializer parameters and options
 
 ---
 
