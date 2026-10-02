@@ -103,6 +103,10 @@ _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
 # Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
 _TTL_REFRESH_MAX_CONCURRENT = 32
+# How long a refresh on a stopped event loop keeps its slot. A request it sent before the loop
+# stopped is still served, so the slot is not reused until such a request has had time to
+# settle: six times CachekitIO's default request timeout, and the same bound as the L2 SWR lease.
+_TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS = 30.0
 
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
@@ -842,7 +846,7 @@ def create_cache_wrapper(
     # would each send a billable PATCH until one lands. At most _TTL_REFRESH_MAX_CONCURRENT
     # run at once, so a burst over many keys can't pile up tasks against a slow backend;
     # a hit at capacity skips its refresh (a later hit retries). Also holds the task refs.
-    _ttl_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+    _ttl_refresh_tasks: dict[str, tuple[asyncio.Task[None], float]] = {}  # flight key -> (task, admitted at)
     _ttl_refresh_lock = threading.Lock()  # the map is shared by every thread running an event loop
     _ttl_refresh_pid = os.getpid()  # owner process: a forked child starts with an empty map
 
@@ -858,22 +862,25 @@ def create_cache_wrapper(
 
         The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
         refreshes each tenant's entry. The cap and the per-key check span every thread's event
-        loop: before counting, a task is pruned only once it is done or its loop is not running.
-        A loop left stopped (run_until_complete, never closed) cannot advance its task, so that
-        task gives up its key and slot and is cancelled: should the loop run again, the task
-        stops at its next await instead of running beside the slot's new holder. A request it
-        sent before its loop stopped is not recalled.
+        loop: before counting, a task is pruned once it is done, or once its loop is not running
+        and it was admitted at least _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS ago. A loop left
+        stopped (run_until_complete, never closed) cannot advance its task, but a request the
+        task already sent is still served, so the slot waits out the hold before reuse, and
+        the cap bounds requests that may still be in flight, not just running tasks. A pruned
+        task is cancelled: should its loop run again, it stops at its next await instead of
+        running beside the slot's new holder.
         """
         nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
         if _ttl_refresh_pid != os.getpid():
             # Forked child: the parent's tasks never finish here, and its lock may be held.
             _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid = {}, threading.Lock(), os.getpid()
         flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
+        now = time.monotonic()
         with _ttl_refresh_lock:
-            for key, t in list(_ttl_refresh_tasks.items()):
+            for key, (t, admitted) in list(_ttl_refresh_tasks.items()):
                 if t.done():
                     del _ttl_refresh_tasks[key]
-                elif not t.get_loop().is_running():
+                elif not t.get_loop().is_running() and now - admitted >= _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS:
                     del _ttl_refresh_tasks[key]
                     # Its slot is free for reuse now, so the task must not run on if its loop resumes.
                     with contextlib.suppress(RuntimeError):  # a closed loop never runs it again
@@ -881,12 +888,12 @@ def create_cache_wrapper(
             if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
                 return
             task = asyncio.get_running_loop().create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
-            _ttl_refresh_tasks[flight_key] = task
+            _ttl_refresh_tasks[flight_key] = (task, now)
         tasks, lock = _ttl_refresh_tasks, _ttl_refresh_lock
 
         def _done(t: asyncio.Task[None]) -> None:
             with lock:
-                if tasks.get(flight_key) is t:
+                if tasks.get(flight_key, (None, 0.0))[0] is t:
                     del tasks[flight_key]
             _ttl_refresh_done_callback(t, cache_key)
 

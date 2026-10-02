@@ -372,11 +372,13 @@ class TestFileRefreshEndToEnd:
         self, file_backend: FileBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A refresh left pending on a loop that stopped without closing (sync code calling
-        run_until_complete) holds neither its key nor a pool slot: a later hit on another loop
-        refreshes another key, then the same key (LAB-7074)."""
+        run_until_complete) keeps its key and pool slot for the hold, as a request it sent may
+        still be in flight; after the hold a hit on another loop refreshes another key, then the
+        same key (LAB-7074)."""
         from cachekit import cache
 
         monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 1)
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
         get_ttl_calls: list[str] = []
 
         async def parked_get_ttl(key: str) -> int | None:
@@ -400,7 +402,11 @@ class TestFileRefreshEndToEnd:
         stopped = asyncio.new_event_loop()
         try:
             stopped.run_until_complete(hit(0))  # key 0's refresh parks on a loop that is then left stopped
-            asyncio.run(hit(1))  # the parked refresh holds no slot
+            asyncio.run(hit(1))  # within the hold the parked refresh keeps its slot
+            asyncio.run(hit(0))  # and its key
+            assert len(get_ttl_calls) == 1
+            monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+            asyncio.run(hit(1))  # past the hold it holds no slot
             asyncio.run(hit(0))  # nor its key
             assert len(get_ttl_calls) == 3
         finally:
@@ -420,6 +426,7 @@ class TestFileRefreshEndToEnd:
         from cachekit import cache
 
         monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_MAX_CONCURRENT", 2)
+        monkeypatch.setattr("cachekit.decorators.wrapper._TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS", 0.0)
 
         async def parked_get_ttl(key: str) -> int | None:
             await asyncio.sleep(3600)  # never answers: the refresh stays pending
