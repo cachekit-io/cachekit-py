@@ -633,6 +633,10 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
 
+# The L1 states a forked child inherited, kept referenced so their pages stay shared with the parent
+# (see _empty_caches_after_fork). Never read.
+_inherited_states: list[_L1State] = []
+
 
 def _forked_without_hooks() -> bool:
     """Whether this process was forked without at-fork hooks (uWSGI unless --py-call-osafterfork)."""
@@ -653,10 +657,16 @@ def _empty_caches_after_fork() -> None:
     section and returns there finishes on the state it bound. The child is single-threaded here, so
     this takes no lock, starts no thread and logs nothing. Starting the cleanup thread stays with
     _take_over_if_forked, outside the hook.
+
+    The parent's states are kept, not freed: freeing them would write to every entry's memory, so
+    each child would copy most of the parent's L1 pages as it forked, a cost close to the size of a
+    warm L1 per child, paid again by every subprocess started with a preexec_fn. Kept, the pages stay
+    shared with the parent.
     """
     global _hooked_pid
     for manager in list(_managers):
         for cache in list(manager._caches.values()):
+            _inherited_states.append(cache._state)
             cache._state = _L1State()
     _hooked_pid = os.getpid()  # last: a hook cut short leaves the child hookless, so the take-over still resets
 

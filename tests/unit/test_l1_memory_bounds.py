@@ -531,6 +531,7 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         monkeypatch.setattr(l1_cache, "_managers", weakref.WeakSet([manager]))  # leave the global manager alone
         monkeypatch.setattr(l1_cache, "_hooked_pid", None)  # restored after the in-process hook call
+        monkeypatch.setattr(l1_cache, "_inherited_states", [])
         caches = [manager.get_cache("free-ns"), manager.get_cache("held-ns")]
         for cache in caches:
             cache.put("pre-fork", b"v")
@@ -553,6 +554,8 @@ class TestCleanupThreadAfterFork:
 
         assert [cache._state is state for cache, state in zip(caches, old, strict=True)] == [False, False]
         assert [list(state.cache) for state in old] == [["pre-fork"], ["pre-fork"]]  # a holder finishes on its own
+        # Kept referenced, never freed: freeing would write to, and so copy, the parent's L1 pages.
+        assert l1_cache._inherited_states == old
         assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
         assert l1_cache._hooked_pid == os.getpid()
 
