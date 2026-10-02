@@ -15,6 +15,7 @@ import asyncio
 import logging
 import threading
 from typing import Optional
+from urllib.parse import urlparse
 
 import redis
 import redis.asyncio as redis_async
@@ -62,6 +63,18 @@ def _resolve_max_connections(override: Optional[int], cfg: RedisBackendConfig) -
     return override
 
 
+def _tcp_only_kwargs(redis_url: str, cfg: RedisBackendConfig) -> dict[str, bool]:
+    """Pool kwargs that only TCP connections accept.
+
+    redis-py's from_url builds a UnixDomainSocketConnection for exactly the unix
+    scheme, and that class raises TypeError on socket_keepalive, with either
+    value, every time the pool makes a connection.
+    """
+    if urlparse(redis_url).scheme == "unix":
+        return {}
+    return {"socket_keepalive": cfg.socket_keepalive}
+
+
 def create_connection_pool(
     redis_url: str | SecretStr,
     config: Optional[RedisBackendConfig] = None,
@@ -70,12 +83,14 @@ def create_connection_pool(
     """Create a sync connection pool bound to an explicit URL.
 
     Single source of truth for pool kwargs: every sync pool in cachekit is
-    built here so binary-safety (decode_responses=False) and finite socket
+    built here so binary-safety (decode_responses=False), finite socket
     timeouts (fail fast on an unreachable Redis instead of blocking on the
-    OS TCP timeout) apply uniformly.
+    OS TCP timeout) and the configured TCP keepalive apply uniformly.
 
     Args:
-        redis_url: Redis connection URL the pool is bound to
+        redis_url: Redis connection URL the pool is bound to. Its query
+            options (e.g. ?socket_timeout=1) override the config-derived
+            kwargs below: redis-py's from_url lets querystring arguments win.
         config: Pool tuning knobs; defaults to env-derived config. Its
             redis_url field is ignored — the explicit URL argument wins.
         max_connections: Override for config.connection_pool_size
@@ -92,6 +107,7 @@ def create_connection_pool(
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
+        **_tcp_only_kwargs(redis_url, cfg),
     )
 
 
@@ -112,6 +128,7 @@ def create_async_connection_pool(
         max_connections=_resolve_max_connections(max_connections, cfg),
         socket_timeout=cfg.socket_timeout,
         socket_connect_timeout=cfg.socket_connect_timeout,
+        **_tcp_only_kwargs(redis_url, cfg),
     )
 
 

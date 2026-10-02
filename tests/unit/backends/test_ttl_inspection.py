@@ -174,8 +174,9 @@ def mc_backend(monkeypatch):
 
     from cachekit.backends.memcached.backend import MemcachedBackend
     from cachekit.backends.memcached.config import MemcachedBackendConfig
+    from tests.utils.memcached_helpers import mock_hash_client
 
-    fake = MagicMock()
+    fake = mock_hash_client()
     monkeypatch.setattr("pymemcache.client.hash.HashClient", MagicMock(return_value=fake))
     backend = MemcachedBackend(MemcachedBackendConfig(key_prefix="app:"))
     return backend, fake

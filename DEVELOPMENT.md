@@ -420,23 +420,6 @@ make release-check    # Version check + full validation + build
 make build            # Creates dist/cachekit-*.whl
 ```
 
-### Profile-Guided Optimization (5-8% faster)
-
-```bash
-make build-pgo        # Requires workload profiling
-```
-
-<details>
-<summary><strong>⚡ PGO Steps</strong></summary>
-
-1. Build with instrumentation (`release-pgo-generate` profile)
-2. Run representative workload (benchmarks)
-3. Rebuild with profile data (`release-pgo-use` profile)
-
-See `Makefile` for full details.
-
-</details>
-
 ---
 
 ## Performance Targets

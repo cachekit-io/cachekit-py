@@ -663,12 +663,13 @@ class RedisBackend:
 
 ### Connection Pool Config
 
+`RedisBackendConfig` defaults (full table: [Redis backend](backends/redis.md)):
+
 ```yaml
-max_connections: 50
-min_idle_connections: 2
-connection_timeout: 5.0s
-socket_timeout: 5.0s
-socket_keepalive: True  # TCP keepalive
+connection_pool_size: 10     # CACHEKIT_CONNECTION_POOL_SIZE
+socket_timeout: 5.0          # seconds, CACHEKIT_SOCKET_TIMEOUT
+socket_connect_timeout: 5.0  # seconds, CACHEKIT_SOCKET_CONNECT_TIMEOUT
+socket_keepalive: true       # SO_KEEPALIVE on TCP connections, not unix://
 ```
 
 ### Graceful Backend Error Handling
