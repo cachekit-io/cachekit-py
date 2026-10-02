@@ -1,0 +1,64 @@
+{
+  "version": "1.1.0",
+  "generator": "cachekit-py FileBackend format v1",
+  "format": "File name = BLAKE2b-128(UTF-8 key) lowercase hex; header = CK | version | reserved | flags u16 BE | expiry u64 BE | payload. reader_action is evaluated at reader_now_unix_seconds (default 0): miss_preserve for nonzero reserved/flags, miss_expired when now reaches a nonzero expiry, else return_payload. reserved defaults to 0.",
+  "vectors": [
+    {
+      "name": "permanent_ascii",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010000000000000000000000",
+      "payload_hex": "68656c6c6f",
+      "file_hex": "434b01000000000000000000000068656c6c6f",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reader_action": "return_payload"
+    },
+    {
+      "name": "future_expiry",
+      "key_utf8": "unicode-ключ-🔑",
+      "filename": "f13b0df717f97cf1d2fe3da650525c79",
+      "header_hex": "434b0100000000000000f4865700",
+      "payload_hex": "68656c6c6f",
+      "file_hex": "434b0100000000000000f486570068656c6c6f",
+      "expiry_unix_seconds": 4102444800,
+      "flags": 0,
+      "reader_action": "return_payload"
+    },
+    {
+      "name": "unknown_flag_preserved",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010000010000000000000000",
+      "payload_hex": "667574757265",
+      "file_hex": "434b010000010000000000000000667574757265",
+      "expiry_unix_seconds": 0,
+      "flags": 1,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "reserved_nonzero_preserved",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b010200000000000000000000",
+      "payload_hex": "7265736572766564",
+      "file_hex": "434b0102000000000000000000007265736572766564",
+      "expiry_unix_seconds": 0,
+      "flags": 0,
+      "reserved": 2,
+      "reader_action": "miss_preserve"
+    },
+    {
+      "name": "expired_entry",
+      "key_utf8": "test-key",
+      "filename": "0e2a03b49262c15a063c04d5a29c0158",
+      "header_hex": "434b01000000000000003b9aca00",
+      "payload_hex": "65787069726564",
+      "file_hex": "434b01000000000000003b9aca0065787069726564",
+      "expiry_unix_seconds": 1000000000,
+      "flags": 0,
+      "reader_now_unix_seconds": 1000000000,
+      "reader_action": "miss_expired"
+    }
+  ]
+}

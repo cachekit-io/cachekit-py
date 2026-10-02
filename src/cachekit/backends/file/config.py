@@ -28,7 +28,7 @@ class FileBackendConfig(BaseBackendConfig):
         max_size_mb: Maximum cache size in MB (1 - 1,000,000).
         max_value_mb: Maximum single value size in MB (1 - 50% of max_size_mb).
         max_entry_count: Maximum number of cache entries (100 - 1,000,000).
-        lock_timeout_seconds: Lock acquisition timeout in seconds (0.5 - 30.0).
+        lock_timeout_seconds: Accepted but has no effect: file locks are non-blocking (0.5 - 30.0).
         permissions: File permissions as octal (default 0o600 - owner-only).
         dir_permissions: Directory permissions as octal (default 0o700 - owner-only).
 
@@ -87,7 +87,7 @@ class FileBackendConfig(BaseBackendConfig):
         default=5.0,
         ge=0.5,
         le=30.0,
-        description="Lock acquisition timeout in seconds",
+        description="Has no effect: file locks are non-blocking and fail at once when held",
     )
     permissions: int = Field(
         default=0o600,
