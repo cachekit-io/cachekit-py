@@ -19,7 +19,7 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   cache is warmed first, and the heap layout is sampled (``ir_workload.run_workload``, ``measure``
   and ``LAYOUTS``).
 
-Two full runs agree within 0.05% per op (0.01% on 3.12), against a 1% fail threshold.
+Two full runs agree within 0.08% per op (0.01% on 3.12), against a 1% fail threshold.
 
 The measured process is ``ir_workload.py``. Its text is compiled into every measured run, so
 editing it moves the heap layout the budgets were recorded at; this gate is kept out of that
