@@ -608,3 +608,28 @@ class TestL1OnlySWRRetryBackoff:
         assert await fn() == "held"
         await _wait_for_calls(lambda: calls, 3)
         assert calls == 3
+
+    async def test_async_upstream_cancelled_error_backs_off(self, monkeypatch):
+        """An upstream that raises CancelledError counts as a failed attempt, not a skip."""
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise asyncio.CancelledError
+            return "held"
+
+        assert await fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 2)
+        await asyncio.sleep(0.05)
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i
+            assert await fn() == "held"
+        await asyncio.sleep(0.1)
+        assert calls == 2, f"refresh retried during back-off (calls={calls})"

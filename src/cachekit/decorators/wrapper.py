@@ -1350,10 +1350,10 @@ def create_cache_wrapper(
         try:
             try:
                 result = await func(*call_args, **call_kwargs)
-            except asyncio.CancelledError:
-                _object_cache.cancel_refresh(cache_key, version)  # nothing failed: no back-off
-                raise
             except BaseException:
+                # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
+                # apart from cancelling this task. Backing off after a real cancellation only delays
+                # the next refresh by one interval; the held value is still served.
                 _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
                 raise  # logged by _l1_swr_task_done
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
