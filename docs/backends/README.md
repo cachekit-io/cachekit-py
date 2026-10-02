@@ -54,7 +54,9 @@ class BaseBackend(Protocol):
             key: Cache key to delete
 
         Returns:
-            True if key was deleted, False if key didn't exist
+            True if key was deleted, False if key didn't exist. CachekitIO returns
+            True on every successful delete, whether or not the key existed: the
+            server does not report existence on DELETE.
 
         Raises:
             BackendError: If backend operation fails

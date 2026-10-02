@@ -63,13 +63,23 @@ ByteStorage LZ4 compression of serialized envelopes (MessagePack, orjson) runs a
 
 ## xxHash3-64 Integrity
 
-Every value stored includes an xxHash3-64 checksum (8 bytes, big-endian). On retrieval:
+With integrity checking on (the default), every value stored in a ByteStorage envelope includes an
+xxHash3-64 checksum (8 bytes, big-endian), computed over the original uncompressed payload bytes only.
+On retrieval:
 
-1. Checksum of retrieved bytes is computed
+1. The payload is decompressed and its checksum is computed
 2. Stored checksum is compared
 3. Mismatch → `SerializationError` at the serializer layer (corrupted data, never returned to caller); a normal `@cache`-decorated read catches it, evicts the entry, and recomputes rather than propagating it to your code
 
-This protects against Redis memory corruption, storage bugs, and bit rot. A corrupt frame header
+Not every value travels in an envelope. With integrity checking off, `StandardSerializer` and
+`AutoSerializer` write no ByteStorage envelope, so MessagePack, columnar and NumPy values carry no
+checksum. Two `AutoSerializer` routes skip ByteStorage even with integrity on: NumPy arrays and Arrow
+DataFrames carry their own 8-byte xxHash3-64 prefix over the bytes they store, with no ByteStorage LZ4 step.
+
+This protects the payload against Redis memory corruption, storage bugs, and bit rot. It does not
+cover the envelope's `format` field, so a rotted `format` passes it. `AutoSerializer` accepts only a
+`format` it writes, and only when a header claim that is present agrees; see *Deserialization failed* in
+[error-codes.md](../error-codes.md#deserialization-failed) for what still gets through. A corrupt frame header
 (truncated, bad version/length, unparseable JSON) takes the same path: `SerializationError`, evict, recompute.
 
 > **Non-cryptographic — corruption detection only.** xxHash3-64 is not a cryptographic

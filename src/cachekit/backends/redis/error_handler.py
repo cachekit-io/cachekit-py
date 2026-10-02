@@ -1,7 +1,7 @@
 """Redis exception classification for backend abstraction.
 
-This module maps redis-py exceptions to BackendErrorType for circuit breaker
-and retry logic. Handles version differences in redis-py library.
+This module maps redis-py exceptions to BackendErrorType for the circuit breaker.
+Handles version differences in redis-py library.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def classify_redis_error(
     """Classify redis-py exception into BackendError with error_type.
 
     Maps redis library exceptions to BackendErrorType categories for
-    circuit breaker and retry logic. Preserves original exception for
+    the circuit breaker. Preserves original exception for
     debugging.
 
     Args:
@@ -34,7 +34,7 @@ def classify_redis_error(
         BackendError with appropriate error_type classification
 
     Examples:
-        Connection errors are classified as TRANSIENT (retry with backoff):
+        Connection errors are classified as TRANSIENT:
 
         >>> from redis.exceptions import ConnectionError as RedisConnectionError
         >>> exc = RedisConnectionError("Connection refused")
@@ -62,7 +62,7 @@ def classify_redis_error(
         >>> error.is_transient
         False
 
-        Data/protocol errors are permanent (don't retry):
+        Data/protocol errors are permanent:
 
         >>> from redis.exceptions import ResponseError
         >>> exc = ResponseError("WRONGTYPE Operation against a key")
@@ -78,10 +78,10 @@ def classify_redis_error(
         'unknown'
 
     Classification rules:
-        - ConnectionError, BusyLoadingError: TRANSIENT (retry with backoff)
-        - TimeoutError: TIMEOUT (configurable retry)
+        - ConnectionError, BusyLoadingError: TRANSIENT (connection lost or server loading)
+        - TimeoutError: TIMEOUT (operation exceeded time limit)
         - AuthenticationError, NoPermissionError: AUTHENTICATION (alert ops)
-        - ResponseError, DataError, InvalidResponse, LockError: PERMANENT (don't retry)
+        - ResponseError, DataError, InvalidResponse, LockError: PERMANENT (data or protocol error)
         - ReadOnlyError, ClusterDownError, TryAgainError: TRANSIENT (temporary cluster state)
         - All others: UNKNOWN (log and investigate)
     """
@@ -138,7 +138,7 @@ def classify_redis_error(
             key=key,
         )
 
-    # TRANSIENT: Temporary failures, retry with exponential backoff
+    # TRANSIENT: Temporary failures
     if isinstance(exc, (RedisConnectionError, BusyLoadingError, ReadOnlyError)):
         return BackendError(
             f"Transient Redis error: {type(exc).__name__}",
