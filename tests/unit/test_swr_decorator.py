@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import logging
 import os
 import sys
 import threading
@@ -699,6 +700,204 @@ class TestSWRSchedulingHardening:
         assert compute() == 1  # slot NOT leaked: retry schedules successfully
         assert _wait_for(lambda: calls["n"] == 2)
         assert _wait_for(lambda: len(backend.set_calls) == 2)
+
+
+_WRAPPER_LOGGER = "cachekit.decorators.wrapper"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture, text: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and text in r.getMessage()]
+
+
+def _assert_key_free(message: str, exc_type: str = "RuntimeError") -> None:
+    """The WARNING names the redacted key and the exception type, never the raw key or exception text."""
+    assert "<redacted:" in message and f": {exc_type}" in message
+    assert "tenant-secret-ns" not in message and "secret-detail" not in message
+
+
+def _failing_thread_shim() -> Any:
+    """A stand-in for the wrapper's threading module whose Thread.start() raises."""
+    import types
+
+    class _FailingThread:
+        def __init__(self, *a: Any, **k: Any) -> None: ...
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    shim = types.SimpleNamespace(**{name: getattr(threading, name) for name in dir(threading) if not name.startswith("_")})
+    shim.Thread = _FailingThread
+    return shim
+
+
+class TestRevalidationFailureWarnings:
+    """A revalidation that fails or never runs reaches a default-level log, throttled per function.
+
+    The caller was served the stale value and must never see the failure, so without a WARNING
+    an operator cannot tell that the entry will only be recomputed in the foreground at evict_at.
+    """
+
+    async def test_async_failure_warns_with_redacted_key_and_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        async def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("secret-detail")
+            return 1
+
+        assert await compute() == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert await compute() == 1  # caller unaffected
+            assert await _await_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+        (warning,) = _warnings(caplog, "SWR revalidation failed")
+        _assert_key_free(warning)
+        assert "in function <redacted:" in warning and "(1 since the last warning)" in warning
+        assert "compute" not in warning  # the function by its digest only
+
+    def test_sync_failure_warns_with_redacted_key_and_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("secret-detail")
+            return 1
+
+        assert compute() == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute() == 1
+            assert _wait_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+        (warning,) = _warnings(caplog, "SWR revalidation failed")
+        _assert_key_free(warning)
+
+    def test_uncopyable_args_warn_that_refresh_ahead_cannot_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns", key=lambda lock: "k")
+        def compute(lock: Any) -> int:
+            return 1
+
+        lock = threading.Lock()  # deepcopy(threading.Lock()) raises TypeError
+        assert compute(lock) == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute(lock) == 1  # stale served; the skip is logged before this returns
+        (warning,) = _warnings(caplog, "SWR revalidation skipped")
+        assert "arguments not deep-copyable, so refresh-ahead cannot run for this call" in warning
+        _assert_key_free(warning, exc_type="TypeError")
+
+    def test_unschedulable_revalidation_warns(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        backend = FakeSWRBackend()
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, namespace="tenant-secret-ns")
+        def compute() -> int:
+            return 1
+
+        assert compute() == 1
+        backend.stale = True
+        monkeypatch.setattr(wrapper_mod, "threading", _failing_thread_shim())
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert compute() == 1
+        (warning,) = _warnings(caplog, "SWR revalidation could not be scheduled")
+        _assert_key_free(warning)
+
+    async def test_failures_in_one_window_warn_once_and_the_next_warning_carries_the_count(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("upstream down")
+            return 1
+
+        assert await compute() == 1
+        backend.stale = True
+        n = 5
+        with caplog.at_level(logging.DEBUG, logger=_WRAPPER_LOGGER):
+            for attempt in range(1, n + 1):
+                assert await compute() == 1
+                # The recompute raises without awaiting, so its log line and slot release land
+                # in the same task step as the count: the next stale hit revalidates again.
+                assert await _await_for(lambda attempt=attempt: calls["n"] == attempt + 1)
+            monkeypatch.setattr(wrapper_mod, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            assert await compute() == 1
+            assert await _await_for(lambda: calls["n"] == n + 2)
+        warnings = _warnings(caplog, "SWR revalidation failed")
+        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "SWR revalidation failed" in r.getMessage()]
+        assert len(warnings) == 2  # one per window, not one per failure
+        assert "(1 since the last warning)" in warnings[0]
+        assert len(debugs) == n - 1  # the rest of the first window, still at DEBUG
+        assert f"({n} since the last warning)" in warnings[1]  # none lost from the count
+
+    async def test_each_kind_has_its_own_window(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A frequent failure must not hide a rarer, permanent skip on the same function."""
+        backend = FakeSWRBackend()
+        calls = {"n": 0}
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False, key=lambda arg: "k")
+        async def compute(arg: Any) -> int:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("upstream down")
+            return 1
+
+        assert await compute(1) == 1
+        backend.stale = True
+        with caplog.at_level(logging.WARNING, logger=_WRAPPER_LOGGER):
+            assert await compute(1) == 1  # revalidation fails: the failure window opens
+            # Logged and its slot released in one task step, so the next hit can revalidate.
+            assert await _await_for(lambda: _warnings(caplog, "SWR revalidation failed"))
+            assert await compute(threading.Lock()) == 1  # same key, uncopyable argument: skipped
+        assert len(_warnings(caplog, "SWR revalidation skipped")) == 1
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_starts_with_its_own_throttle(self) -> None:
+        """A child does not inherit a held throttle lock, nor the parent's window and count."""
+        import multiprocessing
+
+        from cachekit.decorators.wrapper import _WarnThrottle
+
+        throttle = _WarnThrottle()
+        assert throttle.claim() == 1  # the parent's window opens
+        assert throttle.claim() == 0  # counted into the parent's next WARNING
+
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+
+        def child(q: Any) -> None:
+            result: list[int] = []
+            claimer = threading.Thread(target=lambda: result.append(throttle.claim()), daemon=True)
+            claimer.start()
+            claimer.join(5)
+            q.put(result[0] if result else None)
+
+        with throttle._lock:  # a parent thread is mid-claim at fork
+            process = ctx.Process(target=child, args=(queue,), daemon=True)
+            process.start()
+        try:
+            claimed = queue.get(timeout=30)
+        finally:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        assert claimed is not None, "a forked child must not block on a throttle lock it inherited held"
+        assert claimed == 1, "a forked child must open its own window with its own count"
 
 
 class TestPanelFollowUps:
