@@ -101,6 +101,9 @@ _DELETE_BATCH = 10_000
 # constant above so the two features can be tuned independently (LAB-381 panel).
 _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
+# Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
+_TTL_REFRESH_MAX_CONCURRENT = 32
+
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     """Callback for background TTL refresh tasks to handle errors.
@@ -836,7 +839,9 @@ def create_cache_wrapper(
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
     # One background TTL refresh per key at a time: concurrent hits in the refresh window
-    # would each send a billable PATCH until one lands. Also holds the task references.
+    # would each send a billable PATCH until one lands. At most _TTL_REFRESH_MAX_CONCURRENT
+    # run at once, so a burst over many keys can't pile up tasks against a slow backend;
+    # a hit at capacity skips its refresh (a later hit retries). Also holds the task refs.
     _ttl_refresh_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def _refresh_ttl_if_due(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
@@ -847,19 +852,25 @@ def create_cache_wrapper(
         await backend.refresh_ttl(cache_key, refresh_to)
 
     def _schedule_ttl_refresh(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
-        """Run _refresh_ttl_if_due as a background task unless one for this key is running on this loop.
+        """Run _refresh_ttl_if_due as a background task, unless one for this key is running or the pool is full.
 
-        The loop check lets a task orphaned by fork or by a closed loop be replaced.
+        The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
+        refreshes each tenant's entry. Tasks that are done or belong to another loop (orphaned
+        by fork or a closed loop) are pruned first, so they never hold a slot.
         """
-        running = _ttl_refresh_tasks.get(cache_key)
-        if running is not None and not running.done() and running.get_loop() is asyncio.get_running_loop():
+        loop = asyncio.get_running_loop()
+        for key, t in list(_ttl_refresh_tasks.items()):
+            if t.done() or t.get_loop() is not loop:
+                _ttl_refresh_tasks.pop(key, None)
+        flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
+        if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
             return
-        task = asyncio.create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
-        _ttl_refresh_tasks[cache_key] = task
+        task = loop.create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
+        _ttl_refresh_tasks[flight_key] = task
 
         def _done(t: asyncio.Task[None]) -> None:
-            if _ttl_refresh_tasks.get(cache_key) is t:
-                del _ttl_refresh_tasks[cache_key]
+            if _ttl_refresh_tasks.get(flight_key) is t:
+                del _ttl_refresh_tasks[flight_key]
             _ttl_refresh_done_callback(t, cache_key)
 
         task.add_done_callback(_done)
