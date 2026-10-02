@@ -162,7 +162,10 @@ def _in_hookless_child() -> bool:
     """Return whether this process is the child of a fork made from C, which ran no at-fork hook.
 
     Such a fork, as uWSGI's is without ``--py-call-osafterfork``, also skips CPython's own after-fork repair, so a
-    thread started in that child can hang or crash the interpreter. No collector starts one there.
+    thread started in that child can hang or crash the interpreter. No collector starts one there, provided this
+    module was imported before the fork. Imported only after it, as under uWSGI ``--lazy-apps``, the child looks
+    like a fresh process and this returns False, so a collector there may start a worker; that case is open, and
+    ``--py-call-osafterfork`` avoids it.
     """
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_fork_pid
@@ -244,7 +247,9 @@ class AsyncMetricsCollector:
                 collector records synchronously after ``shutdown()``. So does one inherited by a forked child,
                 until a mode check starts a worker of the child's own, which never happens with auto-detect off.
                 In the child of a fork made from C, every collector, inherited or built there, records
-                synchronously for good.
+                synchronously for good, provided this module was imported before the fork. Imported only after
+                it (uWSGI ``--lazy-apps``), the child looks like a fresh process; ``--py-call-osafterfork`` avoids
+                that case.
             auto_detect_mode: Automatically switch between sync/async based on frequency
         """
         self.batch_size = batch_size
@@ -274,7 +279,8 @@ class AsyncMetricsCollector:
         # Keyed by pid, like _metrics_locks: a child forked while a thread was mid-switch must not wait
         # on the copy of the lock that thread still holds, because the thread does not exist in the child.
         self._mode_locks: dict[int, threading.Lock] = {}
-        # Set by shutdown(), and in the child of a fork made from C: no mode switch may start a worker again.
+        # Set by shutdown(), and in the child of a fork made from C if this module was imported before the fork: no
+        # mode switch may start a worker again.
         self._batching_disabled = False
 
         # Memory pool for reducing allocations
@@ -719,7 +725,8 @@ class AsyncMetricsCollector:
         no at-fork hook, and the dead worker's ``Thread.is_alive()`` still returns True. It also skips CPython's
         own after-fork repair, so a thread started in that child can hang or crash the interpreter. A child the
         at-fork hook did not reach therefore never starts a worker, and records synchronously for good; ``__init__``
-        does the same for a collector built there.
+        does the same for a collector built there, as long as this module was imported before the fork (see
+        ``_in_hookless_child``).
         """
         pid = os.getpid()
         if self._owner_pid == pid:
