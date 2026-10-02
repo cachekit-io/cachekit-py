@@ -20,7 +20,6 @@ from typing import Any
 from uuid import UUID
 
 import msgpack
-import numpy as np
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -28,6 +27,11 @@ from hypothesis import strategies as st
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.serializers.auto_serializer import AutoSerializer, _auto_default
 from cachekit.serializers.base import SerializationError
+
+try:
+    import numpy as np
+except ImportError:  # a dev-group dependency; the free-threaded CI job installs only the test group
+    np = None
 
 
 def _legacy_wrap_tuples(obj: Any) -> Any:
@@ -123,7 +127,6 @@ CORPUS: dict[str, Any] = {
     "int-enum": [Color.RED, Color.BIG, {"c": Color.RED}],
     "int-flag": Perm.R | Perm.W,
     "str-enum": [Mood.HAPPY, {"m": Mood.HAPPY}],
-    "np-float64": [np.float64(1.5), np.float64(-0.0)],
     "bytes-like": [b"\x00\xff", bytearray(b"ab"), memoryview(b"mv")],
     "subclasses-with-dict": [
         MyDict(a=(1,)),
@@ -138,10 +141,12 @@ CORPUS: dict[str, Any] = {
     "subclass-keys": {MyStr("k"): 1, Mood.HAPPY: 2, Color.RED: 3},
     "temporal-uuid": [datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc), date(2026, 1, 2), time(3, 4), UUID(int=7)],
     "sets-of-scalars": [{1, 2, 3}, frozenset({"a", "b"})],
-    "ndarray": {"arr": np.arange(6, dtype=np.int32).reshape(2, 3)},
     "scalars": [None, True, False, 0, -1, 2**63, -(2**63), 1.0, -0.0, float("inf"), "", "ü", b""],
     "deep-acyclic": [[[[[[[[(1,)]]]]]]]],
 }
+if np is not None:
+    CORPUS["np-float64"] = [np.float64(1.5), np.float64(-0.0)]
+    CORPUS["ndarray"] = {"arr": np.arange(6, dtype=np.int32).reshape(2, 3)}
 if sys.version_info >= (3, 11):
 
     class Level(enum.StrEnum):
@@ -162,7 +167,9 @@ _leaves = st.one_of(
     st.floats(allow_nan=False),
     st.text(max_size=8),
     st.binary(max_size=8),
-    st.sampled_from([Color.RED, Perm.W, Mood.HAPPY, np.float64(0.25), MyStr("s"), MyInt(3), MyFloat(1.0)]),
+    st.sampled_from(
+        [Color.RED, Perm.W, Mood.HAPPY, MyStr("s"), MyInt(3), MyFloat(1.0)] + ([np.float64(0.25)] if np is not None else [])
+    ),
     st.builds(bytearray, st.binary(max_size=4)),
     st.frozensets(st.integers(min_value=-(2**63), max_value=2**64 - 1), max_size=3),
 )
@@ -188,11 +195,17 @@ def test_fuzzed_values_pack_byte_identical(value: Any) -> None:
     assert _packb(value) == _legacy_packb(value)
 
 
-@pytest.mark.parametrize(
-    "value",
-    [object(), np.int64(1), Tagged(), 2**64, -(2**63) - 1],
-    ids=["object", "np-int64", "custom-class", "int-past-u64", "int-below-i64"],
-)
+_UNSUPPORTED: dict[str, Any] = {
+    "object": object(),
+    "custom-class": Tagged(),
+    "int-past-u64": 2**64,
+    "int-below-i64": -(2**63) - 1,
+}
+if np is not None:
+    _UNSUPPORTED["np-int64"] = np.int64(1)
+
+
+@pytest.mark.parametrize("value", _UNSUPPORTED.values(), ids=list(_UNSUPPORTED))
 def test_unsupported_values_fail_as_before(value: Any) -> None:
     """Same exception type and message as the legacy path, so serialize_data's handling is unchanged."""
     with pytest.raises(TypeError) as legacy:
@@ -224,7 +237,7 @@ def test_cyclic_value_is_a_serialization_error() -> None:
 
 
 def test_round_trip_preserves_types() -> None:
-    value = {"t": (1, (2,)), "nt": Point(1, 2), "e": Color.RED, "od": _reordered(), "f": np.float64(0.5)}
+    value = {"t": (1, (2,)), "nt": Point(1, 2), "e": Color.RED, "od": _reordered(), "f": MyFloat(0.5)}
     s = AutoSerializer()
     data, meta = s.serialize(value)
     out = s.deserialize(data, meta)

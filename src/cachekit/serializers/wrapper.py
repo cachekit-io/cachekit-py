@@ -81,12 +81,17 @@ def _parse_header(header: bytes) -> tuple[SerializationMetadata, str]:
     return SerializationMetadata.from_dict(parsed.get("m", {})), name
 
 
+def _with_class(metadata: SerializationMetadata, cls: type[SerializationMetadata]) -> SerializationMetadata:
+    """A copy of every attribute as ``cls``, bypassing ``__setattr__`` (which _SharedMetadata refuses)."""
+    out = object.__new__(cls)
+    out.__dict__.update(vars(metadata))
+    return out
+
+
 @functools.lru_cache(maxsize=_MEMO_ENTRIES)  # never caches a raise: only validated parses are kept
 def _parse_header_memo(header: bytes) -> tuple[SerializationMetadata, str]:
     metadata, name = _parse_header(header)
-    shared = object.__new__(_SharedMetadata)
-    shared.__dict__.update(vars(metadata))
-    return shared, name
+    return _with_class(metadata, _SharedMetadata), name
 
 
 def _encode_prefix(serializer_name: str, metadata: dict[str, Any], version: str) -> bytes:
@@ -225,13 +230,16 @@ class SerializationWrapper:
     @staticmethod
     def unwrap_metadata(
         wrapped_data: Union[str, bytes, bytearray, memoryview],
+        *,
+        shared: bool = True,
     ) -> tuple[Union[bytes, memoryview], SerializationMetadata, str]:
         """:meth:`unwrap` with the header already parsed into :class:`SerializationMetadata`.
 
         The cache read path's entry point. A v3 frame header of at most 512 bytes is parsed once
-        per distinct header and the result reused, so the returned metadata may be shared with
-        other reads and raises AttributeError on assignment. Validation and errors are exactly
-        :meth:`unwrap` followed by ``SerializationMetadata.from_dict``.
+        per distinct header and the result reused, so with ``shared=True`` the returned metadata
+        may be shared with other reads and raises AttributeError on assignment. ``shared=False``
+        returns a plain copy the caller owns, for code that may write to it (a custom serializer).
+        Validation and errors are exactly :meth:`unwrap` followed by ``SerializationMetadata.from_dict``.
 
         Raises:
             ValueError: as :meth:`unwrap`; also KeyError/TypeError/AttributeError from a header
@@ -241,9 +249,11 @@ class SerializationWrapper:
             frame = _split_frame(wrapped_data)
             if frame is not None:
                 header_bytes, payload = frame
-                parse = _parse_header_memo if len(header_bytes) <= _MEMO_MAX_HEADER_BYTES else _parse_header
-                metadata, name = parse(header_bytes)
-                return payload, metadata, name
+                if len(header_bytes) > _MEMO_MAX_HEADER_BYTES:
+                    metadata, name = _parse_header(header_bytes)
+                    return payload, metadata, name
+                metadata, name = _parse_header_memo(header_bytes)
+                return payload, metadata if shared else _with_class(metadata, SerializationMetadata), name
         payload, metadata_dict, name = SerializationWrapper.unwrap(wrapped_data)
         return payload, SerializationMetadata.from_dict(metadata_dict), name
 

@@ -311,6 +311,26 @@ class TestHeaderMemo:
                 enc.deserialize_data(blob, cache_key="k")
         reset_settings()
 
+    def test_a_custom_serializer_gets_metadata_it_may_write_to(self):
+        """SerializerProtocol is public: a custom deserialize that writes to its metadata must neither
+        fail (evicting a good entry) nor change what the next read of that header sees."""
+        from cachekit.cache_handler import CacheSerializationHandler
+        from cachekit.serializers.standard_serializer import StandardSerializer
+
+        class Scribbler(StandardSerializer):
+            def deserialize(self, data, metadata=None):
+                assert metadata.encoding == "utf-8"
+                metadata.encoding = "scribbled"
+                return super().deserialize(data, metadata)
+
+        handler = CacheSerializationHandler(serializer_name=Scribbler(), encryption=False)
+        blob = handler.serialize_data({"k": "v"}, cache_key="k")
+        for _ in range(2):
+            assert handler.deserialize_data(blob, cache_key="k") == {"k": "v"}
+        frame_meta = SerializationWrapper.unwrap_metadata(blob)[1]
+        assert frame_meta.encoding == "utf-8"
+        assert SerializationWrapper.unwrap_metadata(blob, shared=False)[1] is not frame_meta
+
     @pytest.mark.parametrize(
         "meta",
         [
