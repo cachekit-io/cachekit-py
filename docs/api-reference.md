@@ -592,8 +592,6 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
-**Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
-
 #### Example
 ```python
 from cachekit.config import get_settings

@@ -25,7 +25,7 @@ class MemcachedBackendConfig(BaseBackendConfig):
         connect_timeout: Connection timeout in seconds.
         timeout: Operation timeout in seconds.
         max_pool_size: Maximum connections per server.
-        retry_attempts: Number of retries on transient failures.
+        retry_attempts: Failures pymemcache's HashClient allows a server before marking it dead.
         key_prefix: Optional prefix prepended to all cache keys.
 
     Examples:
@@ -82,7 +82,7 @@ class MemcachedBackendConfig(BaseBackendConfig):
         default=2,
         ge=0,
         le=10,
-        description="Retries on transient failures",
+        description="Failures pymemcache's HashClient allows a server before marking it dead",
     )
     key_prefix: str = Field(
         default="",
