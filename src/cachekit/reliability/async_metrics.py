@@ -655,9 +655,11 @@ class AsyncMetricsCollector:
     def _may_enqueue(self) -> bool:
         """Return whether a producer that read batched mode may queue its record, rather than record it now.
 
-        Only the batched record path calls this, so the sync path pays no ``getpid()``.
+        Only the batched record path calls this, so the sync path pays no ``getpid()``. The PID test is inlined
+        because this runs on every batched record.
         """
-        self._take_over_if_forked()
+        if self._owner_pid != os.getpid():
+            self._take_over_if_forked()
         # Re-read: a take-over, by this thread or a racing one, leaves sync mode set and no worker running. Only a
         # mode switch clears it again, and that starts this process's worker first.
         return not self._sync_mode
