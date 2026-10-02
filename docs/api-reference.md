@@ -618,7 +618,7 @@ The library includes intelligent error classification to distinguish between tra
 
 ### Error Categories
 
-The Redis backend wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
+The Redis backend wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `NoPermissionError`, `ReadOnlyError`, `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
 
 1. **`AUTHENTICATION`**:
    - `redis.exceptions.AuthenticationError`, `redis.exceptions.NoPermissionError` - Wrong credentials or missing ACL permission
