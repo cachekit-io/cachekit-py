@@ -614,23 +614,28 @@ The library includes intelligent error classification to distinguish between tra
 > [!NOTE]
 > For detailed error information, solutions, and troubleshooting, see:
 > - **[Troubleshooting Guide](troubleshooting.md)** - Common errors and solutions
-> - **[Error Codes Reference](error-codes.md)** - Complete error code catalog
+> - **[Error Reference](error-codes.md)** - Error types, causes and fixes
 
 ### Error Categories
 
-1. **Transient Errors** (trigger circuit breaker):
-   - `ConnectionError`, `TimeoutError` - Network issues
-   - `BusyLoadingError`, `TryAgainError` - Redis temporarily unavailable
-   - `ConnectionPoolError` - Pool exhausted
+The Redis backend wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`. Subclasses fall under their parent's category; the checks run in this order:
 
-2. **Permanent Errors** (don't trigger circuit breaker):
-   - `AuthenticationError` - Wrong credentials
-   - `DataError`, `InvalidResponse` - Protocol issues
-   - `LockError` - Lock acquisition failures
+1. **`AUTHENTICATION`**:
+   - `redis.exceptions.AuthenticationError`, `redis.exceptions.NoPermissionError` - Wrong credentials or missing ACL permission
 
-3. **Application Errors** (ignored by circuit breaker):
-   - User code exceptions
-   - Business logic errors
+2. **`TIMEOUT`**:
+   - `redis.exceptions.TimeoutError` - Operation exceeded its time limit
+
+3. **`TRANSIENT`**:
+   - `redis.exceptions.ConnectionError` - Network issues; includes `redis.exceptions.MaxConnectionsError` (connection pool exhausted)
+   - `redis.exceptions.BusyLoadingError`, `redis.exceptions.ReadOnlyError` - Redis temporarily unavailable or failing over
+   - `redis.exceptions.ClusterDownError`, `redis.exceptions.TryAgainError` - Cluster failover or resharding
+
+4. **`PERMANENT`**:
+   - `redis.exceptions.ResponseError`, `redis.exceptions.DataError`, `redis.exceptions.InvalidResponse` - Command or protocol errors
+   - `redis.exceptions.LockError` - Lock acquisition failures
+
+5. **`UNKNOWN`**: any other exception
 
 ### Connection Failures
 When Redis is unavailable:
@@ -867,7 +872,7 @@ def get_reference_data(): ...
 - [Backend Guide](backends/README.md) - Custom storage backend implementation
 - [Configuration Guide](configuration.md) - Environment variable setup and tuning
 - [Troubleshooting Guide](troubleshooting.md) - Debugging and error solutions
-- [Error Codes](error-codes.md) - Complete error code reference
+- [Error Reference](error-codes.md) - Error types, causes and fixes
 
 ### Architecture & Performance
 
