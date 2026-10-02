@@ -147,6 +147,23 @@ def test_host_owned_name_does_not_break_the_breaker(monkeypatch: pytest.MonkeyPa
     _open(_breaker(_namespace()))  # retires the dead namespace through _NoopMetric.remove
 
 
+def _namespace_samples(namespace: str) -> list[Any]:
+    families = (m for m in prometheus_client.REGISTRY.collect() if m.name == "circuit_breaker_state")
+    return [s for m in families for s in m.samples if s.labels.get("namespace") == namespace]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False], ids=["sync", "batched"])
+def test_collector_never_writes_the_gauge(sync_mode: bool):
+    """The breaker is the gauge's only writer: a collector value would count breakers that do not exist."""
+    namespace = _namespace()  # no breaker lives here, so nothing should export a series for it
+    collector = async_metrics.AsyncMetricsCollector(flush_interval=0.05, sync_mode=sync_mode, auto_detect_mode=False)
+    with pytest.warns(DeprecationWarning, match="record_circuit_breaker_state"):
+        collector.record_circuit_breaker_state(namespace, "OPEN", 7)
+    assert collector._sync_mode is sync_mode  # batched: a record would queue, and shutdown flushes it
+    collector.shutdown()
+    assert _namespace_samples(namespace) == []
+
+
 # Each order runs in a fresh interpreter: the gauge registers once per process.
 _COLLECTOR_FIRST = """
 collector = AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
