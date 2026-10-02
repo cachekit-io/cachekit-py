@@ -64,7 +64,6 @@ class PerRequestMockBackend:
 
         # Fix #7: URL-encode tenant ID to prevent ':' collision (matches production)
         self._tenant_id = url_encode(tenant_id, safe="")
-        self._original_tenant_id = tenant_id
 
     @property
     def key_prefix(self) -> str:
