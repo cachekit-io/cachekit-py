@@ -125,7 +125,7 @@ def _build_workload(path: str) -> Callable[[], object]:
         thread updates Prometheus. Pinned clocks never let 5 s pass, so this variant starts the
         collector batched. It then stops the worker, which drains the queue on real time and would
         otherwise change the main thread's count with host load. The budget covers the caller's
-        side, putting the record on the queue; the worker's flush runs on its own thread.
+        side, putting the record on the queue; the worker's Prometheus update is not budgeted.
         """
         made: list[Any] = []
 
@@ -146,7 +146,17 @@ def _build_workload(path: str) -> Callable[[], object]:
         fn(42, "user-profile")
         if collector._sync_mode or collector._queue.qsize() <= queued:
             raise RuntimeError("l2_hit_async_metrics: the call did not queue its metric, so batched mode is not measured")
-        return fn
+
+        def call(*args: Any) -> dict:
+            result = fn(*args)
+            # Do what the worker does with a record: take it off the queue and return its dict to
+            # the pool. Queue and pool then hold one item each, as a keeping-up worker leaves them,
+            # so every call takes the pool-hit branch a busy process takes and the heap stops
+            # growing (a growing queue tripled the layout spread). Under 1.6k Ir of the figure.
+            collector._metric_pool.append(collector._queue.queue.popleft())
+            return result
+
+        return call
 
     l2 = lambda: cache(backend=DictBackend(), l1_enabled=False, ttl=300)(body)  # noqa: E731
     # Every metrics path records through the same AsyncMetricsCollector.record_cache_operation, once
@@ -227,8 +237,8 @@ def _run_workload(path: str, n: int) -> None:
         op()
     for _ in range(n):
         op()
-    # Skip interpreter teardown: what it frees grows with n (l2_hit_async_metrics's queue holds
-    # every record) and would leak into the per-op difference.
+    # Skip interpreter teardown: it is not part of a call, and anything it frees that grew with n
+    # would leak into the per-op difference.
     os._exit(0)
 
 
