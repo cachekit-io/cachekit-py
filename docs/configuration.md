@@ -35,7 +35,7 @@ def fetch_data():
     return expensive_computation()
 ```
 
-**Configuration:** See [Redis Environment Variables](#redis-connection-for-cachekitconfig) below.
+**Configuration:** See [Redis Environment Variables](#redis-connection-for-redisbackendconfig) below.
 
 ### CachekitIO Backend
 
@@ -63,9 +63,9 @@ High-throughput in-memory caching with consistent hashing across multiple server
 
 ## Environment Variables
 
-### Redis Connection (for CachekitConfig)
+### Redis Connection (for RedisBackendConfig)
 
-Configure Redis backend through environment variables:
+Configure the Redis backend (`RedisBackendConfig`) through environment variables:
 
 ```bash
 # Redis Connection
@@ -390,11 +390,11 @@ export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 
 ### CachekitIO Config is Separate
 
-`@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `CachekitConfig`. Redis URL precedence does not apply.
+`@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `RedisBackendConfig`. Redis URL precedence does not apply.
 
 | Decorator | Config Class | Key Variable |
 |-----------|-------------|--------------|
-| `@cache`, `@cache.production()`, etc. | `CachekitConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
+| `@cache`, `@cache.production()`, etc. | `RedisBackendConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
 | `@cache.io()` | `CachekitIOBackendConfig` | `CACHEKIT_API_KEY` |
 
 Setting `REDIS_URL` has no effect on `@cache.io()`. `CACHEKIT_API_KEY` is different: it is also

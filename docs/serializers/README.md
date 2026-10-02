@@ -161,9 +161,17 @@ def get_data():
 > to the default (`"auto"` to `"default"`, or to `@cache.secure` on its default serializer).
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
-> single-key invalidation will not reach. The SDK has no
-> bulk delete — `cache_clear()` reaches only keys this release tracked, never a pre-upgrade
-> one — so flush on
+> single-key invalidation will not reach. The SDK has no bulk delete. On a function that
+> takes parameters, `cache_clear()` reaches a pre-upgrade `:{integrity_flag}s` twin only
+> where that exact key was tracked, in two cases. A twin whose delete failed during
+> `invalidate_cache(args)` is re-tracked in that process's memory, and that process's next
+> no-argument call retries it. A restart, or a call from another process, does not. And on
+> the tenant-scoped Redis backend, a v0.20.0 decorator on the default serializer for the
+> same function and namespace registers that key in the server-side key registry, which
+> every decorator of that function and namespace drains. A twin only a v0.19 release ever
+> wrote is in neither. On a sync function with no parameters, `cache_clear()` deletes the
+> key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and
+> `await fn.ainvalidate_cache()` deletes both. So flush on
 > the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
 > matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries

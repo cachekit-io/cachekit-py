@@ -1,6 +1,6 @@
 """Memcached exception classification for backend abstraction.
 
-Maps pymemcache exceptions to BackendErrorType for circuit breaker and retry logic.
+Maps pymemcache exceptions to BackendErrorType for the circuit breaker.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ def classify_memcached_error(
             key=key,
         )
 
-    # Transient — connection pool exhausted: load, not a fault, so it retries like one.
+    # Transient — connection pool exhausted: load, not a fault, but it counts toward the circuit breaker like one.
     if is_pool_exhausted(exc):
         return BackendError(
             message=f"Memcached connection pool exhausted during {operation}: raise max_pool_size",
@@ -97,7 +97,7 @@ def classify_memcached_error(
             key=key,
         )
 
-    # Permanent — illegal input, client errors (don't retry).
+    # Permanent — illegal input, client errors.
     # Only the exception TYPE goes in the message: pymemcache embeds the raw
     # cache key in illegal-input error text ("Key is too long: %r"), and the
     # message reaches log sinks via str(e) (CWE-532). Full details stay on

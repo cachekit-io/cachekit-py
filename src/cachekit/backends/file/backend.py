@@ -1147,7 +1147,7 @@ class FileBackend:
                 pass  # Best-effort unlock
 
     def _classify_os_error(self, exc: OSError, is_directory: bool) -> BackendErrorType:
-        """Classify OSError into BackendErrorType for retry logic.
+        """Classify OSError into BackendErrorType for the circuit breaker.
 
         Args:
             exc: OSError to classify

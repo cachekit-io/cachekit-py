@@ -310,8 +310,8 @@ class CachekitIOBackend:
         Args:
             method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
             endpoint: API endpoint (relative to base_url/v1/cache/)
-            miss_on_404: Return a 404 response instead of raising. Key reads,
-                exists and delete treat 404 as a miss; skipping raise_for_status
+            miss_on_404: Return a 404 response instead of raising. Key reads
+                and exists treat 404 as a miss; skipping raise_for_status
                 saves the HTTPStatusError + BackendError round-trip on every miss.
             **kwargs: Additional request arguments
 
@@ -367,8 +367,8 @@ class CachekitIOBackend:
         Args:
             method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
             endpoint: API endpoint (relative to base_url/v1/cache/)
-            miss_on_404: Return a 404 response instead of raising. Key reads,
-                exists and delete treat 404 as a miss; skipping raise_for_status
+            miss_on_404: Return a 404 response instead of raising. Key reads
+                and exists treat 404 as a miss; skipping raise_for_status
                 saves the HTTPStatusError + BackendError round-trip on every miss.
             **kwargs: Additional request arguments
 
@@ -514,13 +514,14 @@ class CachekitIOBackend:
             key: Cache key
 
         Returns:
-            True if deleted, False if key didn't exist
+            True on every successful delete, whether or not the key existed: the
+            server does not report existence on DELETE.
 
         Raises:
             BackendError: If operation fails
         """
-        response = self._request_sync("DELETE", self._encode_key(key), miss_on_404=True)
-        return response.status_code != 404
+        self._request_sync("DELETE", self._encode_key(key))
+        return True
 
     def exists(self, key: str) -> bool:
         """Check if key exists in cache (sync).
@@ -616,13 +617,14 @@ class CachekitIOBackend:
             key: Cache key
 
         Returns:
-            True if deleted, False if key didn't exist
+            True on every successful delete, whether or not the key existed: the
+            server does not report existence on DELETE.
 
         Raises:
             BackendError: If operation fails
         """
-        response = await self._request_async("DELETE", self._encode_key(key), miss_on_404=True)
-        return response.status_code != 404
+        await self._request_async("DELETE", self._encode_key(key))
+        return True
 
     async def exists_async(self, key: str) -> bool:
         """Check if key exists in cache (async).
