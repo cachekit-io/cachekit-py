@@ -628,11 +628,12 @@ The Redis backend wraps each redis-py exception in a `BackendError` whose `error
 
 3. **`TRANSIENT`**:
    - `redis.exceptions.ConnectionError` - Network issues; includes `redis.exceptions.MaxConnectionsError` (connection pool exhausted)
-   - `redis.exceptions.BusyLoadingError`, `redis.exceptions.ReadOnlyError` - Redis temporarily unavailable or failing over
+   - `redis.exceptions.BusyLoadingError` - Redis is still loading its dataset into memory
+   - `redis.exceptions.ReadOnlyError` - A read-only replica rejected a write, during failover or because writes are routed to a replica
    - `redis.exceptions.ClusterDownError`, `redis.exceptions.TryAgainError` - Cluster failover or resharding
 
 4. **`PERMANENT`**:
-   - `redis.exceptions.ResponseError`, `redis.exceptions.DataError`, `redis.exceptions.InvalidResponse` - Command or protocol errors
+   - `redis.exceptions.ResponseError`, `redis.exceptions.DataError`, `redis.exceptions.InvalidResponse` - Client input or configuration, command, or protocol errors
    - `redis.exceptions.LockError` - Lock acquisition failures
 
 5. **`UNKNOWN`**: any other exception
