@@ -25,7 +25,8 @@ class RedisBackendConfig(BaseBackendConfig):
         socket_timeout: Socket read/write timeout in seconds (finite so a dead
             Redis fails fast instead of blocking on the OS TCP timeout)
         socket_connect_timeout: Socket connect timeout in seconds
-        socket_keepalive: Enable TCP keepalive for connections
+        socket_keepalive: Enable TCP keepalive (SO_KEEPALIVE) on TCP connections;
+            not applied to unix:// URLs
         disable_hiredis: Disable hiredis parser (use pure Python)
 
     Examples:
@@ -78,7 +79,7 @@ class RedisBackendConfig(BaseBackendConfig):
     )
     socket_keepalive: bool = Field(
         default=True,
-        description="Enable TCP keepalive for connections",
+        description="Enable TCP keepalive on TCP connections; not applied to unix:// URLs (env: CACHEKIT_SOCKET_KEEPALIVE)",
     )
     disable_hiredis: bool = Field(
         default=False,

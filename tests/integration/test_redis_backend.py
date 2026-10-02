@@ -851,3 +851,57 @@ class TestRedisBinaryRoundtrip(RedisIsolationMixin):
         finally:
             rc._pool_instance = None
             reset_settings()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("keepalive", [True, False])
+class TestPoolSocketKeepaliveOnLiveTcpSocket:
+    """A connection checked out of each pool has SO_KEEPALIVE exactly as configured.
+
+    Proves the setting reaches the kernel, not just the pool kwargs. Asserts nonzero,
+    not == 1: BSD and macOS return the flag value.
+    """
+
+    @pytest.fixture
+    def tcp_redis_url(self, request):
+        """TCP URL of the test Redis: CI's external service, else the pytest-redis process's port."""
+        import os
+
+        proc = request.getfixturevalue("redis_noproc" if os.environ.get("REDIS_URL") else "redis_proc")
+        return f"redis://{proc.host}:{proc.port}/0"
+
+    @staticmethod
+    def _config(keepalive):
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        # The default arm uses the untouched default, so a changed default fails here too.
+        return RedisBackendConfig() if keepalive else RedisBackendConfig(socket_keepalive=False)
+
+    @staticmethod
+    def _assert_keepalive(sock, keepalive):
+        import socket
+
+        flag = sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        assert (flag != 0) is keepalive
+
+    def test_sync_pool(self, tcp_redis_url, keepalive):
+        from cachekit.backends.redis.client import create_connection_pool
+
+        pool = create_connection_pool(tcp_redis_url, self._config(keepalive))
+        conn = pool.get_connection()
+        try:
+            self._assert_keepalive(conn._sock, keepalive)
+        finally:
+            pool.release(conn)
+            pool.disconnect()
+
+    async def test_async_pool(self, tcp_redis_url, keepalive):
+        from cachekit.backends.redis.client import create_async_connection_pool
+
+        pool = create_async_connection_pool(tcp_redis_url, self._config(keepalive))
+        conn = await pool.get_connection()
+        try:
+            self._assert_keepalive(conn._writer.get_extra_info("socket"), keepalive)
+        finally:
+            await pool.release(conn)
+            await pool.disconnect()
