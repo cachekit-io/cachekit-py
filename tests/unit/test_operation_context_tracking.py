@@ -14,7 +14,7 @@ import pytest
 
 from cachekit.decorators.orchestrator import FeatureOrchestrator
 from cachekit.reliability.async_metrics import AsyncMetricsCollector
-from cachekit.reliability.circuit_breaker import CircuitBreakerConfig
+from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 
 
 @pytest.fixture
@@ -53,16 +53,24 @@ class TestOperationContextTracking:
 
         assert [(c["operation"], c["duration_ms"]) for c in recorded] == [("cache_operation", 0.0)]
 
-    def test_record_success_emits_no_metric(self, recorded: list[dict[str, Any]]):
-        """Every success site records its own labelled metric; a second record here double-counts."""
+    def test_record_success_feeds_breaker_and_emits_no_metric(
+        self, recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+    ):
+        """Every success site records its own labelled metric; a second record here double-counts.
+
+        Feeding the breaker is record_success()'s only job: a HALF_OPEN probe slot is released
+        only when its outcome reaches the breaker.
+        """
         orchestrator = _orchestrator(circuit_breaker_enabled=True)
+        on_success_calls: list[CircuitBreaker] = []
+        monkeypatch.setattr(CircuitBreaker, "_on_success", lambda self: on_success_calls.append(self))
 
         for _ in range(3):
             orchestrator.set_operation_context("get", duration_ms=1.5)
             orchestrator.record_success()
 
         assert recorded == []
-        assert orchestrator.circuit_breaker.get_stats()["state"] == "CLOSED"
+        assert on_success_calls == [orchestrator.circuit_breaker] * 3
 
     def test_context_isolation_between_operations(self, recorded: list[dict[str, Any]]):
         orchestrator = _orchestrator()
