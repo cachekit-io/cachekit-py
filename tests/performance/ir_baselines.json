@@ -19,16 +19,16 @@
     "cpython-3.14-x86_64": {
       "budgets": {
         "l1_hit": 69220,
-        "l2_hit": 355407,
-        "l2_hit_async_metrics": 300595,
+        "l2_hit": 322805,
+        "l2_hit_async_metrics": 268161,
         "minimal_l1_hit": 67291,
-        "miss": 339264,
-        "secure_l1_hit": 289054,
-        "serializer_arrow": 1955979,
-        "serializer_auto": 113600,
+        "miss": 314921,
+        "secure_l1_hit": 250113,
+        "serializer_arrow": 1953920,
+        "serializer_auto": 70704,
         "serializer_default": 62663,
         "serializer_encrypted": 117851,
-        "serializer_orjson": 23833
+        "serializer_orjson": 23827
       },
       "python": "3.14.3"
     }
