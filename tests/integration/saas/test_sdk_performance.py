@@ -24,6 +24,7 @@ import pytest
 import requests
 
 from tests.performance.stats_utils import (
+    MIN_RUNS_FOR_INFERENCE,
     PerformanceResult,
     balanced_order,
     effect_size_significant,
@@ -197,16 +198,26 @@ def test_l2_hit_latency_and_a_a_floor(cache_io_decorator, response_headers, sdk_
     assert after.misses == before.misses, f"a timed call missed: {before} -> {after}"
     assert after.l1_hits == 0, "L1 served a call with l1_enabled=False"
 
-    miss = summarize("GET-miss + SET", miss_runs, unit="ms")
-    hit_a = summarize("L2 hit, arm A", arms["A"], unit="ms")
-    hit_b = summarize("L2 hit, arm B", arms["B"], unit="ms")
-    hits = summarize("L2 hit, both arms", arms["A"] + arms["B"], unit="ms")
-    for result in (miss, hits, hit_a, hit_b):
-        _report(result, vantage)
-
+    _report(summarize("GET-miss + SET", miss_runs, unit="ms"), vantage)
     print(f"\nL2 hits by serving tier (x-cachekit-store-source) [{vantage}]")
     for tier, latencies in sorted(tiers.items()):
         print(f"  {tier:>10}: n={len(latencies):>3}  p50 {statistics.median(latencies):.1f} ms")
+
+    # A run median needs two store-served hits. A run short of that (a block the edge served from
+    # l0, or a target that sends no tier header) drops out, and too few runs left means no A/A.
+    for arm in arms:
+        arms[arm] = [run for run in arms[arm] if len(run) >= 2]
+    if min(len(runs) for runs in arms.values()) < MIN_RUNS_FOR_INFERENCE:
+        print(
+            f"\nA/A inconclusive: {len(arms['A'])} (A) and {len(arms['B'])} (B) runs kept >= 2 store-served hits; "
+            f"inference needs >= {MIN_RUNS_FOR_INFERENCE} per arm. The tier table shows where the hits went."
+        )
+        return
+
+    hit_a = summarize("L2 hit, arm A", arms["A"], unit="ms")
+    hit_b = summarize("L2 hit, arm B", arms["B"], unit="ms")
+    for result in (summarize("L2 hit, both arms", arms["A"] + arms["B"], unit="ms"), hit_a, hit_b):
+        _report(result, vantage)
 
     changed = effect_size_significant(hit_a, hit_b)
     print(

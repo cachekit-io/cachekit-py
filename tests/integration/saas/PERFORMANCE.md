@@ -26,8 +26,10 @@ memory. It has two arms:
 The test asserts what was timed, not how fast it was: `cache_info().l2_hits` must grow by exactly
 the number of timed calls, and `misses` must not grow. Each hit is also labelled with the serving
 tier from the `X-CacheKit-Store-Source` response header, and only store-served (`do`) hits enter the A/A
-arms. The timed cycle starts past the warm-up keys, so no timed read falls in the edge's few-second
-in-memory window of a warm-up read.
+arms. A run left with fewer than 2 of them drops out. If fewer than 5 runs per arm remain, the output
+says the A/A is inconclusive and the tier table shows where the hits went. The timed cycle starts
+past the warm-up keys, so no timed read falls in the edge's few-second in-memory window of a
+warm-up read.
 
 Every network number is a reported value, never an assert, and carries the label
 `vantage=<colo>, client wall time, <env>`. The colo comes from `/cdn-cgi/trace` at run time. Only
