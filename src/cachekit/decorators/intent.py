@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
 from ..config.validation import hide_secret, reveal_secret
-from .wrapper import create_cache_wrapper
+from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -160,6 +160,12 @@ def cache(
         _explicit_backend = "backend" in manual_overrides
         _explicit_l1_only = _explicit_backend and manual_overrides["backend"] is None
         backend = manual_overrides.pop("backend", None)
+
+        # Refuse an encrypting serializer= before the preset resolves, ahead of the presets' own key checks: a
+        # caller who put the key inside the EncryptionWrapper would otherwise be told the decorator has no key.
+        # backend=None is left to create_cache_wrapper, where the L1-only refusal fires first.
+        if not _explicit_l1_only and _is_encrypting_serializer(manual_overrides.get("serializer")):
+            raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
         if config is not None and not isinstance(config, DecoratorConfig):
             raise TypeError(

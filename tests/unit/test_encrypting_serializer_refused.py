@@ -50,9 +50,13 @@ _SPELLINGS: dict[str, Callable[[FileBackend], Callable[[Callable[..., Any]], Any
     "bare-force-on": lambda b: cache(
         serializer=_wrapper(), encryption=True, single_tenant_mode=True, master_key=_KEY_HEX, backend=b
     ),
+    # No decorator key: the only key is inside the wrapper, so the refusal must beat the presets' own key checks.
+    "bare-force-on-no-key": lambda b: cache(serializer=_wrapper(), encryption=True, single_tenant_mode=True, backend=b),
     "bare-subclass": lambda b: cache(serializer=_SubclassedWrapper(master_key=bytes.fromhex(_KEY_HEX)), backend=b),
     "secure-instance": lambda b: cache.secure(master_key=_KEY_HEX, serializer=_wrapper(), backend=b),
     "secure-name": lambda b: cache.secure(master_key=_KEY_HEX, serializer="encrypted", backend=b),
+    "secure-instance-no-key": lambda b: cache.secure(serializer=_wrapper(), backend=b),
+    "secure-name-no-key": lambda b: cache.secure(serializer="encrypted", backend=b),
     "production-instance": lambda b: cache.production(serializer=_wrapper(), backend=b),
     "production-instance-opt-out": lambda b: cache.production(serializer=_wrapper(), encryption=False, backend=b),
     "minimal-instance": lambda b: cache.minimal(serializer=_wrapper(), backend=b),

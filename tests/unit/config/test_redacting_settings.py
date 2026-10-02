@@ -841,6 +841,12 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ConfigurationError,
         _KEY_HEX,
     ),
+    "config-encrypting-serializer": (
+        {},
+        lambda: cache(config=DecoratorConfig(serializer=EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX))))(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "wrapper-env-previous-is-current": (
         {"CACHEKIT_PREVIOUS_MASTER_KEYS": _KEY_HEX},
         lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX)),
