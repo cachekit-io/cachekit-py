@@ -14,9 +14,10 @@ percent. Instruction counts can, once these sources of run-to-run noise are hand
   Pinned clocks never let the metrics collector's 5 s mode check fire, so the collector stays
   synchronous; ``l2_hit_async_metrics`` measures the batched mode a busy long-lived process
   switches to (see ``_build_workload``).
-- Anything else that runs on real time is kept off the measured loop: no background thread
-  wakes, cyclic GC is off, the environment is fixed, the bytecode cache is warmed first, and the
-  heap layout is sampled (see ``_run_workload``, ``measure`` and ``LAYOUTS``).
+- Nothing else that runs on real time reaches the measured loop (no background thread wakes,
+  cyclic GC is off, the GIL switch interval is long), the environment is fixed, the bytecode
+  cache is warmed first, and the heap layout is sampled (see ``_run_workload``, ``measure`` and
+  ``LAYOUTS``).
 
 Two full runs agree within 0.03% per op (0.01% on 3.12), against a 1% fail threshold.
 
@@ -25,7 +26,7 @@ different number of instructions on 3.12 and 3.14. Instruction counts ignore cac
 branch mispredictions, so a claimed wall-clock win still needs an interleaved wall-clock run.
 
 Run ``python tests/performance/ir_budget.py --help`` for the gate and ``--update`` (ratchet-down)
-options. Requires valgrind; never imported by the test suite except for its pure helpers.
+options. Measuring requires valgrind; the unit tests import this module's helpers without it.
 """
 
 from __future__ import annotations
@@ -328,7 +329,7 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
     for path, ir in measured.items():
         budget = budgets.get(path)
         if budget is None:
-            lines.append(f"FAIL  {path:28} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
+            lines.append(f"FAIL  {path:22} {ir:>9,} Ir/op  no budget for this interpreter (run --update)")
             ok = False
             continue
         pct = (ir - budget) / budget * 100
@@ -337,10 +338,10 @@ def compare(budgets: dict[str, int], measured: dict[str, int]) -> tuple[list[str
         elif pct >= WARN_PCT:
             verdict = "WARN"
         elif pct <= -FAIL_PCT:
-            verdict = "LOWER"  # a real improvement: ratchet the budget down with --update
+            verdict = "LOWER"  # cheaper: ratchet it down with --update if the change touched this path
         else:
             verdict = "ok"
-        lines.append(f"{verdict:5} {path:28} {ir:>9,} Ir/op  budget {budget:>9,}  {pct:+.2f}%")
+        lines.append(f"{verdict:5} {path:22} {ir:>9,} Ir/op  budget {budget:>9,}  {pct:+.2f}%")
     return lines, ok
 
 
