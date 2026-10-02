@@ -18,7 +18,9 @@ self-calibration (`test_measurement_calibration.py`) — run before trusting any
 Run the whole battery with `make perf`; gate regressions with `make perf-compare`.
 
 **Instruction budgets.** `ir_budget.py` (`make perf-ir`) is the deterministic gate: main-thread
-callgrind instructions per call for each hot path, failing at +1% against `ir_baselines.json`.
+callgrind instructions per call for each hot path, failing at +1% (the orjson round trip at +2%)
+against `ir_baselines.json`. Budgets belong to the build that recorded them; on another
+interpreter, extension or C library, record a baseline on `main` first.
 See [docs/performance.md](../../docs/performance.md#instruction-budgets).
 
 ---
