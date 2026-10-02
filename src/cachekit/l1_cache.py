@@ -636,6 +636,10 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
 # The processes a thread may start in: the one that imported this module, and the latest child
 # _reset_cache_locks_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
+# So import cachekit before any fork made from C: a process that first imports it after such a fork
+# (uWSGI --lazy-apps without --py-call-osafterfork) is taken for safe, and cleanup starts a thread there.
+# No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
+# thread idents match a fresh process's, and a fresh process may import on any thread.
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
 
