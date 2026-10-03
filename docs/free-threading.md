@@ -225,12 +225,19 @@ not a free-threaded build, or if `--gil-python` is one. It refuses an existing
 that repeats an arm's repetition. The summary also drops a process whose GIL
 state changed while the cells ran.
 
-Today the CachekitIO cell is tainted under no-GIL. Threads that share one
-backend share one HTTP/2 connection, and httpcore's sync HTTP/2 send path
-allocates stream ids and HPACK-encodes headers outside its locks
-([encode/httpcore#1118](https://github.com/encode/httpcore/pull/1118)). The
-peer then rejects the connection and every request in flight on it fails. The
-race is rare under the GIL and frequent without it.
+The CachekitIO cell can still be tainted under no-GIL, far more rarely than
+before. The sync client is HTTP/1.1, so threads that share one backend no longer
+share one HTTP/2 connection, whose send path allocates stream ids and
+HPACK-encodes headers outside httpcore's locks
+([encode/httpcore#1118](https://github.com/encode/httpcore/pull/1118)): with 8
+threads on 3.14t that failed 23–32% of raw httpx requests, and 1–4% with the
+GIL. httpcore's HTTP/1.1 pool has a smaller race of its own without the GIL:
+`has_expired()` reads a connection's `_expire_at` twice while a thread starting
+a request on it sets it to `None`, and the comparison raises `TypeError`. That
+failed 0.15–0.23% of the same requests, and none with the GIL. There is no
+upstream fix yet. `tests/unit/backends/test_cachekitio_thread_share.py`
+expects zero failures with the GIL and marks the no-GIL case as an expected
+failure.
 
 ## Deferred: declared support + free-threaded wheels
 

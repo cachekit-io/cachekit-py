@@ -76,7 +76,7 @@ _RETRY_METHODS = frozenset({"PUT", "DELETE"})
 _MAX_RETRY_AFTER_S = 2
 
 # The SaaS has no bulk delete, so whole-function invalidation sends this many DELETEs at once over
-# the sync client's HTTP/2 connection (LAB-7070). Each still takes its own limiter verdict.
+# the sync client's pool, one HTTP/1.1 connection each (LAB-7070). Each still takes its own limiter verdict.
 _DELETE_FANOUT = 16
 # A longer rate-limit hint than this is treated as a deny, not waited out. The tenant limiter's
 # window is 60 s, so a real hint is far below it; the cap only bounds the parse.

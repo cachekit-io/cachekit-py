@@ -4,7 +4,7 @@
 
 > *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
-`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTP/2. It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
+`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTPS: HTTP/1.1 for sync calls, HTTP/2 for async ones. It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
 
 ## Setup
 
@@ -188,7 +188,6 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 **When NOT to use**:
 - Sub-millisecond latency requirements — use Redis or L1 cache
 - Fully offline/air-gapped environments
-- Applications that cannot tolerate HTTP/2 dependency
 
 ## Characteristics
 
@@ -198,7 +197,14 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   (n=50 per run). Your numbers depend on where your client enters Cloudflare, the store's region and
   how many reads the edge serves. No p95 is published yet: these samples are too few to claim one.
 - Sync and async support (hybrid client architecture)
-- Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
+- Connection pooling built-in (default: 32 connections). The sync client speaks HTTP/1.1, one request
+  per connection, so threads sharing a backend never share a connection: a thread pool, and every
+  async-decorator L2 operation, which runs on the default executor's threads (at most 32). Over HTTP/2
+  those threads would multiplex one connection, which httpx's sync HTTP/2 support does not make
+  thread-safe, and 1–4% of operations failed as cache misses. Each extra connection costs one TCP and
+  TLS handshake on first use, then stays pooled. A request that finds all 32 in use waits up to the
+  request timeout for one. The async client keeps HTTP/2: one event loop drives it, so its requests
+  share one connection safely. Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
   when the last one is released; the async pool is not, and Python reclaims its sockets with a
   `ResourceWarning` each. Create one backend per key and reuse it
@@ -207,8 +213,8 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   (about 25–30 ms from a client entering at MEL). Each pooled connection sends TCP keepalive probes
   after 60 s idle (every 10 s, 3 probes), which keeps NAT gateway mappings alive (AWS NAT Gateway drops
   idle flows at 350 s, Azure at 4 min). If a network path does die, the probes find it in about 90 s, and
-  the next request no longer waits out the 5 s timeout: over HTTP/1.1 it reconnects, and over HTTP/2 it
-  fails at once and that call is a cache miss. Probes cannot run while a process is suspended (a frozen
+  the next request no longer waits out the 5 s timeout: a sync call (HTTP/1.1) reconnects, and an async
+  call (HTTP/2) fails at once and is a cache miss. Probes cannot run while a process is suspended (a frozen
   serverless runtime, a stopped container), so the first request after such a pause can still wait out
   the timeout on a dead connection and miss. With any proxy setting in the
   environment (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the rest), requests go through httpx's own

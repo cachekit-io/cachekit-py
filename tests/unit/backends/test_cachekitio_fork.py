@@ -18,12 +18,11 @@ import os
 import shutil
 import signal
 import ssl
-import subprocess
 import sys
 import threading
 import traceback
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,31 +40,7 @@ pytestmark = [
 ]
 
 _REQUESTS = 5
-_FAKE = Path(__file__).parents[2] / "performance" / "loopback_saas.py"
 _PROTOCOLS = [pytest.param(False, id="h1"), pytest.param(True, id="h2")]
-
-
-@pytest.fixture(scope="module")
-def fake_saas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[int, Path]]:
-    tmp = tmp_path_factory.mktemp("fork-tls")
-    cert, key = tmp / "cert.pem", tmp / "key.pem"
-    subprocess.run(  # noqa: S603 (trusted: literal openssl argv)
-        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1"]
-        + ["-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cert)],
-        check=True,
-        capture_output=True,
-    )
-    proc = subprocess.Popen(  # noqa: S603 (trusted: this interpreter and a repo script)
-        [sys.executable, str(_FAKE), "0", str(cert), str(key), "2"], stdout=subprocess.PIPE, text=True
-    )
-    assert proc.stdout is not None
-    line = proc.stdout.readline().split()
-    if line[:1] != ["ready"]:
-        proc.kill()
-        pytest.fail(f"loopback fake failed to start (exit {proc.wait()})")
-    yield int(line[1]), cert
-    proc.kill()
-    proc.wait()
 
 
 def _backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool) -> CachekitIOBackend:

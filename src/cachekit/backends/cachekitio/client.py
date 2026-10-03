@@ -202,7 +202,7 @@ _hpack_logger = logging.getLogger("hpack")
 
 
 def _pin_hpack_logger() -> None:
-    # hpack (httpx's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
+    # hpack (the async client's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
     # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
     # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
     # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
@@ -248,11 +248,17 @@ def _client_kwargs(
         max_keepalive_connections=config.connection_pool_size,
         keepalive_expiry=_KEEPALIVE_EXPIRY if probes else _KEEPALIVE_EXPIRY_NO_PROBES,
     )
-    mounts = {"all://": transport_cls(http2=True, limits=limits, socket_options=_KEEPALIVE_SOCKET_OPTIONS)} if probes else None
+    # The sync client is HTTP/1.1. Every thread that calls a backend sends on its one sync client, and over HTTP/2
+    # they would share one connection, which httpcore's sync HTTP/2 path does not lock (encode/httpcore#1118): a
+    # ReadError or RemoteProtocolError fails every request in flight on it, and the cache reads a miss (LAB-7062).
+    # HTTP/1.1 gives each concurrent request its own pooled connection, and h11 costs less CPU per request than h2.
+    # The async client stays on HTTP/2: one event loop drives it.
+    http2 = transport_cls is httpx.AsyncHTTPTransport
+    mounts = {"all://": transport_cls(http2=http2, limits=limits, socket_options=_KEEPALIVE_SOCKET_OPTIONS)} if probes else None
     return {
         "base_url": config.api_url,
         "timeout": config.timeout,
-        "http2": True,
+        "http2": http2,
         "limits": limits,
         "mounts": mounts,
         "headers": {
