@@ -82,12 +82,15 @@ class CircuitBreakerConfig:
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
             starts. Must be finite and > 0: NaN or inf never leaves OPEN, and that
-            restart caps probing at half_open_requests per timeout_seconds. Balance
+            restart caps a cycle's probe slots at half_open_requests per
+            timeout_seconds. Balance
             between giving service time to recover vs detecting recovery quickly.
-        half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
-            not a concurrency limit). Keep it >= success_threshold, or a cycle can
-            never collect enough successes from its probes to close. Unlike the
-            @cache config, this class does not reject a smaller value.
+        half_open_requests: Probe slots per HALF_OPEN cycle, not a concurrency
+            limit. Every admitted probe holds one until the cycle ends, whether it
+            records an outcome or never reports back, unless release_probe hands it
+            back for the next call. Keep it >= success_threshold: every success
+            holds one of a cycle's slots, so a smaller budget can never close it.
+            Unlike the @cache config, this class does not reject a smaller value.
         excluded_error_types: BackendErrorType values that don't count as failures.
             Example: BackendErrorType.PERMANENT for config errors
 
@@ -117,7 +120,7 @@ class CircuitBreakerConfig:
     failure_threshold: int = 5  # Opens circuit after 5 failures within 60 s
     success_threshold: int = 3  # Closes circuit after 3 consecutive successes
     timeout_seconds: float = 30.0  # Wait 30s before testing recovery
-    half_open_requests: int = 3  # Probes per HALF_OPEN cycle; must reach success_threshold to close
+    half_open_requests: int = 3  # Probe slots per HALF_OPEN cycle; must reach success_threshold to close
     excluded_error_types: tuple[BackendErrorType, ...] = ()  # No excluded error types by default
 
     def __post_init__(self):
@@ -308,6 +311,7 @@ class CircuitBreaker:
         self._half_open_permits = 0  # Current test requests in HALF_OPEN
         self._half_open_total_attempts = 0  # Total requests attempted in HALF_OPEN cycle
         self._half_open_since = 0.0  # When the current HALF_OPEN cycle started
+        self._half_open_cycle = 0  # Number of the latest HALF_OPEN cycle (0 before the first); admit() hands it out
         self._lock = threading.RLock()  # Reentrant lock for thread safety
 
         _legacy_state_value.labels(namespace=namespace).set(self._state.value)
@@ -449,6 +453,7 @@ class CircuitBreaker:
         self._half_open_permits = 0
         self._half_open_total_attempts = 0  # Reset attempt counter for new HALF_OPEN cycle
         self._half_open_since = time.time()
+        self._half_open_cycle += 1
         _legacy_state_value.labels(namespace=self.namespace).set(CircuitState.HALF_OPEN.value)
         logger.info(f"Circuit breaker {self.namespace} transitioned to HALF_OPEN")
 
@@ -504,6 +509,41 @@ class CircuitBreaker:
         """
         self._on_success()
 
+    def release_probe(self, cycle: int):
+        """Give back the probe slot of an admitted call that ends with no outcome.
+
+        For an exit that says nothing about backend health, such as the decorated
+        function raising. Recording nothing would leave its HALF_OPEN slot spent, and
+        every call would be rejected until the cycle expires.
+
+        Args:
+            cycle: What ``admit`` returned for the call. Only a call admitted by the
+                current HALF_OPEN cycle gets its slot back, for the next call. A call
+                admitted while CLOSED, or by an earlier cycle, holds no slot of this
+                one, and refunding it would let probes past ``half_open_requests``.
+                A release after the call's own cycle ended changes nothing: every
+                cycle starts from a fresh budget.
+        """
+        with self._lock:
+            if cycle != self._half_open_cycle:
+                return
+            self._half_open_permits = max(0, self._half_open_permits - 1)
+            self._half_open_total_attempts = max(0, self._half_open_total_attempts - 1)
+
+    def admit(self) -> Optional[int]:
+        """Admit or reject a call, and say which HALF_OPEN cycle admitted it.
+
+        The same decision as ``should_attempt_call``, for a caller that may need
+        ``release_probe``.
+
+        Returns:
+            None if the call must fail fast. Otherwise the number of the latest
+            HALF_OPEN cycle, which admitted it if the breaker is HALF_OPEN: 0 before
+            the first cycle, and falsy, so test the result with ``is None``.
+        """
+        with self._lock:
+            return self._half_open_cycle if self._allow_request() else None
+
     def should_attempt_call(self) -> bool:
         """Admit or reject a call — the live admission check.
 
@@ -514,12 +554,13 @@ class CircuitBreaker:
         ``half_open_requests`` probe slots. A spent cycle that no outcome has
         ended within ``timeout_seconds`` starts over with a fresh budget. Record
         the outcome of every admitted call with ``record_success`` /
-        ``record_failure``; never record a rejection.
+        ``record_failure``; never record a rejection. A call that may end with no
+        outcome is admitted with ``admit`` instead, so it can ``release_probe``.
 
         Returns:
             True if the call may proceed, False if it must fail fast.
         """
-        return self._allow_request()
+        return self.admit() is not None
 
     def get_state(self) -> CircuitState:
         """Get current circuit breaker state (alias for state property)."""

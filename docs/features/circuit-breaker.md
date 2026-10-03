@@ -64,8 +64,8 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `enabled` | `bool` | `True` | Turn the breaker on or off |
 | `failure_threshold` | `int` | `5` | Failures within a 60 s rolling window that open the circuit. Successes do not reset the count; older failures stop counting |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
-| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). Must be finite and `> 0`: it also caps probing at `half_open_requests` per cooldown |
-| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
+| `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). Must be finite and `> 0`: it also caps a cycle's probe slots at `half_open_requests` per cooldown |
+| `half_open_requests` | `int` | `3` | Probe slots per HALF_OPEN cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a HALF_OPEN cycle could never close |
 
 > [!NOTE]
 > The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the configuration
@@ -88,7 +88,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
 | **OPEN** | Skip the backend: an L1 hit is still served, and an L1 miss runs the function uncached (sync and async). No failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
-| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further L1 misses run uncached. L1 hits are served and are neither probes nor successes | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
+| **HALF_OPEN** | Each cycle has 3 probe slots (`half_open_requests`); L1 misses that find none free run uncached. L1 hits are served and are neither probes nor successes. Every admitted probe holds its slot until the cycle ends, whether it succeeds, fails or never reports back. Only a probe whose function raises gives it back: it records no outcome and the next call probes in its place, so while the function keeps raising, more than 3 calls in one cycle can reach the backend | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 slots are held and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```
@@ -256,8 +256,8 @@ class CircuitBreaker:
     def call(self, func):
         if self.state == "CLOSED":
             try:
-                return func()  # Normal operation
-            except Exception:
+                return cached(func)  # Normal operation
+            except BackendFailure:  # The function's own exceptions never count
                 now = time.monotonic()
                 # Rolling 60 s window: older failures stop counting, successes never reset it
                 self.failure_times = [t for t in self.failure_times if now - t <= 60] + [now]
@@ -281,10 +281,13 @@ class CircuitBreaker:
                 self.half_open_since = time.time()
             self.probes += 1
             try:
-                result = func()
-            except Exception:
+                result = cached(func)
+            except BackendFailure:
                 self.state = "OPEN"  # Recovery failed
                 self.last_failure_time = time.time()
+                raise
+            except Exception:
+                self.probes -= 1  # The function raised: no outcome, and the next call probes in its place
                 raise
             self.successes += 1
             if self.successes >= success_threshold:  # default 3

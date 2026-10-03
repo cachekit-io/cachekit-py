@@ -1717,7 +1717,8 @@ def create_cache_wrapper(
         # outside the try below on purpose: that except records a failure, and a
         # rejection is not one. Recorded, every rejected call would push the OPEN
         # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        if not features.should_allow_request():
+        probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+        if probe_cycle is None:
             features.log_cache_operation(
                 operation="circuit_breaker_open",
                 key=cache_key,
@@ -1893,8 +1894,16 @@ def create_cache_wrapper(
         _stats.record_miss()
 
         try:
-            # Execute the original function
-            result = func(*args, **kwargs)
+            # Execute the original function. Its exception is not a backend failure, so it is
+            # never counted, but an admitted HALF_OPEN probe hands its slot to the next call
+            # instead of holding it until the cycle expires. probe_cycle confines that to a
+            # slot this call took: a call admitted while CLOSED, or by an ended cycle, gives
+            # the current cycle nothing back.
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                features.release_probe(probe_cycle)
+                raise
 
             # Serialize and cache the result
             try:
@@ -1942,19 +1951,10 @@ def create_cache_wrapper(
 
             return result
 
-        # No `except BackendError` degradation here: the store's own failures are caught
-        # above, so only the function can raise one this far, and rerunning the function
-        # for it would repeat its side effects (LAB-5360). It is the function's exception.
-        except KeyringConfigurationError:
-            # From the write, or a nested cached call's: a local config fault, not a
-            # backend failure. Counting it would open the breaker, and an open breaker
-            # skips the L2 read and write that raise it, so every later call would run
-            # uncached without a word.
-            raise
-        except Exception as e:
-            # Other exceptions - record and re-raise
-            features.record_failure(e)
-            raise
+        # No handler here: the store's own failures are caught above, so what reaches this
+        # point is the function's exception (or a fail-loud write error). It is not a backend
+        # failure, so it never counts toward the breaker, and rerunning the function for a
+        # BackendError it raised would repeat its side effects.
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
@@ -2111,7 +2111,8 @@ def create_cache_wrapper(
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
             # The outer finally resets the stats context.
-            if not features.should_allow_request():
+            probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+            if probe_cycle is None:
                 features.log_cache_operation(
                     operation="circuit_breaker_open",
                     key=cache_key,
@@ -2324,6 +2325,7 @@ def create_cache_wrapper(
                         try:
                             result = await func(*args, **kwargs)
                         except Exception as e:
+                            features.release_probe(probe_cycle)  # not a backend outcome (see the sync wrapper)
                             func_error = e
                         else:
                             # Serialize and cache the result
@@ -2439,68 +2441,63 @@ def create_cache_wrapper(
                     f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
                 )
 
+            # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
             try:
-                # Execute the original function
                 result = await func(*args, **kwargs)
+            except Exception:
+                features.release_probe(probe_cycle)
+                raise
 
-                # Serialize and cache the result
-                try:
-                    serialized_data = operation_handler.serialization_handler.serialize_data(
-                        result, args, kwargs, cache_key=cache_key
-                    )
+            # Serialize and cache the result
+            try:
+                serialized_data = operation_handler.serialization_handler.serialize_data(
+                    result, args, kwargs, cache_key=cache_key
+                )
 
-                    # Store in Redis with TTL
-                    stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                        cache_key,
-                        serialized_data,
-                        ttl=ttl,
-                        stale_ttl=_stale_ttl,
-                    )
+                # Store in Redis with TTL
+                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                    cache_key,
+                    serialized_data,
+                    ttl=ttl,
+                    stale_ttl=_stale_ttl,
+                )
 
-                    # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-                    if stored:
-                        await _track_and_record_async(cache_key)
+                # Also store in L1 cache for fast subsequent access (using serialized bytes)
+                _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+                if stored:
+                    await _track_and_record_async(cache_key)
 
-                    # Record successful cache set
-                    set_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.set_operation_context("set", duration_ms=set_duration_ms)
-                    features.record_success()
+                # Record successful cache set
+                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.set_operation_context("set", duration_ms=set_duration_ms)
+                features.record_success()
 
-                    if features.collect_stats:
-                        features.record_cache_operation(
-                            operation="set",
-                            namespace=namespace or "default",
-                            success=True,
-                            duration_ms=set_duration_ms,
-                            serializer="rust",
-                        )
-
-                except (InteropError, KeyringConfigurationError):
-                    # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
-                    # keyring config fault (see the sync write): fail loud.
-                    raise
-                except Exception as e:
-                    # Caching failed but function succeeded - return result anyway
-                    set_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.handle_cache_error(
-                        error=e,
-                        operation="cache_set",
-                        cache_key=cache_key or "unknown",
+                if features.collect_stats:
+                    features.record_cache_operation(
+                        operation="set",
                         namespace=namespace or "default",
+                        success=True,
                         duration_ms=set_duration_ms,
-                        count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
+                        serializer="rust",
                     )
 
-                return result
-
-            except KeyringConfigurationError:
-                # From the write, or a nested cached call's: never counted (see the sync wrapper).
+            except (InteropError, KeyringConfigurationError):
+                # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                # keyring config fault (see the sync write): fail loud.
                 raise
             except Exception as e:
-                # Function execution failed - record and re-raise
-                features.record_failure(e)
-                raise
+                # Caching failed but function succeeded - return result anyway
+                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.handle_cache_error(
+                    error=e,
+                    operation="cache_set",
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    duration_ms=set_duration_ms,
+                    count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
+                )
+
+            return result
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)

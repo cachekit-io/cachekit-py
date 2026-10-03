@@ -99,7 +99,7 @@ def your_function(args):
   - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
   - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
-  - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a half-open cycle could never close
+  - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
