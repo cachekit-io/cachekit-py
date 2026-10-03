@@ -980,7 +980,10 @@ class TestUwsgiWarning:
 
     @pytest.fixture
     def fake_uwsgi(self, monkeypatch: pytest.MonkeyPatch) -> Any:
-        module = types.ModuleType("uwsgi")
+        """uWSGI's module as the master sees it, while it loads the app before forking any worker."""
+        module: Any = types.ModuleType("uwsgi")
+        module.masterpid = os.getpid
+        module.worker_id = lambda: 0
         monkeypatch.setitem(sys.modules, "uwsgi", module)
         return module
 
@@ -993,7 +996,10 @@ class TestUwsgiWarning:
 
     @pytest.mark.parametrize("option", ["py-call-osafterfork", "lazy-apps", "lazy"])
     def test_no_other_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
-        """py-call-osafterfork aborts every worker on 3.13+; under lazy-apps a worker's thread can hang."""
+        """py-call-osafterfork aborts every worker on 3.13+; under lazy-apps a worker's thread can hang.
+
+        The master imports cachekit under lazy-apps only when something it loads (shared-import) imports it.
+        """
         fake_uwsgi.opt = {"master": True, "enable-threads": True, option: True}
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
@@ -1006,14 +1012,37 @@ class TestUwsgiWarning:
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         assert caplog.records == []
 
-    def test_never_from_a_child_forked_without_hooks(
-        self, fake_uwsgi: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize(
+        ("masterpid", "worker_id"),
+        [(-1, 1), (-1, 0), (0, 1)],
+        ids=["worker", "mule-or-spooler", "worker-without-master"],
+    )
+    def test_never_from_a_process_uwsgi_forked(
+        self, masterpid: int, worker_id: int, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
-        fake_uwsgi.opt = {}
-        monkeypatch.setattr(l1_cache, "_import_pid", -1)
-        monkeypatch.setattr(l1_cache, "_hooked_pid", None)
+        """A process uWSGI forked ran no at-fork hook, so a log call there can hang on a lock a master thread held.
+
+        That includes a worker that first imports cachekit after the fork (lazy-apps), which looks like a fresh
+        process to l1_cache._forked_without_hooks.
+        """
+        fake_uwsgi.opt = {"lazy-apps": True}
+        fake_uwsgi.masterpid = lambda: masterpid
+        fake_uwsgi.worker_id = lambda: worker_id
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert caplog.records == []
+
+    def test_warns_in_the_loading_process_without_a_master(self, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        fake_uwsgi.opt = {"processes": b"4"}
+        fake_uwsgi.masterpid = lambda: 0  # no --master: the process that loads the app forks the workers
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert len(caplog.records) == 1
+
+    def test_silent_without_the_uwsgi_api(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        monkeypatch.setitem(sys.modules, "uwsgi", types.SimpleNamespace(opt={}))  # has opt, but not uWSGI's module
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()  # no raise: import cachekit must not break
         assert caplog.records == []
 
     def test_silent_outside_uwsgi(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -1036,9 +1065,9 @@ class TestUwsgiWarning:
 
     def test_import_warns_once(self) -> None:
         code = (
-            "import logging, sys, types\n"
+            "import logging, os, sys, types\n"
             "logging.basicConfig(level=logging.WARNING, format='%(name)s %(message)s')\n"
-            "sys.modules['uwsgi'] = types.SimpleNamespace(opt={})\n"
+            "sys.modules['uwsgi'] = types.SimpleNamespace(opt={}, masterpid=os.getpid, worker_id=lambda: 0)\n"
             "import cachekit, cachekit.invalidation\n"
             "from cachekit import cache\n"
         )

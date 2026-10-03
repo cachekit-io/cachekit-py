@@ -442,28 +442,41 @@ def _stop_listener() -> None:
         thread.join(timeout=5)
 
 
+def _uwsgi_forked_this_process(uwsgi: Any) -> bool:
+    """Whether uWSGI forked this process from C (a worker, mule or spooler), or cannot say.
+
+    l1_cache._forked_without_hooks misses a process that first imports cachekit after such a fork:
+    a worker under lazy-apps, or one whose app imports cachekit on its first request. With --master,
+    uWSGI forked every process but the master; without it, masterpid() is 0 and worker_id() stays 0
+    in the process that loads the app until it forks the workers.
+    """
+    try:
+        master = uwsgi.masterpid()
+        return os.getpid() != master if master else uwsgi.worker_id() > 0
+    except (AttributeError, TypeError):  # not uWSGI's own module: never log when unsure
+        return True
+
+
 def _warn_if_uwsgi_skips_fork_hooks() -> None:
     """One WARNING when this process runs under uWSGI without _UWSGI_FORK_HOOKS set.
 
-    uWSGI forks its workers from C and runs no Python at-fork hook unless told to. Called once, at
-    import. With the app loaded in the master (uWSGI's default) that is in the master, before any
-    worker exists; each worker keeps the master's L1 entries, runs no invalidation listener and
-    logs nothing, since a handler lock a master thread held at the fork would hang it. Under
-    lazy-apps it is in each worker, after the fork: cachekit takes such a worker for a fresh
-    process, so it may start a thread there that hangs.
+    uWSGI forks its workers from C and runs no Python at-fork hook unless told to, so a worker
+    keeps the master's L1 entries and runs no invalidation listener. Called once, at import, and
+    logs only in a process uWSGI did not fork, the one that loads the app: a process forked without
+    hooks must not log at all, since a handler lock a master thread held at the fork would hang it.
+    So under lazy-apps, where each worker first imports cachekit after the fork, nothing logs.
     uWSGI registers its ``uwsgi`` module before it imports the app, so this looks it up rather than
     importing it: an import outside uWSGI would run any ``uwsgi.py`` on ``sys.path``.
     """
-    if l1_cache._forked_without_hooks():
-        return
-    options = getattr(sys.modules.get("uwsgi"), "opt", None)
-    if not isinstance(options, dict) or _UWSGI_FORK_HOOKS in options:
+    uwsgi = sys.modules.get("uwsgi")
+    options = getattr(uwsgi, "opt", None)
+    if not isinstance(options, dict) or _UWSGI_FORK_HOOKS in options or _uwsgi_forked_this_process(uwsgi):
         return
     logger.warning(
         "uWSGI is running without py-call-uwsgi-fork-hooks, so its worker forks skip all or part of "
-        "CPython's fork protocol: a worker can keep the master's L1 entries and run no invalidation "
-        "listener, or start a thread that hangs (lazy-apps), or hang or abort at start "
-        "(py-call-osafterfork). Run uWSGI with --enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+)."
+        "CPython's fork protocol: a worker keeps the master's L1 entries and runs no invalidation "
+        "listener, or under py-call-osafterfork can hang or abort at start. Run uWSGI with "
+        "--enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+)."
     )
 
 
