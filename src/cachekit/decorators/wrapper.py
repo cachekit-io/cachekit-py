@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import redact_error_for_log
@@ -133,6 +133,29 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
+
+
+class _LockPhase:
+    """How far a lock clause got, so its handler can tell where a lock error was raised.
+
+    ``entered``: ``acquire_lock`` yielded, so an error is no longer an acquire failure.
+    ``body_exited``: the body left without raising, so only the release can have failed.
+    """
+
+    __slots__ = ("body_exited", "entered")
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.body_exited = False
+
+
+@contextlib.asynccontextmanager
+async def _phased(lock: contextlib.AbstractAsyncContextManager[bool], phase: _LockPhase) -> AsyncIterator[bool]:
+    """Enter ``lock`` and record each phase it reaches in ``phase``."""
+    async with lock as acquired:
+        phase.entered = True
+        yield acquired
+        phase.body_exited = True
 
 
 class _WarnThrottle:
@@ -879,8 +902,8 @@ def create_cache_wrapper(
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
     # keys can't spawn unbounded work. Cross-client single-flight rides the
     # backend's async lock as a non-blocking lease (contested = serve stale, no
-    # wait, no retry — _try_acquire_lock already treats 409 AND 200+null as
-    # contested, LAB-240). The lease is best-effort per spec.
+    # wait, no retry — only 200 with a null lock_id is contested, LAB-240; any lock
+    # error abandons the attempt). The lease is best-effort per spec.
     _l2_swr_inflight: set[str] = set()
     _l2_swr_tasks: set[asyncio.Task[None]] = set()
     _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
@@ -2202,12 +2225,16 @@ def create_cache_wrapper(
             # Check if backend supports distributed locking
             if supports_locking(_backend):
                 func_error: Exception | None = None
+                lock_phase = _LockPhase()
                 try:
                     # Use backend's async lock protocol
-                    async with _backend.acquire_lock(
-                        cache_key,
-                        timeout=lock_timeout,
-                        blocking_timeout=blocking_timeout,
+                    async with _phased(
+                        _backend.acquire_lock(
+                            cache_key,
+                            timeout=lock_timeout,
+                            blocking_timeout=blocking_timeout,
+                        ),
+                        lock_phase,
                     ) as lock_acquired:
                         if lock_acquired:
                             # Lock acquired - double-check cache
@@ -2340,9 +2367,8 @@ def create_cache_wrapper(
                     raise
                 except Exception as e:
                     # The function's exceptions never get here (held in func_error above).
-                    # What does is a lock failure, or a cache error the lock body re-raised
-                    # on purpose: fail-closed DecryptionAuthenticationError, InteropError,
-                    # KeyringConfigurationError. Those leave a finally-only lock as they are.
+                    # What does is told apart by where it was raised (lock_phase), not by its
+                    # type: a Redis lock wraps whatever leaves its body in a BackendError.
                     if func_error is not None:
                         # The lock failed while releasing after the function raised. The
                         # function's exception wins and is raised below, outside this handler:
@@ -2351,13 +2377,31 @@ def create_cache_wrapper(
                             f"Lock release failed for {redact_cache_key(cache_key)} after the function raised; "
                             f"the lock may be held until its timeout: {redact_error_for_log(e)}"
                         )
+                    elif lock_phase.body_exited:
+                        # The body returned `result` (its every normal exit without a func_error
+                        # is a `return result`) and only the release failed. Keep it: running the
+                        # function again here would run it twice.
+                        logger().warning(
+                            f"Lock release failed for {redact_cache_key(cache_key)}; "
+                            f"the lock may be held until its timeout: {redact_error_for_log(e)}"
+                        )
+                        return result  # pyright: ignore[reportPossiblyUnboundVariable]
+                    elif lock_phase.entered:
+                        # A cache error the body re-raised on purpose: fail-closed
+                        # DecryptionAuthenticationError, InteropError, KeyringConfigurationError.
+                        # A finally-only lock lets it out as is; a Redis lock wraps it in a
+                        # BackendError, so unwrap and re-raise the original.
+                        if (
+                            isinstance(e, BackendError)
+                            and e.original_exception
+                            and not isinstance(e.original_exception, BackendError)
+                        ):
+                            raise e.original_exception from e
+                        raise
                     elif not isinstance(e, BackendError):
                         raise
-                    elif e.original_exception and not isinstance(e.original_exception, BackendError):
-                        # A Redis lock wraps them in a BackendError; unwrap and re-raise the original.
-                        raise e.original_exception from e
                     else:
-                        # Lock operation failed - execute without lock
+                        # Acquiring the lock failed - execute without lock (the lock is best effort)
                         logger().warning(
                             f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
                         )
