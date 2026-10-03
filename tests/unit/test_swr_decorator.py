@@ -17,7 +17,7 @@ import os
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import pytest
@@ -850,6 +850,59 @@ class TestAsyncSWRStoppedLoop:
         finally:
             _close_loop(first)
             _close_loop(second)
+
+    def test_pruned_revalidation_does_not_store_its_late_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancelling a pruned revalidation does not stop a function that swallows the
+        cancellation, so it must not store what it returns: a newer revalidation has already
+        stored a later value for the key."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        calls: list[str] = []
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> str:
+            if len(calls) == 1:  # the first revalidation parks, then swallows its cancellation
+                calls.append("parked")
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(3600)
+                calls.append("late")
+                return "late"
+            calls.append("seed" if not calls else "fresh")
+            return calls[-1]
+
+        async def finish() -> None:
+            """Run this loop's revalidations to the end: a store goes through a thread, and the
+            task is done only once it has landed."""
+            others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            await asyncio.wait(others, timeout=5)
+
+        async def park() -> None:
+            await compute()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def hit() -> None:
+            await compute()
+            await finish()
+
+        asyncio.run(compute())  # miss: stores "seed"
+        backend.stale = True
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(park())  # the first revalidation parks on a loop then left stopped
+            asyncio.run(hit())  # prunes it, then stores "fresh"
+            assert calls == ["seed", "parked", "fresh"]
+            assert len(backend.set_calls) == 2
+            stopped.run_until_complete(finish())  # the pruned one resumes and returns "late"
+            assert calls[-1] == "late"
+            assert len(backend.set_calls) == 2  # but stores nothing
+            backend.stale = False
+            assert asyncio.run(compute()) == "fresh"
+        finally:
+            _close_loop(stopped)
 
 
 _WRAPPER_LOGGER = "cachekit.decorators.wrapper"

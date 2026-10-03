@@ -170,6 +170,14 @@ class _RefreshPool:
             if held is not None:  # an eager task may already have finished and released
                 self._holders[slot] = (held[0], task, held[2], held[3])
 
+    def holds(self, slot: object) -> bool:
+        """Whether slot is still held. A pruned task checks this before a write: its cancellation
+        lands only if the code it awaits lets CancelledError through."""
+        if self._pid != os.getpid():
+            return False
+        with self._lock:
+            return slot in self._holders
+
     def release(self, slot: object) -> bool:
         """End a holder. False if it no longer held a slot: pruned, or admitted before a fork."""
         if self._pid != os.getpid():
@@ -1213,8 +1221,16 @@ def create_cache_wrapper(
             redact_error_for_log(exc),
         )
 
-    async def _l2_swr_recompute_store_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    async def _l2_swr_recompute_store_async(
+        slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> None:
         result = await func(*call_args, **call_kwargs)
+        if not _l2_swr_pool.holds(slot):
+            # Pruned while its loop was stopped, and func swallowed the cancellation: a newer
+            # revalidation may already have stored a later value. Past this check only cachekit
+            # code runs, which lets a later prune's cancellation through; a write it has already
+            # sent when its loop stops is not recalled.
+            return
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
@@ -1238,9 +1254,9 @@ def create_cache_wrapper(
                 async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
-                    await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                    await _l2_swr_recompute_store_async(slot, cache_key, call_args, call_kwargs)
             else:
-                await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                await _l2_swr_recompute_store_async(slot, cache_key, call_args, call_kwargs)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
             _warn_refresh(_refresh_failed_warn, "SWR revalidation failed", cache_key, exc)
         finally:
