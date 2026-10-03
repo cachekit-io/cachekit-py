@@ -706,7 +706,7 @@ class _FakePubSub:
 
 def _serve(monkeypatch: pytest.MonkeyPatch, pubsub: _FakePubSub) -> None:
     """Make the listener's redis.Redis(connection_pool=...).pubsub() return ``pubsub``."""
-    monkeypatch.setattr(invalidation.redis, "Redis", lambda connection_pool: types.SimpleNamespace(pubsub=lambda: pubsub))
+    monkeypatch.setattr(redis, "Redis", lambda connection_pool: types.SimpleNamespace(pubsub=lambda: pubsub))
 
 
 _POOL_ONLY = types.SimpleNamespace(listener_pool=lambda: None)  # a backend for start_listener with _serve

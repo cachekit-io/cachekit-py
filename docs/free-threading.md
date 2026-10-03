@@ -111,7 +111,8 @@ A program that uses cachekit's Redis backend loads redis-py through
 imports redis-py. On a free-threaded build whose GIL is still off it sets
 `sys.modules["hiredis"] = None`, so redis-py's own `import hiredis` fails and
 it binds its pure-Python parser (`_RESP2Parser`). Every cachekit path to
-redis-py goes through that package first, `PooledClientProvider` included.
+redis-py goes through that package first, `PooledClientProvider` and the
+invalidation listener included.
 The decision reads `CACHEKIT_DISABLE_HIREDIS` straight from the environment at
 `import cachekit`:
 
@@ -139,8 +140,8 @@ an `@cache(backend=None)` call and a `CachekitIOBackend` leave redis-py
 unloaded, and `test_hiredis_settings_are_read_before_backends_load` checks the
 setting is read before `cachekit.backends` or redis-py load. In this lane,
 `test_redis_backend_blocks_hiredis_before_redis_loads` checks that a
-`RedisBackend` and a `PooledClientProvider` each block hiredis before redis-py
-is first requested and leave redis-py on `_RESP2Parser`. None of these needs
+`RedisBackend`, a `PooledClientProvider` and the invalidation listener's
+import of redis-py each block hiredis before redis-py is first requested and leave redis-py on `_RESP2Parser`. None of these needs
 hiredis installed. `test_default_install_keeps_gil_disabled_after_redis_backend`
 checks the GIL in a fresh interpreter with hiredis installed, and
 `test_gil_stays_disabled_with_hiredis_blocked` is its control. Both skip where

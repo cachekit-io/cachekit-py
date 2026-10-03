@@ -140,9 +140,12 @@ import cachekit
 if sys.argv[1] == "redis-backend":
     from cachekit.backends import RedisBackend
     RedisBackend(redis_url="redis://127.0.0.1:6379")
-else:
+elif sys.argv[1] == "pooled-provider":
     from cachekit.backends.provider import PooledClientProvider
     PooledClientProvider("redis://127.0.0.1:6379")
+else:
+    from cachekit import invalidation
+    invalidation._redis()  # the invalidation listener's route to redis-py
 import redis.connection
 print(json.dumps({
     "hiredis_when_redis_requested": seen.get("redis"),
@@ -153,7 +156,7 @@ print(json.dumps({
 
 
 @pytest.mark.skipif(not _FREE_THREADED_BUILD, reason="requires a free-threaded CPython build")
-@pytest.mark.parametrize("program", ["redis-backend", "pooled-provider"])
+@pytest.mark.parametrize("program", ["redis-backend", "pooled-provider", "invalidation-listener"])
 def test_redis_backend_blocks_hiredis_before_redis_loads(program):
     """With no override, cachekit's Redis paths keep hiredis out of redis-py, installed or not."""
     state = _run_probe(_ORDERING_PROBE, program, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
