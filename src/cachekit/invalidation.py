@@ -460,10 +460,10 @@ def _warn_if_uwsgi_skips_fork_hooks() -> None:
     if not isinstance(options, dict) or _UWSGI_FORK_HOOKS in options:
         return
     logger.warning(
-        "uWSGI forks its workers without running Python's at-fork hooks: a worker forked after "
-        "cachekit was imported keeps the master's L1 entries and runs no invalidation listener, and "
-        "one that imports cachekit after the fork (lazy-apps) may start a thread that hangs. Run "
-        "uWSGI with --enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+)."
+        "uWSGI is running without py-call-uwsgi-fork-hooks, so its worker forks skip all or part of "
+        "CPython's fork protocol: a worker can keep the master's L1 entries and run no invalidation "
+        "listener, or start a thread that hangs (lazy-apps), or hang or abort at start "
+        "(py-call-osafterfork). Run uWSGI with --enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+)."
     )
 
 

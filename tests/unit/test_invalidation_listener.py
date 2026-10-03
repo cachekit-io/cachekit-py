@@ -989,8 +989,7 @@ class TestUwsgiWarning:
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         (record,) = caplog.records
-        message = record.getMessage()
-        assert "--enable-threads --py-call-uwsgi-fork-hooks" in message and "osafterfork" not in message
+        assert record.getMessage().endswith("Run uWSGI with --enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+).")
 
     @pytest.mark.parametrize("option", ["py-call-osafterfork", "lazy-apps", "lazy"])
     def test_no_other_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
@@ -1051,4 +1050,4 @@ class TestUwsgiWarning:
             timeout=60,
         )
         assert proc.returncode == 0, proc.stderr
-        assert proc.stderr.count("uWSGI forks its workers") == 1, proc.stderr
+        assert proc.stderr.count("uWSGI is running without py-call-uwsgi-fork-hooks") == 1, proc.stderr
