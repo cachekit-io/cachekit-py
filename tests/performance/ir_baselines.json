@@ -3,11 +3,11 @@
     "cpython-3.12-x86_64": {
       "budgets": {
         "l1_hit": 61244,
-        "l2_hit": 314136,
-        "l2_hit_async_metrics": 258276,
+        "l2_hit": 312228,
+        "l2_hit_async_metrics": 261598,
         "minimal_l1_hit": 59292,
-        "miss": 310019,
-        "secure_l1_hit": 241990,
+        "miss": 312010,
+        "secure_l1_hit": 236889,
         "serializer_arrow": 1946487,
         "serializer_auto": 69446,
         "serializer_default": 61356,
@@ -19,11 +19,11 @@
     "cpython-3.14-x86_64": {
       "budgets": {
         "l1_hit": 62410,
-        "l2_hit": 316348,
-        "l2_hit_async_metrics": 261362,
+        "l2_hit": 313909,
+        "l2_hit_async_metrics": 265142,
         "minimal_l1_hit": 60482,
-        "miss": 307975,
-        "secure_l1_hit": 243213,
+        "miss": 309843,
+        "secure_l1_hit": 237407,
         "serializer_arrow": 1955979,
         "serializer_auto": 70682,
         "serializer_default": 62645,
