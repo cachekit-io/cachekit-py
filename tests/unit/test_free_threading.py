@@ -212,35 +212,36 @@ _PARSER_PROBE = """
 import json
 import cachekit
 import redis
-print(json.dumps({"parser": type(redis.Connection()._parser).__name__}))
+# redis-py 5+ names its parsers _HiredisParser / _RESP2Parser; 4.x names them HiredisParser / PythonParser.
+print(json.dumps({"hiredis_parser": "Hiredis" in type(redis.Connection()._parser).__name__}))
 """
 
 
 @pytest.mark.parametrize(
-    ("setting", "parser"),
+    ("setting", "hiredis_parser"),
     [
-        ("true", "_RESP2Parser"),
+        ("true", False),
         pytest.param(
             "false",
-            "_HiredisParser",
+            True,
             marks=pytest.mark.skipif(not _hiredis_installed(), reason="requires hiredis"),
         ),
         pytest.param(
             None,
-            "_HiredisParser",
+            True,
             marks=pytest.mark.skipif(
                 _FREE_THREADED_BUILD or not _hiredis_installed(), reason="requires a GIL build with hiredis"
             ),
         ),
     ],
 )
-def test_disable_hiredis_setting_selects_connection_parser(monkeypatch, setting, parser):
+def test_disable_hiredis_setting_selects_connection_parser(monkeypatch, setting, hiredis_parser):
     """CACHEKIT_DISABLE_HIREDIS picks the parser a new connection gets; unset, GIL builds keep hiredis."""
     if setting is None:
         monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
     else:
         monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", setting)
-    assert _run_probe(_PARSER_PROBE) == {"parser": parser}
+    assert _run_probe(_PARSER_PROBE) == {"hiredis_parser": hiredis_parser}
 
 
 @pytest.mark.parametrize(
