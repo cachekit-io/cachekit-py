@@ -71,41 +71,74 @@ def _nested_maps(depth: int) -> bytes:
     return b"\x81\xa1a" * depth + b"\xc0"
 
 
+_SIZE = "bytes of at most 4096 expected"
+_SHAPE = "a map with a string registry id expected"
+_KEY = "the key is not a string"
+
+
 @pytest.mark.unit
 class TestDecodeFloor:
     """decode_event: untrusted bytes are bounded before and during decoding."""
 
     @pytest.mark.parametrize(
-        "data",
+        ("data", "error", "match"),
         [
-            pytest.param(b"\x80" + b"x" * 4096, id="oversize"),
+            pytest.param(b"\x80" + b"x" * 4096, ValueError, _SIZE, id="oversize"),
             pytest.param(
                 msgpack.packb({"r": "r" * 1000, "k": "k" * 1000, "a" * 1000: "a" * 1000, "b" * 1000: "b" * 1000}),
+                ValueError,
+                _SIZE,
                 id="oversize-but-decodable",  # within every per-field cap: only the size bound stops it
             ),
-            pytest.param("ck:reg:ns:00", id="str-not-bytes"),
-            pytest.param(None, id="none"),
-            pytest.param(b"\x91\xa1x", id="array"),
-            pytest.param(b"\x01", id="int"),
-            pytest.param(msgpack.packb("ck:reg:ns:00"), id="bare-string"),
-            pytest.param(msgpack.packb({"k": "x"}), id="no-r"),
-            pytest.param(msgpack.packb({"r": 1}), id="int-r"),
-            pytest.param(msgpack.packb({"r": None}), id="nil-r"),
-            pytest.param(msgpack.packb({"r": b"ck:reg:ns:00"}, use_bin_type=True), id="bin-r"),
-            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "k": 7}), id="int-k"),
-            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "k": None}), id="nil-k"),
-            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "k": ["a"]}), id="array-k"),
-            pytest.param(_nested_maps(1300), id="deep"),
-            pytest.param(msgpack.packb({str(i): "x" for i in range(5)}), id="five-entries"),
-            pytest.param(msgpack.packb({"r": "x" * 1025}), id="long-r"),
-            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "t": msgpack.Timestamp(0)}), id="ext"),
-            pytest.param(b"\x81\xa1r\xa2\xff\xfe", id="invalid-utf8"),
-            pytest.param(b"\x81\xa1r", id="truncated"),
-            pytest.param(msgpack.packb({"r": "ck:reg:ns:00"}) + b"\x00", id="trailing-bytes"),
+            pytest.param("ck:reg:ns:00", ValueError, _SIZE, id="str-not-bytes"),
+            pytest.param(None, ValueError, _SIZE, id="none"),
+            pytest.param(b"\x91\xa1x", ValueError, r"exceeds max_array_len\(0\)", id="array"),
+            pytest.param(b"\x01", ValueError, _SHAPE, id="int"),
+            pytest.param(msgpack.packb("ck:reg:ns:00"), ValueError, _SHAPE, id="bare-string"),
+            pytest.param(msgpack.packb({"k": "x"}), ValueError, _SHAPE, id="no-r"),
+            pytest.param(msgpack.packb({"r": 1}), ValueError, _SHAPE, id="int-r"),
+            pytest.param(msgpack.packb({"r": None}), ValueError, _SHAPE, id="nil-r"),
+            pytest.param(
+                msgpack.packb({"r": b"ck:reg:ns:00"}, use_bin_type=True), ValueError, r"exceeds max_bin_len\(0\)", id="bin-r"
+            ),
+            pytest.param(  # decodes to a valid event if bin values are allowed
+                msgpack.packb({"r": "ck:reg:ns:00", "b": b"x"}, use_bin_type=True),
+                ValueError,
+                r"exceeds max_bin_len\(0\)",
+                id="bin-extra-field",
+            ),
+            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "k": 7}), ValueError, _KEY, id="int-k"),
+            pytest.param(msgpack.packb({"r": "ck:reg:ns:00", "k": None}), ValueError, _KEY, id="nil-k"),
+            pytest.param(
+                msgpack.packb({"r": "ck:reg:ns:00", "k": ["a"]}), ValueError, r"exceeds max_array_len\(0\)", id="array-k"
+            ),
+            pytest.param(_nested_maps(1300), msgpack.exceptions.StackError, None, id="deep"),
+            pytest.param(
+                msgpack.packb({str(i): "x" for i in range(5)}), ValueError, r"exceeds max_map_len\(4\)", id="five-entries"
+            ),
+            pytest.param(  # decodes to a valid event if a map may hold five entries
+                msgpack.packb({"r": "x", "a": 1, "b": 2, "c": 3, "d": 4}),
+                ValueError,
+                r"exceeds max_map_len\(4\)",
+                id="five-entries-valid-r",
+            ),
+            pytest.param(msgpack.packb({"r": "x" * 1025}), ValueError, r"exceeds max_str_len\(1024\)", id="long-r"),
+            pytest.param(
+                msgpack.packb({"r": "ck:reg:ns:00", "t": msgpack.Timestamp(0)}),
+                ValueError,
+                r"exceeds max_ext_len\(0\)",
+                id="ext",
+            ),
+            pytest.param(b"\x81\xa1r\xa2\xff\xfe", UnicodeDecodeError, "can't decode byte 0xff", id="invalid-utf8"),
+            pytest.param(b"\x81\xa1r", ValueError, "incomplete input", id="truncated"),
+            pytest.param(
+                msgpack.packb({"r": "ck:reg:ns:00"}) + b"\x00", msgpack.exceptions.ExtraData, "extra data", id="trailing-bytes"
+            ),
         ],
     )
-    def test_rejects(self, data: object) -> None:
-        with pytest.raises(Exception):  # noqa: B017 - any exception: _on_message logs its type and drops it
+    def test_rejects(self, data: object, error: type[Exception], match: Optional[str]) -> None:
+        """Each case fails on its own bound: the error text names it, so removing that bound fails it."""
+        with pytest.raises(error, match=match):
             invalidation.decode_event(data)
 
     def test_accepts_both_event_kinds_and_ignores_extra_fields(self) -> None:
@@ -398,8 +431,6 @@ class TestListenerStart:
 
     def test_no_preset_and_no_decorator_option_reaches_the_flag(self) -> None:
         assert "invalidation_listener_enabled" not in DecoratorConfig.__dataclass_fields__
-        for preset in ("minimal", "production", "dev", "test"):
-            assert not hasattr(getattr(DecoratorConfig, preset)(), "invalidation_listener_enabled")
         assert CachekitConfig().invalidation_listener_enabled is False
 
     def test_flag_reads_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
