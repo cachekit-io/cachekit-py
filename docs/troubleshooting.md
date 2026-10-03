@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): exceptions raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). Exceptions raised by the decorated function itself never count. A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
 - Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many within 60 seconds open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count.
+Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions never count toward the circuit breaker, so a function that raises does not stop its own caching.
 
 </details>
 
