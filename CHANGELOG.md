@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.22.0](https://github.com/cachekit-io/cachekit-py/compare/v0.21.0...v0.22.0) (2026-10-03)
+
+
+### Features
+
+* **cachekitio:** send a cachekit-py/&lt;version&gt; User-Agent (LAB-7052) ([#479](https://github.com/cachekit-io/cachekit-py/issues/479)) ([9dc474a](https://github.com/cachekit-io/cachekit-py/commit/9dc474aefffec5cd4879909b037cc17475d2bee2))
+* **invalidation:** announce each invalidation on a Redis pub/sub channel (LAB-652) ([#470](https://github.com/cachekit-io/cachekit-py/issues/470)) ([5733626](https://github.com/cachekit-io/cachekit-py/commit/57336262bea5f3a3c36d27db1f43b9bb1b4cd032))
+* **invalidation:** opt-in listener evicts L1 on other processes' invalidations (LAB-652) ([#472](https://github.com/cachekit-io/cachekit-py/issues/472)) ([1ae8f12](https://github.com/cachekit-io/cachekit-py/commit/1ae8f1244bd632229b5c09cd7ba246c899f0e6b9))
+* **l1:** a forked child starts with an empty L1 (LAB-652) ([#471](https://github.com/cachekit-io/cachekit-py/issues/471)) ([5097c12](https://github.com/cachekit-io/cachekit-py/commit/5097c12930179303790beefc3bb6b6e586d93d4b))
+
+
+### Bug Fixes
+
+* **arrow:** reject dict values that pyarrow stores as the wrong column (LAB-7490) ([#459](https://github.com/cachekit-io/cachekit-py/issues/459)) ([5cec332](https://github.com/cachekit-io/cachekit-py/commit/5cec3326d7c545458e4bc45ddbb2cabfb7a40156))
+* **cachekitio:** never reuse a parent's pooled connection after fork (LAB-7146) ([#468](https://github.com/cachekit-io/cachekit-py/issues/468)) ([15c1351](https://github.com/cachekit-io/cachekit-py/commit/15c13514e6cbd2ef0df2c77eae82366bb803e542))
+* **cachekitio:** retry a write once on 503 with a short Retry-After (LAB-7686) ([#477](https://github.com/cachekit-io/cachekit-py/issues/477)) ([77a16a5](https://github.com/cachekit-io/cachekit-py/commit/77a16a52ed5d6a984b1b6a9a77780bcba6f66d3c))
+* **decorators:** degrade on async lock errors instead of raising or polling (LAB-5346) ([#473](https://github.com/cachekit-io/cachekit-py/issues/473)) ([6f901f6](https://github.com/cachekit-io/cachekit-py/commit/6f901f649e91359ea057615add8b214cbfff7e30))
+* **invalidation:** delete the pre-0.20.0 twin on no-args invalidation (LAB-5308) ([#464](https://github.com/cachekit-io/cachekit-py/issues/464)) ([f8365d3](https://github.com/cachekit-io/cachekit-py/commit/f8365d380f4d9a93a6555b93b988bbc1255bf92f))
+* **invalidation:** throttle the listener's reconnect WARNING to one a minute (LAB-7638) ([#482](https://github.com/cachekit-io/cachekit-py/issues/482)) ([b3a6c8a](https://github.com/cachekit-io/cachekit-py/commit/b3a6c8a55d8f54638e4c791347473ab90966dc3a))
+* **metrics:** size the duration and size histogram buckets for ms and bytes (LAB-7587) ([#476](https://github.com/cachekit-io/cachekit-py/issues/476)) ([f1a52bd](https://github.com/cachekit-io/cachekit-py/commit/f1a52bd0e5d850aa989773c97f42a7e7aaf86e6f))
+* **redis:** decide on hiredis before redis imports so 3.14t keeps the GIL off (LAB-7077) ([#465](https://github.com/cachekit-io/cachekit-py/issues/465)) ([c19ab6b](https://github.com/cachekit-io/cachekit-py/commit/c19ab6b8913fd26011617fc4afa806a9a67d3c64))
+
+
+### Performance Improvements
+
+* **cachekitio:** fan out whole-function invalidation deletes, 16 at a time (LAB-7070) ([#478](https://github.com/cachekit-io/cachekit-py/issues/478)) ([72026b1](https://github.com/cachekit-io/cachekit-py/commit/72026b1b5f5d3ee93b643dd9b1d5d494099ebe94))
+* **decorators:** decide refresh_ttl_on_get from Fresh-For, refresh in the background (LAB-7074) ([#435](https://github.com/cachekit-io/cachekit-py/issues/435)) ([cc9bf65](https://github.com/cachekit-io/cachekit-py/commit/cc9bf65262193cc712e17d008b0730c00512409b))
+* **serializers:** memoize CK frame headers and pack AutoSerializer values without rebuilding the tree (LAB-7069) ([#441](https://github.com/cachekit-io/cachekit-py/issues/441)) ([c2e907a](https://github.com/cachekit-io/cachekit-py/commit/c2e907af30693bcadf924b992762c75fbbcebb24))
+
 ## [0.21.0](https://github.com/cachekit-io/cachekit-py/compare/v0.20.0...v0.21.0) (2026-10-03)
 
 

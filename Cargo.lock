@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "cachekit-rs"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "cachekit-core",
  "criterion 0.8.2",
