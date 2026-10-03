@@ -138,6 +138,24 @@ remaining = await backend.get_ttl("my-key")      # seconds remaining, or None
 refreshed = await backend.refresh_ttl("my-key", ttl=300)  # update TTL in place
 ```
 
+`get_ttl` counts down to eviction, which includes any `stale_ttl` window. A `PATCH` to an entry
+already past its freshness returns 409, so `refresh_ttl` returns `False`.
+
+With `refresh_ttl_on_get=True`, an async decorated L2 hit decides from the read's remaining
+freshness (`X-CacheKit-Fresh-For`) instead: it sends the refresh when the entry is still fresh
+and less than `ttl_refresh_threshold × ttl` of freshness is left. The refresh runs in the
+background and adds no round trip to the hit. A stale hit is not refreshed. When the server
+sends no usable remaining-freshness value, the decorator falls back to `get_ttl`, also in the
+background.
+
+Refreshes are best-effort. On running event loops, at most one refresh per key and 32 per
+decorated function run at once; a hit that finds its key's refresh running, or the limit
+reached, skips its own, and a later hit retries. A refresh stranded on a stopped event loop
+(sync code that calls `loop.run_until_complete` and leaves the loop stopped) gives up its turn
+30 seconds after it was scheduled and is cancelled, so a hit on another loop can refresh that
+key again. A `PATCH` it had already sent is not recalled: if the server has not answered within
+those 30 seconds, the key can get one more.
+
 ## Timeout Override
 
 Returns a new instance:

@@ -14,6 +14,7 @@ so asserting on a hand-fed argument would pin nothing.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -24,6 +25,10 @@ from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import CacheOperationHandler, CacheSerializationHandler
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.standard_serializer import StandardSerializer
+from tests.unit.test_invalidate_no_args import ScopedFlakyBackend
+from tests.unit.test_invalidate_no_args import _tenant as _flaky_tenant
+from tests.unit.test_key_registry import ScopedBackend, TrackingBackend
+from tests.unit.test_key_registry import _tenant as _registry_tenant
 
 
 class _RecordingBackend:
@@ -305,6 +310,25 @@ def _pre_020_key(current_key: str) -> str:
 NON_DEFAULT_SERIALIZERS = [pytest.param("auto", id="auto"), pytest.param(StandardSerializer(), id="instance")]
 
 
+class _StaleHitBackend(_RecordingBackend):
+    """Freshness-capable store that labels every hit stale, so the hit is never backfilled into L1."""
+
+    def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
+        self.store[key] = value
+
+    def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
+        value = self.store.get(key)
+        return None if value is None else (value, True, None)
+
+
+class _BytearrayHitBackend(_RecordingBackend):
+    """Out-of-contract store: a bytearray envelope deserializes, but the L1 backfill refuses it."""
+
+    def get(self, key: str) -> bytearray | None:  # type: ignore[override]
+        value = self.store.get(key)
+        return None if value is None else bytearray(value)
+
+
 class _FailOnKeysBackend(_RecordingBackend):
     """Recording backend whose delete raises for chosen keys, after recording the attempt."""
 
@@ -559,3 +583,310 @@ class TestHashedLegacyKeyMatchesV019:
         await fn.ainvalidate_cache(1)
 
         assert backend.store == {}, "the key 0.19.0 wrote survived invalidation"
+
+
+@pytest.mark.unit
+class TestNoArgsInvalidationReachesPre020Keys:
+    """No-args `invalidate_cache()`, `ainvalidate_cache()` and `cache_clear()` also delete the
+    pre-0.20.0 twin of every generated key this process wrote or read.
+
+    The write path and every L2 hit record each key's twin next to the key, so both
+    whole-function paths (the local sweep and the key-registry drain) delete it, count its
+    failure and retry it like any recorded key. Twins of keys this process never wrote or read
+    stay out of reach.
+    """
+
+    @staticmethod
+    def _write_and_seed_twin(fn: Any, backend: Any) -> tuple[str, str]:
+        fn(1)
+        (current_key,) = backend.store
+        assert _suffix(current_key) == "1a", "key too long: it was hashed, so _pre_020_key cannot derive its twin"
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"pre-0.20.0 copy"
+        return current_key, legacy_key
+
+    @pytest.mark.parametrize("backend_cls", [_RecordingBackend, TrackingBackend], ids=["local_sweep", "registry_drain"])
+    @pytest.mark.parametrize("clear", ["invalidate_cache", "cache_clear"])
+    def test_sync_no_args_deletes_the_twin(self, backend_cls: type, clear: str):
+        backend = backend_cls()
+
+        @cache(backend=backend, ttl=None, namespace=f"twin-s{backend_cls is TrackingBackend:d}{clear[0]}", serializer="auto")
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        for _ in range(2):  # the second round re-records after the first trimmed everything
+            self._write_and_seed_twin(fn, backend)
+            getattr(fn, clear)()
+            assert backend.store == {}, "the pre-0.20.0 twin survived a no-args invalidation"
+
+    @pytest.mark.parametrize("backend_cls", [_RecordingBackend, TrackingBackend], ids=["local_sweep", "registry_drain"])
+    async def test_async_no_args_deletes_the_twin(self, backend_cls: type):
+        backend = backend_cls()
+
+        @cache(backend=backend, ttl=None, namespace=f"twin-a{backend_cls is TrackingBackend:d}", serializer="auto")
+        async def fn(x: int) -> dict:
+            return {"v": x}
+
+        for _ in range(2):
+            await fn(1)
+            (current_key,) = backend.store
+            assert _suffix(current_key) == "1a"
+            backend.store[_pre_020_key(current_key)] = b"pre-0.20.0 copy"
+
+            await fn.ainvalidate_cache()
+
+            assert backend.store == {}, "the pre-0.20.0 twin survived a no-args invalidation"
+
+    @pytest.mark.parametrize(
+        ("backend_cls", "l1_enabled"),
+        [
+            pytest.param(_RecordingBackend, False, id="l1_off-local_sweep"),
+            pytest.param(TrackingBackend, False, id="l1_off-registry_drain"),
+            pytest.param(_StaleHitBackend, True, id="stale_hit"),
+            pytest.param(_BytearrayHitBackend, True, id="refused_backfill"),
+        ],
+    )
+    def test_l2_hit_without_l1_backfill_records_key_and_twin(self, backend_cls: type, l1_enabled: bool):
+        """A process that only read the key from L2, and did not backfill L1, still deletes both copies.
+
+        The backfill is what records a hit's key and twin. Unless a skipped backfill records
+        them too, that process's no-args invalidation leaves the twin, which a v0.19 replica
+        keeps serving, and on a backend with no key registry the current key as well.
+        """
+        backend = backend_cls()
+        calls: list[int] = []
+
+        def fn(x: int) -> dict:
+            calls.append(x)
+            return {"v": x}
+
+        namespace = f"twin-h{backend_cls.__name__[1:4]}{l1_enabled:d}"
+        writer = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=False)(fn)
+        reader = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=l1_enabled)(fn)
+        self._write_and_seed_twin(writer, backend)
+
+        assert reader(1) == {"v": 1}
+        assert calls == [1], "the reader's call was not an L2 hit"
+        reader.invalidate_cache()
+
+        assert backend.store == {}, "an L2 hit that skipped the L1 backfill did not record its key and twin"
+
+    @pytest.mark.parametrize("backend_cls", [_RecordingBackend, TrackingBackend], ids=["local_sweep", "registry_drain"])
+    async def test_async_l2_hit_without_l1_records_key_and_twin(self, backend_cls: type):
+        backend = backend_cls()
+        calls: list[int] = []
+
+        async def fn(x: int) -> dict:
+            calls.append(x)
+            return {"v": x}
+
+        namespace = f"twin-ha{backend_cls is TrackingBackend:d}"
+        writer = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=False)(fn)
+        reader = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=False)(fn)
+        await writer(1)
+        (current_key,) = backend.store
+        assert _suffix(current_key) == "1a"
+        legacy_key = _pre_020_key(current_key)
+        backend.store[legacy_key] = b"pre-0.20.0 copy"
+
+        assert await reader(1) == {"v": 1}
+        assert calls == [1], "the reader's call was not an L2 hit"
+        await reader.ainvalidate_cache()
+
+        assert backend.store == {}, "an async L2 hit with L1 off did not record its key and twin"
+
+    def test_no_args_deletes_the_v019_hashed_twin(self):
+        """A hashed key's twin comes from the legacy derivation, not from rewriting its suffix."""
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, ttl=None, namespace=_LONG_NAMESPACE, serializer="auto", l1_enabled=False)
+        @_pin_identity
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        fn(1)
+        backend.store[_V019_LONG_KEY] = b"0.19.0 copy"
+
+        fn.invalidate_cache()
+
+        assert backend.store == {}, "the key 0.19.0 wrote survived a no-args invalidation"
+
+    @pytest.mark.parametrize(
+        ("backend_cls", "integrity", "reached"),
+        [
+            pytest.param(_RecordingBackend, True, False, id="local_sweep"),
+            pytest.param(TrackingBackend, True, True, id="registry_drain"),
+            pytest.param(TrackingBackend, False, False, id="registry_drain-other_integrity"),
+        ],
+    )
+    def test_registry_alone_reaches_an_unseen_twin(self, backend_cls: type, integrity: bool, reached: bool):
+        """A twin this process never wrote or read is out of reach, except through the key registry.
+
+        A default-serializer decorator with the same integrity setting writes the non-default
+        decorator's pre-0.20.0 twin as its own key, and the registry set is named by function and
+        namespace, not serializer or integrity setting. So it registers the twin, and the
+        non-default decorator's drain deletes it. With another integrity setting its key differs.
+        """
+        backend = backend_cls()
+
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        namespace = f"twin-u{backend_cls is TrackingBackend:d}{integrity:d}"
+        probe_backend = _RecordingBackend()
+        cache(backend=probe_backend, ttl=None, namespace=namespace, serializer="auto")(fn)(1)
+        (auto_key,) = probe_backend.store
+        assert _suffix(auto_key) == "1a"
+        twin = _pre_020_key(auto_key)
+        default_writer = cache(backend=backend, ttl=None, namespace=namespace, integrity_checking=integrity)(fn)
+        auto = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=False)(fn)
+        default_writer(1)
+        assert (twin in backend.store) is integrity, "the default serializer's key is the twin iff integrity matches"
+        backend.store.setdefault(twin, b"pre-0.20.0 copy")
+
+        auto.invalidate_cache()
+
+        assert (twin not in backend.store) is reached, f"expected twin reached={reached}"
+
+    def test_default_serializer_issues_one_delete_per_recorded_key(self):
+        """Code `s` already is the legacy key: no twin is recorded, so no second delete."""
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="twin-default", serializer="default")
+        def fn(x: int) -> int:
+            return x
+
+        fn(1)
+        fn(2)
+        written = set(backend.store)
+        backend.deleted.clear()
+
+        fn.invalidate_cache()
+
+        assert len(backend.deleted) == 2
+        assert set(backend.deleted) == written
+
+    def test_key_function_records_no_twin(self):
+        backend = _RecordingBackend()
+
+        @cache(backend=backend, ttl=60, namespace="twin-keyfn", serializer="auto", key=str)
+        def fn(x: int) -> int:
+            return x
+
+        fn(1)
+        (written_key,) = backend.store
+        backend.deleted.clear()
+
+        fn.invalidate_cache()
+
+        assert backend.deleted == [written_key]
+
+    @pytest.mark.parametrize(
+        ("backend_cls", "tenant"),
+        [(ScopedFlakyBackend, _flaky_tenant), (ScopedBackend, _registry_tenant)],
+        ids=["local_sweep", "registry_drain"],
+    )
+    def test_another_tenants_no_args_call_leaves_the_twin(self, backend_cls: type, tenant: Any):
+        """Tenant B's whole-function invalidation never deletes tenant A's twin."""
+        backend = backend_cls()
+
+        @cache(
+            backend=backend,
+            ttl=None,
+            namespace=f"twin-t{backend_cls is ScopedBackend:d}",
+            serializer="auto",
+            l1_enabled=False,
+        )
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        token = tenant.set("a")
+        try:
+            fn(1)
+            (a_key,) = backend.store
+            assert _suffix(a_key) == "1a"
+            a_twin = _pre_020_key(a_key)
+            backend.store[a_twin] = b"tenant a pre-0.20.0 copy"
+        finally:
+            tenant.reset(token)
+
+        token = tenant.set("b")
+        try:
+            fn.invalidate_cache()
+        finally:
+            tenant.reset(token)
+        assert a_twin in backend.store, "tenant B's invalidation deleted tenant A's twin"
+
+        token = tenant.set("a")
+        try:
+            fn.invalidate_cache()
+        finally:
+            tenant.reset(token)
+        assert backend.store == {}
+
+    def test_failed_twin_delete_is_counted_and_retried(self, caplog: pytest.LogCaptureFixture):
+        backend = _FailOnKeysBackend()
+
+        @cache(backend=backend, ttl=None, namespace="twin-retry", serializer="auto")
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        current_key, legacy_key = self._write_and_seed_twin(fn, backend)
+        backend.fail_on = {legacy_key}
+
+        with caplog.at_level(logging.ERROR, logger="cachekit"):
+            fn.invalidate_cache()
+
+        records = [r for r in caplog.records if "Failed to delete" in r.getMessage()]
+        assert [r.getMessage() for r in records] == [
+            "Failed to delete 1 L2 key(s); they stay tracked for the next invalidate_cache()"
+        ]
+        assert list(backend.store) == [legacy_key]
+
+        backend.fail_on = set()
+        fn.invalidate_cache()
+        assert backend.store == {}, "the next no-args invalidation did not retry the failed twin delete"
+
+    @pytest.mark.parametrize("path", ["local_sweep", "registry_drain"])
+    def test_rewrite_during_invalidation_keeps_the_twin_tracked(self, path: str):
+        """A key rewritten while a no-args invalidation runs stays tracked, and so does its twin.
+
+        The rewrite lands after the invalidation deleted both keys and before it trims them.
+        The trim keeps the rewritten key; if it dropped the twin, a twin an old replica writes
+        afterwards would survive the next no-args invalidation.
+        """
+        rewrite: list[Callable[[], Any]] = []
+
+        class _RewriteMidSweep(_RecordingBackend):
+            def delete(self, key: str) -> bool:
+                deleted = super().delete(key)
+                if rewrite and _suffix(key) == "1a":
+                    rewrite.pop()()
+                return deleted
+
+        class _RewriteMidDrain(TrackingBackend):
+            def drain_tracked(self, registry_id: str, local_keys: Any) -> set[str]:
+                drained = super().drain_tracked(registry_id, local_keys)
+                if rewrite:
+                    rewrite.pop()()
+                return drained
+
+        backend = _RewriteMidSweep() if path == "local_sweep" else _RewriteMidDrain()
+
+        # L1 off, so the rewrite misses L1 and writes through, as a call on another thread would.
+        @cache(backend=backend, ttl=None, namespace=f"twin-r{path[0]}", serializer="auto", l1_enabled=False)
+        def fn(x: int) -> dict:
+            return {"v": x}
+
+        current_key, legacy_key = self._write_and_seed_twin(fn, backend)
+        rewrite.append(lambda: fn(1))
+
+        fn.invalidate_cache()
+
+        assert not rewrite, "the rewrite hook never ran"
+        assert list(backend.store) == [current_key], "the rewrite did not land after the delete"
+        backend.store[legacy_key] = b"written by an old replica after the invalidation"
+
+        fn.invalidate_cache()
+
+        assert backend.store == {}, "the twin of a key rewritten mid-invalidation was no longer tracked"

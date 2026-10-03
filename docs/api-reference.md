@@ -88,7 +88,7 @@ def your_function(args):
 
 #### Performance Parameters
 
-- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on cache hits when below threshold
+- **`refresh_ttl_on_get`** (`bool`, default: `False`) - Refresh TTL on async L2 hits when below threshold, in the background (no extra round trip on the hit). On CachekitIO the threshold is checked against the hit's remaining freshness; see [CachekitIO TTL inspection](backends/cachekitio.md#ttl-inspection-async-only)
 - **`ttl_refresh_threshold`** (`float`, default: `0.5`) - Minimum remaining TTL fraction (0.0–1.0) to trigger refresh
 - **`l1`** (`L1CacheConfig`, default: `L1CacheConfig()`) - L1 in-memory cache configuration
 
@@ -592,6 +592,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
+- **`invalidation_listener_enabled`** (`bool`, default: `False`) - Run the cross-process L1 invalidation listener in this process: one thread and one Redis connection that evict this process's L1 copies of keys other processes invalidate; tenant-scoped Redis backend only (env: `CACHEKIT_INVALIDATION_LISTENER_ENABLED`). See [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
 #### Example
@@ -809,14 +810,24 @@ names carry no `cachekit_` prefix:
 
 - `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
 - `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
-- `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`
-- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`
+- `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`. Buckets: 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, `+Inf`
+- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`. Buckets: powers of 4 from 16 to 268435456 (256 MiB), `+Inf`
 - `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`
 preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` marks a record
 emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
 rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
+
+Each histogram records one observation per operation whose value is above zero, so its `_count` can be
+lower than `cache_operations_total`. Releases before these bucket bounds used
+prometheus_client's default buckets, sized for seconds, so the `le` values changed: re-check dashboards
+and recording rules over the `_bucket` series. A p99 across all label tuples aggregates with
+`sum by (le)`:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(cache_operation_duration_ms_bucket[5m])))
+```
 
 See the [Prometheus Metrics guide](features/prometheus-metrics.md) for exposition setup,
 query examples, and alerting rules.

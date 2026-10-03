@@ -155,6 +155,16 @@ class CachekitConfig(RedactingSettings):
         gt=0,
         description="Background cleanup interval for expired L1 entries",
     )
+    invalidation_listener_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the cross-process L1 invalidation listener in this process (env: "
+            "CACHEKIT_INVALIDATION_LISTENER_ENABLED): one background thread and one dedicated Redis "
+            "connection that evict this process's L1 copies of keys other processes invalidate. "
+            "Needs the tenant-scoped Redis backend (env-resolved Redis or RedisBackendProvider). "
+            "Publishing needs no setting: every process on that backend announces its invalidations."
+        ),
+    )
 
     # Logging configuration
     log_sampling_rate: float = Field(

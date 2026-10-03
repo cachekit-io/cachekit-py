@@ -69,10 +69,19 @@ class _LockingBackend(_MemoryBackend):
 
 
 class _FailingReleaseLockBackend(_LockingBackend):
-    """Its release raises, as an executor shut down mid-release would make RedisBackend's do."""
+    """Its release raises, as an executor shut down mid-release would make RedisBackend's do.
+
+    ``fill`` is written as the lock is taken, as another worker's entry, so the lock-acquired
+    double-check hits.
+    """
+
+    def __init__(self, *, redis_shaped: bool, fill: dict[str, bytes] | None = None) -> None:
+        super().__init__(redis_shaped=redis_shaped)
+        self._fill = fill or {}
 
     @asynccontextmanager
     async def acquire_lock(self, key: str, timeout: float, blocking_timeout: float | None = None) -> AsyncIterator[bool]:
+        self.store.update(self._fill)
         async with super().acquire_lock(key, timeout, blocking_timeout) as acquired:
             try:
                 yield acquired
@@ -191,6 +200,52 @@ class TestFunctionBackendErrorRunsOnce:
 
         assert len(raised) == 1
         assert excinfo.value is raised[0]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestLockReleaseFailureKeepsTheResult:
+    """A release that fails after the lock body returned keeps that result: the function never reruns.
+
+    The lock clause tells a release failure from an acquire failure by where it was raised, so
+    it never takes one for the other and degrades to "run without the lock" a second time.
+    """
+
+    @staticmethod
+    def _fn(backend: _LockingBackend, runs: list[int], namespace: str) -> Any:
+        @cache(backend=backend, ttl=60, l1_enabled=False, namespace=namespace)
+        async def fn(x: int) -> int:
+            runs.append(x)
+            return x * 2
+
+        return fn
+
+    @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
+    async def test_after_the_store(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped)
+        runs: list[int] = []
+        fn = self._fn(backend, runs, f"lab5346-release-store-{int(redis_shaped)}")
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            assert await fn(1) == 2
+
+        assert runs == [1]
+        assert len(backend.store) == 1, "the result was cached before the release failed"
+        assert any("Lock release failed" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("redis_shaped", LOCK_SHAPES)
+    async def test_after_the_double_check_hit(self, redis_shaped: bool, caplog: pytest.LogCaptureFixture) -> None:
+        namespace = f"lab5346-release-double-check-{int(redis_shaped)}"
+        writer = _LockingBackend(redis_shaped=redis_shaped)
+        assert await self._fn(writer, [], namespace)(1) == 2  # another worker's entry for fn(1)
+        backend = _FailingReleaseLockBackend(redis_shaped=redis_shaped, fill=dict(writer.store))
+        runs: list[int] = []
+
+        with caplog.at_level(logging.WARNING, logger="cachekit"):
+            assert await self._fn(backend, runs, namespace)(1) == 2
+
+        assert runs == [], "the double-check hit is the result; nothing runs"
+        assert any("Lock release failed" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.unit

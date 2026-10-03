@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from cachekit import cache
+from cachekit import cache, hash_utils
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.config.validation import ConfigurationError
 
@@ -813,8 +813,6 @@ class TestRevalidationFailureWarnings:
     async def test_failures_in_one_window_warn_once_and_the_next_warning_carries_the_count(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        import cachekit.decorators.wrapper as wrapper_mod
-
         backend = FakeSWRBackend()
         calls = {"n": 0}
 
@@ -834,7 +832,7 @@ class TestRevalidationFailureWarnings:
                 # The recompute raises without awaiting, so its log line and slot release land
                 # in the same task step as the count: the next stale hit revalidates again.
                 assert await _await_for(lambda attempt=attempt: calls["n"] == attempt + 1)
-            monkeypatch.setattr(wrapper_mod, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert await compute() == 1
             assert await _await_for(lambda: calls["n"] == n + 2)
         warnings = _warnings(caplog, "SWR revalidation failed")
@@ -870,7 +868,7 @@ class TestRevalidationFailureWarnings:
         """A child does not inherit a held throttle lock, nor the parent's window and count."""
         import multiprocessing
 
-        from cachekit.decorators.wrapper import _WarnThrottle
+        from cachekit.hash_utils import _WarnThrottle
 
         throttle = _WarnThrottle()
         assert throttle.claim() == 1  # the parent's window opens

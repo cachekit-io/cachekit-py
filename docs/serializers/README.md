@@ -73,13 +73,18 @@ or by any replica after a rollback to v0.19, deletes only the `:{integrity_flag}
 copy that a v0.20.0 replica wrote under the new key survives. Re-issue any erasure made during
 the rollout once the last v0.19 replica is retired, or cover it with the flush below.
 
-**What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry whose
-arguments you never invalidate. On a function that takes parameters, no-argument
-`invalidate_cache()` / `cache_clear()` does not reach them either: it deletes the keys this process tracked plus, on the tenant-scoped Redis
-backend, the keys in the server-side key registry, and releases before v0.20.0 recorded their
-keys in neither. So if you cache personal data under `ttl=None`, or otherwise need every pre-upgrade
-entry gone rather than aging out, follow the flush procedure in the retention warning
-[below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
+**What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry it never
+recorded. On a function that takes parameters, no-argument `invalidate_cache()` /
+`await fn.ainvalidate_cache()` / `cache_clear()` deletes every key this process recorded since
+it started, the pre-v0.20.0 `:{integrity_flag}s` twin of every key it wrote or read since it
+started, plus, on the tenant-scoped Redis backend, the keys in the server-side key registry.
+It misses the twin of any key only another process, or this process before a restart, wrote
+or read: the registry holds keys, not their twins, and releases before v0.20.0 recorded their
+keys nowhere. The one exception is a v0.20.0 or later decorator on the default serializer for
+the same function, namespace and `integrity_checking` setting: its key is that twin, and it registers it like any key it
+writes, until the registration lapses (see the retention warning [below](#changing-serializers-separate-keyspaces)). So if you cache personal
+data under `ttl=None`, or otherwise need every pre-upgrade entry gone rather than aging out,
+follow the flush procedure in the retention warning [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
 writing `:{integrity_flag}s` entries behind your flush. A `namespace=` bump gives an explicit cut-over but
 orphans the old keyspace rather than deleting it; the retention step still applies.
@@ -162,18 +167,33 @@ def get_data():
 > If you cache personal data, **flush the affected namespace** when you change a serializer
 > rather than relying on expiry, and after upgrading to v0.20.0 for any entries that
 > single-key invalidation will not reach. The SDK has no bulk delete. On a function that
-> takes parameters, `cache_clear()` reaches a pre-upgrade `:{integrity_flag}s` twin only
-> where that exact key was tracked, in two cases. A twin whose delete failed during
-> `invalidate_cache(args)` is re-tracked in that process's memory, and that process's next
-> no-argument call retries it. A restart, or a call from another process, does not. And on
-> the tenant-scoped Redis backend, a v0.20.0 decorator on the default serializer for the
-> same function and namespace registers that key in the server-side key registry, which
-> every decorator of that function and namespace drains. A twin only a v0.19 release ever
-> wrote is in neither. On a sync function with no parameters, `cache_clear()` deletes the
+> takes parameters, no-argument `cache_clear()` (on an async function with a backend,
+> `await fn.ainvalidate_cache()`; `cache_clear()` raises `TypeError` there) deletes the
+> pre-upgrade `:{integrity_flag}s` twin of every key this process wrote or read since it
+> started, and a twin whose delete fails stays tracked for that process's next call. It misses
+> the twin of a key only another process, or this process before a restart, wrote or read. On the
+> tenant-scoped Redis backend the server-side key registry drains those keys but not their
+> twins, with one exception: a v0.20.0 or later decorator on the default serializer for the same
+> function, namespace and `integrity_checking` setting registers its `:{integrity_flag}s` key
+> there like any key it writes. That registration lapses seven days after the last tracked write to the
+> function's registry, and a `ttl=None` entry outlives it. On a sync function with no
+> parameters, `cache_clear()` deletes the
 > key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and
 > `await fn.ainvalidate_cache()` deletes both. So flush on
-> the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
-> matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
+> the backend: on Redis, run the `scan_iter` + `unlink` script under *Option 3: Data
+> corruption* in [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch)
+> once per tenant and per namespace or function (no single `SCAN` pattern both carries the
+> default backend's `t:<tenant>:` key prefix and stops at the namespace boundary). A run
+> reaches only the tenant in its `prefix`, and its `0 generated keys left` speaks for that
+> tenant alone: if you set `tenant_context`, repeat it for every tenant your application
+> uses (the script says how to list them, and that in a shared database a listed tenant
+> may belong to another application). The script does
+> not delete shortened keys (a namespace plus function name past about 170 characters):
+> when it prints `shortened keys may belong here`, the namespace is not yet erased. Evict
+> them with `invalidate_cache(<args>)`; if you do not know the arguments, delete the keys
+> its `shortened` pattern matches only once no other namespace or function shares their
+> first 50 characters, or flush the database if it is dedicated to cachekit. The File
+> backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
 > there retire only by TTL. During a rolling deploy, flush **after the last replica still
 > writing the old keys is gone** — anything written behind the flush is orphaned.

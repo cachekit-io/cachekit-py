@@ -170,7 +170,6 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 | Integrity Checking | - | ✅ | - | ✅ | ✅ 🔒 |
 | Encryption | - | - | - | - | ✅ Required |
 | L1 SWR (L1-only mode) | - | ✅ | - | ✅ | - |
-| L1 Invalidation | - | - | - | ✅ | ✅ |
 | Prometheus Metrics | - | -¹ | - | ✅ | ✅ |
 | Tracing | - | ✅ | - | ✅ | ✅ |
 | Structured Logging | - | ✅ | - | ✅ | ✅ |
@@ -181,6 +180,8 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 > 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
 >
 > **Default TTL** follows the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) (`@cache.io` 3600 s) — the same numbers as cachekit-rs and cachekit-ts. `ttl=` overrides it; `ttl=None` is the explicit never-expire opt-in ([details](docs/configuration.md#intent-presets)).
+>
+> **Cross-process L1 eviction** is not a preset feature: every preset's `invalidate_cache()` deletes from L1 and L2 alike, and evicting other processes' L1 copies is one process-wide opt-in, `CACHEKIT_INVALIDATION_LISTENER_ENABLED` ([L1 invalidation](docs/features/l1-invalidation.md#cross-process-l1-eviction)).
 >
 > **L1 SWR** (within-TTL background refresh) runs only in L1-only mode (`backend=None`) — with a backend configured it has no effect. `@cache.io` additionally ships past-TTL SWR via `stale_ttl` ([docs](docs/configuration.md#stale-while-revalidate-stale_ttl)).
 >
@@ -448,7 +449,7 @@ info = expensive_func.cache_info()
 | [Prometheus Metrics][prometheus-url] | Built-in observability |
 | [Zero-Knowledge Encryption][encryption-url] | Client-side security |
 | [Interop Mode][interop-url] | Cross-SDK cache sharing with cachekit-ts/rs |
-| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), stale-while-revalidate |
+| [L1 Invalidation & SWR][l1-invalidation-url] | Invalidation scope (incl. cross-process whole-function on tenant-scoped Redis from the environment or `RedisBackendProvider`), opt-in cross-process L1 eviction, stale-while-revalidate |
 | [Reference Caching][reference-caching-url] | `@cache.local()` for non-serializable objects |
 | [Rust Serialization][rust-serialization-url] | ByteStorage layer: LZ4, xxHash3, AES-256-GCM |
 | [SSRF Protection][ssrf-url] | URL allowlisting for the CachekitIO backend |

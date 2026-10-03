@@ -21,7 +21,8 @@ def classify_http_error(
     """Classify HTTP exception into BackendError with error_type.
 
     Maps HTTP status codes and network exceptions to BackendErrorType
-    categories for the circuit breaker. Each request is sent once; nothing retries it.
+    categories for the circuit breaker. A PUT or DELETE answered 503 with ``Retry-After``
+    of at most 2 s is sent once more before it gets here; every other request is sent once.
 
     Args:
         exc: Original exception
