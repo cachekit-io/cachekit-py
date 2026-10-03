@@ -103,7 +103,7 @@ def expensive_computation(x: int) -> dict:
 > [!IMPORTANT]
 > **Why cachekit wins:**
 > - **L1+L2 caching**: L1 hits ~50ns (local memory), L1 miss → L2 Redis (~2-7ms)
-> - **Circuit breaker**: Redis down? Cache gracefully, don't cascade failures
+> - **Graceful degradation**: Redis down? Errors are logged, the function runs and L1 keeps caching, nothing raises
 > - **Distributed locking**: Prevents cache stampedes across pods
 > - **Encryption**: with `@cache.secure`, client-side AES-256-GCM means Redis sees only ciphertext values (plain `@cache` does not encrypt)
 > - **Metrics**: Prometheus counters for hits/misses/errors

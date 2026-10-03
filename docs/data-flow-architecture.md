@@ -792,13 +792,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 **States:**
 - **CLOSED**: Normal operation (requests allowed)
-- **OPEN**: Too many failures (requests blocked, fallback used)
+- **OPEN**: Too many failures (L2 skipped: L1 hits still served, an L1 miss runs the function)
 - **HALF_OPEN**: Testing recovery (limited requests)
-
-**Fallback Strategies:**
-- `fail_open` (default): Execute function without caching
-- `fail_closed`: Raise exception
-- `custom`: Call custom_fallback function
 
 ---
 

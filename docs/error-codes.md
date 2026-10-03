@@ -4,7 +4,7 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching, except that after a backend read or write failure the result is still stored in L1 (on by default), so later calls in the same process hit it. Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching, except that after a backend read or write failure the result is still stored in L1 (on by default), so later calls in the same process hit it. The one case L1 does not get it is a sync function using the plaintext Arrow serializer on the File backend, whose streamed write never goes to L1 (see [Circuit breaker open](#circuit-breaker-open)). Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
