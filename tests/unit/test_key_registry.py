@@ -768,17 +768,11 @@ class TestSingleL1WriteSite:
         assert owners == ["_put_l1"]
 
         put_l1 = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_put_l1")
-        adds = [
-            n
-            for n in ast.walk(put_l1)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "add"
-            and isinstance(n.func.value, ast.Name)
-            and n.func.value.id == "_cached_keys"
+        records = [
+            n for n in ast.walk(put_l1) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_record"
         ]
-        assert len(adds) == 1
-        assert adds[0].lineno > puts[0].lineno
+        assert len(records) == 1
+        assert records[0].lineno > puts[0].lineno
 
 
 @pytest.mark.unit
