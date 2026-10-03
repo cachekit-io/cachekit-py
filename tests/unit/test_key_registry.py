@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 import pytest
 
-from cachekit import cache
+from cachekit import cache, hash_utils
 from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import supports_key_tracking
 from cachekit.config.validation import ConfigurationError
@@ -48,10 +48,25 @@ def _closure_cell(fn: Any, name: str) -> Any:
     raise LookupError(name)
 
 
+class FakeRedisClient:
+    """The slice of redis.Redis the invalidation channel publishes through: records each PUBLISH."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes]] = []
+        self.fail_publish: Optional[BaseException] = None
+
+    def publish(self, channel: str, message: bytes) -> int:
+        if self.fail_publish is not None:
+            raise self.fail_publish
+        self.published.append((channel, message))
+        return 0
+
+
 class TrackingBackend:
     """In-memory L2 with a key registry: sets of raw keys per registry id."""
 
     def __init__(self) -> None:
+        self._client = FakeRedisClient()  # where PerRequestRedisBackend keeps its shared client
         self.store: dict[str, bytes] = {}
         self.sets: dict[str, set[str]] = {}
         self.track_calls: list[tuple[str, str]] = []
@@ -269,8 +284,6 @@ class TestTrackingSites:
     def test_track_failure_warning_is_throttled_per_function(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        import cachekit.decorators.wrapper as wrapper_module
-
         backend = TrackingBackend()
         backend.fail_track = True
 
@@ -281,7 +294,7 @@ class TestTrackingSites:
         with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
             for i in range(50):
                 assert f(i) == i
-            monkeypatch.setattr(wrapper_module, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert f(50) == 50
         warnings = [r.getMessage() for r in caplog.records if "Key tracking failed" in r.getMessage()]
         # A registry outage is one WARNING per window, not one per write, and none is lost from the count.
