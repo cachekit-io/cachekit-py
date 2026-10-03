@@ -138,6 +138,7 @@ class _ThreadClients(threading.local):
     # discarded per call gets no pool reuse. Hold one backend per key, or add a small strong LRU in
     # front if per-call construction matters.
     def __init__(self) -> None:
+        self.pid = os.getpid()
         self.sync_leases: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
         self.async_slots: weakref.WeakValueDictionary[_ClientKey, _LoopBoundClient] = weakref.WeakValueDictionary()
 
@@ -146,23 +147,20 @@ class _ThreadClients(threading.local):
 # matters: Authorization, base_url and timeout are fixed at client creation, so one
 # client per thread would send every backend's traffic under the FIRST key constructed
 # on that thread — cross-tenant writes and reads with no error anywhere.
-# Published with the PID that owns them as one tuple, so no reader pairs one process's PID with another's caches.
-_owned_clients = (os.getpid(), _ThreadClients())
+_thread_local = _ThreadClients()
 
 
 def _clients() -> _ThreadClients:
-    """This thread's client caches, replaced wholesale the first time they are read in a forked child.
+    """This thread's client caches, emptied the first time this thread reads them in a forked child.
 
     An owner-PID check rather than an os.register_at_fork hook: uWSGI forks without running Python's
-    at-fork hooks. The inherited caches are dropped, never closed (see _close_released_client). Two child
-    threads racing here can each build new caches; the clients of the one replaced are merely not shared.
+    at-fork hooks. Each thread's caches carry their own owner PID, so only that thread reads or resets
+    them, and no thread can discard another's. The inherited caches are dropped, never closed (see
+    _close_released_client).
     """
-    global _owned_clients
-    owned = _owned_clients
-    pid = os.getpid()
-    if owned[0] != pid:
-        owned = _owned_clients = (pid, _ThreadClients())
-    return owned[1]
+    if _thread_local.pid != os.getpid():
+        _thread_local.__init__()  # this thread's caches start over, as a new thread's do
+    return _thread_local
 
 
 def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
@@ -171,7 +169,8 @@ def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
 
 # Looked up once: getLogger() takes logging's module lock, and a fork from C (uWSGI) skips logging's at-fork
 # reset, so a child re-leasing its clients would hang on a lock a parent thread held at fork. Reading the
-# level takes no lock, and the parent pinned it when it built the client being replaced.
+# level takes no lock, and the parent pinned it when it built the client being replaced. An application that
+# unsets it after that makes the child's re-lease pin it again with setLevel(), which does take the lock.
 _hpack_logger = logging.getLogger("hpack")
 
 

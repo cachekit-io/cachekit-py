@@ -8,6 +8,7 @@ Tests for backends/cachekitio/client.py covering:
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() drops thread-local references
 - New client created after reset
+- State a forked child inherits: replaced, never closed (real forks: test_cachekitio_fork.py)
 """
 
 from __future__ import annotations
@@ -289,6 +290,54 @@ def test_failed_close_on_release_is_logged_not_raised(monkeypatch: pytest.Monkey
     log.debug.assert_called_once()
     assert "OSError" in log.debug.call_args.kwargs["error"]
     assert "SECRET_DETAIL" not in repr(log.debug.call_args)
+
+
+_PARENT_PID = -1  # no process has it, so state marked with it reads as inherited from a parent
+
+
+@pytest.mark.unit
+class TestStateInheritedAcrossFork:
+    """A forked child's view of its parent's state, in process; real forks over TLS: test_cachekitio_fork.py."""
+
+    def test_a_threads_inherited_caches_start_empty(self, config: CachekitIOBackendConfig) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        inherited = lease_sync_http_client(config)
+        client_module._thread_local.pid = _PARENT_PID
+        lease = lease_sync_http_client(config)
+        assert lease is not inherited
+        assert lease_sync_http_client(config) is lease
+
+    def test_an_inherited_client_is_released_unclosed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        closed: list[httpx.Client] = []
+        monkeypatch.setattr(httpx.Client, "close", lambda self: closed.append(self))
+        client_module._close_released_client(httpx.Client(), _PARENT_PID)
+        assert closed == []
+
+    def test_the_backend_replaces_an_inherited_sync_lease(self) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+        from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+        backend = CachekitIOBackend(api_key="ck_test_inherited_sync")  # pragma: allowlist secret
+        inherited = backend._sync_lease
+        inherited.pid = client_module._thread_local.pid = _PARENT_PID  # a child inherits both
+        lease = backend._own_sync_lease()
+        assert lease is not inherited
+        assert lease.pid == os.getpid()
+        assert backend._own_sync_lease() is lease
+
+    def test_the_backend_replaces_an_inherited_async_lease(self) -> None:
+        from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+        backend = CachekitIOBackend(api_key="ck_test_inherited_async")  # pragma: allowlist secret
+        inherited = backend._async_lease
+        inherited.pid = _PARENT_PID
+        lease = backend._own_async_lease()
+        assert lease is not inherited
+        assert lease.pid == os.getpid()
+        assert backend._own_async_lease() is lease
 
 
 @pytest.mark.unit
