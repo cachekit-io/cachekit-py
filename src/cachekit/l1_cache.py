@@ -471,7 +471,9 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread, unless no at-fork hook ran. A thread the parent had stopped stays stopped. Decorated functions get() before
+        thread, unless no at-fork hook ran. A thread the parent never started, or had stopped, stays
+        stopped; a one-shot thread frees the L1 states the child inherited instead
+        (_release_inherited_states). Decorated functions get() before
         they put(), so _empty_caches_after_fork gives every cache a fresh state, and so a free lock,
         before that first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
@@ -482,7 +484,7 @@ class L1CacheManager:
         it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
         A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
         a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
-        starts no cleanup thread in it, start_background_cleanup refuses there too (also for a manager
+        starts no thread in it, start_background_cleanup refuses there too (also for a manager
         first built in that child, which never takes over), and expired entries are evicted on read or
         under the memory bound instead. None of it logs, the lock reset's drop included: the same fork
         skips logging's at-fork reset, so a handler lock a parent thread held would hang the child.
@@ -513,6 +515,15 @@ class L1CacheManager:
                     logger.warning(
                         "L1 cleanup thread restart after fork failed: %s; expired entries are now evicted only on read",
                         redact_error_for_log(e),
+                    )
+            elif _inherited_states:
+                # No cleanup thread to free what the child inherited: a one-shot thread does, then ends.
+                # Nothing runs after it, so it needs no try of its own; an error reaches threading.excepthook.
+                try:
+                    threading.Thread(target=_release_inherited_states, daemon=True).start()
+                except RuntimeError as e:  # refused as above; taken over regardless, so puts don't retry
+                    logger.warning(
+                        "Freeing L1 entries inherited at fork failed to start: %s; they stay", redact_error_for_log(e)
                     )
             self._owner_pid = pid
 
@@ -665,8 +676,8 @@ def _empty_caches_after_fork() -> None:
     The parent's states are not freed here: freeing them writes to every entry's memory, so each
     child would copy most of the parent's L1 pages inside fork(), a cost close to the size of a warm
     L1, and so would every subprocess started with a preexec_fn, which never uses its L1. They are
-    kept in _inherited_states until the child's cleanup thread starts, on the child's first put,
-    and frees them (_release_inherited_states).
+    kept in _inherited_states until the child's first put, whose take-over frees them on the cleanup
+    thread it restarts, or on a one-shot thread when there is none (_release_inherited_states).
     """
     global _hooked_pid
     for manager in list(_managers):
@@ -677,18 +688,19 @@ def _empty_caches_after_fork() -> None:
 
 
 def _release_inherited_states() -> None:
-    """Free the L1 states this process inherited at fork. Called by the cleanup thread when it starts.
+    """Free the L1 states this process inherited at fork: on the cleanup thread as it starts, or on a
+    one-shot thread when the take-over has no cleanup thread to restart.
 
     Kept, they would not stay shared with the parent: once the parent rewrites those pages (its own
     sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
     reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
     Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
-    them, so the child's other threads keep running. A child that never starts a cleanup thread (its
-    parent's manager had none) keeps them.
+    them, so the child's other threads keep running. A child that never puts into its L1 never takes
+    over, and keeps them: one bound for exec pays nothing.
 
     Each state is taken off the list with one pop before it is freed, so two releasers running at
-    once (two managers' cleanup threads) never take the same state, and neither finds the list
-    emptied under it. An empty list therefore means every state was taken, not that every entry is
+    once (the threads of two managers' take-overs) never take the same state, and neither finds the
+    list emptied under it. An empty list therefore means every state was taken, not that every entry is
     freed: a releaser may still be freeing one, and a state in use is left alone. That is a state
     whose lock is taken, by a thread that forked inside its critical section and still runs there:
     that thread finishes on it, and it is freed with that thread's last reference.

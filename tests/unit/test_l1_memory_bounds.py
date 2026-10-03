@@ -684,6 +684,71 @@ class TestCleanupThreadAfterFork:
         assert manager._cleanup_thread is None
         assert manager._owner_pid == os.getpid()
 
+    def test_take_over_with_no_cleanup_to_restart_still_frees_inherited_states(self, monkeypatch):
+        """Cleanup never started, or stopped before the fork: a one-shot thread frees what the child inherited."""
+        from cachekit import l1_cache
+
+        state = l1_cache._L1State()
+        state.cache["k"] = CacheEntry(b"v", time.time() + 60, 1)
+        monkeypatch.setattr(l1_cache, "_inherited_states", [state])
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("one-shot-ns")
+        _as_if_forked(manager, parent_ran_cleanup=False)
+
+        cache.put("k", b"v")
+
+        assert _wait_for(lambda: not state.cache)
+        assert l1_cache._inherited_states == []
+        assert manager._cleanup_thread is None  # and no sweeping the parent did not run
+
+    def test_one_shot_release_that_cannot_start_is_one_warning_and_put_still_stores(self, monkeypatch, caplog):
+        from cachekit import l1_cache
+
+        state = l1_cache._L1State()
+        monkeypatch.setattr(l1_cache, "_inherited_states", [state])
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("one-shot-refused-ns")
+        _as_if_forked(manager, parent_ran_cleanup=False)
+
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+        with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
+            cache.put("k1", b"v")
+            cache.put("k2", b"v")
+
+        assert cache.get("k1")[0] and cache.get("k2")[0]
+        assert sum("inherited at fork" in r.message for r in caplog.records) == 1  # taken over regardless
+        assert l1_cache._inherited_states == [state]  # kept, as before this release existed
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
+    def test_forked_child_of_a_manager_without_cleanup_frees_what_it_inherited(self):
+        """The repro: no cleanup in the parent, one put there, a fork, one put in the child."""
+        from cachekit import l1_cache
+
+        manager = L1CacheManager(default_max_memory_mb=10)  # start_background_cleanup() never called
+        cache = manager.get_cache("no-cleanup-ns")
+        cache.put("pre-fork", b"v")
+        inherited = cache._state  # what the at-fork hook hands the child to free
+        r, w = os.pipe()
+        child = os.fork()
+        if child == 0:
+            try:
+                kept_at_fork = inherited in l1_cache._inherited_states and list(inherited.cache) == ["pre-fork"]
+                cache.put("child", b"v")  # the child's first put: its take-over
+                outcome = {
+                    "kept_at_fork": kept_at_fork,
+                    "freed": _wait_for(lambda: not inherited.cache),
+                    "cleanup": manager._cleanup_thread,
+                }
+            except BaseException as e:
+                outcome = {"error": repr(e)}
+            _report(w, outcome)
+        os.close(w)
+
+        assert _child_outcome(child, r) == {"kept_at_fork": True, "freed": True, "cleanup": None}
+
     def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs_nothing(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("orphan-ns")
@@ -867,19 +932,25 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("hookless-ns")
         _as_if_forked(manager, parent_ran_cleanup=True)
+        idle = L1CacheManager(default_max_memory_mb=10)
+        idle_cache = idle.get_cache("hookless-idle-ns")
+        _as_if_forked(idle, parent_ran_cleanup=False)  # no cleanup to restart: a hooked child frees on a one-shot thread
         _as_if_hookless(monkeypatch)
+        monkeypatch.setattr(l1_cache, "_inherited_states", [l1_cache._L1State()])  # states to free, and still no thread
         starts: list[threading.Thread] = []
         monkeypatch.setattr(threading.Thread, "start", lambda self: starts.append(self))
         with caplog.at_level(logging.WARNING, logger="cachekit.l1_cache"):
             cache.put("k", b"v")
+            idle_cache.put("k", b"v")
             manager.start_background_cleanup(interval_seconds=60)
             born = L1CacheManager(default_max_memory_mb=10)  # first built in the child: no take-over runs
             born.start_background_cleanup(interval_seconds=60)
 
         assert starts == [] and manager._cleanup_thread is None and born._cleanup_thread is None
-        assert cache.get("k")[0]
+        assert cache.get("k")[0] and idle_cache.get("k")[0]
         assert caplog.records == []  # logging's own locks may be orphaned in this child
 
+        monkeypatch.setattr(l1_cache, "_inherited_states", [])  # so the restart below is the only start
         monkeypatch.setattr(l1_cache, "_hooked_pid", os.getpid())  # its own child, forked with hooks
         _as_if_forked(manager, parent_ran_cleanup=False)
         manager.start_background_cleanup(interval_seconds=60)
