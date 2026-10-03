@@ -128,6 +128,24 @@ cache_operation_duration_ms{operation="get",namespace="users",serializer="rust"}
 cache_operation_size_bytes{operation="get",namespace="users",serializer="l1_memory"}
 ```
 
+Both histograms use fixed bucket bounds, sized for their units. Each label tuple has 14 or fewer
+finite buckets plus `+Inf`.
+
+| Histogram | Finite bucket bounds (`le`) |
+|---|---|
+| `cache_operation_duration_ms` | 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000 |
+| `cache_operation_size_bytes` | powers of 4 from 16 B to 16 MiB: 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216 |
+
+An operation slower than 1000 ms, or a payload larger than 16 MiB, counts only in `+Inf`, so a quantile
+that falls there reads as the top finite bound. Both histograms record one observation per operation
+whose value is above zero, whichever recording mode the collector is in.
+
+> **Changed `le` values.** Releases before these bounds used prometheus_client's default buckets
+> (0.005 to 10), sized for seconds, so nearly every operation and every payload landed in `+Inf`. The
+> `le` label values are now different. Re-check any dashboard panel or recording rule that selects
+> `_bucket` series by `le`. prometheus_client writes bounds of one million and over in exponent form
+> (`le="1.048576e+06"`).
+
 ### Gauges (current state)
 
 ```prometheus
@@ -162,19 +180,25 @@ sum(rate(cache_operations_total{operation="set"}[5m]))
 
 ### Cache Latency (P99)
 
+The duration buckets run from 0.01 ms to 1000 ms (see [Histograms](#histograms-latency-and-size)).
+Aggregate with `sum by (le)` to get one quantile across all label tuples; add a label to the `by`
+list (for example `namespace`) for one quantile per value.
+
 ```promql
 # 99th percentile cache operation duration (milliseconds)
 histogram_quantile(0.99,
-  rate(cache_operation_duration_ms_bucket[5m])
+  sum by (le) (rate(cache_operation_duration_ms_bucket[5m]))
 )
 ```
 
 ### Payload Size (P99)
 
+The size buckets run from 16 B to 16 MiB, in powers of 4.
+
 ```promql
 # 99th percentile cache payload size (bytes)
 histogram_quantile(0.99,
-  rate(cache_operation_size_bytes_bucket[5m])
+  sum by (le) (rate(cache_operation_size_bytes_bucket[5m]))
 )
 ```
 

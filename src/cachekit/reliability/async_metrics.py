@@ -29,6 +29,15 @@ _BUILTIN_SERIES = frozenset(
     | {f"{h}{s}" for h in ("cache_operation_duration_ms", "cache_operation_size_bytes") for s in _SERIES_SUFFIXES}
 )
 
+# Bucket bounds for the two built-in histograms. prometheus_client's defaults are sized for seconds and top out at 10,
+# which in these units put every L2 round trip and every real payload in +Inf. The first registration of a metric fixes
+# its buckets for the whole process, so every registration site passes these. At most 14 finite bounds, as the defaults
+# have, so a label tuple still costs at most 15 _bucket series.
+# Milliseconds: L1 hits (microseconds) through local and remote Redis to the SaaS round trip (up to about 1 s).
+DURATION_BUCKETS_MS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0)
+# Bytes, powers of 4: 16 B through 16 MiB.
+SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 13))
+
 try:
     from prometheus_client import REGISTRY, Counter, Gauge, Histogram  # type: ignore[assignment]
 
@@ -193,11 +202,11 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str]) -> Any:
+def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
     """Get or create the process-wide metric instance for ``name``.
 
     Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
-    creating a collector.
+    creating a collector. ``kwargs`` (such as ``buckets``) reach ``metric_class`` only on first creation.
 
     Raises:
         ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
@@ -210,7 +219,7 @@ def _get_shared_metric(name: str, metric_class: type, description: str, labels: 
             metric = _metrics_cache.get(name)
             if metric is None:
                 try:
-                    metric = metric_class(name, description, labels)
+                    metric = metric_class(name, description, labels, **kwargs)
                 except ValueError as e:
                     if "Duplicated timeseries" not in str(e):
                         raise
@@ -492,17 +501,18 @@ class AsyncMetricsCollector:
             return
 
         # Group metrics by type for efficient processing
-        cache_ops = defaultdict(lambda: {"count": 0, "duration": 0, "size": 0})
+        cache_ops: dict[tuple[Any, ...], int] = defaultdict(int)  # {(operation, namespace, success, serializer): count}
+        # Every record's own duration and size, in record order, so the histograms get what sync mode observes.
+        cache_observations: list[tuple[Any, ...]] = []  # [(operation, namespace, serializer, duration_ms, size_bytes)]
         counters = defaultdict(lambda: defaultdict(float))  # {name: {labels_key: value}}
         histograms = defaultdict(list)  # {name: [(value, labels_key)]}
 
         for metric in batch:
             try:
                 if metric["type"] == "cache_operation":
-                    key = (metric["operation"], metric["namespace"], metric["success"], metric["serializer"])
-                    cache_ops[key]["count"] += 1
-                    cache_ops[key]["duration"] += metric["duration_ms"]
-                    cache_ops[key]["size"] += metric["size_bytes"]
+                    operation, namespace, serializer = metric["operation"], metric["namespace"], metric["serializer"]
+                    cache_ops[(operation, namespace, metric["success"], serializer)] += 1
+                    cache_observations.append((operation, namespace, serializer, metric["duration_ms"], metric["size_bytes"]))
 
                 elif metric["type"] == "counter":
                     value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
@@ -527,7 +537,7 @@ class AsyncMetricsCollector:
         # unforeseen: most worker call sites (the shutdown drain among them) have no handler above them, so an
         # escaping exception would end the worker and strand every record still queued.
         try:
-            self._update_prometheus_metrics(cache_ops, counters, histograms)  # type: ignore[arg-type]
+            self._update_prometheus_metrics(cache_ops, cache_observations, counters, histograms)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
@@ -565,7 +575,8 @@ class AsyncMetricsCollector:
 
     def _update_prometheus_metrics(
         self,
-        cache_ops: dict[tuple[Any, ...], dict[str, Any]],
+        cache_ops: dict[tuple[Any, ...], int],
+        cache_observations: list[tuple[Any, ...]],
         counters: dict[str, dict[str, Any]],
         histograms: dict[str, list[Any]],
     ):
@@ -575,29 +586,21 @@ class AsyncMetricsCollector:
             "cache_operations_total", Counter, "Total cache operations", ["operation", "namespace", "success", "serializer"]
         )
 
-        cache_duration = self._get_metric(
-            "cache_operation_duration_ms", Histogram, "Cache operation duration", ["operation", "namespace", "serializer"]
-        )
-
-        cache_size = self._get_metric(
-            "cache_operation_size_bytes", Histogram, "Cache operation size", ["operation", "namespace", "serializer"]
-        )
+        cache_duration = self._duration_histogram()
+        cache_size = self._size_histogram()
 
         # Batch update cache metrics
-        for (operation, namespace, success, serializer), stats in cache_ops.items():
+        for (operation, namespace, success, serializer), count in cache_ops.items():
             cache_counter.labels(operation=operation, namespace=namespace, success=str(success), serializer=serializer).inc(
-                stats["count"]
+                count
             )
 
-            if stats["duration"] > 0:
-                # Record average duration for the batch
-                avg_duration = stats["duration"] / stats["count"]
-                cache_duration.labels(operation=operation, namespace=namespace, serializer=serializer).observe(avg_duration)
-
-            if stats["size"] > 0:
-                # Record average size for the batch
-                avg_size = stats["size"] / stats["count"]
-                cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(avg_size)
+        # One observation per record, skipping zero values as the sync path does.
+        for operation, namespace, serializer, duration_ms, size_bytes in cache_observations:
+            if duration_ms > 0:
+                cache_duration.labels(operation=operation, namespace=namespace, serializer=serializer).observe(duration_ms)
+            if size_bytes > 0:
+                cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
 
         # Update generic counters
         for name, label_values in counters.items():
@@ -648,9 +651,27 @@ class AsyncMetricsCollector:
                         f"Failed to update histogram {name} ({failures} observations): {redact_error_for_log(last_error)}"
                     )
 
-    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
+    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
         """Get or create the process-wide metric instance for ``name`` (see ``_get_shared_metric``)."""
-        return _get_shared_metric(name, metric_class, description, labels)
+        return _get_shared_metric(name, metric_class, description, labels, **kwargs)
+
+    def _duration_histogram(self) -> Any:
+        return self._get_metric(
+            "cache_operation_duration_ms",
+            Histogram,
+            "Cache operation duration",
+            ["operation", "namespace", "serializer"],
+            buckets=DURATION_BUCKETS_MS,
+        )
+
+    def _size_histogram(self) -> Any:
+        return self._get_metric(
+            "cache_operation_size_bytes",
+            Histogram,
+            "Cache operation size",
+            ["operation", "namespace", "serializer"],
+            buckets=SIZE_BUCKETS_BYTES,
+        )
 
     def get_dropped_metrics_count(self) -> int:
         """Get count of dropped metrics due to queue overflow."""
@@ -843,16 +864,12 @@ class AsyncMetricsCollector:
         cache_counter.labels(operation=operation, namespace=namespace, success=str(success), serializer=serializer).inc()
 
         if duration_ms > 0:
-            cache_duration = self._get_metric(
-                "cache_operation_duration_ms", Histogram, "Cache operation duration", ["operation", "namespace", "serializer"]
+            self._duration_histogram().labels(operation=operation, namespace=namespace, serializer=serializer).observe(
+                duration_ms
             )
-            cache_duration.labels(operation=operation, namespace=namespace, serializer=serializer).observe(duration_ms)
 
         if size_bytes > 0:
-            cache_size = self._get_metric(
-                "cache_operation_size_bytes", Histogram, "Cache operation size", ["operation", "namespace", "serializer"]
-            )
-            cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
+            self._size_histogram().labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
 
     def _record_counter_sync(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter directly to Prometheus (sync mode)."""
