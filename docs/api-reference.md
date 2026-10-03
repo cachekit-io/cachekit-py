@@ -818,7 +818,8 @@ preset: `rust` = L2 backend path, `l1_memory` = L1 in-memory hit; `unknown` mark
 emitted without the label. `redis_cache_operations_total` is emitted only on backpressure
 rejection (`operation="backpressure"`, `status="rejected"`, empty `serializer` and `namespace`).
 
-Both histograms record one observation per operation. Releases before these bucket bounds used
+Each histogram records one observation per operation whose value is above zero, so its `_count` can be
+lower than `cache_operations_total`. Releases before these bucket bounds used
 prometheus_client's default buckets, sized for seconds, so the `le` values changed: re-check dashboards
 and recording rules over the `_bucket` series. A p99 across all label tuples aggregates with
 `sum by (le)`:
