@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Install Kani
       run: |
@@ -43,7 +43,7 @@ jobs:
     # where PR latency matters).
     timeout-minutes: 240
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Install nightly Rust
       run: |
@@ -119,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     # No uv or Rust cache on this nightly job: the cold `uv sync` (maturin
     # build included) is noise against 30 min of fuzz time, and an unsuffixed
@@ -197,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Install nightly Rust with Miri
       run: |
@@ -218,7 +218,7 @@ jobs:
       matrix:
         sanitizer: [address, thread, memory]
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Install nightly Rust
       run: |
@@ -263,7 +263,7 @@ jobs:
     needs: [kani-verification, fuzzing, atheris-fuzzing, miri-full, sanitizers]
     if: always()
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Generate security report
       run: |
