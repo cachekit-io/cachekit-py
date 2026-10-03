@@ -268,7 +268,7 @@ def my_function():
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `enabled` | bool | `True` | Enable L1 in-memory cache |
-| `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
+| `max_size_mb` | int | `100` | Maximum L1 cache size in MB; a single value larger than an eighth of it is served from L2 and not kept in L1 |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) — [L1-only mode](#l1-only-mode-backendnone) only |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` — L1-only mode only |
 | `swr_retry_interval` | float | `10.0` | Seconds after a failed background refresh before that key is refreshed again, `>= 0`; `0` retries on the next stale read — L1-only mode only |
@@ -286,7 +286,9 @@ honored as follows:
 - **`max_size_mb`** bounds the cache by *estimated bytes*, not entry count. Sizes of
   raw objects are estimated best-effort (builtin containers are walked recursively;
   other objects are counted via `sys.getsizeof`). A single value larger than the whole
-  budget is returned to the caller but never cached.
+  budget is returned to the caller but never cached. This is looser than with a backend,
+  where a value larger than an eighth of the budget is kept in L2 only: in L1-only mode
+  there is no L2 to serve it from.
 - **SWR requires a `ttl`.** With `swr_enabled=True` and a `ttl` set, a cache hit past
   `ttl * swr_threshold_ratio` (±10% jitter) serves the cached value immediately and
   refreshes it in the background — via `asyncio.create_task` for `async def` functions,

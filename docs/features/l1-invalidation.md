@@ -286,7 +286,7 @@ config = L1CacheConfig(
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `enabled` | bool | `True` | Enable/disable L1 cache completely |
-| `max_size_mb` | int | `100` | Maximum memory usage in MB |
+| `max_size_mb` | int | `100` | Maximum memory usage in MB; a single value larger than an eighth of it is served from L2 and not kept in L1 |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
 | `swr_retry_interval` | float | `10.0` | Seconds after a failed refresh before that key refreshes again, `>= 0` (`0` = next stale read) |

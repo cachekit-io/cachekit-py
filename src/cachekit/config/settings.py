@@ -148,7 +148,7 @@ class CachekitConfig(RedactingSettings):
     l1_max_size_mb: int = Field(
         default=100,
         gt=0,
-        description="Maximum L1 cache size per namespace in megabytes (prevents OOM)",
+        description="Maximum L1 cache size per namespace in megabytes (prevents OOM); one value may take at most an eighth",
     )
     l1_cleanup_interval_seconds: int = Field(
         default=30,

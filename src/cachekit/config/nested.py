@@ -28,6 +28,7 @@ class L1CacheConfig:
         enabled: Enable L1 in-memory cache (default: True)
         max_size_mb: Per-namespace L1 budget in MB. None (default) inherits the global
             CACHEKIT_L1_MAX_SIZE_MB setting (issue #163); an int overrides it per decorator.
+            With a backend, a single value larger than an eighth of the budget stays in L2 only.
             In L1-only mode (backend=None) this is a best-effort byte bound on raw object sizes.
         swr_enabled: Enable stale-while-revalidate background refresh (default: True).
             Requires a ttl; in L1-only mode async functions refresh via an asyncio
