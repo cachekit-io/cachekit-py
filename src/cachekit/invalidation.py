@@ -66,6 +66,8 @@ _publish_failed_warn = _WarnThrottle()
 _too_long_warn = _WarnThrottle()
 # A forged or foreign publisher controls how many bad events arrive: one WARNING a minute here too.
 _dropped_event_warn = _WarnThrottle()
+# A listener that cannot reach Redis fails once a second while it retries: one WARNING a minute.
+_listener_error_warn = _WarnThrottle()
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -415,7 +417,15 @@ def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
         if connection is not None:
             connection.disconnect()
         return
-    logger.warning("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
+    errors = _listener_error_warn.claim()
+    if not errors:
+        logger.debug("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
+    else:
+        logger.warning(
+            "Invalidation listener error (errors since the last warning: %d); retrying every second. Latest: %s",
+            errors,
+            redact_error_for_log(error),
+        )
     time.sleep(1.0)
 
 
