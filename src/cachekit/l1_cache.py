@@ -26,6 +26,14 @@ DEFAULT_L1_TTL_SECONDS = 300
 # Keys removed per lock acquisition in invalidate_many.
 _INVALIDATE_BATCH = 1_000
 
+# The largest share of max_memory_bytes one entry may take. Storing an entry first evicts whole LRU
+# entries until it fits, and an entry read back from L2 is stored again each time it falls out, so a
+# near-budget entry could empty most of L1 on every read. With an eighth, one store evicts less than
+# a quarter of L1 (under an eighth to make room, plus the last whole entry, itself at most an
+# eighth), and the share is far above what ordinary values take. Internal calibration, not a
+# setting; cachekit-ts uses the same share.
+_MAX_ENTRY_SHARE = 1 / 8
+
 logger = logging.getLogger(__name__)
 
 _P = ParamSpec("_P")
@@ -87,7 +95,7 @@ class L1Cache:
     Key features:
     - Thread-safe with RLock for concurrent access
     - Respects Redis TTL (entries expire at Redis TTL time)
-    - Memory bounded (100MB default limit)
+    - Memory bounded (100MB default limit; one entry at most an eighth of it)
     - LRU eviction when memory limit reached
     - Fast lookups (~50ns for hits)
     - Background TTL synchronization
@@ -197,6 +205,9 @@ class L1Cache:
     ) -> None:
         """Store value in L1 cache with TTL.
 
+        A value larger than an eighth of max_memory_bytes is not stored, and any older entry under
+        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it.
+
         Args:
             key: Cache key
             value: Bytes to cache (encrypted or plaintext msgpack, not deserialized object)
@@ -245,18 +256,18 @@ class L1Cache:
         # Estimate size
         size = self._estimate_size(value)
 
-        # Reject entries that cannot fit even in an empty cache. Storing one would push L1
-        # permanently over its budget, and a multi-GB serialized DataFrame envelope is a
-        # direct OOM vector (it would also evict every other useful entry on the way in).
-        # The value is still available from L2; we only decline to mirror it in L1. If a
-        # smaller entry for this key was cached, drop it so L1 stops serving the stale value.
-        if size > self.max_memory_bytes:
+        # Reject entries above the per-entry share (_MAX_ENTRY_SHARE). Above the whole budget one
+        # would also push L1 permanently over its limit (a multi-GB DataFrame envelope is a direct
+        # OOM vector). We only decline to mirror the value in L1. If a smaller entry for this key
+        # was cached, drop it so L1 stops serving the stale value.
+        max_entry_bytes = self.max_memory_bytes * _MAX_ENTRY_SHARE
+        if size > max_entry_bytes:
             self._on_current_state(_L1State.remove, key)
             logger.debug(
-                "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
+                "Skipping L1 cache for key %s - value %d bytes exceeds L1 per-entry limit %d bytes (not kept in L1)",
                 redact_key_for_log(key),
                 size,
-                self.max_memory_bytes,
+                max_entry_bytes,
             )
             return
 

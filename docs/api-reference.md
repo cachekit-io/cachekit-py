@@ -591,7 +591,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
+- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB. With a backend, a single value larger than an eighth of it is not kept in L1: it is served from L2, or recomputed if L2 did not store it (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`invalidation_listener_enabled`** (`bool`, default: `False`) - Run the cross-process L1 invalidation listener in this process: one thread and one Redis connection that evict this process's L1 copies of keys other processes invalidate; tenant-scoped Redis backend only (env: `CACHEKIT_INVALIDATION_LISTENER_ENABLED`). See [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 

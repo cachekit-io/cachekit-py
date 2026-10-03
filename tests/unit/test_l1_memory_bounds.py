@@ -1,8 +1,9 @@
 """L1 memory-bound guarantees, especially the oversized-single-entry vector.
 
-A cached value larger than the entire L1 budget must NOT be stored (it would push L1
-permanently over its own limit and, for multi-GB DataFrame envelopes, become an OOM
-vector that also evicts every other useful entry). Such values still live in L2.
+A cached value larger than an eighth of the L1 budget must NOT be stored: admitting it could
+evict up to that much of L1 on its way in, and again on every read that refills it from L2. Above
+the whole budget it would also push L1 permanently over its limit (for multi-GB DataFrame
+envelopes, an OOM vector). Such values are served from L2, or recomputed if L2 did not store them.
 """
 
 from __future__ import annotations
@@ -39,7 +40,8 @@ class TestOversizedEntryRejection:
     def test_rejected_oversized_put_does_not_evict_existing_entries(self):
         """A doomed oversized put must not evict good entries on its way to failing."""
         cache = L1Cache(max_memory_mb=1)
-        cache.put("keep", b"\x00" * (512 * 1024), redis_ttl=300)  # fits
+        cache.put("keep", b"\x00" * (64 * 1024), redis_ttl=300)  # fits
+        assert cache.get("keep")[0] is True
 
         cache.put("toobig", b"\x00" * (5 * MB), redis_ttl=300)  # cannot ever fit
 
@@ -50,7 +52,7 @@ class TestOversizedEntryRejection:
     def test_oversized_update_drops_stale_smaller_entry(self):
         """An oversized put for an EXISTING key must drop the stale value, not serve it."""
         cache = L1Cache(max_memory_mb=1)
-        cache.put("k", b"\x00" * (256 * 1024), redis_ttl=300)  # fits
+        cache.put("k", b"\x00" * (64 * 1024), redis_ttl=300)  # fits
         assert cache.get("k")[0] is True
 
         cache.put("k", b"\x00" * (5 * MB), redis_ttl=300)  # same key, now oversized
@@ -58,10 +60,38 @@ class TestOversizedEntryRejection:
         assert cache.get("k")[0] is False  # stale smaller value evicted, not served
         assert cache._state.memory_bytes == 0
 
-    def test_entry_equal_to_budget_is_stored(self):
+    def test_entry_at_the_share_is_stored(self):
         cache = L1Cache(max_memory_mb=1)
-        cache.put("exact", b"\x00" * (1 * MB), redis_ttl=300)
+        cache.put("exact", b"\x00" * (MB // 8), redis_ttl=300)
         assert cache.get("exact")[0] is True
+
+    def test_entry_just_above_the_share_is_refused_and_drops_older_entry(self):
+        cache = L1Cache(max_memory_mb=1)
+        cache.put("other", b"\x00" * 1024, redis_ttl=300)
+        cache.put("k", b"\x00" * 1024, redis_ttl=300)
+        assert cache.get("k")[0] is True
+
+        cache.put("k", b"\x00" * (MB // 8 + 1), redis_ttl=300)
+
+        assert cache.get("k")[0] is False  # refused, and the older value is not served
+        assert cache.get("other")[0] is True  # nothing evicted
+        assert _consistent(cache)
+        assert cache._state.memory_bytes == 1024
+
+    def test_small_entries_survive_repeated_reads_of_a_near_budget_key(self):
+        """A key refilled from L2 on every L1 miss must not flush the rest of L1 each time."""
+        cache = L1Cache(max_memory_mb=1)
+        small = [f"small{i}" for i in range(100)]
+        for key in small:
+            cache.put(key, b"\x00" * 8 * 1024, redis_ttl=300)
+        assert cache._state.memory_bytes > cache.max_memory_bytes // 2  # L1 is well used
+
+        for _ in range(20):  # each read misses L1 and stores the L2 value again
+            if not cache.get("near-budget")[0]:
+                cache.put("near-budget", b"\x00" * (MB - 1024), redis_ttl=300)
+
+        assert all(cache.get(key)[0] for key in small)
+        assert cache._evictions == 0
 
     def test_normal_entry_still_stored(self):
         cache = L1Cache(max_memory_mb=10)
@@ -71,8 +101,10 @@ class TestOversizedEntryRejection:
     def test_memory_never_exceeds_budget_under_mixed_load(self):
         cache = L1Cache(max_memory_mb=2)
         for i in range(20):
-            cache.put(f"k{i}", b"\x00" * (300 * 1024), redis_ttl=300)  # 300KB each
+            cache.put(f"k{i}", b"\x00" * (200 * 1024), redis_ttl=300)  # 200KB each, 4MB in all
         cache.put("huge", b"\x00" * (50 * MB), redis_ttl=300)  # rejected
+        assert cache._evictions > 0  # the puts were stored, so the budget was actually tested
+        assert cache.get("k19")[0] is True
         assert cache._state.memory_bytes <= cache.max_memory_bytes
 
 
@@ -86,22 +118,26 @@ class TestUpdateUnderPressure:
 
     def test_lru_first_update_keeps_count_and_budget(self):
         cache = L1Cache(max_memory_mb=1)
-        cache.put("A", b"\x00" * 512_000, redis_ttl=300)
-        cache.put("B", b"\x00" * 512_000, redis_ttl=300)
-        cache.put("A", b"\x00" * 614_400, redis_ttl=300)  # A is LRU: eviction walks past it first
+        for key in "ABCDEFGHIJ":  # 10 x 104,000 B: just under the 1 MiB budget
+            cache.put(key, b"\x00" * 104_000, redis_ttl=300)
+        cache.put("A", b"\x00" * (MB // 8), redis_ttl=300)  # A is LRU: eviction walks past it first
+        assert cache.get("A")[0] is True
+        assert cache._evictions > 0
         assert _consistent(cache)
         assert _held_bytes(cache) <= cache.max_memory_bytes
 
     @pytest.mark.parametrize(
         ("keys", "min_size", "max_size"),
-        [(200, 10 * 1024, 60 * 1024), (8, 100 * 1024, 300 * 1024)],
-        ids=["200-keys-10-60KB", "8-keys-100-300KB"],
+        [(200, 10 * 1024, 60 * 1024), (12, 60 * 1024, 128 * 1024)],
+        ids=["200-keys-10-60KB", "12-keys-60-128KB"],
     )
     def test_random_update_heavy_load_keeps_count_and_budget(self, keys, min_size, max_size):
         rng = random.Random(6897)
         cache = L1Cache(max_memory_mb=1)
         for i in range(5000):
-            cache.put(f"k{rng.randrange(keys)}", b"\x00" * rng.randint(min_size, max_size), redis_ttl=300)
+            key = f"k{rng.randrange(keys)}"
+            cache.put(key, b"\x00" * rng.randint(min_size, max_size), redis_ttl=300)
+            assert key in cache._state.cache, f"put {i} refused: sizes must stay within the per-entry share"
             assert _consistent(cache), f"count drifted at put {i}"
             assert cache._state.memory_bytes >= 0, f"count negative at put {i}"
             assert _held_bytes(cache) <= cache.max_memory_bytes, f"over budget at put {i}"
@@ -166,12 +202,12 @@ class TestConfiguredBudgetWiring:
     def test_configured_budget_enforced_with_eviction(self):
         """Filling past a configured (non-default) 2MB budget evicts LRU entries."""
         cache = L1Cache(max_memory_mb=2)
-        for i in range(5):  # 5 x 512KB = 2.5MB > 2MB budget
-            cache.put(f"k{i}", b"\x00" * (512 * 1024), redis_ttl=300)
+        for i in range(10):  # 10 x 256KB = 2.5MB > 2MB budget; 256KB is the per-entry share
+            cache.put(f"k{i}", b"\x00" * (256 * 1024), redis_ttl=300)
 
         assert cache._state.memory_bytes <= 2 * MB
         assert cache.get("k0")[0] is False  # oldest evicted
-        assert cache.get("k4")[0] is True  # newest survives
+        assert cache.get("k9")[0] is True  # newest survives
         assert cache._evictions > 0
 
     def test_manager_default_reads_settings(self, monkeypatch):
