@@ -95,11 +95,13 @@ class CircuitBreakerConfig:
         failure_threshold: Failures within a 60 s rolling window that open the circuit (default: 5)
         success_threshold: Consecutive successes in HALF_OPEN to close circuit (default: 3)
         recovery_timeout: Cooldown in seconds before an OPEN circuit admits a recovery
-            probe; finite and > 0 (default: 30.0). It also caps probing at
-            half_open_requests per cooldown, so 0 would remove that cap.
-        half_open_requests: Total probe requests admitted per HALF_OPEN cycle, not a
-            concurrency limit (a probe whose function raises gives its slot back);
-            must be >= success_threshold, or a cycle could never close (default: 3)
+            probe; finite and > 0 (default: 30.0). It also caps a cycle's probe slots
+            at half_open_requests per cooldown, so 0 would remove that cap.
+        half_open_requests: Probe slots per HALF_OPEN cycle, not a concurrency limit.
+            Every admitted probe holds one until the cycle ends, cancelled ones
+            included, except a probe whose function raises: it gives its slot back,
+            so more calls than this can reach the backend in one cycle. Must be
+            >= success_threshold, or a cycle could never close (default: 3)
 
     The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
     ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``
@@ -158,7 +160,7 @@ class CircuitBreakerConfig:
             raise ConfigurationError(f"success_threshold must be >= 1, got {self.success_threshold}")
         if self.half_open_requests < 1:
             raise ConfigurationError(f"half_open_requests must be >= 1, got {self.half_open_requests}")
-        # A HALF_OPEN cycle admits at most half_open_requests probes; fewer than
+        # Every success holds one of a cycle's half_open_requests slots; fewer than
         # success_threshold can never close it, and each cycle restart discards the
         # successes collected so far.
         if self.half_open_requests < self.success_threshold:
@@ -166,8 +168,8 @@ class CircuitBreakerConfig:
                 f"half_open_requests ({self.half_open_requests}) must be >= success_threshold "
                 f"({self.success_threshold}): a half-open cycle could never close"
             )
-        # The cooldown also bounds probing to half_open_requests per cooldown; at 0 a
-        # spent cycle restarts on every clock tick and probes are unbounded.
+        # The cooldown also bounds a cycle's probe slots to half_open_requests per
+        # cooldown; at 0 a spent cycle restarts on every clock tick, without bound.
         if not math.isfinite(self.recovery_timeout) or self.recovery_timeout <= 0:
             raise ConfigurationError(f"recovery_timeout must be a finite number > 0, got {self.recovery_timeout!r}")
 

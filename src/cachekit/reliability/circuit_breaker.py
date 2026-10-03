@@ -82,13 +82,15 @@ class CircuitBreakerConfig:
             a HALF_OPEN cycle: once the cycle has admitted all its probes and began
             more than timeout_seconds ago without closing or reopening, a fresh cycle
             starts. Must be finite and > 0: NaN or inf never leaves OPEN, and that
-            restart caps probing at half_open_requests per timeout_seconds. Balance
+            restart caps a cycle's probe slots at half_open_requests per
+            timeout_seconds. Balance
             between giving service time to recover vs detecting recovery quickly.
-        half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
-            not a concurrency limit; a probe handed back with release_probe does not
-            count against it). Keep it >= success_threshold, or a cycle can
-            never collect enough successes from its probes to close. Unlike the
-            @cache config, this class does not reject a smaller value.
+        half_open_requests: Probe slots per HALF_OPEN cycle, not a concurrency
+            limit. Every admitted probe holds one until the cycle ends, whether it
+            records an outcome or never reports back, unless release_probe hands it
+            back for the next call. Keep it >= success_threshold: every success
+            holds one of a cycle's slots, so a smaller budget can never close it.
+            Unlike the @cache config, this class does not reject a smaller value.
         excluded_error_types: BackendErrorType values that don't count as failures.
             Example: BackendErrorType.PERMANENT for config errors
 
@@ -118,7 +120,7 @@ class CircuitBreakerConfig:
     failure_threshold: int = 5  # Opens circuit after 5 failures within 60 s
     success_threshold: int = 3  # Closes circuit after 3 consecutive successes
     timeout_seconds: float = 30.0  # Wait 30s before testing recovery
-    half_open_requests: int = 3  # Probes per HALF_OPEN cycle; must reach success_threshold to close
+    half_open_requests: int = 3  # Probe slots per HALF_OPEN cycle; must reach success_threshold to close
     excluded_error_types: tuple[BackendErrorType, ...] = ()  # No excluded error types by default
 
     def __post_init__(self):
