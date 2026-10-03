@@ -471,7 +471,9 @@ class L1CacheManager:
         os.register_at_fork hook: uWSGI forks without running Python's at-fork hooks, and a
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
-        thread, unless no at-fork hook ran. A thread the parent had stopped stays stopped. Decorated functions get() before
+        thread, unless no at-fork hook ran. A thread the parent never started, or had stopped, stays
+        stopped; a one-shot thread frees the L1 states the child inherited instead
+        (_release_inherited_states). Decorated functions get() before
         they put(), so _empty_caches_after_fork gives every cache a fresh state, and so a free lock,
         before that first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
@@ -482,7 +484,7 @@ class L1CacheManager:
         it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
         A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
         a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
-        starts no cleanup thread in it, start_background_cleanup refuses there too (also for a manager
+        starts no thread in it, start_background_cleanup refuses there too (also for a manager
         first built in that child, which never takes over), and expired entries are evicted on read or
         under the memory bound instead. None of it logs, the lock reset's drop included: the same fork
         skips logging's at-fork reset, so a handler lock a parent thread held would hang the child.
@@ -513,6 +515,15 @@ class L1CacheManager:
                     logger.warning(
                         "L1 cleanup thread restart after fork failed: %s; expired entries are now evicted only on read",
                         redact_error_for_log(e),
+                    )
+            elif _inherited_states:
+                # No cleanup thread to free what the child inherited: a one-shot thread does, then ends.
+                # Nothing runs after it, so it needs no try of its own; an error reaches threading.excepthook.
+                try:
+                    threading.Thread(target=_release_inherited_states, daemon=True).start()
+                except RuntimeError as e:  # refused as above; taken over regardless, so puts don't retry
+                    logger.warning(
+                        "Freeing L1 entries inherited at fork failed to start: %s; they stay", redact_error_for_log(e)
                     )
             self._owner_pid = pid
 
@@ -567,7 +578,10 @@ class L1CacheManager:
     def _spawn_cleanup_thread(self, interval_seconds: float) -> None:
         def cleanup_worker():
             logger.info("L1 cache background cleanup started (interval: %.1fs)", interval_seconds)
-            _release_inherited_states()  # a forked child's, the first time its L1 is used
+            try:  # a forked child's inherited states, before the first wait rather than an interval later
+                _release_inherited_states()
+            except Exception as e:  # its own try: an error there must not end the sweeps below
+                logger.error("Error freeing inherited L1 states: %s", redact_error_for_log(e))
 
             while not self._stop_cleanup.wait(interval_seconds):
                 try:
@@ -634,8 +648,8 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
 
-# The L1 states a forked child inherited, kept until the child's cleanup thread frees them
-# (_empty_caches_after_fork, _release_inherited_states). Never read.
+# The L1 states a forked child inherited that no releaser has taken yet (_empty_caches_after_fork,
+# _release_inherited_states). Nothing serves from them.
 _inherited_states: list[_L1State] = []
 
 
@@ -659,11 +673,11 @@ def _empty_caches_after_fork() -> None:
     this takes no lock, starts no thread and logs nothing. Starting the cleanup thread stays with
     _take_over_if_forked, outside the hook.
 
-    The parent's states are not freed here: freeing them writes to every entry's memory, so each
-    child would copy most of the parent's L1 pages inside fork(), a cost close to the size of a warm
-    L1, and so would every subprocess started with a preexec_fn, which never uses its L1. They are
-    kept in _inherited_states until the child's cleanup thread starts, on the child's first put,
-    and frees them (_release_inherited_states).
+    The parent's states are not freed here: freeing them writes to every entry's memory and to the
+    allocator's beside it, so each child would copy those pages inside fork(), about 2.3 times a warm
+    L1 (_release_inherited_states), and so would every subprocess started with a preexec_fn, which
+    never uses its L1. They are kept in _inherited_states until the child's first put, whose take-over
+    frees them on the cleanup thread it restarts, or on a one-shot thread when there is none.
     """
     global _hooked_pid
     for manager in list(_managers):
@@ -674,29 +688,47 @@ def _empty_caches_after_fork() -> None:
 
 
 def _release_inherited_states() -> None:
-    """Free the L1 states this process inherited at fork. Called by the cleanup thread when it starts.
+    """Free the L1 states this process inherited at fork: on the cleanup thread as it starts, or on a
+    one-shot thread when the take-over has no cleanup thread to restart.
 
-    Kept, they would not stay shared with the parent: once the parent rewrites those pages (its own
-    sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
-    reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
+    Freeing costs memory up front. Each free writes to the entry and to the allocator's bookkeeping
+    beside it, so the child copies those pages once it first puts: 36.5 MiB for a 16 MiB L1 whose
+    values sit among other allocations (tests/performance/test_l1_fork_memory.py, CPython 3.12 and
+    3.14). Its own L1 then reuses that memory, so a child that fills one as large ends 40 MiB up.
+    Kept, the states cost nothing while the parent leaves their pages alone: that child would end
+    22 MiB up, its own L1 alone, under a parent that never rewrites its L1, such as an idle preloaded
+    master whose entries outlive the child. Freeing is still the default because a parent with a
+    cleanup thread, the default, rewrites them within one L1 TTL plus a sweep interval, as each entry
+    it held at fork expires and is swept; one without a cleanup thread rewrites them whenever it
+    evicts, invalidates or clears. From then on a child that kept them would hold a private copy
+    nothing can reach, beside its own L1, for life: 60 MiB in the same test with the release disabled.
+
     Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
-    them, so the child's other threads keep running. A state whose lock is taken, by a thread that
-    forked inside its critical section and still runs there, is only dropped from the list: that
-    thread finishes on it, and it is freed with that thread's last reference. A child that never
-    starts a cleanup thread (its parent's manager had none) keeps them.
+    them, so the child's other threads keep running. A child that never puts into its L1 never takes
+    over, and keeps them: one bound for exec pays nothing.
+
+    Each state is taken off the list with one pop before it is freed, so two releasers running at
+    once (the threads of two managers' take-overs) never take the same state, and neither finds the
+    list emptied under it. An empty list therefore means every state was taken, not that every entry
+    is freed: a releaser may still be freeing one, and a state whose lock is taken is left alone. If
+    a thread that forked inside its critical section still runs there, that thread finishes on it,
+    and it is freed with that thread's last reference. If a parent thread held it at fork, it can
+    stay for the child's life, referenced by that thread's frame, which the child never frees.
     """
-    while _inherited_states:
-        state = _inherited_states[-1]
-        if state.lock.acquire(blocking=False):
-            try:
-                while state.cache:
-                    for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
-                        state.cache.popitem()
-                    time.sleep(0)
-                state.memory_bytes = 0
-            finally:
-                state.lock.release()
-        _inherited_states.pop()  # only once drained: an empty list means every inherited entry is freed
+    while True:
+        try:
+            state = _inherited_states.pop()
+        except IndexError:  # every state is taken
+            return
+        if not state.lock.acquire(blocking=False):
+            continue
+        try:
+            while state.cache:
+                for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
+                    state.cache.popitem()
+                time.sleep(0)
+        finally:
+            state.lock.release()
 
 
 if hasattr(os, "register_at_fork"):

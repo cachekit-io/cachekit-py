@@ -13,7 +13,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
-from cachekit.hash_utils import WarnThrottle, redact_error_for_log
+from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation
 from ..backends.errors import BackendError, UnsupportedTenantError
@@ -977,7 +977,7 @@ def create_cache_wrapper(
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
         _cached_keys, and this process's next drain by the same tenant deletes it from there.
         Other processes' drains cannot see it, so the failure is a WARNING — throttled to one per
-        WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
+        _WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
         if not _is_trackable():
             return
@@ -1126,7 +1126,7 @@ def create_cache_wrapper(
             # letting the caller demote this hit into a recompute.
             logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
-    def _warn_refresh(throttle: WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
+    def _warn_refresh(throttle: _WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
         """Log a background refresh that failed or never ran: a throttled WARNING, DEBUG between.
 
         The caller was already served the cached value and must never see the failure (spec:
@@ -1345,6 +1345,21 @@ def create_cache_wrapper(
         """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
         return getattr(_backend, "key_prefix", None) or ""
 
+    def _evict(key: str | None) -> None:
+        """Another process's invalidation, from the listener thread: evict ``key``, or every key
+        this wrapper recorded (``None``), from L1.
+
+        Never trims _cached_keys. The event is tenant-blind and can race a re-record of the same key
+        (see _watch_records), so a trim could drop this process's only record of a live L2 entry;
+        a record left behind costs one redundant delete later.
+        """
+        if _l1_cache is None:  # never registered without one
+            return
+        if key is not None:
+            _l1_cache.invalidate(key)
+        else:
+            _l1_cache.invalidate_many({cached for _, cached in set(_cached_keys)})
+
     # Whether a generated key differs from its pre-0.20.0 twin: only when the serializer code is
     # not the default's. Fixed at decoration, so the default serializer pays nothing per call.
     _records_twin = (
@@ -1367,10 +1382,10 @@ def create_cache_wrapper(
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
     # Background-failure WARNING throttles, one per kind, so a frequent kind never hides a rarer one.
-    _track_warn = WarnThrottle()  # key tracking failed
-    _refresh_failed_warn = WarnThrottle()  # a background refresh raised
-    _refresh_skipped_warn = WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
-    _refresh_unstarted_warn = WarnThrottle()  # the refresh thread or task could not be started
+    _track_warn = _WarnThrottle()  # key tracking failed
+    _refresh_failed_warn = _WarnThrottle()  # a background refresh raised
+    _refresh_skipped_warn = _WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
+    _refresh_unstarted_warn = _WarnThrottle()  # the refresh thread or task could not be started
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -1758,6 +1773,8 @@ def create_cache_wrapper(
                 reset_current_function_stats(token)
                 raise
 
+        if _l1_cache and invalidation.listener_start_due(_backend):
+            invalidation.start_listener(_backend)
         twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
         # Continue with the rest of the sync wrapper logic...
@@ -2126,6 +2143,10 @@ def create_cache_wrapper(
             if interop is not None and not interop_checked:
                 ensure_interop_backend_compatible(_backend)
 
+            if _l1_cache and invalidation.listener_start_due(_backend):
+                # Connects and subscribes: in an executor thread, and not awaited, so this call never
+                # waits on it. start_listener never raises; concurrent starts give way to the first.
+                asyncio.get_running_loop().run_in_executor(None, invalidation.start_listener, _backend)
             twin_key = _twin_key(args, kwargs)  # after the L1 lookup: an L1 hit records nothing
 
             # Update operation handler with the backend (sync or async)
@@ -2792,7 +2813,14 @@ def create_cache_wrapper(
             )
         invalidate_cache()
 
+    # Other processes' invalidations reach this function's L1 through the process's listener. Only a
+    # backed wrapper with an L1 registers: in L1-only mode nothing is shared, so nothing is announced.
+    # Registered weakly: the wrapper's _cachekit_evict attribute is what keeps _evict alive.
+    if _l1_cache is not None and not _l1_only_mode:
+        invalidation.register(_registry_id, _evict)
+
     if inspect.iscoroutinefunction(func):
+        async_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
         async_wrapper.invalidate_cache = ainvalidate_cache  # type: ignore[attr-defined]
         async_wrapper.ainvalidate_cache = ainvalidate_cache  # async version  # type: ignore[attr-defined]
         async_wrapper.check_health = acheck_health  # async version  # type: ignore[attr-defined]
@@ -2802,6 +2830,7 @@ def create_cache_wrapper(
         async_wrapper.__wrapped__ = func  # type: ignore[attr-defined]
         return async_wrapper  # type: ignore[return-value]
     else:
+        sync_wrapper._cachekit_evict = _evict  # type: ignore[attr-defined]
         sync_wrapper.invalidate_cache = invalidate_cache  # type: ignore[attr-defined]
         sync_wrapper.check_health = check_health  # type: ignore[attr-defined]
         sync_wrapper.get_health_status = get_health_status  # type: ignore[attr-defined]

@@ -27,8 +27,8 @@ WRAPPER_LOGGER = "cachekit.decorators.wrapper"
 @pytest.fixture(autouse=True)
 def fresh_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test opens its own WARNING windows: the throttles are process-wide."""
-    monkeypatch.setattr(invalidation, "_publish_failed_warn", hash_utils.WarnThrottle())
-    monkeypatch.setattr(invalidation, "_too_long_warn", hash_utils.WarnThrottle())
+    monkeypatch.setattr(invalidation, "_publish_failed_warn", hash_utils._WarnThrottle())
+    monkeypatch.setattr(invalidation, "_too_long_warn", hash_utils._WarnThrottle())
 
 
 def _events(backend: TrackingBackend) -> list[dict[str, str]]:
@@ -356,7 +356,7 @@ class TestPublishNeverFailsTheInvalidation:
             for x in range(50):
                 f(x)
                 f.invalidate_cache(x)
-            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             f.invalidate_cache(0)
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "announcement failed" in r.getMessage()]
@@ -424,7 +424,10 @@ class TestPublishNeverFailsTheInvalidation:
         f.invalidate_cache()
         assert calls == []
 
-    def test_registry_id_over_the_cap_is_not_announced(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_registry_id_over_the_cap_is_not_announced_and_warns_once_a_window_with_the_count(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Every invalidation of such a function goes unannounced: one WARNING a window, not one per call."""
         backend = TrackingBackend()
         namespace = "n" * 1100
 
@@ -432,13 +435,21 @@ class TestPublishNeverFailsTheInvalidation:
         def f(x: int) -> int:
             return x
 
-        f(1)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG, logger=invalidation.__name__):
+            for _ in range(2):  # inside one window
+                f(1)
+                f.invalidate_cache()
+                assert backend.store == {}  # the drain itself ran
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             f.invalidate_cache()
 
-        assert backend.store == {}  # the drain itself ran
         assert _events(backend) == []
-        assert "registry id <redacted:" in caplog.text and "over 1024 bytes" in caplog.text
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        debugs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG and "not announced" in r.getMessage()]
+        assert len(warnings) == 2 and len(debugs) == 1
+        assert "invalidations since the last warning: 1)" in warnings[0]
+        assert "invalidations since the last warning: 2)" in warnings[1]  # the DEBUG one is counted, not lost
+        assert all("id <redacted:" in message and "is over 1024 bytes" in message for message in warnings + debugs)
         assert namespace not in caplog.text
 
 

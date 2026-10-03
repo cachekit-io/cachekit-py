@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -66,6 +67,16 @@ for i = 1, #members do
 end
 return members
 """
+
+# The invalidation listener's connection PINGs after this many idle seconds, which keeps idle-timeout
+# proxies and NAT gateways from dropping it. redis-py does not wait for the reply, so a connection
+# that dies silently is still found only when TCP gives up on it.
+_LISTENER_HEALTH_CHECK_SECONDS = 10
+
+# Pool -> (the socket_timeout it had before its outermost open with_timeout() window, that window's
+# token), so listener_pool() clones the configured value, never a window's, whichever backend object
+# opened the window on the shared pool. Weak: pools come and go with their clients.
+_open_windows: weakref.WeakKeyDictionary[redis.ConnectionPool, tuple[float | None, object]] = weakref.WeakKeyDictionary()
 
 
 async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:
@@ -683,6 +694,45 @@ class PerRequestRedisBackend:
         )
         return out
 
+    def listener_pool(self) -> redis.ConnectionPool:
+        """A one-connection pool for the invalidation listener, cloned from this backend's pool.
+
+        A clone, never a pool rebuilt from the URL or from ``connection_kwargs`` alone: redis-py
+        keeps the transport in ``connection_class`` (``SSLConnection`` for ``rediss://``,
+        ``UnixDomainSocketConnection`` for ``unix://``), outside ``connection_kwargs``, so a rebuilt
+        pool would fall back to a plaintext TCP ``Connection`` and send the password in the clear.
+        The clone keeps the configured ``socket_timeout`` even inside a ``with_timeout()`` window.
+
+        The listener holds its one connection for the life of the process, so the connection PINGs
+        after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive (a Unix socket takes
+        no keepalive option): idle-timeout proxies keep it. Replies stay bytes, whatever the backend's
+        client decodes: events are MessagePack.
+
+        Examples:
+            >>> import redis
+            >>> pool = redis.ConnectionPool.from_url("rediss://:pw@cache.example:6380/0")  # pragma: allowlist secret
+            >>> backend = PerRequestRedisBackend(redis.Redis(connection_pool=pool), "default")
+            >>> clone = backend.listener_pool()  # no connection is made until the listener subscribes
+            >>> clone.connection_class is redis.SSLConnection, clone.max_connections
+            (True, 1)
+            >>> clone.connection_kwargs["password"] == pool.connection_kwargs["password"]
+            True
+            >>> clone.connection_kwargs["socket_keepalive"], clone.connection_kwargs["health_check_interval"]
+            (True, 10)
+        """
+        source = self._client.connection_pool
+        window = _open_windows.get(source)  # first: a closing window restores the kwargs before it leaves
+        kwargs = {
+            **source.connection_kwargs,
+            "health_check_interval": _LISTENER_HEALTH_CHECK_SECONDS,
+            "decode_responses": False,
+        }
+        if window is not None:
+            kwargs["socket_timeout"] = window[0]
+        if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
+            kwargs["socket_keepalive"] = True
+        return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
+
     @asynccontextmanager
     async def with_timeout(
         self,
@@ -705,6 +755,8 @@ class PerRequestRedisBackend:
         # This is a best-effort implementation (coarser-grained)
         original_timeout = self._client.connection_pool.connection_kwargs.get("socket_timeout")
         timeout_sec = timeout_ms / 1000.0
+        pool, token = self._client.connection_pool, object()
+        outermost = _open_windows.setdefault(pool, (original_timeout, token))[1] is token
 
         try:
             # Set socket timeout
@@ -718,6 +770,8 @@ class PerRequestRedisBackend:
                 self._client.connection_pool.connection_kwargs["socket_timeout"] = original_timeout
             else:
                 self._client.connection_pool.connection_kwargs.pop("socket_timeout", None)
+            if outermost:
+                _open_windows.pop(pool, None)
 
 
 class RedisBackendProvider:
