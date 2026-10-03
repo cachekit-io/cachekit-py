@@ -332,6 +332,56 @@ jobs:
         uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
         uv run --no-sync pytest tests/critical/ -m "not slow"
 
+  # Oldest-supported redis-py safety net. The lockfile resolves the newest
+  # redis-py, so every other job tests that, while pip accepts any release at
+  # or above the floor in pyproject.toml. Below the real floor nothing fails at
+  # import: client creation fails and every decorated call runs uncached. This
+  # job installs exactly the declared floor and runs the unit suite, so code
+  # that needs a newer redis-py cannot ship with the floor left behind.
+  test-redis-floor:
+    name: Tests (redis-py floor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Start Redis (no persistence)
+      run: |
+        docker run -d --name redis -p 6379:6379 \
+          redis:7-alpine redis-server --save "" --appendonly no
+        until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.19"  # pinned: uv runs as step 1 of every job; a floating release is code exec
+        cache-suffix: redis-floor
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Install dependencies
+      run: uv sync --python ${{ env.DEFAULT_PYTHON_VERSION }} --group dev
+
+    # Read the floor from pyproject.toml rather than repeating it here, and
+    # assert it is what got installed: a silent no-op would test the newest
+    # redis-py and pass for the wrong reason.
+    - name: Install the declared redis-py floor
+      run: |
+        floor=$(uv run --no-sync python -c '
+        import tomllib
+        from packaging.requirements import Requirement
+        reqs = [Requirement(d) for d in tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]]
+        (spec,) = [s for r in reqs if r.name == "redis" for s in r.specifier if s.operator == ">="]
+        print(spec.version)
+        ')
+        uv pip install "redis[hiredis]==$floor"
+        uv run --no-sync python -c "import redis; assert redis.__version__ == '$floor', redis.__version__"
+        echo "unit suite runs on redis-py $floor"
+
+    - name: Run unit suite on the floor
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: uv run --no-sync pytest tests/unit/ -m "not slow" -n auto
+
   # Version sync + dependency CVE scan (push to main only)
   post-merge:
     name: Post-Merge Checks
@@ -461,7 +511,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [quick-check, test, test-freethreaded, runner-drift-guard]
+    needs: [quick-check, test, test-freethreaded, test-redis-floor, runner-drift-guard]
     if: always()
     steps:
     - name: Check all jobs succeeded
@@ -469,6 +519,7 @@ jobs:
         if [[ "${{ needs.quick-check.result }}" != "success" ]] || \
            [[ "${{ needs.test.result }}" != "success" ]] || \
            [[ "${{ needs.test-freethreaded.result }}" != "success" ]] || \
+           [[ "${{ needs.test-redis-floor.result }}" != "success" ]] || \
            [[ "${{ needs.runner-drift-guard.result }}" != "success" ]]; then
           echo "One or more jobs failed"
           exit 1
