@@ -34,7 +34,7 @@ import redis
 
 from cachekit import l1_cache
 from cachekit.cache_handler import supports_key_tracking
-from cachekit.hash_utils import redact_cache_key, redact_error_for_log
+from cachekit.hash_utils import WarnThrottle, redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,12 @@ _RESUBSCRIBE_SECONDS = 60.0
 _UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
 
 Evictor = Callable[[Optional[str]], None]
+
+# One WARNING a minute per kind, process-wide, with the count since the last one; DEBUG between.
+# An ACL without the channel (the Redis 7 default for a new user) fails every PUBLISH, so a
+# WARNING per invalidation would be a flood.
+_publish_failed_warn = WarnThrottle()
+_too_long_warn = WarnThrottle()
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -129,8 +135,10 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
 
     One ``PUBLISH`` on the backend's shared client, outside its error classification and the
     reliability stack, so a pub/sub failure cannot count against the circuit breaker. It waits for
-    Redis's reply, never for delivery. A failure is a WARNING: the invalidation itself stands, and
-    peers that missed the event keep their L1 copies until the L1 TTL.
+    Redis's reply, never for delivery. A failure leaves the invalidation standing, and peers that
+    missed the event keep their L1 copies until the L1 TTL; it is logged by a WarnThrottle. A
+    key-tracking backend with no Redis client (any but the tenant-scoped Redis backend) carries no
+    channel, so nothing is announced for it.
 
     Args:
         backend: The resolved, key-tracking backend whose client carries the event
@@ -139,18 +147,29 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
             for custom ``key=`` functions, whose keys embed caller identifiers.
     """
     try:
+        send = getattr(getattr(backend, "_client", None), "publish", None)
+        if not callable(send):
+            return
         payload = encode_event(registry_id, key)
         if payload is None:
-            logger.warning(
-                "Invalidation not announced: registry id %s is over %d bytes (namespace too long)",
-                redact_cache_key(registry_id),
-                _MAX_FIELD_BYTES,
-            )
+            if _too_long_warn.claim():
+                logger.warning(
+                    "Invalidation not announced: registry id %s is over %d bytes (namespace too long)",
+                    redact_cache_key(registry_id),
+                    _MAX_FIELD_BYTES,
+                )
             return
-        receivers = backend._client.publish(CHANNEL, payload)
+        receivers = send(CHANNEL, payload)
     except Exception as e:
+        failures = _publish_failed_warn.claim()
+        if not failures:
+            logger.debug("Invalidation announcement failed for %s: %s", redact_cache_key(registry_id), redact_error_for_log(e))
+            return
         logger.warning(
-            "Invalidation announcement failed; other processes keep their L1 copies until the L1 TTL: %s",
+            "Invalidation announcement failed (failures since the last warning: %d); other processes keep their "
+            "L1 copies until the L1 TTL. Latest registry %s: %s",
+            failures,
+            redact_cache_key(registry_id),
             redact_error_for_log(e),
         )
         return

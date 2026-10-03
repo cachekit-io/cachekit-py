@@ -16,12 +16,19 @@ import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import NoPermissionError
 
-from cachekit import cache, invalidation
+from cachekit import cache, hash_utils, invalidation
 from cachekit.backends.errors import BackendError
 from tests.unit.test_key_registry import PlainBackend, TrackingBackend, _LegacyFormat, _registry_ids
 from tests.unit.test_key_serializer_suffix import _pre_020_key
 
 WRAPPER_LOGGER = "cachekit.decorators.wrapper"
+
+
+@pytest.fixture(autouse=True)
+def fresh_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test opens its own WARNING windows: the throttles are process-wide."""
+    monkeypatch.setattr(invalidation, "_publish_failed_warn", hash_utils.WarnThrottle())
+    monkeypatch.setattr(invalidation, "_too_long_warn", hash_utils.WarnThrottle())
 
 
 def _events(backend: TrackingBackend) -> list[dict[str, str]]:
@@ -333,6 +340,46 @@ class TestPublishNeverFailsTheInvalidation:
         assert type(error).__name__ in warning.getMessage()  # the type, never the message
         assert "NOPERM" not in caplog.text and key not in caplog.text
         assert not any(rid in caplog.text for rid in _registry_ids(backend))
+
+    def test_failed_publishes_warn_once_a_window_with_the_count(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An ACL without the channel fails every PUBLISH: one WARNING a window, not one per call."""
+        backend = TrackingBackend()
+        backend._client.fail_publish = NoPermissionError("NOPERM")
+
+        @cache(backend=backend, ttl=60, namespace="chan-pub-flood")
+        def f(x: int) -> int:
+            return x
+
+        with caplog.at_level(logging.DEBUG, logger=invalidation.__name__):
+            for x in range(50):
+                f(x)
+                f.invalidate_cache(x)
+            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            f.invalidate_cache(0)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "announcement failed" in r.getMessage()]
+        assert len(warnings) == 2 and len(debugs) == 49
+        assert "failures since the last warning: 1)" in warnings[0]
+        assert "failures since the last warning: 50)" in warnings[1]  # none lost from the count
+        assert backend.store == {}
+
+    def test_tracking_backend_without_a_redis_client_announces_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A third-party KeyTrackableBackend has no channel: no event, and no WARNING per call."""
+        backend = TrackingBackend()
+        del backend._client
+
+        @cache(backend=backend, ttl=60, namespace="chan-third-party")
+        def f(x: int) -> int:
+            return x
+
+        f(1)
+        with caplog.at_level(logging.DEBUG, logger=invalidation.__name__):
+            f.invalidate_cache(1)
+            f(2)
+            f.invalidate_cache()
+        assert backend.store == {} and caplog.records == []
 
     async def test_failed_async_publish_never_escapes(self) -> None:
         backend = TrackingBackend()

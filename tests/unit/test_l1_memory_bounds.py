@@ -554,10 +554,54 @@ class TestCleanupThreadAfterFork:
 
         assert [cache._state is state for cache, state in zip(caches, old, strict=True)] == [False, False]
         assert [list(state.cache) for state in old] == [["pre-fork"], ["pre-fork"]]  # a holder finishes on its own
-        # Kept referenced, never freed: freeing would write to, and so copy, the parent's L1 pages.
+        # Kept, not freed inside fork(): freeing would copy the parent's L1 pages into the child.
         assert l1_cache._inherited_states == old
         assert [cache.get("pre-fork")[0] for cache in caches] == [False, False]
         assert l1_cache._hooked_pid == os.getpid()
+
+    def test_release_frees_inherited_states_and_leaves_one_in_use_alone(self, monkeypatch):
+        """A thread that forked inside a state's critical section still runs on it: that one is only dropped."""
+        from cachekit import l1_cache
+
+        free_state, held_state = l1_cache._L1State(), l1_cache._L1State()
+        for state in (free_state, held_state):
+            for i in range(2500):  # more than one release batch
+                state.cache[f"k{i}"] = CacheEntry(b"v", time.time() + 60, 1)
+            state.memory_bytes = 2500
+        monkeypatch.setattr(l1_cache, "_inherited_states", [held_state, free_state])
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with held_state.lock:
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert held.wait(5)
+        try:
+            l1_cache._release_inherited_states()
+        finally:
+            release.set()
+            holder.join(5)
+
+        assert l1_cache._inherited_states == []
+        assert len(free_state.cache) == 0 and free_state.memory_bytes == 0
+        assert len(held_state.cache) == 2500  # its holder finishes on it, untouched
+
+    def test_cleanup_thread_frees_inherited_states_when_it_starts(self, monkeypatch):
+        from cachekit import l1_cache
+
+        state = l1_cache._L1State()
+        state.cache["k"] = CacheEntry(b"v", time.time() + 60, 1)
+        monkeypatch.setattr(l1_cache, "_inherited_states", [state])
+        manager = L1CacheManager(default_max_memory_mb=10)
+        manager.start_background_cleanup(interval_seconds=600)  # freed at start, not after a sweep interval
+        try:
+            assert _wait_for(lambda: not l1_cache._inherited_states)
+            assert len(state.cache) == 0
+        finally:
+            manager.stop_background_cleanup()
 
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)

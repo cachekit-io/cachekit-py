@@ -1,9 +1,15 @@
-"""Memory guard for the L1 at-fork hook: a forked child must not copy its parent's L1.
+"""Memory guards for the L1 at-fork hook: a forked child must not end up owning a copy of its
+parent's L1.
 
-The hook gives every cache a fresh, empty state in the child. Freeing the inherited state there
-would write to every entry's memory and turn the parent's L1 pages into private copies, at a cost
-close to the size of a warm L1 per child. The child's private dirty memory right after fork() is
-the deterministic measure: a few MB for the interpreter's own writes, independent of L1 size.
+The hook gives every cache a fresh, empty state in the child and keeps the inherited states
+referenced, so fork() itself frees nothing. Freeing them there would write to every entry's
+memory and copy the parent's L1 pages into the child inside fork(). Kept for good, they would be
+copied anyway, later: each page the parent rewrites stops being shared, and the child is left
+with a private copy nothing can reach. So the child's cleanup thread frees them when it starts.
+
+Both guards read the child's private dirty memory (/proc/self/smaps_rollup), the deterministic
+measure, on a heap where the L1 values sit between other allocations, as in an application, so
+no free can shrink the heap and hide the cost.
 """
 
 from __future__ import annotations
@@ -23,9 +29,10 @@ pytestmark = [
 
 _L1_MB = 16
 
-_CHILD = textwrap.dedent(
+_PARENT = textwrap.dedent(
     f"""
-    import os
+    import os, time
+    from cachekit import l1_cache
     from cachekit.l1_cache import L1CacheManager
 
     def private_dirty_kib():
@@ -41,10 +48,15 @@ _CHILD = textwrap.dedent(
     for i in range({_L1_MB} * 1024):
         cache.put(f"key-{{i}}", os.urandom(1024), redis_ttl=600)
         elsewhere.append(os.urandom(1024))
+    """
+)
+
+_AT_FORK = _PARENT + textwrap.dedent(
+    """
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.write(w, f"{{private_dirty_kib()}} {{len(cache._state.cache)}}".encode())  # the hook emptied it
+        os.write(w, f"{private_dirty_kib()} {len(cache._state.cache)}".encode())  # the hook emptied it
         os._exit(0)
     os.close(w)
     print(os.read(r, 64).decode())
@@ -52,12 +64,53 @@ _CHILD = textwrap.dedent(
     """
 )
 
+_AFTER_PARENT_CHURN = _PARENT + textwrap.dedent(
+    """
+    manager.start_background_cleanup(interval_seconds=600)  # the child's first put starts its own
+    churned_r, churned_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    result_r, result_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        cache.put("child", b"v", redis_ttl=600)  # the child uses its L1: its cleanup thread starts
+        deadline = time.monotonic() + 10
+        while l1_cache._inherited_states and time.monotonic() < deadline:
+            time.sleep(0.05)
+        before = private_dirty_kib()
+        os.write(ready_w, b"x")
+        os.read(churned_r, 1)  # the parent has rewritten its L1
+        os.write(result_w, f"{before} {private_dirty_kib()} {len(l1_cache._inherited_states)}".encode())
+        os._exit(0)
+    os.read(ready_r, 1)
+    cache.clear()  # the parent frees every entry: each page it writes stops being shared
+    for i in range(1024):
+        cache.put(f"again-{i}", os.urandom(1024), redis_ttl=600)
+    os.write(churned_w, b"x")
+    print(os.read(result_r, 64).decode())
+    os.waitpid(pid, 0)
+    """
+)
 
-def test_forked_child_shares_its_parents_l1_pages() -> None:
+
+def _run(code: str) -> list[int]:
     proc = subprocess.run(  # noqa: S603 - trusted: sys.executable + literal code
-        [sys.executable, "-c", _CHILD], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert proc.returncode == 0, proc.stderr
-    private_kib, entries = (int(field) for field in proc.stdout.split())
+    return [int(field) for field in proc.stdout.split()]
+
+
+def test_forked_child_copies_nothing_at_fork() -> None:
+    """fork() returns before anything is freed: a few MB of the interpreter's own writes, right after it."""
+    private_kib, entries = _run(_AT_FORK)
     assert entries == 0  # the hook ran in the child
     assert private_kib / 1024 < _L1_MB / 4, f"forked child copied {private_kib / 1024:.1f} MiB of a {_L1_MB} MiB L1"
+
+
+def test_child_keeps_no_copy_of_pages_its_parent_rewrites() -> None:
+    """Once the child uses its L1, its cleanup thread frees the inherited states, so a parent that
+    rewrites its L1 afterwards no longer leaves the child holding private copies of those pages."""
+    before_kib, after_kib, still_inherited = _run(_AFTER_PARENT_CHURN)
+    assert still_inherited == 0  # the child's cleanup thread freed them
+    grown_mib = (after_kib - before_kib) / 1024
+    assert grown_mib < _L1_MB / 4, f"the parent's churn left the child {grown_mib:.1f} MiB of unreachable copies"
