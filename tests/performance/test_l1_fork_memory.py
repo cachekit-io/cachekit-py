@@ -72,9 +72,10 @@ _AFTER_PARENT_CHURN = _PARENT + textwrap.dedent(
     result_r, result_w = os.pipe()
     pid = os.fork()
     if pid == 0:
+        inherited = list(l1_cache._inherited_states)  # the entries, not the list: a state leaves it before it is freed
         cache.put("child", b"v", redis_ttl=600)  # the child uses its L1: its cleanup thread starts
         deadline = time.monotonic() + 10
-        while l1_cache._inherited_states and time.monotonic() < deadline:
+        while any(state.cache for state in inherited) and time.monotonic() < deadline:
             time.sleep(0.05)
         before = private_dirty_kib()
         os.write(ready_w, b"x")

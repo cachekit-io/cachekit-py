@@ -567,7 +567,10 @@ class L1CacheManager:
     def _spawn_cleanup_thread(self, interval_seconds: float) -> None:
         def cleanup_worker():
             logger.info("L1 cache background cleanup started (interval: %.1fs)", interval_seconds)
-            _release_inherited_states()  # a forked child's, the first time its L1 is used
+            try:  # a forked child's inherited states, before the first wait rather than an interval later
+                _release_inherited_states()
+            except Exception as e:  # its own try: an error there must not end the sweeps below
+                logger.error("Error freeing inherited L1 states: %s", redact_error_for_log(e))
 
             while not self._stop_cleanup.wait(interval_seconds):
                 try:
@@ -634,8 +637,8 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
 
-# The L1 states a forked child inherited, kept until the child's cleanup thread frees them
-# (_empty_caches_after_fork, _release_inherited_states). Never read.
+# The L1 states a forked child inherited that no releaser has taken yet (_empty_caches_after_fork,
+# _release_inherited_states). Nothing serves from them.
 _inherited_states: list[_L1State] = []
 
 
@@ -680,23 +683,30 @@ def _release_inherited_states() -> None:
     sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
     reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
     Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
-    them, so the child's other threads keep running. A state whose lock is taken, by a thread that
-    forked inside its critical section and still runs there, is only dropped from the list: that
-    thread finishes on it, and it is freed with that thread's last reference. A child that never
-    starts a cleanup thread (its parent's manager had none) keeps them.
+    them, so the child's other threads keep running. A child that never starts a cleanup thread (its
+    parent's manager had none) keeps them.
+
+    Each state is taken off the list with one pop before it is freed, so two releasers running at
+    once (two managers' cleanup threads) never take the same state, and neither finds the list
+    emptied under it. An empty list therefore means every state was taken, not that every entry is
+    freed: a releaser may still be freeing one, and a state in use is left alone. That is a state
+    whose lock is taken, by a thread that forked inside its critical section and still runs there:
+    that thread finishes on it, and it is freed with that thread's last reference.
     """
-    while _inherited_states:
-        state = _inherited_states[-1]
-        if state.lock.acquire(blocking=False):
-            try:
-                while state.cache:
-                    for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
-                        state.cache.popitem()
-                    time.sleep(0)
-                state.memory_bytes = 0
-            finally:
-                state.lock.release()
-        _inherited_states.pop()  # only once drained: an empty list means every inherited entry is freed
+    while True:
+        try:
+            state = _inherited_states.pop()
+        except IndexError:  # every state is taken
+            return
+        if not state.lock.acquire(blocking=False):
+            continue
+        try:
+            while state.cache:
+                for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
+                    state.cache.popitem()
+                time.sleep(0)
+        finally:
+            state.lock.release()
 
 
 if hasattr(os, "register_at_fork"):

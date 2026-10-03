@@ -567,7 +567,6 @@ class TestCleanupThreadAfterFork:
         for state in (free_state, held_state):
             for i in range(2500):  # more than one release batch
                 state.cache[f"k{i}"] = CacheEntry(b"v", time.time() + 60, 1)
-            state.memory_bytes = 2500
         monkeypatch.setattr(l1_cache, "_inherited_states", [held_state, free_state])
         held, release = threading.Event(), threading.Event()
 
@@ -586,8 +585,59 @@ class TestCleanupThreadAfterFork:
             holder.join(5)
 
         assert l1_cache._inherited_states == []
-        assert len(free_state.cache) == 0 and free_state.memory_bytes == 0
+        assert len(free_state.cache) == 0
         assert len(held_state.cache) == 2500  # its holder finishes on it, untouched
+
+    def test_concurrent_releases_free_each_entry_once_and_never_raise(self, monkeypatch):
+        """Two releasers share one list: two managers' cleanup threads, or one and a take-over's one-shot release.
+
+        The first stops inside the drain of the state it took while the second runs to its end, the
+        interleaving in which taking a state by peeking at it and popping it later raised IndexError.
+        """
+        from collections import OrderedDict
+
+        from cachekit import l1_cache
+
+        draining, resume = threading.Event(), threading.Event()
+        freed: list[str] = []
+
+        class Entries(OrderedDict):  # records each free; a gated one stops its releaser at its first
+            def __init__(self, name: str, gated: bool) -> None:
+                super().__init__((f"{name}-{i}", CacheEntry(b"v", time.time() + 60, 1)) for i in range(3))
+                self.gated = gated
+
+            def popitem(self, last: bool = True) -> tuple[str, CacheEntry]:
+                if self.gated and not draining.is_set():
+                    draining.set()
+                    resume.wait(10)
+                key, entry = super().popitem(last)
+                freed.append(key)
+                return key, entry
+
+        states = [l1_cache._L1State() for _ in range(4)]
+        for i, state in enumerate(states):
+            state.cache = Entries(f"s{i}", gated=i == 3)  # a releaser takes the last state first
+        monkeypatch.setattr(l1_cache, "_inherited_states", list(states))
+        errors: list[BaseException] = []
+
+        def first() -> None:
+            try:
+                l1_cache._release_inherited_states()
+            except BaseException as e:  # what ended the cleanup thread for good
+                errors.append(e)
+
+        thread = threading.Thread(target=first, daemon=True)
+        thread.start()
+        try:
+            assert draining.wait(5)
+            l1_cache._release_inherited_states()  # the second releaser, to its end meanwhile
+        finally:
+            resume.set()
+            thread.join(5)
+
+        assert not thread.is_alive() and errors == []
+        assert sorted(freed) == sorted(f"s{i}-{j}" for i in range(4) for j in range(3))  # every entry, each once
+        assert l1_cache._inherited_states == []
 
     def test_cleanup_thread_frees_inherited_states_when_it_starts(self, monkeypatch):
         from cachekit import l1_cache
@@ -598,10 +648,31 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         manager.start_background_cleanup(interval_seconds=600)  # freed at start, not after a sweep interval
         try:
-            assert _wait_for(lambda: not l1_cache._inherited_states)
-            assert len(state.cache) == 0
+            # The entries, not the list: a releaser takes a state off the list before it frees it.
+            assert _wait_for(lambda: not state.cache)
+            assert l1_cache._inherited_states == []
         finally:
             manager.stop_background_cleanup()
+
+    def test_failed_release_never_ends_the_sweeps(self, monkeypatch, caplog):
+        """The cleanup thread frees inherited states first: an error there is logged, and it sweeps on."""
+        from cachekit import l1_cache
+
+        def broken() -> None:
+            raise RuntimeError("release bug")
+
+        monkeypatch.setattr(l1_cache, "_release_inherited_states", broken)
+        manager = L1CacheManager(default_max_memory_mb=10)
+        cache = manager.get_cache("release-fails-ns")
+        with caplog.at_level(logging.ERROR, logger="cachekit.l1_cache"):
+            manager.start_background_cleanup(interval_seconds=0.05)
+            try:
+                cache.put("k", b"v", redis_ttl=1.2)  # minus the 1s ttl buffer: expires in ~0.2s
+                # No get(): only a live background sweep can count this eviction.
+                assert _wait_for(lambda: cache.get_stats()["expired_evictions"] == 1)
+            finally:
+                manager.stop_background_cleanup()
+        assert "Error freeing inherited L1 states: RuntimeError" in caplog.text
 
     def test_cleanup_stopped_in_parent_stays_stopped(self):
         manager = L1CacheManager(default_max_memory_mb=10)
