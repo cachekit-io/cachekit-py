@@ -3,7 +3,7 @@
 Tests for backends/cachekitio/client.py covering:
 - Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
 - Sync client lifecycle: open while its lease is held, closed once the lease is dropped
-- Client configuration (base_url, timeout, Authorization header)
+- Client configuration (base_url, timeout, Authorization and User-Agent headers)
 - Async clients bound to the running event loop (multi-loop behaviour: test_cachekitio_event_loops.py)
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() drops thread-local references
@@ -14,13 +14,16 @@ Tests for backends/cachekitio/client.py covering:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+from importlib.metadata import PackageNotFoundError, version
 
 import httpx
 import pytest
 import pytest_asyncio  # noqa: F401
 from pydantic import SecretStr
 
+from cachekit.backends.cachekitio import client as client_module
 from cachekit.backends.cachekitio.client import (
     close_async_client,
     close_sync_client,
@@ -90,6 +93,24 @@ class TestLeaseSyncHttpClient:
         assert l2.client.timeout.read == 1.0
         assert lease_sync_http_client(config) is l1
 
+    def test_user_agent_names_sdk_and_httpx_versions(self, config: CachekitIOBackendConfig) -> None:
+        """Edge analytics attribute traffic to an SDK release by this UA, built from installed package metadata."""
+        lease = lease_sync_http_client(config)
+        assert lease.client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
+
+    def test_user_agent_without_distribution_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A source-only or vendored install has no dist-info: the backend must still import, send a UA, and say why."""
+
+        def missing(name: str) -> str:
+            raise PackageNotFoundError(name)
+
+        monkeypatch.setattr(client_module, "version", missing)
+        with caplog.at_level(logging.DEBUG, logger=client_module.__name__):
+            assert client_module._user_agent() == f"cachekit-py/unknown httpx/{httpx.__version__}"
+        assert [r.levelno for r in caplog.records if "distribution metadata" in r.getMessage()] == [logging.DEBUG]
+
 
 @pytest.mark.unit
 class TestLeaseAsyncHttpClient:
@@ -129,6 +150,10 @@ class TestLeaseAsyncHttpClient:
         client = lease_async_http_client(config).client
         auth_header = client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
+
+    async def test_user_agent_names_sdk_and_httpx_versions(self, config: CachekitIOBackendConfig) -> None:
+        client = lease_async_http_client(config).client
+        assert client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
 
 
 @pytest.mark.unit
