@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 import httpx
 import pytest
 import pytest_asyncio  # noqa: F401
 from pydantic import SecretStr
 
+from cachekit.backends.cachekitio import client as client_module
 from cachekit.backends.cachekitio.client import (
     close_async_client,
     close_sync_client,
@@ -95,6 +96,15 @@ class TestLeaseSyncHttpClient:
         """Edge analytics attribute traffic to an SDK release by this UA, built from installed package metadata."""
         lease = lease_sync_http_client(config)
         assert lease.client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
+
+    def test_user_agent_without_distribution_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A source-only or vendored install has no dist-info: the backend must still import and send a UA."""
+
+        def missing(name: str) -> str:
+            raise PackageNotFoundError(name)
+
+        monkeypatch.setattr(client_module, "version", missing)
+        assert client_module._user_agent() == f"cachekit-py/unknown httpx/{httpx.__version__}"
 
 
 @pytest.mark.unit

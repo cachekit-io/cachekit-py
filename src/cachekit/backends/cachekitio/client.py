@@ -19,7 +19,7 @@ import os
 import threading
 import weakref
 from contextlib import AsyncExitStack, ExitStack
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -32,9 +32,19 @@ if TYPE_CHECKING:
 
 _ClientKey = tuple[str, str, float, int]
 
-# Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
-# The version comes from the installed distribution, so it cannot drift from the release.
-_USER_AGENT = f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
+
+def _user_agent() -> str:
+    # Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
+    # The version comes from the installed distribution, so it cannot drift from the release. A source-only or vendored
+    # copy has no distribution metadata; it still identifies as cachekit-py rather than failing the import.
+    try:
+        sdk = version("cachekit")
+    except PackageNotFoundError:
+        sdk = "unknown"
+    return f"cachekit-py/{sdk} httpx/{httpx.__version__}"
+
+
+_USER_AGENT = _user_agent()
 
 _logger = get_structured_logger(__name__)
 
