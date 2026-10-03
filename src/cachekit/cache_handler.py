@@ -801,6 +801,7 @@ class CacheSerializationHandler:
             self._base_serializer = InteropSerializer()
         else:
             self._base_serializer = _get_cached_serializer_instance(serializer_name, enable_integrity_checking)
+        self._custom_serializer = not isinstance(serializer_name, str)
 
         # CRITICAL-03 FIX: Cache EncryptionWrapper instances per tenant to prevent
         # 360K key copies/hour at 100 req/sec. Uses thread-safe LRU cache (maxsize=256)
@@ -1209,8 +1210,11 @@ class CacheSerializationHandler:
             # fail-closed check, so convert here or a corrupt header bypasses the L2
             # `except SerializationError` eviction and survives to TTL (LAB-4075).
             try:
-                serialized_data, metadata_dict, serializer_name = SerializationWrapper.unwrap(data)
-                metadata = SerializationMetadata.from_dict(metadata_dict)
+                # A custom SerializerProtocol may write to the metadata it is handed, so it gets its own
+                # copy rather than the header memo's shared, read-only instance.
+                serialized_data, metadata, serializer_name = SerializationWrapper.unwrap_metadata(
+                    data, shared=not self._custom_serializer
+                )
             except (AttributeError, KeyError, TypeError, ValueError) as e:
                 raise SerializationError(f"Corrupt cache envelope: {bounded_error(e)}") from e
 
