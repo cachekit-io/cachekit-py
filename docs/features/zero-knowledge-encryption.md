@@ -270,7 +270,7 @@ wave — throttle or batch the eviction if the recompute cost is high. Either wa
 eviction to cachekit's keys so unrelated data in the same Redis database survives: run the
 `scan_iter` + `unlink` script under *Option 3: Data corruption* in
 [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch), once per
-namespace or function, and evict functions with a custom `key=` as it describes.
+tenant and per namespace or function, and evict functions with a custom `key=` as it describes.
 `FLUSHDB` is only safe when the database is dedicated to cachekit. Then deploy the encrypting
 decorator (`@cache.secure` or an explicit `encryption=` option), with `CACHEKIT_MASTER_KEY` set
 if it supplies the key.

@@ -14,30 +14,20 @@ These tests validate that the Python SDK works correctly with the production Saa
 
 ---
 
-## IMPORTANT: SaaS Worker Required
+## Target and credentials
 
-**⚠️ These tests REQUIRE a running SaaS Worker on localhost:8787.**
-
-Before running tests, start the Worker locally:
+The suite targets dev (`https://api.dev.cachekit.io`) unless `CACHEKIT_API_URL` says otherwise, and
+every test skips when `CACHEKIT_API_KEY` is unset. Supply the key through 1Password, so it never
+lands in a file or your shell history:
 
 ```bash
-# Terminal 1: Start local Worker
-cd /Users/68824/code/27B/cachekit-workspace/saas/worker
-make dev
-# This starts wrangler dev server on http://localhost:8787
-
-# Terminal 2: Run tests
-cd /Users/68824/code/27B/cachekit-workspace/cachekit
-uv run pytest tests/integration/saas/ -v
+op run --env-file=<file with CACHEKIT_API_KEY=op://...> -- uv run pytest tests/integration/saas/ -v
 ```
 
-**Alternative**: Start Worker + Dashboard together (requires tmux):
-```bash
-cd /Users/68824/code/27B/cachekit-workspace/saas
-make local
-```
-
-If you see `ConnectionRefusedError` or `Worker health check failed`, the Worker is not running locally.
+The SDK only accepts HTTPS URLs on public hosts, and only `api.cachekit.io` and
+`api.staging.cachekit.io` are on its host allowlist, so the fixtures set
+`CACHEKIT_ALLOW_CUSTOM_HOST=true` for dev. A local `wrangler dev` on `http://localhost:8787` cannot be
+targeted: the SDK rejects both the scheme and the host. CI skips this directory.
 
 ---
 
@@ -57,9 +47,8 @@ You need an API key to run these tests:
 ```bash
 # 1. Create account at https://app.dev.cachekit.io
 # 2. Generate API key in dashboard
-# 3. Export it:
-export CACHEKIT_API_KEY="ck_sdk_your_key_here"
-export CACHEKIT_API_URL="https://api.dev.cachekit.io"  # or your custom URL
+# 3. Store it in 1Password and put its reference in an env file that holds no secret:
+#      CACHEKIT_API_KEY=op://<vault>/<item>/credential
 ```
 
 ### 3. Install Dependencies
@@ -96,35 +85,15 @@ uv run pytest -v --timeout=30
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `CACHEKIT_API_KEY` | SDK API key (ck_sdk_...) | `ck_sdk_abc123...` |
-| `CACHEKIT_API_URL` | API endpoint URL | `https://api.dev.cachekit.io` |
+| `CACHEKIT_API_KEY` | SDK API key (ck_sdk_...), via `op run` | `ck_sdk_abc123...` |
 
 ### Optional Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `CACHEKIT_API_URL` | API endpoint URL | `https://api.dev.cachekit.io` |
 | `CACHEKIT_NAMESPACE` | Cache namespace prefix | `sdk_e2e_test` |
 | `CACHEKIT_ARROW_COMPRESSION` | Arrow codec: zstd, lz4, or none | `zstd` |
-
-### .env Files
-
-Create `.env.dev` or `.env.test` to set variables automatically:
-
-```bash
-# .env.dev
-CACHEKIT_API_KEY=ck_sdk_your_dev_key
-CACHEKIT_API_URL=https://api.dev.cachekit.io
-
-# .env.test
-CACHEKIT_API_KEY=ck_sdk_your_test_key
-CACHEKIT_API_URL=https://api.test.cachekit.io
-```
-
-Load with:
-```bash
-set -a; source .env.dev; set +a
-uv run pytest -v
-```
 
 ---
 
@@ -178,9 +147,8 @@ uv run pytest test_sdk_error_handling.py -v
 **Performance characteristics**
 
 Tests:
-- Decorator overhead
-- Serialization speed
-- Cache operation latency
+- L1 hit and `cache_info()` latency (asserted, in-process)
+- L2 hit latency, GET-miss + SET latency and the A/A floor (reported, labelled by vantage; see [PERFORMANCE.md](PERFORMANCE.md))
 - Throughput under load
 
 Run:
@@ -194,51 +162,19 @@ uv run pytest test_sdk_performance.py -v -s
 Provides:
 - Test fixtures for cache clients
 - Cleanup fixtures
-- Performance tracking utilities
+- A latency timer (`performance_timer`)
 - Mock API responses
 
 ---
 
 ## Running Against Different Environments
 
-### Development Environment
+The key always comes through `op run` (see [Target and credentials](#target-and-credentials)).
+Pick the target with `CACHEKIT_API_URL`; dev is the default:
 
 ```bash
-export CACHEKIT_API_KEY="ck_sdk_dev_key"
-export CACHEKIT_API_URL="https://api.dev.cachekit.io"
-uv run pytest -v
-```
-
-### Staging Environment
-
-```bash
-export CACHEKIT_API_KEY="ck_sdk_staging_key"
-export CACHEKIT_API_URL="https://api.staging.cachekit.io"
-uv run pytest -v
-```
-
-### Production Environment
-
-```bash
-export CACHEKIT_API_KEY="ck_sdk_prod_key"
-export CACHEKIT_API_URL="https://api.cachekit.io"
-
-# Use stricter test settings for production
-uv run pytest -v --timeout=60
-```
-
-### Local Development (Worker)
-
-```bash
-# Start the worker locally
-cd saas
-wrangler dev --local
-
-# In another terminal:
-export CACHEKIT_API_KEY="test_key_for_local_dev"
-export CACHEKIT_API_URL="http://localhost:8787"
-cd cachekit/tests/integration/saas
-uv run pytest -v
+op run --env-file=<key file> -- uv run pytest -v                                                  # dev
+CACHEKIT_API_URL=https://api.staging.cachekit.io op run --env-file=<key file> -- uv run pytest -v # staging
 ```
 
 ---
@@ -287,15 +223,7 @@ uv run pytest -v -n auto
 
 ## Performance Metrics
 
-The test suite tracks:
-
-- **Decorator overhead**: Time added by caching decorator vs. raw function
-- **Serialization speed**: Time to serialize/deserialize cached values
-- **Cache operation latency**: GET/SET/DELETE operation times (p50, p95, p99)
-- **Network latency**: Round-trip time to SaaS API
-- **Throughput**: Operations per second
-
-Results are stored in `perf_stats.py` and can be reviewed after test runs.
+What `test_sdk_performance.py` measures, how it labels results, and its first numbers: [PERFORMANCE.md](PERFORMANCE.md).
 
 ---
 
@@ -344,13 +272,8 @@ jobs:
 
 **Fix**:
 ```bash
-# Check your API key
-echo $CACHEKIT_API_KEY
-
-# Regenerate in dashboard
-# Then export and retry:
-export CACHEKIT_API_KEY="ck_sdk_new_key"
-uv run pytest -v
+# Regenerate the key in the dashboard, update the 1Password item, then retry:
+op run --env-file=<key file> -- uv run pytest -v
 ```
 
 ### Issue: "Connection refused" or "Network error"
@@ -366,9 +289,6 @@ echo $CACHEKIT_API_URL
 curl -H "Authorization: Bearer $CACHEKIT_API_KEY" \
   $CACHEKIT_API_URL/health
 
-# For local dev, ensure worker is running:
-cd saas
-wrangler dev
 ```
 
 ### Issue: Tests timeout
@@ -416,7 +336,7 @@ pytest -v
 2. **Test against dev first** - Always test against development API before staging/prod
 3. **Set reasonable timeouts** - Use `--timeout=30` to catch hanging tests
 4. **Use parallel execution** - Speed up test runs with `-n 4`
-5. **Review performance metrics** - Check `perf_stats.py` for regressions
+5. **Review performance metrics** - See [PERFORMANCE.md](PERFORMANCE.md); a change must clear the A/A floor
 6. **Keep test data isolated** - Use unique namespace to avoid cross-test interference
 7. **Clean up resources** - Tests should clean up created cache keys automatically
 
@@ -447,7 +367,7 @@ wrangler deploy --env development
 
 # Run E2E tests against dev
 cd ../cachekit/tests/integration/saas
-CACHEKIT_API_URL=http://localhost:8787 uv run pytest -v
+CACHEKIT_API_URL=https://api.dev.cachekit.io uv run pytest -v
 
 # If tests pass, deploy to prod
 cd ../../saas
@@ -459,7 +379,6 @@ wrangler deploy --env production
 ## Related Documentation
 
 - [cachekit SDK Documentation](../../../README.md)
-- [SaaS API Documentation](../../../saas/README.md)
 - [SDK Unit Tests](../../../tests/)
 - [pytest Documentation](https://docs.pytest.org/)
 - [uv Documentation](https://docs.astral.sh/uv/)

@@ -253,6 +253,7 @@ config = L1CacheConfig(
     # SWR Settings
     swr_enabled=True,                # Enable SWR (default: True)
     swr_threshold_ratio=0.5,         # Refresh at X% of TTL (default: 0.5 = 50%)
+    swr_retry_interval=10.0,         # Back-off after a failed refresh (default: 10 s)
 )
 ```
 
@@ -262,6 +263,7 @@ config = L1CacheConfig(
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
+| `swr_retry_interval` | float | `10.0` | Seconds after a failed refresh before that key refreshes again, `>= 0` (`0` = next stale read) |
 
 ### Intent Presets
 
