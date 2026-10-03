@@ -766,7 +766,6 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
         assert runs == [1, 2]
         assert any("Lock operation failed" in r.getMessage() for r in caplog.records)
         cache_keys = [k for k in fake._store if not k.endswith(":lock")]
-        print("KEYS", cache_keys, [k.split(":", 1)[-1] for k in cache_keys])
         formatter = logging.Formatter()
         for record in caplog.records:
             text = formatter.format(record)
