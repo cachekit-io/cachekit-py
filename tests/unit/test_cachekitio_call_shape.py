@@ -25,6 +25,7 @@ import os
 import threading
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -178,6 +179,7 @@ class _Gate:
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
         self._loop = asyncio.get_running_loop()
+        executor = _track_default_executor(self._loop)
         try:
             caller = asyncio.ensure_future(call)
             while True:
@@ -202,7 +204,9 @@ class _Gate:
                         release()
                     self._parked.clear()
                     continue
-                if not (pending := asyncio.all_tasks() - {asyncio.current_task()}):
+                # Background work is a Task, or an executor job (the lock release runs in a thread).
+                tasks = asyncio.all_tasks() - {asyncio.current_task()}
+                if not (pending := tasks | {asyncio.wrap_future(job) for job in executor.running()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -210,7 +214,7 @@ class _Gate:
         assert not self.errors, self.errors
         return shape
 
-    async def _next_event(self, tasks: set[asyncio.Task[Any]] | set[asyncio.Future[Any]]) -> None:
+    async def _next_event(self, tasks: set[asyncio.Task[Any]] | set[asyncio.Future[Any]] | set[Any]) -> None:
         """Wait until one of ``tasks`` finishes or a request is parked."""
         self._arrived.clear()
         if self._parked:
@@ -220,6 +224,32 @@ class _Gate:
         arrived.cancel()
         await asyncio.gather(arrived, return_exceptions=True)
         assert done, "nothing finished and no request arrived"
+
+
+class _TrackingExecutor(ThreadPoolExecutor):
+    """The default executor, remembering its unfinished jobs so the gate can wait for background thread work."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._jobs: set[Future[Any]] = set()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        job = super().submit(fn, *args, **kwargs)
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
+        return job
+
+    def running(self) -> list[Future[Any]]:
+        return [job for job in list(self._jobs) if not job.done()]
+
+
+def _track_default_executor(loop: asyncio.AbstractEventLoop) -> _TrackingExecutor:
+    executor = getattr(loop, "_call_shape_executor", None)
+    if executor is None:
+        executor = _TrackingExecutor()
+        loop.set_default_executor(executor)
+        loop._call_shape_executor = executor  # type: ignore[attr-defined]
+    return executor
 
 
 async def _settle() -> None:

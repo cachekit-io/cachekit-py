@@ -5,7 +5,7 @@ the DELETE. These tests pin that it still lands when the decorated call is the l
 each process is ``asyncio.run(main())`` against a loopback fake SaaS that records every lock request.
 
 (a) The holder's DELETE /lock reaches the server before the process exits.
-(b) A second process waiting on the same key's lock acquires it within about a second of that DELETE, not
+(b) A second process waiting on the same key's lock acquires it within seconds of that DELETE, not
     at its 5 s blocking timeout, whether the holder exits straight after the call or calls
     ``close_async_client()`` first.
 """
@@ -160,7 +160,10 @@ def test_waiter_acquires_promptly_after_the_holder_exits(saas: _FakeSaaS, tmp_pa
 
     with saas.mutex:
         events = list(saas.events)
-    released_at = next(t for t, event, lock_id in events if event == "released" and lock_id == holder_lock)
+    released_at = next((t for t, event, lock_id in events if event == "released" and lock_id == holder_lock), None)
+    assert released_at is not None, f"the holder exited holding the lock: {events}"
     waiter_granted = [t for t, event, lock_id in events if event == "granted" and lock_id != holder_lock]
     assert waiter_granted, f"the waiter never got the lock, so it timed out: {events}"
-    assert waiter_granted[0] - released_at < 1.0
+    # Well under the waiter's 5 s blocking timeout; the waiter's own poll gap is up to 0.5 s, and a loaded
+    # runner (-n auto) adds scheduling delay, so the bound separates a release from a timeout, nothing finer.
+    assert waiter_granted[0] - released_at < 3.0, events

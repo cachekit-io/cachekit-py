@@ -177,7 +177,8 @@ as asyncio Tasks, and `asyncio.run()` teardown cancels every Task, so a request
 cut short there falls back on that same server-side timeout. The decorator's own
 release is the exception (see below): it is sent from a worker thread, which
 `asyncio.run()` waits for, so it lands even when the decorated call is the last
-thing the process does, and even if `close_async_client()` runs straight after.
+thing the process does, and even if `close_async_client()` or `close_sync_client()`
+runs straight after.
 
 ### Request Count on CachekitIO
 
@@ -187,8 +188,10 @@ waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
 - **No re-read when nobody else held the lock.** The post-lock re-read only
   runs when the lock was granted after a wait, or when the first read failed
   (the entry may still be live, and the re-read is its retry). When the first
-  lock request wins after a clean miss, no other caller can have filled the key,
-  so the re-read would miss again and be billed as a miss.
+  lock request wins after a clean miss, this caller never waited behind another
+  holder, so the re-read would almost always miss again and be billed as a miss.
+  A fill that completes between the read and the lock request is not seen: the
+  value is recomputed and written again, and the last write wins.
 - **The release does not block the return.** The `DELETE …/lock` is sent in the
   background once the value is stored, as cachekit-ts does. Waiters in other
   processes see the lock released just as before.

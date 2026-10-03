@@ -687,9 +687,8 @@ class TestDecoratorDegradesOnLockError:
 
 
 async def _drain_background_releases() -> None:
-    from cachekit.backends.cachekitio.backend import _BACKGROUND_RELEASES
-
-    await asyncio.wait_for(asyncio.gather(*_BACKGROUND_RELEASES, return_exceptions=True), timeout=5.0)
+    """Wait for the executor thread that sends the background DELETE, as ``asyncio.run`` teardown does."""
+    await asyncio.wait_for(asyncio.get_running_loop().shutdown_default_executor(), timeout=5.0)
 
 
 @pytest.mark.unit
@@ -789,21 +788,71 @@ class TestFillLock:
         assert redact_cache_key(key) in record.getMessage()
         assert "secret-tenant" not in record.getMessage()
 
-    async def test_unexpected_release_error_is_logged_by_the_done_callback(
-        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize("sweep", [False, True], ids=["plain", "teardown-sweep"])
+    async def test_unexpected_release_error_is_logged_redacted(
+        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture, sweep: bool
     ) -> None:
+        """An error that is not a BackendError, raised before the request (here by the lease lookup), is
+        logged by the executor callable, redacted, with or without asyncio.run's cancel sweep; nothing is
+        left on the future for asyncio to report unredacted."""
         key = "ns:secret-tenant:func:m.f:args:cd:1s"
         backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-u"}))  # type: ignore[method-assign]
-        backend._request_sync = MagicMock(side_effect=RuntimeError("bug"))  # type: ignore[method-assign]
+        backend._own_sync_lease = MagicMock(side_effect=RuntimeError("lease bug"))  # type: ignore[method-assign]
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, Any]] = []
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
 
         with caplog.at_level(logging.WARNING, logger="cachekit.backends.cachekitio.backend"):
             async with backend.acquire_fill_lock(key, timeout=30.0, blocking_timeout=None):
                 pass
+            if sweep:
+                for task in asyncio.all_tasks() - {asyncio.current_task()}:
+                    task.cancel()
             await _drain_background_releases()
 
-        (record,) = [r for r in caplog.records if "background lock release" in r.getMessage()]
+        (record,) = [r for r in caplog.records if "lock release" in r.getMessage()]
         assert redact_cache_key(key) in record.getMessage()
         assert "secret-tenant" not in record.getMessage()
+        assert "RuntimeError" in record.getMessage()
+        assert unhandled == []
+
+    async def test_manual_loop_close_retains_nothing(self, backend: CachekitIOBackend) -> None:
+        """run_until_complete then close(), without asyncio.run: the DELETE lands from its thread, and once
+        it has, nothing still references the closed loop."""
+        import gc
+        import threading
+        import weakref
+
+        sent = threading.Event()
+
+        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+            sent.set()
+            return _json_response(200, {})
+
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-m"}))  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(side_effect=delete)  # type: ignore[method-assign]
+
+        async def miss() -> None:
+            async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
+                pass
+
+        def run_on_a_manual_loop() -> weakref.ref[asyncio.AbstractEventLoop]:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(miss())
+            finally:
+                loop.close()  # no shutdown_default_executor: the executor thread is not joined
+            return weakref.ref(loop)
+
+        loop_ref = await asyncio.to_thread(run_on_a_manual_loop)
+        assert await asyncio.to_thread(sent.wait, 5.0)
+        for _ in range(50):  # the executor thread drops the work item just after the DELETE returns
+            gc.collect()
+            if loop_ref() is None:
+                break
+            await asyncio.sleep(0.01)
+        assert loop_ref() is None, gc.get_referrers(loop_ref())
+        backend._request_sync.assert_called_once()
 
     async def test_public_acquire_lock_still_releases_before_returning(self, backend: CachekitIOBackend) -> None:
         """The LockableBackend method is unchanged: its DELETE is awaited on the async client."""

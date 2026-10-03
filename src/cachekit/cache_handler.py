@@ -398,7 +398,9 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
 class L2MissProbe:
     """Whether the async L2 read in a ``probe_l2_miss`` scope found no entry, cleanly (LAB-7064).
 
-    ``clean_miss`` is set only where the backend itself returned None. A read that failed is
+    ``clean_miss`` is set only where the backend's freshness read itself returned None: the read
+    every backend with ``acquire_fill_lock`` takes. Any other read leaves it False, which costs
+    only a re-read. A read that failed is
     reported to the caller as a miss too, but leaves it False, so anything other than a confirmed
     miss reads as "not known to be absent".
     """
@@ -2405,8 +2407,6 @@ class StandardCacheHandler:
         try:
             # Run sync backend operation in thread pool
             value = await self._with_backpressure_and_timeout_async(self.backend.get, key)
-            if value is None:
-                _note_clean_l2_miss()
 
             # Optionally refresh TTL if value exists and refresh_ttl provided
             # Uses graceful degradation (skips if backend doesn't support TTL inspection)

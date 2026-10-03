@@ -2276,12 +2276,41 @@ def create_cache_wrapper(
                         _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
                         lock_phase,
                     ) as (lock_acquired, lock_uncontended):
-                        if lock_acquired and not (lock_uncontended and _l2_read.clean_miss):
-                            # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited, or the
-                            # primary read failed and the entry may still be live. Skipped after
-                            # a clean miss and a first-attempt grant: nobody else held the lock,
-                            # so the read would miss again, and be billed as one (LAB-7064).
+                        if not lock_acquired:
+                            # Lock timeout - double-check cache before giving up
+                            # Another request may have populated it while we waited
+                            logger().warning(
+                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                            )
+                            try:
+                                # Routed through the operation handler: corrupt entries evict (#159),
+                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
+                                if cached_result is not None:
+                                    # Cache was populated while waiting - use it
+                                    result, cached_data = cached_result.value, cached_result.envelope
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                    return result
+                            except (DecryptionAuthenticationError, KeyringConfigurationError):
+                                # Same as the lock-acquired double-check below.
+                                raise
+                            except Exception:
+                                # Cache check failed - fall through to execute function
+                                logger().warning(
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
+                                )
+
+                        elif not (lock_uncontended and _l2_read.clean_miss):
+                            # Lock acquired after a wait, or after a failed primary read - double-check
+                            # cache: another request may have populated it while we waited, or the
+                            # entry may still be live. Skipped after a clean miss and an uncontended
+                            # grant (LAB-7064): this caller never waited behind another holder, so
+                            # the read would almost always miss again, and be billed as one. A fill
+                            # that completed between our read and our lock request is recomputed;
+                            # last write wins.
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
@@ -2309,32 +2338,6 @@ def create_cache_wrapper(
                                     "Double-check cache failed after lock acquisition for %s: %s",
                                     redact_cache_key(cache_key),
                                     redact_error_for_log(e),
-                                )
-                        elif not lock_acquired:
-                            # Lock timeout - double-check cache before giving up
-                            # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
-                            )
-                            try:
-                                # Routed through the operation handler: corrupt entries evict (#159),
-                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
-                                _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
-                                if cached_result is not None:
-                                    # Cache was populated while waiting - use it
-                                    result, cached_data = cached_result.value, cached_result.envelope
-                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
-                                    return result
-                            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                                # Same as the lock-acquired double-check above.
-                                raise
-                            except Exception:
-                                # Cache check failed - fall through to execute function
-                                logger().warning(
-                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
                                 )
 
                         # Execute the original function (with or without lock). Its exception
