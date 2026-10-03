@@ -346,13 +346,14 @@ class TestCircuitBreaker:
         with time_machine.travel(0, tick=False) as traveller:
             breaker.record_failure()
             traveller.shift(timedelta(seconds=0.2))
-            assert breaker.should_attempt_call() is True  # enters HALF_OPEN and takes the only slot
+            probe = breaker.admit()  # enters HALF_OPEN and takes the only slot
+            assert probe
             assert breaker.should_attempt_call() is False
 
-            breaker.release_probe()
-            breaker.release_probe()  # a second release cannot mint a slot nobody took
+            breaker.release_probe(probe)
+            breaker.release_probe(probe)  # a second release cannot mint a slot nobody took
 
-            assert breaker.should_attempt_call() is True
+            assert breaker.admit() == probe  # the same cycle
             assert breaker.should_attempt_call() is False
             assert breaker.state == CircuitState.HALF_OPEN
             assert (breaker.success_count, breaker.failure_count) == (0, 1)
@@ -363,14 +364,48 @@ class TestCircuitBreaker:
         breaker = CircuitBreaker(config, namespace="test")
 
         with time_machine.travel(0, tick=False) as traveller:
-            breaker.release_probe()
+            closed = breaker.admit()
+            assert closed == 0  # admitted, before any HALF_OPEN cycle
+            breaker.release_probe(closed)
             assert breaker.state == CircuitState.CLOSED
 
             breaker.record_failure()
-            breaker.release_probe()
+            breaker.release_probe(closed)
             traveller.shift(timedelta(seconds=5))
             assert breaker.should_attempt_call() is False
             assert breaker.state == CircuitState.OPEN
+
+    def test_release_from_another_cycle_mints_no_slot(self):
+        """Only a probe of the current cycle gives a slot back, so the probe cap holds.
+
+        A call admitted while CLOSED, or by a cycle that expired, never took one of
+        this cycle's slots. Refunded anyway, each such call would let one more probe
+        through to the backend under test.
+        """
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=10.0, half_open_requests=2)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            closed = [breaker.admit() for _ in range(3)]
+            breaker.record_failure()
+            traveller.shift(timedelta(seconds=11))
+            first = [breaker.admit() for _ in range(2)]  # cycle 1's probes never report back
+            traveller.shift(timedelta(seconds=11))
+            second = [breaker.admit() for _ in range(2)]  # the spent cycle expired: cycle 2
+            assert breaker.admit() is None
+            assert closed == [0] * 3
+            assert first[0] == first[1] != second[0] == second[1]
+
+            for cycle in closed + first:
+                assert cycle is not None
+                breaker.release_probe(cycle)
+            assert breaker.admit() is None
+
+            assert second[0] is not None
+            breaker.release_probe(second[0])
+            assert breaker.admit() == second[0]
+            assert breaker.admit() is None
+            assert breaker.state == CircuitState.HALF_OPEN
 
     @pytest.mark.asyncio
     async def test_async_call_functionality(self):

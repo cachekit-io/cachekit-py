@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, Optional
@@ -502,7 +504,7 @@ class TestL1HitsBypassTheBreaker:
         await self._warm(fn, resolver)
 
         touched: list[str] = []
-        for name in ("should_attempt_call", "_on_success", "_on_failure"):  # what the orchestrator calls
+        for name in ("admit", "_on_success", "_on_failure"):  # what the orchestrator calls
             real = getattr(breaker, name)
 
             def spy(*args: Any, _name: str = name, _real: Any = real, **kwargs: Any) -> Any:
@@ -516,7 +518,7 @@ class TestL1HitsBypassTheBreaker:
         assert touched == []
 
         assert await _call(fn, "cold") == "v:cold"  # the spies are live: a miss is admitted
-        assert "should_attempt_call" in touched
+        assert "admit" in touched
 
     async def test_open_breaker_serves_l1_hit(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
@@ -670,6 +672,66 @@ class TestFunctionExceptionsDoNotCount:
         assert breaker.state == CircuitState.HALF_OPEN
 
         await _recovers(fn, backend, breaker)  # the same cycle still has every slot
+
+    @pytest.mark.parametrize(
+        ("is_async", "backend_cls"),
+        [(False, _CountingBackend), (True, _CountingBackend), (True, _LockingBackend)],
+        ids=["sync", "async", "async-lock"],
+    )
+    async def test_call_admitted_while_closed_gives_a_later_cycle_nothing(self, is_async, backend_cls, live_breakers, clock):
+        """Calls admitted while CLOSED that raise once HALF_OPEN has spent its budget add no probe.
+
+        Each would otherwise hand the cycle a slot it never took, so enough slow calls in
+        flight would let any number of probes through to a backend still under test.
+        """
+        backend = backend_cls()
+        stale = _DEFAULTS.half_open_requests + 2
+        entered: list[str] = []
+        all_in, gate = threading.Event(), threading.Event()
+
+        def body(x: str) -> str:
+            entered.append(x)
+            if len(entered) == stale:
+                all_in.set()
+            gate.wait(timeout=10)
+            raise ValueError(x)
+
+        async def async_body(x: str) -> str:
+            entered.append(x)
+            if len(entered) == stale:
+                all_in.set()
+            while not gate.is_set():
+                await asyncio.sleep(0)
+            raise ValueError(x)
+
+        namespace = f"lab5319-stale-{is_async}-{backend_cls.__name__}"
+        fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
+        (breaker,) = live_breakers
+
+        with ThreadPoolExecutor(max_workers=stale) as pool:
+            if is_async:
+                calls = [asyncio.ensure_future(fn(f"stale-{i}")) for i in range(stale)]
+                while not all_in.is_set():
+                    await asyncio.sleep(0)
+            else:
+                calls = [asyncio.wrap_future(pool.submit(fn, f"stale-{i}")) for i in range(stale)]
+                assert await asyncio.to_thread(all_in.wait, 10)
+            assert breaker.state == CircuitState.CLOSED  # every stale call is in flight, admitted
+
+            _trip(breaker)
+            clock.shift(_PAST_TIMEOUT)
+            for _ in range(breaker.config.half_open_requests):
+                assert breaker.should_attempt_call()  # the cycle's own probes, still in flight
+
+            gate.set()
+            for outcome in await asyncio.gather(*calls, return_exceptions=True):
+                assert isinstance(outcome, ValueError)
+
+        gets = backend.gets
+        with pytest.raises(ValueError):
+            await _call(fn, "next")
+        assert backend.gets == gets  # rejected: the budget is still spent
+        assert breaker.state == CircuitState.HALF_OPEN
 
     async def test_backend_failures_still_open_the_breaker(self, is_async, live_breakers, monkeypatch):
         """Transient backend errors recorded through ``handle_cache_error`` (client creation) still open it."""

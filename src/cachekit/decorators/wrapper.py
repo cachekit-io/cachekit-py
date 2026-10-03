@@ -1715,7 +1715,8 @@ def create_cache_wrapper(
         # outside the try below on purpose: that except records a failure, and a
         # rejection is not one. Recorded, every rejected call would push the OPEN
         # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        if not features.should_allow_request():
+        probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+        if probe_cycle is None:
             features.log_cache_operation(
                 operation="circuit_breaker_open",
                 key=cache_key,
@@ -1893,11 +1894,13 @@ def create_cache_wrapper(
         try:
             # Execute the original function. Its exception is not a backend failure, so it is
             # never counted, but an admitted HALF_OPEN probe hands its slot to the next call
-            # instead of holding it until the cycle expires.
+            # instead of holding it until the cycle expires. probe_cycle confines that to a
+            # slot this call took: a call admitted while CLOSED, or by an ended cycle, gives
+            # the current cycle nothing back.
             try:
                 result = func(*args, **kwargs)
             except Exception:
-                features.release_probe()
+                features.release_probe(probe_cycle)
                 raise
 
             # Serialize and cache the result
@@ -2106,7 +2109,8 @@ def create_cache_wrapper(
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
             # The outer finally resets the stats context.
-            if not features.should_allow_request():
+            probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+            if probe_cycle is None:
                 features.log_cache_operation(
                     operation="circuit_breaker_open",
                     key=cache_key,
@@ -2319,7 +2323,7 @@ def create_cache_wrapper(
                         try:
                             result = await func(*args, **kwargs)
                         except Exception as e:
-                            features.release_probe()  # not a backend outcome (see the sync wrapper)
+                            features.release_probe(probe_cycle)  # not a backend outcome (see the sync wrapper)
                             func_error = e
                         else:
                             # Serialize and cache the result
@@ -2439,7 +2443,7 @@ def create_cache_wrapper(
             try:
                 result = await func(*args, **kwargs)
             except Exception:
-                features.release_probe()
+                features.release_probe(probe_cycle)
                 raise
 
             # Serialize and cache the result

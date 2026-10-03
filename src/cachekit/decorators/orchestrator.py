@@ -118,20 +118,29 @@ class FeatureOrchestrator:
             self._pool_monitor = PoolMonitor(pool_manager)
 
     def should_allow_request(self) -> bool:
-        """Ask the circuit breaker to admit this request.
+        """Ask the circuit breaker to admit this request: ``admit`` as a bool."""
+        return self.admit() is not None
+
+    def admit(self) -> Optional[int]:
+        """Ask the circuit breaker to admit this request, and say which cycle admitted it.
 
         This is the breaker's admission decision, not a state read: it runs the
         OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
         HALF_OPEN probe slot when it admits. Call it once per request, and record
         the outcome of every admitted request (``record_success`` /
-        ``record_failure``, or ``release_probe`` when it ends with none). A
-        rejected request is not a failure — do not record it.
+        ``record_failure``, or ``release_probe`` with this value when it ends with
+        none). A rejected request is not a failure — do not record it.
+
+        Returns:
+            None if the request must fail fast. Otherwise the cycle number to hand
+            to ``release_probe`` (see ``CircuitBreaker.admit``; 0 with no breaker).
+            0 is falsy: test the result with ``is None``.
         """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
-            return True
+            return 0
 
-        return self._circuit_breaker.should_attempt_call()
+        return self._circuit_breaker.admit()
 
     def can_accept_request(self) -> bool:
         """Check if system can accept new request based on load control."""
@@ -301,14 +310,16 @@ class FeatureOrchestrator:
         if self._circuit_breaker:
             self._circuit_breaker._on_success()
 
-    def release_probe(self) -> None:
+    def release_probe(self, cycle: int) -> None:
         """Give back the HALF_OPEN probe slot of an admitted request that ends with no outcome.
 
         For the decorated function's own exception: it says nothing about backend
         health, so it is not a failure, and the next request probes in its place.
+        ``cycle`` is what ``admit`` returned for the request; a slot from any other
+        cycle stays spent (see ``CircuitBreaker.release_probe``).
         """
         if self._circuit_breaker:
-            self._circuit_breaker.release_probe()
+            self._circuit_breaker.release_probe(cycle)
 
     def record_cache_operation(
         self,
