@@ -13,6 +13,8 @@ import math
 import os
 import threading
 import time
+from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
@@ -68,7 +70,7 @@ class _Server:
                 self.in_flight -= 1
 
 
-def _backend(server: _Server) -> CachekitIOBackend:
+def _backend(server: Callable[[httpx.Request], httpx.Response]) -> CachekitIOBackend:
     transport = httpx.MockTransport(server)
     with (
         patch(
@@ -230,3 +232,153 @@ def test_runs_from_a_thread_with_a_running_event_loop() -> None:
 
     assert asyncio.run(main()) == set()
     assert sorted(server.deleted) == ["a", "b"]
+
+
+# ---- Pacing: a rate-limited fan-out waits out Retry-After instead of failing keys ----------
+
+_SCALE = 20  # one real second is 20 virtual seconds: a real 10 ms DELETE is a 200 ms round trip
+_REAL_RTT = 0.01
+
+
+class _Clock:
+    """Virtual time: real elapsed time x _SCALE, plus every sleep, which returns at once."""
+
+    def __init__(self) -> None:
+        self._t0 = time.monotonic()
+        self._slept = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return (time.monotonic() - self._t0) * _SCALE + self._slept
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self._slept += seconds
+
+
+class _Limited:
+    """A cache API behind a token bucket: ``tokens`` now, refilling at ``per_minute``, capped at ``burst``.
+
+    An admitted DELETE takes one token; a denied one costs nothing and answers 429 with the
+    whole seconds until the next token, or with no Retry-After at all when ``quota`` is set.
+    GETs miss and PUTs succeed, unlimited, so the decorator can write the keys first.
+    """
+
+    def __init__(self, clock: _Clock, tokens: float, per_minute: float, burst: float, quota: bool = False) -> None:
+        self.clock, self.tokens, self.rate, self.burst, self.quota = clock, tokens, per_minute / 60, burst, quota
+        self.deleted: list[str] = []
+        self.sent: list[str] = []
+        self.first_429: float | None = None  # real time the first rate-limited answer went out
+        self.late_peak = 0  # peak DELETEs in flight among those started after it
+        self._late_in_flight = 0
+        self._last = clock.monotonic()
+        self._lock = threading.Lock()
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404)
+        if request.method == "PUT":
+            return httpx.Response(200)
+        key = unquote(request.url.raw_path.decode().removeprefix("/v1/cache/"))
+        with self._lock:
+            self.sent.append(key)
+            late = self.first_429 is not None and time.monotonic() > self.first_429 + _REAL_RTT / 2
+            if late:
+                self._late_in_flight += 1
+                self.late_peak = max(self.late_peak, self._late_in_flight)
+        try:
+            time.sleep(_REAL_RTT)
+            with self._lock:
+                now = self.clock.monotonic()
+                self.tokens = min(self.burst, self.tokens + (now - self._last) * self.rate)
+                self._last = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    self.deleted.append(key)
+                    return httpx.Response(200)
+                if self.quota:
+                    return httpx.Response(429, headers={"X-CacheKit-Deny-Reason": "quota"})
+                if self.first_429 is None:
+                    self.first_429 = time.monotonic()
+                wait = math.ceil((1 - self.tokens) / self.rate)
+                return httpx.Response(429, headers={"Retry-After": str(wait)})
+        finally:
+            if late:
+                with self._lock:
+                    self._late_in_flight -= 1
+
+
+@pytest.fixture
+def clock() -> Any:
+    fake = _Clock()
+    with patch("cachekit.backends.cachekitio.backend.time", SimpleNamespace(monotonic=fake.monotonic, sleep=fake.sleep)):
+        yield fake
+
+
+def test_cobels_case_waits_out_the_rate_limit_and_deletes_every_key(clock: _Clock) -> None:
+    """Free tier, 90 tokens left, 100/min: the unpaced fan-out left about 9 of 100 keys live."""
+    server = _Limited(clock, tokens=90, per_minute=100, burst=200)
+    backend = _backend(server)
+    keys = [f"k{i}" for i in range(100)]
+
+    assert backend._delete_many(keys) == set()
+
+    assert sorted(server.deleted) == sorted(keys)
+    assert clock.sleeps  # the rate limit was hit and waited out
+    assert server.late_peak <= 1  # no concurrent DELETE after the first rate-limited answer
+
+
+def test_cobels_case_through_the_decorator_leaves_nothing_tracked(clock: _Clock) -> None:
+    server = _Limited(clock, tokens=90, per_minute=100, burst=200)
+
+    @cache(backend=_backend(server), ttl=60, namespace="fanout_paced", l1_enabled=False)
+    def f(x: int) -> int:
+        return x
+
+    for i in range(100):
+        f(i)
+
+    f.invalidate_cache()
+
+    assert len(server.deleted) == 100 and clock.sleeps
+    assert _cached_keys(f) == set()
+
+
+def test_startup_shaped_bucket_deletes_every_key(clock: _Clock) -> None:
+    """A burst well under N with a refill faster than the serial rate (5/s): every key goes."""
+    server = _Limited(clock, tokens=20, per_minute=1000, burst=20)
+    keys = [f"k{i}" for i in range(80)]
+
+    assert _backend(server)._delete_many(keys) == set()
+
+    assert sorted(server.deleted) == sorted(keys)
+    assert server.late_peak <= 1
+
+
+def test_spent_budget_stops_at_the_deadline_and_returns_exactly_the_rest(
+    clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = _Limited(clock, tokens=0, per_minute=100, burst=200)
+    keys = [f"k{i}" for i in range(50)]
+    start = clock.monotonic()
+
+    with caplog.at_level("WARNING"):
+        failed = _backend(server)._delete_many(keys)
+
+    assert failed == set(keys) - set(server.deleted)
+    assert 0 < len(server.deleted) < len(keys)
+    # The deadline is about the serial loop's time (50 x 200 ms), not a wait for every key.
+    assert clock.monotonic() - start < 50 * 0.2 * 2
+    unsent = [key for key in keys if key in failed and key not in server.sent]
+    assert unsent  # keys past the deadline are failed without being sent
+    assert any("rate limit" in record.getMessage() for record in caplog.records)
+
+
+def test_quota_deny_sends_each_key_once_and_never_sleeps(clock: _Clock) -> None:
+    server = _Limited(clock, tokens=0, per_minute=0.001, burst=200, quota=True)
+    keys = [f"k{i}" for i in range(40)]
+
+    assert _backend(server)._delete_many(keys) == set(keys)
+
+    assert sorted(server.sent) == sorted(keys)
+    assert clock.sleeps == []
