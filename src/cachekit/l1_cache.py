@@ -673,11 +673,11 @@ def _empty_caches_after_fork() -> None:
     this takes no lock, starts no thread and logs nothing. Starting the cleanup thread stays with
     _take_over_if_forked, outside the hook.
 
-    The parent's states are not freed here: freeing them writes to every entry's memory, so each
-    child would copy most of the parent's L1 pages inside fork(), a cost close to the size of a warm
-    L1, and so would every subprocess started with a preexec_fn, which never uses its L1. They are
-    kept in _inherited_states until the child's first put, whose take-over frees them on the cleanup
-    thread it restarts, or on a one-shot thread when there is none (_release_inherited_states).
+    The parent's states are not freed here: freeing them writes to every entry's memory and to the
+    allocator's beside it, so each child would copy those pages inside fork(), about 2.3 times a warm
+    L1 (_release_inherited_states), and so would every subprocess started with a preexec_fn, which
+    never uses its L1. They are kept in _inherited_states until the child's first put, whose take-over
+    frees them on the cleanup thread it restarts, or on a one-shot thread when there is none.
     """
     global _hooked_pid
     for manager in list(_managers):
@@ -691,19 +691,29 @@ def _release_inherited_states() -> None:
     """Free the L1 states this process inherited at fork: on the cleanup thread as it starts, or on a
     one-shot thread when the take-over has no cleanup thread to restart.
 
-    Kept, they would not stay shared with the parent: once the parent rewrites those pages (its own
-    sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
-    reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
+    Freeing costs memory up front. Each free writes to the entry and to the allocator's bookkeeping
+    beside it, so the child copies those pages once it first puts: 36.5 MiB for a 16 MiB L1 whose
+    values sit among other allocations (tests/performance/test_l1_fork_memory.py, CPython 3.12 and
+    3.14). Its own L1 then reuses that memory, so a child that fills one as large ends 40 MiB up.
+    Kept, the states cost nothing while the parent leaves their pages alone: that child would end
+    22 MiB up, its own L1 alone, under a parent that never rewrites its L1, such as an idle preloaded
+    master whose entries outlive the child. Freeing is still the default because a parent with a
+    cleanup thread, the default, rewrites them within one L1 TTL plus a sweep interval, as each entry
+    it held at fork expires and is swept; one without a cleanup thread rewrites them whenever it
+    evicts, invalidates or clears. From then on a child that kept them would hold a private copy
+    nothing can reach, beside its own L1, for life: 60 MiB in the same test with the release disabled.
+
     Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
     them, so the child's other threads keep running. A child that never puts into its L1 never takes
     over, and keeps them: one bound for exec pays nothing.
 
     Each state is taken off the list with one pop before it is freed, so two releasers running at
     once (the threads of two managers' take-overs) never take the same state, and neither finds the
-    list emptied under it. An empty list therefore means every state was taken, not that every entry is
-    freed: a releaser may still be freeing one, and a state in use is left alone. That is a state
-    whose lock is taken, by a thread that forked inside its critical section and still runs there:
-    that thread finishes on it, and it is freed with that thread's last reference.
+    list emptied under it. An empty list therefore means every state was taken, not that every entry
+    is freed: a releaser may still be freeing one, and a state whose lock is taken is left alone. If
+    a thread that forked inside its critical section still runs there, that thread finishes on it,
+    and it is freed with that thread's last reference. If a parent thread held it at fork, it can
+    stay for the child's life, referenced by that thread's frame, which the child never frees.
     """
     while True:
         try:
