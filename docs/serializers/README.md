@@ -81,7 +81,7 @@ started, plus, on the tenant-scoped Redis backend, the keys in the server-side k
 It misses the twin of any key only another process, or this process before a restart, wrote
 or read: the registry holds keys, not their twins, and releases before v0.20.0 recorded their
 keys nowhere. The one exception is a v0.20.0 or later decorator on the default serializer for
-the same function and namespace: its key is that twin, and it registers it like any key it
+the same function, namespace and `integrity_checking` setting: its key is that twin, and it registers it like any key it
 writes, until the registration lapses (see the retention warning [below](#changing-serializers-separate-keyspaces)). So if you cache personal
 data under `ttl=None`, or otherwise need every pre-upgrade entry gone rather than aging out,
 follow the flush procedure in the retention warning [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
@@ -174,8 +174,8 @@ def get_data():
 > the twin of a key only another process, or this process before a restart, wrote or read. On the
 > tenant-scoped Redis backend the server-side key registry drains those keys but not their
 > twins, with one exception: a v0.20.0 or later decorator on the default serializer for the same
-> function and namespace registers its `:{integrity_flag}s` key there like any key it
-> writes. That registration lapses seven days after the last tracked write to the
+> function, namespace and `integrity_checking` setting registers its `:{integrity_flag}s` key
+> there like any key it writes. That registration lapses seven days after the last tracked write to the
 > function's registry, and a `ttl=None` entry outlives it. On a sync function with no
 > parameters, `cache_clear()` deletes the
 > key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and

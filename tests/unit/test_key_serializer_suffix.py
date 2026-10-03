@@ -711,33 +711,42 @@ class TestNoArgsInvalidationReachesPre020Keys:
 
         assert backend.store == {}, "the key 0.19.0 wrote survived a no-args invalidation"
 
-    @pytest.mark.parametrize("backend_cls", [_RecordingBackend, TrackingBackend], ids=["local_sweep", "registry_drain"])
-    def test_registry_alone_reaches_an_unseen_twin(self, backend_cls: type):
+    @pytest.mark.parametrize(
+        ("backend_cls", "integrity", "reached"),
+        [
+            pytest.param(_RecordingBackend, True, False, id="local_sweep"),
+            pytest.param(TrackingBackend, True, True, id="registry_drain"),
+            pytest.param(TrackingBackend, False, False, id="registry_drain-other_integrity"),
+        ],
+    )
+    def test_registry_alone_reaches_an_unseen_twin(self, backend_cls: type, integrity: bool, reached: bool):
         """A twin this process never wrote or read is out of reach, except through the key registry.
 
-        A default-serializer decorator's key IS the pre-0.20.0 twin of the non-default decorator's
-        key, and the registry set is named by function and namespace, not serializer. So it
-        registers the twin, and the non-default decorator's drain deletes it.
+        A default-serializer decorator with the same integrity setting writes the non-default
+        decorator's pre-0.20.0 twin as its own key, and the registry set is named by function and
+        namespace, not serializer or integrity setting. So it registers the twin, and the
+        non-default decorator's drain deletes it. With another integrity setting its key differs.
         """
         backend = backend_cls()
 
         def fn(x: int) -> dict:
             return {"v": x}
 
-        namespace = f"twin-u{backend_cls is TrackingBackend:d}"
+        namespace = f"twin-u{backend_cls is TrackingBackend:d}{integrity:d}"
         probe_backend = _RecordingBackend()
         cache(backend=probe_backend, ttl=None, namespace=namespace, serializer="auto")(fn)(1)
         (auto_key,) = probe_backend.store
         assert _suffix(auto_key) == "1a"
-        default_writer = cache(backend=backend, ttl=None, namespace=namespace, l1_enabled=False)(fn)
+        twin = _pre_020_key(auto_key)
+        default_writer = cache(backend=backend, ttl=None, namespace=namespace, integrity_checking=integrity)(fn)
         auto = cache(backend=backend, ttl=None, namespace=namespace, serializer="auto", l1_enabled=False)(fn)
         default_writer(1)
-        assert set(backend.store) == {_pre_020_key(auto_key)}, "the default serializer's key is not the twin"
+        assert (twin in backend.store) is integrity, "the default serializer's key is the twin iff integrity matches"
+        backend.store.setdefault(twin, b"pre-0.20.0 copy")
 
         auto.invalidate_cache()
 
-        reached = backend_cls is TrackingBackend
-        assert (backend.store == {}) is reached, f"twin reached={not backend.store}, expected {reached}"
+        assert (twin not in backend.store) is reached, f"expected twin reached={reached}"
 
     def test_default_serializer_issues_one_delete_per_recorded_key(self):
         """Code `s` already is the legacy key: no twin is recorded, so no second delete."""
