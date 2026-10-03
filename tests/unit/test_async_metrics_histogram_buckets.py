@@ -143,3 +143,26 @@ def test_batched_mode_observes_what_sync_mode_observes() -> None:
         expected = _samples(name, ns_sync)
         assert expected, name
         assert _samples(name, ns_batched) == expected, name
+
+
+def test_default_max_value_size_has_a_finite_size_bucket() -> None:
+    # A bound below the largest value cachekit accepts by default would report every larger payload as that bound.
+    from cachekit.config.settings import CachekitConfig
+
+    assert SIZE_BUCKETS_BYTES[-1] >= CachekitConfig.model_fields["max_value_size"].default
+
+
+def test_malformed_batched_record_is_skipped_alone() -> None:
+    # One record the flush cannot compare must not cost the batch's other observations.
+    namespace = f"buckets-malformed-{uuid.uuid4().hex}"
+    collector = AsyncMetricsCollector(sync_mode=False, auto_detect_mode=False)
+    collector.record_cache_operation("get", namespace, True, "invalid", serializer="rust", size_bytes=4)  # type: ignore[arg-type]
+    collector.record_cache_operation("get", namespace, True, 55.0, serializer="rust", size_bytes=300)
+    collector.shutdown()
+
+    labels = (("operation", "get"), ("serializer", "rust"))
+    assert _samples(DURATION, namespace)[("cache_operation_duration_ms_count", labels)] == 1
+    assert _samples(DURATION, namespace)[("cache_operation_duration_ms_sum", labels)] == 55.0
+    assert _samples(SIZE, namespace)[("cache_operation_size_bytes_count", labels)] == 1
+    counter = _metrics_cache["cache_operations_total"]
+    assert counter.labels(operation="get", namespace=namespace, success="True", serializer="rust")._value.get() == 1

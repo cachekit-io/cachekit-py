@@ -810,7 +810,7 @@ names carry no `cachekit_` prefix:
 - `cache_operations_total` - Operation counter. Labels: `operation`, `namespace`, `success`, `serializer`
 - `redis_cache_operations_total` - Load-control rejection counter. Labels: `operation`, `status`, `serializer`, `namespace`
 - `cache_operation_duration_ms` - Operation latency histogram (milliseconds). Labels: `operation`, `namespace`, `serializer`. Buckets: 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, `+Inf`
-- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`. Buckets: powers of 4 from 16 to 16777216 (16 MiB), `+Inf`
+- `cache_operation_size_bytes` - Operation payload size histogram (bytes). Labels: `operation`, `namespace`, `serializer`. Buckets: powers of 4 from 16 to 268435456 (256 MiB), `+Inf`
 - `circuit_breaker_state` - Gauge: number of live circuit breakers in each state. Labels: `namespace`, `state` (`CLOSED`, `OPEN`, `HALF_OPEN`)
 
 The `serializer` label is the tier that served the record, not the `@cache(serializer=...)`

@@ -35,8 +35,8 @@ _BUILTIN_SERIES = frozenset(
 # have, so a label tuple still costs at most 15 _bucket series.
 # Milliseconds: L1 hits (microseconds) through local and remote Redis to the SaaS round trip (up to about 1 s).
 DURATION_BUCKETS_MS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0)
-# Bytes, powers of 4: 16 B through 16 MiB.
-SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 13))
+# Bytes, powers of 4: 16 B through 256 MiB, above the default max_value_size (100 MiB).
+SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 15))
 
 try:
     from prometheus_client import REGISTRY, Counter, Gauge, Histogram  # type: ignore[assignment]
@@ -502,7 +502,8 @@ class AsyncMetricsCollector:
 
         # Group metrics by type for efficient processing
         cache_ops: dict[tuple[Any, ...], int] = defaultdict(int)  # {(operation, namespace, success, serializer): count}
-        # Every record's own duration and size, in record order, so the histograms get what sync mode observes.
+        # Every record's own duration and size, in record order, so the histograms get what sync mode observes. None
+        # marks a value sync mode would not observe.
         cache_observations: list[tuple[Any, ...]] = []  # [(operation, namespace, serializer, duration_ms, size_bytes)]
         counters = defaultdict(lambda: defaultdict(float))  # {name: {labels_key: value}}
         histograms = defaultdict(list)  # {name: [(value, labels_key)]}
@@ -511,8 +512,12 @@ class AsyncMetricsCollector:
             try:
                 if metric["type"] == "cache_operation":
                     operation, namespace, serializer = metric["operation"], metric["namespace"], metric["serializer"]
+                    # Compared here, before anything is counted: a value that cannot be compared rejects only this
+                    # record, where in the update below it would end the batch's remaining observations.
+                    duration_ms = metric["duration_ms"] if metric["duration_ms"] > 0 else None
+                    size_bytes = metric["size_bytes"] if metric["size_bytes"] > 0 else None
                     cache_ops[(operation, namespace, metric["success"], serializer)] += 1
-                    cache_observations.append((operation, namespace, serializer, metric["duration_ms"], metric["size_bytes"]))
+                    cache_observations.append((operation, namespace, serializer, duration_ms, size_bytes))
 
                 elif metric["type"] == "counter":
                     value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
@@ -597,9 +602,9 @@ class AsyncMetricsCollector:
 
         # One observation per record, skipping zero values as the sync path does.
         for operation, namespace, serializer, duration_ms, size_bytes in cache_observations:
-            if duration_ms > 0:
+            if duration_ms is not None:
                 cache_duration.labels(operation=operation, namespace=namespace, serializer=serializer).observe(duration_ms)
-            if size_bytes > 0:
+            if size_bytes is not None:
                 cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
 
         # Update generic counters

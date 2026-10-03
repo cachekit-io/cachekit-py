@@ -134,9 +134,9 @@ finite buckets plus `+Inf`.
 | Histogram | Finite bucket bounds (`le`) |
 |---|---|
 | `cache_operation_duration_ms` | 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000 |
-| `cache_operation_size_bytes` | powers of 4 from 16 B to 16 MiB: 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216 |
+| `cache_operation_size_bytes` | powers of 4 from 16 B to 256 MiB: 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456 |
 
-An operation slower than 1000 ms, or a payload larger than 16 MiB, counts only in `+Inf`, so a quantile
+An operation slower than 1000 ms, or a payload larger than 256 MiB, counts only in `+Inf`, so a quantile
 that falls there reads as the top finite bound. Both histograms record one observation per operation
 whose value is above zero, whichever recording mode the collector is in.
 
@@ -193,7 +193,8 @@ histogram_quantile(0.99,
 
 ### Payload Size (P99)
 
-The size buckets run from 16 B to 16 MiB, in powers of 4.
+The size buckets run from 16 B to 256 MiB, in powers of 4. The top bound sits above the default
+`max_value_size` (100 MiB).
 
 ```promql
 # 99th percentile cache payload size (bytes)
