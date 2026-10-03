@@ -784,7 +784,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 ### Error Scenarios
 
-1. **Redis Connection Failed** → Execute function without caching
+1. **Redis Connection Failed** → Execute function; the result is still stored in L1, unless Redis was down when the backend was first built (then nothing is cached)
 2. **Lock Acquisition Timeout** → Execute without lock (thundering herd risk accepted)
 3. **Serialization Failed** → Return result, skip caching
 4. **Deserialization Failed** → Execute function as if cache miss
@@ -793,13 +793,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 **States:**
 - **CLOSED**: Normal operation (requests allowed)
-- **OPEN**: Too many failures (requests blocked, fallback used)
+- **OPEN**: Too many failures (L2 skipped: L1 hits still served, an L1 miss runs the function)
 - **HALF_OPEN**: Testing recovery (limited requests)
-
-**Fallback Strategies:**
-- `fail_open` (default): Execute function without caching
-- `fail_closed`: Raise exception
-- `custom`: Call custom_fallback function
 
 ---
 
