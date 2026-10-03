@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -10,6 +11,7 @@ import os
 import random
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
@@ -70,6 +72,10 @@ FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 # honoured by not retrying, rather than by retrying early.
 _RETRY_METHODS = frozenset({"PUT", "DELETE"})
 _MAX_RETRY_AFTER_S = 2
+
+# The SaaS has no bulk delete, so whole-function invalidation sends this many DELETEs at once over
+# the sync client's HTTP/2 connection (LAB-7070). Each still takes its own limiter verdict.
+_DELETE_FANOUT = 16
 
 
 def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
@@ -606,6 +612,32 @@ class CachekitIOBackend:
         """
         self._request_sync("DELETE", self._encode_key(key))
         return True
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        """Delete many keys, up to ``_DELETE_FANOUT`` at a time (internal: whole-function invalidation).
+
+        Each key is one ``delete`` on a worker thread, so a key fails exactly when ``delete``
+        would raise ``BackendError`` for it (a 429 included): it is returned, and the caller
+        keeps it tracked for the next sweep. Wall time is about ``ceil(len(keys) / 16)`` round
+        trips instead of ``len(keys)``. Any other exception propagates once every delete has
+        finished, and the caller then deletes the keys one by one.
+        """
+        if not keys:
+            return set()
+
+        def delete_one(key: str) -> bool:
+            try:
+                self.delete(key)
+                return True
+            except BackendError as e:
+                _logger.debug(f"Failed to delete L2 key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+                return False
+
+        with ThreadPoolExecutor(max_workers=min(_DELETE_FANOUT, len(keys))) as pool:
+            # One context copy per key: the metrics headers read the caller's contextvars, and a
+            # Context cannot be entered by two threads at once.
+            futures = [pool.submit(contextvars.copy_context().run, delete_one, key) for key in keys]
+        return {key for key, future in zip(keys, futures, strict=True) if not future.result()}
 
     def exists(self, key: str) -> bool:
         """Check if key exists in cache (sync).
