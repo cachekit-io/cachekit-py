@@ -147,8 +147,8 @@ def test_env_proxy_still_routes_requests(
 ) -> None:
     monkeypatch.setenv(variable, f"http://127.0.0.1:{connect_proxy.server_address[1]}")
     kwargs = _kwargs(config, transport_cls)
-    # No probes reach through a proxy, so the idle time drops under the shortest NAT limit.
-    assert kwargs["limits"].keepalive_expiry == 200.0
+    # No probes reach through a proxy and its idle limit is unknown, so the expiry stays at httpx's 5 s default.
+    assert kwargs["limits"].keepalive_expiry == 5.0
 
     if client_cls is httpx.Client:
         with httpx.Client(**kwargs) as client, pytest.raises(httpx.ProxyError):
@@ -170,4 +170,4 @@ def test_no_proxy_alone_keeps_httpx_transports(config: CachekitIOBackendConfig, 
     monkeypatch.setenv("NO_PROXY", "api.cachekit.io")
     kwargs = _kwargs(config, httpx.HTTPTransport)
     assert kwargs["mounts"] is None
-    assert kwargs["limits"].keepalive_expiry == 200.0
+    assert kwargs["limits"].keepalive_expiry == 5.0

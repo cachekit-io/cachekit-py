@@ -212,7 +212,8 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   serverless runtime, a stopped container), so the first request after such a pause can still wait out
   the timeout on a dead connection and miss. With any proxy setting in the
   environment (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the rest), requests go through httpx's own
-  transports so the proxy is honoured, without probes, and idle connections are kept for 200 s instead
+  transports so the proxy is honoured, without probes, and idle connections keep httpx's 5 s default:
+  a proxy's own idle limit is unknown, and a connection it dropped silently would cost a timeout and a miss
 - Safe across event loops: the async pool belongs to the thread's running event loop and is built on
   the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
   thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first

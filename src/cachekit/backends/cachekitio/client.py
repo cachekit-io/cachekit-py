@@ -215,8 +215,9 @@ def _pin_hpack_logger() -> None:
 # NAT gateways drop idle flows sooner (AWS 350 s, Azure 4 min); TCP keepalive probes from 60 s idle keep their
 # mappings alive and detect a dead path in about 90 s instead of a 5 s read timeout on the next request.
 _KEEPALIVE_EXPIRY = 390.0
-# Without keepalive probes (behind an env proxy, below), cap the idle time under the shortest NAT limit.
-_KEEPALIVE_EXPIRY_NO_PROBES = 200.0
+# Without keepalive probes (behind an env proxy, below), keep httpx's 5 s default: a proxy's own idle limit is
+# unknown, and a connection it dropped silently would cost the next request its whole timeout and a miss.
+_KEEPALIVE_EXPIRY_NO_PROBES = 5.0
 
 
 def _keepalive_socket_options() -> list[tuple[int, int, int]]:
@@ -240,7 +241,7 @@ def _client_kwargs(
     # Keepalive probes need our own transport, and passing transport= turns off httpx's env proxies. So the
     # transport is mounted for all:// instead. With any proxy setting present (getproxies() is what httpx reads),
     # that mount would replace an ALL_PROXY proxy or miss a NO_PROXY host, so the client keeps httpx's own
-    # transports and the shorter expiry instead.
+    # transports and today's 5 s expiry instead.
     probes = not urllib.request.getproxies()
     limits = httpx.Limits(
         max_connections=config.connection_pool_size,
