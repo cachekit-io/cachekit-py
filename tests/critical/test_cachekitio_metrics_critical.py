@@ -8,6 +8,7 @@ Performance target: < 1 second total.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -30,10 +31,12 @@ def _make_response(status_code: int = 200, content: bytes = b"") -> httpx.Respon
 def mock_sync_client():
     client = MagicMock(spec=httpx.Client)
     with (
-        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(pid=os.getpid(), client=client)
+        ),
         patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
         ),
     ):
         yield client
@@ -46,9 +49,12 @@ def mock_async_client():
     with (
         patch(
             "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
         ),
-        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=async_client),
+        ),
     ):
         yield async_client
 

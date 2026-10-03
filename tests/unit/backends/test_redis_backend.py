@@ -46,6 +46,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
+from cachekit import cache
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis import provider as provider_module
@@ -389,6 +390,29 @@ class TestRedisBackendGetContract:
         assert backend.get("k") is None
 
 
+@pytest.mark.unit
+class TestRedisTtlOpsRunOffTheLoop:
+    """get_ttl and refresh_ttl call the sync client from a worker thread, so a Redis round trip
+    never stalls the event loop (LAB-7074)."""
+
+    @staticmethod
+    def _backend_with(client: Mock) -> PerRequestRedisBackend:
+        return PerRequestRedisBackend(client, tenant_id="default")
+
+    async def test_get_ttl_and_refresh_ttl_leave_the_loop_thread(self):
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+        client = Mock()
+        client.ttl.side_effect = lambda _k: seen.append(threading.current_thread()) or 42
+        client.expire.side_effect = lambda _k, _t: seen.append(threading.current_thread()) or 1
+        backend = self._backend_with(client)
+
+        assert await backend.get_ttl("k") == 42
+        assert await backend.refresh_ttl("k", 60) is True
+        assert len(seen) == 2
+        assert loop_thread not in seen
+
+
 class _FakeRedis:
     """Just enough of ``redis.Redis`` for ``redis.lock.Lock`` (SET NX PX plus the release
     script) and for a decorator's reads, writes and deletes (TTLs are not modelled).
@@ -722,6 +746,30 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
         assert [r.levelno for r in caplog.records if "release" in r.getMessage()] == [level]
+
+    async def test_decorator_runs_uncached_when_redis_goes_away_before_the_lock(self, caplog):
+        """A ``SET NX`` failing after a successful call degrades the next miss: the function runs once,
+        uncached, and the raw ``redis.ConnectionError`` never reaches the caller (LAB-5346)."""
+        fake = _FakeRedis()
+        runs: list[int] = []
+
+        @cache(backend=PerRequestRedisBackend(fake, tenant_id="t"), ttl=60, l1_enabled=False, namespace="lab5346-redis")
+        async def compute(x: int) -> int:
+            runs.append(x)
+            return x * 2
+
+        assert await compute(1) == 2  # warm-up: Redis works
+        fake.nx_error = RedisConnectionError("redis went away")
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            assert await compute(2) == 4
+
+        assert runs == [1, 2]
+        assert any("Lock operation failed" in r.getMessage() for r in caplog.records)
+        cache_keys = [k for k in fake._store if not k.endswith(":lock")]
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            text = formatter.format(record)
+            assert not any(k.split(":", 1)[-1] in text for k in cache_keys), f"{record.name} logged a cache key: {text}"
 
 
 REG = "ck:reg:ns:0123456789abcdef"

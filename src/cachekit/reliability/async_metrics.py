@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union
 
@@ -20,9 +21,9 @@ logger = logging.getLogger(__name__)
 # Suffixes prometheus_client appends to a metric's base name to form its series names.
 _SERIES_SUFFIXES = ("", "_total", "_created", "_bucket", "_count", "_sum")
 
-# Every series name the collector's own metrics register. A caller-supplied metric whose series would include
-# one of these could claim it: the built-in metric would then register under a renamed series, or break every
-# later cache-operation update.
+# Every series name cachekit's own metrics register: the collector's, and the circuit breaker's gauge. A
+# caller-supplied metric whose series would include one of these could claim it: the built-in metric would then
+# register under a renamed series, or break every later cache-operation update or breaker construction.
 _BUILTIN_SERIES = frozenset(
     {"cache_operations", "cache_operations_total", "cache_operations_created", "circuit_breaker_state"}
     | {f"{h}{s}" for h in ("cache_operation_duration_ms", "cache_operation_size_bytes") for s in _SERIES_SUFFIXES}
@@ -195,7 +196,7 @@ if hasattr(os, "register_at_fork"):
 def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str]) -> Any:
     """Get or create the process-wide metric instance for ``name``.
 
-    Module-level so ``circuit_breaker_gauge()`` returns the collectors' object without
+    Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
     creating a collector.
 
     Raises:
@@ -225,7 +226,7 @@ def _get_shared_metric(name: str, metric_class: type, description: str, labels: 
 
 
 def circuit_breaker_gauge() -> Any:
-    """Return the process-wide ``circuit_breaker_state`` gauge."""
+    """Return the process-wide ``circuit_breaker_state`` gauge. The circuit breaker is its only writer."""
     return _get_shared_metric(
         "circuit_breaker_state", Gauge, "Number of live circuit breakers per namespace and state", ["namespace", "state"]
     )
@@ -364,16 +365,17 @@ class AsyncMetricsCollector:
             self._record_cache_operation_async(operation, namespace, success, duration_ms, serializer, size_bytes)
 
     def record_circuit_breaker_state(self, namespace: str, state: str, transitions: int = 0):
-        """Record circuit breaker state change."""
-        self._operation_count += 1
+        """Deprecated: records nothing.
 
-        if self.auto_detect_mode and self._should_check_mode():
-            self._maybe_switch_mode()
-
-        if self._sync_mode or not self._may_enqueue():
-            self._record_circuit_breaker_sync(namespace, state, transitions)
-        else:
-            self._record_circuit_breaker_async(namespace, state, transitions)
+        The circuit breaker is the only writer of ``circuit_breaker_state``, which counts live breakers per
+        namespace and state. A value written here would read as breakers that do not exist.
+        """
+        warnings.warn(
+            "record_circuit_breaker_state is deprecated and records nothing: each CircuitBreaker publishes "
+            "circuit_breaker_state itself",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def record_counter(self, metric_name: str, labels: Optional[dict[str, Any]] = None, value: float = 1.0):
         """Record a counter metric.
@@ -491,7 +493,6 @@ class AsyncMetricsCollector:
 
         # Group metrics by type for efficient processing
         cache_ops = defaultdict(lambda: {"count": 0, "duration": 0, "size": 0})
-        circuit_states = defaultdict(int)
         counters = defaultdict(lambda: defaultdict(float))  # {name: {labels_key: value}}
         histograms = defaultdict(list)  # {name: [(value, labels_key)]}
 
@@ -502,10 +503,6 @@ class AsyncMetricsCollector:
                     cache_ops[key]["count"] += 1
                     cache_ops[key]["duration"] += metric["duration_ms"]
                     cache_ops[key]["size"] += metric["size_bytes"]
-
-                elif metric["type"] == "circuit_breaker":
-                    key = (metric["namespace"], metric["state"])
-                    circuit_states[key] += 1
 
                 elif metric["type"] == "counter":
                     value = self._check_generic_metric(metric["name"], metric["labels"], metric["value"])
@@ -530,7 +527,7 @@ class AsyncMetricsCollector:
         # unforeseen: most worker call sites (the shutdown drain among them) have no handler above them, so an
         # escaping exception would end the worker and strand every record still queued.
         try:
-            self._update_prometheus_metrics(cache_ops, circuit_states, counters, histograms)  # type: ignore[arg-type]
+            self._update_prometheus_metrics(cache_ops, counters, histograms)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"Failed to update metrics batch: {redact_error_for_log(e)}")
 
@@ -569,7 +566,6 @@ class AsyncMetricsCollector:
     def _update_prometheus_metrics(
         self,
         cache_ops: dict[tuple[Any, ...], dict[str, Any]],
-        circuit_states: dict[tuple[Any, ...], int],
         counters: dict[str, dict[str, Any]],
         histograms: dict[str, list[Any]],
     ):
@@ -587,8 +583,6 @@ class AsyncMetricsCollector:
             "cache_operation_size_bytes", Histogram, "Cache operation size", ["operation", "namespace", "serializer"]
         )
 
-        circuit_gauge = circuit_breaker_gauge()
-
         # Batch update cache metrics
         for (operation, namespace, success, serializer), stats in cache_ops.items():
             cache_counter.labels(operation=operation, namespace=namespace, success=str(success), serializer=serializer).inc(
@@ -604,10 +598,6 @@ class AsyncMetricsCollector:
                 # Record average size for the batch
                 avg_size = stats["size"] / stats["count"]
                 cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(avg_size)
-
-        # Update circuit breaker states
-        for (namespace, state), count in circuit_states.items():
-            circuit_gauge.labels(namespace=namespace, state=state).set(count)
 
         # Update generic counters
         for name, label_values in counters.items():
@@ -864,14 +854,6 @@ class AsyncMetricsCollector:
             )
             cache_size.labels(operation=operation, namespace=namespace, serializer=serializer).observe(size_bytes)
 
-    def _record_circuit_breaker_sync(self, namespace: str, state: str, transitions: int):
-        """Record circuit breaker state directly to Prometheus (sync mode)."""
-        if not PROMETHEUS_AVAILABLE:
-            return
-
-        circuit_gauge = circuit_breaker_gauge()
-        circuit_gauge.labels(namespace=namespace, state=state).set(transitions)
-
     def _record_counter_sync(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter directly to Prometheus (sync mode)."""
         if not PROMETHEUS_AVAILABLE:
@@ -922,27 +904,6 @@ class AsyncMetricsCollector:
         except queue.Full:
             self._dropped_metrics += 1
             self._return_to_pool(metric_data)  # Return to pool if failed
-
-    def _record_circuit_breaker_async(self, namespace: str, state: str, transitions: int):
-        """Record circuit breaker state to queue for async processing."""
-        assert self._queue is not None, "Async metrics not initialized"
-
-        metric_data = self._get_pooled_metric_data()
-        metric_data.update(
-            {
-                "type": "circuit_breaker",
-                "namespace": namespace,
-                "state": state,
-                "transitions": transitions,
-                "timestamp": time.time(),
-            }
-        )
-
-        try:
-            self._queue.put_nowait(metric_data)
-        except queue.Full:
-            self._dropped_metrics += 1
-            self._return_to_pool(metric_data)
 
     def _record_counter_async(self, metric_name: str, labels: dict[str, Any], value: float):
         """Record counter to queue for async processing."""

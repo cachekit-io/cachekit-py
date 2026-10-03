@@ -26,6 +26,7 @@ the Python SDK from drifting back out of conformance.
 from __future__ import annotations
 
 import json as _json
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
@@ -55,11 +56,11 @@ def backend() -> CachekitIOBackend:
     """Build a CachekitIOBackend with mocked HTTP clients."""
     with patch(
         "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-        return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
         ):
             return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
 

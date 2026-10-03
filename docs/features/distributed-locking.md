@@ -146,9 +146,11 @@ Three behavioural edges to design around:
 3. **Lock backend errors degrade to no lock.** If lock acquisition raises a
    backend error (lock backend outage, authentication failure), the wrapper
    logs a warning and **executes the function without the lock** — for every
-   caller, i.e. a full stampede. A failed release never runs the function
-   again: the Redis and CachekitIO backends swallow a backend error on
-   release, and the lock may stay until its 30 s timeout. The lock is
+   caller, i.e. a full stampede. A failed lock request is not retried; only a
+   lock another caller holds is waited on. A failed release never runs the
+   function again: the Redis and CachekitIO backends swallow a backend error
+   on release, any other release failure is logged and the call keeps its
+   result, and the lock may stay until its 30 s timeout. The lock is
    best-effort stampede mitigation, never load-bearing mutual exclusion: do
    not rely on it for correctness of non-idempotent operations.
 
