@@ -101,8 +101,9 @@ anyway, in one of two ways.
 A program that uses no Redis backend (L1-only, CachekitIO, File or Memcached)
 never loads redis-py: `import cachekit` imports no redis-py, and
 `RedisBackend` is loaded only on first use, through the module `__getattr__`
-of `cachekit.backends`. Nothing is blocked, and the program's own
-`import hiredis` works.
+of `cachekit.backends`. With `CACHEKIT_DISABLE_HIREDIS` unset nothing is
+blocked, and the program's own `import hiredis` works. (`true` blocks hiredis
+at `import cachekit` for every program, Redis or not.)
 
 A program that uses cachekit's Redis backend loads redis-py through
 `cachekit.backends.redis`, and that package decides on hiredis before it
@@ -125,7 +126,9 @@ The block is process-wide: once it is in place, an application's own
 process, as importing hiredis there always does). The unset default acts only
 when cachekit's Redis backend loads, so an application that imports redis-py
 itself before that keeps hiredis, and on a free-threaded build the GIL turns
-on. Set `CACHEKIT_DISABLE_HIREDIS=true` to block from `import cachekit` on.
+on. To avoid that, set `CACHEKIT_DISABLE_HIREDIS=true` and import cachekit
+before redis-py: `true` blocks at `import cachekit`, and cannot undo a
+hiredis that redis-py has already loaded.
 When hiredis is already loaded, cachekit logs a warning that redis-py keeps
 the hiredis parser and, on a free-threaded build, that the GIL is already on.
 

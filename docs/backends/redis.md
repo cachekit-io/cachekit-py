@@ -61,11 +61,11 @@ Query options in `redis_url` override the pool fields above, because redis-py's 
 
 ### hiredis and the reply parser
 
-redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. cachekit loads redis-py only for a program that uses its Redis backend, so the choice below never touches a program that uses L1 only, CachekitIO, File or Memcached.
+redis-py uses the hiredis C parser when hiredis is installed, which `redis[hiredis]` always does. cachekit loads redis-py only for a program that uses its Redis backend, so with the variable unset, the default below never touches a program that uses L1 only, CachekitIO, File or Memcached. `true` is the exception: it blocks hiredis at `import cachekit` for every program, whichever backend it uses.
 
 `CACHEKIT_DISABLE_HIREDIS=true` keeps hiredis out and gives every connection redis-py's pure-Python parser. cachekit applies it at `import cachekit`, so import cachekit before redis; if hiredis is already loaded it logs a warning and the setting cannot take effect. `CACHEKIT_DISABLE_HIREDIS=false` keeps hiredis on every build.
 
-Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is already on (for example `-X gil=1`). A free-threaded build with the GIL still off drops it when cachekit's Redis backend loads, before redis-py does, because importing hiredis there re-enables the GIL. An application that imports redis-py itself before that point keeps hiredis, and the GIL turns on; set `true` to block from `import cachekit` on. Either block is process-wide: once it is in place, any later `import hiredis` in the process raises `ImportError`. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
+Unset, a GIL build keeps hiredis, and so does a free-threaded build whose GIL is already on (for example `-X gil=1`). A free-threaded build with the GIL still off drops it when cachekit's Redis backend loads, before redis-py does, because importing hiredis there re-enables the GIL. An application that imports redis-py itself before that point keeps hiredis, and the GIL turns on. To avoid that, set `true` and import cachekit before redis-py; `true` cannot undo a hiredis that redis-py has already loaded. Either block is process-wide: once it is in place, any later `import hiredis` in the process raises `ImportError`. See [Free-threaded CPython](../free-threading.md#the-ci-safety-net).
 
 ## When to Use
 
