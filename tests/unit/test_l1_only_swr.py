@@ -20,11 +20,14 @@ import copy
 import logging
 import threading
 import time
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from cachekit import cache
 from cachekit.config import L1CacheConfig
+from tests.unit.test_swr_decorator import _close_loop, _collect_pruned, _resume
 
 
 async def _wait_for_calls(get_calls, expected: int, timeout: float = 2.0) -> None:
@@ -315,6 +318,125 @@ class TestL1OnlySWRBoundedConcurrency:
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.1)  # settle: catch any over-cap stragglers
         assert refresh_calls == n_keys + 32, f"expected exactly 32 refreshes, got {refresh_calls - n_keys}"
+
+
+@pytest.mark.unit
+class TestL1OnlySWRStoppedLoop:
+    """LAB-7295: an async refresh left pending on an event loop that stopped (sync code calling
+    run_until_complete) or closed without cancelling its tasks keeps its slot and key for the
+    hold; the next refresh attempt on any key then releases both and cancels it."""
+
+    _L1 = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.01)  # stale after ~0.1 s of ttl=10
+
+    def _seeded_fn(self, n_keys: int, starts: list[int], park: Callable[[], bool]) -> Any:
+        """An L1-only async function with n_keys entries, all stale; a refresh logs its key in
+        starts and, while park() says so, never answers."""
+        seeded: set[int] = set()
+
+        @cache(ttl=10, backend=None, l1=self._L1)
+        async def fn(x: int) -> int:
+            if x in seeded:  # a refresh
+                starts.append(x)
+                if park():
+                    await asyncio.sleep(3600)
+            seeded.add(x)
+            return x
+
+        for x in range(n_keys):
+            asyncio.run(fn(x))  # misses: seed
+        time.sleep(0.2)  # past ttl * ratio, with jitter
+        return fn
+
+    @staticmethod
+    def _hit(fn: Any, *keys: int) -> Any:
+        async def hit() -> None:
+            for x in keys:
+                assert await fn(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        return hit()
+
+    @pytest.mark.parametrize("close", [False, True], ids=["stopped", "closed"])
+    def test_refresh_on_stopped_loop_frees_slot_and_key(self, monkeypatch: pytest.MonkeyPatch, close: bool) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L1_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+        starts: list[int] = []
+        fn = self._seeded_fn(2, starts, park=lambda: len(starts) == 1)  # only the first refresh parks
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(self._hit(fn, 0))  # key 0's refresh parks on a loop then left stopped
+            if close:
+                stopped.close()  # without cancelling it
+            asyncio.run(self._hit(fn, 1))  # within the hold the parked refresh keeps the only slot
+            assert starts == [0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+            asyncio.run(self._hit(fn, 1))  # past the hold it holds no slot
+            asyncio.run(self._hit(fn, 0))  # and the prune released key 0's in-flight marker
+            assert starts == [0, 1, 0]
+            if close:
+                _collect_pruned(monkeypatch)
+        finally:
+            _close_loop(stopped)
+
+    def test_refreshes_pruned_from_stopped_loops_do_not_resume(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loops that resume after pausing between run_until_complete calls run no more
+        refreshes than the pool holds: the pruned ones were cancelled."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L1_SWR_MAX_CONCURRENT_REFRESHES", 2)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        fn = self._seeded_fn(6, [], park=lambda: True)
+        loops = [asyncio.new_event_loop() for _ in range(3)]
+        try:
+            for i, loop in enumerate(loops):
+                loop.run_until_complete(self._hit(fn, 2 * i, 2 * i + 1))  # each pauses with its refreshes pending
+            assert sum(len(loop.run_until_complete(_resume())) for loop in loops) == 2  # the pool's 2, not 6
+        finally:
+            for loop in loops:
+                _close_loop(loop)
+
+    def test_pruned_refresh_that_resumes_frees_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pruned refresh whose loop runs again neither raises nor settles key state: a newer
+        refresh of the same entry shares its version, so failing its own refresh would release
+        the newer one's marker. Nor does it give back the slot the newer one holds."""
+        import cachekit.decorators.wrapper as wrapper_mod
+        from cachekit.object_cache import ObjectCache
+
+        monkeypatch.setattr(wrapper_mod, "_L1_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        settled: list[str] = []
+
+        def spy(name: str) -> Callable[..., Any]:
+            real = getattr(ObjectCache, name)
+
+            def record(self: ObjectCache, *args: Any, **kwargs: Any) -> Any:
+                settled.append(name)
+                return real(self, *args, **kwargs)
+
+            return record
+
+        for name in ("fail_refresh", "complete_refresh"):
+            monkeypatch.setattr(ObjectCache, name, spy(name))
+        starts: list[int] = []
+        fn = self._seeded_fn(2, starts, park=lambda: True)
+        loop_a, loop_b, loop_c = (asyncio.new_event_loop() for _ in range(3))
+        try:
+            loop_a.run_until_complete(self._hit(fn, 0))  # A parks on key 0
+            loop_b.run_until_complete(self._hit(fn, 1))  # prunes A (key 0 released); B parks on key 1
+            loop_c.run_until_complete(self._hit(fn, 0))  # prunes B; C refreshes key 0 at A's version
+            assert starts == [0, 1, 0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+            assert loop_a.run_until_complete(_resume()) == []  # A and B resume and end cancelled
+            assert loop_b.run_until_complete(_resume()) == []
+            assert settled == []  # without touching C's marker
+            asyncio.run(self._hit(fn, 1))  # C still holds the only slot
+            assert starts == [0, 1, 0]
+        finally:
+            for loop in (loop_a, loop_b, loop_c):
+                _close_loop(loop)
 
 
 @pytest.mark.unit
