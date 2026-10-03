@@ -341,7 +341,7 @@ def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
 
 
 def _as_if_hookless(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make this process a child the at-fork hook never reached (uWSGI without --py-call-osafterfork)."""
+    """Make this process a child the at-fork hook never reached (uWSGI without --py-call-uwsgi-fork-hooks)."""
     from cachekit import l1_cache
 
     monkeypatch.setattr(l1_cache, "_import_pid", -1)

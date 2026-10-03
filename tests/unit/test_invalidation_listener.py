@@ -976,7 +976,7 @@ class TestListenerPool:
 
 @pytest.mark.unit
 class TestUwsgiWarning:
-    """One WARNING under uWSGI when no option runs Python's at-fork hooks in workers."""
+    """One WARNING under uWSGI unless py-call-uwsgi-fork-hooks runs Python's at-fork hooks in workers."""
 
     @pytest.fixture
     def fake_uwsgi(self, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -989,11 +989,20 @@ class TestUwsgiWarning:
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         (record,) = caplog.records
-        assert "py-call-uwsgi-fork-hooks" in record.getMessage() and "lazy-apps" in record.getMessage()
+        message = record.getMessage()
+        assert "--enable-threads --py-call-uwsgi-fork-hooks" in message and "osafterfork" not in message
 
-    @pytest.mark.parametrize("option", ["py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy"])
-    def test_any_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
-        fake_uwsgi.opt = {"master": True, option: True}
+    @pytest.mark.parametrize("option", ["py-call-osafterfork", "lazy-apps", "lazy"])
+    def test_no_other_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        """py-call-osafterfork aborts every worker on 3.13+; under lazy-apps a worker's thread can hang."""
+        fake_uwsgi.opt = {"master": True, "enable-threads": True, option: True}
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert len(caplog.records) == 1
+
+    @pytest.mark.parametrize("extra", [{}, {"lazy-apps": True}])
+    def test_fork_hooks_silence_it(self, extra: dict[str, bool], fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        fake_uwsgi.opt = {"master": True, "py-call-uwsgi-fork-hooks": True, **extra}
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         assert caplog.records == []
