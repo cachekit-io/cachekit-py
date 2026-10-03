@@ -1,9 +1,9 @@
 """L1 memory-bound guarantees, especially the oversized-single-entry vector.
 
-A cached value larger than an eighth of the L1 budget must NOT be stored: admitting it would
-evict that much of L1 on its way in, and again on every read that refills it from L2. Above the
-whole budget it would also push L1 permanently over its limit (for multi-GB DataFrame envelopes,
-an OOM vector). Such values still live in L2.
+A cached value larger than an eighth of the L1 budget must NOT be stored: admitting it could
+evict up to that much of L1 on its way in, and again on every read that refills it from L2. Above
+the whole budget it would also push L1 permanently over its limit (for multi-GB DataFrame
+envelopes, an OOM vector). Such values are served from L2, or recomputed if L2 did not store them.
 """
 
 from __future__ import annotations
@@ -77,17 +77,6 @@ class TestOversizedEntryRejection:
         assert cache.get("other")[0] is True  # nothing evicted
         assert _consistent(cache)
         assert cache._state.memory_bytes == 1024
-
-    def test_entry_just_under_the_budget_is_refused_without_evicting(self):
-        cache = L1Cache(max_memory_mb=1)
-        for i in range(8):
-            cache.put(f"small{i}", b"\x00" * (100 * 1024), redis_ttl=300)
-
-        cache.put("near-budget", b"\x00" * (MB - 1), redis_ttl=300)
-
-        assert cache.get("near-budget")[0] is False
-        assert all(cache.get(f"small{i}")[0] for i in range(8))
-        assert cache._evictions == 0
 
     def test_small_entries_survive_repeated_reads_of_a_near_budget_key(self):
         """A key refilled from L2 on every L1 miss must not flush the rest of L1 each time."""

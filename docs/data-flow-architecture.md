@@ -290,9 +290,10 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  1. Calculate expiry: time.time() + ttl - buffer (1s)                       │
 │  2. Estimate size: len(serialized_bytes)  # O(1), not recursive             │
-│  3. Evict LRU entries if needed (max 100MB)                                 │
-│  4. Store bytes in OrderedDict with metadata                                │
-│  5. Mark as most recently used (move_to_end)                                │
+│  3. If size > budget/8: drop any older entry for the key, store nothing     │
+│  4. Evict LRU entries if needed (max 100MB)                                 │
+│  5. Store bytes in OrderedDict with metadata                                │
+│  6. Mark as most recently used (move_to_end)                                │
 │                                                                             │
 │  Note: Stores bytes (encrypted or plaintext msgpack), not Python objects    │
 └──────────────────────────────────┬──────────────────────────────────────────┘
