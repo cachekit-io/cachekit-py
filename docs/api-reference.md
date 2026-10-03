@@ -635,7 +635,7 @@ The Redis backend wraps each redis-py exception in a `BackendError` whose `error
 
 ### Connection Failures
 When Redis is unavailable:
-1. Function executes, and its result is still stored in L1, so later calls in the same process hit L1
+1. Function executes. Its result is still stored in L1, unless Redis was already down when the backend was first built: then nothing is cached (see [Connection Errors](error-codes.md#connection-errors))
 2. Warning is logged (if logging configured)
 3. No exception is raised to the caller
 

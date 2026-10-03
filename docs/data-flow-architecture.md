@@ -783,7 +783,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 ### Error Scenarios
 
-1. **Redis Connection Failed** → Execute function; L2 is skipped, but the result is still stored in L1
+1. **Redis Connection Failed** → Execute function; the result is still stored in L1, unless Redis was down when the backend was first built (then nothing is cached)
 2. **Lock Acquisition Timeout** → Execute without lock (thundering herd risk accepted)
 3. **Serialization Failed** → Return result, skip caching
 4. **Deserialization Failed** → Execute function as if cache miss

@@ -4,10 +4,12 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching, except that after a backend read or write failure the result is still stored in L1 (on by default), so later calls in the same process hit it. The one case L1 does not get it is a sync function using the plaintext Arrow serializer on the File backend, whose streamed write never goes to L1 (see [Circuit breaker open](#circuit-breaker-open)). Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function. Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
+
+After a read or write failure on a backend that is already built, the result is still stored in L1 (on by default), so later calls in the same process hit it. Two backend failures cache nothing: a backend that cannot be built on the first call, such as an auto-detected Redis that is down then (see [Connection Errors](#connection-errors)), and a failed streamed write from a sync function using the plaintext Arrow serializer on the File backend, which never goes to L1 (see [Circuit breaker open](#circuit-breaker-open)).
 
 ## Encryption Errors
 
@@ -299,7 +301,12 @@ function (see [Multi-Tenant Isolation](features/zero-knowledge-encryption.md#mul
 
 ## Connection Errors
 
-None of these raise to a `@cache`-decorated caller, sync or async. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function: a failed read is a miss, a failed write skips L2, and the result is still stored in L1. Depending on where the failure happens, the log line is one of:
+None of these raise to a `@cache`-decorated caller, sync or async. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function. What happens to the result depends on when Redis fails:
+
+- **Unreachable when the backend is built.** Without `backend=` or `set_default_backend()`, cachekit builds its Redis backend on the first call and pings Redis then. If the ping fails, the call runs the function uncached: nothing goes to L1 or L2, the failure counts toward the circuit breaker, and the next call tries the build again. Once the breaker opens (five failures within 60 s by default), calls run the function without trying to connect until the cooldown ends. A `RedisBackend` you build yourself does not ping, so it never fails this way.
+- **Lost after the backend is built.** A failed read is a miss, and a failed write still stores the result in L1, so later calls in the same process hit it. These errors do not currently count toward the breaker.
+
+Depending on where the failure happens, the log line is one of:
 
 - `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
 - `Backend error getting key ...: BackendError(...)` (ERROR)
@@ -319,7 +326,7 @@ The redis-py exceptions below reach your code only when you use a Redis client d
 # Redis not running
 @cache()
 def my_function():
-    return data()  # Logs a warning, runs data(), caches the result in L1 only
+    return data()  # Logs a warning, runs data(), caches nothing, counts toward the breaker
 ```
 
 **Solutions**:
