@@ -113,11 +113,12 @@ def _point_clients_at(monkeypatch: pytest.MonkeyPatch, saas: _FakeSaaS, keepaliv
     # instead; the backend, its lease and httpx's real connection pool all run unchanged.
     real_kwargs = client_module._client_kwargs
 
-    def local_kwargs(config: Any) -> dict[str, Any]:
-        kwargs = real_kwargs(config)
+    def local_kwargs(config: Any, transport_cls: Any) -> dict[str, Any]:
+        kwargs = real_kwargs(config, transport_cls)
         kwargs["base_url"] = f"http://127.0.0.1:{saas.server_address[1]}"
         kwargs["http2"] = False
         kwargs["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=10, keepalive_expiry=keepalive_expiry)
+        kwargs["mounts"] = None  # the keepalive mount would bypass the overrides above
         return kwargs
 
     monkeypatch.setattr(client_module, "_client_kwargs", local_kwargs)

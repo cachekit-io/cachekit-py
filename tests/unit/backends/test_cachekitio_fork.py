@@ -75,12 +75,13 @@ def _backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2
     port, cert = fake_saas
     real_kwargs = client_module._client_kwargs
 
-    def local_kwargs(config: Any) -> dict[str, Any]:
-        kwargs = real_kwargs(config)
+    def local_kwargs(config: Any, transport_cls: Any) -> dict[str, Any]:
+        kwargs = real_kwargs(config, transport_cls)
         kwargs["base_url"] = f"https://127.0.0.1:{port}"
         kwargs["verify"] = ssl.create_default_context(cafile=str(cert))
         kwargs["http2"] = http2
         kwargs["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=10, keepalive_expiry=60.0)
+        kwargs["mounts"] = None  # the keepalive mount would bypass the overrides above
         return kwargs
 
     monkeypatch.setattr(client_module, "_client_kwargs", local_kwargs)

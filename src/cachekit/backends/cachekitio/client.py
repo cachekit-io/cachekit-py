@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import threading
+import urllib.request
 import weakref
 from contextlib import AsyncExitStack, ExitStack
 from importlib.metadata import PackageNotFoundError, version
@@ -69,7 +71,7 @@ class SyncClientLease:
     # weak references still resolve, so the racing lookup revives the object and inherits the close.
     def __init__(self, config: CachekitIOBackendConfig) -> None:
         self.pid = os.getpid()
-        self.client = httpx.Client(**_client_kwargs(config))
+        self.client = httpx.Client(**_client_kwargs(config, httpx.HTTPTransport))
         # atexit=False: exit-time finalizers run while daemon threads (stale-while-revalidate) are still
         # alive, so closing then could pull a client out from under an in-flight request. The process
         # reclaims the sockets at exit anyway.
@@ -110,7 +112,7 @@ class _LoopBoundClient:
         if self._client is None or self._loop is None or self._loop() is not loop:
             # The replaced client is dropped unclosed: its loop has finished, so its connections
             # cannot be awaited closed (the same ResourceWarning as a released async client).
-            self._client = httpx.AsyncClient(**_client_kwargs(self._config))
+            self._client = httpx.AsyncClient(**_client_kwargs(self._config, httpx.AsyncHTTPTransport))
             self._loop = weakref.ref(loop)
         return self._client
 
@@ -208,17 +210,50 @@ def _pin_hpack_logger() -> None:
         _hpack_logger.setLevel(logging.INFO)
 
 
-def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
+# Pool policy. Cloudflare closes an idle client connection at 400 s, so an idle pooled connection is kept for
+# 390 s instead of httpx's 5 s default, and a request after a gap of up to 390 s skips a new TCP+TLS handshake.
+# NAT gateways drop idle flows sooner (AWS 350 s, Azure 4 min); TCP keepalive probes from 60 s idle keep their
+# mappings alive and detect a dead path in about 90 s instead of a 5 s read timeout on the next request.
+_KEEPALIVE_EXPIRY = 390.0
+# Without keepalive probes (behind an env proxy, below), cap the idle time under the shortest NAT limit.
+_KEEPALIVE_EXPIRY_NO_PROBES = 200.0
+
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # macOS names the idle option TCP_KEEPALIVE; a platform without one keeps the kernel's defaults.
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    for name, value in ((idle, 60), (getattr(socket, "TCP_KEEPINTVL", None), 10), (getattr(socket, "TCP_KEEPCNT", None), 3)):
+        if name is not None:
+            options.append((socket.IPPROTO_TCP, name, value))
+    return options
+
+
+_KEEPALIVE_SOCKET_OPTIONS = _keepalive_socket_options()
+
+
+def _client_kwargs(
+    config: CachekitIOBackendConfig, transport_cls: type[httpx.HTTPTransport] | type[httpx.AsyncHTTPTransport]
+) -> dict[str, Any]:
     # Every client carries the bearer key, so no client is built before the pin.
     _pin_hpack_logger()
+    # Keepalive probes need our own transport, and passing transport= turns off httpx's env proxies. So the
+    # transport is mounted for all:// instead. With any proxy setting present (getproxies() is what httpx reads),
+    # that mount would replace an ALL_PROXY proxy or miss a NO_PROXY host, so the client keeps httpx's own
+    # transports and the shorter expiry instead.
+    probes = not urllib.request.getproxies()
+    limits = httpx.Limits(
+        max_connections=config.connection_pool_size,
+        max_keepalive_connections=config.connection_pool_size,
+        keepalive_expiry=_KEEPALIVE_EXPIRY if probes else _KEEPALIVE_EXPIRY_NO_PROBES,
+    )
+    mounts = {"all://": transport_cls(http2=True, limits=limits, socket_options=_KEEPALIVE_SOCKET_OPTIONS)} if probes else None
     return {
         "base_url": config.api_url,
         "timeout": config.timeout,
         "http2": True,
-        "limits": httpx.Limits(
-            max_connections=config.connection_pool_size,
-            max_keepalive_connections=config.connection_pool_size,
-        ),
+        "limits": limits,
+        "mounts": mounts,
         "headers": {
             "Authorization": f"Bearer {config.api_key.get_secret_value()}",
             "Content-Type": "application/octet-stream",

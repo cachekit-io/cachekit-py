@@ -202,6 +202,17 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
   when the last one is released; the async pool is not, and Python reclaims its sockets with a
   `ResourceWarning` each. Create one backend per key and reuse it
+- Idle connections stay pooled for up to 390 s, just under Cloudflare's 400 s idle close, so a request
+  after a pause of up to 390 s reuses its connection instead of paying a new TCP and TLS handshake
+  (about 25–30 ms from a client entering at MEL). Each pooled connection sends TCP keepalive probes
+  after 60 s idle (every 10 s, 3 probes), which keeps NAT gateway mappings alive (AWS NAT Gateway drops
+  idle flows at 350 s, Azure at 4 min). If a network path does die, the probes find it in about 90 s, and
+  the next request no longer waits out the 5 s timeout: over HTTP/1.1 it reconnects, and over HTTP/2 it
+  fails at once and that call is a cache miss. Probes cannot run while a process is suspended (a frozen
+  serverless runtime, a stopped container), so the first request after such a pause can still wait out
+  the timeout on a dead connection and miss. With any proxy setting in the
+  environment (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the rest), requests go through httpx's own
+  transports so the proxy is honoured, without probes, and idle connections are kept for 200 s instead
 - Safe across event loops: the async pool belongs to the thread's running event loop and is built on
   the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
   thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
