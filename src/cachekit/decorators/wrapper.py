@@ -1075,20 +1075,18 @@ def create_cache_wrapper(
         Exception` that would otherwise demote the served hit into a recompute on
         each call (LAB-348). Anything else is an L1 bug and propagates.
 
-        A hit that is not backfilled still records its twin, though not its key: the key's
-        writer recorded the key, and a key-tracking backend's registry holds it for every
-        process, but no registry holds a twin, so a no-args invalidation here reaches it only
+        A hit that is not backfilled still records its key and twin, in one step as _put_l1
+        does: no registry holds a twin, and on a backend without one the key's writer recorded
+        the key only in its own process, so a no-args invalidation here reaches them only
         through this record.
         """
         if not (_l1_cache and cache_key and cached_data and not is_stale):
-            if twin is not None:
-                _record(twin)
+            _record(cache_key, twin)
             return
         try:
             _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin)
         except TypeError as exc:
-            if twin is not None:
-                _record(twin)
+            _record(cache_key, twin)
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
 
     def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
