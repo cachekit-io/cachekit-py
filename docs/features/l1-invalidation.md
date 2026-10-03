@@ -237,6 +237,12 @@ CacheKit does **not** ship cross-instance L1 invalidation in Python. When runnin
 
 The TypeScript SDK ships an opt-in Redis pub/sub invalidation channel. Python [announces invalidations](#whole-function-invalidation) on `cachekit:py:invalidate:v1`, but nothing in this release subscribes to them to evict other processes' L1 copies. See the [cross-SDK feature matrix](https://github.com/cachekit-io/protocol) for current per-SDK support.
 
+### Forked Processes
+
+A process created by `fork()`, such as a `multiprocessing` fork-context worker or a Gunicorn or Celery prefork worker, starts with an empty L1. None of its parent's L1 entries carry over, and the child refills from L2 on first use. A master that warmed L1 before forking (Gunicorn `--preload`) therefore no longer passes that warmth to its workers.
+
+uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-uwsgi-fork-hooks` (uWSGI 2.0.21 or later) or `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; any one of them keeps the rule above. Without one, a uWSGI worker keeps the L1 entries its master held at fork and runs no background sweep of expired L1 entries. An expired entry is still never served: it is evicted when it is read.
+
 ---
 
 ## Configuration Reference

@@ -276,19 +276,18 @@ class L1Cache:
             # Move to end (most recently used)
             s.cache.move_to_end(key)
 
-    def _reset_lock_after_fork(self, timeout: float = 1.0, log: bool = True) -> None:
-        """Replace the state if its lock is unavailable after fork; call only from a fork take-over or hook.
+    def _reset_lock_after_fork(self, timeout: float = 1.0) -> None:
+        """Replace the state if its lock is unavailable after fork; call only from the take-over of a
+        child no at-fork hook reached (_forked_without_hooks).
 
         A parent thread holding the lock at fork does not exist in the child, so it never releases.
         _is_owned() first: a thread started in the child can reuse the dead holder's ident and so
-        "own" its hold. The timeout waits out a child thread briefly holding the lock legitimately;
-        the at-fork hook passes 0 for a non-blocking probe, as no other child thread exists yet.
-        Neither probe proves the holder dead: in the hook, _is_owned() also means the forking thread
-        forked from inside a critical section; without hooks, a live child thread may hold the lock
-        past the timeout. So the reset never clears or swaps anything in use. It publishes a fresh
-        empty state, and whichever thread holds the old lock finishes on the old state. The entries
-        are dropped either way (an orphaned holder may have left them half-updated); L2 still has them.
-        log=False drops them silently, for a child logging's own at-fork lock reset never reached.
+        "own" its hold. The timeout waits out a child thread briefly holding the lock legitimately.
+        Neither probe proves the holder dead: a live child thread may hold the lock past the timeout.
+        So the reset never clears or swaps anything in use. It publishes a fresh empty state, and
+        whichever thread holds the old lock finishes on the old state. The entries are dropped either
+        way (an orphaned holder may have left them half-updated); L2 still has them. Nothing is
+        logged: the same fork skipped logging's own at-fork lock reset.
         """
         s = self._state
         owned = s.lock._is_owned()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
@@ -296,15 +295,6 @@ class L1Cache:
             s.lock.release()
             return
         self._state = _L1State()
-        if not log:
-            return
-        # Log only once repaired: a raising logging Filter escapes Logger.handle.
-        logger.warning(
-            "L1Cache %s: dropped %d entries (%d bytes) after fork; its lock was unavailable",
-            self.namespace,
-            len(s.cache),
-            s.memory_bytes,
-        )
 
     def _on_current_state(self, mutate: Callable[Concatenate[_L1State, _P], None], *args: _P.args, **kwargs: _P.kwargs) -> None:
         """Run mutate(state, *args, **kwargs) under the state lock, again on any state a fork reset published meanwhile.
@@ -482,8 +472,8 @@ class L1CacheManager:
         thread started inside one is unsafe. L1Cache.put runs this (not get: getpid() is a
         syscall costing about an L1 hit), so any child that grows its L1 gets a live cleanup
         thread, unless no at-fork hook ran. A thread the parent had stopped stays stopped. Decorated functions get() before
-        they put(), so _reset_cache_locks_after_fork repairs orphaned cache locks before that
-        first get() on os.fork() servers; without at-fork hooks (uWSGI unless
+        they put(), so _empty_caches_after_fork gives every cache a fresh state, and so a free lock,
+        before that first get() on os.fork() servers; without at-fork hooks (uWSGI unless
         --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
         The take-over resets cache locks only when that hook did not run in this PID
         (_forked_without_hooks): after it, a held cache lock belongs to a live child thread. Without
@@ -511,7 +501,7 @@ class L1CacheManager:
             # live child thread, and resetting it would drop that cache's entries for nothing.
             if _forked_without_hooks():
                 for cache in self._caches.values():
-                    cache._reset_lock_after_fork(log=False)  # the fork skipped logging's at-fork lock reset too
+                    cache._reset_lock_after_fork()
                 self._cleanup_thread = None  # dead, and no thread may start here
             elif self._cleanup_thread is not None:
                 try:
@@ -577,6 +567,7 @@ class L1CacheManager:
     def _spawn_cleanup_thread(self, interval_seconds: float) -> None:
         def cleanup_worker():
             logger.info("L1 cache background cleanup started (interval: %.1fs)", interval_seconds)
+            _release_inherited_states()  # a forked child's, the first time its L1 is used
 
             while not self._stop_cleanup.wait(interval_seconds):
                 try:
@@ -635,13 +626,17 @@ class L1CacheManager:
 _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 
 # The processes a thread may start in: the one that imported this module, and the latest child
-# _reset_cache_locks_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
+# _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
 # So import cachekit before any fork made from C: a process that first imports it after such a fork
 # (uWSGI --lazy-apps without --py-call-osafterfork) is taken for safe, and cleanup starts a thread there.
 # No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
 # thread idents match a fresh process's, and a fresh process may import on any thread.
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
+
+# The L1 states a forked child inherited, kept until the child's cleanup thread frees them
+# (_empty_caches_after_fork, _release_inherited_states). Never read.
+_inherited_states: list[_L1State] = []
 
 
 def _forked_without_hooks() -> bool:
@@ -650,34 +645,62 @@ def _forked_without_hooks() -> bool:
     return pid != _import_pid and pid != _hooked_pid
 
 
-def _reset_cache_locks_after_fork() -> None:
-    """Replace the state of every cache whose lock is unavailable after fork, before the child's first get().
+def _empty_caches_after_fork() -> None:
+    """Give every cache a fresh, empty state in a forked child, before the child's first get().
 
-    Decorators get() before they put(), so the put-path take-over comes too late for a lock a
-    parent thread (say the cleanup sweep) held at fork: that first get() would hang for the
-    child's life. The child is single-threaded here, so a non-blocking probe (timeout=0) suffices.
-    A lock the forking thread holds (it forked inside a critical section) is replaced too: a child
-    that never returns there, like multiprocessing's, would keep it held for good, and one that
-    does return finishes on the state it bound. Only the locks: starting the cleanup thread stays
-    with _take_over_if_forked, outside the hook. Logging's own at-fork hook ran first (registered at
-    its import, which precedes this module's), so the handler locks are repaired and the drop warning
-    is safe here.
+    A forked child starts with an empty L1. The parent's entries are not the child's to serve: an
+    invalidation announced after the fork reaches the child only once it subscribes (if ever), so an
+    inherited entry could outlive its invalidation for its whole L1 TTL. L2 still has every entry.
+    The fresh state also retires what a parent thread left mid-update at fork: a lock it held, which
+    would hang the child's first get(), and a byte count it had not settled.
+
+    One attribute store per cache, never a clear in place: a thread that forked inside a critical
+    section and returns there finishes on the state it bound. The child is single-threaded here, so
+    this takes no lock, starts no thread and logs nothing. Starting the cleanup thread stays with
+    _take_over_if_forked, outside the hook.
+
+    The parent's states are not freed here: freeing them writes to every entry's memory, so each
+    child would copy most of the parent's L1 pages inside fork(), a cost close to the size of a warm
+    L1, and so would every subprocess started with a preexec_fn, which never uses its L1. They are
+    kept in _inherited_states until the child's cleanup thread starts, on the child's first put,
+    and frees them (_release_inherited_states).
     """
     global _hooked_pid
-    error: Optional[Exception] = None
     for manager in list(_managers):
         for cache in list(manager._caches.values()):
-            try:
-                cache._reset_lock_after_fork(timeout=0)
-            except Exception as e:  # its drop warning, logged after the repair: repair the rest too
-                error = error or e
+            _inherited_states.append(cache._state)
+            cache._state = _L1State()
     _hooked_pid = os.getpid()  # last: a hook cut short leaves the child hookless, so the take-over still resets
-    if error is not None:
-        raise error  # only now; Python reports an at-fork hook's exception and carries on
+
+
+def _release_inherited_states() -> None:
+    """Free the L1 states this process inherited at fork. Called by the cleanup thread when it starts.
+
+    Kept, they would not stay shared with the parent: once the parent rewrites those pages (its own
+    sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
+    reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
+    Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
+    them, so the child's other threads keep running. A state whose lock is taken, by a thread that
+    forked inside its critical section and still runs there, is only dropped from the list: that
+    thread finishes on it, and it is freed with that thread's last reference. A child that never
+    starts a cleanup thread (its parent's manager had none) keeps them.
+    """
+    while _inherited_states:
+        state = _inherited_states[-1]
+        if state.lock.acquire(blocking=False):
+            try:
+                while state.cache:
+                    for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
+                        state.cache.popitem()
+                    time.sleep(0)
+                state.memory_bytes = 0
+            finally:
+                state.lock.release()
+        _inherited_states.pop()  # only once drained: an empty list means every inherited entry is freed
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_cache_locks_after_fork)
+    os.register_at_fork(after_in_child=_empty_caches_after_fork)
 
 
 # Global L1 cache manager instance
