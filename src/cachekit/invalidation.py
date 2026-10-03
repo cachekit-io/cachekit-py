@@ -19,7 +19,6 @@ new channel name, never a field negotiation.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import sys
@@ -34,6 +33,7 @@ import redis
 
 from cachekit import l1_cache
 from cachekit.cache_handler import supports_key_tracking
+from cachekit.config.singleton import get_settings
 from cachekit.hash_utils import WarnThrottle, redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
@@ -47,10 +47,12 @@ _MAX_FIELD_BYTES = 1024
 _MAX_EVENT_BYTES = 4096
 
 # A listener that failed to start is retried by a cache operation this much later, not by every
-# one: during an outage each attempt can wait out a connect timeout.
+# one: during an outage each attempt can wait out a connect timeout, or _CONFIRM_SECONDS.
 _START_RETRY_SECONDS = 60.0
 # A running listener whose subscription Redis refuses subscribes again this much later.
 _RESUBSCRIBE_SECONDS = 60.0
+# How long a start waits, in all, for Redis to answer its SUBSCRIBE and its PING.
+_CONFIRM_SECONDS = 5.0
 
 # uWSGI options under which a worker runs Python's at-fork hooks, or imports the app after the fork.
 _UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
@@ -62,6 +64,8 @@ Evictor = Callable[[Optional[str]], None]
 # WARNING per invalidation would be a flood.
 _publish_failed_warn = WarnThrottle()
 _too_long_warn = WarnThrottle()
+# A forged or foreign publisher controls how many bad events arrive: one WARNING a minute here too.
+_dropped_event_warn = WarnThrottle()
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -209,42 +213,39 @@ def _evictors_for(registry_id: str) -> list[Evictor]:
 
 
 # ---- Listener: one per process, started by a cache operation (owner-PID check, no fork hook) ----
-_listener_flag: Optional[bool] = None  # CACHEKIT_INVALIDATION_LISTENER_ENABLED, read on first use
 _listener_pid: Optional[int] = None  # the process the running listener belongs to
-_listener: Any = None  # (PubSub, worker thread) of that listener
+_listener: Any = None  # that listener's worker thread (its .pubsub is the subscription)
 _start_locks: dict[int, threading.Lock] = {}  # see _pid_lock
 _start_retry_at = float("-inf")  # time.monotonic() before which a failed start is not retried
 _untrackable_warned: dict[int, object] = {}  # PID -> marker: one WARNING per process
 
 
 def _listener_enabled() -> bool:
-    global _listener_flag
-    if _listener_flag is None:
-        from cachekit.config.singleton import get_settings
-
-        _listener_flag = get_settings().invalidation_listener_enabled
-    return _listener_flag
+    """CACHEKIT_INVALIDATION_LISTENER_ENABLED, from the settings the rest of cachekit reads."""
+    return get_settings().invalidation_listener_enabled
 
 
 def listener_start_due(backend: object) -> bool:
     """Whether this cache operation should start the process's listener. Never raises.
 
-    With the flag unset, the default, this reads one cached bool. With it set, it compares the
+    With the flag unset, the default, this reads one setting. With it set, it first checks that
+    the backend's class carries events: only a class that keeps a key registry and can clone a
+    listener pool does (PerRequestRedisBackend), and a function on any other backend gets the
+    one-time WARNING, whether or not another function's listener already runs. Then it compares the
     process id with the listener's owner, so a forked child starts its own listener instead of
     believing it has its parent's; the parent's socket is the parent's. A child forked without
     at-fork hooks (uWSGI without the options in _UWSGI_FORK_OPTIONS) runs no listener at all and
     this logs nothing there: a thread started in such a child can hang in Thread.start(), and a
     log call on a handler lock a parent thread held at fork hangs too. Its L1 heals by TTL.
-
-    Only a backend whose class keeps a key registry and can clone a listener pool carries events,
-    PerRequestRedisBackend; any other KeyTrackableBackend is told apart here, once, not by a start
-    failing every minute.
     """
     try:
-        if not _listener_enabled() or _listener_pid == os.getpid() or l1_cache._forked_without_hooks():
+        if not _listener_enabled():
             return False
         if not supports_key_tracking(backend) or not callable(getattr(type(backend), "listener_pool", None)):
-            _warn_untrackable(backend)
+            if not l1_cache._forked_without_hooks():
+                _warn_untrackable(backend)
+            return False
+        if _listener_pid == os.getpid() or l1_cache._forked_without_hooks():
             return False
         return time.monotonic() >= _start_retry_at
     except Exception as e:  # a listener must never fail a cache operation
@@ -267,31 +268,42 @@ def _warn_untrackable(backend: object) -> None:
 def start_listener(backend: Any) -> None:
     """Start this process's listener on ``backend``'s Redis, unless another thread is starting it.
 
-    Never raises and never waits for another thread. Sync; async callers run it through
-    asyncio.to_thread, as it connects and subscribes. A failed start (Redis unreachable) is a
-    WARNING, and a cache operation that reaches Redis retries it _START_RETRY_SECONDS later. Once
-    started, the listener is this process's until it exits, and its worker thread alone deals with
-    what Redis does next (_on_listener_error), a refused subscription included.
+    Never raises and never waits for another thread. It connects and subscribes, so it is sync, and
+    it returns once Redis has confirmed the SUBSCRIBE and answered a PING (_confirm_subscription):
+    a refusal fails the start instead of hiding in the worker, and a sync cache operation that
+    starts the listener reads L2 only after the subscription is in place. Nothing else waits for
+    the start: an async operation runs it in an executor thread without awaiting it, and another
+    thread's operation goes on while it is in progress. An event published before the subscription
+    is lost, and that L1 entry expires by its L1 TTL.
+
+    A failed start (Redis unreachable, an ACL that refuses the channel or PING, or no reply within
+    _CONFIRM_SECONDS) is a WARNING, and the next cache operation that reaches Redis after
+    _START_RETRY_SECONDS retries it; the window is checked again under the lock, so a thread that
+    raced the failure does not retry at once. Once started, the listener is this process's until it
+    exits, and its worker thread alone deals with what Redis does next (_on_listener_error).
     """
     global _listener, _listener_pid, _start_retry_at
     lock = _pid_lock(_start_locks)
     if not lock.acquire(blocking=False):
         return
     try:
-        if _listener_pid == os.getpid():
+        if _listener_pid == os.getpid() or time.monotonic() < _start_retry_at:
             return
         pubsub = None
         try:
             pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
             pubsub.subscribe(**{CHANNEL: _on_message})
+            _confirm_subscription(pubsub)
             thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
         except Exception as e:
             if pubsub is not None:
-                with contextlib.suppress(Exception):
+                try:
                     pubsub.close()
+                except Exception as close_error:
+                    logger.debug("Closing the failed listener's connection failed: %s", redact_error_for_log(close_error))
             _start_retry_at = time.monotonic() + _START_RETRY_SECONDS
             logger.warning(
-                "Invalidation listener failed to start; a cache operation retries in %d s: %s",
+                "Invalidation listener failed to start; the next cache operation that reaches Redis after %d s retries it: %s",
                 _START_RETRY_SECONDS,
                 redact_error_for_log(e),
             )
@@ -300,17 +312,39 @@ def start_listener(backend: Any) -> None:
         # Replaces a parent's listener in a forked child. Dropping that one does no I/O on the
         # parent's socket: redis-py shuts a connection's socket down only in the process that opened
         # it, and a PubSub reset sends no UNSUBSCRIBE.
-        _listener = (pubsub, thread)
+        _listener = thread
         _listener_pid = os.getpid()
     finally:
         lock.release()
     logger.info("Invalidation listener started: pid=%d channel=%s", os.getpid(), CHANNEL)
 
 
+def _confirm_subscription(pubsub: Any) -> None:
+    """Wait up to _CONFIRM_SECONDS, in all, for Redis to confirm the SUBSCRIBE and then answer a
+    PING. Raises on a refusal (NoPermissionError) and on no reply (TimeoutError).
+
+    redis-py only sends the SUBSCRIBE, so without this a refusal (an ACL without the channel, the
+    Redis 7 default for a new user) would surface later in the worker. The PING is the listener's
+    idle check: an ACL that allows SUBSCRIBE but not PING would otherwise pass here and fail ten
+    seconds later. An event that arrives before the PONG goes to its evictors, as in the worker.
+    """
+    deadline = time.monotonic() + _CONFIRM_SECONDS
+    for expected in ("subscribe", "pong"):
+        if expected == "pong":
+            pubsub.ping()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise redis.TimeoutError(f"Redis sent no {expected} reply in {_CONFIRM_SECONDS:g} s")
+            reply = pubsub.get_message(timeout=remaining)  # a refusal raises here (NoPermissionError)
+            if reply is not None and reply.get("type") == expected:
+                break
+
+
 def _on_message(message: dict[str, Any]) -> None:
-    """Handle one event in the listener thread. Never raises: a bad event is dropped and the
-    listener keeps running. Never logs the registry id or key: a forged event carries the sender's
-    text."""
+    """Handle one event, in the listener thread (or in the starting thread, before the PONG). Never
+    raises: a bad event is dropped and the listener keeps running. Never logs the registry id or
+    key: a forged event carries the sender's text."""
     try:
         registry_id, key = decode_event(message.get("data"))
         evictors = _evictors_for(registry_id)
@@ -320,18 +354,27 @@ def _on_message(message: dict[str, Any]) -> None:
         for evict in evictors:
             evict(key)
     except Exception as e:
-        logger.warning("Invalidation event dropped: %s", redact_error_for_log(e))
+        drops = _dropped_event_warn.claim()
+        if not drops:
+            logger.debug("Invalidation event dropped: %s", redact_error_for_log(e))
+            return
+        logger.warning(
+            "Invalidation event dropped (drops since the last warning: %d); the listener keeps running. Latest: %s",
+            drops,
+            redact_error_for_log(e),
+        )
 
 
 def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
     """Called by redis-py's worker thread instead of dying. Events published meanwhile are lost.
 
-    It never stops the thread or touches who owns the listener, so it cannot race the start that
-    records the thread, and the retry needs no cache operation: a process serving only L1 hits
-    recovers too. A connection error: the thread's next read reconnects, and the connection's
-    on_connect callback subscribes again, after a second's wait so a Redis that is down is not spun
-    on. A command Redis refused, a SUBSCRIBE an ACL denies above all (Redis 7 gives a new ACL user no
-    channels): redis-py sends the SUBSCRIBE again only on a reconnect, so the thread waits
+    It handles what goes wrong after a successful start; a refusal at start fails the start
+    instead (_confirm_subscription). It never stops the thread or touches who owns the listener, so
+    it cannot race the start that records the thread, and its retry needs no cache operation: a
+    process serving only L1 hits recovers too. A connection error: the thread's next read
+    reconnects, and the connection's on_connect callback subscribes again, after a second's wait so
+    a Redis that is down is not spun on. A command Redis refused, a SUBSCRIBE or PING an ACL change
+    now denies above all: redis-py sends the SUBSCRIBE again only on a reconnect, so the thread waits
     _RESUBSCRIBE_SECONDS and drops the connection, and its next read reconnects and subscribes again.
     A grant therefore takes effect within that wait, with no restart.
     """
@@ -353,9 +396,8 @@ def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
 def _stop_listener() -> None:
     """Stop and forget this process's listener (tests)."""
     global _listener, _listener_pid
-    listener, _listener, _listener_pid = _listener, None, None
-    if listener is not None:
-        _, thread = listener
+    thread, _listener, _listener_pid = _listener, None, None
+    if thread is not None:
         thread.stop()  # its loop closes the PubSub on its way out
         thread.join(timeout=5)
 

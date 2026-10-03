@@ -25,11 +25,12 @@ import msgpack
 import pytest
 import redis
 
-from cachekit import cache, invalidation, l1_cache
+from cachekit import cache, hash_utils, invalidation, l1_cache
 from cachekit.backends.redis.client import create_connection_pool
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 from cachekit.config import DecoratorConfig
 from cachekit.config.settings import CachekitConfig
+from cachekit.config.singleton import reset_settings
 from tests.unit.test_key_registry import PlainBackend, ScopedBackend, TrackingBackend, _closure_cell, _registry_ids, _tenant
 
 INVALIDATION_LOGGER = invalidation.__name__
@@ -38,13 +39,22 @@ LISTENER_THREAD = "cachekit-invalidation-listener"
 
 @pytest.fixture(autouse=True)
 def listener_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with the flag off, no listener and no retry pending, and leaves none behind."""
-    monkeypatch.setattr(invalidation, "_listener_flag", False)
+    """Each test starts with the flag unset, no listener, no retry pending and a fresh WARNING
+    window, and leaves no listener behind."""
+    monkeypatch.delenv("CACHEKIT_INVALIDATION_LISTENER_ENABLED", raising=False)
+    reset_settings()
     monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))
     monkeypatch.setattr(invalidation, "_untrackable_warned", {})
     monkeypatch.setattr(invalidation, "_start_locks", {})
+    monkeypatch.setattr(invalidation, "_dropped_event_warn", hash_utils.WarnThrottle())
     yield
     invalidation._stop_listener()
+
+
+def _listen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set CACHEKIT_INVALIDATION_LISTENER_ENABLED for this test, as an operator would."""
+    monkeypatch.setenv("CACHEKIT_INVALIDATION_LISTENER_ENABLED", "true")
+    reset_settings()
 
 
 def _listener_threads() -> list[threading.Thread]:
@@ -164,8 +174,27 @@ class TestOnMessage:
 
         assert called == []
         (record,) = caplog.records
-        assert record.levelno == logging.WARNING and record.getMessage().startswith("Invalidation event dropped: ")
+        assert record.levelno == logging.WARNING
+        assert record.getMessage().startswith("Invalidation event dropped (drops since the last warning: 1)")
         assert "SECRET" not in caplog.text and "aaaa" not in caplog.text
+
+    def test_bad_events_warn_once_a_window_with_the_count(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Whoever can publish on the channel decides how many bad events arrive: one WARNING a
+        window, the rest at DEBUG, and the next WARNING counts them all."""
+        with caplog.at_level(logging.DEBUG, logger=INVALIDATION_LOGGER):
+            for _ in range(5):
+                invalidation._on_message(_message(b"SECRET-garbage"))
+            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            invalidation._on_message(_message(b"SECRET-garbage"))
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        debugs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert len(warnings) == 2 and len(debugs) == 4
+        assert warnings[0].startswith("Invalidation event dropped (drops since the last warning: 1)")
+        assert warnings[1].startswith("Invalidation event dropped (drops since the last warning: 5)")  # none lost
+        assert all(m.startswith("Invalidation event dropped: ") for m in debugs)
+        assert "SECRET" not in caplog.text
 
     def test_registration_during_dispatch_drops_no_event(self, caplog: pytest.LogCaptureFixture) -> None:
         """A decoration landing mid-dispatch, here from inside an evictor, must not abort the event:
@@ -377,6 +406,18 @@ class TestListenerStart:
         monkeypatch.setenv("CACHEKIT_INVALIDATION_LISTENER_ENABLED", "true")
         assert CachekitConfig().invalidation_listener_enabled is True
 
+    def test_flag_follows_the_settings_after_a_reset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The flag is read from cachekit's settings on each check, with no copy of its own, so
+        reset_settings() reaches it."""
+        backend = _ListenerBackend()
+        assert invalidation.listener_start_due(backend) is False  # unset, the default
+        monkeypatch.setenv("CACHEKIT_INVALIDATION_LISTENER_ENABLED", "true")
+        reset_settings()
+        assert invalidation.listener_start_due(backend) is True
+        monkeypatch.setenv("CACHEKIT_INVALIDATION_LISTENER_ENABLED", "false")
+        reset_settings()
+        assert invalidation.listener_start_due(backend) is False
+
     def test_flag_unset_opens_no_thread_and_no_connection(self) -> None:
         backend = _ListenerBackend()
 
@@ -403,7 +444,7 @@ class TestListenerStart:
     def test_flag_on_with_a_backend_that_cannot_listen_warns_once(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        _listen(monkeypatch)
         first, second = PlainBackend(), PlainBackend()
 
         @cache(backend=first, ttl=60, namespace="start-plain-a")
@@ -422,10 +463,24 @@ class TestListenerStart:
         assert "PlainBackend does not carry invalidation events" in record.getMessage()
         assert invalidation._listener_pid is None and _listener_threads() == []
 
+    def test_a_running_listener_does_not_hide_the_warning_for_a_backend_that_cannot_listen(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Another function's listener already runs in this process: a function on a backend that
+        carries no events still gets the one-time WARNING."""
+        _listen(monkeypatch)
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            assert invalidation.listener_start_due(_ListenerBackend()) is False  # already listening
+            assert invalidation.listener_start_due(PlainBackend()) is False
+            assert invalidation.listener_start_due(PlainBackend()) is False
+        (record,) = caplog.records
+        assert "PlainBackend does not carry invalidation events" in record.getMessage()
+
     def test_failed_start_warns_and_waits_before_retrying(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        _listen(monkeypatch)
         backend = _ListenerBackend(pool_error=redis.ConnectionError("Error 111 connecting to secret-host:6379"))
 
         @cache(backend=backend, ttl=60, namespace="start-fail")
@@ -437,7 +492,10 @@ class TestListenerStart:
                 assert f(x) == x  # the cache operation itself is unaffected
         assert len(backend.pool_threads) == 1  # retried no sooner than _START_RETRY_SECONDS
         (record,) = caplog.records
-        assert "failed to start" in record.getMessage() and "ConnectionError" in record.getMessage()
+        assert record.getMessage() == (
+            "Invalidation listener failed to start; the next cache operation that reaches Redis after 60 s retries it: "
+            "ConnectionError"
+        )
         assert "secret-host" not in caplog.text
 
         monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))  # the retry window passed
@@ -459,10 +517,18 @@ class TestListenerStart:
             starter.join(5)
         assert backend.pool_threads == []
 
+    def test_start_that_raced_a_failed_one_waits_out_the_retry_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A thread that passed listener_start_due just before another thread's start failed finds
+        the retry window under the lock, so it does not retry at once."""
+        backend = _ListenerBackend()
+        monkeypatch.setattr(invalidation, "_start_retry_at", time.monotonic() + 60)  # the other start just failed
+        invalidation.start_listener(backend)
+        assert backend.pool_threads == []
+
     async def test_async_start_runs_off_the_loop_and_the_call_does_not_wait_for_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        _listen(monkeypatch)
         backend = _ListenerBackend(pool_error=redis.ConnectionError("down"))
         connecting = threading.Event()
         real_pool = backend.listener_pool
@@ -491,7 +557,7 @@ class TestListenerStart:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A KeyTrackableBackend other than the tenant-scoped Redis backend has no listener pool."""
-        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        _listen(monkeypatch)
         backend = TrackingBackend()
 
         @cache(backend=backend, ttl=60, namespace="start-tracking-no-pool")
@@ -508,9 +574,10 @@ class TestListenerStart:
     def test_child_forked_without_hooks_starts_nothing_and_logs_nothing(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setattr(invalidation, "_listener_flag", True)
+        _listen(monkeypatch)
         monkeypatch.setattr(l1_cache, "_import_pid", -1)  # a fork made from C: no at-fork hook ran here
         monkeypatch.setattr(l1_cache, "_hooked_pid", None)
+        monkeypatch.setattr(invalidation, "_listener_pid", os.getppid())  # the parent's listener, inherited
         listening, plain = _ListenerBackend(), PlainBackend()
 
         with caplog.at_level(logging.DEBUG, logger=INVALIDATION_LOGGER):
@@ -537,6 +604,7 @@ class TestListenerStart:
 
 class _FakeWorker:
     def __init__(self) -> None:
+        self.started = False
         self.stopped = False
 
     def stop(self) -> None:
@@ -554,24 +622,163 @@ class _FakeConnection:
         self.disconnects += 1
 
 
-class _FakePubSub:
-    """A PubSub whose worker hits ``error`` before run_in_thread() returns, the earliest it can."""
+# What redis-py's get_message() returns for Redis's reply to SUBSCRIBE and to a PING.
+_SUBSCRIBED = {"type": "subscribe", "pattern": None, "channel": invalidation.CHANNEL.encode(), "data": 1}
+_PONG = {"type": "pong", "pattern": None, "channel": None, "data": b""}
 
-    def __init__(self, error: Optional[BaseException] = None) -> None:
-        self.connection = _FakeConnection()
+
+class _FakePubSub:
+    """A PubSub talking to a scripted Redis. get_message() takes the next item of ``inbox``: a
+    reply is returned, an exception (a refusal) raised, and a message handed to its channel's
+    handler, as redis-py does. ping() adds ``pong`` to the inbox, or nothing if it is None. With
+    the inbox empty, a read waits out its timeout. The worker hits ``error`` before run_in_thread()
+    returns, the earliest it can."""
+
+    def __init__(self, inbox: Optional[list[Any]] = None, pong: Any = _PONG, error: Optional[BaseException] = None) -> None:
+        self.inbox = [_SUBSCRIBED] if inbox is None else list(inbox)
+        self.pong = pong
         self.error = error
+        self.connection = _FakeConnection()
         self.worker = _FakeWorker()
+        self.handlers: dict[str, Any] = {}
+        self.timeouts: list[float] = []
+        self.closed = False
 
     def subscribe(self, **handlers: Any) -> None:
-        pass
+        self.handlers.update(handlers)
+
+    def ping(self) -> None:
+        if self.pong is not None:
+            self.inbox.append(self.pong)
+
+    def get_message(self, timeout: float) -> Optional[dict[str, Any]]:
+        self.timeouts.append(timeout)
+        if not self.inbox:
+            time.sleep(timeout)
+            return None
+        reply = self.inbox.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        if reply["type"] == "message":
+            self.handlers[invalidation.CHANNEL](reply)
+            return None
+        return reply
 
     def run_in_thread(self, sleep_time: float, daemon: bool, exception_handler: Any) -> _FakeWorker:
+        self.worker.started = True
         if self.error is not None:
             exception_handler(self.error, self, self.worker)
         return self.worker
 
     def close(self) -> None:
-        pass
+        self.closed = True
+
+
+def _serve(monkeypatch: pytest.MonkeyPatch, pubsub: _FakePubSub) -> None:
+    """Make the listener's redis.Redis(connection_pool=...).pubsub() return ``pubsub``."""
+    monkeypatch.setattr(invalidation.redis, "Redis", lambda connection_pool: types.SimpleNamespace(pubsub=lambda: pubsub))
+
+
+_POOL_ONLY = types.SimpleNamespace(listener_pool=lambda: None)  # a backend for start_listener with _serve
+
+
+@pytest.mark.unit
+class TestListenerConfirm:
+    """A start waits for Redis to confirm the SUBSCRIBE and answer a PING; a refusal or silence fails it."""
+
+    @pytest.mark.parametrize(
+        ("inbox", "pong", "error"),
+        [
+            pytest.param(
+                [redis.exceptions.NoPermissionError("NOPERM no channel")], _PONG, "NoPermissionError", id="subscribe-refused"
+            ),
+            pytest.param(
+                [_SUBSCRIBED], redis.exceptions.NoPermissionError("NOPERM no ping"), "NoPermissionError", id="ping-refused"
+            ),
+            pytest.param([], _PONG, "TimeoutError", id="no-subscribe-reply"),
+            pytest.param([_SUBSCRIBED], None, "TimeoutError", id="no-pong"),
+        ],
+    )
+    def test_a_start_redis_does_not_confirm_fails_and_waits_for_a_later_cache_operation(
+        self, inbox: list[Any], pong: Any, error: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(invalidation, "_CONFIRM_SECONDS", 0.2)
+        pubsub = _FakePubSub(inbox, pong)
+        _serve(monkeypatch, pubsub)
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation.start_listener(_POOL_ONLY)
+        assert invalidation._listener is None and invalidation._listener_pid is None
+        assert invalidation._start_retry_at > time.monotonic() + 50  # the next cache operation after the window retries
+        assert pubsub.closed and not pubsub.worker.started
+        (record,) = caplog.records
+        assert record.getMessage().startswith("Invalidation listener failed to start")
+        assert record.getMessage().endswith(f": {error}") and "NOPERM" not in caplog.text
+
+    def test_one_window_covers_both_replies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The PING gets what the SUBSCRIBE's reply left of _CONFIRM_SECONDS, not a window of its own."""
+        monkeypatch.setattr(invalidation, "_CONFIRM_SECONDS", 1.0)
+        pubsub = _FakePubSub()
+        read = pubsub.get_message
+
+        def late_subscribe_reply(timeout: float) -> Optional[dict[str, Any]]:
+            if not pubsub.timeouts:
+                time.sleep(0.3)
+            return read(timeout)
+
+        pubsub.get_message = late_subscribe_reply  # type: ignore[method-assign]
+        _serve(monkeypatch, pubsub)
+        invalidation.start_listener(_POOL_ONLY)
+        assert invalidation._listener is pubsub.worker
+        subscribe_wait, pong_wait = pubsub.timeouts
+        assert subscribe_wait > 0.9 and pong_wait < 0.75
+
+    def test_an_event_published_during_the_confirmation_reaches_its_evictors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        got: list[tuple[Optional[str], threading.Thread]] = []
+
+        def evict(key: Optional[str]) -> None:
+            got.append((key, threading.current_thread()))
+
+        invalidation.register("ck:reg:t:confirm", evict)
+        event = _message(invalidation.encode_event("ck:reg:t:confirm", "k1"))
+        pubsub = _FakePubSub([_SUBSCRIBED, event])  # after the SUBSCRIBE's reply, before the PONG
+        _serve(monkeypatch, pubsub)
+        invalidation.start_listener(_POOL_ONLY)
+        assert got == [("k1", threading.current_thread())]  # dispatched by the start itself
+        assert invalidation._listener is pubsub.worker and invalidation._listener_pid == os.getpid()
+
+    def test_a_sync_operation_that_starts_the_listener_reads_l2_after_the_confirmation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+
+        class Backend(TrackingBackend):
+            def listener_pool(self) -> Any:
+                return None  # _serve's redis.Redis ignores it
+
+            def get(self, key: str) -> Optional[bytes]:
+                order.append("l2-read")
+                return super().get(key)
+
+        pubsub = _FakePubSub()
+        read = pubsub.get_message
+
+        def recorded(timeout: float) -> Optional[dict[str, Any]]:
+            reply = read(timeout)
+            if reply is not None:
+                order.append(reply["type"])
+            return reply
+
+        pubsub.get_message = recorded  # type: ignore[method-assign]
+        _serve(monkeypatch, pubsub)
+        _listen(monkeypatch)
+
+        @cache(backend=Backend(), ttl=60, namespace="confirm-sync")
+        def f(x: int) -> int:
+            return x
+
+        assert f(1) == 1
+        assert order == ["subscribe", "pong", "l2-read"]
+        assert invalidation._listener is pubsub.worker
 
 
 @pytest.mark.unit
@@ -582,42 +789,40 @@ class TestListenerErrors:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         pubsub, slept = _FakePubSub(), []
-        listener = (pubsub, pubsub.worker)
-        monkeypatch.setattr(invalidation, "_listener", listener)
+        monkeypatch.setattr(invalidation, "_listener", pubsub.worker)
         monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
         monkeypatch.setattr(invalidation.time, "sleep", slept.append)
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._on_listener_error(redis.exceptions.NoPermissionError("NOPERM no channel"), pubsub, pubsub.worker)
         assert slept == [invalidation._RESUBSCRIBE_SECONDS] and pubsub.connection.disconnects == 1
         assert not pubsub.worker.stopped  # the thread's next read reconnects, and on_connect subscribes again
-        assert invalidation._listener is listener and invalidation._listener_pid == os.getpid()
+        assert invalidation._listener is pubsub.worker and invalidation._listener_pid == os.getpid()
         assert "Invalidation listener refused by Redis" in caplog.text and "NOPERM" not in caplog.text
 
     def test_a_connection_error_waits_a_second_and_keeps_the_connection_to_redis_py(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         pubsub, slept = _FakePubSub(), []
-        listener = (pubsub, pubsub.worker)
-        monkeypatch.setattr(invalidation, "_listener", listener)
+        monkeypatch.setattr(invalidation, "_listener", pubsub.worker)
         monkeypatch.setattr(invalidation, "_listener_pid", os.getpid())
         monkeypatch.setattr(invalidation.time, "sleep", slept.append)
         invalidation._on_listener_error(redis.ConnectionError("lost"), pubsub, pubsub.worker)
         assert slept == [1.0] and pubsub.connection.disconnects == 0 and not pubsub.worker.stopped
-        assert invalidation._listener is listener and invalidation._listener_pid == os.getpid()
+        assert invalidation._listener is pubsub.worker and invalidation._listener_pid == os.getpid()
 
     def test_a_refusal_before_the_start_records_the_thread_leaves_a_listener_that_retries(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The worker can fail before run_in_thread() returns. Its handler changes no ownership, so
-        the start still records a live thread, and that thread keeps subscribing again."""
+        """The worker can fail before run_in_thread() returns, here on an ACL change just after the
+        start confirmed the subscription. Its handler changes no ownership, so the start still
+        records a live thread, and that thread keeps subscribing again."""
         pubsub = _FakePubSub(error=redis.exceptions.NoPermissionError("NOPERM"))
-        monkeypatch.setattr(invalidation.redis, "Redis", lambda connection_pool: types.SimpleNamespace(pubsub=lambda: pubsub))
+        _serve(monkeypatch, pubsub)
         monkeypatch.setattr(invalidation.time, "sleep", lambda seconds: None)
-        backend = types.SimpleNamespace(listener_pool=lambda: None)
 
-        invalidation.start_listener(backend)
+        invalidation.start_listener(_POOL_ONLY)
 
-        assert invalidation._listener == (pubsub, pubsub.worker) and invalidation._listener_pid == os.getpid()
+        assert invalidation._listener is pubsub.worker and invalidation._listener_pid == os.getpid()
         assert not pubsub.worker.stopped and pubsub.connection.disconnects == 1
 
 
