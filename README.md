@@ -243,6 +243,7 @@ def test_cached_function():
 
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity (+28% throughput)
+- CachekitIO keeps an idle connection for up to 390 s, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
 - Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/2736a81f2f853cf08c5563c0fe7c8361331fa3ad/test-vectors/decode-bounds.json) vectors
