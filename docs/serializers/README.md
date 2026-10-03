@@ -174,8 +174,11 @@ def get_data():
 > `await fn.ainvalidate_cache()` deletes both. So flush on
 > the backend: on Redis, run the `scan_iter` + `unlink` script under *Option 3: Data
 > corruption* in [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch)
-> once per namespace or function (no single `SCAN` pattern both carries the default
-> backend's `t:<tenant>:` key prefix and stops at the namespace boundary). The script does
+> once per tenant and per namespace or function (no single `SCAN` pattern both carries the
+> default backend's `t:<tenant>:` key prefix and stops at the namespace boundary). A run
+> reaches only the tenant in its `prefix`, and its `0 generated keys left` speaks for that
+> tenant alone: if you set `tenant_context`, repeat it for every tenant with keys (the
+> script says how to list them). The script does
 > not delete shortened keys (a namespace plus function name past about 170 characters):
 > when it prints `shortened keys may belong here`, the namespace is not yet erased. Evict
 > them with `invalidate_cache(<args>)`; if you do not know the arguments, delete the keys

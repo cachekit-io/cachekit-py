@@ -212,6 +212,9 @@ r = redis.Redis.from_url("redis://localhost:6379/0")
 
 # The Redis backend stores keys under t:<tenant>: with <tenant> "default" unless
 # you set one, percent-encoded (an int or UUID tenant as its str() first).
+# One run reaches one tenant. If you set tenant_context, run it for every tenant
+# with keys: each key from r.scan_iter(match="t:*") names one between its first
+# two colons, already encoded, so set prefix = "t:" + that + ":" without quote().
 # A RedisBackend you pass as backend= adds no prefix: set prefix = "".
 prefix = "t:" + quote("default", safe="") + ":"
 # The namespace exactly as passed to @cache(namespace=...), or None (or "") for none.
