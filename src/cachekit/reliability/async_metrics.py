@@ -208,11 +208,15 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
+def _get_shared_metric(
+    name: str, metric_class: type, description: str, labels: list[str], buckets: tuple[float, ...] | None = None
+) -> Any:
     """Get or create the process-wide metric instance for ``name``.
 
     Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
-    creating a collector. ``kwargs`` (such as ``buckets``) reach ``metric_class`` only on first creation.
+    creating a collector. ``buckets`` reach a ``Histogram`` only on first creation. It is a named
+    parameter, not ``**kwargs``: every recorded cache operation calls this up to three times, and
+    forwarding ``**kwargs`` cost about 2,500 instructions per call (LAB-7801).
 
     Raises:
         ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
@@ -225,7 +229,8 @@ def _get_shared_metric(name: str, metric_class: type, description: str, labels: 
             metric = _metrics_cache.get(name)
             if metric is None:
                 try:
-                    metric = metric_class(name, description, labels, **kwargs)
+                    extra = {} if buckets is None else {"buckets": buckets}
+                    metric = metric_class(name, description, labels, **extra)
                 except ValueError as e:
                     if "Duplicated timeseries" not in str(e):
                         raise
@@ -661,12 +666,12 @@ class AsyncMetricsCollector:
                         f"Failed to update histogram {name} ({failures} observations): {redact_error_for_log(last_error)}"
                     )
 
-    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
+    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
         """Get or create the process-wide metric instance for ``name`` (see ``_get_shared_metric``)."""
-        return _get_shared_metric(name, metric_class, description, labels, **kwargs)
+        return _get_shared_metric(name, metric_class, description, labels)
 
     def _duration_histogram(self) -> Any:
-        return self._get_metric(
+        return _get_shared_metric(
             "cache_operation_duration_ms",
             Histogram,
             "Cache operation duration",
@@ -675,7 +680,7 @@ class AsyncMetricsCollector:
         )
 
     def _size_histogram(self) -> Any:
-        return self._get_metric(
+        return _get_shared_metric(
             "cache_operation_size_bytes",
             Histogram,
             "Cache operation size",
