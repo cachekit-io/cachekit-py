@@ -64,6 +64,38 @@ STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 
+# A write the server sheds with 503 + a short Retry-After (request deadline, a retryable store
+# fault) is sent once more, inline, after exactly that delay (LAB-7686). PUT and DELETE are
+# idempotent, so a duplicate is harmless. A longer hint (the rate-limiter fault sends 10 s) is
+# honoured by not retrying, rather than by retrying early.
+_RETRY_METHODS = frozenset({"PUT", "DELETE"})
+_MAX_RETRY_AFTER_S = 2
+
+
+def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
+    """Seconds to wait before the one retry of a shed write, or None for no retry.
+
+    Only the delta-seconds form of ``Retry-After`` is read; an HTTP-date, a fraction or a
+    missing header means no retry.
+
+    Examples:
+        >>> req = httpx.Request("PUT", "https://api.cachekit.io/v1/cache/k")
+        >>> _write_retry_delay("PUT", httpx.Response(503, headers={"Retry-After": "1"}, request=req))
+        1
+        >>> _write_retry_delay("PUT", httpx.Response(503, headers={"Retry-After": "10"}, request=req)) is None
+        True
+        >>> _write_retry_delay("PATCH", httpx.Response(503, headers={"Retry-After": "1"}, request=req)) is None
+        True
+    """
+    if method not in _RETRY_METHODS or response.status_code != 503:
+        return None
+    value = response.headers.get("Retry-After", "").strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    delay = int(value)
+    return delay if delay <= _MAX_RETRY_AFTER_S else None
+
+
 # Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
 _RESERVED_KEY_SEGMENTS = frozenset({"", ".", "..", "health", "ttl", "lock"})
 
@@ -353,6 +385,9 @@ class CachekitIOBackend:
             BackendError: Classified error for circuit breaker
 
         Notes:
+            A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once
+            more after exactly that delay (see ``_write_retry_delay``); nothing else retries.
+
             Automatically injects cache metrics headers (L1/L2 hits, session ID) when
             called from within a @cache decorated function. If no stats available in
             context, headers are not injected (backward compatible).
@@ -371,6 +406,10 @@ class CachekitIOBackend:
         lease = self._own_sync_lease()
         try:
             response = lease.client.request(method, url, **kwargs)
+            if (delay := _write_retry_delay(method, response)) is not None:
+                _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
+                time.sleep(delay)
+                response = lease.client.request(method, url, **kwargs)
             if miss_on_404 and response.status_code == 404:
                 return response
             response.raise_for_status()
@@ -412,6 +451,9 @@ class CachekitIOBackend:
             BackendError: Classified error for circuit breaker
 
         Notes:
+            A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once
+            more after exactly that delay (see ``_write_retry_delay``); nothing else retries.
+
             Automatically injects cache metrics headers (L1/L2 hits, session ID) when
             called from within a @cache decorated function. If no stats available in
             context, headers are not injected (backward compatible).
@@ -428,6 +470,10 @@ class CachekitIOBackend:
         url = f"/v1/cache/{endpoint}"
         try:
             response = await self._own_async_lease().client.request(method, url, **kwargs)
+            if (delay := _write_retry_delay(method, response)) is not None:
+                _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
+                await asyncio.sleep(delay)
+                response = await self._own_async_lease().client.request(method, url, **kwargs)
             if miss_on_404 and response.status_code == 404:
                 return response
             response.raise_for_status()

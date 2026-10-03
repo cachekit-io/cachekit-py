@@ -605,7 +605,7 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises, for sync or async functions: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. "Uncached" in this section means the value is not served from the cache: a failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises, for sync or async functions: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached. One case is retried first: a write or delete (a `PUT` or `DELETE`, the lock release included) that the server answers `503` with a `Retry-After` of 2 seconds or less is sent once more, inline, after exactly that delay; see [Server error (5xx)](#server-error-5xx). Nothing else is retried. "Uncached" in this section means the value is not served from the cache: a failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
 
 On a miss, an async function first requests the per-key lock (see [Distributed Locking](features/distributed-locking.md)). Any HTTP failure of that request ends the lock wait at once: the function runs without the lock, and cachekit logs `Lock operation failed … executing without lock`. Only a lock another caller holds is waited on.
 
@@ -677,6 +677,8 @@ def get_data():
 **Cause**: Transient server-side error at the CachekitIO API
 
 **Behavior**: TRANSIENT — logged, and the call runs uncached.
+
+**One retry for a shed write**: the server answers `503` with a `Retry-After` header when it sheds a request for a short, transient reason. When that answer is to a cache write or delete and `Retry-After` is a whole number of seconds no greater than 2, cachekit waits exactly that long and sends the request once more, inside the same call; only if the second attempt also fails is the error logged. A longer `Retry-After`, a missing or non-numeric one, any other 5xx, a read, the lock request and a TTL refresh are not retried. The wait adds at most 2 seconds to that call.
 
 **What happens while server errors persist**:
 ```python notest
@@ -762,7 +764,7 @@ echo $CACHEKIT_API_URL
 | `ConnectError`, `NetworkError` | `TRANSIENT` |
 | Other | `UNKNOWN` |
 
-For sync functions no type is retried, and none counts toward the circuit breaker. Async functions retry none either: a failed lock request ends the lock wait, as the note at the top of this section says.
+No type counts toward the circuit breaker. Only a `503` to a write or delete with a `Retry-After` of 2 seconds or less is retried, once, for sync and async functions alike (see [Server error (5xx)](#server-error-5xx)). A failed lock request is not retried: it ends the lock wait, as the note at the top of this section says.
 
 ---
 
