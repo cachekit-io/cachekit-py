@@ -567,6 +567,7 @@ class L1CacheManager:
     def _spawn_cleanup_thread(self, interval_seconds: float) -> None:
         def cleanup_worker():
             logger.info("L1 cache background cleanup started (interval: %.1fs)", interval_seconds)
+            _release_inherited_states()  # a forked child's, the first time its L1 is used
 
             while not self._stop_cleanup.wait(interval_seconds):
                 try:
@@ -633,8 +634,8 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 _import_pid = os.getpid()
 _hooked_pid: Optional[int] = None
 
-# The L1 states a forked child inherited, kept referenced so their pages stay shared with the parent
-# (see _empty_caches_after_fork). Never read.
+# The L1 states a forked child inherited, kept until the child's cleanup thread frees them
+# (_empty_caches_after_fork, _release_inherited_states). Never read.
 _inherited_states: list[_L1State] = []
 
 
@@ -658,10 +659,11 @@ def _empty_caches_after_fork() -> None:
     this takes no lock, starts no thread and logs nothing. Starting the cleanup thread stays with
     _take_over_if_forked, outside the hook.
 
-    The parent's states are kept, not freed: freeing them would write to every entry's memory, so
-    each child would copy most of the parent's L1 pages as it forked, a cost close to the size of a
-    warm L1 per child, paid again by every subprocess started with a preexec_fn. Kept, the pages stay
-    shared with the parent.
+    The parent's states are not freed here: freeing them writes to every entry's memory, so each
+    child would copy most of the parent's L1 pages inside fork(), a cost close to the size of a warm
+    L1, and so would every subprocess started with a preexec_fn, which never uses its L1. They are
+    kept in _inherited_states until the child's cleanup thread starts, on the child's first put,
+    and frees them (_release_inherited_states).
     """
     global _hooked_pid
     for manager in list(_managers):
@@ -669,6 +671,32 @@ def _empty_caches_after_fork() -> None:
             _inherited_states.append(cache._state)
             cache._state = _L1State()
     _hooked_pid = os.getpid()  # last: a hook cut short leaves the child hookless, so the take-over still resets
+
+
+def _release_inherited_states() -> None:
+    """Free the L1 states this process inherited at fork. Called by the cleanup thread when it starts.
+
+    Kept, they would not stay shared with the parent: once the parent rewrites those pages (its own
+    sweep, an eviction, an invalidation), copy-on-write leaves this child a private copy nothing can
+    reach, next to its own L1, for life. Freed, the memory is the child's to reuse for its own L1.
+    Off the request path, in batches of _INVALIDATE_BATCH entries with the GIL given up between
+    them, so the child's other threads keep running. A state whose lock is taken, by a thread that
+    forked inside its critical section and still runs there, is only dropped from the list: that
+    thread finishes on it, and it is freed with that thread's last reference. A child that never
+    starts a cleanup thread (its parent's manager had none) keeps them.
+    """
+    while _inherited_states:
+        state = _inherited_states[-1]
+        if state.lock.acquire(blocking=False):
+            try:
+                while state.cache:
+                    for _ in range(min(_INVALIDATE_BATCH, len(state.cache))):
+                        state.cache.popitem()
+                    time.sleep(0)
+                state.memory_bytes = 0
+            finally:
+                state.lock.release()
+        _inherited_states.pop()  # only once drained: an empty list means every inherited entry is freed
 
 
 if hasattr(os, "register_at_fork"):
