@@ -832,7 +832,7 @@ class TestRevalidationFailureWarnings:
                 # The recompute raises without awaiting, so its log line and slot release land
                 # in the same task step as the count: the next stale hit revalidates again.
                 assert await _await_for(lambda attempt=attempt: calls["n"] == attempt + 1)
-            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert await compute() == 1
             assert await _await_for(lambda: calls["n"] == n + 2)
         warnings = _warnings(caplog, "SWR revalidation failed")
@@ -868,9 +868,9 @@ class TestRevalidationFailureWarnings:
         """A child does not inherit a held throttle lock, nor the parent's window and count."""
         import multiprocessing
 
-        from cachekit.hash_utils import WarnThrottle
+        from cachekit.hash_utils import _WarnThrottle
 
-        throttle = WarnThrottle()
+        throttle = _WarnThrottle()
         assert throttle.claim() == 1  # the parent's window opens
         assert throttle.claim() == 0  # counted into the parent's next WARNING
 

@@ -34,7 +34,7 @@ import redis
 from cachekit import l1_cache
 from cachekit.cache_handler import supports_key_tracking
 from cachekit.config.singleton import get_settings
-from cachekit.hash_utils import WarnThrottle, redact_cache_key, redact_error_for_log
+from cachekit.hash_utils import _WarnThrottle, redact_cache_key, redact_error_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +62,10 @@ Evictor = Callable[[Optional[str]], None]
 # One WARNING a minute per kind, process-wide, with the count since the last one; DEBUG between.
 # An ACL without the channel (the Redis 7 default for a new user) fails every PUBLISH, so a
 # WARNING per invalidation would be a flood.
-_publish_failed_warn = WarnThrottle()
-_too_long_warn = WarnThrottle()
+_publish_failed_warn = _WarnThrottle()
+_too_long_warn = _WarnThrottle()
 # A forged or foreign publisher controls how many bad events arrive: one WARNING a minute here too.
-_dropped_event_warn = WarnThrottle()
+_dropped_event_warn = _WarnThrottle()
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -140,7 +140,7 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
     One ``PUBLISH`` on the backend's shared client, outside its error classification and the
     reliability stack, so a pub/sub failure cannot count against the circuit breaker. It waits for
     Redis's reply, never for delivery. A failure leaves the invalidation standing, and peers that
-    missed the event keep their L1 copies until the L1 TTL; it is logged by a WarnThrottle. A
+    missed the event keep their L1 copies until the L1 TTL; it is logged by a _WarnThrottle. A
     key-tracking backend with no Redis client (any but the tenant-scoped Redis backend) carries no
     channel, so nothing is announced for it.
 

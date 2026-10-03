@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
-from cachekit.hash_utils import WarnThrottle, redact_error_for_log
+from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
 
 from .. import invalidation
 from ..backends.errors import BackendError, UnsupportedTenantError
@@ -873,7 +873,7 @@ def create_cache_wrapper(
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
         _cached_keys, and this process's next drain by the same tenant deletes it from there.
         Other processes' drains cannot see it, so the failure is a WARNING — throttled to one per
-        WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
+        _WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
         if not _is_trackable():
             return
@@ -1013,7 +1013,7 @@ def create_cache_wrapper(
             # letting the caller demote this hit into a recompute.
             logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
-    def _warn_refresh(throttle: WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
+    def _warn_refresh(throttle: _WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
         """Log a background refresh that failed or never ran: a throttled WARNING, DEBUG between.
 
         The caller was already served the cached value and must never see the failure (spec:
@@ -1251,10 +1251,10 @@ def create_cache_wrapper(
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
     # Background-failure WARNING throttles, one per kind, so a frequent kind never hides a rarer one.
-    _track_warn = WarnThrottle()  # key tracking failed
-    _refresh_failed_warn = WarnThrottle()  # a background refresh raised
-    _refresh_skipped_warn = WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
-    _refresh_unstarted_warn = WarnThrottle()  # the refresh thread or task could not be started
+    _track_warn = _WarnThrottle()  # key tracking failed
+    _refresh_failed_warn = _WarnThrottle()  # a background refresh raised
+    _refresh_skipped_warn = _WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
+    _refresh_unstarted_warn = _WarnThrottle()  # the refresh thread or task could not be started
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.

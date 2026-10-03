@@ -4,7 +4,7 @@ Runs two digests for two jobs: BLAKE3 for cache-key hashing, blake2b for the
 log-redaction correlation id below.
 
 This is also the leaf home for the log-redaction policy — ``redact_cache_key``,
-``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532) — and for ``WarnThrottle``,
+``redact_key_for_log`` and ``redact_error_for_log`` (CWE-532) — and for ``_WarnThrottle``,
 which bounds how often a background failure is logged. They live here, not in
 ``cache_handler`` or ``backends.errors``, so backend/L1 modules, the decorator and the
 invalidation channel share one policy without an import cycle (``backends.errors`` imports
@@ -25,18 +25,18 @@ import blake3
 # be announced); failures in between log at DEBUG and are counted into the next WARNING. A
 # registry outage fails every L2 write and a failing upstream every refresh, so one WARNING
 # each would be a log flood.
-WARN_INTERVAL_SECONDS = 60.0
+_WARN_INTERVAL_SECONDS = 60.0
 
 
-class WarnThrottle:
-    """One WARNING per WARN_INTERVAL_SECONDS for one kind of failure; claim() counts the rest.
+class _WarnThrottle:
+    """One WARNING per _WARN_INTERVAL_SECONDS for one kind of failure; claim() counts the rest.
 
     Fork-safe by the owner-PID idiom: a forked child's first claim replaces the lock, which a
     parent thread that did not survive the fork may hold, and drops the parent's count. Sibling
     threads racing that swap cost at worst one extra WARNING, once per fork.
 
     Examples:
-        >>> throttle = WarnThrottle()
+        >>> throttle = _WarnThrottle()
         >>> throttle.claim(), throttle.claim(), throttle.claim()  # WARNING, DEBUG, DEBUG
         (1, 0, 0)
     """
@@ -63,7 +63,7 @@ class WarnThrottle:
         with self._lock:
             self._count += 1
             now = time.monotonic()
-            if now - self._warned_at < WARN_INTERVAL_SECONDS:
+            if now - self._warned_at < _WARN_INTERVAL_SECONDS:
                 return 0
             count, self._count, self._warned_at = self._count, 0, now
             return count

@@ -27,8 +27,8 @@ WRAPPER_LOGGER = "cachekit.decorators.wrapper"
 @pytest.fixture(autouse=True)
 def fresh_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test opens its own WARNING windows: the throttles are process-wide."""
-    monkeypatch.setattr(invalidation, "_publish_failed_warn", hash_utils.WarnThrottle())
-    monkeypatch.setattr(invalidation, "_too_long_warn", hash_utils.WarnThrottle())
+    monkeypatch.setattr(invalidation, "_publish_failed_warn", hash_utils._WarnThrottle())
+    monkeypatch.setattr(invalidation, "_too_long_warn", hash_utils._WarnThrottle())
 
 
 def _events(backend: TrackingBackend) -> list[dict[str, str]]:
@@ -356,7 +356,7 @@ class TestPublishNeverFailsTheInvalidation:
             for x in range(50):
                 f(x)
                 f.invalidate_cache(x)
-            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             f.invalidate_cache(0)
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "announcement failed" in r.getMessage()]

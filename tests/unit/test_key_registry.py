@@ -294,7 +294,7 @@ class TestTrackingSites:
         with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
             for i in range(50):
                 assert f(i) == i
-            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             assert f(50) == 50
         warnings = [r.getMessage() for r in caplog.records if "Key tracking failed" in r.getMessage()]
         # A registry outage is one WARNING per window, not one per write, and none is lost from the count.

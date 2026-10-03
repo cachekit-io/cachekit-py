@@ -25,7 +25,7 @@ from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import provider as provider_module
 from cachekit.backends.redis.provider import PerRequestRedisBackend
 from cachekit.config.singleton import reset_settings
-from cachekit.hash_utils import WarnThrottle
+from cachekit.hash_utils import _WarnThrottle
 from cachekit.l1_cache import L1Cache, get_l1_cache
 from tests.integration import _key_registry_worker as worker
 from tests.unit.test_l1_memory_bounds import _child_outcome, _report
@@ -41,8 +41,8 @@ def client(redis_test_client: redis.Redis) -> redis.Redis:
 @pytest.fixture(autouse=True)
 def fresh_throttles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test opens its own WARNING windows: the throttles are process-wide."""
-    monkeypatch.setattr(invalidation, "_publish_failed_warn", WarnThrottle())
-    monkeypatch.setattr(invalidation, "_dropped_event_warn", WarnThrottle())
+    monkeypatch.setattr(invalidation, "_publish_failed_warn", _WarnThrottle())
+    monkeypatch.setattr(invalidation, "_dropped_event_warn", _WarnThrottle())
 
 
 @pytest.fixture

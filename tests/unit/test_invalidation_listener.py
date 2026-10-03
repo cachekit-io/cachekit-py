@@ -46,7 +46,7 @@ def listener_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(invalidation, "_start_retry_at", float("-inf"))
     monkeypatch.setattr(invalidation, "_untrackable_warned", {})
     monkeypatch.setattr(invalidation, "_start_locks", {})
-    monkeypatch.setattr(invalidation, "_dropped_event_warn", hash_utils.WarnThrottle())
+    monkeypatch.setattr(invalidation, "_dropped_event_warn", hash_utils._WarnThrottle())
     yield
     invalidation._stop_listener()
 
@@ -219,7 +219,7 @@ class TestOnMessage:
         with caplog.at_level(logging.DEBUG, logger=INVALIDATION_LOGGER):
             for _ in range(5):
                 invalidation._on_message(_message(b"SECRET-garbage"))
-            monkeypatch.setattr(hash_utils, "WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
+            monkeypatch.setattr(hash_utils, "_WARN_INTERVAL_SECONDS", 0.0)  # the window elapses
             invalidation._on_message(_message(b"SECRET-garbage"))
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         debugs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
