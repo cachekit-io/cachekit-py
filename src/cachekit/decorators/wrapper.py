@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Union
 
 from cachekit.hash_utils import _WarnThrottle, redact_error_for_log
@@ -103,6 +103,14 @@ _DELETE_BATCH = 10_000
 # constant above so the two features can be tuned independently (LAB-381 panel).
 _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
+# Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
+_TTL_REFRESH_MAX_CONCURRENT = 32
+# Lease on the slot and key of a refresh whose event loop has stopped, from admission; the same
+# lease length as L2 SWR. A stopped loop runs no timers, so its client timeout never fires and
+# this lease is what releases the slot. It is an assumption, not a server bound: a PATCH the
+# refresh already sent is assumed answered within it (see _schedule_ttl_refresh).
+_TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS = 30.0
+
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     """Callback for background TTL refresh tasks to handle errors.
@@ -121,6 +129,29 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
+
+
+class _LockPhase:
+    """How far a lock clause got, so its handler can tell where a lock error was raised.
+
+    ``entered``: ``acquire_lock`` yielded, so an error is no longer an acquire failure.
+    ``body_exited``: the body left without raising, so only the release can have failed.
+    """
+
+    __slots__ = ("body_exited", "entered")
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.body_exited = False
+
+
+@contextlib.asynccontextmanager
+async def _phased(lock: contextlib.AbstractAsyncContextManager[bool], phase: _LockPhase) -> AsyncIterator[bool]:
+    """Enter ``lock`` and record each phase it reaches in ``phase``."""
+    async with lock as acquired:
+        phase.entered = True
+        yield acquired
+        phase.body_exited = True
 
 
 class CacheInfo(NamedTuple):
@@ -799,7 +830,7 @@ def create_cache_wrapper(
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
     # L1CacheConfig is honored here (#207): max_size_mb bounds bytes (best-effort
-    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio
+    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio/swr_retry_interval
     # drive background refresh via get_with_swr.
     from ..config.nested import L1CacheConfig
     from ..config.singleton import get_settings
@@ -816,6 +847,7 @@ def create_cache_wrapper(
             max_entries=None,
             max_size_bytes=_l1_budget_mb * 1024 * 1024,
             swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+            swr_retry_interval=_l1_config.swr_retry_interval,
         )
         if _l1_only_mode and l1_enabled
         else None
@@ -829,13 +861,76 @@ def create_cache_wrapper(
     # per-key in-flight dedup + a bounded slot pool so a burst of distinct stale
     # keys can't spawn unbounded work. Cross-client single-flight rides the
     # backend's async lock as a non-blocking lease (contested = serve stale, no
-    # wait, no retry — _try_acquire_lock already treats 409 AND 200+null as
-    # contested, LAB-240). The lease is best-effort per spec.
+    # wait, no retry — only 200 with a null lock_id is contested, LAB-240; any lock
+    # error abandons the attempt). The lease is best-effort per spec.
     _l2_swr_inflight: set[str] = set()
     _l2_swr_tasks: set[asyncio.Task[None]] = set()
     _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
     _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
+
+    # One background TTL refresh per key at a time: concurrent hits in the refresh window
+    # would each send a billable PATCH until one lands. At most _TTL_REFRESH_MAX_CONCURRENT
+    # run at once, so a burst over many keys can't pile up tasks against a slow backend;
+    # a hit at capacity skips its refresh (a later hit retries). Stopped loops get a weaker,
+    # best-effort bound: see _schedule_ttl_refresh. Also holds the task refs.
+    _ttl_refresh_tasks: dict[str, tuple[asyncio.Task[None], float]] = {}  # flight key -> (task, admitted at)
+    _ttl_refresh_lock = threading.Lock()  # the map is shared by every thread running an event loop
+    _ttl_refresh_pid = os.getpid()  # owner process: a forked child starts with an empty map
+
+    async def _refresh_ttl_if_due(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        if remaining is None:
+            remaining = await backend.get_ttl(cache_key)
+            if not remaining or remaining >= refresh_to * ttl_refresh_threshold:
+                return
+        await backend.refresh_ttl(cache_key, refresh_to)
+
+    def _schedule_ttl_refresh(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        """Run _refresh_ttl_if_due as a background task, unless one for this key is running or the pool is full.
+
+        The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
+        refreshes each tenant's entry. The guarantee has two tiers.
+
+        Hard, on running event loops: per decorated function, at most _TTL_REFRESH_MAX_CONCURRENT
+        refreshes, and one per flight key, are admitted at once, counted across every thread's
+        loop under the lock. A done task is pruned before counting.
+
+        Best-effort, on stopped loops: a loop left stopped (run_until_complete, never closed)
+        cannot advance its task, so the task keeps its slot and key for
+        _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS from admission, then is released and cancelled on
+        its own loop; should that loop run again, the task stops at its next await. A PATCH it
+        already sent is not recalled, so the bound on PATCHes still at the server assumes each is
+        answered within the hold. If the server holds one longer, that key can get one more PATCH
+        per expired hold, and the function at most one cap's worth per hold.
+        """
+        nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
+        if _ttl_refresh_pid != os.getpid():
+            # Forked child: the parent's tasks never finish here, and its lock may be held.
+            _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid = {}, threading.Lock(), os.getpid()
+        flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
+        now = time.monotonic()
+        with _ttl_refresh_lock:
+            for key, (t, admitted) in list(_ttl_refresh_tasks.items()):
+                if t.done():
+                    del _ttl_refresh_tasks[key]
+                elif not t.get_loop().is_running() and now - admitted >= _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS:
+                    del _ttl_refresh_tasks[key]
+                    # Its slot is free for reuse now, so the task must not run on if its loop resumes.
+                    with contextlib.suppress(RuntimeError):  # a closed loop never runs it again
+                        t.get_loop().call_soon_threadsafe(t.cancel)
+            if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
+                return
+            task = asyncio.get_running_loop().create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
+            _ttl_refresh_tasks[flight_key] = (task, now)
+        tasks, lock = _ttl_refresh_tasks, _ttl_refresh_lock
+
+        def _done(t: asyncio.Task[None]) -> None:
+            with lock:
+                if tasks.get(flight_key, (None, 0.0))[0] is t:
+                    del tasks[flight_key]
+            _ttl_refresh_done_callback(t, cache_key)
+
+        task.add_done_callback(_done)
 
     def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
@@ -1324,7 +1419,10 @@ def create_cache_wrapper(
             try:
                 result = await func(*call_args, **call_kwargs)
             except BaseException:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
+                # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
+                # apart from cancelling this task. Backing off after a real cancellation only delays
+                # the next refresh by one interval; the held value is still served.
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
                 raise  # logged by _l1_swr_task_done
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -1340,7 +1438,7 @@ def create_cache_wrapper(
             try:
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
                 _warn_refresh(_refresh_failed_warn, "L1-only SWR refresh failed", cache_key, exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
@@ -2054,17 +2152,15 @@ def create_cache_wrapper(
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
-                    # Handle TTL refresh if configured and threshold met
+                    # TTL refresh, never on the caller's path (LAB-7074). Decide from the
+                    # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
+                    # it only drops below the threshold after fresh_until, when the PATCH
+                    # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
+                    # tier copy (saas-api.md), so it falls back to GET /ttl like no header.
                     if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
-                        try:
-                            remaining_ttl = await _backend.get_ttl(cache_key)
-                            if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
-                                # Refresh TTL in background with error callback
-                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
-                                task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
-                        except Exception as e:
-                            # TTL refresh is optional, don't fail on error
-                            _logger.debug("TTL refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                        _fresh_for = _l2_fresh_for or None
+                        if not _l2_is_stale and (_fresh_for is None or _fresh_for < ttl * ttl_refresh_threshold):
+                            _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
                     elif refresh_ttl_on_get and ttl:
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.
@@ -2111,12 +2207,16 @@ def create_cache_wrapper(
             # Check if backend supports distributed locking
             if supports_locking(_backend):
                 func_error: Exception | None = None
+                lock_phase = _LockPhase()
                 try:
                     # Use backend's async lock protocol
-                    async with _backend.acquire_lock(
-                        cache_key,
-                        timeout=lock_timeout,
-                        blocking_timeout=blocking_timeout,
+                    async with _phased(
+                        _backend.acquire_lock(
+                            cache_key,
+                            timeout=lock_timeout,
+                            blocking_timeout=blocking_timeout,
+                        ),
+                        lock_phase,
                     ) as lock_acquired:
                         if lock_acquired:
                             # Lock acquired - double-check cache
@@ -2249,9 +2349,8 @@ def create_cache_wrapper(
                     raise
                 except Exception as e:
                     # The function's exceptions never get here (held in func_error above).
-                    # What does is a lock failure, or a cache error the lock body re-raised
-                    # on purpose: fail-closed DecryptionAuthenticationError, InteropError,
-                    # KeyringConfigurationError. Those leave a finally-only lock as they are.
+                    # What does is told apart by where it was raised (lock_phase), not by its
+                    # type: a Redis lock wraps whatever leaves its body in a BackendError.
                     if func_error is not None:
                         # The lock failed while releasing after the function raised. The
                         # function's exception wins and is raised below, outside this handler:
@@ -2260,13 +2359,31 @@ def create_cache_wrapper(
                             f"Lock release failed for {redact_cache_key(cache_key)} after the function raised; "
                             f"the lock may be held until its timeout: {redact_error_for_log(e)}"
                         )
+                    elif lock_phase.body_exited:
+                        # The body returned `result` (its every normal exit without a func_error
+                        # is a `return result`) and only the release failed. Keep it: running the
+                        # function again here would run it twice.
+                        logger().warning(
+                            f"Lock release failed for {redact_cache_key(cache_key)}; "
+                            f"the lock may be held until its timeout: {redact_error_for_log(e)}"
+                        )
+                        return result  # pyright: ignore[reportPossiblyUnboundVariable]
+                    elif lock_phase.entered:
+                        # A cache error the body re-raised on purpose: fail-closed
+                        # DecryptionAuthenticationError, InteropError, KeyringConfigurationError.
+                        # A finally-only lock lets it out as is; a Redis lock wraps it in a
+                        # BackendError, so unwrap and re-raise the original.
+                        if (
+                            isinstance(e, BackendError)
+                            and e.original_exception
+                            and not isinstance(e.original_exception, BackendError)
+                        ):
+                            raise e.original_exception from e
+                        raise
                     elif not isinstance(e, BackendError):
                         raise
-                    elif e.original_exception and not isinstance(e.original_exception, BackendError):
-                        # A Redis lock wraps them in a BackendError; unwrap and re-raise the original.
-                        raise e.original_exception from e
                     else:
-                        # Lock operation failed - execute without lock
+                        # Acquiring the lock failed - execute without lock (the lock is best effort)
                         logger().warning(
                             f"Lock operation failed for {redact_cache_key(cache_key)}, executing without lock: {redact_error_for_log(e)}"
                         )

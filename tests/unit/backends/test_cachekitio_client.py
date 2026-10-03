@@ -8,11 +8,13 @@ Tests for backends/cachekitio/client.py covering:
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() drops thread-local references
 - New client created after reset
+- State a forked child inherits: replaced, never closed (real forks: test_cachekitio_fork.py)
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 
 import httpx
 import pytest
@@ -140,7 +142,7 @@ class TestCloseSyncClient:
         lease = lease_sync_http_client(config)
         close_sync_client()
         assert lease.client.is_closed
-        assert not client_module._thread_local.sync_leases
+        assert not client_module._clients().sync_leases
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
@@ -172,7 +174,7 @@ class TestCloseSurvivesAFailingClient:
         with pytest.raises(RuntimeError, match="close failed"):
             close_sync_client()
         assert leases[1 - fail_idx].client.is_closed
-        assert not client_module._thread_local.sync_leases
+        assert not client_module._clients().sync_leases
         del leases[fail_idx].client.close  # else the release finalizer later hits _raise
 
     async def test_async(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
@@ -203,8 +205,8 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
     for i in range(20):
         asyncio.run(use_async(CachekitIOBackend(api_key=f"ck_test_rotated_{i}")))  # pragma: allowlist secret
     gc.collect()
-    assert list(client_module._thread_local.sync_leases.values()) == [live._sync_lease]
-    assert list(client_module._thread_local.async_slots.values()) == [live._async_lease._held.slot]
+    assert list(client_module._clients().sync_leases.values()) == [live._sync_lease]
+    assert list(client_module._clients().async_slots.values()) == [live._async_lease._held.slot]
 
 
 @pytest.mark.unit
@@ -222,7 +224,7 @@ def test_releasing_the_last_backend_closes_its_sync_client(monkeypatch: pytest.M
     monkeypatch.setattr(httpx.Client, "close", spy)
     first = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
     second = CachekitIOBackend(api_key="ck_test_released")  # pragma: allowlist secret
-    client_id = id(first._sync_client)
+    client_id = id(first._sync_lease.client)
     del first
     assert closed == []  # still shared with a live backend
     del second
@@ -268,7 +270,7 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
     resume.set()
     releaser.join(5)
     assert not releaser.is_alive()
-    assert not rebuilt._sync_client.is_closed
+    assert not rebuilt._sync_lease.client.is_closed
 
 
 @pytest.mark.unit
@@ -284,10 +286,58 @@ def test_failed_close_on_release_is_logged_not_raised(monkeypatch: pytest.Monkey
     log = MagicMock()
     monkeypatch.setattr(client_module, "_logger", log)
     monkeypatch.setattr(httpx.Client, "close", fail)
-    client_module._close_released_client(httpx.Client())
+    client_module._close_released_client(httpx.Client(), os.getpid())
     log.debug.assert_called_once()
     assert "OSError" in log.debug.call_args.kwargs["error"]
     assert "SECRET_DETAIL" not in repr(log.debug.call_args)
+
+
+_PARENT_PID = -1  # no process has it, so state marked with it reads as inherited from a parent
+
+
+@pytest.mark.unit
+class TestStateInheritedAcrossFork:
+    """A forked child's view of its parent's state, in process; real forks over TLS: test_cachekitio_fork.py."""
+
+    def test_a_threads_inherited_caches_start_empty(self, config: CachekitIOBackendConfig) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        inherited = lease_sync_http_client(config)
+        client_module._thread_local.pid = _PARENT_PID
+        lease = lease_sync_http_client(config)
+        assert lease is not inherited
+        assert lease_sync_http_client(config) is lease
+
+    def test_an_inherited_client_is_released_unclosed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+
+        closed: list[httpx.Client] = []
+        monkeypatch.setattr(httpx.Client, "close", lambda self: closed.append(self))
+        client_module._close_released_client(httpx.Client(), _PARENT_PID)
+        assert closed == []
+
+    def test_the_backend_replaces_an_inherited_sync_lease(self) -> None:
+        from cachekit.backends.cachekitio import client as client_module
+        from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+        backend = CachekitIOBackend(api_key="ck_test_inherited_sync")  # pragma: allowlist secret
+        inherited = backend._sync_lease
+        inherited.pid = client_module._thread_local.pid = _PARENT_PID  # a child inherits both
+        lease = backend._own_sync_lease()
+        assert lease is not inherited
+        assert lease.pid == os.getpid()
+        assert backend._own_sync_lease() is lease
+
+    def test_the_backend_replaces_an_inherited_async_lease(self) -> None:
+        from cachekit.backends.cachekitio.backend import CachekitIOBackend
+
+        backend = CachekitIOBackend(api_key="ck_test_inherited_async")  # pragma: allowlist secret
+        inherited = backend._async_lease
+        inherited.pid = _PARENT_PID
+        lease = backend._own_async_lease()
+        assert lease is not inherited
+        assert lease.pid == os.getpid()
+        assert backend._own_async_lease() is lease
 
 
 @pytest.mark.unit
@@ -317,7 +367,7 @@ class TestResetGlobalClient:
 
         lease = lease_sync_http_client(config)  # held, so only the reset can empty the cache
         reset_global_client()
-        assert not client_module._thread_local.sync_leases
+        assert not client_module._clients().sync_leases
         assert not lease.client.is_closed
 
     async def test_drops_async_clients(self, config: CachekitIOBackendConfig) -> None:

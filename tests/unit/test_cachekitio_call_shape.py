@@ -19,8 +19,11 @@ count and order from run to run, so they belong to invariant tests, not here.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
+import os
 import threading
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,6 +55,7 @@ class _FakeSaaS:
     store: dict[str, bytes] = field(default_factory=dict)
     stale: bool = False  # serve hits labelled stale (X-CacheKit-Freshness: stale)
     fail_reads: bool = False  # answer every entry GET with a 503
+    fresh_for: int | None = 60  # X-CacheKit-Fresh-For on a fresh hit; None omits the header (pre-signal server)
     ttl_left: int = 1  # GET .../ttl answer; under the refresh threshold, so a refresh is due
     lock_held_for: int = 0  # answer this many lock POSTs "held elsewhere" ({"lock_id": null})
     filled_by_holder: bytes | None = None  # stored when the other holder's lock is first reported
@@ -63,7 +67,10 @@ class _FakeSaaS:
                 return httpx.Response(503)
             if key not in self.store:
                 return httpx.Response(404)
-            headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"} if self.stale else {FRESH_FOR_HEADER: "60"}
+            if self.stale:
+                headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
+            else:
+                headers = {} if self.fresh_for is None else {FRESH_FOR_HEADER: str(self.fresh_for)}
             return httpx.Response(200, content=self.store[key], headers=headers)
         if op == "PUT":
             self.store[key] = request.content
@@ -232,11 +239,23 @@ def backend(gate: _Gate) -> Iterator[CachekitIOBackend]:
     sync_client = httpx.Client(base_url=_API_URL, transport=httpx.MockTransport(gate.sync_handler))
     async_client = httpx.AsyncClient(base_url=_API_URL, transport=httpx.MockTransport(gate.async_handler))
     with (
-        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=sync_client)),
-        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=sync_client),
+        ),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=async_client),
+        ),
     ):
         yield CachekitIOBackend(api_url=_API_URL, api_key=_API_KEY)
     sync_client.close()
+
+
+def _op_counts(shape: _Shape) -> dict[str, int]:
+    """Requests sent, blocking or not. For several callers at once: a request one caller left in the
+    background can park while a sibling still waits, so only the counts are an invariant there."""
+    return dict(Counter(shape.blocking + shape.background))
 
 
 def _only_key(saas: _FakeSaaS) -> str:
@@ -348,14 +367,95 @@ class TestAsyncCallShape:
         shape = await gate.run_async(fn(1))
         assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET", "DELETE /lock"])
 
-    async def test_refresh_ttl_on_get_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+    # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller (LAB-7074).
+
+    async def test_refresh_ttl_on_get_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
+        """Fresh-For under ttl x threshold: the PATCH goes straight to the background, no GET /ttl."""
+
         @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
         async def fn(x: int) -> int:
             return x * 2
 
         await gate.run_async(fn(1))
+        saas.fresh_for = 10
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "GET /ttl"], background=["PATCH /ttl"])
+        assert shape == _Shape(blocking=["GET"], background=["PATCH /ttl"])
+
+    async def test_refresh_ttl_on_get_hit_not_due(self, backend: CachekitIOBackend, gate: _Gate) -> None:
+        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        shape = await gate.run_async(fn(1))  # Fresh-For 60 is above 0.5 x 60
+        assert shape == _Shape(blocking=["GET"])
+
+    async def test_refresh_ttl_on_get_hit_in_swr_fresh_window(
+        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS
+    ) -> None:
+        """With stale_ttl = ttl, GET /ttl counts to evict_at and reads 85 at age 35, so it never asked for a
+        refresh while the entry was fresh. Fresh-For 25 does: the PATCH lands before fresh_until."""
+
+        @cache(backend=backend, ttl=60, stale_ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.fresh_for, saas.ttl_left = 25, 85
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET"], background=["PATCH /ttl"])
+
+    async def test_refresh_ttl_on_get_stale_hit(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
+        """A stale entry can't be renewed (the server answers 409), so no PATCH is sent."""
+
+        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.stale = True
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET"])
+
+    @pytest.mark.parametrize("fresh_for", [None, 0], ids=["no-header", "fresh-labelled-zero"])
+    async def test_refresh_ttl_on_get_hit_without_fresh_for(
+        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, fresh_for: int | None
+    ) -> None:
+        """No usable Fresh-For: fall back to GET /ttl, in the background with the PATCH."""
+
+        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.fresh_for = fresh_for
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET"], background=["GET /ttl", "PATCH /ttl"])
+
+    async def test_refresh_ttl_on_get_single_flight_is_per_key_prefix(
+        self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tenant-scoped backend (key_prefix per calling context) refreshes each tenant's entry,
+        even when two tenants hit the same cache key at once."""
+        prefix: contextvars.ContextVar[str] = contextvars.ContextVar("prefix", default="t:a:")
+        monkeypatch.setattr(CachekitIOBackend, "key_prefix", property(lambda _self: prefix.get()), raising=False)
+
+        @cache(backend=backend, ttl=60, refresh_ttl_on_get=True, l1_enabled=False)
+        async def fn(x: int) -> int:
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.fresh_for = 10
+
+        async def as_tenant(tenant: str) -> None:
+            prefix.set(tenant)
+            await fn(1)
+
+        async def two_tenants() -> None:
+            await asyncio.gather(as_tenant("t:a:"), as_tenant("t:b:"))
+
+        shape = await gate.run_async(two_tenants())
+        assert _op_counts(shape) == {"GET": 2, "PATCH /ttl": 2}
 
     async def test_invalidate(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         """ainvalidate_cache sends its DELETE from a worker thread through the sync client, and awaits it."""

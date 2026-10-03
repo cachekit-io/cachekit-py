@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.21.0](https://github.com/cachekit-io/cachekit-py/compare/v0.20.0...v0.21.0) (2026-10-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **reliability:** removed the cachekit.reliability.profiles module, with ReliabilityProfile, ProfileConfig, PROFILE_CONFIGS, get_profile_config, get_profile_description, recommend_profile, HIGH_THROUGHPUT_THRESHOLD_RPS and LOW_THROUGHPUT_THRESHOLD_RPS; cachekit.reliability no longer re-exports ReliabilityProfile, ProfileConfig, get_profile_config or recommend_profile. No cachekit API read these values, so no runtime behaviour changes.
+* **encryption:** a master key with no stated encryption intent fails at construction (LAB-4739) ([#411](https://github.com/cachekit-io/cachekit-py/issues/411))
+* **config:** CachekitConfig.l1_enabled, CachekitConfig.enable_prometheus_metrics, CachekitConfig.backend_provider_class and CachekitIOBackendConfig.max_retries are removed, along with their env vars CACHEKIT_L1_ENABLED, CACHEKIT_ENABLE_PROMETHEUS_METRICS, CACHEKIT_BACKEND_PROVIDER_CLASS and CACHEKIT_MAX_RETRIES. Passing one of these fields to the constructor now raises ValidationError. A still-exported env var is ignored, so startup is unaffected.
+* **interop:** an interop namespace or operation containing `..` now raises `ConfigurationError` at decoration time, on every backend; the manual `generate_interop_key` helper raises `InteropError`. Rename the segment; its keys become a full cache miss.
+
+### Features
+
+* **encryption:** a master key with no stated encryption intent fails at construction (LAB-4739) ([#411](https://github.com/cachekit-io/cachekit-py/issues/411)) ([2baad1b](https://github.com/cachekit-io/cachekit-py/commit/2baad1be9a29be5fe85d7cd9c3a05e8b9b1a4adc))
+* **l1-only:** back off a failed background refresh before retrying it (LAB-7442) ([#462](https://github.com/cachekit-io/cachekit-py/issues/462)) ([b6f3d46](https://github.com/cachekit-io/cachekit-py/commit/b6f3d46431669f9ac7e60913f8287f61b048762f))
+
+
+### Bug Fixes
+
+* **build:** remove build-pgo target and unused PGO profiles (LAB-7151) ([#426](https://github.com/cachekit-io/cachekit-py/issues/426)) ([a8c8f16](https://github.com/cachekit-io/cachekit-py/commit/a8c8f16b5d41fb6579d72bbb899fe994c769dcb8))
+* **cachekitio:** DELETE never reports existence, so a 404 raises (LAB-5580) ([#447](https://github.com/cachekit-io/cachekit-py/issues/447)) ([e56a139](https://github.com/cachekit-io/cachekit-py/commit/e56a1397fcfc7cb3fa4060ceab76c2060cabc0e1))
+* **cachekitio:** key the async client per running event loop (LAB-7102) ([#433](https://github.com/cachekit-io/cachekit-py/issues/433)) ([c6a04b9](https://github.com/cachekit-io/cachekit-py/commit/c6a04b9198ba139625f765338a631fba942e5361))
+* **cachekitio:** reject the empty cache key client-side (LAB-6550) ([#397](https://github.com/cachekit-io/cachekit-py/issues/397)) ([9c2c2be](https://github.com/cachekit-io/cachekit-py/commit/9c2c2bee26543334010cdb1829be6139fface694))
+* **config:** drop raw-input locals from RedactingSettings frames before raising (LAB-4766) ([#386](https://github.com/cachekit-io/cachekit-py/issues/386)) ([0722b08](https://github.com/cachekit-io/cachekit-py/commit/0722b0874346f2a5ee336d8b30477ce9a666102e))
+* **config:** honour an explicit redis_url kwarg when REDIS_URL is set (LAB-6831) ([#418](https://github.com/cachekit-io/cachekit-py/issues/418)) ([74d12c1](https://github.com/cachekit-io/cachekit-py/commit/74d12c1256a017e67bcc28a03dcf094cc63a82bc))
+* **config:** intent presets accept overrides of the fields they set (LAB-5361) ([#390](https://github.com/cachekit-io/cachekit-py/issues/390)) ([3d02435](https://github.com/cachekit-io/cachekit-py/commit/3d0243577a4766e39e5e5a49b7f736ff244c3090))
+* **config:** redact config validation errors raised through the core schema (LAB-5213) ([#404](https://github.com/cachekit-io/cachekit-py/issues/404)) ([25baba1](https://github.com/cachekit-io/cachekit-py/commit/25baba1255b5d001b6a5d1e7449097d43e06a562))
+* **config:** remove four config fields nothing reads (LAB-4765) ([#394](https://github.com/cachekit-io/cachekit-py/issues/394)) ([4307cd5](https://github.com/cachekit-io/cachekit-py/commit/4307cd59ed29f02877504c373403a1ed93feea70))
+* **decorators:** async return value the cache write cannot serialize no longer counts toward the circuit breaker (LAB-7461) ([#442](https://github.com/cachekit-io/cachekit-py/issues/442)) ([e410aa7](https://github.com/cachekit-io/cachekit-py/commit/e410aa790136b2f8e548227841408c853d6b33bb))
+* **decorators:** key and name the registry set by a str namespace's exact value (LAB-6197) ([#388](https://github.com/cachekit-io/cachekit-py/issues/388)) ([74937d5](https://github.com/cachekit-io/cachekit-py/commit/74937d5d90bb89f987d28edeb0d69bb01fd24625))
+* **decorators:** key-generation failures no longer count toward the circuit breaker (LAB-5376) ([#381](https://github.com/cachekit-io/cachekit-py/issues/381)) ([67732fb](https://github.com/cachekit-io/cachekit-py/commit/67732fb98bd3974cf0ae775ef1987f74f88f051e))
+* **decorators:** L1-only encryption refusal names the full backend resolution order (LAB-6738) ([#413](https://github.com/cachekit-io/cachekit-py/issues/413)) ([704db62](https://github.com/cachekit-io/cachekit-py/commit/704db62408a5148f0324f7937f19cfb0fb9afa3d))
+* **decorators:** log failed L2 deletes of a no-args invalidation once, with the count (LAB-6074) ([#383](https://github.com/cachekit-io/cachekit-py/issues/383)) ([ff952ef](https://github.com/cachekit-io/cachekit-py/commit/ff952efe9217e8e2d55be44823d15e64b6c4163b))
+* **decorators:** re-raise KeyringConfigurationError from [@cache](https://github.com/cache) L2 reads (LAB-4841) ([#393](https://github.com/cachekit-io/cachekit-py/issues/393)) ([eb6a6e4](https://github.com/cachekit-io/cachekit-py/commit/eb6a6e4b9dc65670e0ecdbbac93fdc2f5e05f408))
+* **decorators:** re-raise KeyringConfigurationError from [@cache](https://github.com/cache) writes (LAB-6519) ([#396](https://github.com/cachekit-io/cachekit-py/issues/396)) ([08179ba](https://github.com/cachekit-io/cachekit-py/commit/08179badec6c429d94b86229c50d5fe2fe645622))
+* **decorators:** re-track a key on any exception from its L2 delete (LAB-6198) ([#382](https://github.com/cachekit-io/cachekit-py/issues/382)) ([5bef998](https://github.com/cachekit-io/cachekit-py/commit/5bef998983529f8959274275cb6950716e0193d7))
+* **decorators:** run a decorated function at most once when it raises BackendError (LAB-5360) ([#429](https://github.com/cachekit-io/cachekit-py/issues/429)) ([7be20d7](https://github.com/cachekit-io/cachekit-py/commit/7be20d7e228ed845906972867e0f6e50afb29dac))
+* **decorators:** serve L1 hits whatever the circuit-breaker state (LAB-5351) ([#385](https://github.com/cachekit-io/cachekit-py/issues/385)) ([6407b58](https://github.com/cachekit-io/cachekit-py/commit/6407b58b10aabf3ba61b775682df9d67bc529ef1))
+* **deps:** raise the redis-py floor to 4.6.0 and test it in CI (LAB-7560) ([#474](https://github.com/cachekit-io/cachekit-py/issues/474)) ([fe317c9](https://github.com/cachekit-io/cachekit-py/commit/fe317c9cee794068a488d505730118a4a35136f4))
+* **deps:** raise urllib3 to 2.8.0 for three 2026-09-30 advisories (LAB-6743) ([#412](https://github.com/cachekit-io/cachekit-py/issues/412)) ([90d705c](https://github.com/cachekit-io/cachekit-py/commit/90d705c52e2a77486fac9dfb487e159604aec656))
+* **encryption:** resolve the caller's tenant on encrypted reads (LAB-4260) ([#410](https://github.com/cachekit-io/cachekit-py/issues/410)) ([0f436f1](https://github.com/cachekit-io/cachekit-py/commit/0f436f1967ede100ec4d299a29825a310786f232))
+* **file:** miss on nonzero header flags; correct File backend docs (LAB-7152) ([#431](https://github.com/cachekit-io/cachekit-py/issues/431)) ([6f649c9](https://github.com/cachekit-io/cachekit-py/commit/6f649c9ab9c7c6a24207eda046e762e04a6ef980))
+* **interop:** hash str/int/float/bytes subclass arguments as their exact base-type value (LAB-6201) ([#384](https://github.com/cachekit-io/cachekit-py/issues/384)) ([4044866](https://github.com/cachekit-io/cachekit-py/commit/40448660d9041b8c880ca053f55e5508574f025e))
+* **interop:** reject double-dot interop segments (LAB-5906) ([#391](https://github.com/cachekit-io/cachekit-py/issues/391)) ([5ade81d](https://github.com/cachekit-io/cachekit-py/commit/5ade81d72f49f40d63e2fc71a8871f0afc30b3d9))
+* **l1:** at-fork hook repairs every cache even when its drop warning raises (LAB-6370) ([#392](https://github.com/cachekit-io/cachekit-py/issues/392)) ([b75bcbb](https://github.com/cachekit-io/cachekit-py/commit/b75bcbb446ece061abaed78bffc36f64910b13b7))
+* **l1:** never clear a cache under a live lock holder on fork reset (LAB-6375) ([#416](https://github.com/cachekit-io/cachekit-py/issues/416)) ([468c7c8](https://github.com/cachekit-io/cachekit-py/commit/468c7c83118ddf11c8ac72c68627e42c98174c04))
+* **l1:** remove the old entry before eviction on update (LAB-6897) ([#419](https://github.com/cachekit-io/cachekit-py/issues/419)) ([eb7af5f](https://github.com/cachekit-io/cachekit-py/commit/eb7af5f1724bf95b1c01489b5bce46cb2802c33c))
+* **l1:** start no cleanup thread in a child forked without at-fork hooks (LAB-7271) ([#436](https://github.com/cachekit-io/cachekit-py/issues/436)) ([c3fabda](https://github.com/cachekit-io/cachekit-py/commit/c3fabdae03b2c9a6f6de8b075d5de8740a2c8fab))
+* **memcached:** pool connections per server so threads never share a socket (LAB-6744) ([#414](https://github.com/cachekit-io/cachekit-py/issues/414)) ([7d5da3a](https://github.com/cachekit-io/cachekit-py/commit/7d5da3a934730ec6009cf6d5266b3072a9532ec4))
+* **memcached:** raise when HashClient skips a command in its retry window (LAB-6740) ([#432](https://github.com/cachekit-io/cachekit-py/issues/432)) ([20fce0e](https://github.com/cachekit-io/cachekit-py/commit/20fce0e41119b4fa9b5e8426d145a6480ee0d2e7))
+* **metrics:** export circuit_breaker_state to Prometheus as a per-state count (LAB-6403) ([#428](https://github.com/cachekit-io/cachekit-py/issues/428)) ([1f05bd4](https://github.com/cachekit-io/cachekit-py/commit/1f05bd45800c8c4422016bd4b3c6d8d18d87dd78))
+* **metrics:** give a forked child its own batching state and record synchronously after shutdown (LAB-6779) ([#434](https://github.com/cachekit-io/cachekit-py/issues/434)) ([7b985b0](https://github.com/cachekit-io/cachekit-py/commit/7b985b032ab811aca3429319064f07a5c1d7078b))
+* **metrics:** make the circuit breaker the only writer of circuit_breaker_state (LAB-7269) ([#463](https://github.com/cachekit-io/cachekit-py/issues/463)) ([0b27d40](https://github.com/cachekit-io/cachekit-py/commit/0b27d4027db162896ef36c88771a027dfb138836))
+* **metrics:** record label-less generic counters and histograms (LAB-6389) ([#403](https://github.com/cachekit-io/cachekit-py/issues/403)) ([a57569c](https://github.com/cachekit-io/cachekit-py/commit/a57569c1f581a2554cf9281da483275f5e283333))
+* **metrics:** restart the batching worker when auto-detect returns to batched mode (LAB-6376) ([#407](https://github.com/cachekit-io/cachekit-py/issues/407)) ([dab6b08](https://github.com/cachekit-io/cachekit-py/commit/dab6b085864b253f7956c6ad3e7aad07cd3718c8))
+* **redis:** size every pool from config (default 50) and wait on exhaustion (LAB-7457) ([#444](https://github.com/cachekit-io/cachekit-py/issues/444)) ([e2a4c55](https://github.com/cachekit-io/cachekit-py/commit/e2a4c55e8204ccdc0d8764a2219ccff799de1cc6))
+* **redis:** wire socket_keepalive into both connection pools (LAB-7150) ([#427](https://github.com/cachekit-io/cachekit-py/issues/427)) ([87ed6b8](https://github.com/cachekit-io/cachekit-py/commit/87ed6b8785b3cf3f38a752903fa51fd1d48ee4ec))
+* **reliability:** count CLOSED breaker failures in a 60 s rolling window (LAB-5352) ([#405](https://github.com/cachekit-io/cachekit-py/issues/405)) ([22a4178](https://github.com/cachekit-io/cachekit-py/commit/22a4178a3348820e639941e2c9e7b8e99e9a415c))
+* **security:** keep secrets wrapped in cachekit frames on raised errors (LAB-6515) ([#430](https://github.com/cachekit-io/cachekit-py/issues/430)) ([02fb730](https://github.com/cachekit-io/cachekit-py/commit/02fb73063bd4e273fd6dd1d7ce3970b641ca213f))
+* **serializers:** classify a non-encodable compressed header as corruption (LAB-6354) ([#380](https://github.com/cachekit-io/cachekit-py/issues/380)) ([1971dd6](https://github.com/cachekit-io/cachekit-py/commit/1971dd6f97a123a4fbdfc485847db27c94606670))
+* **serializers:** integrity-off AutoSerializer refuses a header format no writer emits (LAB-6359) ([#387](https://github.com/cachekit-io/cachekit-py/issues/387)) ([b475b6d](https://github.com/cachekit-io/cachekit-py/commit/b475b6d2315455ca24b005ce600f57931c58f438))
+* **swr:** log failed and skipped background refreshes at WARNING (LAB-7456) ([#446](https://github.com/cachekit-io/cachekit-py/issues/446)) ([1ba3312](https://github.com/cachekit-io/cachekit-py/commit/1ba3312096e57bf7932c8d5d8183ac1f2749044c))
+
+
+### Performance Improvements
+
+* **backends:** batch L2 deletes in whole-function invalidation (LAB-6075) ([#408](https://github.com/cachekit-io/cachekit-py/issues/408)) ([db0345e](https://github.com/cachekit-io/cachekit-py/commit/db0345eb30175bb3e92652167269796b3e12a082))
+* **cachekitio:** return the 404 miss before raise_for_status (LAB-7066) ([#423](https://github.com/cachekit-io/cachekit-py/issues/423)) ([d2934eb](https://github.com/cachekit-io/cachekit-py/commit/d2934eb8b4b861dd7afe92e5a01ec72ea6c86ba8))
+* **keys:** fast-path exact primitives in key normalisation (LAB-7068) ([#422](https://github.com/cachekit-io/cachekit-py/issues/422)) ([84db725](https://github.com/cachekit-io/cachekit-py/commit/84db725cdefbe4a20a0b369f3fc4490956d3d92d))
+* **keys:** skip func-name regex passes that cannot change the name (LAB-7405) ([#469](https://github.com/cachekit-io/cachekit-py/issues/469)) ([21c87b9](https://github.com/cachekit-io/cachekit-py/commit/21c87b9af898d52549286b8f9b0c67e56d049c66))
+* **redis:** cache the redis.Redis client per PooledClientProvider (LAB-7075) ([#421](https://github.com/cachekit-io/cachekit-py/issues/421)) ([b3312de](https://github.com/cachekit-io/cachekit-py/commit/b3312de50cd577f61e471470cefefaa9726a42b7))
+* **serializers:** hash checksummed Arrow/NumPy bodies once per read (LAB-6371) ([#406](https://github.com/cachekit-io/cachekit-py/issues/406)) ([df121d8](https://github.com/cachekit-io/cachekit-py/commit/df121d800779db803035230c1bf01d8fdbc14584))
+
+
+### Code Refactoring
+
+* **reliability:** delete unconsumed reliability profiles module (LAB-6352) ([#445](https://github.com/cachekit-io/cachekit-py/issues/445)) ([0b71441](https://github.com/cachekit-io/cachekit-py/commit/0b714419cb14c785ac9e09aa34c27c6fb32c5cb9))
+
 ## [0.20.0](https://github.com/cachekit-io/cachekit-py/compare/v0.19.0...v0.20.0) (2026-09-30)
 
 

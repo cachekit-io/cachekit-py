@@ -143,26 +143,6 @@ def _safe_hasattr(obj: Any, attr: str) -> bool:
         return False
 
 
-def _wrap_tuples(obj: Any) -> Any:
-    """Recursively wrap tuples in type markers before msgpack encoding.
-
-    Msgpack natively serializes tuples as arrays (same as lists), so the
-    ``default`` callback is never called for them. This pre-processor
-    converts tuples to ``{"__tuple__": True, "value": [...]}`` markers
-    that ``_auto_object_hook`` restores on deserialization.
-
-    Only affects tuples — all other types pass through unchanged and are
-    handled by msgpack's ``default`` callback (``_auto_default``).
-    """
-    if isinstance(obj, tuple):
-        return {"__tuple__": True, "value": [_wrap_tuples(x) for x in obj]}
-    if isinstance(obj, list):
-        return [_wrap_tuples(x) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _wrap_tuples(v) for k, v in obj.items()}
-    return obj
-
-
 def _is_plain_numpy_numeric(dtype: Any) -> bool:
     """True only for a plain NumPy int/uint/float dtype.
 
@@ -254,6 +234,8 @@ def _auto_default(obj: Any) -> Any:
     """Custom encoder for types not natively supported by MessagePack.
 
     Handles:
+    - tuple → dict with a ``__tuple__`` marker (the packer runs with strict_types=True)
+    - builtin subclasses (IntEnum, (str, Enum), OrderedDict, namedtuple, np.float64, ...) → their exact base type
     - datetime/date/time → ISO-8601 strings
     - UUID → string representation
     - set/frozenset → list (with type marker for roundtrip)
@@ -273,6 +255,34 @@ def _auto_default(obj: Any) -> Any:
     Raises:
         TypeError: For unsupported types with actionable guidance
     """
+    # The packer runs with strict_types=True, so every tuple and every builtin subclass lands here
+    # instead of being packed natively. Each is reduced to its exact base type and packs to the bytes
+    # the non-strict packer gave it. Tuples get the marker _auto_object_hook restores. The base-type
+    # methods (str.__str__, int.__int__, ...) read the stored value and ignore a subclass override,
+    # as the C packer does; plain str() would emit an Enum member's name. An int outside msgpack's
+    # 64-bit range, exact or subclass, falls through to the error below, as the non-strict packer
+    # sent it here on overflow. Containers are copied with a comprehension, as the old pre-pass did:
+    # list(obj), list(iter(obj)) and dict(obj.items()) also consult __len__, the iterator's
+    # __length_hint__ or a keys() on the items() result, which a subclass can make raise or alter
+    # the value. An exact tuple's hooks are builtin. Bytes are read from their own storage, never
+    # through the buffer protocol, which a subclass can override from 3.12 (PEP 688, __buffer__).
+    if isinstance(obj, tuple):
+        return {"__tuple__": True, "value": list(obj) if type(obj) is tuple else [x for x in obj]}  # noqa: C416 - see above
+    if isinstance(obj, dict):
+        return {k: v for k, v in obj.items()}  # noqa: C416 - dict(obj.items()) can read it as a mapping
+    if isinstance(obj, list):
+        return [x for x in obj]  # noqa: C416 - list(obj) would call __len__ / __length_hint__
+    if isinstance(obj, str):
+        return str.__str__(obj)
+    if isinstance(obj, int) and type(obj) is not int and -(2**63) <= int.__int__(obj) < 2**64:
+        return int.__int__(obj)
+    if isinstance(obj, float):
+        return float.__float__(obj)
+    if isinstance(obj, bytes):
+        return bytes.__getitem__(obj, slice(None))
+    if isinstance(obj, bytearray):
+        return bytes(bytearray.copy(obj))
+
     # Existing: datetime/date/time support (KEEP)
     if isinstance(obj, datetime):
         return {"__datetime__": True, "value": obj.isoformat()}
@@ -510,9 +520,15 @@ class AutoSerializer:
         # MessagePack configuration for speed
         self._msgpack_pack_opts = {
             "use_bin_type": True,  # Use bin type for bytes (faster)
-            "strict_types": False,  # Allow mixed types (more flexible)
-            "default": _auto_default,  # Handle datetime, UUID, set, frozenset
+            # Tuples and builtin subclasses go to the default, which marks tuples for the reader.
+            # Strict is what lets it see tuples without first copying the whole value tree.
+            "strict_types": True,
+            "default": _auto_default,  # Handle tuple, datetime, UUID, set, frozenset
         }
+        # The columnar DataFrame/Series documents always packed without the tuple pre-pass, so a
+        # tuple in an index, a name or a column label packs as an array. They keep the non-strict
+        # packer, under which the default never sees a tuple, so their bytes stay as they were.
+        self._columnar_pack_opts = {**self._msgpack_pack_opts, "strict_types": False}
         self._msgpack_unpack_opts = {
             "use_list": True,  # Need lists for DataFrame serialization format
             "raw": False,  # Decode strings properly
@@ -1059,7 +1075,7 @@ class AutoSerializer:
         for col in df.columns:
             serialized["data"][col] = _column_trio(df[col])
 
-        msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
+        msgpack_data = msgpack.packb(serialized, **self._columnar_pack_opts)
 
         if self.enable_integrity_checking:
             return self._byte_storage.store(msgpack_data, "dataframe")  # type: ignore[return-value]
@@ -1115,7 +1131,7 @@ class AutoSerializer:
         # so the on-wire key order is {name, index, type, data[, dtype]} (byte-compatible).
         serialized.update(_column_trio(series))
 
-        msgpack_data = msgpack.packb(serialized, **self._msgpack_pack_opts)
+        msgpack_data = msgpack.packb(serialized, **self._columnar_pack_opts)
 
         if self.enable_integrity_checking:
             return self._byte_storage.store(msgpack_data, "series")  # type: ignore[return-value]
@@ -1232,9 +1248,12 @@ class AutoSerializer:
 
     def _serialize_msgpack(self, obj: Any) -> bytes:
         """Serialize general object with MessagePack."""
-        # Pre-process tuples into markers (msgpack natively flattens them to lists)
-        obj = _wrap_tuples(obj)
-        msgpack_data: bytes = msgpack.packb(obj, **self._msgpack_pack_opts)  # type: ignore[assignment]  # stub: Optional
+        try:
+            msgpack_data: bytes = msgpack.packb(obj, **self._msgpack_pack_opts)  # type: ignore[assignment]  # stub: Optional
+        except ValueError as e:
+            # msgpack's nesting limit (a cyclic or 500-deep value) and its 4 GiB size limits. As a
+            # bare ValueError, serialize_data would re-raise it as a fail-loud config error.
+            raise SerializationError(f"Value cannot be packed as MessagePack: {bounded_error(e)}") from e
 
         if self.enable_integrity_checking:
             return self._byte_storage.store(msgpack_data, self.default_format)  # type: ignore[return-value]

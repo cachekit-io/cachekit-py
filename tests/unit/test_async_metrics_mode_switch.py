@@ -317,11 +317,6 @@ def _metric_name(namespace: str) -> str:
 # Each entry point, how to read its series, and the value after one record in the child and one more batched.
 ENTRY_POINTS = {
     "cache-operation": (_record, _flushed, 2),
-    "circuit-breaker": (
-        lambda c, n: c.record_circuit_breaker_state(namespace=n, state="open", transitions=1),
-        lambda n: _sample("circuit_breaker_state", {"namespace": n, "state": "open"}),
-        1,
-    ),
     "counter": (lambda c, n: c.record_counter(_metric_name(n)), lambda n: _sample(f"{_metric_name(n)}_total"), 2),
     "histogram": (lambda c, n: c.record_histogram(_metric_name(n), 1.0), lambda n: _sample(f"{_metric_name(n)}_count"), 2),
 }

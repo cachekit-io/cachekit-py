@@ -28,6 +28,7 @@ layer that used to defeat it.
 from __future__ import annotations
 
 import json as _json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -91,8 +92,14 @@ def _make_backend() -> tuple[CachekitIOBackend, list[httpx.Request]]:
     sync_client = httpx.Client(base_url=_TEST_API_URL, transport=transport)
     async_client = httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)
     with (
-        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=sync_client)),
-        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=sync_client),
+        ),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=async_client),
+        ),
     ):
         return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY), seen
 

@@ -550,3 +550,151 @@ class TestObjectCacheSWR:
         assert oc.complete_refresh("k", version, "x" * 100_000, ttl=10) is False
         assert oc.get("k")[0] is False
         assert oc.size_bytes == 0
+
+
+@pytest.mark.unit
+class TestObjectCacheRefreshRetryBackoff:
+    """A failed refresh is not retried until swr_retry_interval has passed.
+
+    Clock is faked. With ttl=100 and ratio=0.5 the max jittered threshold is 55 s,
+    so every read from t=1060 on is in the refresh band until hard expiry at t=1100.
+    """
+
+    @staticmethod
+    def _fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> types.SimpleNamespace:
+        fake_time = types.SimpleNamespace(monotonic=lambda: start)
+        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+        return fake_time
+
+    @staticmethod
+    def _fail_once(oc: ObjectCache, key: str) -> None:
+        _, _, needs_refresh, version = oc.get_with_swr(key, ttl=100)
+        assert needs_refresh
+        oc.fail_refresh(key, version)
+
+    def test_no_refresh_flagged_inside_interval_and_value_served(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
+        oc.put("k", "held", ttl=100)
+
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1060.0 + i  # up to 1071, all inside the 20 s back-off
+            hit, value, needs_refresh, _ = oc.get_with_swr("k", ttl=100)
+            assert (hit, value, needs_refresh) == (True, "held", False)
+
+    def test_first_read_after_interval_flags_exactly_one_refresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
+        oc.put("k", "held", ttl=100)
+
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        fake.monotonic = lambda: 1080.0
+        flags = [oc.get_with_swr("k", ttl=100)[2] for _ in range(5)]
+        assert flags == [True, False, False, False, False]
+
+    def test_success_clears_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
+        oc.put("k", "held", ttl=100)
+
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+        assert oc._store["k"].refresh_failed_at == 1060.0
+
+        fake.monotonic = lambda: 1080.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=100)
+        assert needs_refresh
+        assert oc.complete_refresh("k", version, "new", ttl=100) is True
+        assert oc._store["k"].refresh_failed_at is None
+
+    def test_backoff_is_per_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
+        oc.put("a", 1, ttl=100)
+        oc.put("b", 2, ttl=100)
+
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "a")
+
+        assert oc.get_with_swr("a", ttl=100)[2] is False
+        assert oc.get_with_swr("b", ttl=100)[2] is True
+
+    def test_invalidated_entry_takes_its_backoff_with_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
+        oc.put("k", "held", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        assert oc.delete("k") is True
+        oc.put("k", "recached", ttl=100)
+        fake.monotonic = lambda: 1120.0  # stale again, still inside the old 1000 s back-off
+        assert oc.get_with_swr("k", ttl=100)[2] is True
+
+    def test_evicted_entry_takes_its_backoff_with_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(max_entries=1, swr_threshold_ratio=0.5, swr_retry_interval=1000)
+        oc.put("k", "held", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        oc.put("other", "x", ttl=100)  # LRU-evicts k
+        assert oc.get("k")[0] is False
+        oc.put("k", "recached", ttl=100)
+        fake.monotonic = lambda: 1120.0
+        assert oc.get_with_swr("k", ttl=100)[2] is True
+
+    def test_zero_interval_retries_on_next_stale_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=0)
+        oc.put("k", "held", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        assert oc.get_with_swr("k", ttl=100)[2] is True
+
+    def test_cancel_does_not_back_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A refresh that never ran (capacity, uncopyable args) made no upstream call."""
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
+        oc.put("k", "held", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        _, _, needs_refresh, version = oc.get_with_swr("k", ttl=100)
+        assert needs_refresh
+        oc.cancel_refresh("k", version)
+
+        assert oc.get_with_swr("k", ttl=100)[2] is True
+
+    def test_stale_fail_cannot_back_off_newer_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
+        oc.put("k", "v1", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        _, _, _, old_version = oc.get_with_swr("k", ttl=100)
+
+        oc.put("k", "v2", ttl=100)  # replaced while the old refresh ran
+        oc.fail_refresh("k", old_version)
+        assert oc._store["k"].refresh_failed_at is None
+
+        fake.monotonic = lambda: 1120.0
+        assert oc.get_with_swr("k", ttl=100)[2] is True
+
+    def test_hard_expiry_still_misses_during_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._fake_clock(monkeypatch)
+        oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
+        oc.put("k", "held", ttl=100)
+        fake.monotonic = lambda: 1060.0
+        self._fail_once(oc, "k")
+
+        fake.monotonic = lambda: 1100.0
+        assert oc.get_with_swr("k", ttl=100) == (False, None, False, 0)
+
+    @pytest.mark.parametrize("bad", [-1, -0.001, float("nan")])
+    def test_rejects_negative_or_nan_interval(self, bad: float) -> None:
+        with pytest.raises(ValueError, match="swr_retry_interval"):
+            ObjectCache(swr_retry_interval=bad)

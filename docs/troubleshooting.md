@@ -293,7 +293,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **Sync calls do not retry a rate-limited request** — the call runs uncached, and the failure does not count toward the circuit breaker. Async calls currently retry the lock request for about 5 seconds plus request time on a 429 (a known defect, see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the call runs uncached, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs uncached (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -354,7 +354,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker. Async calls currently retry the lock request for about 5 seconds plus request time before running the function (a known defect, see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
+4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
 
 </details>
 

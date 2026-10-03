@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import random
 import time
 from collections.abc import AsyncIterator
@@ -16,7 +17,12 @@ from urllib.parse import quote
 import httpx
 from pydantic import SecretStr, ValidationError
 
-from cachekit.backends.cachekitio.client import lease_async_http_client, lease_sync_http_client
+from cachekit.backends.cachekitio.client import (
+    AsyncClientLease,
+    SyncClientLease,
+    lease_async_http_client,
+    lease_sync_http_client,
+)
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -244,13 +250,38 @@ class CachekitIOBackend:
             raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
         # Get HTTP clients (hybrid sync/async architecture)
-        # Sync client: per-thread, thread-safe, no event loop required. _sync_lease is never read:
-        # it is held only to keep the client open, and dropping it closes the client.
+        # Sync client: per-thread, thread-safe, no event loop required. Holding the lease keeps the client
+        # open; dropping it closes the client.
         # Async client: per thread and running event loop, built on first async use; asyncio.run per job
         # gets a fresh client each time, never one whose connections belong to a closed loop.
+        # Fork: each request re-leases when the lease's PID is not this process's (see _own_sync_lease).
         self._sync_lease = lease_sync_http_client(self._config)
-        self._sync_client = self._sync_lease.client
         self._async_lease = lease_async_http_client(self._config)
+
+    def _own_sync_lease(self) -> SyncClientLease:
+        """This process's sync lease: a forked child re-leases, so it never sends on its parent's connections.
+
+        Those connections share the parent's TLS sessions: whichever process writes second on one breaks
+        it, and a raced read can return the other process's response. Checked per request rather than by
+        an at-fork hook, because uWSGI forks without running Python's at-fork hooks; os.getpid() is
+        negligible next to the request. The lease is published through one reference and carries its own
+        PID, so a thread never pairs a new PID with an inherited client.
+        """
+        lease = self._sync_lease
+        if lease.pid != os.getpid():
+            lease = self._sync_lease = lease_sync_http_client(self._config)
+        return lease
+
+    def _own_async_lease(self) -> AsyncClientLease:
+        """This process's async lease, as _own_sync_lease.
+
+        A new lease also drops the per-loop slot the inherited one holds, which a child still running its
+        parent's event loop object would otherwise reuse, parent's client and all.
+        """
+        lease = self._async_lease
+        if lease.pid != os.getpid():
+            lease = self._async_lease = lease_async_http_client(self._config)
+        return lease
 
     @staticmethod
     def _encode_key(key: str) -> str:
@@ -336,8 +367,10 @@ class CachekitIOBackend:
             kwargs["headers"] = metrics_headers
 
         url = f"/v1/cache/{endpoint}"
+        # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
+        lease = self._own_sync_lease()
         try:
-            response = self._sync_client.request(method, url, **kwargs)
+            response = lease.client.request(method, url, **kwargs)
             if miss_on_404 and response.status_code == 404:
                 return response
             response.raise_for_status()
@@ -394,7 +427,7 @@ class CachekitIOBackend:
 
         url = f"/v1/cache/{endpoint}"
         try:
-            response = await self._async_lease.client.request(method, url, **kwargs)
+            response = await self._own_async_lease().client.request(method, url, **kwargs)
             if miss_on_404 and response.status_code == 404:
                 return response
             response.raise_for_status()
@@ -694,29 +727,22 @@ class CachekitIOBackend:
         escape the wrapper's degrade-to-no-lock branch.
 
         Raises:
-            BackendError: For AUTHENTICATION and PERMANENT failures (bad key, bad key
-                format rejected by SaaS validator) — polling won't recover and the wrapper
-                degrades to no-lock execution. TRANSIENT/TIMEOUT/UNKNOWN are swallowed as
-                None so the polling loop can retry.
+            BackendError: For any failed request, whatever its type. Only ``200`` with a null
+                ``lock_id`` means contested (protocol ``POST /v1/cache/{key}/lock``); an error
+                status or a network failure ends the wait, and the wrapper degrades to no-lock
+                execution instead of polling a failing endpoint for ``blocking_timeout``.
         """
         # Clamp non-positive / non-finite timeouts before the int conversion.
         # int(NaN) / int(inf) raise ValueError/OverflowError that aren't BackendError, so
         # they'd escape the wrapper's degrade-to-no-lock branch and crash the @cache.io call.
         timeout_ms = max(1, int(timeout * 1000)) if math.isfinite(timeout) else 1
         encoded_key = self._encode_key(lock_key)
-        try:
-            response = await self._request_async(
-                "POST",
-                f"{encoded_key}/lock",
-                content=json.dumps({"timeout_ms": timeout_ms}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-        except BackendError as exc:
-            # Re-raise unrecoverable failures so the wrapper can log + degrade once,
-            # instead of burning the full blocking_timeout on billable retries.
-            if exc.error_type in (BackendErrorType.AUTHENTICATION, BackendErrorType.PERMANENT):
-                raise
-            return None
+        response = await self._request_async(
+            "POST",
+            f"{encoded_key}/lock",
+            content=json.dumps({"timeout_ms": timeout_ms}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
 
         try:
             data = response.json()
