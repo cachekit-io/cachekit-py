@@ -17,7 +17,7 @@ import os
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import pytest
@@ -316,10 +316,10 @@ class TestSWRConfig:
 class TestSWRForkIsolation:
     """LAB-506 follow-through: SWR scheduler state must not survive fork().
 
-    The per-wrapper in-flight set and slot semaphore are parent state: the
-    parent threads that would clear them don't survive fork, so without a
+    The per-wrapper refresh pool (in-flight keys and slots) is parent state:
+    the parent threads that would clear it don't survive fork, so without a
     PID guard an inherited in-flight key starves revalidation in the child
-    forever, and the inherited semaphore can carry consumed slots.
+    forever, and the inherited pool can carry consumed slots.
     """
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
@@ -700,6 +700,209 @@ class TestSWRSchedulingHardening:
         assert compute() == 1  # slot NOT leaked: retry schedules successfully
         assert _wait_for(lambda: calls["n"] == 2)
         assert _wait_for(lambda: len(backend.set_calls) == 2)
+
+
+async def _resume() -> list[asyncio.Task[Any]]:
+    """Let a resumed loop run its other tasks a few steps; return those still pending.
+
+    Every task that finished must have been cancelled: a pruned refresh that raised on the way
+    out (say, by giving back a slot it no longer held) fails the test here.
+    """
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    for t in others:
+        if t.done():
+            assert t.cancelled(), t.exception()
+    return [t for t in others if not t.done()]
+
+
+def _collect_pruned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collect the refreshes pruned from a closed loop, which nothing holds any more. asyncio logs
+    each as destroyed while pending; closing its coroutine must raise nothing."""
+    import gc
+
+    unraisable: list[Any] = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    gc.collect()
+    assert unraisable == []
+
+
+def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
+    if loop.is_closed():
+        return
+    pending = asyncio.all_tasks(loop)
+    for t in pending:
+        t.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
+
+
+class TestAsyncSWRStoppedLoop:
+    """LAB-7295: a revalidation left pending on an event loop that stopped (sync code calling
+    run_until_complete) or closed without cancelling its tasks keeps its slot and key for the
+    hold, then the next revalidation attempt releases both and cancels it."""
+
+    @staticmethod
+    def _parking_compute(backend: FakeSWRBackend, starts: list[int]) -> Any:
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute(x: int) -> int:
+            if backend.stale:  # a revalidation
+                starts.append(x)
+                await asyncio.sleep(3600)  # never answers: the revalidation stays pending
+            return x
+
+        return compute
+
+    @pytest.mark.parametrize("close", [False, True], ids=["stopped", "closed"])
+    def test_revalidation_on_stopped_loop_frees_slot_and_key(self, monkeypatch: pytest.MonkeyPatch, close: bool) -> None:
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+        backend = FakeSWRBackend()
+        starts: list[int] = []
+        compute = self._parking_compute(backend, starts)
+
+        async def hit(x: int) -> None:
+            assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(hit(0))  # key 0's revalidation parks on a loop then left stopped
+            if close:
+                stopped.close()  # without cancelling it
+            asyncio.run(hit(1))  # within the hold the parked revalidation keeps the only slot
+            asyncio.run(hit(0))  # and its key
+            assert starts == [0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+            asyncio.run(hit(1))  # past the hold it holds no slot
+            asyncio.run(hit(0))  # nor its key
+            assert starts == [0, 1, 0]
+            if close:
+                _collect_pruned(monkeypatch)
+        finally:
+            _close_loop(stopped)
+
+    def test_revalidations_pruned_from_stopped_loops_do_not_resume(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loops that resume after pausing between run_until_complete calls run no more
+        revalidations than the pool holds: the pruned ones were cancelled."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 2)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        compute = self._parking_compute(backend, [])
+
+        async def hits() -> None:
+            for x in (0, 1):
+                assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        loops = [asyncio.new_event_loop() for _ in range(3)]
+        try:
+            for loop in loops:
+                loop.run_until_complete(hits())  # each pauses with its revalidations pending
+            assert sum(len(loop.run_until_complete(_resume())) for loop in loops) == 2  # the pool's 2, not 6
+        finally:
+            for loop in loops:
+                _close_loop(loop)
+
+    def test_pruned_revalidation_that_resumes_frees_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pruned revalidation whose loop runs again neither raises nor gives back the slot or
+        the key that a newer revalidation of the same key now holds."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        starts: list[int] = []
+        compute = self._parking_compute(backend, starts)
+
+        async def hit(x: int) -> None:
+            assert await compute(x) == x
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(compute(0))  # misses: store
+        asyncio.run(compute(1))
+        backend.stale = True
+        first, second = asyncio.new_event_loop(), asyncio.new_event_loop()
+        try:
+            first.run_until_complete(hit(0))  # parks
+            second.run_until_complete(hit(0))  # prunes the first, then holds key 0 and the only slot
+            assert starts == [0, 0]
+            monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 3600.0)
+            assert first.run_until_complete(_resume()) == []  # the pruned one ends cancelled
+            asyncio.run(hit(0))  # the second still holds key 0
+            asyncio.run(hit(1))  # and the only slot
+            assert starts == [0, 0]
+        finally:
+            _close_loop(first)
+            _close_loop(second)
+
+    def test_pruned_revalidation_does_not_store_its_late_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancelling a pruned revalidation does not stop a function that swallows the
+        cancellation, so it must not store what it returns: a newer revalidation has already
+        stored a later value for the key."""
+        import cachekit.decorators.wrapper as wrapper_mod
+
+        monkeypatch.setattr(wrapper_mod, "_L2_SWR_MAX_CONCURRENT_REFRESHES", 1)
+        monkeypatch.setattr(wrapper_mod, "_SWR_STOPPED_LOOP_HOLD_SECONDS", 0.0)
+        backend = FakeSWRBackend()
+        calls: list[str] = []
+
+        @cache(backend=backend, ttl=60, stale_ttl=120, l1_enabled=False)
+        async def compute() -> str:
+            if len(calls) == 1:  # the first revalidation parks, then swallows its cancellation
+                calls.append("parked")
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(3600)
+                calls.append("late")
+                return "late"
+            calls.append("seed" if not calls else "fresh")
+            return calls[-1]
+
+        async def finish() -> None:
+            """Run this loop's revalidations to the end: a store goes through a thread, and the
+            task is done only once it has landed."""
+            others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            await asyncio.wait(others, timeout=5)
+
+        async def park() -> None:
+            await compute()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def hit() -> None:
+            await compute()
+            await finish()
+
+        asyncio.run(compute())  # miss: stores "seed"
+        backend.stale = True
+        stopped = asyncio.new_event_loop()
+        try:
+            stopped.run_until_complete(park())  # the first revalidation parks on a loop then left stopped
+            asyncio.run(hit())  # prunes it, then stores "fresh"
+            assert calls == ["seed", "parked", "fresh"]
+            assert len(backend.set_calls) == 2
+            stopped.run_until_complete(finish())  # the pruned one resumes and returns "late"
+            assert calls[-1] == "late"
+            assert len(backend.set_calls) == 2  # but stores nothing
+            backend.stale = False
+            assert asyncio.run(compute()) == "fresh"
+        finally:
+            _close_loop(stopped)
 
 
 _WRAPPER_LOGGER = "cachekit.decorators.wrapper"
