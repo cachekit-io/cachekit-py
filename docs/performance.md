@@ -8,210 +8,72 @@
 
 ## Key Numbers
 
-> [!WARNING]
-> Most microsecond figures on this page predate the current stack and have not been re-measured.
-> On 2026-10-03 the guards in `tests/performance/test_production_realism.py` measured the decorator
-> + L1 hit on the 10KB dict at a raw p95 of 14–16μs, not 242μs, and the 10-thread case at 13μs.
-> Treat the other figures as stale until they are re-run. [Instruction Budgets](#instruction-budgets)
-> is current.
-
 > [!TIP]
-> **Key numbers (p95 latency):**
-> - **L1 cache hit**: 500ns (pure dict lookup)
-> - **Decorator + L1 hit**: ~5.6μs median, CPython 3.12 (indicative wall clock; 61k instructions per call, see [Instruction Budgets](#instruction-budgets))
-> - **Complex payload (10KB dict)**: 242μs with serialization
-> - **DataFrame (10K rows, Arrow)**: 800μs total roundtrip
-> - **Concurrent access (10 threads)**: 231μs (minimal contention)
-> - **Encryption overhead**: 1.03x (only 3% slower)
+> **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03; indicative wall clock on a shared host):
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
+> - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
+> - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
+> - **Redis L2 hit**, L1 disabled, same dict, Redis on loopback: 0.41–0.42ms
 
 ## Measurement Methodology
 
-All benchmarks use:
-- **time.perf_counter_ns()**: Nanosecond-precision performance counter
-- **Statistical rigor**: 5 independent runs; the estimate is a 95% t-interval over the per-run medians
+Every figure on this page comes from a guard in `tests/performance/`:
+- **Timer**: `time.perf_counter_ns()` around each call
+- **Runs, not samples**: each guard takes 5 independent runs, with a forced garbage collection before each. The figure is the mean of the per-run medians with its 95% t band at df = 4 (`stats_utils.summarize`)
 - **Every raw sample kept**: percentiles cover all samples; outliers are counted, never filtered
-- **Warmup**: 1,000 iterations before measurement
-- **Realistic payloads**: 10KB dicts, 10K row DataFrames, custom dataclasses
-- **Production configuration**: All reliability features enabled (circuit breaker, backpressure, timeouts)
+- **Warm-up**: each run warms up for at least 5,000 calls (2,000 for the raw L1 guard), stopping once the last 1,000 calls vary by less than 10%, and at most twice that minimum
+- **Pre-flight**: each session prints whether the host is throttled or loaded (`measurement_env.py`)
+- **No tail claims at 5 runs**: the `P95` line of a guard's summary reads "inconclusive" unless it has at least 10 runs and 400 samples (the `P99` line needs 10 runs and 2,000 samples). Every guard below runs 5, so both lines read "inconclusive" and this page quotes no tail percentile. The guards' own lines after the summary ("Total measured", the ✅ line, "Decorator + complex payload") still print the raw p95 of every sample, which their thresholds check; at 5 runs that number does not support a tail claim
 
-Run benchmarks yourself:
+## Measured Figures
+
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards on 2026-10-03, CPython 3.14.3, x86_64 Linux. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
+
+| Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
+|------|------------------------------|-------:|-------:|
+| Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as MessagePack) | `test_production_realism.py::test_decorator_overhead_complex_dict` | 6.39 ± 2.03μs | 5.55 ± 0.83μs |
+| Decorator + L1 hit, `@cache(backend=None)`, `User` dataclass | `test_production_realism.py::test_decorator_overhead_dataclass` | 6.27 ± 2.10μs | 4.98 ± 0.07μs |
+| Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 5.38 ± 0.15μs | 5.08 ± 0.17μs |
+| Raw L1 byte-cache lookup, `L1Cache.get` of 1KB, no decorator | `test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous` | 354 ± 68ns | 362 ± 41ns |
+| Redis L2 hit, L1 disabled, same 100-user dict, Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
+
+The bands run from ±1% to ±39% of their figure, and pass 2 sits between 2% above and 21% below pass 1. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
+
+Run them yourself:
 ```bash
-# Component-level profiling
-uv run pytest tests/performance/test_cache_profiler.py -v -s
-
-# End-to-end decorator overhead
-uv run pytest tests/performance/test_end_to_end_latency.py -v -s
-
-# Production-realistic scenarios
-uv run pytest tests/performance/test_production_realism.py -v -s
-
-# Serializer comparison
-uv run pytest tests/performance/test_serializer_benchmarks.py -v -s
+uv run pytest tests/performance/test_production_realism.py -v -s \
+  -k "complex_dict or dataclass or dataframe or redis_l2"
+uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous -v -s
+# The Redis guard skips unless Redis answers at REDIS_URL (default redis://localhost:6379)
 ```
 
-## End-to-End Latency Breakdown
+## Why an L1-Only Hit Costs the Same for Any Payload
 
-### 10KB Complex Dict (Typical API Response)
+With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.
 
-**Total p95: 242μs** (241,708ns)
-
-Component breakdown:
-- **Serialization (msgpack)**: 100μs (41%)
-- **Deserialization**: 100μs (41%)
-- **Decorator overhead**: 20μs (8%)
-- **Key generation**: 2μs (1%)
-- **L1 cache lookup**: 0.5μs (0.2%)
-- **Other (Python interpreter)**: 20μs (8%)
-
-**Validated with 95% CI:** [208.5μs, 208.8μs] across 5 runs, 49,548 samples
-
-### User Dataclass (Smaller Payload)
-
-**Total p95: 122μs** (121,546ns)
-
-Faster due to smaller serialization overhead. Same component ratios.
-
-### DataFrame (10K Rows)
-
-**With ArrowSerializer:**
-- **Serialize**: 0.48ms
-- **Deserialize**: 0.32ms
-- **Total roundtrip**: 0.80ms
-- **Decorator overhead**: ~20μs
-- **Grand total**: ~820μs
-
-**With MessagePack (default):**
-- **Serialize**: 1.64ms
-- **Deserialize**: 2.32ms
-- **Total roundtrip**: 3.96ms
-- **Speedup**: **5.0x slower** than Arrow
-
-> [!IMPORTANT]
-> Use ArrowSerializer for DataFrames with 10K+ rows (see [Serializer Guide](serializers/README.md)).
-
-## L1 Cache Component Profiling
-
-Pure L1 cache performance (no decorator, direct cache.get() calls):
-
-**Total p95: 458ns**
-
-Component breakdown:
-- **Lock acquisition (RLock)**: 250ns (54.6%)
-- **TTL check (time.time())**: 208ns (45.4%)
-- **Dict lookup**: 125ns (27.3%)
-- **LRU move (OrderedDict)**: 125ns (27.3%)
-- **Counter increment**: 125ns (27.3%)
-
-> [!NOTE]
-> Lock acquisition dominates L1 latency, but it's necessary for thread safety. The 458ns is the practical limit for a thread-safe Python cache.
-
-**Scaling characteristics:**
-- Dict lookup is **O(1)**: 125ns for 1 entry, 125ns for 10,000 entries
-- Cache size has **zero impact** on lookup speed
-- Lock contention remains minimal up to 4 concurrent threads (500ns p95)
-
-## Decorator Overhead Analysis
-
-### Isolated Decorator (No Caching)
-
-**Mean: 110μs, p95: 160μs**
-
-This measures the decorator machinery alone:
-- Argument binding and inspection
-- Context extraction (thread/async detection)
-- Function invocation
-- Key generation
+With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. No guard measures it through the run-level harness yet, so this page quotes no figure for it.
 
 ### Decorator + L1 Hit (Hot Path)
 
-**About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
+An L1-only hit takes 5.0–6.4μs across the three payloads above.
 
 The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **61,000 instructions per call** on CPython 3.12 and 62,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
-**About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
-
-## Concurrent Access Performance
-
-**Workload:** 10 threads hammering the same cache key (worst-case contention)
-
-**Results:**
-- **Single-threaded**: 242μs p95
-- **10 threads**: 231μs p95
-- **Degradation**: Essentially none (within measurement noise)
-
-**Key takeaway:** RLock contention is **not a bottleneck** for realistic concurrency levels. The L1 cache is designed for high-throughput, multi-threaded applications.
-
-## Encryption Overhead
-
-**Without encryption:** 210μs mean, 228μs p95
-**With AES-256-GCM:** 215μs mean, 236μs p95
-
-**Overhead:** 1.03x (only **3% slower**)
-
-**Why so low?**
-- Encryption happens in Rust (PyO3 FFI)
-- AES-NI hardware acceleration on modern CPUs
-- Zero-copy memory handling
-
-**Security benefit:**
-- Client-side encryption (no plaintext PII in cache)
-- L1 stores encrypted bytes only
-
-See [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for details.
-
-## Serializer Performance Comparison
-
-### DataFrame Serialization (10K rows)
-
-| Serializer | Serialize | Deserialize | Total | Speedup |
-|------------|-----------|-------------|-------|---------|
-| **Arrow** | 0.48ms | 0.32ms | 0.80ms | **Baseline** |
-| **MessagePack** | 1.64ms | 2.32ms | 3.96ms | 5.0x slower |
-
-### DataFrame Serialization (100K rows)
-
-| Serializer | Serialize | Deserialize | Total | Speedup |
-|------------|-----------|-------------|-------|---------|
-| **Arrow** | 2.93ms | 1.13ms | 4.06ms | **Baseline** |
-| **MessagePack** | 16.42ms | 22.62ms | 39.04ms | 9.6x slower |
-
-**Arrow advantages:**
-- **Zero-copy deserialization**: Memory-mapped, no full data copy
-- **Columnar format**: Efficient for numeric/datetime columns
-- **20x faster deserialization** for large DataFrames
-
-**MessagePack advantages:**
-- **Broad type support**: Handles all Python objects (dicts, lists, custom classes)
-- **Lower overhead for small data**: Faster than Arrow for <1K rows
-- **Integrated compression**: LZ4 + xxHash3-64 checksums (Rust layer)
-
-See [Serializer Guide](serializers/README.md) for decision matrix.
+The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-only hit uses a separate object cache, whose lookup no guard times on its own.
 
 ## L2 Backend (Redis) Performance
 
-**Local Redis (localhost):**
-- **Network RTT**: 1-2ms
-- **Total L2 hit latency**: 2-5ms (network + deserialization)
+An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis on the same machine takes 0.41–0.42ms: the decorator, the round trip over loopback and deserialization. That is 65–73 times an L1-only hit of the same dict (pass by pass). A Redis on another machine adds its network latency on top; no guard measures that.
 
-**Remote Redis (same datacenter):**
-- **Network RTT**: 5-15ms
-- **Total L2 hit latency**: 10-30ms
+## Not Measured Here
 
-**L1 cache value proposition:**
-- L1 hit: **242μs** (0.242ms)
-- L2 hit: **2-5ms** (local Redis)
-- **Speedup**: **8-20x faster** with L1 cache
+These have no figure from the run-level harness, so this page quotes none:
+- **An L1 hit with an L2 backend configured**, which deserializes the stored bytes
+- **Concurrent access**: the 10-thread guard (`test_concurrent_cache_access`) collects every thread's samples into one list and computes its tail outside the run-level harness
+- **Encryption overhead**: `test_encryption_overhead` prints only means and raw p95s. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+- **The async decorator, serializer comparisons and a Redis on another machine**
 
-## Async Decorator Performance
-
-**Async decorator + L1 hit:** 192μs mean, 201μs p95
-
-**Compared to sync:** ~6x faster than sync decorator (which showed 32μs mean in other tests, but this is likely due to measurement differences)
-
-**Why async is competitive:**
-- Same L1 cache path (no await needed for memory lookups)
-- Async overhead is minimal for cache hits
-- Async benefits show up during cache misses (non-blocking I/O to Redis)
+For choosing a serializer, see the [Serializer Guide](serializers/README.md).
 
 ## Performance Optimization Tips
 
@@ -227,9 +89,8 @@ def expensive_function(user_id: int):
 ```
 
 **L1 gives you:**
-- 8-20x faster than Redis
-- Sub-millisecond latency
-- No network overhead
+- No network round trip on a hit
+- An L1-only hit in 5.0–6.4μs, against 0.41–0.42ms for a loopback Redis L2 hit
 
 ### 2. Choose the Right Serializer
 
@@ -239,7 +100,7 @@ from cachekit.serializers import ArrowSerializer
 
 @cache(serializer=ArrowSerializer())
 def get_large_dataset(date: str):
-    return load_dataframe(date)  # 5-10x faster serialization
+    return load_dataframe(date)  # columnar Arrow format
 ```
 
 **For everything else:**
@@ -254,7 +115,7 @@ def get_user_config(user_id: int):
 **Bad (many small cache hits):**
 ```python notest
 for user_id in user_ids:
-    data = get_user_data(user_id)  # 100 cache hits = 24ms total
+    data = get_user_data(user_id)  # one decorator call per user
 ```
 
 **Good (one large cache hit):**
@@ -263,7 +124,7 @@ for user_id in user_ids:
 def get_users_batch(user_ids: list[int]):
     return [fetch_user_data(uid) for uid in user_ids]
 
-data = get_users_batch(user_ids)  # 1 cache hit = 242μs
+data = get_users_batch(user_ids)  # one decorator call for the batch
 ```
 
 ### 4. Tune TTL for Hit Rate
@@ -313,62 +174,27 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ## Performance Bottlenecks and Mitigations
 
-### Bottleneck 1: Serialization Dominates Latency (82%)
+### Bottleneck 1: The L2 Round Trip
 
-**Problem:** MessagePack serialization takes 100μs for a 10KB dict, which is 200x slower than the L1 lookup (500ns).
-
-**Mitigations:**
-- **Reduce payload size:** Cache only what you need
-- **Use Arrow for DataFrames:** 5-10x faster serialization
-- **Enable compression:** Already enabled by default (Rust layer)
-
-**Reality check:** Even with serialization overhead, 242μs is still 8-20x faster than Redis.
-
-### Bottleneck 2: Network Latency (L2 Cache)
-
-**Problem:** Redis L2 hit adds 2-5ms network RTT.
+**Problem:** a Redis L2 hit over loopback takes 0.41–0.42ms, 65–73 times an L1-only hit of the same 100-user dict (23.5KB as MessagePack). A Redis on another machine adds its network latency.
 
 **Mitigations:**
-- **L1 cache already handles this:** 90%+ of cache hits should come from L1
-- **Tune L1 size:** Increase `max_memory_mb` if needed (default: 100MB)
+- **Keep L1 on** (the default), so repeat reads skip the round trip
+- **Tune L1 size:** raise `L1CacheConfig(max_size_mb=...)` or `CACHEKIT_L1_MAX_SIZE_MB` (default: 100MB per namespace) if entries are evicted early
 - **Optimize L1 TTL:** Match L1 TTL to data freshness requirements
+- **Reduce payload size:** cache only what you need; the L2 path deserializes the whole value
 
-### Bottleneck 3: Decorator Overhead (~5μs)
+### Bottleneck 2: Decorator Overhead
 
-**Problem:** Decorator machinery adds ~5μs on top of the L1 lookup.
-
-**Mitigations:**
-- **This is acceptable:** ~5μs is negligible compared to function execution time
-- **For ultra-low-latency:** Use direct `StandardCacheHandler` API (bypasses decorator)
-- **Batch queries:** Amortize decorator overhead across multiple items
-
-**Example (advanced):**
-```python notest
-from cachekit.cache_handler import StandardCacheHandler
-
-handler = StandardCacheHandler(backend=redis_backend)
-
-# Direct cache access (no decorator overhead)
-found, value = handler.get("my_key")
-if not found:
-    value = expensive_function()
-    handler.put("my_key", value, ttl=3600)
-```
-
-### Bottleneck 4: Lock Contention (High Concurrency)
-
-**Problem:** RLock acquisition takes 250ns, which can become a bottleneck at 100+ threads.
+**Problem:** every decorated call pays for key generation and the decorator's bookkeeping, 5.0–6.4μs per L1-only hit.
 
 **Mitigations:**
-- **Most apps don't hit this:** Lock contention is minimal up to 10-20 threads
-- **Shard your cache:** Use multiple L1Cache instances with consistent hashing
-- **Use async:** Async decorator avoids blocking on locks
-
-**Reality check:** Lock overhead (250ns) is 0.1% of total latency (242μs). Not worth optimizing unless you have extreme concurrency (100+ threads).
+- **This is acceptable** for any function slow enough to be worth caching
+- **Batch queries:** one call that returns many items pays the overhead once
 
 ## Performance Regression Testing
 
-Wall-clock benchmarks do not gate CI: on a shared machine their run-to-run noise is several percent. The wall-clock suites below are informational:
+Wall-clock benchmarks do not gate CI: on a shared machine one guard's run-level band reaches ±39% (see [Measured Figures](#measured-figures)). The wall-clock suites below are informational:
 
 ```bash
 uv run pytest tests/performance/ -v -m performance
@@ -418,76 +244,6 @@ make perf-ir-update  # ratchet: write lower measured figures back as budgets, ne
 ```
 
 The gate runs at most 8 callgrind processes at a time (fewer on a smaller machine), and each holds about half a gigabyte, so it can share a machine with other work. `--jobs N` changes that. A deliberate cost increase (a new feature on the hot path) is recorded with `uv run python tests/performance/ir_budget.py --update --allow-increase`, and the PR states why.
-
-## Real-World Performance Context
-
-**Typical use case:** API response caching
-
-**Without cachekit:**
-- Database query: 50-200ms
-- Redis cache hit: 2-5ms
-- **Best case**: 2ms (Redis hit)
-
-**With cachekit:**
-- L1 cache hit: **242μs** (0.242ms)
-- L2 cache hit: 2-5ms (Redis)
-- Cache miss: 50-200ms (database)
-
-**With 90% L1 hit rate:**
-- Average latency: 0.9 × 0.242ms + 0.1 × 2ms = **0.42ms**
-- **Speedup**: 4.8x faster than Redis-only caching
-
-**Network latency dominates real-world performance.** Even a "slow" 1ms cache operation is fast when you consider:
-- Typical API response time: 100-500ms
-- Database query: 50-200ms
-- External API call: 200-1000ms
-
-## Appendix: Raw Benchmark Data
-
-**L1 Cache Component Breakdown:**
-```
-Lock acquisition:        250ns p95
-Dict lookup:            125ns p95
-TTL check:              208ns p95
-LRU move:               125ns p95
-Counter increment:      125ns p95
------------------------------------
-Total (measured):       458ns p95
-```
-
-**Decorator Overhead (10KB dict):**
-```
-Serialization:          100μs (41%)
-Deserialization:        100μs (41%)
-Decorator machinery:     20μs (8%)
-Key generation:           2μs (1%)
-L1 lookup:              0.5μs (0.2%)
-Other (interpreter):     20μs (8%)
------------------------------------
-Total (measured):       242μs p95
-95% CI:                 [208.5, 208.8]μs
-```
-
-**Concurrent Access (10 threads):**
-```
-Total operations:       10,000
-Mean:                   844μs
-Median:                 210μs
-P95:                    231μs
-P99:                    284μs
-```
-
-**Arrow vs MessagePack (10K rows):**
-```
-Arrow serialize:        0.48ms
-Arrow deserialize:      0.32ms
-MessagePack serialize:  1.64ms
-MessagePack deserialize: 2.32ms
-
-Serialization speedup:  3.4x
-Deserialization speedup: 7.1x
-Total speedup:          5.0x
-```
 
 ---
 
