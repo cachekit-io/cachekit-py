@@ -949,11 +949,23 @@ class CachekitIOBackend:
     def _delete_lock_sync(self, lock_key: str, lock_id: str) -> bool:
         """``_delete_lock`` on the sync client, for an executor thread.
 
+        The caller has already returned, so it may close the sync client (``close_sync_client()``)
+        before or while this runs. That client is the one the backend's lease holds, so a failure
+        on a closed client takes a new lease and sends the DELETE once more; the server matches the
+        DELETE on the holder, so a repeat is harmless.
+
         A failure is logged here, not left on the future: if the loop closes before the DELETE
         finishes, nothing on the loop ever reads the future again.
         """
+        path = f"{self._encode_key(lock_key)}/lock"
+        headers = {LOCK_ID_HEADER: lock_id}
         try:
-            self._request_sync("DELETE", f"{self._encode_key(lock_key)}/lock", headers={LOCK_ID_HEADER: lock_id})
+            try:
+                self._request_sync("DELETE", path, headers=headers)
+            except BackendError:
+                if not self._renew_closed_sync_lease():
+                    raise
+                self._request_sync("DELETE", path, headers=headers)
             return True
         except BackendError as exc:
             logger.warning(
@@ -962,6 +974,13 @@ class CachekitIOBackend:
                 redact_error_for_log(exc),
             )
             return False
+
+    def _renew_closed_sync_lease(self) -> bool:
+        """Replace the sync lease if its client was closed under it. Returns whether it was."""
+        if self._sync_lease.client.is_closed is not True:  # `is True`: a Mock client is never closed
+            return False
+        self._sync_lease = lease_sync_http_client(self._config)
+        return True
 
     async def _release_lock(self, lock_key: str, lock_id: str) -> bool:
         """Release distributed lock. Internal helper for ``acquire_lock``'s cleanup.

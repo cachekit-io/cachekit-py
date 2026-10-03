@@ -816,3 +816,42 @@ class TestFillLock:
 
         assert _method_calls(request_mock) == ["POST", "DELETE"]
         backend._request_sync.assert_not_called()
+
+    async def test_release_survives_the_sync_client_closing_first(self) -> None:
+        """The release is still queued (one busy executor thread) when the caller closes the sync client,
+        as close_sync_client() does to the client a backend's lease holds. The DELETE still lands."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        sent: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append((request.method, request.url.path))
+            return httpx.Response(200)
+
+        clients = [httpx.Client(base_url=_TEST_API_URL, transport=httpx.MockTransport(handler)) for _ in range(2)]
+        leases = iter([MagicMock(pid=os.getpid(), client=client) for client in clients])
+        loop = asyncio.get_running_loop()
+        pool = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(pool)
+        with (
+            patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", side_effect=lambda _config: next(leases)),
+            patch(
+                "cachekit.backends.cachekitio.backend.lease_async_http_client",
+                return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
+            ),
+        ):
+            backend = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+            backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-c"}))  # type: ignore[method-assign]
+            gate = threading.Event()
+            busy = loop.run_in_executor(None, gate.wait, 5.0)
+
+            async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
+                pass
+            clients[0].close()
+            gate.set()
+            await busy
+            await _drain_background_releases()
+
+        clients[1].close()
+        assert sent == [("DELETE", "/v1/cache/k/lock")]
