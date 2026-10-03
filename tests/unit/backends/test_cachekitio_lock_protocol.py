@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import urllib.parse
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -338,20 +339,36 @@ class TestErrorPropagation:
                 pytest.fail("should never enter context body")
         assert request_mock.await_count == 1
 
-    async def test_transient_error_swallowed_for_retry(self, backend: CachekitIOBackend) -> None:
-        """TRANSIENT errors (e.g. 503) must be swallowed so polling can retry the SaaS."""
-        responses: list[Any] = [
-            BackendError("server down", error_type=BackendErrorType.TRANSIENT),
-            _json_response(200, {"lock_id": "lock-recovered"}),
-            _json_response(200, {}),  # release
-        ]
-        request_mock = AsyncMock(side_effect=responses)
+    @pytest.mark.parametrize(
+        "error_type",
+        [BackendErrorType.TRANSIENT, BackendErrorType.TIMEOUT, BackendErrorType.UNKNOWN],
+    )
+    async def test_retryable_error_ends_the_wait(self, backend: CachekitIOBackend, error_type: BackendErrorType) -> None:
+        """A 429, 5xx, timeout or connect error is an error, not contention: one POST, then raise.
+
+        Only ``200`` with a null ``lock_id`` is contested. Polling a failing endpoint used to
+        stall every call for the whole ``blocking_timeout``.
+        """
+        request_mock = AsyncMock(side_effect=BackendError("server down", error_type=error_type))
         backend._request_async = request_mock  # type: ignore[method-assign]
 
-        async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=5.0) as acquired:
-            assert acquired is True
+        with pytest.raises(BackendError) as exc_info:
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=5.0):
+                pytest.fail("should never enter context body")
+        assert exc_info.value.error_type == error_type
+        assert request_mock.await_count == 1
 
-        assert request_mock.await_count == 3
+    async def test_error_while_polling_ends_the_wait(self, backend: CachekitIOBackend) -> None:
+        """An error on a retry after a contested answer ends the wait too."""
+        request_mock = AsyncMock(
+            side_effect=[_json_response(200, _HELD), BackendError("rate limited", error_type=BackendErrorType.TRANSIENT)]
+        )
+        backend._request_async = request_mock  # type: ignore[method-assign]
+
+        with pytest.raises(BackendError):
+            async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=5.0):
+                pytest.fail("should never enter context body")
+        assert request_mock.await_count == 2
 
 
 @pytest.mark.unit
@@ -594,3 +611,76 @@ class TestCancellationMidRequest:
         assert fake.posts_done == 1
         assert fake.calls == ["POST"]
         assert calls == 0
+
+
+def _lock_failing_backend(lock_status: int, lock_body: bytes) -> tuple[CachekitIOBackend, list[httpx.Request]]:
+    """A backend over a real httpx client whose lock POST fails; every read misses, writes succeed."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "POST" and request.url.raw_path.endswith(b"/lock"):
+            return httpx.Response(lock_status, content=lock_body)
+        if request.method == "GET":
+            return httpx.Response(404)
+        return httpx.Response(200, content=b"{}")
+
+    transport = httpx.MockTransport(handler)
+    with (
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
+        ),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
+        ),
+    ):
+        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY), seen
+
+
+@pytest.mark.unit
+class TestDecoratorDegradesOnLockError:
+    """End to end: a failed lock POST never reaches an async caller, and ends the lock wait.
+
+    The function runs once, uncached, as a sync call would, and no ``cachekit.*`` log record
+    names the cache key in either form: the raw ``HTTPStatusError`` carries the request URL, in
+    which the key is percent-encoded.
+    """
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            pytest.param(401, b'{"error": "invalid api key"}', id="401"),
+            pytest.param(403, b"<!DOCTYPE html><title>Just a moment...</title>", id="403-challenge"),
+            pytest.param(403, b"error code: 1010", id="403-1010"),
+            pytest.param(400, b'{"error": "invalid key"}', id="400"),
+            pytest.param(429, b'{"error": "rate limited"}', id="429"),
+        ],
+    )
+    async def test_runs_once_uncached_with_one_lock_post(
+        self, status: int, body: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend, seen = _lock_failing_backend(status, body)
+        runs: list[int] = []
+
+        @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab5346")
+        async def compute(x: int) -> int:
+            runs.append(x)
+            return x * 2
+
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            assert await compute(1) == 2
+
+        assert runs == [1]
+        lock_posts = [r for r in seen if r.method == "POST" and r.url.raw_path.endswith(b"/lock")]
+        assert len(lock_posts) == 1, "a lock error ends the wait: no polling"
+
+        encoded_key = lock_posts[0].url.raw_path.decode().removeprefix("/v1/cache/").removesuffix("/lock")
+        raw_key = urllib.parse.unquote(encoded_key)
+        assert raw_key != encoded_key, "the key must carry a ':' for the encoded check to mean anything"
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            if record.name.startswith("cachekit"):
+                text = formatter.format(record)
+                assert raw_key not in text and encoded_key not in text, f"{record.name} logged the cache key: {text}"

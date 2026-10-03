@@ -176,11 +176,24 @@ def get_data():
 > twins, with one exception: a v0.20.0 or later decorator on the default serializer for the same
 > function and namespace registers its `:{integrity_flag}s` key there like any key it
 > writes. That registration lapses seven days after the last tracked write to the
-> function's registry, and a `ttl=None` entry outlives it. On a function with no
-> parameters, single-key and no-argument invalidation are one call and delete the key and
-> its twin. So flush on
-> the backend: on Redis, `SCAN` for the key prefix (`ns:<namespace>:*`) and `UNLINK` the
-> matches; the File backend stores one file per hashed key in `cache_dir`, so the only flush
+> function's registry, and a `ttl=None` entry outlives it. On a sync function with no
+> parameters, `cache_clear()` deletes the
+> key and its twin; on an async one with a backend, `cache_clear()` raises `TypeError`, and
+> `await fn.ainvalidate_cache()` deletes both. So flush on
+> the backend: on Redis, run the `scan_iter` + `unlink` script under *Option 3: Data
+> corruption* in [Decryption failed](../error-codes.md#decryption-failed---authentication-tag-mismatch)
+> once per tenant and per namespace or function (no single `SCAN` pattern both carries the
+> default backend's `t:<tenant>:` key prefix and stops at the namespace boundary). A run
+> reaches only the tenant in its `prefix`, and its `0 generated keys left` speaks for that
+> tenant alone: if you set `tenant_context`, repeat it for every tenant your application
+> uses (the script says how to list them, and that in a shared database a listed tenant
+> may belong to another application). The script does
+> not delete shortened keys (a namespace plus function name past about 170 characters):
+> when it prints `shortened keys may belong here`, the namespace is not yet erased. Evict
+> them with `invalidate_cache(<args>)`; if you do not know the arguments, delete the keys
+> its `shortened` pattern matches only once no other namespace or function shares their
+> first 50 characters, or flush the database if it is dedicated to cachekit. The File
+> backend stores one file per hashed key in `cache_dir`, so the only flush
 > is the whole directory. Memcached and CachekitIO offer no pattern delete, so old entries
 > there retire only by TTL. During a rolling deploy, flush **after the last replica still
 > writing the old keys is gone** — anything written behind the flush is orphaned.
