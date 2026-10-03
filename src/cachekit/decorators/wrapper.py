@@ -65,7 +65,7 @@ from .tenant_context import TenantContextExtractor
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
-    from ..backends.base import BaseBackend
+    from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
 
 
@@ -159,7 +159,9 @@ async def _phased(lock: contextlib.AbstractAsyncContextManager[_T], phase: _Lock
 
 
 @contextlib.asynccontextmanager
-async def _fill_lock(backend: Any, key: str, timeout: float, blocking_timeout: float) -> AsyncIterator[tuple[bool, bool]]:
+async def _fill_lock(
+    backend: LockableBackend, key: str, timeout: float, blocking_timeout: float
+) -> AsyncIterator[tuple[bool, bool]]:
     """The miss path's lock: ``(acquired, uncontended)``.
 
     A backend with ``acquire_fill_lock`` reports whether its first lock attempt won, and releases
@@ -2297,10 +2299,11 @@ def create_cache_wrapper(
                             except (DecryptionAuthenticationError, KeyringConfigurationError):
                                 # Same as the lock-acquired double-check below.
                                 raise
-                            except Exception:
+                            except Exception as e:
                                 # Cache check failed - fall through to execute function
                                 logger().warning(
-                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, "
+                                    f"executing without lock: {redact_error_for_log(e)}"
                                 )
 
                         elif not (lock_uncontended and _l2_read.clean_miss):

@@ -742,9 +742,9 @@ class TestFillLock:
         assert call.kwargs["headers"] == {LOCK_ID_HEADER: "lock-bg"}
 
     async def test_release_survives_the_teardown_cancel_sweep(self, backend: CachekitIOBackend) -> None:
-        """asyncio.run teardown cancels every Task, here before the drain Task has started. The DELETE was
-        already submitted to the executor, so it still runs to the end (asyncio.run then waits for the
-        executor; the cross-process test pins that part)."""
+        """asyncio.run teardown cancels every Task. The DELETE is already an executor job, not a Task, so
+        the sweep cannot reach it and it runs to the end (asyncio.run then waits for the executor; the
+        cross-process test pins that part)."""
         import threading
 
         in_flight, finish, sent = threading.Event(), threading.Event(), threading.Event()
@@ -868,7 +868,9 @@ class TestFillLock:
 
     async def test_release_survives_the_sync_client_closing_first(self) -> None:
         """The release is still queued (one busy executor thread) when the caller closes the sync client,
-        as close_sync_client() does to the client a backend's lease holds. The DELETE still lands."""
+        as close_sync_client() does to the client a backend's lease holds. The DELETE still lands, on a
+        new lease that stays local to the release: the backend keeps its own lease, so no client cached
+        on the executor thread outlives the caller's close_sync_client()."""
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
@@ -904,3 +906,4 @@ class TestFillLock:
 
         clients[1].close()
         assert sent == [("DELETE", "/v1/cache/k/lock")]
+        assert backend._sync_lease.client is clients[0]

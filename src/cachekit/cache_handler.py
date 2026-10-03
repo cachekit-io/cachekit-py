@@ -400,9 +400,8 @@ class L2MissProbe:
 
     ``clean_miss`` is set only where the backend's freshness read itself returned None: the read
     every backend with ``acquire_fill_lock`` takes. Any other read leaves it False, which costs
-    only a re-read. A read that failed is
-    reported to the caller as a miss too, but leaves it False, so anything other than a confirmed
-    miss reads as "not known to be absent".
+    only a re-read. A read that failed is reported to the caller as a miss too, but leaves it
+    False, so anything other than a confirmed miss reads as "not known to be absent".
     """
 
     __slots__ = ("clean_miss",)

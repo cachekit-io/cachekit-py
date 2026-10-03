@@ -381,6 +381,7 @@ class CachekitIOBackend:
         endpoint: str,
         *,
         miss_on_404: bool = False,
+        lease: SyncClientLease | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         """Make sync HTTP request with error handling and metrics injection.
@@ -391,6 +392,7 @@ class CachekitIOBackend:
             miss_on_404: Return a 404 response instead of raising. Key reads
                 and exists treat 404 as a miss; skipping raise_for_status
                 saves the HTTPStatusError + BackendError round-trip on every miss.
+            lease: Send on this lease's client instead of the backend's own lease.
             **kwargs: Additional request arguments
 
         Returns:
@@ -418,7 +420,8 @@ class CachekitIOBackend:
 
         url = f"/v1/cache/{endpoint}"
         # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
-        lease = self._own_sync_lease()
+        if lease is None:
+            lease = self._own_sync_lease()
         try:
             response = lease.client.request(method, url, **kwargs)
             if (delay := _write_retry_delay(method, response)) is not None:
@@ -938,29 +941,26 @@ class CachekitIOBackend:
 
         The caller has already returned, so it may close the sync client (``close_sync_client()``)
         before or while this runs. That client is the one the backend's lease holds, so a failure
-        on a closed client takes a new lease and sends the DELETE once more; the server matches the
-        DELETE on the holder, so a repeat is harmless.
+        on that closed client sends the DELETE once more on a new lease; the server matches the
+        DELETE on the holder, so a repeat is harmless. The new lease stays local to this call and is
+        dropped when it returns. It is cached on this executor thread, so on the backend it would
+        keep a client open that the caller's ``close_sync_client()`` cannot reach, and another
+        release would test that open client instead of the closed one it failed on.
 
         Every failure is logged here, not left on the future: nothing reads the future, and an
         exception left on it would surface only as asyncio's unredacted "never retrieved" report.
         """
         try:
             path, headers = self._lock_release_request(lock_key, lock_id)
+            lease = self._own_sync_lease()
             try:
-                self._request_sync("DELETE", path, headers=headers)
+                self._request_sync("DELETE", path, headers=headers, lease=lease)
             except BackendError:
-                if not self._renew_closed_sync_lease():
+                if lease.client.is_closed is not True:  # `is True`: a Mock client is never closed
                     raise
-                self._request_sync("DELETE", path, headers=headers)
+                self._request_sync("DELETE", path, headers=headers, lease=lease_sync_http_client(self._config))
         except Exception as exc:
             _log_release_failure(lock_key, exc)
-
-    def _renew_closed_sync_lease(self) -> bool:
-        """Replace the sync lease if its client was closed under it. Returns whether it was."""
-        if self._sync_lease.client.is_closed is not True:  # `is True`: a Mock client is never closed
-            return False
-        self._sync_lease = lease_sync_http_client(self._config)
-        return True
 
     async def _release_lock(self, lock_key: str, lock_id: str) -> bool:
         """Release distributed lock. Internal helper for ``acquire_lock``'s cleanup.

@@ -206,7 +206,7 @@ class _Gate:
                     continue
                 # Background work is a Task, or an executor job (the lock release runs in a thread).
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
-                if not (pending := tasks | {asyncio.wrap_future(job) for job in executor.running()}):
+                if not (pending := tasks | {asyncio.wrap_future(job) for job in executor.unfinished()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -214,7 +214,7 @@ class _Gate:
         assert not self.errors, self.errors
         return shape
 
-    async def _next_event(self, tasks: set[asyncio.Task[Any]] | set[asyncio.Future[Any]] | set[Any]) -> None:
+    async def _next_event(self, tasks: set[Any]) -> None:
         """Wait until one of ``tasks`` finishes or a request is parked."""
         self._arrived.clear()
         if self._parked:
@@ -239,7 +239,7 @@ class _TrackingExecutor(ThreadPoolExecutor):
         job.add_done_callback(self._jobs.discard)
         return job
 
-    def running(self) -> list[Future[Any]]:
+    def unfinished(self) -> list[Future[Any]]:
         return [job for job in list(self._jobs) if not job.done()]
 
 
