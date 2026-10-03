@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
 import os
 import random
+import statistics
+import threading
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
@@ -71,6 +75,13 @@ FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
 _RETRY_METHODS = frozenset({"PUT", "DELETE"})
 _MAX_RETRY_AFTER_S = 2
 
+# The SaaS has no bulk delete, so whole-function invalidation sends this many DELETEs at once over
+# the sync client's HTTP/2 connection (LAB-7070). Each still takes its own limiter verdict.
+_DELETE_FANOUT = 16
+# A longer rate-limit hint than this is treated as a deny, not waited out. The tenant limiter's
+# window is 60 s, so a real hint is far below it; the cap only bounds the parse.
+_MAX_RATE_LIMIT_WAIT_S = 3600
+
 
 def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
     """Seconds to wait before the one retry of a shed write, or None for no retry.
@@ -89,16 +100,43 @@ def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
     """
     if method not in _RETRY_METHODS or response.status_code != 503:
         return None
+    return _retry_after_seconds(response, _MAX_RETRY_AFTER_S)
+
+
+def _retry_after_seconds(response: httpx.Response, max_seconds: int) -> int | None:
+    """The delta-seconds ``Retry-After`` of ``response`` if it is at most ``max_seconds``, else None.
+
+    An HTTP-date, a fraction, a missing header or a larger value is None.
+
+    Examples:
+        >>> req = httpx.Request("DELETE", "https://api.cachekit.io/v1/cache/k")
+        >>> _retry_after_seconds(httpx.Response(429, headers={"Retry-After": "007"}, request=req), 60)
+        7
+        >>> _retry_after_seconds(httpx.Response(429, headers={"Retry-After": "61"}, request=req), 60) is None
+        True
+    """
     value = response.headers.get("Retry-After", "").strip()
     if not (value.isascii() and value.isdigit()):
         return None
     # Bound the digits before int(): past 4,300 digits it raises ValueError, which would
-    # turn the 503 into an UNKNOWN error. Zero padding is valid delta-seconds, so strip it.
+    # turn the response into an UNKNOWN error. Zero padding is valid delta-seconds, so strip it.
     value = value.lstrip("0") or "0"
-    if len(value) > len(str(_MAX_RETRY_AFTER_S)):
+    if len(value) > len(str(max_seconds)):
         return None
     delay = int(value)
-    return delay if delay <= _MAX_RETRY_AFTER_S else None
+    return delay if delay <= max_seconds else None
+
+
+def _rate_limit_delay(error: BackendError) -> int | None:
+    """Seconds to wait out a rate-limited DELETE, or None when ``error`` is not one.
+
+    Rate limited means a 429 with a delta-seconds ``Retry-After``. A 429 without one is the
+    quota or balance deny (``X-CacheKit-Deny-Reason``): waiting does not clear it.
+    """
+    cause = error.original_exception
+    if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 429:
+        return _retry_after_seconds(cause.response, _MAX_RATE_LIMIT_WAIT_S)
+    return None
 
 
 # Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
@@ -606,6 +644,84 @@ class CachekitIOBackend:
         """
         self._request_sync("DELETE", self._encode_key(key))
         return True
+
+    def _delete_many(self, keys: list[str]) -> set[str]:
+        """Delete many keys, up to ``_DELETE_FANOUT`` at a time (internal: whole-function invalidation).
+
+        A concurrency cap does not cap rate: the tenant limiter counts admissions over time, so
+        16 workers spend its budget far faster than one key at a time. So the fan-out runs only
+        until a DELETE is rate limited (a 429 with ``Retry-After``). From then on no new
+        concurrent DELETE starts, and the rate-limited and unsent keys go to ``_delete_paced``.
+
+        A key fails when its ``delete`` raises any other ``BackendError`` (a 429 without
+        ``Retry-After`` included), or when pacing runs out of time: it is returned, and the
+        caller keeps it tracked for the next sweep. Any other exception propagates once every
+        fan-out delete has finished, and the caller then deletes the keys one by one.
+        """
+        if not keys:
+            return set()
+        rate_limited = threading.Event()
+        round_trips: list[float] = []
+
+        def delete_one(key: str) -> bool | None:
+            """True deleted, False failed, None left for the paced phase."""
+            if rate_limited.is_set():
+                return None
+            start = time.monotonic()
+            try:
+                self.delete(key)
+                return True
+            except BackendError as e:
+                if _rate_limit_delay(e) is not None:
+                    rate_limited.set()
+                    return None
+                _logger.debug(f"Failed to delete L2 key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+                return False
+            finally:
+                round_trips.append(time.monotonic() - start)
+
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=min(_DELETE_FANOUT, len(keys))) as pool:
+            # One context copy per key: the metrics headers read the caller's contextvars, and a
+            # Context cannot be entered by two threads at once.
+            futures = [pool.submit(contextvars.copy_context().run, delete_one, key) for key in keys]
+        outcomes = [future.result() for future in futures]
+        failed = {key for key, outcome in zip(keys, outcomes, strict=True) if outcome is False}
+        paced = [key for key, outcome in zip(keys, outcomes, strict=True) if outcome is None]
+        if paced:
+            # About what the serial loop would have taken, so no caller blocks much longer than it did.
+            deadline = started + len(keys) * statistics.fmean(round_trips)
+            failed |= self._delete_paced(paced, deadline)
+        return failed
+
+    def _delete_paced(self, keys: list[str], deadline: float) -> set[str]:
+        """Delete ``keys`` one at a time, in order, waiting out each rate-limited DELETE.
+
+        A rate-limited key is retried after its ``Retry-After``. If that wait would end past
+        ``deadline``, that key and every key after it fail without being sent, and one WARNING
+        names the rate limit. Any other ``BackendError`` fails its key at once. Returns the
+        keys not deleted.
+        """
+        failed: set[str] = set()
+        for i, key in enumerate(keys):
+            while True:
+                try:
+                    self.delete(key)
+                    break
+                except BackendError as e:
+                    delay = _rate_limit_delay(e)
+                    if delay is None:
+                        _logger.debug(f"Failed to delete L2 key {redact_cache_key(key)}: {redact_error_for_log(e)}")
+                        failed.add(key)
+                        break
+                    if time.monotonic() + delay > deadline:
+                        logger.warning(
+                            "CachekitIO rate limit: stopped pacing invalidation deletes at the deadline; %d key(s) not deleted",
+                            len(keys) - i,
+                        )
+                        return failed | set(keys[i:])
+                    time.sleep(delay)
+        return failed
 
     def exists(self, key: str) -> bool:
         """Check if key exists in cache (sync).
