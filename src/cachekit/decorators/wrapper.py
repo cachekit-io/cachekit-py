@@ -949,14 +949,16 @@ def create_cache_wrapper(
             _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
         _record(cache_key, twin)
 
-    def _record(*keys: str | None) -> None:
-        """Record ``keys`` (None skipped) in _cached_keys under the current L2 scope, in one step.
+    def _record(cache_key: str, twin: str | None) -> None:
+        """Record ``cache_key`` and its ``twin`` (if any) in _cached_keys under the current L2 scope,
+        in one step.
 
         Every open _watch_records() set is told about them BEFORE they are recorded, so a
         concurrent whole-function invalidation cannot drop a record it was not told about.
+        Fixed arity and a tuple, not *args and a comprehension: this runs on every L2 hit and miss.
         """
         scope = _l2_scope()
-        entries = [(scope, key) for key in keys if key is not None]
+        entries = ((scope, cache_key),) if twin is None else ((scope, cache_key), (scope, twin))
         if _drain_watches:
             for watch in _drain_watches.copy().values():
                 watch.update(entries)

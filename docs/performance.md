@@ -126,7 +126,7 @@ This measures the decorator machinery alone:
 
 **About 5.6μs per call** (median of 12 processes, CPython 3.12, `@cache(backend=None)` returning a small dict; indicative wall clock on a shared host).
 
-The deterministic figure is **61,244 instructions per call** on CPython 3.12 (62,415 on 3.14), from the [instruction budget](#instruction-budgets). Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
+The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **61,000 instructions per call** on CPython 3.12 and 62,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
 **About 11x the raw L1 lookup:** the decorator stack adds ~5μs on top of the sub-microsecond dict lookup, still **several hundred times faster** than a Redis round trip (2-7ms).
 
@@ -394,19 +394,19 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 
 | Path | What one call does | CPython 3.12 | CPython 3.14 |
 |------|--------------------|-------------:|-------------:|
-| `l1_hit` | `@cache(backend=None)` L1 hit | 61,244 | 62,415 |
+| `l1_hit` | `@cache(backend=None)` L1 hit | 61,244 | 62,410 |
 | `minimal_l1_hit` | `@cache.minimal(backend=None)` L1 hit | 59,292 | 60,482 |
-| `l2_hit` | `@cache`, L1 disabled, L2 hit | 346,876 | 348,273 |
-| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 332,060 | 332,697 |
-| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 281,500 | 282,257 |
-| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 290,734 | 293,554 |
-| `serializer_default` | `StandardSerializer` round trip, small dict | 61,356 | 62,663 |
-| `serializer_auto` | `AutoSerializer` round trip | 110,227 | 113,600 |
+| `l2_hit` | `@cache`, L1 disabled, L2 hit | 312,228 | 313,909 |
+| `miss` | `@cache`, L1 disabled, L2 miss, compute, L2 write | 312,010 | 309,843 |
+| `secure_l1_hit` | `@cache.secure` L1 hit (decrypts the ciphertext L1 holds) | 236,889 | 237,407 |
+| `l2_hit_async_metrics` | `l2_hit` with the metrics collector in batched mode | 261,598 | 265,142 |
+| `serializer_default` | `StandardSerializer` round trip, small dict | 61,356 | 62,645 |
+| `serializer_auto` | `AutoSerializer` round trip | 69,446 | 70,682 |
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,792 | 23,833 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,946,487 | 1,955,979 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,652 | 117,851 |
 
-Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 55,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
+Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 50,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
 
 **Sensitivity:** one extra BLAKE2b hash of the cache key per call raised every key-generating path by 4,700 to 4,900 instructions (`l1_hit` +6.1%, `l2_hit_async_metrics` +1.5%, `miss` +1.4%) and failed the gate, while the serializer paths, which generate no key, stayed within 0.11%. An interleaved wall-clock run agreed in sign (+286ns per L1 hit, median of 12 paired processes).
 
