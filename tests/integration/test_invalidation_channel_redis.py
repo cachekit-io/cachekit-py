@@ -178,6 +178,7 @@ class TestDrainAnnouncement:
         client.acl_setuser(
             user, enabled=True, passwords=[f"+{password}"], keys=["*"], channels=["*"], commands=["+@all", "-publish"]
         )
+        restricted = None
         try:
             restricted = _client_as(client, user, password)
             fn = cache(backend=PerRequestRedisBackend(restricted, "default"), ttl=300, namespace="chan_acl")(worker.lookup)
@@ -190,8 +191,9 @@ class TestDrainAnnouncement:
             assert "invalidating local keys only" not in caplog.text
             assert "Invalidation announcement failed" in caplog.text and "NoPermissionError" in caplog.text
             assert _received(subscriber) == []
-            restricted.close()
         finally:
+            if restricted is not None:
+                restricted.close()
             client.acl_deluser(user)
 
 
@@ -525,6 +527,7 @@ class TestListenerConfiguration:
         monkeypatch.setattr(invalidation, "_START_RETRY_SECONDS", 2.0)
         user, password = "ck-chan-nosub", "ck-chan-nosub-pw"  # pragma: allowlist secret - throwaway ACL user
         client.acl_setuser(user, enabled=True, passwords=[f"+{password}"], keys=["*"], commands=["+@all"], reset_channels=True)
+        restricted = None
         try:
             restricted = _client_as(client, user, password)
             ns = "chan_acl_sub"
@@ -546,8 +549,9 @@ class TestListenerConfiguration:
             _run_peer(client, f"invalidate([1], {ns!r})")
             assert _wait_for(lambda: len(evictions) == 1, timeout=5)
             invalidation._stop_listener()
-            restricted.close()
         finally:
+            if restricted is not None:
+                restricted.close()
             client.acl_deluser(user)
 
     def test_acl_without_ping_fails_the_start(
@@ -564,6 +568,7 @@ class TestListenerConfiguration:
             channels=[invalidation.CHANNEL],
             commands=["+@all", "-ping"],
         )
+        restricted = None
         try:
             restricted = _client_as(client, user, password)
             fn = worker.cached_lookup(restricted, namespace="chan_acl_noping")
@@ -573,8 +578,9 @@ class TestListenerConfiguration:
             assert warning.startswith("Invalidation listener failed to start") and warning.endswith(": NoPermissionError")
             assert invalidation._listener_pid is None and invalidation._listener is None
             assert _subscribers(client) == 0  # the refused listener's connection is closed
-            restricted.close()
         finally:
+            if restricted is not None:
+                restricted.close()
             client.acl_deluser(user)
 
     def test_subscription_revoked_while_running_comes_back_when_granted_again(
@@ -583,6 +589,7 @@ class TestListenerConfiguration:
         monkeypatch.setattr(invalidation, "_RESUBSCRIBE_SECONDS", 0.2)
         user, password = "ck-chan-revoked", "ck-chan-revoked-pw"  # pragma: allowlist secret - throwaway ACL user
         client.acl_setuser(user, enabled=True, passwords=[f"+{password}"], keys=["*"], channels=["*"], commands=["+@all"])
+        restricted = None
         try:
             restricted = _client_as(client, user, password)
             fn = worker.cached_lookup(restricted, namespace="chan_acl_revoked")
@@ -596,6 +603,7 @@ class TestListenerConfiguration:
             client.acl_setuser(user, enabled=True, channels=[invalidation.CHANNEL])
             assert _wait_for(lambda: _subscribers(client) == 1, timeout=10)  # back, with no cache operation
             invalidation._stop_listener()
-            restricted.close()
         finally:
+            if restricted is not None:
+                restricted.close()
             client.acl_deluser(user)

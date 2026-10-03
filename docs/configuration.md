@@ -98,12 +98,18 @@ CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
 
+# Evict this process's L1 copies when another process invalidates them (default: false).
+# Tenant-scoped Redis backend only; see the link below this block.
+CACHEKIT_INVALIDATION_LISTENER_ENABLED=false
+
 # Logging
 LOG_LEVEL=INFO
 
 # Performance Testing
 REQUESTS_CA_BUNDLE=  # Unset to avoid SSL issues
 ```
+
+`CACHEKIT_INVALIDATION_LISTENER_ENABLED` runs one invalidation listener per process; see [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction) for what it does and what it needs from Redis.
 
 ---
 
