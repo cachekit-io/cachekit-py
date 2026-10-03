@@ -100,8 +100,9 @@ def test_performance_docs_state_the_committed_budgets() -> None:
     assert sorted(interpreters) == sorted(columns), "add or remove a column in docs/performance.md's Budgets table"
     lines = (ir_budget.BASELINES.parents[2] / "docs" / "performance.md").read_text().splitlines()
     rows = lines[lines.index("| Path | What one call does | CPython 3.12 | CPython 3.14 |") + 2 :]
+    end = next(i for i, line in enumerate(rows) if not line.startswith("|"))
     table = {}
-    for row in rows[: next(i for i, row in enumerate(rows) if not row.startswith("|"))]:
+    for row in rows[:end]:
         cells = [cell.strip() for cell in row.strip("|").split("|")]
         table[cells[0].strip("`")] = tuple(int(cell.replace(",", "")) for cell in cells[2:])
     assert table == {path: tuple(interpreters[key]["budgets"][path] for key in columns) for path in PATHS}
