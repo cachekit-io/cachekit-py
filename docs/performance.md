@@ -10,10 +10,10 @@
 
 > [!TIP]
 > **Key numbers** (run median of 5 runs, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03; indicative wall clock on a shared host):
-> - **Decorator + L1 hit, `@cache(backend=None)`, 10KB dict**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
+> - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
-> - **Redis L2 hit**, L1 disabled, 10KB dict, Redis on loopback: 0.41–0.42ms
+> - **Redis L2 hit**, L1 disabled, same dict, Redis on loopback: 0.41–0.42ms
 
 ## Measurement Methodology
 
@@ -31,11 +31,11 @@ Two back-to-back passes of the same guards, on 2026-10-03, CPython 3.14.3, x86_6
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
-| Decorator + L1 hit, `@cache(backend=None)`, 10KB dict | `test_production_realism.py::test_decorator_overhead_complex_dict` | 6.39 ± 2.03μs | 5.55 ± 0.83μs |
+| Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as MessagePack) | `test_production_realism.py::test_decorator_overhead_complex_dict` | 6.39 ± 2.03μs | 5.55 ± 0.83μs |
 | Decorator + L1 hit, `@cache(backend=None)`, `User` dataclass | `test_production_realism.py::test_decorator_overhead_dataclass` | 6.27 ± 2.10μs | 4.98 ± 0.07μs |
 | Decorator + L1 hit, `@cache(backend=None, serializer="auto")`, 10K-row DataFrame | `test_production_realism.py::test_decorator_overhead_dataframe` | 5.38 ± 0.15μs | 5.08 ± 0.17μs |
 | Raw L1 byte-cache lookup, `L1Cache.get` of 1KB, no decorator | `test_statistical_rigor.py::test_l1_cache_hit_statistically_rigorous` | 354 ± 68ns | 362 ± 41ns |
-| Redis L2 hit, L1 disabled, 10KB dict, Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
+| Redis L2 hit, L1 disabled, same 100-user dict, Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
 
 The bands run from ±1% to ±39% of their figure, and pass 2 sits between 2% above and 21% below pass 1. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
 
@@ -49,7 +49,7 @@ uv run pytest tests/performance/test_statistical_rigor.py::test_l1_cache_hit_sta
 
 ## Why an L1-Only Hit Costs the Same for Any Payload
 
-With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so a 10KB dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.
+With `backend=None`, cachekit keeps the returned object itself in memory and hands that same object back on a hit (see [backend=None](backends/none.md)). Nothing is serialized or deserialized, so the 100-user dict, a dataclass and a 10K-row DataFrame all cost about the same: key generation, the lookup and the decorator's bookkeeping.
 
 With an L2 backend configured, L1 holds the serialized bytes instead, and a hit deserializes them, so that hit costs more as the payload grows. No guard measures it through the run-level harness yet, so this page quotes no figure for it.
 
@@ -63,7 +63,7 @@ The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-on
 
 ## L2 Backend (Redis) Performance
 
-An L2 hit with L1 disabled, a 10KB dict and Redis on the same machine takes 0.41–0.42ms: the decorator, the round trip over loopback and deserialization. That is 65–73 times an L1-only hit of the same dict (pass by pass). A Redis on another machine adds its network latency on top; no guard measures that.
+An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis on the same machine takes 0.41–0.42ms: the decorator, the round trip over loopback and deserialization. That is 65–73 times an L1-only hit of the same dict (pass by pass). A Redis on another machine adds its network latency on top; no guard measures that.
 
 ## Not Measured Here
 
@@ -176,7 +176,7 @@ See [Prometheus Metrics](features/prometheus-metrics.md) for details.
 
 ### Bottleneck 1: The L2 Round Trip
 
-**Problem:** a Redis L2 hit over loopback takes 0.41–0.42ms, 65–73 times an L1-only hit of the same 10KB dict. A Redis on another machine adds its network latency.
+**Problem:** a Redis L2 hit over loopback takes 0.41–0.42ms, 65–73 times an L1-only hit of the same 100-user dict (23.5KB as MessagePack). A Redis on another machine adds its network latency.
 
 **Mitigations:**
 - **Keep L1 on** (the default), so repeat reads skip the round trip
