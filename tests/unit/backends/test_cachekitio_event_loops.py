@@ -95,7 +95,7 @@ def _api_key() -> str:
 
 
 def _slots_for(api_key: str) -> list[Any]:
-    return [slot for key, slot in client_module._thread_local.async_slots.items() if key[1] == api_key]
+    return [slot for key, slot in client_module._clients().async_slots.items() if key[1] == api_key]
 
 
 @pytest.fixture
@@ -248,5 +248,5 @@ def test_construction_builds_no_async_client(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", spy)
     backend = CachekitIOBackend(api_key=_api_key())
-    assert backend._sync_client is not None
+    assert backend._sync_lease.client is not None
     assert built == []

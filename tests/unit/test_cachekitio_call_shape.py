@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
@@ -232,8 +233,14 @@ def backend(gate: _Gate) -> Iterator[CachekitIOBackend]:
     sync_client = httpx.Client(base_url=_API_URL, transport=httpx.MockTransport(gate.sync_handler))
     async_client = httpx.AsyncClient(base_url=_API_URL, transport=httpx.MockTransport(gate.async_handler))
     with (
-        patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(client=sync_client)),
-        patch("cachekit.backends.cachekitio.backend.lease_async_http_client", return_value=MagicMock(client=async_client)),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=sync_client),
+        ),
+        patch(
+            "cachekit.backends.cachekitio.backend.lease_async_http_client",
+            return_value=MagicMock(pid=os.getpid(), client=async_client),
+        ),
     ):
         yield CachekitIOBackend(api_url=_API_URL, api_key=_API_KEY)
     sync_client.close()

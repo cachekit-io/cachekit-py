@@ -174,7 +174,11 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 ## Characteristics
 
-- Latency: ~10–50ms L2 (HTTP/2, region-dependent)
+- Latency, measured per call as client wall time from a client entering Cloudflare at MEL, against the
+  dev environment (2026-10-03, `tests/integration/saas/test_sdk_performance.py`, three runs): an L2
+  hit served by the store is p50 42–45ms (n=200 per run), and a miss, GET then SET, is p50 112–116ms
+  (n=50 per run). Your numbers depend on where your client enters Cloudflare, the store's region and
+  how many reads the edge serves. No p95 is published yet: these samples are too few to claim one.
 - Sync and async support (hybrid client architecture)
 - Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
@@ -184,6 +188,12 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
   thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
   attempt. A sync-only caller never builds an async client
+- Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
+  opens its own connections on its first request and never reuses its parent's, so a backend built
+  before the fork works in every worker. One exception, for a fork made from C that skips Python's
+  at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
+  that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
+  avoid it; [Free-threading](../free-threading.md) gives the detail
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 

@@ -347,8 +347,8 @@ class TestIoPreset:
         a = DecoratorConfig.io(api_key="ck_tenant_a").backend  # pragma: allowlist secret
         b = DecoratorConfig.io(api_key="ck_tenant_b").backend  # pragma: allowlist secret
         assert isinstance(a, CachekitIOBackend) and isinstance(b, CachekitIOBackend)
-        assert a._sync_client.headers["authorization"] == "Bearer ck_tenant_a"
-        assert b._sync_client.headers["authorization"] == "Bearer ck_tenant_b"
+        assert a._sync_lease.client.headers["authorization"] == "Bearer ck_tenant_a"
+        assert b._sync_lease.client.headers["authorization"] == "Bearer ck_tenant_b"
 
         async def async_auth() -> str:
             return b._async_lease.client.headers["authorization"]

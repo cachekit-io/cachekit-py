@@ -34,6 +34,9 @@ class L1CacheConfig:
             task and sync functions via a daemon thread.
         swr_threshold_ratio: Fraction of TTL after which a hit triggers a background
             refresh, in (0.0, 1.0] (default: 0.5)
+        swr_retry_interval: Seconds to wait after a failed background refresh before
+            refreshing that key again, >= 0 (default: 10.0). Until then the cached
+            value keeps being served, up to its ttl. 0 retries on the next stale read.
 
     Examples:
         Create with defaults:
@@ -61,18 +64,23 @@ class L1CacheConfig:
     max_size_mb: int | None = None
     swr_enabled: bool = True
     swr_threshold_ratio: float = 0.5
+    # 10 s caps a failing upstream at one background call per key per 10 s, instead
+    # of one per read, and still picks up recovery well inside typical TTLs.
+    swr_retry_interval: float = 10.0
 
     def validate(self) -> None:
         """Validate L1 cache configuration.
 
         Raises:
-            ConfigurationError: If max_size_mb < 1 or swr_threshold_ratio is
-                outside (0.0, 1.0]
+            ConfigurationError: If max_size_mb < 1, swr_threshold_ratio is
+                outside (0.0, 1.0], or swr_retry_interval is negative or NaN
         """
         if self.max_size_mb is not None and self.max_size_mb < 1:
             raise ConfigurationError(f"L1 max_size_mb must be >= 1, got {self.max_size_mb}")
         if not (0.0 < self.swr_threshold_ratio <= 1.0):
             raise ConfigurationError(f"L1 swr_threshold_ratio must be in (0.0, 1.0], got {self.swr_threshold_ratio}")
+        if not self.swr_retry_interval >= 0:  # also rejects NaN
+            raise ConfigurationError(f"L1 swr_retry_interval must be >= 0, got {self.swr_retry_interval}")
 
 
 @dataclass(frozen=True)

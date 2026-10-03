@@ -5,12 +5,17 @@ its last backend is released; an async one is not, so ``await close_async_client
 owning event loop for a clean shutdown. Both close_* helpers also close clients that live
 backends still hold. An async client is also bound to the event loop it was first used on:
 the next loop on the same thread gets a new one.
+
+A forked child never sees its parent's cached clients: their pooled connections share the parent's TLS
+sessions, so a request on one from both processes desynchronises it. The caches are owned by a PID, and
+a child (``os.fork()``, or a fork from C that runs no at-fork hook) starts with empty ones.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import weakref
 from contextlib import AsyncExitStack, ExitStack
@@ -34,6 +39,10 @@ class SyncClientLease:
 
     Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
     on its own drops the lease at once, and with it the client.
+
+    A lease belongs to the process that built it (``.pid``). In a forked child, ``.client`` is still the
+    parent's client, on the parent's connections: lease again there. CachekitIOBackend does so before
+    every request.
     """
 
     # The weak cache points at leases, never at clients, and a lease has no __del__. A backend can be
@@ -42,14 +51,20 @@ class SyncClientLease:
     # miss, never a client mid-close. A __del__ on the cached object cannot promise that: it runs while
     # weak references still resolve, so the racing lookup revives the object and inherits the close.
     def __init__(self, config: CachekitIOBackendConfig) -> None:
+        self.pid = os.getpid()
         self.client = httpx.Client(**_client_kwargs(config))
         # atexit=False: exit-time finalizers run while daemon threads (stale-while-revalidate) are still
         # alive, so closing then could pull a client out from under an in-flight request. The process
         # reclaims the sockets at exit anyway.
-        weakref.finalize(self, _close_released_client, self.client).atexit = False
+        weakref.finalize(self, _close_released_client, self.client, self.pid).atexit = False
 
 
-def _close_released_client(client: httpx.Client) -> None:
+def _close_released_client(client: httpx.Client, owner_pid: int) -> None:
+    # A forked child drops an inherited lease unclosed: the client's connections are its parent's too,
+    # and close() takes the pool lock, which a parent thread may have held at fork. Garbage collection
+    # closes the child's copies of the sockets, which sends nothing.
+    if os.getpid() != owner_pid:
+        return
     # A finalizer has no caller to report to, so the expected failure (a socket that will not close
     # cleanly) is logged, not raised. Anything else is a bug; the interpreter reports it as
     # unraisable instead of it vanishing here.
@@ -95,9 +110,14 @@ class AsyncClientLease:
     slot of every thread it has been used on (dropped at thread exit), so the shared per-thread slot
     lives while some backend uses it, and no client is ever handed to a thread or loop it was not
     built on.
+
+    Like a SyncClientLease, it belongs to the process that built it (``.pid``): in a forked child the
+    forking thread's held slot is still the parent's, so lease again there, as CachekitIOBackend does
+    before every request.
     """
 
     def __init__(self, config: CachekitIOBackendConfig) -> None:
+        self.pid = os.getpid()
         self._config = config
         self._held = threading.local()
 
@@ -106,7 +126,7 @@ class AsyncClientLease:
         """The async client bound to the running event loop. Raises RuntimeError with no running loop."""
         slot: _LoopBoundClient | None = getattr(self._held, "slot", None)
         if slot is None:
-            slots = _thread_local.async_slots
+            slots = _clients().async_slots
             key = _client_key(self._config)
             slot = slots.get(key)
             if slot is None:
@@ -126,6 +146,7 @@ class _ThreadClients(threading.local):
     # discarded per call gets no pool reuse. Hold one backend per key, or add a small strong LRU in
     # front if per-call construction matters.
     def __init__(self) -> None:
+        self.pid = os.getpid()
         self.sync_leases: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
         self.async_slots: weakref.WeakValueDictionary[_ClientKey, _LoopBoundClient] = weakref.WeakValueDictionary()
 
@@ -137,8 +158,28 @@ class _ThreadClients(threading.local):
 _thread_local = _ThreadClients()
 
 
+def _clients() -> _ThreadClients:
+    """This thread's client caches, emptied the first time this thread reads them in a forked child.
+
+    An owner-PID check rather than an os.register_at_fork hook: uWSGI forks without running Python's
+    at-fork hooks. Each thread's caches carry their own owner PID, so only that thread reads or resets
+    them, and no thread can discard another's. The inherited caches are dropped, never closed (see
+    _close_released_client).
+    """
+    if _thread_local.pid != os.getpid():
+        _thread_local.__init__()  # this thread's caches start over, as a new thread's do
+    return _thread_local
+
+
 def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
     return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
+
+
+# Looked up once: getLogger() takes logging's module lock, and a fork from C (uWSGI) skips logging's at-fork
+# reset, so a child re-leasing its clients would hang on a lock a parent thread held at fork. Reading the
+# level takes no lock, and the parent pinned it when it built the client being replaced. An application that
+# unsets it after that makes the child's re-lease pin it again with setLevel(), which does take the lock.
+_hpack_logger = logging.getLogger("hpack")
 
 
 def _pin_hpack_logger() -> None:
@@ -146,9 +187,8 @@ def _pin_hpack_logger() -> None:
     # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
     # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
     # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
-    hpack_logger = logging.getLogger("hpack")
-    if hpack_logger.level == logging.NOTSET:
-        hpack_logger.setLevel(logging.INFO)
+    if _hpack_logger.level == logging.NOTSET:
+        _hpack_logger.setLevel(logging.INFO)
 
 
 def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
@@ -192,7 +232,7 @@ def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
         SyncClientLease: its ``.client`` is the thread-local sync client for exactly this config,
         open for as long as the lease is held
     """
-    leases = _thread_local.sync_leases
+    leases = _clients().sync_leases
     key = _client_key(config)
     # Bind to a local first: the weak dict alone would let a fresh lease die on insertion.
     lease = leases.get(key)
@@ -209,7 +249,7 @@ async def close_async_client() -> None:
     A backend that is used again afterwards gets a new client, never a closed one.
     """
     async with AsyncExitStack() as stack:
-        for slot in list(_thread_local.async_slots.values()):
+        for slot in list(_clients().async_slots.values()):
             client = slot.take()
             if client is not None:
                 stack.push_async_callback(client.aclose)
@@ -217,7 +257,7 @@ async def close_async_client() -> None:
 
 def close_sync_client() -> None:
     """Close this thread's sync client instances (useful for cleanup)."""
-    leases = _thread_local.sync_leases
+    leases = _clients().sync_leases
     with ExitStack() as stack:
         for lease in leases.values():
             stack.callback(lease.client.close)
@@ -229,9 +269,10 @@ def reset_global_client() -> None:
 
     Note: This does not properly close clients. Use close_*_client() for proper cleanup.
     """
-    for slot in list(_thread_local.async_slots.values()):
+    clients = _clients()
+    for slot in list(clients.async_slots.values()):
         slot.take()
-    _thread_local.sync_leases.clear()
+    clients.sync_leases.clear()
 
 
 __all__ = [

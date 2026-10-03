@@ -484,3 +484,152 @@ class TestL1OnlySizeBound:
         assert fn(1) == "value-1"
         assert fn(1) == "value-1"
         assert calls == 1
+
+
+@pytest.mark.unit
+class TestL1OnlySWRRetryBackoff:
+    """A failed L1-only refresh is not retried on every read (swr_retry_interval).
+
+    The ObjectCache clock is faked so the band/back-off/expiry boundaries are exact;
+    the refresh itself still runs on a real thread or task.
+    """
+
+    @staticmethod
+    def _fake_clock(monkeypatch, start: float = 1000.0):
+        import types
+
+        fake_time = types.SimpleNamespace(monotonic=lambda: start)
+        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+        return fake_time
+
+    @staticmethod
+    def _wait_sync(get_calls, expected: int, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while get_calls() < expected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)  # let the refresh thread record its failure
+
+    def test_sync_failed_refresh_backs_off_then_retries_once(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0  # in the refresh band
+        assert fn() == "held"  # schedules the refresh that fails
+        self._wait_sync(lambda: calls, 2)
+        assert calls == 2
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i  # inside the 20 s back-off
+            assert fn() == "held"
+        time.sleep(0.1)
+        assert calls == 2, f"refresh retried during back-off (calls={calls})"
+
+        fake.monotonic = lambda: 1080.0  # back-off over
+        assert fn() == "held"
+        assert fn() == "held"
+        self._wait_sync(lambda: calls, 3)
+        assert calls == 3, f"expected exactly one retry after the interval (calls={calls})"
+
+    def test_sync_past_ttl_caller_sees_exception(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=1000))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert fn() == "held"
+        self._wait_sync(lambda: calls, 2)
+
+        fake.monotonic = lambda: 1100.0  # hard expiry, back-off still running
+        with pytest.raises(RuntimeError, match="upstream down"):
+            fn()
+        assert calls == 3
+
+    def test_zero_interval_restores_retry_on_every_stale_read(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=0))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        for expected in (2, 3, 4):
+            assert fn() == "held"
+            self._wait_sync(lambda: calls, expected)
+        assert calls == 4
+
+    async def test_async_failed_refresh_backs_off(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert await fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 2)
+        await asyncio.sleep(0.05)  # let the failed task finish
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i
+            assert await fn() == "held"
+        await asyncio.sleep(0.1)
+        assert calls == 2
+
+        fake.monotonic = lambda: 1080.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 3)
+        assert calls == 3
+
+    async def test_async_upstream_cancelled_error_backs_off(self, monkeypatch):
+        """An upstream that raises CancelledError counts as a failed attempt, not a skip."""
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise asyncio.CancelledError
+            return "held"
+
+        assert await fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 2)
+        await asyncio.sleep(0.05)
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i
+            assert await fn() == "held"
+        await asyncio.sleep(0.1)
+        assert calls == 2, f"refresh retried during back-off (calls={calls})"
