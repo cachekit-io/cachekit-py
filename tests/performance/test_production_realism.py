@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ except ImportError:
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
 
-from .stats_utils import benchmark_with_gc_handling, difference_band, summarize
+from .stats_utils import balanced_order, benchmark_with_gc_handling, difference_band, measure_with_jit_warmup, summarize
 
 # =============================================================================
 # Realistic Test Payloads
@@ -354,7 +355,7 @@ def test_decorator_overhead_l1_hit_with_backend() -> None:
 
 @pytest.mark.performance
 def test_concurrent_cache_access() -> None:
-    """Measure the per-call latency each thread sees while 10 threads hit one key.
+    """Measure per-call execution time while 10 threads call one key at once.
 
     Tests:
     - L1 cache lock contention
@@ -363,7 +364,9 @@ def test_concurrent_cache_access() -> None:
 
     Each run starts 10 threads together and keeps all their samples as that run's samples: the
     threads of one run share the host's state, so the run, not the thread, is the unit summarize
-    infers over. On a GIL build a sample includes the time a thread waits for the GIL.
+    infers over. Each sample starts inside the thread's loop, so it is execution time once the
+    thread is scheduled: on a GIL build, a thread that waits for its turn before its first call
+    waits outside every sample. This is not a request-latency or contention figure.
     """
     payload = create_complex_dict("medium")
     num_threads = 10
@@ -469,29 +472,17 @@ def test_encryption_overhead() -> None:
     get_data_encrypted(1)
     gets_after_prime = backend_plain.gets, backend_encrypted.gets
 
-    # Benchmark plain
-    def measure_plain():
-        get_data_plain(1)
+    # Interleave the two arms' runs in a shuffled, balanced order, so slow host drift lands on both
+    # arms instead of loading whichever arm would run second.
+    arms = {"P": lambda: get_data_plain(1), "E": lambda: get_data_encrypted(1)}
+    per_run: dict[str, list[list[float]]] = {"P": [], "E": []}
+    for arm in balanced_order(5, random.Random(0), arms="PE"):
+        gc.collect()
+        samples, _ = measure_with_jit_warmup(arms[arm], 5_000)
+        per_run[arm].append([float(x) for x in samples])
 
-    result_plain = benchmark_with_gc_handling(
-        name="Without encryption",
-        fn=measure_plain,
-        iterations_per_run=5_000,
-        runs=5,
-        unit="ns",
-    )
-
-    # Benchmark encrypted
-    def measure_encrypted():
-        get_data_encrypted(1)
-
-    result_encrypted = benchmark_with_gc_handling(
-        name="With encryption (AES-256-GCM)",
-        fn=measure_encrypted,
-        iterations_per_run=5_000,
-        runs=5,
-        unit="ns",
-    )
+    result_plain = summarize("Without encryption", per_run["P"], "ns")
+    result_encrypted = summarize("With encryption (AES-256-GCM)", per_run["E"], "ns")
 
     # Every measured call must have been an L1 hit; one that reached L2 would time the wrong path.
     assert (backend_plain.gets, backend_encrypted.gets) == gets_after_prime, "measured calls reached L2"

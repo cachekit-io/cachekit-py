@@ -28,7 +28,7 @@ Every figure on this page comes from a guard in `tests/performance/`:
 
 ## Measured Figures
 
-Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first five rows on 2026-10-03, the last four on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards, CPython 3.14.3, x86_64 Linux: the first five rows on 2026-10-03, the last two on 2026-10-04. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
@@ -39,10 +39,8 @@ Each cell is the mean of five run medians ± its 95% t band (the summary's `Run 
 | Redis L2 hit, L1 disabled, same 100-user dict, Redis on loopback | `test_production_realism.py::test_redis_l2_roundtrip` | 416 ± 139μs | 407 ± 159μs |
 | Decorator + L1 hit with an L2 backend configured (in-process, never reached), same 100-user dict | `test_production_realism.py::test_decorator_overhead_l1_hit_with_backend` | 239 ± 31μs | 276 ± 120μs |
 | Decorator + L1 hit, `@cache(backend=None)`, same 100-user dict, 10 threads on one key, per call | `test_production_realism.py::test_concurrent_cache_access` | 5.77 ± 0.47μs | 6.39 ± 1.53μs |
-| L1 hit with a backend, same dict, plaintext arm | `test_production_realism.py::test_encryption_overhead` | 242 ± 14μs | 296 ± 109μs |
-| L1 hit with a backend, same dict, AES-256-GCM arm (L1 holds ciphertext) | `test_production_realism.py::test_encryption_overhead` | 242 ± 9μs | 247 ± 5μs |
 
-The bands run from ±1% to ±43% of their figure, and pass 2 sits between 2% above and 21% below pass 1 on the first five rows, and up to 22% above it on the last four. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
+The bands run from ±1% to ±43% of their figure, and pass 2 sits between 2% above and 21% below pass 1 on the first five rows, and up to 15% above it on the last two. That spread is why these suites inform rather than gate (see [Performance Regression Testing](#performance-regression-testing)).
 
 Run them yourself:
 ```bash
@@ -65,7 +63,7 @@ With an L2 backend configured, L1 holds the serialized bytes instead, and a hit 
 
 An L1-only hit takes 5.0–6.4μs across the three payloads above.
 
-Ten threads calling one function with the same key see 5.8–6.4μs per call at the median, about what one thread sees. These runs used a GIL build, where only one thread runs Python at a time: a call that loses the GIL midway waits for the others, and that wait lands in the tail, which five runs do not resolve.
+With ten threads calling one function on the same key at once, each call took 5.8–6.4μs at the median once its thread was running. That is execution time after scheduling, not request latency. Each sample starts inside its thread's loop, so on a GIL build, where only one thread runs Python at a time, the time a thread waits for its turn falls outside every sample. No guard measures how long a request waits under contention.
 
 The deterministic figure is the `l1_hit` row of the [instruction budgets](#instruction-budgets): about **61,000 instructions per call** on CPython 3.12 and 62,000 on 3.14. Key generation, the L1 lookup, the `cache_info()` hit counter and the decorator's own bookkeeping are all inside that count; this L1-only path records no Prometheus metric.
 
@@ -75,13 +73,11 @@ The raw L1 byte-cache lookup, without the decorator, takes 354–362ns. An L1-on
 
 An L2 hit with L1 disabled, the 100-user dict (23.5KB as MessagePack) and Redis on the same machine takes 0.41–0.42ms: the decorator, the round trip over loopback and deserialization. That is 65–73 times an L1-only hit of the same dict (pass by pass). A Redis on another machine adds its network latency on top; no guard measures that.
 
-## Encryption Overhead
-
-With encryption on, L1 holds ciphertext and a hit decrypts it before deserializing. On the 100-user dict the encrypted hit took 242–247μs and the plaintext hit 242–296μs: the difference between the two arms' run medians was −0.4 ± 14.6μs in one pass and −50 ± 109μs in the other (Welch 95%), so at this payload decryption costs less than the run-to-run noise of deserialization. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works.
-
 ## Not Measured Here
 
-These have no figure from the run-level harness, so this page quotes none:
+These have no figure from the run-level harness that supports a claim:
+- **Encryption overhead through the decorator**: `test_encryption_overhead` interleaves its plaintext and encrypted runs and prints both results, but on this shared host the difference between the arms' run medians stayed inside its own band in all four passes on the 100-user dict (from −0.4 ± 14.6μs to −97 ± 194μs, Welch 95%): two on a quiet host with one arm's runs after the other's, and two interleaved on a loaded host. That bounds nothing: decryption may cost little next to deserialization, or the noise may hide it. The deterministic costs are the `secure_l1_hit` and `serializer_encrypted` rows of [Instruction Budgets](#instruction-budgets); see [Zero-Knowledge Encryption](features/zero-knowledge-encryption.md) for how encryption works
+- **Request latency under contention**: the 10-thread guard times each call after its thread is scheduled (see [Decorator + L1 Hit](#decorator--l1-hit-hot-path))
 - **The async decorator, serializer comparisons and a Redis on another machine**
 
 For choosing a serializer, see the [Serializer Guide](serializers/README.md).

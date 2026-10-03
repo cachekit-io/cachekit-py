@@ -723,7 +723,7 @@ didn't recently disable encryption for that function, investigate.
 
 Run benchmarks: `pytest tests/performance/test_encryption_overhead.py -v -s`
 
-Through the decorator, an L1 hit of a 23.5KB dict costs the same with and without encryption, within run-to-run noise: deserializing the value costs far more than decrypting it. See [Encryption Overhead](../performance.md#encryption-overhead) in the Performance Guide.
+Through the decorator, a wall-clock comparison of an L1 hit of a 23.5KB dict with and without encryption is inconclusive: the difference stayed inside run-to-run noise. See [Not Measured Here](../performance.md#not-measured-here) in the Performance Guide.
 
 ### Key Derivation (Per-Tenant)
 ```
