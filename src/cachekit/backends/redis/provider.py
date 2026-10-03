@@ -76,7 +76,7 @@ _LISTENER_HEALTH_CHECK_SECONDS = 10
 # Pool -> (the socket_timeout it had before its outermost open with_timeout() window, that window's
 # token), so listener_pool() clones the configured value, never a window's, whichever backend object
 # opened the window on the shared pool. Weak: pools come and go with their clients.
-_open_windows: weakref.WeakKeyDictionary[Any, tuple[Any, object]] = weakref.WeakKeyDictionary()
+_open_windows: weakref.WeakKeyDictionary[redis.ConnectionPool, tuple[float | None, object]] = weakref.WeakKeyDictionary()
 
 
 async def _await_uninterrupted(fut: asyncio.Future[T]) -> T:

@@ -574,9 +574,8 @@ class TestListenerStart:
         async def f(x: int) -> int:
             return x
 
-        began = time.monotonic()
         assert await f(1) == 1
-        assert time.monotonic() - began < 2  # returned while the start was still connecting
+        assert backend.pool_threads == []  # returned while the start was still connecting
         connecting.set()
         for _ in range(500):
             if backend.pool_threads:
