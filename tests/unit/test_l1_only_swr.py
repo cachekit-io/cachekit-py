@@ -20,7 +20,7 @@ import copy
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Any
 
 import pytest
@@ -348,7 +348,7 @@ class TestL1OnlySWRStoppedLoop:
         return fn
 
     @staticmethod
-    def _hit(fn: Any, *keys: int) -> Any:
+    def _hit(fn: Any, *keys: int) -> Coroutine[Any, Any, None]:
         async def hit() -> None:
             for x in keys:
                 assert await fn(x) == x
