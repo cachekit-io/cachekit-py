@@ -205,6 +205,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  # After acquiring lock, check cache again                                  │
 │  # Another thread may have populated it while we waited                     │
+│  # CachekitIO skips this when the first lock request won after a clean miss │
 │                                                                             │
 │  cached_result = get_cached_value(cache_key)                                │
 │  if cached_result:                                                          │

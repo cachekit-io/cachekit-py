@@ -21,13 +21,16 @@ from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
+    L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
+    probe_l2_miss,
     redact_cache_key,
+    supports_fill_lock,
     supports_key_tracking,
     supports_locking,
     supports_swr,
@@ -62,7 +65,7 @@ from .tenant_context import TenantContextExtractor
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
-    from ..backends.base import BaseBackend
+    from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
 
 
@@ -83,6 +86,7 @@ def _resolve_lazy_backend() -> BaseBackend:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 _logger = logging.getLogger(__name__)
 
@@ -146,12 +150,30 @@ class _LockPhase:
 
 
 @contextlib.asynccontextmanager
-async def _phased(lock: contextlib.AbstractAsyncContextManager[bool], phase: _LockPhase) -> AsyncIterator[bool]:
+async def _phased(lock: contextlib.AbstractAsyncContextManager[_T], phase: _LockPhase) -> AsyncIterator[_T]:
     """Enter ``lock`` and record each phase it reaches in ``phase``."""
     async with lock as acquired:
         phase.entered = True
         yield acquired
         phase.body_exited = True
+
+
+@contextlib.asynccontextmanager
+async def _fill_lock(
+    backend: LockableBackend, key: str, timeout: float, blocking_timeout: float
+) -> AsyncIterator[tuple[bool, bool]]:
+    """The miss path's lock: ``(acquired, uncontended)``.
+
+    A backend with ``acquire_fill_lock`` reports whether its first lock attempt won, and releases
+    without blocking the caller (LAB-7064). Any other lockable backend reports every grant as
+    contended, so the caller keeps the post-lock double-check read.
+    """
+    if supports_fill_lock(backend):
+        async with backend.acquire_fill_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as grant:
+            yield grant
+    else:
+        async with backend.acquire_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as acquired:
+            yield acquired, False
 
 
 class CacheInfo(NamedTuple):
@@ -2160,6 +2182,9 @@ def create_cache_wrapper(
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()
 
+            # The read paths report a failed read as a miss; the probe tells the two apart, so
+            # the post-lock double-check is skipped only after a clean miss (LAB-7064).
+            _l2_read = L2MissProbe()
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
                 # eviction + the cache_get_deserialize metric instead of persisting (#159),
@@ -2170,13 +2195,14 @@ def create_cache_wrapper(
                 # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
-                if _l2_freshness_capable():
-                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
-                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                    _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                    _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-                else:
-                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
+                with probe_l2_miss(_l2_read):
+                    if _l2_freshness_capable():
+                        _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
+                        cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                        _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                        _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+                    else:
+                        cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
 
                 if cached_result is not None:
                     # Cache hit: envelope is the raw serialized bytes for L1 backfill
@@ -2249,16 +2275,45 @@ def create_cache_wrapper(
                 try:
                     # Use backend's async lock protocol
                     async with _phased(
-                        _backend.acquire_lock(
-                            cache_key,
-                            timeout=lock_timeout,
-                            blocking_timeout=blocking_timeout,
-                        ),
+                        _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
                         lock_phase,
-                    ) as lock_acquired:
-                        if lock_acquired:
-                            # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited.
+                    ) as (lock_acquired, lock_uncontended):
+                        if not lock_acquired:
+                            # Lock timeout - double-check cache before giving up
+                            # Another request may have populated it while we waited
+                            logger().warning(
+                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                            )
+                            try:
+                                # Routed through the operation handler: corrupt entries evict (#159),
+                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
+                                if cached_result is not None:
+                                    # Cache was populated while waiting - use it
+                                    result, cached_data = cached_result.value, cached_result.envelope
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                    return result
+                            except (DecryptionAuthenticationError, KeyringConfigurationError):
+                                # Same as the lock-acquired double-check below.
+                                raise
+                            except Exception as e:
+                                # Cache check failed - fall through to execute function
+                                logger().warning(
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, "
+                                    f"executing without lock: {redact_error_for_log(e)}"
+                                )
+
+                        elif not (lock_uncontended and _l2_read.clean_miss):
+                            # Lock acquired after a wait, or after a failed primary read - double-check
+                            # cache: another request may have populated it while we waited, or the
+                            # entry may still be live. Skipped after a clean miss and an uncontended
+                            # grant (LAB-7064): this caller never waited behind another holder, so
+                            # the read would almost always miss again, and be billed as one. A fill
+                            # that completed between our read and our lock request is recomputed;
+                            # last write wins.
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
@@ -2286,32 +2341,6 @@ def create_cache_wrapper(
                                     "Double-check cache failed after lock acquisition for %s: %s",
                                     redact_cache_key(cache_key),
                                     redact_error_for_log(e),
-                                )
-                        else:
-                            # Lock timeout - double-check cache before giving up
-                            # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
-                            )
-                            try:
-                                # Routed through the operation handler: corrupt entries evict (#159),
-                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
-                                _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
-                                if cached_result is not None:
-                                    # Cache was populated while waiting - use it
-                                    result, cached_data = cached_result.value, cached_result.envelope
-                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
-                                    return result
-                            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                                # Same as the lock-acquired double-check above.
-                                raise
-                            except Exception:
-                                # Cache check failed - fall through to execute function
-                                logger().warning(
-                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
                                 )
 
                         # Execute the original function (with or without lock). Its exception
