@@ -92,6 +92,11 @@ def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
     value = response.headers.get("Retry-After", "").strip()
     if not (value.isascii() and value.isdigit()):
         return None
+    # Bound the digits before int(): past 4,300 digits it raises ValueError, which would
+    # turn the 503 into an UNKNOWN error. Zero padding is valid delta-seconds, so strip it.
+    value = value.lstrip("0") or "0"
+    if len(value) > len(str(_MAX_RETRY_AFTER_S)):
+        return None
     delay = int(value)
     return delay if delay <= _MAX_RETRY_AFTER_S else None
 

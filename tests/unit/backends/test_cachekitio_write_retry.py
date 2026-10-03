@@ -82,13 +82,23 @@ _WRITES = [(op, mode) for op in ("set", "delete") for mode in ("sync", "async")]
 
 class TestShedWriteIsRetriedOnce:
     @pytest.mark.parametrize(("op", "mode"), _WRITES)
-    @pytest.mark.parametrize("retry_after", ["1", "2"])
-    def test_retry_after_short_hint_lands_the_write(self, sleeps: MagicMock, op: str, mode: str, retry_after: str) -> None:
+    @pytest.mark.parametrize(
+        ("retry_after", "delay"),
+        [
+            ("1", 1),
+            ("2", 2),
+            ("01", 1),  # zero padding is valid delta-seconds
+            pytest.param("0" * 5000 + "1", 1, id="padded-past-int-digit-limit"),
+        ],
+    )
+    def test_retry_after_short_hint_lands_the_write(
+        self, sleeps: MagicMock, op: str, mode: str, retry_after: str, delay: int
+    ) -> None:
         server = _Server(_shed(retry_after), httpx.Response(200))
         _write(_backend(server), op, mode)
 
         assert len(server.requests) == 2
-        sleeps.assert_called_once_with(int(retry_after))
+        sleeps.assert_called_once_with(delay)
         first, second = server.requests
         assert second.method == first.method == ("PUT" if op == "set" else "DELETE")
         assert second.url == first.url
@@ -119,6 +129,7 @@ class TestNoRetry:
             "²",  # superscript two: str.isdigit() accepts it, int() does not
             "3",  # above the 2 s cap
             "10",  # the rate-limiter fault's hint
+            pytest.param("9" * 5000, id="past-int-digit-limit"),  # no retry, and still a TRANSIENT 503
         ],
     )
     def test_503_without_a_short_hint(self, sleeps: MagicMock, op: str, mode: str, retry_after: str | None) -> None:
