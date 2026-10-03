@@ -26,10 +26,10 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any, Optional
 
 import msgpack
-import redis
 
 from cachekit import l1_cache
 from cachekit.cache_handler import supports_key_tracking
@@ -276,6 +276,21 @@ def _warn_untrackable(backend: object) -> None:
         )
 
 
+def _redis() -> ModuleType:
+    """redis-py, imported only once a listener needs it.
+
+    A module-level import would load redis-py, and with it hiredis, for every program that imports
+    cachekit. cachekit's redis package is imported first so its hiredis decision runs before
+    redis-py loads (see cachekit.hiredis_compat).
+    """
+    import cachekit.backends.redis  # noqa: F401
+
+    # isort: split
+    import redis
+
+    return redis
+
+
 def start_listener(backend: Any) -> None:
     """Start this process's listener on ``backend``'s Redis, unless another thread is starting it.
 
@@ -302,7 +317,7 @@ def start_listener(backend: Any) -> None:
             return
         pubsub = None
         try:
-            pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
+            pubsub = _redis().Redis(connection_pool=backend.listener_pool()).pubsub()
             pubsub.subscribe(**{CHANNEL: _on_message})
             _confirm_subscription(pubsub)
             thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
@@ -346,7 +361,7 @@ def _confirm_subscription(pubsub: Any) -> None:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise redis.TimeoutError(f"Redis sent no {expected} reply in {_CONFIRM_SECONDS:g} s")
+                raise _redis().TimeoutError(f"Redis sent no {expected} reply in {_CONFIRM_SECONDS:g} s")
             reply = pubsub.get_message(timeout=remaining)  # a refusal raises here (NoPermissionError)
             if reply is not None and reply.get("type") == expected:
                 break
@@ -389,7 +404,7 @@ def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
     _RESUBSCRIBE_SECONDS and drops the connection, and its next read reconnects and subscribes again.
     A grant therefore takes effect within that wait, with no restart.
     """
-    if isinstance(error, redis.ResponseError):
+    if isinstance(error, _redis().ResponseError):
         logger.warning(
             "Invalidation listener refused by Redis; subscribing again in %d s: %s",
             _RESUBSCRIBE_SECONDS,

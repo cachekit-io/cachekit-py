@@ -95,19 +95,58 @@ hiredis is excluded because it does not declare free-threaded support (no
 `Py_mod_gil` slot); redis-py transparently falls back to its pure-Python
 parser. On a GIL build nothing changes — hiredis remains the default parser.
 
-The exclusion also means the lane never sees what a default install gets.
-`pip install cachekit` pulls in hiredis, and on 3.14t importing cachekit with
-hiredis present still re-enables the GIL. `cachekit.hiredis_compat` has to
-import `redis.connection` to clear its `HIREDIS_AVAILABLE` flag, and that
-import loads hiredis. The flag is inert by then anyway: redis-py binds its
-default parser at import time, so the hiredis parser stays the default.
-`tests/unit/test_free_threading.py::test_default_install_keeps_gil_disabled_after_redis_backend`
-checks this in a fresh interpreter. It is marked `xfail(strict=True)`, so it
-turns red the day the GIL stays off and the mark must go.
-`test_gil_stays_disabled_with_hiredis_blocked` is its control: the same check
-with hiredis kept out must pass, so hiredis is the only thing the xfail waits
-on. Both skip where hiredis is not installed, as in this lane, so run them by
-hand in a 3.14t environment that has hiredis:
+The exclusion also means the lane never sees what a default install gets:
+`pip install cachekit` pulls in hiredis. A default install keeps the GIL off
+anyway, in one of two ways.
+
+A program that uses no Redis backend (L1-only, CachekitIO, File or Memcached)
+never loads redis-py: `import cachekit` imports no redis-py, and
+`RedisBackend` is loaded only on first use, through the module `__getattr__`
+of `cachekit.backends`. With `CACHEKIT_DISABLE_HIREDIS` unset nothing is
+blocked, and the program's own `import hiredis` works. (`true` blocks hiredis
+at `import cachekit` for every program, Redis or not.)
+
+A program that uses cachekit's Redis backend loads redis-py through
+`cachekit.backends.redis`, and that package decides on hiredis before it
+imports redis-py. On a free-threaded build whose GIL is still off it sets
+`sys.modules["hiredis"] = None`, so redis-py's own `import hiredis` fails and
+it binds its pure-Python parser (`_RESP2Parser`). Every cachekit path to
+redis-py goes through that package first, `PooledClientProvider` and the
+invalidation listener included.
+The decision reads `CACHEKIT_DISABLE_HIREDIS` straight from the environment at
+`import cachekit`:
+
+| `CACHEKIT_DISABLE_HIREDIS` | GIL build | free-threaded build |
+|---|---|---|
+| unset | hiredis | pure-Python parser, GIL stays off; blocked when `cachekit.backends.redis` loads (if the GIL is already on, for example `-X gil=1`: hiredis) |
+| `true` | pure-Python parser | pure-Python parser, GIL stays off; blocked at `import cachekit` |
+| `false` | hiredis | hiredis, GIL re-enabled once redis-py loads |
+
+The block is process-wide: once it is in place, an application's own
+`import hiredis` raises `ImportError` unless it sets
+`CACHEKIT_DISABLE_HIREDIS=false` (which re-enables the GIL for the whole
+process, as importing hiredis there always does). The unset default acts only
+when cachekit's Redis backend loads, so an application that imports redis-py
+itself before that keeps hiredis, and on a free-threaded build the GIL turns
+on. To avoid that, set `CACHEKIT_DISABLE_HIREDIS=true` and import cachekit
+before redis-py: `true` blocks at `import cachekit`, and cannot undo a
+hiredis that redis-py has already loaded.
+When hiredis is already loaded, cachekit logs a warning that redis-py keeps
+the hiredis parser and, on a free-threaded build, that the GIL is already on.
+
+`tests/unit/test_free_threading.py` pins this. In every lane,
+`test_non_redis_programs_never_load_redis_py` checks that `import cachekit`,
+an `@cache(backend=None)` call and a `CachekitIOBackend` leave redis-py
+unloaded, and `test_hiredis_settings_are_read_before_backends_load` checks the
+setting is read before `cachekit.backends` or redis-py load. In this lane,
+`test_redis_backend_blocks_hiredis_before_redis_loads` checks that a
+`RedisBackend`, a `PooledClientProvider` and the invalidation listener's
+import of redis-py each block hiredis before redis-py is first requested and leave redis-py on `_RESP2Parser`. None of these needs
+hiredis installed. `test_default_install_keeps_gil_disabled_after_redis_backend`
+checks the GIL in a fresh interpreter with hiredis installed, and
+`test_gil_stays_disabled_with_hiredis_blocked` is its control. Both skip where
+hiredis is not installed, as in this lane, so run them by hand in a 3.14t
+environment that has hiredis:
 
 ```bash
 uv sync --python 3.14t --no-default-groups --group test
@@ -115,8 +154,9 @@ uv run --no-sync pytest tests/unit/test_free_threading.py
 ```
 
 In that environment `test_gil_stays_disabled_after_importing_cachekit` and the
-session-teardown GIL check also report the re-enabled GIL, because the pytest
-process itself has imported hiredis.
+session-teardown GIL check still report a re-enabled GIL. That is the test
+harness, not cachekit: the pytest-redis plugin and `tests/conftest.py` import
+redis, and so hiredis, before any test imports cachekit.
 
 ## Measured performance
 
@@ -204,6 +244,10 @@ dependency chain allows it. Blocking as of 2026-09-29:
   the moment a user adds `cachekit[json]` is not a declaration worth making.
 - **hiredis** — no `Py_mod_gil` declaration; importing it re-enables the GIL.
   Pulled in unconditionally via the required `redis[hiredis]` dependency.
+  A program without cachekit's Redis backend never loads it. One that uses
+  the Redis backend has it blocked on free-threaded builds (see
+  [The CI safety net](#the-ci-safety-net)), so it runs redis-py's slower
+  pure-Python parser.
 
 numpy, pandas and pyarrow (the `[data]` extra) now publish `cp314t` wheels,
 but the free-threaded CI lane does not install `[data]` yet, so `[data]` on

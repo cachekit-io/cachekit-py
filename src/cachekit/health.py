@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from cachekit.backends import RedisBackend
 from cachekit.backends.provider import CacheClientProvider
 from cachekit.di import DIContainer
 from cachekit.imports import OptionalImport
@@ -138,6 +137,8 @@ class HealthChecker:
         """
         try:
             client_provider = container.get(CacheClientProvider)
+            from cachekit.backends.redis import RedisBackend
+
             backend = RedisBackend(client_provider=client_provider)
             return backend.health_check()[0]
         except Exception:
@@ -326,6 +327,8 @@ class HealthChecker:
         """Check Redis connectivity asynchronously."""
         try:
             client_provider = container.get(CacheClientProvider)
+            from cachekit.backends.redis import RedisBackend
+
             backend = RedisBackend(client_provider=client_provider)
             is_healthy, details = await asyncio.wait_for(
                 asyncio.to_thread(backend.health_check),
@@ -368,6 +371,8 @@ class HealthChecker:
         """Check Redis connectivity synchronously."""
         try:
             client_provider = container.get(CacheClientProvider)
+            from cachekit.backends.redis import RedisBackend
+
             backend = RedisBackend(client_provider=client_provider)
             is_healthy, details = backend.health_check()
 

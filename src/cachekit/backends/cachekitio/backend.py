@@ -17,6 +17,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import SecretStr, ValidationError
 
+from cachekit.backends._uninterrupted import _await_uninterrupted
 from cachekit.backends.cachekitio.client import (
     AsyncClientLease,
     SyncClientLease,
@@ -26,7 +27,6 @@ from cachekit.backends.cachekitio.client import (
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
-from cachekit.backends.redis.provider import _await_uninterrupted
 from cachekit.config.validation import ConfigurationError, hide_secret
 from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log

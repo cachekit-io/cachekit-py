@@ -396,7 +396,9 @@ free-threaded 3.14 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
 (`gil_used = false`). Free-threaded wheels are **not yet published** and
 free-threaded builds are not officially supported — blocked upstream on
-orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import). See
+orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import;
+cachekit loads redis-py only for its Redis backend, and keeps hiredis out there,
+so redis-py uses its pure-Python parser). See
 [measured performance results](docs/free-threading.md#measured-performance) and the
 full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 
