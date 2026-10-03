@@ -14,6 +14,7 @@ Tests for backends/cachekitio/client.py covering:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from importlib.metadata import PackageNotFoundError, version
 
@@ -97,14 +98,18 @@ class TestLeaseSyncHttpClient:
         lease = lease_sync_http_client(config)
         assert lease.client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
 
-    def test_user_agent_without_distribution_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A source-only or vendored install has no dist-info: the backend must still import and send a UA."""
+    def test_user_agent_without_distribution_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A source-only or vendored install has no dist-info: the backend must still import, send a UA, and say why."""
 
         def missing(name: str) -> str:
             raise PackageNotFoundError(name)
 
         monkeypatch.setattr(client_module, "version", missing)
-        assert client_module._user_agent() == f"cachekit-py/unknown httpx/{httpx.__version__}"
+        with caplog.at_level(logging.DEBUG, logger=client_module.__name__):
+            assert client_module._user_agent() == f"cachekit-py/unknown httpx/{httpx.__version__}"
+        assert [r.levelno for r in caplog.records if "distribution metadata" in r.getMessage()] == [logging.DEBUG]
 
 
 @pytest.mark.unit

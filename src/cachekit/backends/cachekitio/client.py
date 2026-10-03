@@ -37,9 +37,11 @@ def _user_agent() -> str:
     # Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
     # The version comes from the installed distribution, so it cannot drift from the release. A source-only or vendored
     # copy has no distribution metadata; it still identifies as cachekit-py rather than failing the import.
+    # Stdlib logger, not _logger: this runs once at import, and the structured logger samples records away.
     try:
         sdk = version("cachekit")
     except PackageNotFoundError:
+        logging.getLogger(__name__).debug("No cachekit distribution metadata; User-Agent reports cachekit-py/unknown")
         sdk = "unknown"
     return f"cachekit-py/{sdk} httpx/{httpx.__version__}"
 
