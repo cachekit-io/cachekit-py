@@ -453,7 +453,7 @@ def _uwsgi_forked_this_process(uwsgi: Any) -> bool:
     try:
         master = uwsgi.masterpid()
         return os.getpid() != master if master else uwsgi.worker_id() > 0
-    except (AttributeError, TypeError):  # not uWSGI's own module: never log when unsure
+    except Exception:  # not uWSGI's own module: never log when unsure, never fail import cachekit
         return True
 
 

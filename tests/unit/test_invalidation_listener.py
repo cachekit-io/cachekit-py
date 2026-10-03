@@ -1039,8 +1039,18 @@ class TestUwsgiWarning:
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         assert len(caplog.records) == 1
 
-    def test_silent_without_the_uwsgi_api(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        monkeypatch.setitem(sys.modules, "uwsgi", types.SimpleNamespace(opt={}))  # has opt, but not uWSGI's module
+    @pytest.mark.parametrize(
+        "foreign",
+        [
+            types.SimpleNamespace(opt={}),  # has opt, but not uWSGI's module
+            types.SimpleNamespace(opt={}, masterpid=lambda: int("not a pid")),  # its API raises ValueError
+        ],
+        ids=["no-api", "api-raises"],
+    )
+    def test_silent_without_the_uwsgi_api(
+        self, foreign: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "uwsgi", foreign)
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()  # no raise: import cachekit must not break
         assert caplog.records == []
