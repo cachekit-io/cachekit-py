@@ -9,7 +9,7 @@
 ## Key Numbers
 
 > [!TIP]
-> **Key numbers** (run median of 5 runs, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03; indicative wall clock on a shared host):
+> **Key numbers** (mean of five run medians, two passes; CPython 3.14.3, x86_64 Linux, 2026-10-03; indicative wall clock on a shared host):
 > - **Decorator + L1 hit, `@cache(backend=None)`, 100-user nested dict (23.5KB as plain MessagePack)**: 5.6–6.4μs (61k instructions per call, see [Instruction Budgets](#instruction-budgets))
 > - **Same hit, 10K-row DataFrame**: 5.1–5.4μs. An L1-only hit never serializes, so payload size barely matters
 > - **Raw L1 byte-cache lookup** (`L1Cache.get`, no decorator): 354–362ns
@@ -23,11 +23,11 @@ Every figure on this page comes from a guard in `tests/performance/`:
 - **Every raw sample kept**: percentiles cover all samples; outliers are counted, never filtered
 - **Warm-up**: each run warms up for at least 5,000 calls (2,000 for the raw L1 guard), stopping once the last 1,000 calls vary by less than 10%, and at most twice that minimum
 - **Pre-flight**: each session prints whether the host is throttled or loaded (`measurement_env.py`)
-- **No tail claims at 5 runs**: the harness prints a p95 only from at least 10 runs and 400 samples (a p99 from 10 runs and 2,000 samples). Every guard below runs 5, so its `P95` and `P99` lines read "inconclusive" and this page quotes no tail percentile
+- **No tail claims at 5 runs**: the `P95` line of a guard's summary reads "inconclusive" unless it has at least 10 runs and 400 samples (the `P99` line needs 10 runs and 2,000 samples). Every guard below runs 5, so both lines read "inconclusive" and this page quotes no tail percentile. The guards' own lines after the summary ("Total measured", the ✅ line, "Decorator + complex payload") still print the raw p95 of every sample, which their thresholds check; at 5 runs that number does not support a tail claim
 
 ## Measured Figures
 
-Two back-to-back passes of the same guards, on 2026-10-03, CPython 3.14.3, x86_64 Linux. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
+Each cell is the mean of five run medians ± its 95% t band (the summary's `Run median:` line), from two back-to-back passes of the same guards on 2026-10-03, CPython 3.14.3, x86_64 Linux. The pre-flight reported no throttling or load, but the host is shared, so the figures are indicative: compare them with each other rather than with your machine.
 
 | Path | Guard (`tests/performance/`) | Pass 1 | Pass 2 |
 |------|------------------------------|-------:|-------:|
