@@ -39,6 +39,10 @@ class SyncClientLease:
 
     Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
     on its own drops the lease at once, and with it the client.
+
+    A lease belongs to the process that built it (``.pid``). In a forked child, ``.client`` is still the
+    parent's client, on the parent's connections: lease again there. CachekitIOBackend does so before
+    every request.
     """
 
     # The weak cache points at leases, never at clients, and a lease has no __del__. A backend can be
@@ -106,6 +110,10 @@ class AsyncClientLease:
     slot of every thread it has been used on (dropped at thread exit), so the shared per-thread slot
     lives while some backend uses it, and no client is ever handed to a thread or loop it was not
     built on.
+
+    Like a SyncClientLease, it belongs to the process that built it (``.pid``): in a forked child the
+    forking thread's held slot is still the parent's, so lease again there, as CachekitIOBackend does
+    before every request.
     """
 
     def __init__(self, config: CachekitIOBackendConfig) -> None:

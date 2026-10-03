@@ -190,7 +190,10 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   attempt. A sync-only caller never builds an async client
 - Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
   opens its own connections on its first request and never reuses its parent's, so a backend built
-  before the fork works in every worker
+  before the fork works in every worker. One exception, for a fork made from C that skips Python's
+  at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
+  that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
+  avoid it; [Free-threading](../free-threading.md) gives the detail
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 
