@@ -261,6 +261,8 @@ The parent's entries stay in the child's memory, shared with the parent, until t
 
 uWSGI forks its workers without running Python's at-fork hooks. Set `py-call-uwsgi-fork-hooks` (uWSGI 2.0.21 or later) or `py-call-osafterfork` so that it runs them, or `lazy-apps` so that each worker imports your app after the fork; any one of them keeps the rule above. Without one, a uWSGI worker keeps the L1 entries its master held at fork, runs no background sweep of expired L1 entries, and runs no invalidation listener, so its L1 heals by TTL. An expired entry is still never served: it is evicted when it is read. Under uWSGI with none of these options, cachekit logs one WARNING `uWSGI forks its workers without running Python's at-fork hooks` when it is imported.
 
+L1-only mode (`backend=None`, `@cache.local()`) has no L2 to refill from, so a forked child keeps the entries its parent held at fork, each expiring on its own TTL. The exception is a function whose cache a parent thread was using at the fork: that cache starts empty in the child. A background refresh that was running in the parent starts again on the child's next stale read. Under uWSGI, set `py-call-uwsgi-fork-hooks` or `lazy-apps`: without either, a worker's first call to an L1-only cached function can hang if a master thread was using that function's cache at the fork.
+
 ---
 
 ## Configuration Reference

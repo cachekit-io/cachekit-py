@@ -8,21 +8,18 @@ envelopes, an OOM vector). Such values are served from L2, or recomputed if L2 d
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 import random
-import select
 import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
-from typing import NoReturn
 
 import pytest
 
 from cachekit.l1_cache import CacheEntry, L1Cache, L1CacheManager
+from tests.utils.fork_helpers import child_outcome, on_new_thread, report
 
 MB = 1024 * 1024
 
@@ -301,34 +298,6 @@ def _wait_for(predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
-def _report(w: int, outcome: object) -> NoReturn:
-    """End a child forked with os.fork() with an outcome for its parent; never return into pytest."""
-    try:
-        os.write(w, repr(outcome).encode())  # literals only: ast.literal_eval reads it
-    finally:
-        os._exit(0)
-
-
-def _child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
-    """What the child at pid reported on the pipe r; a hung child is killed."""
-    assert pid > 0, "no child was forked"  # os.kill(0, ...) would signal pytest's whole process group
-    data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
-    if not data:
-        os.kill(pid, signal.SIGKILL)
-    os.waitpid(pid, 0)
-    os.close(r)
-    return ast.literal_eval(data.decode()) if data else "no outcome: the child hung or died"
-
-
-def _on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
-    """fn's result from a new thread, or "hung" if it holds the thread past timeout."""
-    out: list[object] = []
-    thread = threading.Thread(target=lambda: out.append(fn()), daemon=True)
-    thread.start()
-    thread.join(timeout)
-    return out[0] if out else "hung"
-
-
 def _consistent(cache: L1Cache) -> bool:
     s = cache._state
     return s.memory_bytes == sum(entry.size_bytes for entry in s.cache.values())
@@ -583,7 +552,7 @@ class TestCleanupThreadAfterFork:
         holder.start()
         assert held.wait(5)
         try:
-            assert _on_new_thread(l1_cache._empty_caches_after_fork, timeout=5) is None  # returned, never blocked
+            assert on_new_thread(l1_cache._empty_caches_after_fork, timeout=5) is None  # returned, never blocked
         finally:
             release.set()
             holder.join(5)
@@ -780,10 +749,10 @@ class TestCleanupThreadAfterFork:
                 }
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
-        assert _child_outcome(child, r) == {"kept_at_fork": True, "freed": True, "cleanup": None}
+        assert child_outcome(child, r) == {"kept_at_fork": True, "freed": True, "cleanup": None}
 
     def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs_nothing(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
@@ -827,22 +796,22 @@ class TestCleanupThreadAfterFork:
             found = cache.get("k")
         except BaseException as e:
             if os.getpid() != parent:
-                _report(w, {"error": repr(e)})  # the reset emptied the dict under the in-flight get()
+                report(w, {"error": repr(e)})  # the reset emptied the dict under the in-flight get()
             raise
         if os.getpid() != parent:
             try:
                 outcome = {
                     "found": found,
                     "consistent": _consistent(cache),
-                    "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                    "new_thread": on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
                 }
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
         assert child, "get() no longer calls CacheEntry.is_expired"
-        assert _child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
+        assert child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_fork_inside_a_critical_section_the_child_never_leaves(self, monkeypatch):
@@ -861,12 +830,12 @@ class TestCleanupThreadAfterFork:
             if child == 0:
                 try:  # this thread holds the old lock for good, so new threads must not need it
                     outcome = {
-                        "pre_fork": _on_new_thread(lambda: cache.get("pre-fork")),
-                        "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                        "pre_fork": on_new_thread(lambda: cache.get("pre-fork")),
+                        "new_thread": on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
                     }
                 except BaseException as e:
                     outcome = {"error": repr(e)}
-                _report(w, outcome)
+                report(w, outcome)
             return real(entry)
 
         monkeypatch.setattr(CacheEntry, "is_expired", fork_here)
@@ -875,7 +844,7 @@ class TestCleanupThreadAfterFork:
         assert child, "get() no longer calls CacheEntry.is_expired"
 
         # The fork dropped the namespace's entries; L2 still has them.
-        assert _child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
+        assert child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_hookless_take_over_past_a_live_holder_leaves_it_unharmed(self, monkeypatch):
@@ -920,10 +889,10 @@ class TestCleanupThreadAfterFork:
                 outcome = {"holder": got, "found": cache.get("k"), "consistent": _consistent(cache)}
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
-        assert _child_outcome(child, r) == {"holder": [(True, b"v")], "found": (True, b"v"), "consistent": True}
+        assert child_outcome(child, r) == {"holder": [(True, b"v")], "found": (True, b"v"), "consistent": True}
 
     def test_invalidation_queued_behind_a_replaced_lock_reaches_the_fresh_state(self):
         cache = L1Cache(namespace="requeue-ns")
@@ -1045,7 +1014,7 @@ class TestCleanupThreadAfterFork:
                     manager.start_background_cleanup(interval_seconds=60)
                     l1_cache._global_l1_manager = None
                     born = l1_cache.get_l1_cache_manager()  # starts its cleanup unless refused
-                    _report(
+                    report(
                         w,
                         {
                             "requested": requested,
@@ -1058,7 +1027,7 @@ class TestCleanupThreadAfterFork:
                 finally:
                     os._exit(1)
             os.close(w)
-            assert _child_outcome(child, r) == {
+            assert child_outcome(child, r) == {
                 "requested": [],
                 "thread": None,
                 "born_thread": None,
