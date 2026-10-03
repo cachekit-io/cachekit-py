@@ -38,6 +38,12 @@ DURATION_BUCKETS_MS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 10
 # Bytes, powers of 4: 16 B through 256 MiB, above the default max_value_size (100 MiB).
 SIZE_BUCKETS_BYTES = tuple(float(4**i) for i in range(2, 15))
 
+# A batched flush's cache_operations_total series: (operation, namespace, success, serializer).
+_CacheOpKey = tuple[str, str, bool, str]
+# One batched record's histogram values: (operation, namespace, serializer, duration_ms, size_bytes). None marks a
+# value the sync path would not observe.
+_CacheObservation = tuple[str, str, str, Optional[float], Optional[int]]
+
 try:
     from prometheus_client import REGISTRY, Counter, Gauge, Histogram  # type: ignore[assignment]
 
@@ -501,10 +507,9 @@ class AsyncMetricsCollector:
             return
 
         # Group metrics by type for efficient processing
-        cache_ops: dict[tuple[Any, ...], int] = defaultdict(int)  # {(operation, namespace, success, serializer): count}
-        # Every record's own duration and size, in record order, so the histograms get what sync mode observes. None
-        # marks a value sync mode would not observe.
-        cache_observations: list[tuple[Any, ...]] = []  # [(operation, namespace, serializer, duration_ms, size_bytes)]
+        cache_ops: dict[_CacheOpKey, int] = defaultdict(int)
+        # Every record's own duration and size, in record order, so the histograms get what sync mode observes.
+        cache_observations: list[_CacheObservation] = []
         counters = defaultdict(lambda: defaultdict(float))  # {name: {labels_key: value}}
         histograms = defaultdict(list)  # {name: [(value, labels_key)]}
 
@@ -580,8 +585,8 @@ class AsyncMetricsCollector:
 
     def _update_prometheus_metrics(
         self,
-        cache_ops: dict[tuple[Any, ...], int],
-        cache_observations: list[tuple[Any, ...]],
+        cache_ops: dict[_CacheOpKey, int],
+        cache_observations: list[_CacheObservation],
         counters: dict[str, dict[str, Any]],
         histograms: dict[str, list[Any]],
     ):
