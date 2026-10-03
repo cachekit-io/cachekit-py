@@ -90,10 +90,14 @@ _logger = logging.getLogger(__name__)
 # the refresh is skipped (stale keeps being served) and a later hit retries.
 _L1_SWR_MAX_CONCURRENT_REFRESHES = 32
 
-# At most one "Key tracking failed" WARNING per wrapped function per window; failures in
-# between log at DEBUG and are counted into the next WARNING. A registry outage fails every
-# L2 write, and one WARNING per write would turn it into a log flood.
-_TRACK_WARN_INTERVAL_SECONDS = 60.0
+# At most one WARNING per wrapped function per window for each background failure the caller
+# never sees (key tracking, a failed refresh, a refresh that could not run); failures in
+# between log at DEBUG and are counted into the next WARNING. A registry outage fails every L2
+# write and a failing upstream every refresh, so one WARNING each would be a log flood.
+_WARN_INTERVAL_SECONDS = 60.0
+# Why a refresh never ran when its arguments cannot be snapshotted: every call of that shape
+# skips it, so the entry is recomputed only in the foreground once it expires.
+_NOT_DEEP_COPYABLE = ": arguments not deep-copyable, so refresh-ahead cannot run for this call"
 
 # Keys per multi-key L2 delete in a whole-function invalidation: bounds each server-side
 # command, like the Redis registry drain's chunk.
@@ -121,6 +125,43 @@ def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     except asyncio.CancelledError:
         # Task was cancelled (e.g., during shutdown) - this is expected, don't log
         pass
+
+
+class _WarnThrottle:
+    """One WARNING per _WARN_INTERVAL_SECONDS for one kind of failure; claim() counts the rest.
+
+    Fork-safe by the owner-PID idiom (see _l2_swr_try_begin): a forked child's first claim
+    replaces the lock, which a parent thread that did not survive the fork may hold, and drops
+    the parent's count. Sibling threads racing that swap cost at worst one extra WARNING, once
+    per fork.
+    """
+
+    __slots__ = ("_count", "_lock", "_pid", "_warned_at")
+
+    def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
+        self._lock = threading.Lock()
+        self._warned_at, self._count = float("-inf"), 0
+        self._pid = os.getpid()
+
+    def claim(self) -> int:
+        """Count one failure. Returns 0 if it should log at DEBUG, else the failures since the
+        last WARNING, this one included, for the WARNING it should log.
+
+        The window is claimed under the lock and the caller logs outside it: concurrent
+        failures then emit one WARNING, and a slow log sink never serializes the failing callers.
+        """
+        if self._pid != os.getpid():
+            self._reset()
+        with self._lock:
+            self._count += 1
+            now = time.monotonic()
+            if now - self._warned_at < _WARN_INTERVAL_SECONDS:
+                return 0
+            count, self._count, self._warned_at = self._count, 0, now
+            return count
 
 
 class CacheInfo(NamedTuple):
@@ -799,7 +840,7 @@ def create_cache_wrapper(
     # L1-only mode: use ObjectCache for raw Python object storage (no serialization).
     # This preserves types (tuples, sets, frozensets) that MessagePack would degrade.
     # L1CacheConfig is honored here (#207): max_size_mb bounds bytes (best-effort
-    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio
+    # object-graph estimate, not entry count) and swr_enabled/swr_threshold_ratio/swr_retry_interval
     # drive background refresh via get_with_swr.
     from ..config.nested import L1CacheConfig
     from ..config.singleton import get_settings
@@ -816,6 +857,7 @@ def create_cache_wrapper(
             max_entries=None,
             max_size_bytes=_l1_budget_mb * 1024 * 1024,
             swr_threshold_ratio=_l1_config.swr_threshold_ratio,
+            swr_retry_interval=_l1_config.swr_retry_interval,
         )
         if _l1_only_mode and l1_enabled
         else None
@@ -873,30 +915,14 @@ def create_cache_wrapper(
         (async callers use asyncio.to_thread). A key whose tracking fails stays in
         _cached_keys, and this process's next drain by the same tenant deletes it from there.
         Other processes' drains cannot see it, so the failure is a WARNING — throttled to one per
-        _TRACK_WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
+        _WARN_INTERVAL_SECONDS, carrying the count of failures since the last one.
         """
-        nonlocal _track_warned_at, _track_failures, _track_warn_lock, _track_warn_pid
         if not _is_trackable():
             return
         try:
             _backend.track_key(_registry_id, cache_key)  # type: ignore[union-attr]
         except Exception as e:
-            if _track_warn_pid != os.getpid():
-                # Forked child: the inherited lock may be held by a parent thread that did not
-                # survive the fork, so taking it would hang this write forever, and the count is
-                # the parent's. Replace all of it. Sibling threads racing this swap cost at worst
-                # one extra WARNING, once per fork.
-                _track_warn_lock = threading.Lock()
-                _track_warned_at, _track_failures = float("-inf"), 0
-                _track_warn_pid = os.getpid()
-            # Claim the window under the lock, log outside it: concurrent failures then emit
-            # one WARNING, and a slow log sink never serializes the failing writers.
-            with _track_warn_lock:
-                _track_failures += 1
-                now = time.monotonic()
-                failures = 0
-                if now - _track_warned_at >= _TRACK_WARN_INTERVAL_SECONDS:
-                    failures, _track_failures, _track_warned_at = _track_failures, 0, now
+            failures = _track_warn.claim()
             if not failures:
                 _logger.debug("Key tracking failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
                 return
@@ -1029,6 +1055,28 @@ def create_cache_wrapper(
             # letting the caller demote this hit into a recompute.
             logger().error(f"L2 hit telemetry failed unexpectedly ({type(exc).__name__}): {redact_error_for_log(exc)}")
 
+    def _warn_refresh(throttle: _WarnThrottle, event: str, cache_key: str, exc: BaseException, reason: str = "") -> None:
+        """Log a background refresh that failed or never ran: a throttled WARNING, DEBUG between.
+
+        The caller was already served the cached value and must never see the failure (spec:
+        revalidation failure must never surface to callers), so this line is the only signal.
+        The function is named by its digest, like the key: a dynamically created function's
+        __qualname__ can carry caller data (CWE-532).
+        """
+        failures = throttle.claim()
+        if not failures:
+            _logger.debug("%s for %s%s: %s", event, redact_cache_key(cache_key), reason, redact_error_for_log(exc))
+            return
+        _logger.warning(
+            "%s in function %s (%d since the last warning)%s; callers keep the cached value until it expires. Latest key %s: %s",
+            event,
+            redact_cache_key(function_identifier),
+            failures,
+            reason,
+            redact_cache_key(cache_key),
+            redact_error_for_log(exc),
+        )
+
     def _l2_swr_try_begin(cache_key: str) -> bool:
         """Claim a revalidation slot for this key; False = already in flight or at capacity.
 
@@ -1074,9 +1122,10 @@ def create_cache_wrapper(
             await _track_and_record_async(cache_key)
 
     async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
-        """Background revalidation for async functions. Failures are silent by design:
-        the caller already got the stale value; the entry hard-expires at evict_at and
-        the next request takes the ordinary synchronous miss path (spec degradation)."""
+        """Background revalidation for async functions. Failures never reach the caller, only
+        the log (_warn_refresh): the caller already got the stale value; the entry hard-expires
+        at evict_at and the next request takes the ordinary synchronous miss path (spec
+        degradation)."""
         try:
             if supports_locking(_backend):
                 async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
@@ -1086,7 +1135,7 @@ def create_cache_wrapper(
             else:
                 await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
+            _warn_refresh(_refresh_failed_warn, "SWR revalidation failed", cache_key, exc)
         finally:
             _l2_swr_end(cache_key)
 
@@ -1110,7 +1159,7 @@ def create_cache_wrapper(
             if stored:
                 _track_and_record(cache_key)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
-            _logger.debug("SWR revalidation failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc))
+            _warn_refresh(_refresh_failed_warn, "SWR revalidation failed", cache_key, exc)
         finally:
             _l2_swr_end(cache_key)
 
@@ -1131,11 +1180,7 @@ def create_cache_wrapper(
             call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
             _l2_swr_end(cache_key)
-            _logger.debug(
-                "SWR revalidation skipped for %s: arguments not deep-copyable: %s",
-                redact_cache_key(cache_key),
-                redact_error_for_log(exc),
-            )
+            _warn_refresh(_refresh_skipped_warn, "SWR revalidation skipped", cache_key, exc, _NOT_DEEP_COPYABLE)
             return
         try:
             if is_async:
@@ -1157,9 +1202,7 @@ def create_cache_wrapper(
                 ).start()
         except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
             _l2_swr_end(cache_key)
-            _logger.debug(
-                "SWR revalidation could not be scheduled for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc)
-            )
+            _warn_refresh(_refresh_unstarted_warn, "SWR revalidation could not be scheduled", cache_key, exc)
 
     # Create per-function statistics tracker with lazy session ID generation
     # Session ID format: "{process_uuid}:{module}.{function_name}"
@@ -1192,7 +1235,8 @@ def create_cache_wrapper(
         # Standard key generation with type-aware handling
         if _generated_key_mode:
             return operation_handler.get_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
-        # Interop mode takes priority (mutually exclusive with key= and fast_mode)
+        # Interop: decoration rejects it together with key= or fast_mode, so it never
+        # competes with the branches below
         if interop is not None:
             return _interop_cache_key(call_args, call_kwargs)
         # Custom key function (escape hatch for complex types)
@@ -1201,7 +1245,8 @@ def create_cache_wrapper(
             if not isinstance(custom_key, str):
                 raise TypeError(f"key function must return str, got {type(custom_key).__name__}")
             return f"{namespace or 'default'}:{custom_key}"
-        # fast_mode: minimal key generation - no string formatting overhead (10-50μs savings)
+        # fast_mode: the only mode _generated_key_mode leaves once interop and key= are out.
+        # Minimal key generation - no string formatting overhead (10-50μs savings)
         from ..hash_utils import cache_key_hash
 
         return (namespace or "default") + ":" + func_hash + ":" + cache_key_hash(str(call_args) + str(call_kwargs))
@@ -1232,11 +1277,11 @@ def create_cache_wrapper(
     # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every entry it
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
-    # track_key failure WARNING throttle: when it last fired (monotonic), failures since.
-    _track_warned_at = float("-inf")
-    _track_failures = 0
-    _track_warn_lock = threading.Lock()
-    _track_warn_pid = os.getpid()  # owner process — see _l2_swr_try_begin's fork note
+    # Background-failure WARNING throttles, one per kind, so a frequent kind never hides a rarer one.
+    _track_warn = _WarnThrottle()  # key tracking failed
+    _refresh_failed_warn = _WarnThrottle()  # a background refresh raised
+    _refresh_skipped_warn = _WarnThrottle()  # arguments not deep-copyable: refresh-ahead cannot run
+    _refresh_unstarted_warn = _WarnThrottle()  # the refresh thread or task could not be started
 
     # Shared stats tracker from the process-global registry (session ID lazy-initialized
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
@@ -1283,16 +1328,16 @@ def create_cache_wrapper(
         except Exception as exc:
             _l1_swr_slots.release()
             _object_cache.cancel_refresh(cache_key, version)
-            _logger.debug(
-                "L1-only SWR refresh skipped for %s: arguments not deep-copyable: %s",
-                redact_cache_key(cache_key),
-                redact_error_for_log(exc),
-            )
+            _warn_refresh(_refresh_skipped_warn, "L1-only SWR refresh skipped", cache_key, exc, _NOT_DEEP_COPYABLE)
             return None
 
     def _l1_swr_task_done(task: asyncio.Task[None], cache_key: str) -> None:
         _l1_swr_tasks.discard(task)
-        _ttl_refresh_done_callback(task, cache_key)
+        if task.cancelled():  # e.g. loop shutdown: nothing failed
+            return
+        exc = task.exception()
+        if exc is not None:
+            _warn_refresh(_refresh_failed_warn, "L1-only SWR refresh failed", cache_key, exc)
 
     async def _l1_swr_refresh_async(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
@@ -1306,8 +1351,11 @@ def create_cache_wrapper(
             try:
                 result = await func(*call_args, **call_kwargs)
             except BaseException:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
-                raise  # logged (at debug) by _l1_swr_task_done
+                # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
+                # apart from cancelling this task. Backing off after a real cancellation only delays
+                # the next refresh by one interval; the held value is still served.
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
+                raise  # logged by _l1_swr_task_done
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
             _l1_swr_slots.release()
@@ -1322,10 +1370,8 @@ def create_cache_wrapper(
             try:
                 result = func(*call_args, **call_kwargs)
             except Exception as exc:
-                _object_cache.cancel_refresh(cache_key, version)  # let a later call retry
-                _logger.debug(
-                    "L1-only SWR background refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(exc)
-                )
+                _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
+                _warn_refresh(_refresh_failed_warn, "L1-only SWR refresh failed", cache_key, exc)
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
@@ -1415,14 +1461,15 @@ def create_cache_wrapper(
                             threading.Thread(
                                 target=_l1_swr_refresh_sync,
                                 args=(cache_key, version, refresh_args, refresh_kwargs),
-                                name=f"cachekit-swr-{func.__name__}",
+                                name="cachekit-swr-refresh",  # no function or key metadata (CWE-532)
                                 daemon=True,
                             ).start()
-                        except RuntimeError:
+                        except RuntimeError as exc:
                             # Thread couldn't start (resource pressure) — release
                             # the slot and this exact refresh so a later call retries
                             _l1_swr_slots.release()
                             _object_cache.cancel_refresh(cache_key, version)
+                            _warn_refresh(_refresh_unstarted_warn, "L1-only SWR refresh could not be started", cache_key, exc)
                 reset_current_function_stats(token)
                 return cached_value
 
@@ -2208,6 +2255,9 @@ def create_cache_wrapper(
                                     cache_key=cache_key or "unknown",
                                     namespace=namespace or "default",
                                     duration_ms=set_duration_ms,
+                                    # A value the serializer (or encryption) rejects is not a
+                                    # backend failure; the sync write does not count it either.
+                                    count_toward_breaker=not isinstance(e, SerializationError),
                                 )
 
                             return result
@@ -2304,6 +2354,7 @@ def create_cache_wrapper(
                         cache_key=cache_key or "unknown",
                         namespace=namespace or "default",
                         duration_ms=set_duration_ms,
+                        count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
                     )
 
                 return result

@@ -61,6 +61,17 @@ class TestL1CacheConfig:
         with pytest.raises(ConfigurationError, match="L1 max_size_mb must be >= 1, got -10"):
             config.validate()
 
+    def test_swr_retry_interval_default_is_non_zero(self) -> None:
+        assert L1CacheConfig().swr_retry_interval == 10.0
+
+    def test_swr_retry_interval_zero_is_valid(self) -> None:
+        L1CacheConfig(swr_retry_interval=0).validate()  # 0 = retry on the next stale read
+
+    @pytest.mark.parametrize("bad", [-1, -0.5, float("nan")])
+    def test_validate_swr_retry_interval_negative_or_nan(self, bad: float) -> None:
+        with pytest.raises(ConfigurationError, match="L1 swr_retry_interval must be >= 0"):
+            L1CacheConfig(swr_retry_interval=bad).validate()
+
 
 @pytest.mark.unit
 class TestCircuitBreakerConfig:

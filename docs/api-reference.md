@@ -427,12 +427,14 @@ result = compute_results(123)  # Multi-language compatible
 - Collections: `list`, `tuple`, `dict`
 - Dates: `datetime`, `date`, `time` (ISO-8601 format via MessagePack extension)
 
-**Explicitly NOT supported** (raises `TypeError`):
+**Explicitly NOT supported**:
 - NumPy arrays → Use `serializer="auto"`
 - pandas DataFrames/Series → Use `serializer="arrow"`
 - UUID, set, frozenset → Use `serializer="auto"`
 - Pydantic models, ORM models → Convert to dict first
 - Custom classes → Convert to dict first
+
+With a backend, a decorated call that returns one of these does not raise. It returns the result, caches nothing, and logs an ERROR and a WARNING on every call; see [Troubleshooting → Serialization Failures](troubleshooting.md#common-errors). Only interop mode raises, with `InteropError`. Calling `StandardSerializer.serialize` directly raises `TypeError`.
 
 ### Using AutoSerializer (Python-Only)
 
@@ -592,8 +594,6 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 - **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
-**Environment Variable Priority:** `CACHEKIT_*` variables take precedence over fallback variables (e.g., `CACHEKIT_REDIS_URL` > `REDIS_URL`).
-
 #### Example
 ```python
 from cachekit.config import get_settings
@@ -614,23 +614,29 @@ The library includes intelligent error classification to distinguish between tra
 > [!NOTE]
 > For detailed error information, solutions, and troubleshooting, see:
 > - **[Troubleshooting Guide](troubleshooting.md)** - Common errors and solutions
-> - **[Error Codes Reference](error-codes.md)** - Complete error code catalog
+> - **[Error Reference](error-codes.md)** - Error types, causes and fixes
 
 ### Error Categories
 
-1. **Transient Errors** (trigger circuit breaker):
-   - `ConnectionError`, `TimeoutError` - Network issues
-   - `BusyLoadingError`, `TryAgainError` - Redis temporarily unavailable
-   - `ConnectionPoolError` - Pool exhausted
+The Redis backend wraps each redis-py exception in a `BackendError` whose `error_type` is a `BackendErrorType`. The checks run in this order, and the first one an exception matches sets its category. A class can therefore land in a different category from its parent: `AuthenticationError` subclasses `ConnectionError`, and `NoPermissionError`, `ReadOnlyError`, `ClusterDownError` and `TryAgainError` subclass `ResponseError`.
 
-2. **Permanent Errors** (don't trigger circuit breaker):
-   - `AuthenticationError` - Wrong credentials
-   - `DataError`, `InvalidResponse` - Protocol issues
-   - `LockError` - Lock acquisition failures
+1. **`AUTHENTICATION`**:
+   - `redis.exceptions.AuthenticationError`, `redis.exceptions.NoPermissionError` - Wrong credentials or missing ACL permission
 
-3. **Application Errors** (ignored by circuit breaker):
-   - User code exceptions
-   - Business logic errors
+2. **`TIMEOUT`**:
+   - `redis.exceptions.TimeoutError` - Operation exceeded its time limit
+
+3. **`TRANSIENT`**:
+   - `redis.exceptions.ConnectionError` - Network issues; includes `redis.exceptions.MaxConnectionsError` (connection pool exhausted)
+   - `redis.exceptions.BusyLoadingError` - Redis is still loading its dataset into memory
+   - `redis.exceptions.ReadOnlyError` - A read-only replica rejected a write, during failover or because writes are routed to a replica
+   - `redis.exceptions.ClusterDownError`, `redis.exceptions.TryAgainError` - Cluster failover or resharding
+
+4. **`PERMANENT`**:
+   - `redis.exceptions.ResponseError`, `redis.exceptions.DataError`, `redis.exceptions.InvalidResponse` - Client input or configuration, command, or protocol errors
+   - `redis.exceptions.LockError` - Lock acquisition failures
+
+5. **`UNKNOWN`**: any other exception
 
 ### Connection Failures
 When Redis is unavailable:
@@ -867,7 +873,7 @@ def get_reference_data(): ...
 - [Backend Guide](backends/README.md) - Custom storage backend implementation
 - [Configuration Guide](configuration.md) - Environment variable setup and tuning
 - [Troubleshooting Guide](troubleshooting.md) - Debugging and error solutions
-- [Error Codes](error-codes.md) - Complete error code reference
+- [Error Reference](error-codes.md) - Error types, causes and fixes
 
 ### Architecture & Performance
 

@@ -1,8 +1,8 @@
 """Byte-verification of auto-mode cache keys against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/cache-keys.json, vendored from
-cachekit-io/protocol @ f0672c1cf2a3bbd2ba3f4760b6d1406a4357aab9
-(sha256 4a0ae13dfa745a1a2505f2a10148db7d55f23f9b01636000cf477e805b86450e).
+cachekit-io/protocol @ 3799ebde38feb8a87e9b419eb2fa2d99e562ead7
+(sha256 e4c4174217757686069224a6f4553a1af7816191f689a865498f1cb4969856bb).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 Each vector pins the full 7-segment auto-mode key
@@ -30,13 +30,13 @@ import pytest
 from cachekit.key_generator import CacheKeyGenerator
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "cache-keys.json"
-FIXTURE_SHA256 = "4a0ae13dfa745a1a2505f2a10148db7d55f23f9b01636000cf477e805b86450e"
+FIXTURE_SHA256 = "e4c4174217757686069224a6f4553a1af7816191f689a865498f1cb4969856bb"
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 # Part of the conformance claim: a fixture update that adds or removes
 # vectors must be a conscious change, not a silent drift.
-EXPECTED_VECTOR_COUNT = 10
+EXPECTED_VECTOR_COUNT = 17
 
 
 def test_fixture_integrity():

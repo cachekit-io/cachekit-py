@@ -209,17 +209,6 @@ class TestPerRequestBackendErrorHandling:
         with pytest.raises(RuntimeError, match="tenant_id cannot be None"):
             PerRequestRedisBackend(client, tenant_id=None)
 
-    def test_per_request_backend_stores_original_tenant_id(self):
-        """Test PerRequestRedisBackend stores original tenant ID before URL encoding."""
-        client = redis.Redis()
-        tenant_id = "org:123:division"
-        backend = PerRequestRedisBackend(client, tenant_id=tenant_id)
-
-        # Original ID should be stored for error messages
-        assert backend._original_tenant_id == tenant_id
-        # URL-encoded version should be used for keys
-        assert backend._tenant_id == "org%3A123%3Adivision"
-
     def test_per_request_backend_error_includes_context(self):
         """Test backend errors include operation and key context."""
         # BackendError context is tested via classify_redis_error()

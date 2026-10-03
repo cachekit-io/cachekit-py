@@ -46,7 +46,7 @@ cached_at = 1850   # Freshness clock restarts
 expires_at = 5450  # Hard expiry restarts too (1850 + 3600)
 ```
 
-If the background refresh fails (your function raises), the entry is left as-is: the cached value keeps being served until its original hard expiry, and the next qualifying hit retries the refresh.
+If the background refresh fails (your function raises), the entry is left as-is: the cached value keeps being served until its original hard expiry, the next qualifying hit retries the refresh, and cachekit logs a WARNING `L1-only SWR refresh failed` (see [SWR refresh failing](#problem-swr-refresh-failing)).
 
 ---
 
@@ -252,6 +252,7 @@ config = L1CacheConfig(
     # SWR Settings
     swr_enabled=True,                # Enable SWR (default: True)
     swr_threshold_ratio=0.5,         # Refresh at X% of TTL (default: 0.5 = 50%)
+    swr_retry_interval=10.0,         # Back-off after a failed refresh (default: 10 s)
 )
 ```
 
@@ -261,6 +262,7 @@ config = L1CacheConfig(
 | `max_size_mb` | int | `100` | Maximum memory usage in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (L1-only mode, requires a `ttl`) |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` |
+| `swr_retry_interval` | float | `10.0` | Seconds after a failed refresh before that key refreshes again, `>= 0` (`0` = next stale read) |
 
 ### Intent Presets
 
@@ -385,9 +387,11 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 ### Problem: SWR refresh failing
 
-**Cause:** Your function raised during the background re-run (L1-only mode)
+**Cause:** Your function raised during the background re-run (L1-only mode), or the refresh never ran: the call's arguments cannot be deep-copied (a lock, an open connection), or its thread could not start.
 
-**Behavior:** The cached value continues to be served until its hard expiry, and the next qualifying hit retries the refresh. This is by design - a failed refresh never evicts a servable value.
+**Behavior:** The cached value continues to be served until its hard expiry, and the next qualifying hit retries the refresh. This is by design - a failed refresh never evicts a servable value. Arguments that cannot be copied fail the same way on every retry, so for that call refresh-ahead never runs and the value is recomputed in the foreground after expiry.
+
+**Diagnosis:** cachekit logs a WARNING `L1-only SWR refresh failed`, `L1-only SWR refresh skipped` or `L1-only SWR refresh could not be started`, with the function and the key as `<redacted:…>` digests and the exception type (never its message). The function's digest is that of its `module.qualname`: `cachekit.hash_utils.redact_cache_key("app.sources.fetch")` gives the value to match. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 
 ### Problem: High memory usage despite max_size_mb limit
 

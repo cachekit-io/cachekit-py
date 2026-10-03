@@ -21,7 +21,8 @@ class RedisBackendConfig(BaseBackendConfig):
 
     Attributes:
         redis_url: Redis server connection URL
-        connection_pool_size: Maximum connections in the Redis pool
+        connection_pool_size: Maximum connections in the Redis pool. When all are
+            in use, an operation waits up to socket_timeout for one to be released
         socket_timeout: Socket read/write timeout in seconds (finite so a dead
             Redis fails fast instead of blocking on the OS TCP timeout)
         socket_connect_timeout: Socket connect timeout in seconds
@@ -36,7 +37,7 @@ class RedisBackendConfig(BaseBackendConfig):
         >>> config.redis_url
         'redis://localhost:6379'
         >>> config.connection_pool_size
-        10
+        50
         >>> config.socket_keepalive
         True
 
@@ -63,9 +64,11 @@ class RedisBackendConfig(BaseBackendConfig):
         description="Redis connection URL (env: CACHEKIT_REDIS_URL or REDIS_URL)",
     )
     connection_pool_size: int = Field(
-        default=10,
+        # Above the default executor's min(32, cpu_count + 4) threads, which async
+        # decorated calls share for their L2 operations. Connections open lazily.
+        default=50,
         gt=0,
-        description="Maximum connections in the Redis pool",
+        description="Maximum connections in the Redis pool (env: CACHEKIT_CONNECTION_POOL_SIZE)",
     )
     socket_timeout: float = Field(
         default=5.0,

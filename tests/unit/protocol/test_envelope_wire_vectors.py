@@ -1,8 +1,8 @@
 """SDK-level byte-verification of the ByteStorage envelope against the protocol wire-format vectors.
 
 Fixture: tests/unit/protocol/fixtures/wire-format.json, vendored from
-cachekit-io/protocol @ 5be35d5240817617275e3983de486a5826a587af
-(fixture 1.1.1, sha256 b902db88fb9b2c4a2d0def7266f8199a858fcb921262c1eaf2c2c03412b5b56a).
+cachekit-io/protocol @ efe56e54723cdfb5292a2e9352157d4141a08421
+(fixture 1.3.0, sha256 5d72ca1ff27202ab46aa501f54abf77e535f275d2ea4443966ad464f3c020cd7).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 The fixture is append-only (protocol 1.1, decisions/envelope-bin-encoding.md):
@@ -24,6 +24,17 @@ paths that:
    byte-identically from the vector inputs.
 4. **Round-trip identity** through the full stack (store → retrieve) for
    compressible and incompressible payloads.
+5. **Ratio-product width**: the constructed ``envelope_ratio_product_wraps_32_bits``
+   vector, whose ``1000 * compressed_size`` overflows 32 bits, decodes to its
+   constructed input. cachekit-py ships 64-bit wheels only, where a
+   pointer-width product passes this vector anyway, so it is a regression guard
+   and does not discharge the spec's MUST for 32-bit targets.
+6. **Named rejections**: every ``reject_vectors`` envelope is rejected by
+   ``ByteStorage.retrieve`` with the error class and message its row names. The
+   spec also asks that the reads of ``reject_original_size_over_cap`` and
+   ``reject_ratio_bomb`` stay below ``original_size`` in allocation; that bound
+   is not asserted here, because an SDK over cachekit-core may rely on it only
+   once core's allocation probe runs in CI on the core version this package pins.
 
 A failure here is a wire-format break to triage, never a fixture to silently
 regenerate: envelopes are shared cross-SDK (py/ts read each other's bytes),
@@ -40,7 +51,7 @@ import msgpack
 import pytest
 
 from cachekit import cache
-from cachekit._rust_serializer import ByteStorage
+from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
 from cachekit.backends.file import FileBackend, FileBackendConfig
 from cachekit.key_generator import CacheKeyGenerator
 from cachekit.serializers.standard_serializer import StandardSerializer
@@ -49,7 +60,7 @@ from cachekit.serializers.wrapper import SerializationWrapper
 pytestmark = pytest.mark.unit
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "wire-format.json"
-FIXTURE_SHA256 = "b902db88fb9b2c4a2d0def7266f8199a858fcb921262c1eaf2c2c03412b5b56a"
+FIXTURE_SHA256 = "5d72ca1ff27202ab46aa501f54abf77e535f275d2ea4443966ad464f3c020cd7"  # pragma: allowlist secret
 
 _FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 VECTORS = _FIXTURE["vectors"]
@@ -58,6 +69,19 @@ BIN_VECTORS = [v for v in VECTORS if v.get("envelope_encoding") == "bin"]
 
 # Envelope is a positional fixarray(4): [compressed_data, checksum, original_size, format].
 FIXARRAY_4 = 0x94
+
+
+def _named_vector(group: str, name: str) -> dict:
+    """The fixture vector ``name`` in ``group``; fails by name if either is missing."""
+    for vector in _FIXTURE.get(group, []):
+        if vector["name"] == name:
+            return vector
+    pytest.fail(f"fixtures/wire-format.json has no {group}[{name!r}]")
+
+
+def _construct(segments: list[dict]) -> bytes:
+    """Expand a fixture ``{hex, count}`` segment list into the bytes it describes."""
+    return b"".join(bytes.fromhex(seg["hex"]) * seg["count"] for seg in segments)
 
 
 def _incompressible(n: int) -> bytes:
@@ -145,6 +169,55 @@ class TestFfiDualRead:
         storage = ByteStorage("msgpack")
         envelope = bytes(storage.store(bytes.fromhex(vector["input_hex"]), "msgpack"))
         assert envelope.hex() == vector["envelope_hex"]
+
+
+class TestConstructedVectors:
+    """Vectors too large to store as one hex string, rebuilt from their segment lists."""
+
+    def test_ratio_product_wrapping_32_bits_decodes(self):
+        """1000 * compressed_size overflows 32 bits here; a 32-bit product reads 704 and rejects a valid envelope."""
+        vector = _named_vector("constructed_vectors", "envelope_ratio_product_wraps_32_bits")
+        envelope = _construct(vector["envelope_construction"])
+        expected = _construct(vector["input_construction"])
+        assert len(envelope) == vector["envelope_size"]
+        assert len(expected) == vector["original_size"]
+
+        payload, fmt = ByteStorage("msgpack").retrieve(envelope)
+        assert bytes(payload) == expected
+        assert fmt == "msgpack"
+
+
+# Each reject vector's named error, as cachekit-py surfaces it (rust/src/python_bindings.rs maps
+# DeserializationFailed to a plain ValueError, every other core error to EnvelopeIntegrityError).
+REJECT_EXPECTATIONS: dict[str, tuple[type[Exception], str]] = {
+    "reject_original_size_over_cap": (EnvelopeIntegrityError, "input exceeds maximum size"),
+    # A Retrieve Flow step-2 range-checked decode into u32, which the row allows.
+    "reject_original_size_wraps_u32": (ValueError, "expected u32"),
+    # Core shares one error variant between its zero-length and ratio checks, so the message is the
+    # ratio one; with original_size 0 the ratio check cannot fire (1000 * 0 = 0), so only the
+    # zero-length check can have rejected it.
+    "reject_zero_length_compressed_data": (EnvelopeIntegrityError, "decompression ratio exceeds safety limit"),
+    "reject_ratio_bomb": (EnvelopeIntegrityError, "decompression ratio exceeds safety limit"),
+    "reject_decompressed_length_mismatch": (EnvelopeIntegrityError, "size validation failed"),
+    "reject_checksum_mismatch": (EnvelopeIntegrityError, "integrity check failed"),
+}
+
+
+class TestRejectVectors:
+    """Every reject vector is refused by the real FFI retrieve path with the error its row names."""
+
+    def test_reject_vector_names_are_pinned(self):
+        """An emptied or renamed group fails here instead of passing on zero parametrized cases."""
+        assert {v["name"] for v in _FIXTURE.get("reject_vectors", [])} == set(REJECT_EXPECTATIONS)
+
+    @pytest.mark.parametrize(("name", "expected"), REJECT_EXPECTATIONS.items(), ids=list(REJECT_EXPECTATIONS))
+    def test_retrieve_rejects_with_named_error(self, name, expected):
+        error_type, message = expected
+        envelope = bytes.fromhex(_named_vector("reject_vectors", name)["envelope_hex"])
+        with pytest.raises(error_type, match=message) as excinfo:
+            ByteStorage("msgpack").retrieve(envelope)
+        if error_type is ValueError:
+            assert not isinstance(excinfo.value, EnvelopeIntegrityError)
 
 
 class TestBinEmitWidths:

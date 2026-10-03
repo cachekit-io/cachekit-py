@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import threading
 import time
 
@@ -317,6 +318,124 @@ class TestL1OnlySWRBoundedConcurrency:
 
 
 @pytest.mark.unit
+class TestL1OnlySWRFailureWarnings:
+    """A refresh that fails or never runs reaches a default-level log: the caller never sees it.
+
+    Without the WARNING, a function whose upstream is down, or whose arguments cannot be
+    snapshotted, silently serves the cached value until ttl and then recomputes in the foreground.
+    """
+
+    _L1 = L1CacheConfig(swr_enabled=True, swr_threshold_ratio=0.01)  # stale after ~0.1 s of ttl=10
+
+    async def test_async_failed_refresh_warns_with_redacted_key_and_type(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _await_for, _warnings
+
+        calls = 0
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("secret-detail")
+            return calls
+
+        assert await fn() == 1
+        await asyncio.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert await fn() == 1  # stale served; the refresh fails in the background
+            assert await _await_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (warning,) = _warnings(caplog, "L1-only SWR refresh failed")
+        _assert_key_free(warning)
+
+    def test_sync_failed_refresh_warns_with_redacted_key_and_type(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _wait_for, _warnings
+
+        calls = 0
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("secret-detail")
+            return calls
+
+        assert fn() == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+            assert _wait_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (warning,) = _warnings(caplog, "L1-only SWR refresh failed")
+        _assert_key_free(warning)
+
+    def test_function_metadata_never_reaches_the_warning(self, caplog):
+        """A dynamically created function's __qualname__ and __name__ can carry caller data.
+
+        The WARNING names the function by the digest of its module.qualname, so it stays
+        correlatable, and the record's thread name is static: a log format with
+        %(threadName)s must not leak the function name either.
+        """
+        from cachekit.hash_utils import redact_cache_key
+        from tests.unit.test_swr_decorator import _wait_for, _warnings
+
+        calls = 0
+
+        def source():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("down")
+            return calls
+
+        source.__qualname__ = "factory.<locals>.tenant-customer-42.fetch"
+        source.__name__ = "fetch_tenant-customer-42"
+        fn = cache(ttl=10, backend=None, l1=self._L1)(source)
+
+        assert fn() == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+            assert _wait_for(lambda: _warnings(caplog, "L1-only SWR refresh failed"))
+        (record,) = [r for r in caplog.records if "L1-only SWR refresh failed" in r.getMessage()]
+        assert "tenant-customer-42" not in record.getMessage()
+        assert "tenant-customer-42" not in record.threadName
+        assert f"in function {redact_cache_key(f'{__name__}.factory.<locals>.tenant-customer-42.fetch')}" in record.getMessage()
+
+    def test_uncopyable_args_warn_that_refresh_ahead_cannot_run(self, caplog):
+        from tests.unit.test_swr_decorator import _assert_key_free, _warnings
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", key=lambda lock: "k", l1=self._L1)
+        def fn(lock):
+            return 1
+
+        lock = threading.Lock()  # deepcopy(threading.Lock()) raises TypeError
+        assert fn(lock) == 1
+        time.sleep(0.15)
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn(lock) == 1  # stale served; the skip is logged before this returns
+        (warning,) = _warnings(caplog, "L1-only SWR refresh skipped")
+        assert "arguments not deep-copyable, so refresh-ahead cannot run for this call" in warning
+        _assert_key_free(warning, exc_type="TypeError")
+
+    def test_thread_start_failure_warns(self, monkeypatch, caplog):
+        import cachekit.decorators.wrapper as wrapper_mod
+        from tests.unit.test_swr_decorator import _assert_key_free, _failing_thread_shim, _warnings
+
+        @cache(ttl=10, backend=None, namespace="tenant-secret-ns", l1=self._L1)
+        def fn():
+            return 1
+
+        assert fn() == 1
+        time.sleep(0.15)
+        monkeypatch.setattr(wrapper_mod, "threading", _failing_thread_shim())
+        with caplog.at_level(logging.WARNING, logger="cachekit.decorators.wrapper"):
+            assert fn() == 1
+        (warning,) = _warnings(caplog, "L1-only SWR refresh could not be started")
+        _assert_key_free(warning)
+
+
+@pytest.mark.unit
 class TestL1OnlySizeBound:
     """max_size_mb is a byte bound in L1-only mode, not an entry count."""
 
@@ -365,3 +484,152 @@ class TestL1OnlySizeBound:
         assert fn(1) == "value-1"
         assert fn(1) == "value-1"
         assert calls == 1
+
+
+@pytest.mark.unit
+class TestL1OnlySWRRetryBackoff:
+    """A failed L1-only refresh is not retried on every read (swr_retry_interval).
+
+    The ObjectCache clock is faked so the band/back-off/expiry boundaries are exact;
+    the refresh itself still runs on a real thread or task.
+    """
+
+    @staticmethod
+    def _fake_clock(monkeypatch, start: float = 1000.0):
+        import types
+
+        fake_time = types.SimpleNamespace(monotonic=lambda: start)
+        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+        return fake_time
+
+    @staticmethod
+    def _wait_sync(get_calls, expected: int, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while get_calls() < expected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)  # let the refresh thread record its failure
+
+    def test_sync_failed_refresh_backs_off_then_retries_once(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0  # in the refresh band
+        assert fn() == "held"  # schedules the refresh that fails
+        self._wait_sync(lambda: calls, 2)
+        assert calls == 2
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i  # inside the 20 s back-off
+            assert fn() == "held"
+        time.sleep(0.1)
+        assert calls == 2, f"refresh retried during back-off (calls={calls})"
+
+        fake.monotonic = lambda: 1080.0  # back-off over
+        assert fn() == "held"
+        assert fn() == "held"
+        self._wait_sync(lambda: calls, 3)
+        assert calls == 3, f"expected exactly one retry after the interval (calls={calls})"
+
+    def test_sync_past_ttl_caller_sees_exception(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=1000))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert fn() == "held"
+        self._wait_sync(lambda: calls, 2)
+
+        fake.monotonic = lambda: 1100.0  # hard expiry, back-off still running
+        with pytest.raises(RuntimeError, match="upstream down"):
+            fn()
+        assert calls == 3
+
+    def test_zero_interval_restores_retry_on_every_stale_read(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=0))
+        def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        for expected in (2, 3, 4):
+            assert fn() == "held"
+            self._wait_sync(lambda: calls, expected)
+        assert calls == 4
+
+    async def test_async_failed_refresh_backs_off(self, monkeypatch):
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return "held"
+
+        assert await fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 2)
+        await asyncio.sleep(0.05)  # let the failed task finish
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i
+            assert await fn() == "held"
+        await asyncio.sleep(0.1)
+        assert calls == 2
+
+        fake.monotonic = lambda: 1080.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 3)
+        assert calls == 3
+
+    async def test_async_upstream_cancelled_error_backs_off(self, monkeypatch):
+        """An upstream that raises CancelledError counts as a failed attempt, not a skip."""
+        fake = self._fake_clock(monkeypatch)
+        calls = 0
+
+        @cache(ttl=100, backend=None, l1=L1CacheConfig(swr_threshold_ratio=0.5, swr_retry_interval=20))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise asyncio.CancelledError
+            return "held"
+
+        assert await fn() == "held"
+        fake.monotonic = lambda: 1060.0
+        assert await fn() == "held"
+        await _wait_for_calls(lambda: calls, 2)
+        await asyncio.sleep(0.05)
+
+        for i in range(12):
+            fake.monotonic = lambda i=i: 1061.0 + i
+            assert await fn() == "held"
+        await asyncio.sleep(0.1)
+        assert calls == 2, f"refresh retried during back-off (calls={calls})"

@@ -49,7 +49,7 @@ from redis.lock import Lock
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis import provider as provider_module
-from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider, tenant_context
+from cachekit.backends.redis.provider import PerRequestRedisBackend, RedisBackendProvider
 from tests.fixtures.tenant import as_tenant
 
 
@@ -76,7 +76,7 @@ class TestRedisPoolDecodeResponses:
         rc = self._reset(monkeypatch)
         from cachekit.config.singleton import reset_settings
 
-        with patch("redis.ConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
+        with patch("redis.BlockingConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
             try:
                 rc.get_cached_redis_client()
             finally:
@@ -101,7 +101,7 @@ class TestRedisPoolDecodeResponses:
         rc = self._reset(monkeypatch)
         from cachekit.config.singleton import reset_settings
 
-        with patch("redis.ConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
+        with patch("redis.BlockingConnectionPool.from_url") as mock_from_url, patch("redis.Redis"):
             try:
                 rc.get_cached_redis_client()
             finally:
@@ -165,6 +165,80 @@ class TestRedisPoolSocketKeepalive:
         pool = self._pool(build, "unix:///tmp/cachekit-no-such.sock?db=0", keepalive)
         assert "socket_keepalive" not in pool.connection_kwargs
         pool.make_connection()  # raised TypeError when the kwarg leaked through
+
+
+@pytest.mark.unit
+class TestRedisPoolSizing:
+    """Every Redis pool path is sized by RedisBackendConfig.connection_pool_size (default 50).
+
+    The default executor runs min(32, cpu_count + 4) L2 operations at once, so a smaller
+    pool raised on ordinary async load. The live wait/timeout behaviour is covered against
+    a real Redis in tests/integration/test_redis_backend.py.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        for var in (
+            "CACHEKIT_CONNECTION_POOL_SIZE",
+            "CACHEKIT_API_KEY",
+            "CACHEKIT_MEMCACHED_SERVERS",
+            "CACHEKIT_FILE_CACHE_DIR",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_default_pool_size_is_50(self):
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        assert RedisBackendConfig().connection_pool_size == 50
+
+    def test_explicit_backend_default_pool(self):
+        assert RedisBackend(redis_url="redis://localhost:6379")._client_provider._pool.max_connections == 50
+
+    @pytest.mark.parametrize(("env_size", "expected"), [(None, 50), ("3", 3)])
+    def test_env_resolved_backend_pool_follows_config(self, monkeypatch, env_size, expected):
+        from cachekit.backends.provider import DefaultBackendProvider
+
+        monkeypatch.setenv("CACHEKIT_REDIS_URL", "redis://localhost:6379")
+        if env_size is not None:
+            monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", env_size)
+        with patch.object(redis.Redis, "ping"):
+            backend = DefaultBackendProvider().get_backend()
+        assert backend._client.connection_pool.max_connections == expected
+
+    def test_provider_pool_size_argument_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("CACHEKIT_CONNECTION_POOL_SIZE", "3")
+        with patch.object(redis.Redis, "ping"):
+            provider = RedisBackendProvider("redis://localhost:6379", pool_size=7)
+        assert provider._pool.max_connections == 7
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [("redis://localhost:6379", 1.5), ("redis://localhost:6379?socket_timeout=0.1", 0.1)],
+    )
+    def test_sync_pool_waits_up_to_the_effective_socket_timeout(self, url, expected):
+        """A URL query option overrides the config's socket_timeout, and so bounds the pool wait too."""
+        from cachekit.backends.redis.client import create_connection_pool
+        from cachekit.backends.redis.config import RedisBackendConfig
+
+        pool = create_connection_pool(url, RedisBackendConfig(socket_timeout=1.5))
+        assert isinstance(pool, redis.BlockingConnectionPool)
+        assert pool.timeout == pool.connection_kwargs["socket_timeout"] == expected
+
+    @pytest.mark.parametrize(("method", "args", "command"), [("get_ttl", ("k",), "ttl"), ("refresh_ttl", ("k", 60), "expire")])
+    async def test_ttl_commands_run_off_the_event_loop(self, method, args, command):
+        """A full pool makes a sync command wait up to socket_timeout; on the loop thread it would stall every coroutine."""
+        threads = []
+        client = Mock()
+        getattr(client, command).side_effect = lambda *a: threads.append(threading.get_ident()) or 1
+        await getattr(PerRequestRedisBackend(client, "tenant"), method)(*args)
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_cachekitio_keeps_its_own_default(self, monkeypatch):
+        """CACHEKIT_CONNECTION_POOL_SIZE also sizes the CachekitIO HTTP pool, whose default stays 10."""
+        from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
+
+        monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_123")  # pragma: allowlist secret
+        assert CachekitIOBackendConfig.from_env().connection_pool_size == 10
 
 
 @pytest.mark.unit
@@ -745,14 +819,6 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
     provider-issued backend must scope each operation to the calling context's tenant."""
 
     @staticmethod
-    def _as_tenant(tenant, fn, *args):
-        token = tenant_context.set(tenant)
-        try:
-            return fn(*args)
-        finally:
-            tenant_context.reset(token)
-
-    @staticmethod
     def _tenants(fake: _FakeRedis) -> set[str]:
         return {key.split(":", 2)[1] for key in fake._store}
 
@@ -772,7 +838,8 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
     def test_accepted_tenant_ids_encode_to_their_canonical_form(self, tenant, wire):
         shared = PerRequestRedisBackend(Mock(), "default", follow_context=True)
         assert PerRequestRedisBackend(Mock(), tenant).key_prefix == f"t:{wire}:"
-        assert self._as_tenant(tenant, lambda: shared.key_prefix) == f"t:{wire}:"
+        with as_tenant(tenant):
+            assert shared.key_prefix == f"t:{wire}:"
 
     @pytest.mark.parametrize(
         "tenant", [object(), True, False, enum.IntEnum("Org", "A").A], ids=["object", "True", "False", "IntEnum"]
@@ -785,8 +852,8 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         with pytest.raises(TypeError):
             PerRequestRedisBackend(client, tenant)
         shared = PerRequestRedisBackend(client, "default", follow_context=True)
-        with pytest.raises(TypeError):
-            self._as_tenant(tenant, shared.get, "k")
+        with as_tenant(tenant), pytest.raises(TypeError):
+            shared.get("k")
         client.get.assert_not_called()
 
     def test_a_context_without_a_tenant_falls_back_to_default_or_the_call_time_tenant(self):
@@ -795,12 +862,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         try:
             # An empty context (e.g. a thread that inherited none) has no tenant: get_shared_backend()
             # falls back to "default", get_backend() to the tenant current at the call.
-            shared = self._as_tenant("tenant-x", provider.get_shared_backend)
+            with as_tenant("tenant-x"):
+                shared = provider.get_shared_backend()
             assert contextvars.Context().run(lambda: shared.key_prefix) == "t:default:"
-            assert self._as_tenant("tenant-y", lambda: shared.key_prefix) == "t:tenant-y:"
-            backend = self._as_tenant("tenant-x", provider.get_backend)
+            with as_tenant("tenant-y"):
+                assert shared.key_prefix == "t:tenant-y:"
+            with as_tenant("tenant-x"):
+                backend = provider.get_backend()
             assert contextvars.Context().run(lambda: backend.key_prefix) == "t:tenant-x:"
-            assert self._as_tenant("tenant-y", lambda: backend.key_prefix) == "t:tenant-y:"
+            with as_tenant("tenant-y"):
+                assert backend.key_prefix == "t:tenant-y:"
         finally:
             provider.close()
 
@@ -813,12 +884,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         def lookup(x):
             return x
 
-        self._as_tenant("tenant-a", lookup, 1)
-        self._as_tenant("tenant-b", lookup, 1)
+        with as_tenant("tenant-a"):
+            lookup(1)
+        with as_tenant("tenant-b"):
+            lookup(1)
 
-        self._as_tenant("tenant-a", lookup.invalidate_cache)
+        with as_tenant("tenant-a"):
+            lookup.invalidate_cache()
         assert self._tenants(fake) == {"tenant-b"}
-        self._as_tenant("tenant-b", lookup.invalidate_cache)  # tenant-b's entry stayed tracked
+        with as_tenant("tenant-b"):
+            lookup.invalidate_cache()  # tenant-b's entry stayed tracked
         assert fake._store == {}
 
     async def test_async_whole_function_invalidate_deletes_only_the_callers_entries_and_keeps_others_tracked(self, monkeypatch):
@@ -831,16 +906,16 @@ class TestProviderIssuedBackendFollowsTheCallingTenant:
         async def lookup(x):
             return x
 
-        async def as_tenant(tenant, fn, *args):
-            tenant_context.set(tenant)  # each create_task below runs this in its own context copy
-            await fn(*args)
+        with as_tenant("tenant-a"):
+            await lookup(1)
+        with as_tenant("tenant-b"):
+            await lookup(1)
 
-        await asyncio.create_task(as_tenant("tenant-a", lookup, 1))
-        await asyncio.create_task(as_tenant("tenant-b", lookup, 1))
-
-        await asyncio.create_task(as_tenant("tenant-a", lookup.ainvalidate_cache))
+        with as_tenant("tenant-a"):
+            await lookup.ainvalidate_cache()
         assert self._tenants(fake) == {"tenant-b"}
-        await asyncio.create_task(as_tenant("tenant-b", lookup.ainvalidate_cache))
+        with as_tenant("tenant-b"):
+            await lookup.ainvalidate_cache()
         assert fake._store == {}
 
 

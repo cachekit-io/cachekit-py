@@ -36,7 +36,7 @@ Without orjson installed, `get_serializer("orjson")` raises `ImportError: orjson
 **Native type support:**
 - datetime → ISO-8601 strings (automatic conversion)
 - UUID → string representation
-- Dataclass → dict (with OPT_PASSTHROUGH_DATACLASS)
+- Dataclass → dict (encoded by default; a hit returns the dict, not the dataclass)
 - Sorted keys by default (deterministic caching)
 
 ## Basic Usage
@@ -107,11 +107,11 @@ OrjsonSerializer handles JSON-compatible types plus extended types:
 **Extended types** (auto-converted):
 - `datetime` → ISO-8601 string (`"2025-01-15T12:30:45Z"`)
 - `UUID` → string representation
-- `dataclass` → dict (requires `OPT_PASSTHROUGH_DATACLASS`)
+- `dataclass` → dict (a hit returns the dict, not the dataclass)
 
-**NOT supported** (raises `TypeError`):
+**NOT supported.** Calling `serialize()` directly raises `TypeError`. A `@cache`-decorated call with a backend does not raise: it returns the value, caches nothing, and logs the failure ([Troubleshooting → Serialization Failures](../troubleshooting.md#common-errors)).
 - `bytes` → use `StandardSerializer` instead
-- Custom classes → use `StandardSerializer` or implement `__dict__`
+- Custom classes → convert to a dict (`dataclasses.asdict`, `model_dump`) or use a [custom serializer](./custom.md)
 - `set`, `frozenset` → convert to `list` first
 
 **Type checking example:**
@@ -161,13 +161,12 @@ OrjsonSerializer vs StandardSerializer (msgpack):
 **When to prefer StandardSerializer:**
 - Maximum compression needed
 - Binary data (bytes, images, etc.)
-- Non-JSON types (custom objects)
 - Smallest possible cache footprint
 
 **Limitations:**
 - JSON-compatible types only (dict, list, str, int, float, bool, None)
-- NO binary data (bytes will raise TypeError) → use StandardSerializer
-- NO arbitrary Python objects → use StandardSerializer
+- NO binary data (`bytes`) → use StandardSerializer
+- NO arbitrary Python objects → convert to a dict first
 - Output is ~20-50% larger than msgpack+LZ4 (acceptable tradeoff for JSON interop)
 
 ---

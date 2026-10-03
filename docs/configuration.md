@@ -35,7 +35,7 @@ def fetch_data():
     return expensive_computation()
 ```
 
-**Configuration:** See [Redis Environment Variables](#redis-connection-for-cachekitconfig) below.
+**Configuration:** See [Redis Environment Variables](#redis-connection-for-redisbackendconfig) below.
 
 ### CachekitIO Backend
 
@@ -63,14 +63,14 @@ High-throughput in-memory caching with consistent hashing across multiple server
 
 ## Environment Variables
 
-### Redis Connection (for CachekitConfig)
+### Redis Connection (for RedisBackendConfig)
 
-Configure Redis backend through environment variables:
+Configure the Redis backend (`RedisBackendConfig`) through environment variables:
 
 ```bash
 # Redis Connection
 CACHEKIT_REDIS_URL=redis://localhost:6379/0
-CACHEKIT_CONNECTION_POOL_SIZE=10
+CACHEKIT_CONNECTION_POOL_SIZE=50  # default 50; a full pool waits CACHEKIT_SOCKET_TIMEOUT for a connection
 CACHEKIT_SOCKET_TIMEOUT=1.0
 CACHEKIT_SOCKET_CONNECT_TIMEOUT=1.0
 
@@ -126,6 +126,7 @@ CACHEKIT_API_URL=https://api.cachekit.io
 CACHEKIT_TIMEOUT=5.0
 
 # Optional: HTTP connection pool size (default: 10, must be > 0)
+# The same variable sizes the Redis pool, whose default is 50
 CACHEKIT_CONNECTION_POOL_SIZE=10
 
 # Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
@@ -140,7 +141,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool. The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
 **Security notes:**
@@ -188,7 +189,7 @@ Rules and behavior:
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
 - **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
-- A failed background recompute is silent: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path.
+- A failed background recompute never reaches the caller: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path. It logs a WARNING `SWR revalidation failed`, as does a revalidation skipped because the call's arguments cannot be deep-copied (`SWR revalidation skipped`) or one that could not be scheduled. It names the function by the same digest as the L1-only refresh WARNING. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
 - On the CachekitIO backend, every read (SWR-configured or not) also carries the server's remaining freshness (`X-CacheKit-Fresh-For`, [protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#remaining-freshness)): an L2 hit backfilled into L1 lives at most `min(ttl, remaining)` locally (with `ttl=None`, L1's own 300-second default lifetime, capped by `remaining`), so a value read near the end of its server-side freshness window is never served fresh from L1 past the server's bound. Pre-signal servers omit the header and behavior is unchanged.
@@ -264,6 +265,7 @@ def my_function():
 | `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) — [L1-only mode](#l1-only-mode-backendnone) only |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` — L1-only mode only |
+| `swr_retry_interval` | float | `10.0` | Seconds after a failed background refresh before that key is refreshed again, `>= 0`; `0` retries on the next stale read — L1-only mode only |
 
 **L1 Cache Concepts:**
 - **Freshness**: When to serve stale data + trigger background refresh (SWR, [L1-only mode](#l1-only-mode-backendnone) only — with a backend configured these fields have no effect)
@@ -287,8 +289,21 @@ honored as follows:
   is ever scheduled — they are stored with a one-year (31,536,000&nbsp;s) sentinel
   expiry rather than truly indefinitely, and can still be evicted earlier under
   byte pressure.
-- **Refresh failures are non-fatal**: the stale value keeps being served until hard
-  expiry, and the next qualifying hit retries the refresh.
+- **Refresh failures are non-fatal and back off**: the stale value keeps being served
+  until hard expiry. After a refresh raises, no background refresh for that key starts
+  again until `swr_retry_interval` seconds (default 10) have passed, so a failing
+  upstream gets at most one background call per key per interval rather than one per
+  read. A successful refresh, or the entry leaving the cache, ends the back-off; past
+  the `ttl` the next call runs the function in the foreground as usual and sees its
+  exception. Set `swr_retry_interval=0` to retry on every stale hit. The refresh runs on a deep copy
+  of the call's arguments; when they cannot be copied (a lock, an open connection), it is
+  skipped, so that call is only ever recomputed in the foreground after expiry.
+- **Failed and skipped refreshes log a WARNING** (`L1-only SWR refresh failed`, `… skipped`,
+  `… could not be started`) with the redacted function, the redacted key and the exception
+  type. The function appears as the `<redacted:…>` digest of its `module.qualname`;
+  `cachekit.hash_utils.redact_cache_key("app.sources.fetch")` gives the digest to match.
+  Each fires at most once a minute per function and carries the count since the last one;
+  the occurrences in between log at DEBUG.
 
 ```python notest
 import asyncio
@@ -382,11 +397,11 @@ export REDIS_URL=redis://localhost:6379/0  # Ignored - won't be used
 
 ### CachekitIO Config is Separate
 
-`@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `CachekitConfig`. Redis URL precedence does not apply.
+`@cache.io()` reads from `CachekitIOBackendConfig` — a completely separate config class from `RedisBackendConfig`. Redis URL precedence does not apply.
 
 | Decorator | Config Class | Key Variable |
 |-----------|-------------|--------------|
-| `@cache`, `@cache.production()`, etc. | `CachekitConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
+| `@cache`, `@cache.production()`, etc. | `RedisBackendConfig` | `CACHEKIT_REDIS_URL` / `REDIS_URL` |
 | `@cache.io()` | `CachekitIOBackendConfig` | `CACHEKIT_API_KEY` |
 
 Setting `REDIS_URL` has no effect on `@cache.io()`. `CACHEKIT_API_KEY` is different: it is also
@@ -422,7 +437,7 @@ For production with Redis:
 
 ```bash
 export CACHEKIT_REDIS_URL=redis://redis-primary:6379/0
-export CACHEKIT_CONNECTION_POOL_SIZE=20
+export CACHEKIT_CONNECTION_POOL_SIZE=50
 export CACHEKIT_ARROW_COMPRESSION=zstd
 ```
 
@@ -608,9 +623,11 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins.
+
 ```bash
 # Tune connection pool size based on concurrency
-export CACHEKIT_CONNECTION_POOL_SIZE=20  # Default is 10
+export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 10
 
 # Higher for:
 # - Many concurrent requests

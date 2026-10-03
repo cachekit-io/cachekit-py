@@ -74,10 +74,6 @@ class SimpleLogger:
         ttl_info = f" with TTL {ttl}" if ttl else ""
         self._logger.debug(f"Cached result for key: {redact_key_for_log(key)}{ttl_info}")
 
-    def cache_invalidated(self, key: str, source: str = "Redis"):
-        """Log cache invalidation. Keys are redacted — they embed caller identifiers (CWE-532)."""
-        self._logger.debug(f"Invalidated {source} cache for key: {redact_key_for_log(key)}")
-
 
 class DefaultLoggerProvider(LoggerProvider):
     """Default logger provider using standard Python logging."""
@@ -252,7 +248,7 @@ class DefaultBackendProvider(BackendProviderInterface):
             from cachekit.backends.redis.provider import RedisBackendProvider
 
             redis_config = RedisBackendConfig.from_env()
-            self._redis_backend = RedisBackendProvider(redis_url=redis_config.redis_url).get_shared_backend()
+            self._redis_backend = RedisBackendProvider(redis_config.redis_url, config=redis_config).get_shared_backend()
         return self._redis_backend
 
 
