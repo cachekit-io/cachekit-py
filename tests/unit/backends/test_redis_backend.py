@@ -46,6 +46,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
+from cachekit import cache
 from cachekit.backends.errors import BackendError
 from cachekit.backends.redis import RedisBackend
 from cachekit.backends.redis import provider as provider_module
@@ -722,6 +723,31 @@ class TestRedisLockWaitersDoNotPinExecutorThreads:
 
         assert backend._scoped_key("k") + ":lock" in fake._store, "a failed release leaves the key for its TTL"
         assert [r.levelno for r in caplog.records if "release" in r.getMessage()] == [level]
+
+    async def test_decorator_runs_uncached_when_redis_goes_away_before_the_lock(self, caplog):
+        """A ``SET NX`` failing after a successful call degrades the next miss: the function runs once,
+        uncached, and the raw ``redis.ConnectionError`` never reaches the caller (LAB-5346)."""
+        fake = _FakeRedis()
+        runs: list[int] = []
+
+        @cache(backend=PerRequestRedisBackend(fake, tenant_id="t"), ttl=60, l1_enabled=False, namespace="lab5346-redis")
+        async def compute(x: int) -> int:
+            runs.append(x)
+            return x * 2
+
+        assert await compute(1) == 2  # warm-up: Redis works
+        fake.nx_error = RedisConnectionError("redis went away")
+        with caplog.at_level(logging.DEBUG, logger="cachekit"):
+            assert await compute(2) == 4
+
+        assert runs == [1, 2]
+        assert any("Lock operation failed" in r.getMessage() for r in caplog.records)
+        cache_keys = [k for k in fake._store if not k.endswith(":lock")]
+        print("KEYS", cache_keys, [k.split(":", 1)[-1] for k in cache_keys])
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            text = formatter.format(record)
+            assert not any(k.split(":", 1)[-1] in text for k in cache_keys), f"{record.name} logged a cache key: {text}"
 
 
 REG = "ck:reg:ns:0123456789abcdef"

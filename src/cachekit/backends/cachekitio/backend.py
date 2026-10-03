@@ -694,29 +694,22 @@ class CachekitIOBackend:
         escape the wrapper's degrade-to-no-lock branch.
 
         Raises:
-            BackendError: For AUTHENTICATION and PERMANENT failures (bad key, bad key
-                format rejected by SaaS validator) — polling won't recover and the wrapper
-                degrades to no-lock execution. TRANSIENT/TIMEOUT/UNKNOWN are swallowed as
-                None so the polling loop can retry.
+            BackendError: For any failed request, whatever its type. Only ``200`` with a null
+                ``lock_id`` means contested (protocol ``POST /v1/cache/{key}/lock``); an error
+                status or a network failure ends the wait, and the wrapper degrades to no-lock
+                execution instead of polling a failing endpoint for ``blocking_timeout``.
         """
         # Clamp non-positive / non-finite timeouts before the int conversion.
         # int(NaN) / int(inf) raise ValueError/OverflowError that aren't BackendError, so
         # they'd escape the wrapper's degrade-to-no-lock branch and crash the @cache.io call.
         timeout_ms = max(1, int(timeout * 1000)) if math.isfinite(timeout) else 1
         encoded_key = self._encode_key(lock_key)
-        try:
-            response = await self._request_async(
-                "POST",
-                f"{encoded_key}/lock",
-                content=json.dumps({"timeout_ms": timeout_ms}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-        except BackendError as exc:
-            # Re-raise unrecoverable failures so the wrapper can log + degrade once,
-            # instead of burning the full blocking_timeout on billable retries.
-            if exc.error_type in (BackendErrorType.AUTHENTICATION, BackendErrorType.PERMANENT):
-                raise
-            return None
+        response = await self._request_async(
+            "POST",
+            f"{encoded_key}/lock",
+            content=json.dumps({"timeout_ms": timeout_ms}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
 
         try:
             data = response.json()

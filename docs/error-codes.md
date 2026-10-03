@@ -4,11 +4,10 @@
 
 The errors cachekit raises or logs, and how to fix them. cachekit has no numeric error codes: catch the class shown under **Exception**.
 
-Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Three exceptions to that rule:
+Configuration errors raise when the decorator is applied. Backend failures (connection, timeout, CachekitIO HTTP errors), serialization, deserialization, circuit-breaker and lock failures do not raise to the caller: a `@cache`-decorated call logs the failure and runs the function without caching. Where that holds, the entry reads **Exception**: none. Two exceptions to that rule:
 
 - Decryption failures raise only when fail-closed is on.
 - With `interop=...`, a return value the interop data model can't represent raises `InteropError`.
-- An **async** function can currently raise the backend's own exception instead of degrading (a known defect): `redis.exceptions.ConnectionError` on every call once Redis goes away after the first successful call, and `httpx.HTTPStatusError` on a CachekitIO 401, 403 or 400, without running the function. On a CachekitIO 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
 
 ## Encryption Errors
 
@@ -295,7 +294,7 @@ function (see [Multi-Tenant Isolation](features/zero-knowledge-encryption.md#mul
 
 ## Connection Errors
 
-None of these raise to a sync `@cache`-decorated caller, or to an async one whose Redis was unreachable from the start. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching. An async function whose Redis goes away after a successful call currently raises `redis.exceptions.ConnectionError` on every call instead (a known defect). Depending on where the failure happens, the log line is one of:
+None of these raise to a `@cache`-decorated caller, sync or async. cachekit wraps the redis-py exception in a `BackendError`, logs it, and runs the function without caching. Depending on where the failure happens, the log line is one of:
 
 - `Cache operation '...' failed for key '...': ...` (WARNING; the last part names the error, e.g. `BackendError(transient)`)
 - `Backend error getting key ...: BackendError(...)` (ERROR)
@@ -601,9 +600,9 @@ redis-cli DEL <lock-key>
 
 ## CachekitIO HTTP Errors
 
-These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. For sync functions none raises: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. "Uncached" in this section means the value is not served from the cache: a failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
+These errors occur when using `@cache.io()` with the CachekitIO SaaS backend. None raises, for sync or async functions: each HTTP failure becomes a `BackendError` with a `BackendErrorType`, is logged as described under *Connection Errors*, and the function runs uncached, with no retry. "Uncached" in this section means the value is not served from the cache: a failed read is treated as a miss, so the decorator still tries to write the function's result to the cache afterwards, and a failed write is logged the same way. These failures do not count toward the circuit breaker.
 
-Async functions currently behave differently (a known defect). A 401, 403 or 400 raises `httpx.HTTPStatusError` to the caller without running the function. On a 429, 5xx or timeout, an async call retries the lock request for about 5 seconds (plus the time each request takes) before running the function, so these calls are slow.
+On a miss, an async function first requests the per-key lock (see [Distributed Locking](features/distributed-locking.md)). Any HTTP failure of that request ends the lock wait at once: the function runs without the lock, and cachekit logs `Lock operation failed … executing without lock`. Only a lock another caller holds is waited on.
 
 ### Authentication failure (401/403)
 
@@ -758,7 +757,7 @@ echo $CACHEKIT_API_URL
 | `ConnectError`, `NetworkError` | `TRANSIENT` |
 | Other | `UNKNOWN` |
 
-For sync functions no type is retried, and none counts toward the circuit breaker. For async functions, see the note at the top of this section.
+For sync functions no type is retried, and none counts toward the circuit breaker. Async functions retry none either: a failed lock request ends the lock wait, as the note at the top of this section says.
 
 ---
 
