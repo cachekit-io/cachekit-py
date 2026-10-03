@@ -6,12 +6,12 @@
 
 ## TL;DR
 
-Circuit breaker prevents cascading failures when the L2 backend is down. After N errors, circuit opens: calls skip the backend and run your function uncached instead of failing, while values already in the in-process L1 cache are still served. Auto-recovers after cooldown.
+Circuit breaker takes the L2 backend out of the call path after repeated failures. After N failures within 60 s, circuit opens: calls skip the backend and run your function uncached instead of failing, while values already in the in-process L1 cache are still served. Auto-recovers after cooldown. A failure is an exception raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](../error-codes.md#circuit-breaker-open). Backend read and write errors do not currently count toward the breaker.
 
 ```python notest
-@cache(ttl=300, backend=None)  # Circuit breaker enabled by default
+@cache(ttl=300)  # Circuit breaker enabled by default
 def get_data(key):
-    return db.query(key)  # illustrative - If backend fails, circuit breaker catches it
+    return db.query(key)  # illustrative - if this raises 5 times within 60 s, the circuit opens
 ```
 
 ---
@@ -23,16 +23,16 @@ Circuit breaker is enabled by default. No configuration needed:
 ```python
 from cachekit import cache
 
-@cache(ttl=300, backend=None)  # Circuit breaker active
+@cache(ttl=300)  # Circuit breaker active
 def expensive_operation(x):
     return do_expensive_computation()
 
 # Redis working: Normal cache behavior
 result = expensive_operation(1)  # L1 hit or L2 hit or compute
 
-# Backend down: Circuit breaker catches error
-# Behavior: the function runs uncached, app continues
-result = expensive_operation(1)  # Computed directly instead of raising
+# Backend down: the error is logged (it does not currently count toward the breaker)
+# Behavior: the function runs and its result is still stored in L1, app continues
+result = expensive_operation(2)  # Computed directly instead of raising
 ```
 
 **Configuration** (optional):
@@ -67,8 +67,8 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
 
 > [!NOTE]
-> The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples
-> on this page so they run anywhere) it is never consulted. The examples show configuration,
+> The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the configuration
+> examples on this page so they run anywhere) it is never consulted. Those examples show configuration,
 > not protection.
 
 > [!IMPORTANT]
@@ -93,11 +93,11 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 ```
 Pod A tries to cache fetch at 12:00:00
 Backend working: CLOSED state, success
-Backend fails at 12:00:05
-Requests 1-5: Errors accumulated; the 5th failure OPENS the circuit
+fetch starts raising at 12:00:05 (its database is down)
+Requests 1-5: each exception reaches the caller and counts; the 5th within 60 s OPENS the circuit
 Requests 6-34: Circuit OPEN, function runs uncached (no backend calls)
 Request 35 (once 30s have passed since the circuit opened): Circuit goes HALF_OPEN, probe 1 of 3
-Requests 35-37: Backend back up, all 3 probes succeed → Circuit CLOSES
+Requests 35-37: fetch works again, all 3 probes succeed → Circuit CLOSES
 Request 38: Normal operation resumes
 ```
 
@@ -110,20 +110,18 @@ Request 38: Normal operation resumes
 **Without circuit breaker**:
 ```
 Backend is down
-Cache decorator catches errors
-Caller gets exception: "ConnectionError: backend unreachable"
-Service crashes if error not handled by caller
-Cascades to dependent services
+Cache decorator logs each error: a failed read is a miss, a failed write skips L2
+Caller gets: the function's result, still stored in L1
+Every L1 miss still tries the backend first
 ```
 
 **With circuit breaker**:
 ```
 Backend is down
-Circuit breaker catches errors
-After N failures: Circuit OPENS
-Caller gets: the function's result, computed without the cache
-Service continues working (degraded but up)
-No cascading failures
+Same as without: backend errors do not currently count toward the breaker
+After N counted failures (the function raising, the backend client failing to build): Circuit OPENS
+Caller gets: L1 hits as before; an L1 miss runs the function without trying the backend
+Auto-recovers after the cooldown
 ```
 
 ---
@@ -168,7 +166,7 @@ from cachekit.config.nested import CircuitBreakerConfig
 
 @cache(ttl=300, circuit_breaker=CircuitBreakerConfig(recovery_timeout=1.0), backend=None)
 def problematic_function():
-    # Problem: a 1s cooldown re-probes a still-failing backend every second
+    # Problem: a 1s cooldown re-probes a still-failing function every second
     # (OPEN → HALF_OPEN → OPEN).
     # Solution: Increase cooldown to 30-60 seconds
     return expensive_operation()  # illustrative - not defined
@@ -196,17 +194,17 @@ def get_data():
 ```python notest
 from cachekit import cache
 
-@cache(ttl=3600, backend=None)  # Circuit breaker ON by default
+@cache(ttl=3600)  # Circuit breaker ON by default
 def get_user(user_id):
     return db.query(User).filter_by(id=user_id).first()  # illustrative - not defined
 
 # App continues working even if backend is down
-user = get_user(123)  # Backend down: the query runs uncached
+user = get_user(123)  # Backend down: the query runs, and its result is still stored in L1
 ```
 
 ### With Graceful Fallback
 ```python notest
-@cache(ttl=3600, backend=None)
+@cache(ttl=3600)
 def get_config(key):
     return db.get_config(key)  # illustrative - not defined
 
@@ -226,7 +224,7 @@ from cachekit.config.nested import CircuitBreakerConfig
 @cache(
     ttl=3600,
     backend=None,
-    # Tune these based on your Redis reliability
+    # Tune these to how often the function itself fails
     circuit_breaker=CircuitBreakerConfig(
         failure_threshold=10,  # Open after 10 failures
         recovery_timeout=60.0,  # Cooldown before a recovery probe
@@ -353,7 +351,7 @@ Alert on `circuit_breaker_state{state="OPEN"} > 0`. See the
 ```python notest
 # Example of checking circuit breaker state (API may vary)
 # Check function's health status instead:
-@cache(ttl=300, backend=None)
+@cache(ttl=300)
 def fetch_user(user_id):
     return {"id": user_id}
 
@@ -368,10 +366,10 @@ print(f"Failures: {health['circuit_breaker']['failure_count']}")
 ## Troubleshooting
 
 **Q: Circuit breaker keeps opening**
-A: Raise `failure_threshold` or `recovery_timeout`. Investigate why Redis is failing.
+A: Raise `failure_threshold` or `recovery_timeout`. Look in the logs for the failures that count (listed under [Circuit breaker open](../error-codes.md#circuit-breaker-open)); backend read and write errors do not currently count.
 
-**Q: My function runs on every call while the backend is down**
-A: That's the OPEN state: calls skip the cache and run your function. Once the cooldown has passed, the circuit probes the backend again and closes after 3 successful probes.
+**Q: My function runs on every call while the circuit is OPEN**
+A: That's the OPEN state: calls skip L2 and run your function, and nothing new is written to L1; only values already in L1 are still served. Once the cooldown has passed, the circuit admits probe calls again and closes after 3 successful probes.
 
 **Q: Want to disable circuit breaker for testing**
 A: Pass `circuit_breaker=CircuitBreakerConfig(enabled=False)`.

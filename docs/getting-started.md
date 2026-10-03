@@ -340,7 +340,7 @@ def critical_function():
     return important_data()
 
 # Redis is down? No problem!
-# Function executes normally, just without caching
+# Function executes normally; its result is still cached in L1 (in-process)
 result = critical_function()  # Works even if Redis is offline
 ```
 

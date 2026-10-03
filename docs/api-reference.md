@@ -318,12 +318,6 @@ Non-blocking metrics collection system that prevents performance degradation:
 - Self-healing worker thread management
 - Zero impact on critical path latency
 
-#### `RedisErrorClassifier`
-Intelligent error categorization for circuit breaker decisions:
-- Distinguishes transient vs. permanent failures
-- Prevents application errors from triggering circuit breaker
-- Enables targeted recovery strategies
-
 #### `get_cached_redis_client()`
 Thread-local Redis client caching (`cachekit.backends.redis.client`):
 - Eliminates repeated client creation overhead
@@ -641,7 +635,7 @@ The Redis backend wraps each redis-py exception in a `BackendError` whose `error
 
 ### Connection Failures
 When Redis is unavailable:
-1. Function executes without caching
+1. Function executes, and its result is still stored in L1, so later calls in the same process hit L1
 2. Warning is logged (if logging configured)
 3. No exception is raised to the caller
 

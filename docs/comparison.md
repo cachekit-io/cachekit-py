@@ -115,7 +115,8 @@ from cachekit import cache
 def get_user_data(user_id: int) -> dict:
     # First pod (same instance): L1 hit (~50ns)
     # Different pod: L2 hit from Redis (~2-7ms)
-    # Redis down: Circuit breaker returns stale/None, doesn't crash
+    # Redis down: errors are logged, the function runs and its result still goes to L1, doesn't crash
+    # Circuit breaker open: L1 hits still served; a miss runs the function and returns its result
     # Multiple pods calling simultaneously: Distributed lock prevents stampede
     return fetch_user_from_db(user_id)
 ```
@@ -203,9 +204,9 @@ def compute(x):
 ```python
 @cache(ttl=300)  # Circuit breaker enabled by default
 def fetch_data(key):
-    # Redis is down → Circuit breaker catches errors
-    # After N failures → Open circuit → return None instead of errors
-    # Caller can handle gracefully, app stays up
+    # Redis is down → errors are logged, the function runs, the result still goes to L1
+    # Circuit open → L2 is skipped: L1 hits still served, a miss runs the function
+    # Caller gets the function's result either way, app stays up
     return db.query(key)
 ```
 
@@ -505,7 +506,7 @@ A: cachekit is in beta ahead of 1.0. It's used in production by early adopters, 
 A: Yes. Works with any framework (FastAPI, Django, Flask, etc). Metrics integrate with Prometheus/Grafana.
 
 **Q: What if Redis goes down?**
-A: Circuit breaker catches errors, returns stale cache or None, app continues working.
+A: The app keeps working. Redis errors are logged, your function runs and returns its result, and L1 still caches it in-process. If the circuit breaker opens, L1 hits are still served and a miss runs the function.
 
 **Q: Can I use my own backend?**
 A: Yes. Four built-in backends (Redis, CachekitIO, File, Memcached) or implement the BaseBackend protocol (~100 LOC) for custom storage.

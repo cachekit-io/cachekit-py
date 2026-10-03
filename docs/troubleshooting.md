@@ -114,7 +114,7 @@ def get_user(user_id: int) -> dict:
 
 **Issue**: Redis connection timeout or refused
 
-`@cache` does not raise these: it logs the failure and runs the function uncached. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
+`@cache` does not raise these: it logs the failure and runs the function, and the result is still stored in L1, so later calls in the same process hit L1. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
 ```
 Error 111 connecting to localhost:6379. Connection refused.
 Timeout connecting to server
@@ -293,7 +293,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **Sync calls do not retry a rate-limited request** — the call runs uncached, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs uncached (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the function runs, its result is still stored in L1, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs without the lock (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -354,7 +354,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
+4. **A timeout does not fail the call**: the request is logged, the function runs, and its result is still stored in L1. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
 
 </details>
 
