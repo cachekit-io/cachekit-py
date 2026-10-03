@@ -3,7 +3,7 @@
 Tests for backends/cachekitio/client.py covering:
 - Thread-local, per-config caching (same client for the same config; distinct clients for distinct keys)
 - Sync client lifecycle: open while its lease is held, closed once the lease is dropped
-- Client configuration (base_url, timeout, Authorization header)
+- Client configuration (base_url, timeout, Authorization and User-Agent headers)
 - Async clients bound to the running event loop (multi-loop behaviour: test_cachekitio_event_loops.py)
 - Cleanup via close_sync_client() and close_async_client()
 - reset_global_client() drops thread-local references
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from importlib.metadata import version
 
 import httpx
 import pytest
@@ -90,6 +91,11 @@ class TestLeaseSyncHttpClient:
         assert l2.client.timeout.read == 1.0
         assert lease_sync_http_client(config) is l1
 
+    def test_user_agent_names_sdk_and_httpx_versions(self, config: CachekitIOBackendConfig) -> None:
+        """Edge analytics attribute traffic to an SDK release by this UA, built from installed package metadata."""
+        lease = lease_sync_http_client(config)
+        assert lease.client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
+
 
 @pytest.mark.unit
 class TestLeaseAsyncHttpClient:
@@ -129,6 +135,10 @@ class TestLeaseAsyncHttpClient:
         client = lease_async_http_client(config).client
         auth_header = client.headers.get("authorization", "")
         assert auth_header == f"Bearer {config.api_key.get_secret_value()}"
+
+    async def test_user_agent_names_sdk_and_httpx_versions(self, config: CachekitIOBackendConfig) -> None:
+        client = lease_async_http_client(config).client
+        assert client.headers["user-agent"] == f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
 
 
 @pytest.mark.unit

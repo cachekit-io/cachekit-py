@@ -212,6 +212,8 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
   that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
   avoid it; [Free-threading](../free-threading.md) gives the detail
+- Every request identifies the SDK with a `User-Agent: cachekit-py/<version> httpx/<version>` header,
+  taken from the installed packages, so cachekit.io can attribute traffic to an SDK release
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 

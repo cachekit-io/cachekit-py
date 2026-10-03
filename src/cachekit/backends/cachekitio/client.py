@@ -19,6 +19,7 @@ import os
 import threading
 import weakref
 from contextlib import AsyncExitStack, ExitStack
+from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -30,6 +31,10 @@ if TYPE_CHECKING:
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
 _ClientKey = tuple[str, str, float, int]
+
+# Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
+# The version comes from the installed distribution, so it cannot drift from the release.
+_USER_AGENT = f"cachekit-py/{version('cachekit')} httpx/{httpx.__version__}"
 
 _logger = get_structured_logger(__name__)
 
@@ -205,6 +210,7 @@ def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
         "headers": {
             "Authorization": f"Bearer {config.api_key.get_secret_value()}",
             "Content-Type": "application/octet-stream",
+            "User-Agent": _USER_AGENT,
         },
     }
 
