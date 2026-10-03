@@ -1891,8 +1891,14 @@ def create_cache_wrapper(
         _stats.record_miss()
 
         try:
-            # Execute the original function
-            result = func(*args, **kwargs)
+            # Execute the original function. Its exception is not a backend failure, so it is
+            # never counted, but an admitted HALF_OPEN probe hands its slot to the next call
+            # instead of holding it until the cycle expires.
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                features.release_probe()
+                raise
 
             # Serialize and cache the result
             try:
@@ -2313,6 +2319,7 @@ def create_cache_wrapper(
                         try:
                             result = await func(*args, **kwargs)
                         except Exception as e:
+                            features.release_probe()  # not a backend outcome (see the sync wrapper)
                             func_error = e
                         else:
                             # Serialize and cache the result
@@ -2429,7 +2436,11 @@ def create_cache_wrapper(
                 )
 
             # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
-            result = await func(*args, **kwargs)
+            try:
+                result = await func(*args, **kwargs)
+            except Exception:
+                features.release_probe()
+                raise
 
             # Serialize and cache the result
             try:

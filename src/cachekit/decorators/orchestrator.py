@@ -124,7 +124,8 @@ class FeatureOrchestrator:
         OPEN -> HALF_OPEN transition once the timeout has passed and consumes a
         HALF_OPEN probe slot when it admits. Call it once per request, and record
         the outcome of every admitted request (``record_success`` /
-        ``record_failure``). A rejected request is not a failure — do not record it.
+        ``record_failure``, or ``release_probe`` when it ends with none). A
+        rejected request is not a failure — do not record it.
         """
         # Guard clause: No circuit breaker means allow
         if not self._circuit_breaker:
@@ -299,6 +300,15 @@ class FeatureOrchestrator:
         """
         if self._circuit_breaker:
             self._circuit_breaker._on_success()
+
+    def release_probe(self) -> None:
+        """Give back the HALF_OPEN probe slot of an admitted request that ends with no outcome.
+
+        For the decorated function's own exception: it says nothing about backend
+        health, so it is not a failure, and the next request probes in its place.
+        """
+        if self._circuit_breaker:
+            self._circuit_breaker.release_probe()
 
     def record_cache_operation(
         self,

@@ -64,7 +64,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 | `failure_threshold` | `int` | `5` | Failures within a 60 s rolling window that open the circuit. Successes do not reset the count; older failures stop counting |
 | `success_threshold` | `int` | `3` | Consecutive successes in HALF_OPEN before it closes |
 | `recovery_timeout` | `float` | `30.0` | Cooldown in seconds before an OPEN circuit admits a recovery probe (reported as `timeout_seconds`). Must be finite and `> 0`: it also caps probing at `half_open_requests` per cooldown |
-| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
+| `half_open_requests` | `int` | `3` | Total probe requests admitted per HALF_OPEN cycle (not a concurrency limit; a probe whose function raises gives its slot back). Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a HALF_OPEN cycle could never close |
 
 > [!NOTE]
 > The breaker guards L2 backend calls only: in L1-only mode (`backend=None`, used in the examples
@@ -87,7 +87,7 @@ assert live["timeout_seconds"] == 10.0  # recovery_timeout
 |-------|----------|------------|
 | **CLOSED** | Normal cache operation, count failures | After N failures → OPEN |
 | **OPEN** | Skip the backend: an L1 hit is still served, and an L1 miss runs the function uncached (sync and async). No failure is counted | First call once the cooldown has passed (default 30s after the circuit opened) → HALF_OPEN |
-| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further L1 misses run uncached. L1 hits are served and are neither probes nor successes | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
+| **HALF_OPEN** | Admit up to 3 probe calls to the backend (`half_open_requests`); further L1 misses run uncached. L1 hits are served and are neither probes nor successes. A probe whose function raises records no outcome and hands its slot to the next call | 3 successes (`success_threshold`) → CLOSED, any recorded failure → OPEN. If all 3 probes have been admitted and the cycle is still undecided a cooldown after it began (for example, a cancelled async probe never reported back), a fresh cycle of 3 probes starts and any successes already counted are discarded |
 
 **Example scenario**:
 ```

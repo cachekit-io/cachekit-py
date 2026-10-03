@@ -33,7 +33,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
 3. **Let the breaker recover** — no restart is needed:
-- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
+- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls (a probe whose function raises hands its slot to the next call); three successes close it, and a counted failure reopens it for another cooldown
 - While open, sync and async functions with an L2 backend still serve L1 hits and run without caching on an L1 miss (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):

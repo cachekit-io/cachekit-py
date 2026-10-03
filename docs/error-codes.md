@@ -501,7 +501,7 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **What it means**:
 - A failure listed under **Cause** has occurred `failure_threshold` times (five by default) within 60 seconds
-- Calls to this function that miss L1 run uncached until the breaker recovers; L1 hits are still served. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which admits up to three probe calls (`half_open_requests`) while further calls run uncached. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
+- Calls to this function that miss L1 run uncached until the breaker recovers; L1 hits are still served. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which admits up to three probe calls (`half_open_requests`) while further calls run uncached. A probe whose function raises records no outcome and hands its slot to the next call. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
 
 **Solutions**:
 

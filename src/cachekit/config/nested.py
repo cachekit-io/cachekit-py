@@ -98,8 +98,8 @@ class CircuitBreakerConfig:
             probe; finite and > 0 (default: 30.0). It also caps probing at
             half_open_requests per cooldown, so 0 would remove that cap.
         half_open_requests: Total probe requests admitted per HALF_OPEN cycle, not a
-            concurrency limit; must be >= success_threshold, or a cycle could never
-            close (default: 3)
+            concurrency limit (a probe whose function raises gives its slot back);
+            must be >= success_threshold, or a cycle could never close (default: 3)
 
     The four knobs are forwarded to the live breaker (``recovery_timeout`` becomes its
     ``timeout_seconds``), and ``fn.get_health_status()["circuit_breaker"]["config"]``

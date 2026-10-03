@@ -338,6 +338,40 @@ class TestCircuitBreaker:
             assert "Circuit breaker is OPEN" in str(exc_info.value)
             fast_operation.assert_not_called()
 
+    def test_released_probe_slot_goes_to_the_next_call(self):
+        """A HALF_OPEN probe that ends with no outcome gives its slot back, and records nothing."""
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=0.1, half_open_requests=1)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            breaker.record_failure()
+            traveller.shift(timedelta(seconds=0.2))
+            assert breaker.should_attempt_call() is True  # enters HALF_OPEN and takes the only slot
+            assert breaker.should_attempt_call() is False
+
+            breaker.release_probe()
+            breaker.release_probe()  # a second release cannot mint a slot nobody took
+
+            assert breaker.should_attempt_call() is True
+            assert breaker.should_attempt_call() is False
+            assert breaker.state == CircuitState.HALF_OPEN
+            assert (breaker.success_count, breaker.failure_count) == (0, 1)
+
+    def test_release_outside_half_open_does_nothing(self):
+        """Only a HALF_OPEN cycle has probe slots: an OPEN breaker stays OPEN for its full cooldown."""
+        config = CircuitBreakerConfig(failure_threshold=1, timeout_seconds=10.0)
+        breaker = CircuitBreaker(config, namespace="test")
+
+        with time_machine.travel(0, tick=False) as traveller:
+            breaker.release_probe()
+            assert breaker.state == CircuitState.CLOSED
+
+            breaker.record_failure()
+            breaker.release_probe()
+            traveller.shift(timedelta(seconds=5))
+            assert breaker.should_attempt_call() is False
+            assert breaker.state == CircuitState.OPEN
+
     @pytest.mark.asyncio
     async def test_async_call_functionality(self):
         """Test async call functionality."""

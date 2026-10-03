@@ -85,7 +85,8 @@ class CircuitBreakerConfig:
             restart caps probing at half_open_requests per timeout_seconds. Balance
             between giving service time to recover vs detecting recovery quickly.
         half_open_requests: Probe requests admitted per HALF_OPEN cycle (a total,
-            not a concurrency limit). Keep it >= success_threshold, or a cycle can
+            not a concurrency limit; a probe handed back with release_probe does not
+            count against it). Keep it >= success_threshold, or a cycle can
             never collect enough successes from its probes to close. Unlike the
             @cache config, this class does not reject a smaller value.
         excluded_error_types: BackendErrorType values that don't count as failures.
@@ -504,6 +505,19 @@ class CircuitBreaker:
         """
         self._on_success()
 
+    def release_probe(self):
+        """Give back the probe slot of an admitted call that ends with no outcome.
+
+        For an exit that says nothing about backend health, such as the decorated
+        function raising. Recording nothing would leave its HALF_OPEN slot spent, and
+        every call would be rejected until the cycle expires. In HALF_OPEN the slot
+        goes to the next call. Elsewhere it changes nothing: CLOSED holds no slots,
+        and the next HALF_OPEN cycle starts with a fresh budget.
+        """
+        with self._lock:
+            self._half_open_permits = max(0, self._half_open_permits - 1)
+            self._half_open_total_attempts = max(0, self._half_open_total_attempts - 1)
+
     def should_attempt_call(self) -> bool:
         """Admit or reject a call — the live admission check.
 
@@ -514,7 +528,8 @@ class CircuitBreaker:
         ``half_open_requests`` probe slots. A spent cycle that no outcome has
         ended within ``timeout_seconds`` starts over with a fresh budget. Record
         the outcome of every admitted call with ``record_success`` /
-        ``record_failure``; never record a rejection.
+        ``record_failure``, or ``release_probe`` when its exit says nothing about
+        backend health; never record a rejection.
 
         Returns:
             True if the call may proceed, False if it must fail fast.
