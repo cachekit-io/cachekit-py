@@ -140,9 +140,11 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
     One ``PUBLISH`` on the backend's shared client, outside its error classification and the
     reliability stack, so a pub/sub failure cannot count against the circuit breaker. It waits for
     Redis's reply, never for delivery. A failure leaves the invalidation standing, and peers that
-    missed the event keep their L1 copies until the L1 TTL; it is logged by a _WarnThrottle. A
-    key-tracking backend with no Redis client (any but the tenant-scoped Redis backend) carries no
-    channel, so nothing is announced for it.
+    missed the event keep their L1 copies until the L1 TTL. So does a registry id over the field cap
+    (a namespace over 1000 bytes), which no event can carry. Each is logged through its own
+    _WarnThrottle: one WARNING a minute with the count since the last, DEBUG between. A key-tracking
+    backend with no Redis client (any but the tenant-scoped Redis backend) carries no channel, so
+    nothing is announced for it.
 
     Args:
         backend: The resolved, key-tracking backend whose client carries the event
@@ -156,12 +158,21 @@ def publish(backend: Any, registry_id: str, key: Optional[str]) -> None:
             return
         payload = encode_event(registry_id, key)
         if payload is None:
-            if _too_long_warn.claim():
-                logger.warning(
-                    "Invalidation not announced: registry id %s is over %d bytes (namespace too long)",
+            unannounced = _too_long_warn.claim()
+            if not unannounced:
+                logger.debug(
+                    "Invalidation not announced: registry id %s is over %d bytes",
                     redact_cache_key(registry_id),
                     _MAX_FIELD_BYTES,
                 )
+                return
+            logger.warning(
+                "Invalidation not announced (invalidations since the last warning: %d); other processes keep their L1 "
+                "copies until the L1 TTL. Registry id %s is over %d bytes (namespace too long)",
+                unannounced,
+                redact_cache_key(registry_id),
+                _MAX_FIELD_BYTES,
+            )
             return
         receivers = send(CHANNEL, payload)
     except Exception as e:
