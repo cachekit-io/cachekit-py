@@ -8,6 +8,13 @@
 
 ## Key Numbers
 
+> [!WARNING]
+> Most microsecond figures on this page predate the current stack and have not been re-measured.
+> On 2026-10-03 the guards in `tests/performance/test_production_realism.py` measured the decorator
+> + L1 hit on the 10KB dict at a raw p95 of 14–16μs, not 242μs, and the 10-thread case at 13μs.
+> Treat the other figures as stale until they are re-run. [Instruction Budgets](#instruction-budgets)
+> is current.
+
 > [!TIP]
 > **Key numbers (p95 latency):**
 > - **L1 cache hit**: 500ns (pure dict lookup)
@@ -21,8 +28,8 @@
 
 All benchmarks use:
 - **time.perf_counter_ns()**: Nanosecond-precision performance counter
-- **Statistical rigor**: 5 independent runs, 95% confidence intervals
-- **GC filtering**: Exclude garbage collection pauses from measurements
+- **Statistical rigor**: 5 independent runs; the estimate is a 95% t-interval over the per-run medians
+- **Every raw sample kept**: percentiles cover all samples; outliers are counted, never filtered
 - **Warmup**: 1,000 iterations before measurement
 - **Realistic payloads**: 10KB dicts, 10K row DataFrames, custom dataclasses
 - **Production configuration**: All reliability features enabled (circuit breaker, backpressure, timeouts)

@@ -120,8 +120,7 @@ def calibrate_timer(sleep_ms: float = 1.0, samples: int = 50) -> tuple[bool, str
     pollution bug, where setup leaks into the timed region) or near-zero, the timer is
     lying and no benchmark on this machine can be trusted. The window is deliberately
     generous on the high side to absorb OS scheduling overshoot — it catches only gross
-    errors, not precision. Reuses `coefficient_of_variation` for the stability report;
-    see `validate_measurement_accuracy` for the per-operation (symmetric) analog.
+    errors, not precision. Reuses `coefficient_of_variation` for the stability report.
     """
     expected_ns = sleep_ms * 1_000_000.0
     time.sleep(sleep_ms / 1000.0)  # one untimed warmup sleep
