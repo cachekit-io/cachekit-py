@@ -126,12 +126,26 @@ def test_default_install_keeps_gil_disabled_after_redis_backend():
     assert state["redis_parser"] == "_RESP2Parser", state
 
 
-# Runs in the CI lane without hiredis: what it pins is that hiredis is blocked before redis is imported.
+# Runs in the CI lane without hiredis. argv[1] names the program that reaches redis-py through cachekit; a
+# spy records what sys.modules held for hiredis when redis-py was first requested.
 _ORDERING_PROBE = """
 import json, sys
+seen = {}
+class Spy:
+    def find_spec(self, name, path=None, target=None):
+        if name == "redis" and name not in seen:
+            seen[name] = repr(sys.modules.get("hiredis", "<absent>"))
+sys.meta_path.insert(0, Spy())
 import cachekit
+if sys.argv[1] == "redis-backend":
+    from cachekit.backends import RedisBackend
+    RedisBackend(redis_url="redis://127.0.0.1:6379")
+else:
+    from cachekit.backends.provider import PooledClientProvider
+    PooledClientProvider("redis://127.0.0.1:6379")
 import redis.connection
 print(json.dumps({
+    "hiredis_when_redis_requested": seen.get("redis"),
     "hiredis_entry": repr(sys.modules.get("hiredis", "<absent>")),
     "redis_parser": redis.connection.DefaultParser.__name__,
 }))
@@ -139,13 +153,41 @@ print(json.dumps({
 
 
 @pytest.mark.skipif(not _FREE_THREADED_BUILD, reason="requires a free-threaded CPython build")
-def test_import_blocks_hiredis_before_redis_loads():
-    """With no override, `import cachekit` keeps hiredis out of redis-py, installed or not."""
-    state = _run_probe(_ORDERING_PROBE, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
-    assert state == {"hiredis_entry": "None", "redis_parser": "_RESP2Parser"}, state
+@pytest.mark.parametrize("program", ["redis-backend", "pooled-provider"])
+def test_redis_backend_blocks_hiredis_before_redis_loads(program):
+    """With no override, cachekit's Redis paths keep hiredis out of redis-py, installed or not."""
+    state = _run_probe(_ORDERING_PROBE, program, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
+    assert state == {
+        "hiredis_when_redis_requested": "None",
+        "hiredis_entry": "None",
+        "redis_parser": "_RESP2Parser",
+    }, state
 
 
-# Records, when redis or cachekit.backends is first imported, whether hiredis_compat had already finished.
+# Runs in every lane: a program that uses no Redis backend never loads redis-py, so hiredis stays importable.
+_NO_REDIS_PROBE = """
+import json, sys
+import cachekit
+from cachekit import cache
+
+@cache(backend=None)
+def double(x):
+    return x * 2
+
+assert double(2) == double(2) == 4
+from cachekit.backends.cachekitio import CachekitIOBackend
+CachekitIOBackend(api_key="ck_test_" + "0" * 32)  # pragma: allowlist secret (dummy key; the probe makes no request)
+print(json.dumps({"redis_loaded": "redis" in sys.modules, "hiredis_entry": repr(sys.modules.get("hiredis", "<absent>"))}))
+"""
+
+
+def test_non_redis_programs_never_load_redis_py():
+    """`import cachekit`, an L1-only call and a CachekitIO backend load no redis-py, so nothing is blocked."""
+    state = _run_probe(_NO_REDIS_PROBE, env_drop=("CACHEKIT_DISABLE_HIREDIS",))
+    assert state == {"redis_loaded": False, "hiredis_entry": "'<absent>'"}, state
+
+
+# Records, when cachekit.backends or redis-py is first requested, whether hiredis_compat had already finished.
 _DECISION_ORDER_PROBE = """
 import json, sys
 seen = {}
@@ -153,15 +195,16 @@ class Spy:
     def find_spec(self, name, path=None, target=None):
         if name in ("redis", "cachekit.backends") and name not in seen:
             compat = sys.modules.get("cachekit.hiredis_compat")
-            seen[name] = compat is not None and hasattr(compat, "HIREDIS_DISABLED")
+            seen[name] = compat is not None and hasattr(compat, "block_hiredis_for_free_threading")
 sys.meta_path.insert(0, Spy())
 import cachekit
+from cachekit.backends import RedisBackend
 print(json.dumps(seen))
 """
 
 
-def test_hiredis_decision_runs_before_redis_is_imported():
-    """hiredis_compat decides before anything imports redis, so it must not import cachekit.backends."""
+def test_hiredis_settings_are_read_before_backends_load():
+    """hiredis_compat reads its setting before cachekit.backends or redis-py load, so it imports neither."""
     assert _run_probe(_DECISION_ORDER_PROBE) == {"redis": True, "cachekit.backends": True}
 
 
@@ -248,36 +291,50 @@ _LOADED = object()  # stands in for an already-imported hiredis module
 
 
 @pytest.mark.parametrize(
-    ("setting", "free_threaded", "gil_on", "hiredis", "blocked", "warns"),
+    ("step", "setting", "free_threaded", "gil_on", "hiredis", "blocked", "warns"),
     [
-        ("false", True, False, None, False, None),
-        (None, False, True, None, False, None),
-        ("true", False, True, None, True, None),
-        (None, True, False, None, True, None),
-        (None, True, True, None, False, None),
-        ("true", False, True, _LOADED, False, "keeps the hiredis parser"),
-        (None, True, True, _LOADED, False, "GIL is already on"),
+        ("import", True, False, True, None, True, None),
+        ("import", True, True, False, _LOADED, False, "keeps the hiredis parser and the GIL is already on"),
+        ("import", True, False, True, _LOADED, False, "keeps the hiredis parser"),
+        ("import", False, True, False, None, False, None),
+        ("import", None, True, False, None, False, None),
+        ("redis", None, True, False, None, True, None),
+        ("redis", None, True, True, None, False, None),
+        ("redis", None, True, True, _LOADED, False, "GIL is already on"),
+        ("redis", None, False, True, None, False, None),
+        ("redis", False, True, False, None, False, None),
+        ("redis", True, True, False, None, False, None),
     ],
-    ids=["false", "unset-gil", "true-gil", "unset-ft", "unset-ft-gil-on", "loaded-gil", "loaded-ft"],
+    ids=[
+        "import-true",
+        "import-true-loaded-ft",
+        "import-true-loaded-gil",
+        "import-false",
+        "import-unset",
+        "redis-unset-ft",
+        "redis-unset-ft-gil-on",
+        "redis-unset-ft-loaded",
+        "redis-unset-gil",
+        "redis-false-ft",
+        "redis-true-ft",
+    ],
 )
-def test_configure_hiredis_decision(monkeypatch, caplog, setting, free_threaded, gil_on, hiredis, blocked, warns):
-    """The decision table in-process: when hiredis is blocked, and the warning when it already loaded."""
+def test_hiredis_decision_table(monkeypatch, caplog, step, setting, free_threaded, gil_on, hiredis, blocked, warns):
+    """Both decision points in-process: `true` blocks at import, the unset free-threaded default when Redis loads."""
     import sysconfig
 
     from cachekit import hiredis_compat
 
-    if setting is None:
-        monkeypatch.delenv("CACHEKIT_DISABLE_HIREDIS", raising=False)
-    else:
-        monkeypatch.setenv("CACHEKIT_DISABLE_HIREDIS", setting)
+    monkeypatch.setattr(hiredis_compat, "_DISABLE", setting)
     monkeypatch.setattr(sysconfig, "get_config_var", lambda name: 1 if free_threaded else 0)
     monkeypatch.setattr(sys, "_is_gil_enabled", lambda: gil_on, raising=False)
     monkeypatch.setitem(sys.modules, "hiredis", hiredis)  # recorded first, so teardown restores the real entry
     if hiredis is None:
         monkeypatch.delitem(sys.modules, "hiredis")
+    decide = hiredis_compat.block_hiredis_if_disabled if step == "import" else hiredis_compat.block_hiredis_for_free_threading
 
     with caplog.at_level("WARNING", logger="cachekit.hiredis_compat"):
-        assert hiredis_compat.configure_hiredis_for_free_threading() is blocked
+        assert decide() is blocked
     if blocked:
         assert sys.modules["hiredis"] is None
     elif hiredis is None:

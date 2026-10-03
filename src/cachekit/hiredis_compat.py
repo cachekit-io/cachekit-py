@@ -1,15 +1,17 @@
-"""Choose redis-py's reply parser before anything imports redis.
+"""Choose redis-py's reply parser before redis-py loads.
 
 redis-py imports hiredis when it is installed and binds its default parser at import time, and on a
 free-threaded CPython build importing hiredis re-enables the GIL for the whole process. The only way
-to opt out is to keep hiredis from loading before the first ``import redis``, so this module must be
-imported before any redis import and must not import anything that does: it reads
-``CACHEKIT_DISABLE_HIREDIS`` straight from the environment, not through ``RedisBackendConfig``.
+to opt out is to keep hiredis from loading before the first ``import redis``, so this module imports
+nothing that imports redis: it reads ``CACHEKIT_DISABLE_HIREDIS`` straight from the environment, not
+through ``RedisBackendConfig``.
 
-- ``CACHEKIT_DISABLE_HIREDIS=true`` blocks hiredis on every build.
-- ``CACHEKIT_DISABLE_HIREDIS=false`` keeps hiredis on every build, re-enabling the GIL on a
-  free-threaded one.
-- Unset: a free-threaded build with the GIL still off blocks hiredis; a GIL build keeps it.
+- ``CACHEKIT_DISABLE_HIREDIS=true`` blocks hiredis at ``import cachekit``, on every build.
+- ``CACHEKIT_DISABLE_HIREDIS=false`` never blocks hiredis; on a free-threaded build that re-enables
+  the GIL once redis-py loads.
+- Unset: a free-threaded build whose GIL is still off blocks hiredis when cachekit's Redis backend
+  package (``cachekit.backends.redis``) loads, before it imports redis-py. A program that never uses
+  that package never loads redis-py, so nothing is blocked. A GIL build keeps hiredis.
 
 Blocking is process-wide: ``sys.modules["hiredis"] = None`` makes any later ``import hiredis`` in the
 process raise ImportError, and redis-py falls back to its pure-Python parser.
@@ -48,29 +50,49 @@ def _disable_hiredis_setting() -> bool | None:
     return None
 
 
-def configure_hiredis_for_free_threading() -> bool:
-    """Block hiredis before redis loads when the setting or a GIL-free interpreter calls for it.
+# Read once, at `import cachekit`, so an unparseable value is logged once.
+_DISABLE = _disable_hiredis_setting()
 
-    Returns:
-        bool: True if hiredis is blocked, so redis-py uses its pure-Python parser
-    """
-    disable = _disable_hiredis_setting()
-    if disable is False:
-        return False
-    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
-    if disable is None and not free_threaded:
-        return False
+
+def _free_threaded() -> bool:
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+def _block() -> bool:
+    """Keep hiredis out of the process, unless it already loaded (then log why the block came too late)."""
     if sys.modules.get("hiredis") is not None:
         logger.warning(
-            "hiredis was imported before cachekit, so redis-py keeps the hiredis parser%s",
-            " and the GIL is already on" if free_threaded else "",
+            "hiredis was imported before cachekit could block it, so redis-py keeps the hiredis parser%s",
+            " and the GIL is already on" if _free_threaded() else "",
         )
         return False
-    if disable is None and sys._is_gil_enabled():  # type: ignore[attr-defined]
-        return False  # Something else already re-enabled the GIL; hiredis would cost nothing more.
     sys.modules.setdefault("hiredis", None)  # type: ignore[arg-type]  # None makes `import hiredis` raise ImportError
     logger.debug("hiredis blocked - redis-py will use its pure-Python parser")
     return True
 
 
-HIREDIS_DISABLED = configure_hiredis_for_free_threading()
+def block_hiredis_if_disabled() -> bool:
+    """Block hiredis now when CACHEKIT_DISABLE_HIREDIS=true, on every build. Runs at ``import cachekit``.
+
+    Returns:
+        bool: True if hiredis is blocked
+    """
+    return _DISABLE is True and _block()
+
+
+def block_hiredis_for_free_threading() -> bool:
+    """With the setting unset on a free-threaded build whose GIL is still off, block hiredis.
+
+    Runs when ``cachekit.backends.redis`` loads, before it imports redis-py.
+
+    Returns:
+        bool: True if hiredis is blocked by this call
+    """
+    if _DISABLE is not None or not _free_threaded():
+        return False
+    if sys.modules.get("hiredis") is None and sys._is_gil_enabled():  # type: ignore[attr-defined]
+        return False  # Something else already re-enabled the GIL; hiredis would cost nothing more.
+    return _block()
+
+
+block_hiredis_if_disabled()

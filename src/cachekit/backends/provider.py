@@ -123,11 +123,13 @@ class PooledClientProvider(CacheClientProvider):
     """
 
     def __init__(self, redis_url: str | SecretStr, config: Optional[RedisBackendConfig] = None) -> None:
-        import redis
-
+        # cachekit's redis package first: loading it runs the hiredis decision before redis-py loads.
         from cachekit.backends.redis.client import create_connection_pool
         from cachekit.backends.redis.config import RedisBackendConfig
         from cachekit.config.validation import hide_secret
+
+        # isort: split
+        import redis
 
         # The URL may carry a password: kept wrapped and unwrapped only inside the pool builders (CWE-532)
         redis_url = hide_secret(redis_url)
@@ -145,9 +147,11 @@ class PooledClientProvider(CacheClientProvider):
         return self._client
 
     async def get_async_client(self) -> redis_async.Redis:
-        import redis.asyncio as redis_async
-
+        # cachekit's redis package first, as in __init__.
         from cachekit.backends.redis.client import create_async_connection_pool
+
+        # isort: split
+        import redis.asyncio as redis_async
 
         if self._async_client is None:
             # Created lazily inside a running loop. No await between the check

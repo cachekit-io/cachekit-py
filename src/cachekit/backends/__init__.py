@@ -30,7 +30,7 @@ Dependency injection pattern:
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from cachekit.backends.base import (
     BaseBackend,
@@ -45,7 +45,10 @@ from cachekit.backends.errors import (
     BackendErrorType,
     CapabilityNotAvailableError,
 )
-from cachekit.backends.redis import RedisBackend
+
+if TYPE_CHECKING:
+    from cachekit.backends.memcached import MemcachedBackend
+    from cachekit.backends.redis import RedisBackend
 
 __all__ = [
     "BaseBackend",
@@ -106,7 +109,15 @@ class BackendProvider(Protocol):
 
 
 def __getattr__(name: str):
-    """Lazy import for optional backends (pymemcache may not be installed)."""
+    """Lazy imports: pymemcache may not be installed, and redis-py loads only for a program that uses Redis.
+
+    Loading redis-py loads hiredis, which re-enables the GIL on a free-threaded build, so
+    ``import cachekit`` must not load it (see cachekit.hiredis_compat).
+    """
+    if name == "RedisBackend":
+        from cachekit.backends.redis import RedisBackend
+
+        return RedisBackend
     if name == "MemcachedBackend":
         from cachekit.backends.memcached import MemcachedBackend
 
