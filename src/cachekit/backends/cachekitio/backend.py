@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import json
 import logging
 import math
@@ -39,6 +41,23 @@ if TYPE_CHECKING:
 _logger = get_structured_logger(__name__)
 # Unsampled stdlib logger for one-off lock warnings that _logger's sampling could drop.
 logger = logging.getLogger(__name__)
+
+# Background lock releases still in flight (see CachekitIOBackend._release_lock_in_background).
+_BACKGROUND_RELEASES: set[asyncio.Task[bool]] = set()
+
+
+def _background_release_done(lock_key: str, drain: asyncio.Task[bool]) -> None:
+    """Drop a finished release, logging a failure the DELETE itself did not log."""
+    _BACKGROUND_RELEASES.discard(drain)
+    if drain.cancelled():
+        return  # the DELETE runs to the end in its thread regardless, and logs its own failure
+    if (exc := drain.exception()) is not None:
+        logger.warning(
+            "CachekitIO background lock release for %s failed (%s); the lock is held until its timeout",
+            redact_cache_key(lock_key),
+            redact_error_for_log(exc),
+        )
+
 
 # Lock capability token travels in this request header, never the query string:
 # a ?lock_id= query leaks the token into access/proxy logs and OpenTelemetry
@@ -829,6 +848,31 @@ class CachekitIOBackend:
                 await self._release_lock(lock_key, won)
             raise
 
+    async def _acquire_lock_id(self, key: str, timeout: float, blocking_timeout: Optional[float]) -> tuple[str | None, bool]:
+        """Run the lock attempts. Returns ``(lock_id or None, granted on the first attempt)``.
+
+        The SaaS endpoint returns immediately; client-side polling implements
+        ``blocking_timeout`` with proportional jitter (0.5×–1× the capped delay) to
+        avoid lockstep retries on concurrent waiters. Each retry is a billable SaaS
+        request — keep the cap tight.
+        """
+        lock_id = await self._try_acquire_lock_drained(key, timeout)
+        if lock_id is not None or blocking_timeout is None:
+            return lock_id, lock_id is not None
+
+        deadline = time.monotonic() + blocking_timeout
+        delay = 0.05
+        while lock_id is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
+            jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
+            await asyncio.sleep(min(delay, remaining) * jitter)
+            lock_id = await self._try_acquire_lock_drained(key, timeout)
+            delay = min(delay * 2, 0.5)
+        return lock_id, False
+
     @asynccontextmanager
     async def acquire_lock(
         self,
@@ -838,10 +882,8 @@ class CachekitIOBackend:
     ) -> AsyncIterator[bool]:
         """Acquire distributed lock (LockableBackend protocol).
 
-        The SaaS endpoint returns immediately; client-side polling implements
-        ``blocking_timeout`` with proportional jitter (0.5×–1× the capped delay) to
-        avoid lockstep retries on concurrent waiters. Each retry is a billable SaaS
-        request — keep the cap tight.
+        Polls up to ``blocking_timeout`` (see ``_acquire_lock_id``), and releases on exit before
+        the ``async with`` returns.
 
         Args:
             key: Lock key
@@ -851,27 +893,75 @@ class CachekitIOBackend:
         Yields:
             True if acquired, False if ``blocking_timeout`` elapsed without acquisition
         """
-        lock_id: str | None = None
+        lock_id, _ = await self._acquire_lock_id(key, timeout, blocking_timeout)
         try:
-            lock_id = await self._try_acquire_lock_drained(key, timeout)
-
-            if lock_id is None and blocking_timeout is not None:
-                deadline = time.monotonic() + blocking_timeout
-                delay = 0.05
-                while lock_id is None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
-                    jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
-                    await asyncio.sleep(min(delay, remaining) * jitter)
-                    lock_id = await self._try_acquire_lock_drained(key, timeout)
-                    delay = min(delay * 2, 0.5)
-
             yield lock_id is not None
         finally:
             if lock_id is not None:
                 await self._release_lock(key, lock_id)
+
+    @asynccontextmanager
+    async def acquire_fill_lock(
+        self,
+        key: str,
+        timeout: float,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """``acquire_lock`` for the decorator's miss path; not part of the LockableBackend protocol.
+
+        Two differences, both so the caller does not wait on a request it does not need (LAB-7064):
+
+        - It yields ``(acquired, uncontended)``. ``uncontended`` is True when the first lock POST
+          won, so no other holder can have filled the key while this caller waited.
+        - It releases in the background: the DELETE is sent from an executor thread and the
+          ``async with`` returns at once (see ``_release_lock_in_background``).
+        """
+        lock_id, first_attempt = await self._acquire_lock_id(key, timeout, blocking_timeout)
+        try:
+            yield lock_id is not None, first_attempt
+        finally:
+            if lock_id is not None:
+                self._release_lock_in_background(key, lock_id)
+
+    def _release_lock_in_background(self, lock_key: str, lock_id: str) -> None:
+        """Send the lock DELETE without waiting for it, in a way loop shutdown cannot drop.
+
+        The DELETE runs on the sync client in the default executor, submitted here, before this
+        returns: it is a plain future, which ``asyncio.run`` teardown does not cancel, and that
+        teardown then waits for the executor. A Task around the async client would be cancelled by
+        the teardown sweep whenever the decorated call is the process's last await, and the lock
+        would then be held until its server-side timeout. The sync client also survives
+        ``close_async_client()`` called straight after the call.
+
+        The drain Task only holds the future so that the loop knows about it. It sits in
+        ``_BACKGROUND_RELEASES`` so it is not collected mid-flight and, once running, absorbs
+        cancels until the DELETE has finished; one cancelled before it starts leaves the DELETE
+        running in its thread. The DELETE copies this context, so it carries the same metrics headers
+        an awaited release does.
+        """
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        release = loop.run_in_executor(None, lambda: ctx.run(self._delete_lock_sync, lock_key, lock_id))
+        drain = asyncio.ensure_future(_await_uninterrupted(release))
+        _BACKGROUND_RELEASES.add(drain)
+        drain.add_done_callback(functools.partial(_background_release_done, lock_key))
+
+    def _delete_lock_sync(self, lock_key: str, lock_id: str) -> bool:
+        """``_delete_lock`` on the sync client, for an executor thread.
+
+        A failure is logged here, not left on the future: if the loop closes before the DELETE
+        finishes, nothing on the loop ever reads the future again.
+        """
+        try:
+            self._request_sync("DELETE", f"{self._encode_key(lock_key)}/lock", headers={LOCK_ID_HEADER: lock_id})
+            return True
+        except BackendError as exc:
+            logger.warning(
+                "CachekitIO lock release for %s failed (%s); the lock is held until its timeout",
+                redact_cache_key(lock_key),
+                redact_error_for_log(exc),
+            )
+            return False
 
     async def _release_lock(self, lock_key: str, lock_id: str) -> bool:
         """Release distributed lock. Internal helper for ``acquire_lock``'s cleanup.

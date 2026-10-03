@@ -21,13 +21,16 @@ from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
+    L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
+    probe_l2_miss,
     redact_cache_key,
+    supports_fill_lock,
     supports_key_tracking,
     supports_locking,
     supports_swr,
@@ -83,6 +86,7 @@ def _resolve_lazy_backend() -> BaseBackend:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 _logger = logging.getLogger(__name__)
 
@@ -146,12 +150,28 @@ class _LockPhase:
 
 
 @contextlib.asynccontextmanager
-async def _phased(lock: contextlib.AbstractAsyncContextManager[bool], phase: _LockPhase) -> AsyncIterator[bool]:
+async def _phased(lock: contextlib.AbstractAsyncContextManager[_T], phase: _LockPhase) -> AsyncIterator[_T]:
     """Enter ``lock`` and record each phase it reaches in ``phase``."""
     async with lock as acquired:
         phase.entered = True
         yield acquired
         phase.body_exited = True
+
+
+@contextlib.asynccontextmanager
+async def _fill_lock(backend: Any, key: str, timeout: float, blocking_timeout: float) -> AsyncIterator[tuple[bool, bool]]:
+    """The miss path's lock: ``(acquired, uncontended)``.
+
+    A backend with ``acquire_fill_lock`` reports whether its first lock attempt won, and releases
+    without blocking the caller (LAB-7064). Any other lockable backend reports every grant as
+    contended, so the caller keeps the post-lock double-check read.
+    """
+    if supports_fill_lock(backend):
+        async with backend.acquire_fill_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as grant:
+            yield grant
+    else:
+        async with backend.acquire_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as acquired:
+            yield acquired, False
 
 
 class CacheInfo(NamedTuple):
@@ -2160,6 +2180,9 @@ def create_cache_wrapper(
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()
 
+            # The read paths report a failed read as a miss; the probe tells the two apart, so
+            # the post-lock double-check is skipped only after a clean miss (LAB-7064).
+            _l2_read = L2MissProbe()
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
                 # eviction + the cache_get_deserialize metric instead of persisting (#159),
@@ -2170,13 +2193,14 @@ def create_cache_wrapper(
                 # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
-                if _l2_freshness_capable():
-                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
-                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                    _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                    _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-                else:
-                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
+                with probe_l2_miss(_l2_read):
+                    if _l2_freshness_capable():
+                        _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
+                        cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                        _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                        _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+                    else:
+                        cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
 
                 if cached_result is not None:
                     # Cache hit: envelope is the raw serialized bytes for L1 backfill
@@ -2249,16 +2273,15 @@ def create_cache_wrapper(
                 try:
                     # Use backend's async lock protocol
                     async with _phased(
-                        _backend.acquire_lock(
-                            cache_key,
-                            timeout=lock_timeout,
-                            blocking_timeout=blocking_timeout,
-                        ),
+                        _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
                         lock_phase,
-                    ) as lock_acquired:
-                        if lock_acquired:
+                    ) as (lock_acquired, lock_uncontended):
+                        if lock_acquired and not (lock_uncontended and _l2_read.clean_miss):
                             # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited.
+                            # Another request may have populated it while we waited, or the
+                            # primary read failed and the entry may still be live. Skipped after
+                            # a clean miss and a first-attempt grant: nobody else held the lock,
+                            # so the read would miss again, and be billed as one (LAB-7064).
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
@@ -2287,7 +2310,7 @@ def create_cache_wrapper(
                                     redact_cache_key(cache_key),
                                     redact_error_for_log(e),
                                 )
-                        else:
+                        elif not lock_acquired:
                             # Lock timeout - double-check cache before giving up
                             # Another request may have populated it while we waited
                             logger().warning(

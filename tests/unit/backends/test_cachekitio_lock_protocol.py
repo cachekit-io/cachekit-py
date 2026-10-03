@@ -684,3 +684,135 @@ class TestDecoratorDegradesOnLockError:
             if record.name.startswith("cachekit"):
                 text = formatter.format(record)
                 assert raw_key not in text and encoded_key not in text, f"{record.name} logged the cache key: {text}"
+
+
+async def _drain_background_releases() -> None:
+    from cachekit.backends.cachekitio.backend import _BACKGROUND_RELEASES
+
+    await asyncio.wait_for(asyncio.gather(*_BACKGROUND_RELEASES, return_exceptions=True), timeout=5.0)
+
+
+@pytest.mark.unit
+class TestFillLock:
+    """acquire_fill_lock (LAB-7064): reports a first-attempt grant and releases without blocking the caller."""
+
+    @pytest.mark.parametrize(
+        ("posts", "expected"),
+        [
+            ([{"lock_id": "l1"}], (True, True)),
+            ([_HELD, {"lock_id": "l1"}], (True, False)),
+            ([_HELD], (False, False)),
+        ],
+        ids=["first-attempt", "after-a-poll", "never"],
+    )
+    async def test_yields_acquired_and_uncontended(
+        self, backend: CachekitIOBackend, posts: list[dict[str, Any]], expected: tuple[bool, bool]
+    ) -> None:
+        backend._request_async = AsyncMock(side_effect=[_json_response(200, body) for body in posts])  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(return_value=_json_response(200, {}))  # type: ignore[method-assign]
+        blocking_timeout = 5.0 if len(posts) > 1 else None
+
+        async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=blocking_timeout) as grant:
+            assert grant == expected
+        await _drain_background_releases()
+
+        assert backend._request_sync.call_count == (1 if expected[0] else 0)
+
+    async def test_release_is_sent_but_not_waited_on(self, backend: CachekitIOBackend) -> None:
+        """The async with returns while the DELETE is still in flight; the DELETE then lands."""
+        import threading
+
+        in_flight, finish = threading.Event(), threading.Event()
+
+        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+            in_flight.set()
+            assert finish.wait(5.0)
+            return _json_response(200, {})
+
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-bg"}))  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(side_effect=delete)  # type: ignore[method-assign]
+
+        async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=5.0):
+            pass
+        assert await asyncio.to_thread(in_flight.wait, 5.0)  # exited with the DELETE still unanswered
+        finish.set()
+        await _drain_background_releases()
+
+        (call,) = backend._request_sync.call_args_list
+        assert call.args == ("DELETE", "k/lock")
+        assert call.kwargs["headers"] == {LOCK_ID_HEADER: "lock-bg"}
+
+    async def test_release_survives_the_teardown_cancel_sweep(self, backend: CachekitIOBackend) -> None:
+        """asyncio.run teardown cancels every Task, here before the drain Task has started. The DELETE was
+        already submitted to the executor, so it still runs to the end (asyncio.run then waits for the
+        executor; the cross-process test pins that part)."""
+        import threading
+
+        in_flight, finish, sent = threading.Event(), threading.Event(), threading.Event()
+        done: list[str] = []
+
+        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+            in_flight.set()
+            assert finish.wait(5.0)
+            done.append(endpoint)
+            sent.set()
+            return _json_response(200, {})
+
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-sweep"}))  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(side_effect=delete)  # type: ignore[method-assign]
+
+        async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=5.0):
+            pass
+        for task in asyncio.all_tasks() - {asyncio.current_task()}:
+            task.cancel()  # the sweep
+        assert await asyncio.to_thread(in_flight.wait, 5.0)
+        finish.set()
+        assert await asyncio.to_thread(sent.wait, 5.0)
+
+        assert done == ["k/lock"]
+
+    async def test_release_failure_is_logged_with_the_key_redacted(
+        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        key = "ns:secret-tenant:func:m.f:args:ab:1s"
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-f"}))  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(  # type: ignore[method-assign]
+            side_effect=BackendError("release failed", error_type=BackendErrorType.TRANSIENT)
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cachekit.backends.cachekitio.backend"):
+            async with backend.acquire_fill_lock(key, timeout=30.0, blocking_timeout=None):
+                pass
+            await _drain_background_releases()
+
+        (record,) = [r for r in caplog.records if "lock release" in r.getMessage()]
+        assert redact_cache_key(key) in record.getMessage()
+        assert "secret-tenant" not in record.getMessage()
+
+    async def test_unexpected_release_error_is_logged_by_the_done_callback(
+        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        key = "ns:secret-tenant:func:m.f:args:cd:1s"
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-u"}))  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(side_effect=RuntimeError("bug"))  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING, logger="cachekit.backends.cachekitio.backend"):
+            async with backend.acquire_fill_lock(key, timeout=30.0, blocking_timeout=None):
+                pass
+            await _drain_background_releases()
+
+        (record,) = [r for r in caplog.records if "background lock release" in r.getMessage()]
+        assert redact_cache_key(key) in record.getMessage()
+        assert "secret-tenant" not in record.getMessage()
+
+    async def test_public_acquire_lock_still_releases_before_returning(self, backend: CachekitIOBackend) -> None:
+        """The LockableBackend method is unchanged: its DELETE is awaited on the async client."""
+        request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-1"}))
+        backend._request_async = request_mock  # type: ignore[method-assign]
+        backend._request_sync = MagicMock()  # type: ignore[method-assign]
+
+        async with backend.acquire_lock("k", timeout=30.0, blocking_timeout=5.0) as acquired:
+            assert acquired is True
+
+        assert _method_calls(request_mock) == ["POST", "DELETE"]
+        backend._request_sync.assert_not_called()
