@@ -26,11 +26,12 @@ DEFAULT_L1_TTL_SECONDS = 300
 # Keys removed per lock acquisition in invalidate_many.
 _INVALIDATE_BATCH = 1_000
 
-# The largest share of max_memory_bytes one entry may take. Storing an entry first evicts up to as
-# much as it takes, and an entry read back from L2 is stored again each time it falls out, so a
-# near-budget entry could empty most of L1 on every read. An eighth caps that at an eighth of L1
-# per store, far above what ordinary values take. Internal calibration, not a setting; cachekit-ts
-# uses the same share.
+# The largest share of max_memory_bytes one entry may take. Storing an entry first evicts whole LRU
+# entries until it fits, and an entry read back from L2 is stored again each time it falls out, so a
+# near-budget entry could empty most of L1 on every read. With an eighth, one store evicts less than
+# a quarter of L1 (under an eighth to make room, plus the last whole entry, itself at most an
+# eighth), and the share is far above what ordinary values take. Internal calibration, not a
+# setting; cachekit-ts uses the same share.
 _MAX_ENTRY_SHARE = 1 / 8
 
 logger = logging.getLogger(__name__)
