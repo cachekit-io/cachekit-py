@@ -390,6 +390,29 @@ class TestRedisBackendGetContract:
         assert backend.get("k") is None
 
 
+@pytest.mark.unit
+class TestRedisTtlOpsRunOffTheLoop:
+    """get_ttl and refresh_ttl call the sync client from a worker thread, so a Redis round trip
+    never stalls the event loop (LAB-7074)."""
+
+    @staticmethod
+    def _backend_with(client: Mock) -> PerRequestRedisBackend:
+        return PerRequestRedisBackend(client, tenant_id="default")
+
+    async def test_get_ttl_and_refresh_ttl_leave_the_loop_thread(self):
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+        client = Mock()
+        client.ttl.side_effect = lambda _k: seen.append(threading.current_thread()) or 42
+        client.expire.side_effect = lambda _k, _t: seen.append(threading.current_thread()) or 1
+        backend = self._backend_with(client)
+
+        assert await backend.get_ttl("k") == 42
+        assert await backend.refresh_ttl("k", 60) is True
+        assert len(seen) == 2
+        assert loop_thread not in seen
+
+
 class _FakeRedis:
     """Just enough of ``redis.Redis`` for ``redis.lock.Lock`` (SET NX PX plus the release
     script) and for a decorator's reads, writes and deletes (TTLs are not modelled).

@@ -107,6 +107,14 @@ _DELETE_BATCH = 10_000
 # constant above so the two features can be tuned independently (LAB-381 panel).
 _L2_SWR_MAX_CONCURRENT_REFRESHES = 32
 
+# Background refresh_ttl_on_get pool (LAB-7074), same bound as the L2 SWR pool.
+_TTL_REFRESH_MAX_CONCURRENT = 32
+# Lease on the slot and key of a refresh whose event loop has stopped, from admission; the same
+# lease length as L2 SWR. A stopped loop runs no timers, so its client timeout never fires and
+# this lease is what releases the slot. It is an assumption, not a server bound: a PATCH the
+# refresh already sent is assumed answered within it (see _schedule_ttl_refresh).
+_TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS = 30.0
+
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
     """Callback for background TTL refresh tasks to handle errors.
@@ -901,6 +909,69 @@ def create_cache_wrapper(
     _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
     _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
+
+    # One background TTL refresh per key at a time: concurrent hits in the refresh window
+    # would each send a billable PATCH until one lands. At most _TTL_REFRESH_MAX_CONCURRENT
+    # run at once, so a burst over many keys can't pile up tasks against a slow backend;
+    # a hit at capacity skips its refresh (a later hit retries). Stopped loops get a weaker,
+    # best-effort bound: see _schedule_ttl_refresh. Also holds the task refs.
+    _ttl_refresh_tasks: dict[str, tuple[asyncio.Task[None], float]] = {}  # flight key -> (task, admitted at)
+    _ttl_refresh_lock = threading.Lock()  # the map is shared by every thread running an event loop
+    _ttl_refresh_pid = os.getpid()  # owner process: a forked child starts with an empty map
+
+    async def _refresh_ttl_if_due(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        if remaining is None:
+            remaining = await backend.get_ttl(cache_key)
+            if not remaining or remaining >= refresh_to * ttl_refresh_threshold:
+                return
+        await backend.refresh_ttl(cache_key, refresh_to)
+
+    def _schedule_ttl_refresh(backend: Any, cache_key: str, refresh_to: int, remaining: int | None) -> None:
+        """Run _refresh_ttl_if_due as a background task, unless one for this key is running or the pool is full.
+
+        The in-flight identity carries the backend's key_prefix, so a tenant-scoped backend
+        refreshes each tenant's entry. The guarantee has two tiers.
+
+        Hard, on running event loops: per decorated function, at most _TTL_REFRESH_MAX_CONCURRENT
+        refreshes, and one per flight key, are admitted at once, counted across every thread's
+        loop under the lock. A done task is pruned before counting.
+
+        Best-effort, on stopped loops: a loop left stopped (run_until_complete, never closed)
+        cannot advance its task, so the task keeps its slot and key for
+        _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS from admission, then is released and cancelled on
+        its own loop; should that loop run again, the task stops at its next await. A PATCH it
+        already sent is not recalled, so the bound on PATCHes still at the server assumes each is
+        answered within the hold. If the server holds one longer, that key can get one more PATCH
+        per expired hold, and the function at most one cap's worth per hold.
+        """
+        nonlocal _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid
+        if _ttl_refresh_pid != os.getpid():
+            # Forked child: the parent's tasks never finish here, and its lock may be held.
+            _ttl_refresh_tasks, _ttl_refresh_lock, _ttl_refresh_pid = {}, threading.Lock(), os.getpid()
+        flight_key = f"{getattr(backend, 'key_prefix', '')}{cache_key}"
+        now = time.monotonic()
+        with _ttl_refresh_lock:
+            for key, (t, admitted) in list(_ttl_refresh_tasks.items()):
+                if t.done():
+                    del _ttl_refresh_tasks[key]
+                elif not t.get_loop().is_running() and now - admitted >= _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS:
+                    del _ttl_refresh_tasks[key]
+                    # Its slot is free for reuse now, so the task must not run on if its loop resumes.
+                    with contextlib.suppress(RuntimeError):  # a closed loop never runs it again
+                        t.get_loop().call_soon_threadsafe(t.cancel)
+            if flight_key in _ttl_refresh_tasks or len(_ttl_refresh_tasks) >= _TTL_REFRESH_MAX_CONCURRENT:
+                return
+            task = asyncio.get_running_loop().create_task(_refresh_ttl_if_due(backend, cache_key, refresh_to, remaining))
+            _ttl_refresh_tasks[flight_key] = (task, now)
+        tasks, lock = _ttl_refresh_tasks, _ttl_refresh_lock
+
+        def _done(t: asyncio.Task[None]) -> None:
+            with lock:
+                if tasks.get(flight_key, (None, 0.0))[0] is t:
+                    del tasks[flight_key]
+            _ttl_refresh_done_callback(t, cache_key)
+
+        task.add_done_callback(_done)
 
     def _put_l1(cache_key: str, serialized_data: Any, l1_ttl: int | None) -> None:
         """The only L1 write in this wrapper: put the serialized bytes (str payloads encoded),
@@ -2099,17 +2170,15 @@ def create_cache_wrapper(
                     # fast access — stale-exclusion + remaining-freshness bound (LAB-557).
                     _l1_backfill_from_l2(cache_key, cached_data, _l2_is_stale, _l2_fresh_for)
 
-                    # Handle TTL refresh if configured and threshold met
+                    # TTL refresh, never on the caller's path (LAB-7074). Decide from the
+                    # hit's X-CacheKit-Fresh-For: GET /ttl counts to evict_at, so under SWR
+                    # it only drops below the threshold after fresh_until, when the PATCH
+                    # 409s. A stale hit can't be renewed. A fresh-labelled 0 is an unhinted
+                    # tier copy (saas-api.md), so it falls back to GET /ttl like no header.
                     if refresh_ttl_on_get and ttl and supports_ttl_inspection(_backend):
-                        try:
-                            remaining_ttl = await _backend.get_ttl(cache_key)
-                            if remaining_ttl and remaining_ttl < (ttl * ttl_refresh_threshold):
-                                # Refresh TTL in background with error callback
-                                task = asyncio.create_task(_backend.refresh_ttl(cache_key, ttl))
-                                task.add_done_callback(lambda t: _ttl_refresh_done_callback(t, cache_key))
-                        except Exception as e:
-                            # TTL refresh is optional, don't fail on error
-                            _logger.debug("TTL refresh failed for %s: %s", redact_cache_key(cache_key), redact_error_for_log(e))
+                        _fresh_for = _l2_fresh_for or None
+                        if not _l2_is_stale and (_fresh_for is None or _fresh_for < ttl * ttl_refresh_threshold):
+                            _schedule_ttl_refresh(_backend, cache_key, ttl, _fresh_for)
                     elif refresh_ttl_on_get and ttl:
                         # Backend can't inspect TTL: warn once instead of silently ignoring
                         # the opted-in flag (LAB-446). Still degrades gracefully.

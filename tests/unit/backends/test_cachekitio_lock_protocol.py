@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import urllib.parse
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -56,11 +57,11 @@ def backend() -> CachekitIOBackend:
     """Build a CachekitIOBackend with mocked HTTP clients."""
     with patch(
         "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-        return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+        return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
     ):
         with patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
         ):
             return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
 
@@ -628,11 +629,11 @@ def _lock_failing_backend(lock_status: int, lock_body: bytes) -> tuple[CachekitI
     with (
         patch(
             "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
+            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
         ),
         patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
+            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
         ),
     ):
         return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY), seen
