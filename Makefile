@@ -349,7 +349,7 @@ test-rust-integration: ## Run integration tests only
 test-rust-property: ## Run property-based tests (proptest)
 	@$(MAKE) -C rust test-property
 
-rust-bench: ## Run Rust benchmarks
+rust-bench: ## Point at the Rust benchmarks (in cachekit-core)
 	@$(MAKE) -C rust bench
 
 # ═══════════════════════════════════════════════════════════════════════════════

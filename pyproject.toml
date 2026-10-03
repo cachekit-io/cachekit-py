@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cachekit"
-version = "0.20.0"
+version = "0.21.0"
 description = "Backend-agnostic caching for Python — intent-based decorators with circuit breaker, distributed locking, Prometheus metrics, and optional zero-knowledge AES-256-GCM encryption, on a Rust-powered core. Zero-config L1 in-memory; scales to Redis, Memcached, File, or CachekitIO."
 readme = "README.md"
 license = {text = "MIT"}
@@ -53,8 +53,11 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    # Core Redis functionality
-    "redis[hiredis]>=4.0.0",
+    # Core Redis functionality. 4.6.0 is the oldest release on which every URL scheme creates a client:
+    # redis.asyncio arrived in 4.2.0, and before 4.6.0 a unix:// connection rejects socket_connect_timeout.
+    # Below the floor, client creation fails and every decorated call runs uncached. CI runs the unit suite
+    # on exactly this version (the redis-py floor job), so raise it here when the code needs a newer release.
+    "redis[hiredis]>=4.6.0",
     # Configuration and validation
     "pydantic>=2.0.0",
     # 2.12.0 lets an explicit constructor kwarg beat an aliased env var: before it,

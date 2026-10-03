@@ -411,7 +411,7 @@ class TestCorruptFrameHeaderEvicts:
         mock_ch.get.return_value = blob
         handler.set_cache_handler(mock_ch)
 
-        with mock.patch.object(SerializationWrapper, "unwrap", side_effect=RecursionError("parser blew the stack")):
+        with mock.patch.object(SerializationWrapper, "unwrap_metadata", side_effect=RecursionError("parser blew the stack")):
             with pytest.raises(SerializationError):
                 plain_handler.deserialize_data(blob, cache_key=self.KEY)
             assert handler.get_cached_value(self.KEY) is None

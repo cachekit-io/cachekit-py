@@ -138,6 +138,24 @@ remaining = await backend.get_ttl("my-key")      # seconds remaining, or None
 refreshed = await backend.refresh_ttl("my-key", ttl=300)  # update TTL in place
 ```
 
+`get_ttl` counts down to eviction, which includes any `stale_ttl` window. A `PATCH` to an entry
+already past its freshness returns 409, so `refresh_ttl` returns `False`.
+
+With `refresh_ttl_on_get=True`, an async decorated L2 hit decides from the read's remaining
+freshness (`X-CacheKit-Fresh-For`) instead: it sends the refresh when the entry is still fresh
+and less than `ttl_refresh_threshold × ttl` of freshness is left. The refresh runs in the
+background and adds no round trip to the hit. A stale hit is not refreshed. When the server
+sends no usable remaining-freshness value, the decorator falls back to `get_ttl`, also in the
+background.
+
+Refreshes are best-effort. On running event loops, at most one refresh per key and 32 per
+decorated function run at once; a hit that finds its key's refresh running, or the limit
+reached, skips its own, and a later hit retries. A refresh stranded on a stopped event loop
+(sync code that calls `loop.run_until_complete` and leaves the loop stopped) gives up its turn
+30 seconds after it was scheduled and is cancelled, so a hit on another loop can refresh that
+key again. A `PATCH` it had already sent is not recalled: if the server has not answered within
+those 30 seconds, the key can get one more.
+
 ## Timeout Override
 
 Returns a new instance:
@@ -174,7 +192,11 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 
 ## Characteristics
 
-- Latency: ~10–50ms L2 (HTTP/2, region-dependent)
+- Latency, measured per call as client wall time from a client entering Cloudflare at MEL, against the
+  dev environment (2026-10-03, `tests/integration/saas/test_sdk_performance.py`, three runs): an L2
+  hit served by the store is p50 42–45ms (n=200 per run), and a miss, GET then SET, is p50 112–116ms
+  (n=50 per run). Your numbers depend on where your client enters Cloudflare, the store's region and
+  how many reads the edge serves. No p95 is published yet: these samples are too few to claim one.
 - Sync and async support (hybrid client architecture)
 - Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
@@ -184,6 +206,12 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
   thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
   attempt. A sync-only caller never builds an async client
+- Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
+  opens its own connections on its first request and never reuses its parent's, so a backend built
+  before the fork works in every worker. One exception, for a fork made from C that skips Python's
+  at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
+  that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
+  avoid it; [Free-threading](../free-threading.md) gives the detail
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported
 

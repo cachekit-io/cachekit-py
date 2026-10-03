@@ -7,6 +7,7 @@ StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -40,11 +41,11 @@ def backend() -> CachekitIOBackend:
     with (
         patch(
             "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.Client)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
         ),
         patch(
             "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(client=MagicMock(spec=httpx.AsyncClient)),
+            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
         ),
     ):
         return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
