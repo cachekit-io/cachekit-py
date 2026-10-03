@@ -76,10 +76,11 @@ the rollout once the last v0.19 replica is retired, or cover it with the flush b
 **What still needs a backend flush.** The SDK cannot reach a pre-upgrade entry it never
 recorded. On a function that takes parameters, no-argument `invalidate_cache()` /
 `await fn.ainvalidate_cache()` / `cache_clear()` deletes every key this process recorded since
-it started, each with its pre-v0.20.0 `:{integrity_flag}s` twin, plus, on the tenant-scoped
-Redis backend, the keys in the server-side key registry. It misses the twin of any key only
-another process, or this process before a restart, recorded: the registry holds keys, not
-their twins, and releases before v0.20.0 recorded their keys nowhere. So if you cache personal
+it started, the pre-v0.20.0 `:{integrity_flag}s` twin of every key it wrote or read since it
+started, plus, on the tenant-scoped Redis backend, the keys in the server-side key registry.
+It misses the twin of any key only another process, or this process before a restart, wrote
+or read: the registry holds keys, not their twins, and releases before v0.20.0 recorded their
+keys nowhere. So if you cache personal
 data under `ttl=None`, or otherwise need every pre-upgrade entry gone rather than aging out,
 follow the flush procedure in the retention warning [below](#changing-serializers-separate-keyspaces) — **after the last v0.19 replica is
 retired**, not at the start of a rolling deploy, or replicas still on the old release keep
@@ -166,9 +167,9 @@ def get_data():
 > single-key invalidation will not reach. The SDK has no bulk delete. On a function that
 > takes parameters, no-argument `cache_clear()` (on an async function with a backend,
 > `await fn.ainvalidate_cache()`; `cache_clear()` raises `TypeError` there) deletes the
-> pre-upgrade `:{integrity_flag}s` twin of every key this process recorded since it started,
-> and a twin whose delete fails stays tracked for that process's next call. It misses the
-> twin of a key only another process, or this process before a restart, recorded. On the
+> pre-upgrade `:{integrity_flag}s` twin of every key this process wrote or read since it
+> started, and a twin whose delete fails stays tracked for that process's next call. It misses
+> the twin of a key only another process, or this process before a restart, wrote or read. On the
 > tenant-scoped Redis backend the server-side key registry drains those keys but not their
 > twins, with one exception: a v0.20.0 decorator on the default serializer for the same
 > function and namespace registers its `:{integrity_flag}s` key there like any key it

@@ -959,16 +959,22 @@ def create_cache_wrapper(
         entry. The key is recorded even when there is nothing to put (L1 disabled, a streamed
         value): _cached_keys also drives the L2 deletes of process-local invalidation.
 
-        Every open _watch_records() set is told about the key BEFORE it is recorded, so a
-        concurrent whole-function invalidation cannot drop a record it was not told about. The
-        twin is recorded in the same step: recorded separately, a trim could keep a rewritten
-        key and drop its twin, which a later no-args invalidation would then miss.
+        The twin is recorded in the same _record step: recorded separately, a trim could keep a
+        rewritten key and drop its twin, which a later no-args invalidation would then miss.
         """
         if _l1_cache and serialized_data:
             _b = serialized_data.encode("utf-8") if isinstance(serialized_data, str) else serialized_data
             _l1_cache.put(cache_key, _b, redis_ttl=l1_ttl)
+        _record(cache_key, twin)
+
+    def _record(*keys: str | None) -> None:
+        """Record ``keys`` (None skipped) in _cached_keys under the current L2 scope, in one step.
+
+        Every open _watch_records() set is told about them BEFORE they are recorded, so a
+        concurrent whole-function invalidation cannot drop a record it was not told about.
+        """
         scope = _l2_scope()
-        entries = [(scope, cache_key)] if twin is None else [(scope, cache_key), (scope, twin)]
+        entries = [(scope, key) for key in keys if key is not None]
         if _drain_watches:
             for watch in _drain_watches.copy().values():
                 watch.update(entries)
@@ -1068,12 +1074,21 @@ def create_cache_wrapper(
         backend — is logged and skipped; every caller sits inside an `except
         Exception` that would otherwise demote the served hit into a recompute on
         each call (LAB-348). Anything else is an L1 bug and propagates.
+
+        A hit that is not backfilled still records its twin, though not its key: the key's
+        writer recorded the key, and a key-tracking backend's registry holds it for every
+        process, but no registry holds a twin, so a no-args invalidation here reaches it only
+        through this record.
         """
         if not (_l1_cache and cache_key and cached_data and not is_stale):
+            if twin is not None:
+                _record(twin)
             return
         try:
             _put_l1(cache_key, cached_data, _l1_backfill_ttl(fresh_for), twin=twin)
         except TypeError as exc:
+            if twin is not None:
+                _record(twin)
             logger().warning(f"L1 backfill skipped for {redact_cache_key(cache_key)}: {redact_error_for_log(exc)}")
 
     def _record_l2_hit_async(size_bytes: int, get_duration_ms: float) -> None:
@@ -1359,7 +1374,7 @@ def create_cache_wrapper(
     )
 
     def _twin_key(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> str | None:
-        """The call's pre-0.20.0 twin key for _put_l1 to record, or None when the key has none.
+        """The call's pre-0.20.0 twin key for the write or L2 hit to record, or None when it has none.
 
         Recorded, a twin is deleted by a no-args invalidation on either path, counted when its
         delete fails and kept for retry, like any recorded key.
@@ -1368,7 +1383,7 @@ def create_cache_wrapper(
             return None
         return operation_handler.get_legacy_cache_key(func, call_args, call_kwargs, namespace, integrity_checking)
 
-    # One set per open _watch_records(), keyed by (pid, token): _put_l1 adds every entry it
+    # One set per open _watch_records(), keyed by (pid, token): _record adds every entry it
     # records to each, so a whole-function invalidation spares entries re-recorded meanwhile.
     _drain_watches: dict[tuple[int, object], set[tuple[str, str]]] = {}
     # Background-failure WARNING throttles, one per kind, so a frequent kind never hides a rarer one.
@@ -2468,12 +2483,12 @@ def create_cache_wrapper(
 
     @contextlib.contextmanager
     def _watch_records() -> Iterator[set[tuple[str, str]]]:
-        """Yield a set that collects every entry _put_l1 records until the block exits.
+        """Yield a set that collects every entry _record records until the block exits.
 
         A whole-function invalidation trims _cached_keys after its L2 deletes. A concurrent
-        miss can rewrite a key in between, and _put_l1's re-record of an already-present key
+        miss can rewrite a key in between, and _record's re-record of an already-present key
         changes nothing, so without this set the trim drops the only local record of the new
-        value. _put_l1 adds to the set BEFORE it records: re-adding any trimmed key found in
+        value. _record adds to the set BEFORE it records: re-adding any trimmed key found in
         the set afterwards therefore covers a record that races the trim itself.
         """
         pid = os.getpid()
@@ -2573,7 +2588,7 @@ def create_cache_wrapper(
         entries are handled as in _local_invalidate_all(). Any failure falls back to
         _local_invalidate_all().
 
-        The trim keeps every entry _put_l1 records while the drain is in flight. Such an entry
+        The trim keeps every entry _record records while the drain is in flight. Such an entry
         may carry a value written after the drain unlinked it, and if that write's track_key
         failed, this process's record is the only thing left that can reach it: it stays in
         _cached_keys for the next drain.
