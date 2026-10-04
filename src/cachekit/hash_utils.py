@@ -86,8 +86,14 @@ def redact_cache_key(cache_key: object) -> str:
     The exact output format (``<redacted:{16 hex}>``) is pinned by
     ``_REDACTED_KEY_RE`` below and by ``test_pass_through_is_strict_allow_list``
     — change them together.
+
+    ``surrogatepass`` keeps this non-raising for a key holding an unpaired surrogate (a
+    namespace or custom key built from ``surrogateescape``-decoded data): it runs inside error
+    handlers, so a strict encode would turn a degraded L2 failure into a ``UnicodeEncodeError``
+    for the caller. It leaves the digest of every surrogate-free string unchanged and keeps
+    distinct inputs distinct.
     """
-    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8'), digest_size=8).hexdigest()}>"
+    return f"<redacted:{hashlib.blake2b(str(cache_key).encode('utf-8', 'surrogatepass'), digest_size=8).hexdigest()}>"
 
 
 #: Placeholders that occupy the cache_key field but are not keys and carry no
