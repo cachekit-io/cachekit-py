@@ -28,6 +28,11 @@ def build_workload(path: str) -> Callable[[], object]:
     from cachekit.serializers import EncryptionWrapper, get_serializer
 
     value = {"id": 42, "name": "Ada Lovelace", "roles": ["admin", "ops"], "score": 97.5, "tags": list(range(16))}
+    # Dict-heavy value (about 6 KB): the decoder's object_hook runs once per record.
+    records = [
+        {"id": i, "name": f"user-{i}", "email": f"user-{i}@example.com", "active": i % 2 == 0, "score": i * 0.5, "team": "ops"}
+        for i in range(100)
+    ]
     frame = pd.DataFrame({"id": range(100), "score": [i * 0.5 for i in range(100)]})
     master_key = "ab" * 32
 
@@ -126,6 +131,8 @@ def build_workload(path: str) -> Callable[[], object]:
 
     if path == "serializer_arrow":
         return roundtrip(get_serializer("arrow"), frame)
+    if path == "serializer_default_records":
+        return roundtrip(get_serializer("default"), records)
     if path == "serializer_encrypted":
         encrypted = EncryptionWrapper(master_key=bytes.fromhex(master_key), previous_master_keys=[])
         return roundtrip(encrypted, value, cache_key="ns:bench:func:m.f:args:" + "0" * 64 + ":0")

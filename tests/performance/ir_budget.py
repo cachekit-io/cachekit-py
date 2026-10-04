@@ -77,6 +77,7 @@ PATHS = (
     "secure_l1_hit",
     "l2_hit_async_metrics",
     "serializer_default",
+    "serializer_default_records",
     "serializer_auto",
     "serializer_orjson",
     "serializer_arrow",

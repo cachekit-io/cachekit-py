@@ -1173,55 +1173,43 @@ class TestStandardSerializerOrmVariations:
 
 @pytest.mark.unit
 class TestStandardSerializerDatetimeErrors:
-    """Test error handling for malformed datetime data."""
+    """Malformed markers: only a two-key map is read as a marker, so only a two-key map can fail."""
 
-    def test_deserialize_malformed_datetime_missing_value(self) -> None:
-        """Test deserialization of datetime dict without value field."""
+    @pytest.mark.parametrize("sentinel", ["__datetime__", "__date__", "__time__"])
+    def test_deserialize_two_key_marker_missing_value_raises(self, sentinel: str) -> None:
+        """A marker-sized map with its sentinel but no 'value' field is corrupt cached data."""
+        import msgpack
+
+        serializer = StandardSerializer(enable_integrity_checking=False)
+        data = msgpack.packb({sentinel: True, "other": 1})
+
+        with pytest.raises(SerializationError, match="missing 'value' field"):
+            serializer.deserialize(data)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"__datetime__": True},  # one key: raised before the length check, now a plain dict
+            {"__date__": True, "value": "2026-01-01", "extra": 1},  # three keys: was a date, now a plain dict
+            {"__time__": True, "value": None, "extra": 1},  # three keys: raised, now a plain dict
+        ],
+    )
+    def test_deserialize_non_two_key_map_is_never_a_marker(self, value: dict) -> None:
+        """No encoder writes a marker of another size, so such a map round-trips as the dict it is."""
         import msgpack
 
         serializer = StandardSerializer(enable_integrity_checking=False)
 
-        # Manually create malformed datetime dict (missing 'value' field)
-        malformed = {"__datetime__": True}  # Missing 'value' key
-        data = msgpack.packb(malformed)
+        assert serializer.deserialize(msgpack.packb(value)) == value
 
-        with pytest.raises(SerializationError) as exc_info:
-            serializer.deserialize(data)
+    def test_deserialize_two_key_records_are_untouched(self) -> None:
+        """A two-key map without a truthy sentinel is user data, not a marker."""
+        serializer = StandardSerializer()
+        value = [{"a": i, "b": str(i)} for i in range(10)] + [{"__datetime__": False, "value": "x"}]
 
-        error_msg = str(exc_info.value)
-        assert "Invalid datetime format" in error_msg or "missing" in error_msg
+        data, meta = serializer.serialize(value)
 
-    def test_deserialize_malformed_date_missing_value(self) -> None:
-        """Test deserialization of date dict without value field."""
-        import msgpack
-
-        serializer = StandardSerializer(enable_integrity_checking=False)
-
-        # Manually create malformed date dict (missing 'value' field)
-        malformed = {"__date__": True}  # Missing 'value' key
-        data = msgpack.packb(malformed)
-
-        with pytest.raises(SerializationError) as exc_info:
-            serializer.deserialize(data)
-
-        error_msg = str(exc_info.value)
-        assert "Invalid date format" in error_msg or "missing" in error_msg
-
-    def test_deserialize_malformed_time_missing_value(self) -> None:
-        """Test deserialization of time dict without value field."""
-        import msgpack
-
-        serializer = StandardSerializer(enable_integrity_checking=False)
-
-        # Manually create malformed time dict (missing 'value' field)
-        malformed = {"__time__": True}  # Missing 'value' key
-        data = msgpack.packb(malformed)
-
-        with pytest.raises(SerializationError) as exc_info:
-            serializer.deserialize(data)
-
-        error_msg = str(exc_info.value)
-        assert "Invalid time format" in error_msg or "missing" in error_msg
+        assert serializer.deserialize(data, meta) == value
 
 
 @pytest.mark.unit
