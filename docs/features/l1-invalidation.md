@@ -135,11 +135,15 @@ Only one refresh runs per key at a time — an in-flight marker dedups concurren
 
 CacheKit applies **jitter** (±10% randomness) to the threshold to stagger refreshes across keys:
 
-```python notest
+```python
+import random
+
+ttl, swr_threshold_ratio = 3600, 0.5
+
 # Without jitter: 1000 keys cached at T=0 all refresh at T=1800
 # With jitter: Refreshes spread from T=1620 to T=1980
-
 refresh_threshold = ttl * swr_threshold_ratio * random.uniform(0.9, 1.1)
+assert 1620 <= refresh_threshold <= 1980
 ```
 
 This is automatic and transparent - no configuration needed.
@@ -154,20 +158,37 @@ Invalidation is exposed per decorated function via `invalidate_cache()`:
 
 Clear the cache for a **specific function call**:
 
-```python notest
+```python
 from cachekit import cache
 
-@cache
-def get_user(user_id: int):
-    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
+calls = []
 
-# Clear cache only for user #123
+# backend=None keeps this example self-contained; with a backend the same calls also delete from L2.
+@cache(backend=None)
+def get_user(user_id: int):
+    calls.append(user_id)
+    return fetch_from_database(user_id)
+
+get_user(123)
+get_user(456)
+
+# Clear cache only for user #123: pass the arguments the way the cached call did
+get_user.invalidate_cache(123)
+get_user(123)  # recomputed
+get_user(456)  # still cached
+assert calls == [123, 456, 123]
+
+# A different spelling of the same call is a different entry, so this leaves get_user(123) cached
 get_user.invalidate_cache(user_id=123)
+get_user(123)
+assert calls == [123, 456, 123]
 
 # Clear cache for multiple users
 for uid in [1, 2, 3]:
-    get_user.invalidate_cache(user_id=uid)
+    get_user.invalidate_cache(uid)
 ```
+
+**Spell the call the same way.** A generated key is built from the arguments as passed, not as bound to the function's signature, so `get_user(123)` and `get_user(user_id=123)` are two cache entries, and a call that leaves a defaulted parameter out is a different entry from one that passes the default. `invalidate_cache(...)` removes only the entry for the spelling you give it. When callers use more than one spelling, invalidate each one, or use the no-args form below.
 
 **Use cases:**
 - Single record update
@@ -180,13 +201,22 @@ for uid in [1, 2, 3]:
 
 Calling `invalidate_cache()` with **no arguments** on a parameterized function clears every cached entry for that function. How far "every" reaches depends on the backend:
 
-```python notest
-@cache
-def get_user(user_id: int):
-    return db.query("SELECT * FROM users WHERE id = %s", (user_id,))
+```python
+calls = []
 
-# Clear all get_user entries (L1 + L2)
+@cache(backend=None)
+def get_user(user_id: int):
+    calls.append(user_id)
+    return fetch_from_database(user_id)
+
+get_user(1)
+get_user(2)
+
+# Clear all get_user entries (L1, and L2 when a backend is configured)
 get_user.invalidate_cache()
+get_user(1)
+get_user(2)
+assert calls == [1, 2, 1, 2]
 ```
 
 | Backend the decorator resolves | L2 entries deleted |
@@ -206,8 +236,8 @@ Things to know:
 - **Server requirements.** A single-instance or primary/replica Redis **5.0 or newer**. Redis Cluster and sharding proxies (one endpoint in front of several shards) are not supported. A restricted ACL user needs the `@scripting` category. When the drain fails for any of these reasons, cachekit logs a WARNING and falls back to deleting only this process's keys. A drain removes a key from the set only after deleting it, so tracked keys a failed drain did not reach stay in the set for the next drain, unless the set expires first.
 - **Other processes' L1.** The registry cleans L2 only. Other processes keep serving their L1 copies until the L1 TTL, as with single-key invalidation, unless they run the [invalidation listener](#cross-process-l1-eviction).
 - **Invalidation announcements.** Once an invalidation's L2 change has succeeded, cachekit publishes one message on the Redis pub/sub channel `cachekit:py:invalidate:v1`, which processes running the [invalidation listener](#cross-process-l1-eviction) act on: after a no-args drain returns, and after an `invalidate_cache(args)` whose delete of the key returned. A failed delete, or a failed drain that falls back to this process's own keys, publishes nothing. The message carries the function's registry id and, for `invalidate_cache(args)`, the invalidated key. A custom `key=` function's key is never sent because it can embed caller identifiers; its message names only the function. Anyone allowed to `SUBSCRIBE` to the channel sees a live feed of which functions are invalidated, with their generated keys. A generated key spells out the function and carries an unkeyed hash of the arguments, so arguments that are easy to guess, such as small integer ids, can be recovered by trying candidates (see [Invalidation Channel](../../SECURITY.md#invalidation-channel-redis-pubsub)). Redis delivers pub/sub messages whatever a client's database number, so grant `subscribe` on the channel only to your application's own Redis users. A restricted ACL user needs the `publish` command and access to the channel (`&cachekit:py:invalidate:v1`). Without them the invalidation still completes, and cachekit logs a WARNING `Invalidation announcement failed` at most once a minute per process, with the count of failures since the last one; each failure in between logs at DEBUG.
-- **Set lifetime.** A tracking set expires 7 days after the last tracked write to its function; each write whose tracking round-trip succeeds refreshes that expiry. While the set exists, a key leaves it only when a no-args drain deletes it: the key's own expiry and `invalidate_cache(args)` do not remove it. A zero-parameter function has no drain — its `invalidate_cache()` deletes its one key directly and leaves that key's member in the set until the set expires. A parameterised function that is written continuously and never invalidated with no args therefore grows its set by one member per distinct key. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them, and keys written before an upgrade to this version were never tracked. Call `invalidate_cache()` before you decommission a function whose entries have no TTL.
-- **Tenants.** The set is tenant-scoped like every other key. Each write is tracked in the set of the tenant in `tenant_context` for that call, and a drain empties only the calling tenant's set and can only delete keys inside that tenant's prefix — `default` when no tenant is set (see **Tenant scope** below). The INFO line `Key registry drained N keys` shows how many keys a drain deleted.
+- **Set lifetime.** A tracking set expires 7 days after the last tracked write to its function; each write whose tracking round-trip succeeds refreshes that expiry. While the set exists, a key leaves it only when a no-args drain deletes it: the key's own expiry and `invalidate_cache(args)` do not remove it. A zero-parameter function has no drain — its `invalidate_cache()` deletes its one key directly and leaves that key's member in the set until the set expires. A parameterised function that is written continuously and never invalidated with no args therefore grows its set by one member per distinct key. Keys that outlive it — `ttl=None` or a TTL above 7 days — are no longer reachable by a drain from a process that never saw them. Keys written before the upgrade to v0.20.0 sit in no set: a drain deletes them only in an upgraded process that wrote or read them since it started, and otherwise they stay until their TTL, or for good with `ttl=None`. Call `invalidate_cache()` before you decommission a function whose entries have no TTL or a TTL above 7 days.
+- **Tenants.** The set is tenant-scoped like every other key. Each write is tracked in the set of the tenant in `tenant_context` for that call, and a drain empties only the calling tenant's set and can only delete keys inside that tenant's prefix — `default` when no tenant is set (see **Tenant scope** below). The INFO line `Key registry drained N keys` shows how many keys a drain deleted. An operator shell or one-off script in a multi-tenant deployment must enter the tenant's `tenant_context` before it invalidates: without it the drain empties the `default` tenant's set, and `Key registry drained 0 keys` is the usual sign.
 - **Reserved namespace.** `namespace="ck"` and any namespace starting with `ck:` are rejected at decoration: a key written there could overwrite a tracking set.
 - **Same module path everywhere.** The set is named by the function's `module.qualname`, so every process must import the function from the same module path.
 
@@ -223,6 +253,8 @@ Things to know:
 - **Observability names change.** The `namespace` metrics label reads `users` instead of `NS.USERS` on every Python version, 3.10 included, so update dashboards and alerts that match on it. On Python 3.11 and later, the log-message prefix `[NS.USERS]` becomes `[users]`.
 
 **Tenant scope:** with the tenant-scoped Redis backend (env auto-detection, or `RedisBackendProvider(...).get_shared_backend()`), each tenant's entries live under its own `t:{tenant}:` prefix. `invalidate_cache()` — with or without arguments — deletes only the L2 entries of the tenant set in `tenant_context` for the calling context (`default` when none is set); other tenants' entries stay cached and tracked. L1 is not tenant-scoped: within a process, all tenants share one L1 entry per cache key, so a tenant can be served the value another tenant cached, and `invalidate_cache()` evicts that entry for every tenant. The exception is an encrypted cache whose `tenant_extractor` resolves the same tenant as `tenant_context`: an L1 entry encrypted for another tenant is skipped as a miss, and the read goes on to L2. Disable L1 on functions whose results differ by tenant: `@cache(..., l1_enabled=False)`, or with a preset `@cache.production(..., l1_enabled=False)`, which keeps the preset's other L1 settings.
+
+**Writes in flight.** An invalidation does not stop a write that began before it. A call that missed the cache before an invalidation still stores its result after it, and so does a `@cache.io` [`stale_ttl`](../configuration.md#stale-while-revalidate-stale_ttl) refresh. The value it stores was computed no earlier than the call started, and it expires by its TTL. With `ttl=None` that is never for an L2 entry, and one year for an entry in L1-only mode. With a backend, the store is two steps, L2 then L1, so an invalidation that arrives between them, from this process or [announced](#cross-process-l1-eviction) by another, can leave the value in this process's L1 alone. Likewise, a read that fetched the old value from L2 just before an invalidation can copy it into this process's L1 just after. Either copy expires by its L1 TTL. In L1-only mode a background SWR refresh never lands after an invalidation: it is dropped when the entry it refreshes has been removed.
 
 ---
 
@@ -295,7 +327,7 @@ config = L1CacheConfig(
 
 CacheKit includes preconfigured presets for common use cases:
 
-```python notest
+```python
 from cachekit import cache
 
 # Development: SWR only
@@ -347,21 +379,20 @@ def test_function():
 
 Delete the cached entry when the underlying data changes:
 
-```python notest
+```python
 from cachekit import cache
-import database
 
 @cache
 def get_user(user_id: int):
-    return database.get_user(user_id)
+    return db.get_user(user_id)  # db: your data layer
 
 # User update endpoint
 def update_user(user_id: int, data: dict):
     # Update database
-    database.update_user(user_id, data)
+    db.update_user(user_id, data)
 
-    # Remove from local L1 and shared L2
-    get_user.invalidate_cache(user_id=user_id)
+    # Remove from local L1 and shared L2, spelled the way the reads call get_user
+    get_user.invalidate_cache(user_id)
 
     return {"status": "updated"}
 ```
@@ -372,7 +403,7 @@ In multi-pod deployments, other pods pick up the fresh value on their next L1 mi
 
 Clear everything cached for a function:
 
-```python notest
+```python
 @cache(namespace="products")
 def get_product(product_id: int):
     return db.get_product(product_id)
@@ -410,7 +441,7 @@ For typical workloads (1000s of keys), overhead is <1MB.
 
 **Cause:** Expected behavior without the [invalidation listener](#cross-process-l1-eviction) — L1 invalidation is process-local. The invalidating process deletes the key from shared L2, but other pods keep their L1 copy until it expires.
 
-**Solution:** On the tenant-scoped Redis backend, set `CACHEKIT_INVALIDATION_LISTENER_ENABLED=true` in the pods that serve reads. Otherwise, bound acceptable staleness with the entry's TTL. If a class of data cannot tolerate any cross-pod staleness window, don't cache it in L1 (`l1=L1CacheConfig(enabled=False)`): the listener's delivery is at most once.
+**Solution:** On the tenant-scoped Redis backend, set `CACHEKIT_INVALIDATION_LISTENER_ENABLED=true` in the pods that serve reads. Otherwise, bound acceptable staleness with the entry's TTL. Disabling L1 (`l1=L1CacheConfig(enabled=False)`) removes the per-pod window, which the listener only narrows because its delivery is at most once. It does not remove every stale read: a call that began before an invalidation can still store its old result in L2 after it, where every pod reads it until its TTL or the next invalidation (see **Writes in flight** under [Invalidation API](#invalidation-api)). Data that cannot tolerate any stale read should not be cached.
 
 ### Problem: The listener is enabled but a pod still serves stale data
 
