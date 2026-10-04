@@ -125,7 +125,7 @@ repos:
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
-        # Same patterns. git hands this hook the raw message file: "#" comment lines, the diff
+        # Same patterns. git hands this hook the raw message file: "# " comment lines, the diff
         # below the `git commit -v` scissors line, and its own merge and revert subjects, which
         # quote branch names and earlier subjects. Only the text the author wrote is checked.
         language: python
@@ -137,7 +137,7 @@ repos:
             GIT_SUBJECT = re.compile(r"Merge (?:branch|branches|remote-tracking branch|tag|commit) '[^']*'(?: and '[^']*')*(?: of \S+)?(?: into \S+)?|Revert \".*\"")
             text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
             text = text.split("# ------------------------ >8 ------------------------")[0]
-            lines = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+            lines = [line for line in text.splitlines() if line.strip() and not re.match(r"#(?:[ \t]|$)", line)]
             if lines and GIT_SUBJECT.fullmatch(lines[0]):
                 lines = lines[1:]
             bad = [line for line in lines if P.search(line)]
