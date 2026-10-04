@@ -208,7 +208,7 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   waiting for another thread's request to finish; urllib3 closes that connection when it comes back to a
   full pool, and logs a `Connection pool is full, discarding connection` warning. Each such request pays
   a new handshake, so set `connection_pool_size` to at least the number of threads that call one backend
-  at once. Backends
+  at once. Whole-function invalidation sends up to 16 deletes at once, never more than the pool size. Backends
   with the same key, URL, timeout and pool size share one pool while any of them is alive, and the pool
   is closed when the last one is released. Create one backend per key and reuse it
 - Idle connections stay pooled until the server closes them: urllib3 has no client-side idle expiry.
