@@ -203,7 +203,7 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   those threads would multiplex one connection, which httpx's sync HTTP/2 support does not make
   thread-safe, and 1–4% of operations failed as cache misses. Each extra connection costs one TCP and
   TLS handshake on first use, then stays pooled. A request that finds every connection in use waits for
-  one to free, and fails only if none frees within the request timeout. The waits are not served in
+  one to free, and fails if it gets none within the request timeout. The waits are not served in
   order (a thread starting a new request can take a freed connection first), so with more threads than
   connections a few requests wait many round trips: keep `connection_pool_size` at least as large as
   the number of threads that share one backend. The async client keeps HTTP/2: one event loop drives
