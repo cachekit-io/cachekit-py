@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import socket
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Iterable
@@ -71,8 +72,10 @@ return members
 
 # The invalidation listener's connection PINGs after this many idle seconds, which keeps idle-timeout
 # proxies and NAT gateways from dropping it. redis-py does not wait for the reply, so a connection
-# that dies silently is still found only when TCP gives up on it.
+# whose peer goes silent is found only when TCP gives up on it: after _LISTENER_USER_TIMEOUT_MS of an
+# unacknowledged PING on Linux, after TCP's own retransmission limit (about 15 minutes) elsewhere.
 _LISTENER_HEALTH_CHECK_SECONDS = 10
+_LISTENER_USER_TIMEOUT_MS = 30_000
 
 # Pool -> (the socket_timeout it had before its outermost open with_timeout() window, that window's
 # token), so listener_pool() clones the configured value, never a window's, whichever backend object
@@ -680,8 +683,10 @@ class PerRequestRedisBackend:
 
         The listener holds its one connection for the life of the process, so the connection PINGs
         after 10 idle seconds and a TCP or TLS connection also sets TCP keepalive (a Unix socket takes
-        no keepalive option): idle-timeout proxies keep it. Replies stay bytes, whatever the backend's
-        client decodes: events are MessagePack.
+        no keepalive option): idle-timeout proxies keep it. On Linux a TCP or TLS connection also sets
+        ``TCP_USER_TIMEOUT`` to 30 s, unless the backend's pool sets its own, so a peer that stops
+        acknowledging the PING fails the connection and the listener reconnects. Replies stay bytes,
+        whatever the backend's client decodes: events are MessagePack.
 
         Examples:
             >>> import redis
@@ -706,6 +711,9 @@ class PerRequestRedisBackend:
             kwargs["socket_timeout"] = window[0]
         if not issubclass(source.connection_class, redis.UnixDomainSocketConnection):
             kwargs["socket_keepalive"] = True
+            if hasattr(socket, "TCP_USER_TIMEOUT"):  # Linux only
+                configured = kwargs.get("socket_keepalive_options") or {}
+                kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: _LISTENER_USER_TIMEOUT_MS, **configured}
         return redis.ConnectionPool(connection_class=source.connection_class, max_connections=1, **kwargs)
 
     @asynccontextmanager
