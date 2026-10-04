@@ -28,7 +28,7 @@ from cachekit.config.singleton import reset_settings
 from cachekit.hash_utils import _WarnThrottle
 from cachekit.l1_cache import L1Cache, get_l1_cache
 from tests.integration import _key_registry_worker as worker
-from tests.unit.test_l1_memory_bounds import _child_outcome, _report
+from tests.utils.fork_helpers import child_outcome, report
 
 pytestmark = pytest.mark.integration
 
@@ -415,7 +415,7 @@ class TestListenerAndFork:
                     threading.Thread.start = lambda self: started.append(type(self).__name__)  # type: ignore[method-assign]
                     del records[:]
                     value = fn(2)  # a cache operation that reaches the backend
-                    _report(
+                    report(
                         w,
                         {
                             "value": value,
@@ -427,7 +427,7 @@ class TestListenerAndFork:
                 finally:
                     os._exit(1)
             os.close(w)
-            assert _child_outcome(child, r) == {
+            assert child_outcome(child, r) == {
                 "value": 20,
                 "started": [],
                 "records": [],
