@@ -112,7 +112,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  Backend types:                                                             │
 │  • RedisBackend: Distributed Redis storage (default)                        │
-│  • CachekitIOBackend: Managed cloud storage via HTTP/2 (api.cachekit.io)    │
+│  • CachekitIOBackend: Managed cloud storage via HTTPS (api.cachekit.io)     │
 │  • Future: DynamoDBBackend, etc.                                            │
 │                                                                             │
 │  RedisBackend internal flow:                                                │
@@ -449,7 +449,7 @@ def _blake2b_pickle_hash(args, kwargs):
 ┌─────────────────────────────────────────┐
 │ L2 Backend (Pluggable Storage Layer)    │
 │ • RedisBackend (default)                │
-│ • CachekitIOBackend (HTTP/2, managed)   │
+│ • CachekitIOBackend (HTTPS, managed)    │
 │ • Network call (~1-2ms latency)         │
 │ • Bytes-based protocol (BaseBackend)    │
 │ • Persistent across process restarts    │

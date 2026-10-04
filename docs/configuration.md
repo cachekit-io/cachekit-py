@@ -131,9 +131,9 @@ CACHEKIT_API_URL=https://api.cachekit.io
 # Optional: Request timeout in seconds (default: 5.0, must be > 0)
 CACHEKIT_TIMEOUT=5.0
 
-# Optional: HTTP connection pool size (default: 10, must be > 0)
+# Optional: HTTP connection pool size (default: 32, must be > 0)
 # The same variable sizes the Redis pool, whose default is 50
-CACHEKIT_CONNECTION_POOL_SIZE=10
+CACHEKIT_CONNECTION_POOL_SIZE=32
 
 # Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
 # Only set to true when pointing at a private test server
@@ -147,7 +147,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool. The same variable sizes the Redis pool, whose default is 50 |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `32` | No | Max HTTP connections in pool. The sync client uses one per concurrent request (HTTP/1.1). The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
 **Security notes:**
@@ -642,11 +642,11 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
-One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins.
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 32. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins. A CachekitIO sync request holds a connection for its whole round trip (HTTP/1.1), so the pool caps how many run at once: size it to at least the number of threads that share one backend ([details](backends/cachekitio.md#characteristics)).
 
 ```bash
 # Tune connection pool size based on concurrency
-export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 10
+export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 32
 
 # Higher for:
 # - Many concurrent requests
