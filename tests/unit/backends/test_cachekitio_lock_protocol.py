@@ -907,3 +907,48 @@ class TestFillLock:
         clients[1].close()
         assert sent == [("DELETE", "/v1/cache/k/lock")]
         assert backend._sync_lease.client is clients[0]
+
+    @pytest.mark.parametrize("refusal", ["loop-executor-shut-down", "own-executor-shut-down"])
+    async def test_release_is_awaited_when_the_executor_refuses_it(self, backend: CachekitIOBackend, refusal: str) -> None:
+        """run_in_executor raises RuntimeError once the default executor is shut down, before it queues
+        anything. The release then falls back to the awaited DELETE on the async client, as acquire_lock
+        sends it, rather than leaving the lock held until its server-side timeout."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-r"}))
+        backend._request_async = request_mock  # type: ignore[method-assign]
+        backend._request_sync = MagicMock()  # type: ignore[method-assign]
+        loop = asyncio.get_running_loop()
+        if refusal == "own-executor-shut-down":
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop.set_default_executor(pool)
+            pool.shutdown()
+
+        async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
+            if refusal == "loop-executor-shut-down":
+                await _drain_background_releases()
+
+        assert _method_calls(request_mock) == ["POST", "DELETE"]
+        assert request_mock.await_args_list[1].kwargs["headers"] == {LOCK_ID_HEADER: "lock-r"}
+        backend._request_sync.assert_not_called()
+
+    async def test_cancel_stays_a_cancel_when_the_executor_refuses_the_release(self, backend: CachekitIOBackend) -> None:
+        """A cancel that lands in the body still releases through the fallback, and still propagates as
+        the cancel, not as the executor's RuntimeError."""
+        request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-x"}))
+        backend._request_async = request_mock  # type: ignore[method-assign]
+        entered = asyncio.Event()
+
+        async def fill() -> None:
+            async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
+                entered.set()
+                await asyncio.sleep(5.0)
+
+        await _drain_background_releases()
+        task = asyncio.ensure_future(fill())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert _method_calls(request_mock) == ["POST", "DELETE"]

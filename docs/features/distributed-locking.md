@@ -196,7 +196,9 @@ waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
   value is recomputed and written again, and the last write wins.
 - **The release does not block the return.** The `DELETE …/lock` is sent in the
   background once the value is stored, as cachekit-ts does. Waiters in other
-  processes see the lock released just as before.
+  processes see the lock released just as before. If the event loop's default
+  executor has already been shut down, the release is awaited instead, so the
+  lock is still released.
 
 The Redis backend keeps both steps: its release is one Redis round trip.
 

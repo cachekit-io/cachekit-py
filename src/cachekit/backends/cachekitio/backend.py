@@ -1024,14 +1024,19 @@ class CachekitIOBackend:
           won: this caller never waited behind another holder. A fill that completed between the
           caller's read and that POST is not seen, so it is recomputed; last write wins.
         - It releases in the background: the DELETE is sent from an executor thread and the
-          ``async with`` returns at once (see ``_release_lock_in_background``).
+          ``async with`` returns at once (see ``_release_lock_in_background``). If the default
+          executor is already shut down, ``run_in_executor`` refuses the job with ``RuntimeError``,
+          and the release is awaited instead, as ``acquire_lock`` does it.
         """
         lock_id, uncontended = await self._acquire_lock_id(key, timeout, blocking_timeout)
         try:
             yield lock_id is not None, uncontended
         finally:
             if lock_id is not None:
-                self._release_lock_in_background(key, lock_id)
+                try:
+                    self._release_lock_in_background(key, lock_id)
+                except RuntimeError:
+                    await self._release_lock(key, lock_id)
 
     def _release_lock_in_background(self, lock_key: str, lock_id: str) -> None:
         """Send the lock DELETE without waiting for it, in a way loop shutdown cannot drop.
