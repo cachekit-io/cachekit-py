@@ -1,61 +1,47 @@
 """One inline retry of a shed write (LAB-7686).
 
 A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once more after
-exactly that delay; every other failure is sent once. Requests go through a real httpx
-client on a MockTransport, so status handling runs as in production; the sleeps are faked.
+exactly that delay; every other failure is sent once. Requests go through the backend's real
+client on a fake pool (tests/utils/cachekitio_fakes.py), so status handling runs as in
+production; the sleeps are faked.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections.abc import Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
+from urllib3.exceptions import ReadTimeoutError
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
+from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, response
 
 
 class _Server:
-    """Answers each request with the next queued response and records what it was sent."""
+    """Answers each request with the next queued response, or raises the next queued exception."""
 
-    def __init__(self, *responses: httpx.Response | Exception) -> None:
+    def __init__(self, *responses: HTTPResponse | Exception) -> None:
         self._responses = list(responses)
-        self.requests: list[httpx.Request] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
         answer = self._responses.pop(0)
         if isinstance(answer, Exception):
             raise answer
         return answer
 
 
-def _shed(retry_after: str | None = "1") -> httpx.Response:
-    headers = {} if retry_after is None else {"Retry-After": retry_after.encode()}  # bytes: httpx would ascii-encode a str
-    return httpx.Response(503, headers=headers, json={"error": "request_deadline_exceeded"})
+def _shed(retry_after: str | None = "1") -> HTTPResponse:
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return response(503, headers=headers, json={"error": "request_deadline_exceeded"})
 
 
-def _backend(server: _Server) -> CachekitIOBackend:
-    transport = httpx.MockTransport(server)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def _backend(*responses: HTTPResponse | Exception) -> tuple[CachekitIOBackend, FakePool]:
+    return fake_backend(_Server(*responses))
 
 
 @pytest.fixture
@@ -94,24 +80,24 @@ class TestShedWriteIsRetriedOnce:
     def test_retry_after_short_hint_lands_the_write(
         self, sleeps: MagicMock, op: str, mode: str, retry_after: str, delay: int
     ) -> None:
-        server = _Server(_shed(retry_after), httpx.Response(200))
-        _write(_backend(server), op, mode)
+        backend, pool = _backend(_shed(retry_after), response(200))
+        _write(backend, op, mode)
 
-        assert len(server.requests) == 2
+        assert len(pool.requests) == 2
         sleeps.assert_called_once_with(delay)
-        first, second = server.requests
+        first, second = pool.requests
         assert second.method == first.method == ("PUT" if op == "set" else "DELETE")
-        assert second.url == first.url
-        assert second.content == first.content
+        assert second.path == first.path
+        assert second.body == first.body
 
     @pytest.mark.parametrize(("op", "mode"), _WRITES)
     def test_second_503_is_not_retried_again(self, sleeps: MagicMock, op: str, mode: str) -> None:
-        server = _Server(_shed("1"), _shed("1"))
+        backend, pool = _backend(_shed("1"), _shed("1"))
         with pytest.raises(BackendError) as exc_info:
-            _write(_backend(server), op, mode)
+            _write(backend, op, mode)
 
         assert exc_info.value.error_type == BackendErrorType.TRANSIENT
-        assert len(server.requests) == 2
+        assert len(pool.requests) == 2
         sleeps.assert_called_once_with(1)
 
 
@@ -133,32 +119,32 @@ class TestNoRetry:
         ],
     )
     def test_503_without_a_short_hint(self, sleeps: MagicMock, op: str, mode: str, retry_after: str | None) -> None:
-        server = _Server(_shed(retry_after))
+        backend, pool = _backend(_shed(retry_after))
         with pytest.raises(BackendError) as exc_info:
-            _write(_backend(server), op, mode)
+            _write(backend, op, mode)
 
         assert exc_info.value.error_type == BackendErrorType.TRANSIENT
-        assert len(server.requests) == 1
+        assert len(pool.requests) == 1
         sleeps.assert_not_called()
 
     @pytest.mark.parametrize(("op", "mode"), _WRITES)
     @pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 429, 500, 502, 504])
     def test_other_status_even_with_retry_after(self, sleeps: MagicMock, op: str, mode: str, status: int) -> None:
-        server = _Server(httpx.Response(status, headers={"Retry-After": "1"}))
+        backend, pool = _backend(response(status, headers={"Retry-After": "1"}))
         with pytest.raises(BackendError):
-            _write(_backend(server), op, mode)
+            _write(backend, op, mode)
 
-        assert len(server.requests) == 1
+        assert len(pool.requests) == 1
         sleeps.assert_not_called()
 
     @pytest.mark.parametrize(("op", "mode"), _WRITES)
     def test_timeout(self, sleeps: MagicMock, op: str, mode: str) -> None:
-        server = _Server(httpx.ReadTimeout("timed out"))
+        backend, pool = _backend(ReadTimeoutError(None, "/v1/cache/k", "timed out"))  # type: ignore[arg-type]
         with pytest.raises(BackendError) as exc_info:
-            _write(_backend(server), op, mode)
+            _write(backend, op, mode)
 
         assert exc_info.value.error_type == BackendErrorType.TIMEOUT
-        assert len(server.requests) == 1
+        assert len(pool.requests) == 1
         sleeps.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -170,24 +156,24 @@ class TestNoRetry:
         ],
     )
     def test_reads(self, sleeps: MagicMock, name: str, call: Callable[[CachekitIOBackend], object]) -> None:
-        server = _Server(_shed("1"))
+        backend, pool = _backend(_shed("1"))
         with pytest.raises(BackendError):
-            call(_backend(server))
+            call(backend)
 
-        assert len(server.requests) == 1
+        assert len(pool.requests) == 1
         sleeps.assert_not_called()
 
     def test_lock_acquire_post(self, sleeps: MagicMock) -> None:
-        server = _Server(_shed("1"))
+        backend, pool = _backend(_shed("1"))
         with pytest.raises(BackendError):
-            asyncio.run(_backend(server)._try_acquire_lock("k", 1.0))
+            asyncio.run(backend._try_acquire_lock("k", 1.0))
 
-        assert [r.method for r in server.requests] == ["POST"]
+        assert [r.method for r in pool.requests] == ["POST"]
         sleeps.assert_not_called()
 
     def test_ttl_patch(self, sleeps: MagicMock) -> None:
-        server = _Server(_shed("1"))
-        assert asyncio.run(_backend(server).refresh_ttl("k", 60)) is False
+        backend, pool = _backend(_shed("1"))
+        assert asyncio.run(backend.refresh_ttl("k", 60)) is False
 
-        assert [r.method for r in server.requests] == ["PATCH"]
+        assert [r.method for r in pool.requests] == ["PATCH"]
         sleeps.assert_not_called()

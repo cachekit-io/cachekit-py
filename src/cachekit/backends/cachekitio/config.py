@@ -168,8 +168,8 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         if parsed is None:
             raise ValueError("Invalid API URL: could not be parsed")
 
-        # Userinfo never authenticates here: httpx sends it as Basic auth in place of the Bearer key,
-        # and its INFO log prints the full request URL, password included (CWE-532).
+        # Userinfo never authenticates here (the client sends only the Bearer key), and a password in
+        # the URL reaches any log or error that prints it (CWE-532).
         if "@" in parsed.netloc:
             raise ValueError("API URL must not contain credentials (user:password@)")
 

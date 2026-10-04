@@ -1,42 +1,42 @@
-"""HTTP client factory with connection pooling and per-thread, per-config caching.
+"""HTTP client for cachekit.io: one urllib3 connection pool per config, shared by every thread of a process.
 
-A cached client lives as long as some CachekitIOBackend uses it. A sync client is closed when
-its last backend is released; an async one is not, so ``await close_async_client()`` on the
-owning event loop for a clean shutdown. Both close_* helpers also close clients that live
-backends still hold. An async client is also bound to the event loop it was first used on:
-the next loop on the same thread gets a new one.
+urllib3's pool is thread-safe, so one client serves every thread that calls a backend, and the async backend
+methods send on that same client through ``asyncio.to_thread``. A cached client lives as long as some
+CachekitIOBackend uses it, and is closed when its last backend is released.
 
-A forked child never sees its parent's cached clients: their pooled connections share the parent's TLS
-sessions, so a request on one from both processes desynchronises it. The caches are owned by a PID, and
-a child (``os.fork()``, or a fork from C that runs no at-fork hook) starts with empty ones.
+A forked child never sees its parent's cached clients: their pooled connections share the parent's TLS sessions,
+so a request on one from both processes desynchronises it. The cache is owned by a PID, and a child
+(``os.fork()``, or a fork from C that runs no at-fork hook) starts with an empty one.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import socket
 import threading
 import urllib.request
 import weakref
-from contextlib import AsyncExitStack, ExitStack
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
-import httpx
+import urllib3
+from urllib3.util import Timeout, make_headers, parse_url
 
 from cachekit.hash_utils import redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
+    from urllib3 import BaseHTTPResponse, HTTPSConnectionPool
+
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
 _ClientKey = tuple[str, str, float, int]
 
 
 def _user_agent() -> str:
-    # Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
+    # Edge analytics group SaaS traffic by User-Agent; the SaaS reads only the first product token.
     # The version comes from the installed distribution, so it cannot drift from the release. A source-only or vendored
     # copy has no distribution metadata; it still identifies as cachekit-py rather than failing the import.
     # Stdlib logger, not _logger: this runs once at import, and the structured logger samples records away.
@@ -45,7 +45,7 @@ def _user_agent() -> str:
     except PackageNotFoundError:
         logging.getLogger(__name__).debug("No cachekit distribution metadata; User-Agent reports cachekit-py/unknown")
         sdk = "unknown"
-    return f"cachekit-py/{sdk} httpx/{httpx.__version__}"
+    return f"cachekit-py/{sdk} urllib3/{version('urllib3')}"
 
 
 _USER_AGENT = _user_agent()
@@ -53,8 +53,95 @@ _USER_AGENT = _user_agent()
 _logger = get_structured_logger(__name__)
 
 
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    # Cloudflare closes an idle client connection at 400 s, but NAT gateways drop idle flows sooner (AWS 350 s,
+    # Azure 4 min) and silently. Probes from 60 s idle keep their mappings alive and detect a dead path in about
+    # 90 s, instead of a read timeout and a miss on the next request. These replace urllib3's default options,
+    # so its TCP_NODELAY is repeated.
+    options = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1), (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # macOS names the idle option TCP_KEEPALIVE; a platform without one keeps the kernel's defaults.
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    for name, value in ((idle, 60), (getattr(socket, "TCP_KEEPINTVL", None), 10), (getattr(socket, "TCP_KEEPCNT", None), 3)):
+        if name is not None:
+            options.append((socket.IPPROTO_TCP, name, value))
+    return options
+
+
+_KEEPALIVE_SOCKET_OPTIONS = _keepalive_socket_options()
+
+
+def _env_proxy(host: str) -> str | None:
+    """The proxy URL the environment sets for HTTPS requests to ``host``, or None to connect directly.
+
+    urllib3 reads no proxy settings itself, so the standard library's reading of them is used:
+    ``HTTPS_PROXY``, then ``ALL_PROXY``, unless ``NO_PROXY`` covers the host. ``getproxies`` also reads
+    the macOS and Windows system settings. A proxy URL with no scheme is taken as ``http://``.
+    """
+    proxies = urllib.request.getproxies()
+    proxy = proxies.get("https") or proxies.get("all")
+    if not proxy or urllib.request.proxy_bypass(host):
+        return None
+    return proxy if "://" in proxy else f"http://{proxy}"
+
+
+def _connection_pool(config: CachekitIOBackendConfig) -> HTTPSConnectionPool:
+    pool_kw: dict[str, Any] = {
+        "timeout": Timeout(connect=config.timeout, read=config.timeout),
+        # A request that finds every connection busy waits for one, up to the timeout (pool_timeout in request()),
+        # rather than opening connections past the configured size.
+        "maxsize": config.connection_pool_size,
+        "block": True,
+        "socket_options": _KEEPALIVE_SOCKET_OPTIONS,
+    }
+    proxy = _env_proxy(parse_url(config.api_url).host or "")
+    if proxy is None:
+        manager = urllib3.PoolManager(**pool_kw)
+    else:
+        # urllib3 sends no credentials from the proxy URL itself.
+        proxy_auth = parse_url(proxy).auth
+        proxy_headers = make_headers(proxy_basic_auth=unquote(proxy_auth)) if proxy_auth else None
+        manager = urllib3.ProxyManager(proxy, proxy_headers=proxy_headers, **pool_kw)
+    # The config only accepts https:// URLs.
+    return manager.connection_from_url(config.api_url)  # type: ignore[return-value]
+
+
+class HTTPClient:
+    """Sends requests to one config's API under its key. Thread-safe: share one per process."""
+
+    def __init__(self, config: CachekitIOBackendConfig) -> None:
+        # A path on api_url prefixes every request path.
+        self._prefix = (parse_url(config.api_url).path or "").rstrip("/")
+        self._timeout = config.timeout
+        self.headers = {
+            "Authorization": f"Bearer {config.api_key.get_secret_value()}",
+            "Content-Type": "application/octet-stream",
+            "User-Agent": _USER_AGENT,
+        }
+        self.pool = _connection_pool(config)
+
+    def request(
+        self, method: str, path: str, *, body: bytes | None = None, headers: dict[str, str] | None = None
+    ) -> BaseHTTPResponse:
+        """Send one request and read the whole response; a header in ``headers`` replaces the client's own.
+
+        No retry and no redirect: a transport failure raises urllib3's own exception, and a 3xx is returned.
+        """
+        return self.pool.urlopen(
+            method,
+            self._prefix + path,
+            body=body,
+            headers={**self.headers, **headers} if headers else self.headers,
+            retries=False,
+            redirect=False,
+            pool_timeout=self._timeout,  # type: ignore[arg-type]  # annotated int; queue.get takes a float
+        )
+
+    def close(self) -> None:
+        self.pool.close()
+
+
 class SyncClientLease:
-    """Sole owner of a cached per-thread sync client, which is closed once its last holder drops the lease.
+    """Sole owner of a cached client, which is closed once its last holder drops the lease.
 
     Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
     on its own drops the lease at once, and with it the client.
@@ -71,17 +158,17 @@ class SyncClientLease:
     # weak references still resolve, so the racing lookup revives the object and inherits the close.
     def __init__(self, config: CachekitIOBackendConfig) -> None:
         self.pid = os.getpid()
-        self.client = httpx.Client(**_client_kwargs(config, httpx.HTTPTransport))
+        self.client = HTTPClient(config)
         # atexit=False: exit-time finalizers run while daemon threads (stale-while-revalidate) are still
         # alive, so closing then could pull a client out from under an in-flight request. The process
         # reclaims the sockets at exit anyway.
         weakref.finalize(self, _close_released_client, self.client, self.pid).atexit = False
 
 
-def _close_released_client(client: httpx.Client, owner_pid: int) -> None:
+def _close_released_client(client: HTTPClient, owner_pid: int) -> None:
     # A forked child drops an inherited lease unclosed: the client's connections are its parent's too,
-    # and close() takes the pool lock, which a parent thread may have held at fork. Garbage collection
-    # closes the child's copies of the sockets, which sends nothing.
+    # and close() takes the pool's queue lock, which a parent thread may have held at fork. Garbage
+    # collection closes the child's copies of the sockets, which sends nothing.
     if os.getpid() != owner_pid:
         return
     # A finalizer has no caller to report to, so the expected failure (a socket that will not close
@@ -93,254 +180,91 @@ def _close_released_client(client: httpx.Client, owner_pid: int) -> None:
         _logger.debug("Closing a released cachekit.io HTTP client failed", error=redact_error_for_log(e))
 
 
-class _LoopBoundClient:
-    """One thread's async client for one config, rebuilt whenever the running event loop changes.
+class _Leases:
+    """This process's lease cache, keyed by the config values baked into a client.
 
-    An httpx.AsyncClient's pooled connections belong to the loop that opened them: on any later loop
-    the next request raises RuntimeError('Event loop is closed'). A thread runs one loop at a time, so
-    one slot per thread and config is enough. The slot holds the loop weakly, but a used client's
-    connections hold their loop, so the last loop lives until this slot is rebuilt or released.
+    The key matters: Authorization, the URL and the timeout are fixed at client creation, so one client
+    for every backend would send every backend's traffic under the FIRST key constructed: cross-tenant
+    writes and reads with no error anywhere. Values are weak: each CachekitIOBackend holds its lease
+    strongly, so a lease stays cached while some backend uses it and is dropped when the last one goes.
     """
 
-    def __init__(self, config: CachekitIOBackendConfig) -> None:
-        self._config = config
-        self._loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
-        self._client: httpx.AsyncClient | None = None
-
-    def get(self) -> httpx.AsyncClient:
-        loop = asyncio.get_running_loop()
-        if self._client is None or self._loop is None or self._loop() is not loop:
-            # The replaced client is dropped unclosed: its loop has finished, so its connections
-            # cannot be awaited closed (the same ResourceWarning as a released async client).
-            self._client = httpx.AsyncClient(**_client_kwargs(self._config, httpx.AsyncHTTPTransport))
-            self._loop = weakref.ref(loop)
-        return self._client
-
-    def take(self) -> httpx.AsyncClient | None:
-        """Detach the current client, so the next get() builds a new one."""
-        client, self._client, self._loop = self._client, None, None
-        return client
-
-
-class AsyncClientLease:
-    """A backend's handle on the async clients for its config: ``.client`` is the one for this thread's running loop.
-
-    Building a lease builds no client; the first async call on each loop does. The lease holds the
-    slot of every thread it has been used on (dropped at thread exit), so the shared per-thread slot
-    lives while some backend uses it, and no client is ever handed to a thread or loop it was not
-    built on.
-
-    Like a SyncClientLease, it belongs to the process that built it (``.pid``): in a forked child the
-    forking thread's held slot is still the parent's, so lease again there, as CachekitIOBackend does
-    before every request.
-    """
-
-    def __init__(self, config: CachekitIOBackendConfig) -> None:
-        self.pid = os.getpid()
-        self._config = config
-        self._held = threading.local()
-
-    @property
-    def client(self) -> httpx.AsyncClient:
-        """The async client bound to the running event loop. Raises RuntimeError with no running loop."""
-        slot: _LoopBoundClient | None = getattr(self._held, "slot", None)
-        if slot is None:
-            slots = _clients().async_slots
-            key = _client_key(self._config)
-            slot = slots.get(key)
-            if slot is None:
-                slot = slots[key] = _LoopBoundClient(self._config)
-            self._held.slot = slot
-        return slot.get()
-
-
-class _ThreadClients(threading.local):
-    # threading.local runs __init__ once per thread, on that thread's first access.
-    # Values are weak: each CachekitIOBackend holds its sync lease strongly and its async lease holds
-    # this thread's slot, so each stays cached while some backend uses it and is dropped when the
-    # last one goes (a sync client is closed then too, see SyncClientLease). No __del__ or aclose
-    # finalizer on either, see SyncClientLease.
-    # ponytail: a released async client is never closed — a finalizer cannot await aclose() — so its
-    # sockets are reclaimed by their finalizers, with a ResourceWarning each; and a backend built and
-    # discarded per call gets no pool reuse. Hold one backend per key, or add a small strong LRU in
-    # front if per-call construction matters.
     def __init__(self) -> None:
         self.pid = os.getpid()
-        self.sync_leases: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
-        self.async_slots: weakref.WeakValueDictionary[_ClientKey, _LoopBoundClient] = weakref.WeakValueDictionary()
+        self.lock = threading.Lock()
+        self.by_key: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
 
 
-# Per-thread client caches, keyed by the config values baked into a client. The key
-# matters: Authorization, base_url and timeout are fixed at client creation, so one
-# client per thread would send every backend's traffic under the FIRST key constructed
-# on that thread — cross-tenant writes and reads with no error anywhere.
-_thread_local = _ThreadClients()
+_leases = _Leases()
 
 
-def _clients() -> _ThreadClients:
-    """This thread's client caches, emptied the first time this thread reads them in a forked child.
+def _own_leases() -> _Leases:
+    """This process's lease cache: a forked child replaces the inherited one, lock included.
 
-    An owner-PID check rather than an os.register_at_fork hook: uWSGI forks without running Python's
-    at-fork hooks. Each thread's caches carry their own owner PID, so only that thread reads or resets
-    them, and no thread can discard another's. The inherited caches are dropped, never closed (see
-    _close_released_client).
+    An owner-PID check rather than an os.register_at_fork hook: uWSGI forks without running Python's at-fork
+    hooks. The PID travels with the cache and its lock in one published reference, so no thread pairs this
+    process with the parent's lock, which a parent thread may have held at fork. Two child threads racing
+    here each build a cache; one is kept, and the other's leases still work, unshared. Inherited leases are
+    dropped, never closed (see _close_released_client).
     """
-    if _thread_local.pid != os.getpid():
-        _thread_local.__init__()  # this thread's caches start over, as a new thread's do
-    return _thread_local
+    global _leases
+    leases = _leases
+    if leases.pid != os.getpid():
+        leases = _leases = _Leases()
+    return leases
 
 
 def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
     return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
 
 
-# Looked up once: getLogger() takes logging's module lock, and a fork from C (uWSGI) skips logging's at-fork
-# reset, so a child re-leasing its clients would hang on a lock a parent thread held at fork. Reading the
-# level takes no lock, and the parent pinned it when it built the client being replaced. An application that
-# unsets it after that makes the child's re-lease pin it again with setLevel(), which does take the lock.
-_hpack_logger = logging.getLogger("hpack")
-
-
-def _pin_hpack_logger() -> None:
-    # hpack (the async client's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
-    # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
-    # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
-    # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
-    if _hpack_logger.level == logging.NOTSET:
-        _hpack_logger.setLevel(logging.INFO)
-
-
-# Pool policy. Cloudflare closes an idle client connection at 400 s, so an idle pooled connection is kept for
-# 390 s instead of httpx's 5 s default, and a request after a gap of up to 390 s skips a new TCP+TLS handshake.
-# NAT gateways drop idle flows sooner (AWS 350 s, Azure 4 min); TCP keepalive probes from 60 s idle keep their
-# mappings alive and detect a dead path in about 90 s instead of a 5 s read timeout on the next request.
-_KEEPALIVE_EXPIRY = 390.0
-# Without keepalive probes (behind an env proxy, below), keep httpx's 5 s default: a proxy's own idle limit is
-# unknown, and a connection it dropped silently would cost the next request its whole timeout and a miss.
-_KEEPALIVE_EXPIRY_NO_PROBES = 5.0
-
-
-def _keepalive_socket_options() -> list[tuple[int, int, int]]:
-    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    # macOS names the idle option TCP_KEEPALIVE; a platform without one keeps the kernel's defaults.
-    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
-    for name, value in ((idle, 60), (getattr(socket, "TCP_KEEPINTVL", None), 10), (getattr(socket, "TCP_KEEPCNT", None), 3)):
-        if name is not None:
-            options.append((socket.IPPROTO_TCP, name, value))
-    return options
-
-
-_KEEPALIVE_SOCKET_OPTIONS = _keepalive_socket_options()
-
-
-def _client_kwargs(
-    config: CachekitIOBackendConfig, transport_cls: type[httpx.HTTPTransport] | type[httpx.AsyncHTTPTransport]
-) -> dict[str, Any]:
-    # Every client carries the bearer key, so no client is built before the pin.
-    _pin_hpack_logger()
-    # Keepalive probes need our own transport, and passing transport= turns off httpx's env proxies. So the
-    # transport is mounted for all:// instead. With any proxy setting present (getproxies() is what httpx reads),
-    # that mount would replace an ALL_PROXY proxy or miss a NO_PROXY host, so the client keeps httpx's own
-    # transports and today's 5 s expiry instead.
-    probes = not urllib.request.getproxies()
-    limits = httpx.Limits(
-        max_connections=config.connection_pool_size,
-        max_keepalive_connections=config.connection_pool_size,
-        keepalive_expiry=_KEEPALIVE_EXPIRY if probes else _KEEPALIVE_EXPIRY_NO_PROBES,
-    )
-    # The sync client is HTTP/1.1. Every thread that calls a backend sends on its one sync client, and over HTTP/2
-    # they would share one connection, which httpcore's sync HTTP/2 path does not lock (encode/httpcore#1118): a
-    # ReadError or RemoteProtocolError fails every request in flight on it, and the cache reads a miss (LAB-7062).
-    # HTTP/1.1 gives each concurrent request its own pooled connection, and h11 costs less CPU per request than h2.
-    # The async client stays on HTTP/2: one event loop drives it.
-    http2 = transport_cls is httpx.AsyncHTTPTransport
-    mounts = {"all://": transport_cls(http2=http2, limits=limits, socket_options=_KEEPALIVE_SOCKET_OPTIONS)} if probes else None
-    return {
-        "base_url": config.api_url,
-        "timeout": config.timeout,
-        "http2": http2,
-        "limits": limits,
-        "mounts": mounts,
-        "headers": {
-            "Authorization": f"Bearer {config.api_key.get_secret_value()}",
-            "Content-Type": "application/octet-stream",
-            "User-Agent": _USER_AGENT,
-        },
-    }
-
-
-def lease_async_http_client(config: CachekitIOBackendConfig) -> AsyncClientLease:
-    """Lease the async HTTP clients for this config (each created on first use on its thread and loop).
-
-    Args:
-        config: cachekit.io backend configuration
-
-    Returns:
-        AsyncClientLease: its ``.client`` is the async client for exactly this config, this thread
-        and the running event loop
-    """
-    return AsyncClientLease(config)
-
-
 def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
-    """Lease the per-thread sync HTTP client for this config (created on first use).
+    """Lease this process's HTTP client for this config (created on first use).
 
     Args:
         config: cachekit.io backend configuration
 
     Returns:
-        SyncClientLease: its ``.client`` is the thread-local sync client for exactly this config,
-        open for as long as the lease is held
+        SyncClientLease: its ``.client`` is the client for exactly this config, open for as long as the
+        lease is held
     """
-    leases = _clients().sync_leases
+    leases = _own_leases()
     key = _client_key(config)
-    # Bind to a local first: the weak dict alone would let a fresh lease die on insertion.
-    lease = leases.get(key)
-    if lease is None:
-        lease = leases[key] = SyncClientLease(config)
+    with leases.lock:
+        # Bind to a local first: the weak dict alone would let a fresh lease die on insertion.
+        lease = leases.by_key.get(key)
+        if lease is None:
+            lease = leases.by_key[key] = SyncClientLease(config)
     return lease
 
 
-# The exit stack runs every pushed close even when an earlier one raises, then re-raises:
-# one failing client can neither leak the rest nor leave closed clients in the cache.
-async def close_async_client() -> None:
-    """Close this thread's async client instances (useful for cleanup).
-
-    A backend that is used again afterwards gets a new client, never a closed one.
-    """
-    async with AsyncExitStack() as stack:
-        for slot in list(_clients().async_slots.values()):
-            client = slot.take()
-            if client is not None:
-                stack.push_async_callback(client.aclose)
-
-
 def close_sync_client() -> None:
-    """Close this thread's sync client instances (useful for cleanup)."""
-    leases = _clients().sync_leases
-    with ExitStack() as stack:
-        for lease in leases.values():
-            stack.callback(lease.client.close)
-        leases.clear()
+    """Close this process's cached clients (useful for cleanup).
+
+    A backend built earlier keeps its closed client, and its requests then fail: build a new backend.
+    """
+    leases = _own_leases()
+    with leases.lock:
+        held = list(leases.by_key.values())
+        leases.by_key.clear()
+    for lease in held:
+        lease.client.close()
 
 
 def reset_global_client() -> None:
-    """Drop this thread's cached clients without closing them (useful for testing).
+    """Drop this process's cached clients without closing them (useful for testing).
 
-    Note: This does not properly close clients. Use close_*_client() for proper cleanup.
+    Note: This does not properly close clients. Use close_sync_client() for proper cleanup.
     """
-    clients = _clients()
-    for slot in list(clients.async_slots.values()):
-        slot.take()
-    clients.sync_leases.clear()
+    leases = _own_leases()
+    with leases.lock:
+        leases.by_key.clear()
 
 
 __all__ = [
-    "AsyncClientLease",
-    "lease_async_http_client",
+    "HTTPClient",
     "SyncClientLease",
     "lease_sync_http_client",
-    "close_async_client",
     "close_sync_client",
     "reset_global_client",
 ]

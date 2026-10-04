@@ -18,18 +18,12 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
-import httpx
 from pydantic import SecretStr, ValidationError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted
-from cachekit.backends.cachekitio.client import (
-    AsyncClientLease,
-    SyncClientLease,
-    lease_async_http_client,
-    lease_sync_http_client,
-)
+from cachekit.backends.cachekitio.client import SyncClientLease, lease_sync_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
-from cachekit.backends.cachekitio.error_handler import classify_http_error
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError, hide_secret
 from cachekit.decorators.stats_context import get_current_function_stats
@@ -37,6 +31,8 @@ from cachekit.hash_utils import redact_cache_key, redact_error_for_log
 from cachekit.logging import get_structured_logger
 
 if TYPE_CHECKING:
+    from urllib3 import BaseHTTPResponse
+
     from cachekit.decorators.wrapper import _FunctionStats
 
 # Module-level logger
@@ -83,36 +79,36 @@ _DELETE_FANOUT = 16
 _MAX_RATE_LIMIT_WAIT_S = 3600
 
 
-def _write_retry_delay(method: str, response: httpx.Response) -> int | None:
+def _write_retry_delay(method: str, response: BaseHTTPResponse) -> int | None:
     """Seconds to wait before the one retry of a shed write, or None for no retry.
 
     Only the delta-seconds form of ``Retry-After`` is read; an HTTP-date, a fraction or a
     missing header means no retry.
 
     Examples:
-        >>> req = httpx.Request("PUT", "https://api.cachekit.io/v1/cache/k")
-        >>> _write_retry_delay("PUT", httpx.Response(503, headers={"Retry-After": "1"}, request=req))
+        >>> from urllib3 import HTTPResponse
+        >>> _write_retry_delay("PUT", HTTPResponse(status=503, headers={"Retry-After": "1"}))
         1
-        >>> _write_retry_delay("PUT", httpx.Response(503, headers={"Retry-After": "10"}, request=req)) is None
+        >>> _write_retry_delay("PUT", HTTPResponse(status=503, headers={"Retry-After": "10"})) is None
         True
-        >>> _write_retry_delay("PATCH", httpx.Response(503, headers={"Retry-After": "1"}, request=req)) is None
+        >>> _write_retry_delay("PATCH", HTTPResponse(status=503, headers={"Retry-After": "1"})) is None
         True
     """
-    if method not in _RETRY_METHODS or response.status_code != 503:
+    if method not in _RETRY_METHODS or response.status != 503:
         return None
     return _retry_after_seconds(response, _MAX_RETRY_AFTER_S)
 
 
-def _retry_after_seconds(response: httpx.Response, max_seconds: int) -> int | None:
+def _retry_after_seconds(response: BaseHTTPResponse, max_seconds: int) -> int | None:
     """The delta-seconds ``Retry-After`` of ``response`` if it is at most ``max_seconds``, else None.
 
     An HTTP-date, a fraction, a missing header or a larger value is None.
 
     Examples:
-        >>> req = httpx.Request("DELETE", "https://api.cachekit.io/v1/cache/k")
-        >>> _retry_after_seconds(httpx.Response(429, headers={"Retry-After": "007"}, request=req), 60)
+        >>> from urllib3 import HTTPResponse
+        >>> _retry_after_seconds(HTTPResponse(status=429, headers={"Retry-After": "007"}), 60)
         7
-        >>> _retry_after_seconds(httpx.Response(429, headers={"Retry-After": "61"}, request=req), 60) is None
+        >>> _retry_after_seconds(HTTPResponse(status=429, headers={"Retry-After": "61"}), 60) is None
         True
     """
     value = response.headers.get("Retry-After", "").strip()
@@ -134,7 +130,7 @@ def _rate_limit_delay(error: BackendError) -> int | None:
     quota or balance deny (``X-CacheKit-Deny-Reason``): waiting does not clear it.
     """
     cause = error.original_exception
-    if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 429:
+    if isinstance(cause, HTTPStatusError) and cause.response.status == 429:
         return _retry_after_seconds(cause.response, _MAX_RATE_LIMIT_WAIT_S)
     return None
 
@@ -324,14 +320,10 @@ class CachekitIOBackend:
             hint = _API_KEY_HINT if key_absent else ""
             raise ConfigurationError(f"Invalid cachekit.io backend configuration — {problems}{hint}")
 
-        # Get HTTP clients (hybrid sync/async architecture)
-        # Sync client: per-thread, thread-safe, no event loop required. Holding the lease keeps the client
-        # open; dropping it closes the client.
-        # Async client: per thread and running event loop, built on first async use; asyncio.run per job
-        # gets a fresh client each time, never one whose connections belong to a closed loop.
+        # One thread-safe client per config and process, for sync and async methods alike: an async method sends
+        # on it through asyncio.to_thread. Holding the lease keeps the client open; dropping it closes the client.
         # Fork: each request re-leases when the lease's PID is not this process's (see _own_sync_lease).
         self._sync_lease = lease_sync_http_client(self._config)
-        self._async_lease = lease_async_http_client(self._config)
 
     def _own_sync_lease(self) -> SyncClientLease:
         """This process's sync lease: a forked child re-leases, so it never sends on its parent's connections.
@@ -345,17 +337,6 @@ class CachekitIOBackend:
         lease = self._sync_lease
         if lease.pid != os.getpid():
             lease = self._sync_lease = lease_sync_http_client(self._config)
-        return lease
-
-    def _own_async_lease(self) -> AsyncClientLease:
-        """This process's async lease, as _own_sync_lease.
-
-        A new lease also drops the per-loop slot the inherited one holds, which a child still running its
-        parent's event loop object would otherwise reuse, parent's client and all.
-        """
-        lease = self._async_lease
-        if lease.pid != os.getpid():
-            lease = self._async_lease = lease_async_http_client(self._config)
         return lease
 
     @staticmethod
@@ -403,29 +384,49 @@ class CachekitIOBackend:
             )
         return encoded
 
+    def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> BaseHTTPResponse:
+        """One attempt on this process's client, any status. Raises BackendError for a transport failure."""
+        # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
+        lease = self._own_sync_lease()
+        try:
+            return lease.client.request(method, url, body=body, headers=headers)
+        except Exception as exc:
+            raise classify_http_error(exc, operation=method.lower()) from exc
+
+    @staticmethod
+    def _checked(method: str, response: BaseHTTPResponse, miss_on_404: bool) -> BaseHTTPResponse:
+        """``response`` if it is a 2xx, or a 404 that ``miss_on_404`` accepts; otherwise the classified BackendError."""
+        if 200 <= response.status < 300 or (miss_on_404 and response.status == 404):
+            return response
+        exc = HTTPStatusError(response)
+        raise classify_http_error(exc, response=response, operation=method.lower()) from exc
+
     def _request_sync(
         self,
         method: str,
         endpoint: str,
         *,
         miss_on_404: bool = False,
-        **kwargs: Any,
-    ) -> httpx.Response:
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> BaseHTTPResponse:
         """Make sync HTTP request with error handling and metrics injection.
 
         Args:
             method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
             endpoint: API endpoint (relative to base_url/v1/cache/)
             miss_on_404: Return a 404 response instead of raising. Key reads
-                and exists treat 404 as a miss; skipping raise_for_status
+                and exists treat 404 as a miss; skipping the error path
                 saves the HTTPStatusError + BackendError round-trip on every miss.
-            **kwargs: Additional request arguments
+            body: Request body
+            headers: Request headers, over the client's own
 
         Returns:
-            httpx.Response: HTTP response
+            The response, its body already read
 
         Raises:
-            BackendError: Classified error for circuit breaker
+            BackendError: Classified error for circuit breaker, for a transport failure or any
+                status other than 2xx (and 404 under ``miss_on_404``)
 
         Notes:
             A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once
@@ -435,39 +436,14 @@ class CachekitIOBackend:
             called from within a @cache decorated function. If no stats available in
             context, headers are not injected (backward compatible).
         """
-        # Inject metrics headers (always — defaults to L1-Status: disabled when no stats)
-        stats = get_current_function_stats()
-        metrics_headers = _inject_metrics_headers(stats)
-        # Merge with existing headers
-        if "headers" in kwargs:
-            kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
-        else:
-            kwargs["headers"] = metrics_headers
-
         url = f"/v1/cache/{endpoint}"
-        # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
-        lease = self._own_sync_lease()
-        try:
-            response = lease.client.request(method, url, **kwargs)
-            if (delay := _write_retry_delay(method, response)) is not None:
-                _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
-                time.sleep(delay)
-                response = lease.client.request(method, url, **kwargs)
-            if miss_on_404 and response.status_code == 404:
-                return response
-            response.raise_for_status()
-            return response
-        except httpx.HTTPStatusError as exc:
-            raise classify_http_error(
-                exc,
-                response=exc.response,
-                operation=method.lower(),
-            ) from exc
-        except Exception as exc:
-            raise classify_http_error(
-                exc,
-                operation=method.lower(),
-            ) from exc
+        headers = self._request_headers(headers)
+        response = self._send(method, url, body, headers)
+        if (delay := _write_retry_delay(method, response)) is not None:
+            _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
+            time.sleep(delay)
+            response = self._send(method, url, body, headers)
+        return self._checked(method, response, miss_on_404)
 
     async def _request_async(
         self,
@@ -475,66 +451,32 @@ class CachekitIOBackend:
         endpoint: str,
         *,
         miss_on_404: bool = False,
-        **kwargs: Any,
-    ) -> httpx.Response:
-        """Make async HTTP request with error handling and metrics injection.
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> BaseHTTPResponse:
+        """``_request_sync`` for a coroutine: each attempt runs on the same client in ``asyncio.to_thread``.
 
-        Args:
-            method: HTTP method (GET, HEAD, PUT, DELETE, POST, PATCH)
-            endpoint: API endpoint (relative to base_url/v1/cache/)
-            miss_on_404: Return a 404 response instead of raising. Key reads
-                and exists treat 404 as a miss; skipping raise_for_status
-                saves the HTTPStatusError + BackendError round-trip on every miss.
-            **kwargs: Additional request arguments
-
-        Returns:
-            httpx.Response: HTTP response
-
-        Raises:
-            BackendError: Classified error for circuit breaker
-
-        Notes:
-            A PUT or DELETE answered 503 with ``Retry-After`` of at most 2 s is sent once
-            more after exactly that delay (see ``_write_retry_delay``); nothing else retries.
-
-            Automatically injects cache metrics headers (L1/L2 hits, session ID) when
-            called from within a @cache decorated function. If no stats available in
-            context, headers are not injected (backward compatible).
+        The retry wait is ``asyncio.sleep``, so it holds no thread. A cancel stops the wait for the
+        response, not the request: the attempt in flight still completes on its worker thread.
         """
-        # Inject metrics headers (always — defaults to L1-Status: disabled when no stats)
-        stats = get_current_function_stats()
-        metrics_headers = _inject_metrics_headers(stats)
-        # Merge with existing headers
-        if "headers" in kwargs:
-            kwargs["headers"] = {**kwargs["headers"], **metrics_headers}
-        else:
-            kwargs["headers"] = metrics_headers
-
         url = f"/v1/cache/{endpoint}"
-        try:
-            response = await self._own_async_lease().client.request(method, url, **kwargs)
-            if (delay := _write_retry_delay(method, response)) is not None:
-                _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
-                await asyncio.sleep(delay)
-                response = await self._own_async_lease().client.request(method, url, **kwargs)
-            if miss_on_404 and response.status_code == 404:
-                return response
-            response.raise_for_status()
-            return response
-        except httpx.HTTPStatusError as exc:
-            raise classify_http_error(
-                exc,
-                response=exc.response,
-                operation=method.lower(),
-            ) from exc
-        except Exception as exc:
-            raise classify_http_error(
-                exc,
-                operation=method.lower(),
-            ) from exc
+        headers = self._request_headers(headers)
+        response = await asyncio.to_thread(self._send, method, url, body, headers)
+        if (delay := _write_retry_delay(method, response)) is not None:
+            _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
+            await asyncio.sleep(delay)
+            response = await asyncio.to_thread(self._send, method, url, body, headers)
+        return self._checked(method, response, miss_on_404)
+
+    @staticmethod
+    def _request_headers(headers: dict[str, str] | None) -> dict[str, str]:
+        # Always — defaults to L1-Status: disabled when no stats. Built on the caller's thread: the stats
+        # come from its context.
+        metrics_headers = _inject_metrics_headers(get_current_function_stats())
+        return {**headers, **metrics_headers} if headers else metrics_headers
 
     # ==================== BaseBackend Protocol (Sync) ====================
-    # These sync methods use sync httpx.Client (thread-safe, no event loop required)
+    # These sync methods send on the shared client on the calling thread (no event loop required)
 
     def get(self, key: str) -> bytes | None:
         """Retrieve value from cache (sync).
@@ -549,12 +491,12 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         response = self._request_sync("GET", self._encode_key(key), miss_on_404=True)
-        if response.status_code == 404:
+        if response.status == 404:
             return None
-        return response.content
+        return response.data
 
     @staticmethod
-    def _is_stale(response: httpx.Response) -> bool:
+    def _is_stale(response: BaseHTTPResponse) -> bool:
         """Map the X-CacheKit-Freshness header to staleness (spec/saas-api.md).
 
         Absent header = fresh (pre-SWR server); unrecognized value = stale
@@ -565,7 +507,7 @@ class CachekitIOBackend:
         return value is not None and value != "fresh"
 
     @staticmethod
-    def _fresh_for(response: httpx.Response) -> int | None:
+    def _fresh_for(response: BaseHTTPResponse) -> int | None:
         """Parse X-CacheKit-Fresh-For (LAB-557, spec/saas-api.md#remaining-freshness).
 
         Absent = pre-signal server → None (legacy behavior: no bound).
@@ -598,9 +540,9 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         response = self._request_sync("GET", self._encode_key(key), miss_on_404=True)
-        if response.status_code == 404:
+        if response.status == 404:
             return None
-        return response.content, self._is_stale(response), self._fresh_for(response)
+        return response.data, self._is_stale(response), self._fresh_for(response)
 
     def set(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (sync).
@@ -616,7 +558,7 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        self._request_sync("PUT", self._encode_key(key), content=value, headers=self._set_headers(ttl, stale_ttl))
+        self._request_sync("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
@@ -737,7 +679,7 @@ class CachekitIOBackend:
         """
         # Use HEAD request (idiomatic HTTP for existence checks)
         response = self._request_sync("HEAD", self._encode_key(key), miss_on_404=True)
-        return response.status_code != 404
+        return response.status != 404
 
     def health_check(self) -> tuple[bool, dict[str, Any]]:
         """Check cachekit.io backend health (sync).
@@ -790,9 +732,9 @@ class CachekitIOBackend:
             BackendError: If operation fails (network, auth, etc.)
         """
         response = await self._request_async("GET", self._encode_key(key), miss_on_404=True)
-        if response.status_code == 404:
+        if response.status == 404:
             return None
-        return response.content
+        return response.data
 
     async def set_async(self, key: str, value: bytes, ttl: int | None = None, stale_ttl: int | None = None) -> None:
         """Store value in cache (async).
@@ -808,7 +750,7 @@ class CachekitIOBackend:
         Raises:
             BackendError: If operation fails
         """
-        await self._request_async("PUT", self._encode_key(key), content=value, headers=self._set_headers(ttl, stale_ttl))
+        await self._request_async("PUT", self._encode_key(key), body=value, headers=self._set_headers(ttl, stale_ttl))
 
     async def delete_async(self, key: str) -> bool:
         """Delete key from cache (async).
@@ -840,7 +782,7 @@ class CachekitIOBackend:
         """
         # Use HEAD request (idiomatic HTTP for existence checks)
         response = await self._request_async("HEAD", self._encode_key(key), miss_on_404=True)
-        return response.status_code != 404
+        return response.status != 404
 
     async def health_check_async(self) -> tuple[bool, dict[str, Any]]:
         """Check cachekit.io backend health (async).
@@ -907,7 +849,7 @@ class CachekitIOBackend:
         response = await self._request_async(
             "POST",
             f"{encoded_key}/lock",
-            content=json.dumps({"timeout_ms": timeout_ms}).encode(),
+            body=json.dumps({"timeout_ms": timeout_ms}).encode(),
             headers={"Content-Type": "application/json"},
         )
 
@@ -1057,7 +999,7 @@ class CachekitIOBackend:
             await self._request_async(
                 "PATCH",
                 f"{encoded_key}/ttl",
-                content=payload.encode(),
+                body=payload.encode(),
                 headers={"Content-Type": "application/json"},
             )
             return True

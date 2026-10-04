@@ -4,17 +4,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import httpx
+from urllib3 import exceptions as u3
 
 from cachekit.backends.errors import BackendError, BackendErrorType
 
 if TYPE_CHECKING:
-    pass
+    from urllib3 import BaseHTTPResponse
+
+
+class HTTPStatusError(Exception):
+    """A response with an error status, kept as the BackendError's ``original_exception``.
+
+    The message names the status only: the response carries no request URL, so neither does this.
+    """
+
+    def __init__(self, response: BaseHTTPResponse) -> None:
+        super().__init__(f"HTTP {response.status}")
+        self.response = response
 
 
 def classify_http_error(
     exc: Exception,
-    response: httpx.Response | None = None,
+    response: BaseHTTPResponse | None = None,
     operation: str | None = None,
     key: str | None = None,
 ) -> BackendError:
@@ -39,13 +50,14 @@ def classify_http_error(
         - HTTP 413: PERMANENT (value too large — retrying never helps)
         - HTTP 5xx: TRANSIENT (server error)
         - HTTP 4xx: PERMANENT (client error)
-        - TimeoutException: TIMEOUT (request exceeded time limit)
-        - ConnectError: TRANSIENT (network issue)
+        - urllib3 TimeoutError, EmptyPoolError: TIMEOUT (request, or the wait for a pooled
+          connection, exceeded the time limit)
+        - NewConnectionError, ProtocolError, SSLError, ProxyError: TRANSIENT (network issue)
         - All others: UNKNOWN (log and investigate)
     """
     # HTTP status code classification
     if response is not None:
-        status = response.status_code
+        status = response.status
 
         # AUTHENTICATION: Credential/auth issues
         if status in (401, 403):
@@ -100,22 +112,11 @@ def classify_http_error(
                 key=key,
             )
 
-    # TIMEOUT: Request exceeded time limit.
-    # Only the exception TYPE goes in the message: httpx exception text embeds the
-    # request URL, which carries the raw cache key in its path, and the message reaches
+    # TRANSIENT: Connection failures. Checked before TIMEOUT: urllib3's NewConnectionError subclasses
+    # its ConnectTimeoutError. Only the exception TYPE goes in the message: urllib3 exception text
+    # can embed the request URL, which carries the raw cache key in its path, and the message reaches
     # log sinks via str(e) (CWE-532, LAB-304). Detail stays on original_exception.
-    if isinstance(exc, httpx.TimeoutException):
-        return BackendError(
-            f"Request timeout: {type(exc).__name__}",
-            error_type=BackendErrorType.TIMEOUT,
-            original_exception=exc,
-            operation=operation,
-            key=key,
-        )
-
-    # TRANSIENT: Connection failures. Type-only message — httpx text can echo
-    # the request URL (raw key in path), and str(e) reaches log sinks (CWE-532).
-    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
+    if isinstance(exc, (u3.NewConnectionError, u3.ProtocolError, u3.SSLError, u3.ProxyError)):
         return BackendError(
             f"Connection failed: {type(exc).__name__}",
             error_type=BackendErrorType.TRANSIENT,
@@ -124,7 +125,17 @@ def classify_http_error(
             key=key,
         )
 
-    # UNKNOWN: Unclassified error. Type-only message (CWE-532): arbitrary httpx text
+    # TIMEOUT: Request, or the wait for a free pooled connection, exceeded the time limit.
+    if isinstance(exc, (u3.TimeoutError, u3.EmptyPoolError)):
+        return BackendError(
+            f"Request timeout: {type(exc).__name__}",
+            error_type=BackendErrorType.TIMEOUT,
+            original_exception=exc,
+            operation=operation,
+            key=key,
+        )
+
+    # UNKNOWN: Unclassified error. Type-only message (CWE-532): arbitrary urllib3 text
     # can echo the request URL, which carries the raw key. Detail on original_exception.
     return BackendError(
         f"Unknown HTTP error: {type(exc).__name__}",

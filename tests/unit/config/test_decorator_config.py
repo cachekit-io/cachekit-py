@@ -10,7 +10,6 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import fields, replace
 
 import pytest
@@ -343,17 +342,13 @@ class TestIoPreset:
 
     def test_two_keys_in_one_process_reach_the_wire_separately(self) -> None:
         """Regression: the per-thread HTTP client was first-wins, so a second key's backend
-        carried the right _config but every request left under the FIRST key's header."""
+        carried the right _config but every request left under the FIRST key's header.
+        Async methods send on the same client, through asyncio.to_thread."""
         a = DecoratorConfig.io(api_key="ck_tenant_a").backend  # pragma: allowlist secret
         b = DecoratorConfig.io(api_key="ck_tenant_b").backend  # pragma: allowlist secret
         assert isinstance(a, CachekitIOBackend) and isinstance(b, CachekitIOBackend)
-        assert a._sync_lease.client.headers["authorization"] == "Bearer ck_tenant_a"
-        assert b._sync_lease.client.headers["authorization"] == "Bearer ck_tenant_b"
-
-        async def async_auth() -> str:
-            return b._async_lease.client.headers["authorization"]
-
-        assert asyncio.run(async_auth()) == "Bearer ck_tenant_b"
+        assert a._sync_lease.client.headers["Authorization"] == "Bearer ck_tenant_a"
+        assert b._sync_lease.client.headers["Authorization"] == "Bearer ck_tenant_b"
 
     @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
     def test_backend_kwarg_rejected(self, backend: object) -> None:
