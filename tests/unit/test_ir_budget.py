@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -79,8 +84,82 @@ def test_ratchet_only_lowers_unless_increase_allowed() -> None:
 
 
 def test_default_parallelism_stays_small_on_a_big_machine() -> None:
-    """Each callgrind run holds about half a gigabyte, so the default must not grow with the core count."""
+    """A callgrind run peaks at up to a gigabyte, so the default must not grow with the core count."""
     assert 1 <= ir_budget.JOBS <= 8
+
+
+# A stand-in for the measured process: records its pid, then sleeps unless it is a warm-up run (n=1).
+SLEEPER = """
+import os, sys, time
+from pathlib import Path
+Path(__file__).with_name("pids").joinpath(str(os.getpid())).write_text(sys.argv[2])
+if sys.argv[2] != "1":
+    time.sleep(60)
+"""
+
+# Runs the gate's measure() with the sleeper in place of callgrind + ir_workload.py.
+DRIVER = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from tests.performance import ir_budget as b
+b.WORKLOAD = Path(sys.argv[1])
+b._measure_one = lambda path, n, workdir, env, *timeout: b._run([], path, n, env, *timeout) or 0
+b.measure(["l1_hit"], 2)
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _sleeper(tmp_path: Path) -> tuple[Path, Path]:
+    pids = tmp_path / "pids"
+    pids.mkdir()
+    script = tmp_path / "sleeper.py"
+    script.write_text(SLEEPER)
+    return script, pids
+
+
+def test_a_run_past_the_child_timeout_fails_the_gate_and_is_killed(tmp_path, monkeypatch) -> None:
+    script, pids = _sleeper(tmp_path)
+    monkeypatch.setattr(ir_budget, "WORKLOAD", script)
+    env = {"IR_BUDGET_LAYOUT": "48"}
+    with pytest.raises(RuntimeError, match=r"l1_hit n=1000 layout=48 ran past --child-timeout \(0\.01 min\)"):
+        ir_budget._run([], "l1_hit", 1000, env, timeout_s=0.6)
+    [pid] = (int(f.name) for f in pids.iterdir())
+    assert not _alive(pid)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_to_the_gate_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo)])  # noqa: S603 (trusted: this test's files)
+    try:
+        deadline = time.monotonic() + 30
+        while sum(f.read_text() != "1" for f in pids.iterdir()) < 2:  # both measured runs started
+            assert gate.poll() is None and time.monotonic() < deadline, "the stub runs never started"
+            time.sleep(0.05)
+        gate.send_signal(sig)
+        code = gate.wait(timeout=10)
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)  # an uncaught KeyboardInterrupt re-raises SIGINT
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
 
 
 def test_every_path_has_a_committed_budget() -> None:
