@@ -59,6 +59,8 @@ In a general value, tuples keep their marker at any depth, including inside a se
 
 These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP) will see them as plain dicts, not as the original types.
 
+`import cachekit` never imports numpy, pandas or pyarrow, even when they are installed. Writing an array, DataFrame or Series uses the module your code already imported. The first read of such an entry in a process imports the module it needs, so that read pays the import cost once.
+
 ## When to Use
 
 **Use `serializer='auto'` when:**
