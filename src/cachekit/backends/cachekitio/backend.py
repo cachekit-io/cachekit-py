@@ -623,7 +623,8 @@ class CachekitIOBackend:
                 round_trips.append(time.monotonic() - start)
 
         started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=min(_DELETE_FANOUT, len(keys))) as pool:
+        # No more workers than pooled connections: a full pool opens, then discards, a connection per extra request.
+        with ThreadPoolExecutor(max_workers=min(_DELETE_FANOUT, self._config.connection_pool_size, len(keys))) as pool:
             # One context copy per key: the metrics headers read the caller's contextvars, and a
             # Context cannot be entered by two threads at once.
             futures = [pool.submit(contextvars.copy_context().run, delete_one, key) for key in keys]

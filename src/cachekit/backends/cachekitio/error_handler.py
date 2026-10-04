@@ -118,7 +118,8 @@ def classify_http_error(
     # log sinks via str(e) (CWE-532, LAB-304). Detail stays on original_exception.
     if isinstance(exc, (u3.NewConnectionError, u3.ProtocolError, u3.SSLError, u3.ProxyError)):
         # A host with no CA bundle fails every request here; name the fix rather than look like a network flake.
-        if any(isinstance(arg, ssl.SSLCertVerificationError) for arg in exc.args):
+        # A hostname mismatch (X509_V_ERR_HOSTNAME_MISMATCH, 62) is not a trust-store problem, so it keeps the type.
+        if any(isinstance(arg, ssl.SSLCertVerificationError) and arg.verify_code != 62 for arg in exc.args):
             message = "Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)"
         else:
             message = f"Connection failed: {type(exc).__name__}"

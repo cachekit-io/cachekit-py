@@ -123,6 +123,13 @@ class TestHTTPStatusEndToEnd:
 
 
 # (exception factory, error type, message). Each factory builds the exception as urllib3 raises it.
+def _cert_error(verify_code: int, message: str) -> ssl.SSLCertVerificationError:
+    """The verification error OpenSSL raises, with its X509_V_ERR code (20: unknown issuer, 62: hostname mismatch)."""
+    err = ssl.SSLCertVerificationError(1, message)
+    err.verify_code = verify_code
+    return err
+
+
 _TRANSPORT_RULES: list[tuple[Callable[[], Exception], BackendErrorType, str]] = [
     (
         lambda: u3.NewConnectionError(None, f"Failed to establish a new connection to {_URL}: [Errno 111] refused"),  # type: ignore[arg-type]
@@ -145,6 +152,12 @@ _TRANSPORT_RULES: list[tuple[Callable[[], Exception], BackendErrorType, str]] = 
         "Connection failed: SSLError",
     ),
     (
+        # A hostname mismatch is a certificate failure, but not the trust store's: it keeps the type-only message.
+        lambda: u3.SSLError(_cert_error(62, f"Hostname mismatch, certificate is not valid for {_URL}")),
+        BackendErrorType.TRANSIENT,
+        "Connection failed: SSLError",
+    ),
+    (
         lambda: u3.ProxyError(f"Unable to connect to proxy for {_URL}", OSError("refused")),
         BackendErrorType.TRANSIENT,
         "Connection failed: ProxyError",
@@ -161,7 +174,7 @@ _TRANSPORT_RULES: list[tuple[Callable[[], Exception], BackendErrorType, str]] = 
     ),
     (
         # A host with no CA bundle: the message names the fix, still with no URL.
-        lambda: u3.SSLError(ssl.SSLCertVerificationError(1, f"certificate verify failed for {_URL}")),
+        lambda: u3.SSLError(_cert_error(20, f"unable to get local issuer certificate for {_URL}")),
         BackendErrorType.TRANSIENT,
         "Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)",
     ),
