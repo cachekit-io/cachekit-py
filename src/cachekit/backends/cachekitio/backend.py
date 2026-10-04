@@ -44,6 +44,15 @@ _logger = get_structured_logger(__name__)
 # Unsampled stdlib logger for one-off lock warnings that _logger's sampling could drop.
 logger = logging.getLogger(__name__)
 
+
+def _log_release_failure(lock_key: str, exc: BaseException) -> None:
+    logger.warning(
+        "CachekitIO lock release for %s failed (%s); the lock is held until its timeout",
+        redact_cache_key(lock_key),
+        redact_error_for_log(exc),
+    )
+
+
 # Lock capability token travels in this request header, never the query string:
 # a ?lock_id= query leaks the token into access/proxy logs and OpenTelemetry
 # http.url spans (CWE-532), letting anyone with log access replay it. The SaaS
@@ -439,6 +448,7 @@ class CachekitIOBackend:
         endpoint: str,
         *,
         miss_on_404: bool = False,
+        lease: SyncClientLease | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         """Make sync HTTP request with error handling and metrics injection.
@@ -449,6 +459,7 @@ class CachekitIOBackend:
             miss_on_404: Return a 404 response instead of raising. Key reads
                 and exists treat 404 as a miss; skipping raise_for_status
                 saves the HTTPStatusError + BackendError round-trip on every miss.
+            lease: Send on this lease's client instead of the backend's own lease.
             **kwargs: Additional request arguments
 
         Returns:
@@ -476,7 +487,8 @@ class CachekitIOBackend:
 
         url = f"/v1/cache/{endpoint}"
         # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
-        lease = self._own_sync_lease()
+        if lease is None:
+            lease = self._own_sync_lease()
         try:
             response = lease.client.request(method, url, **kwargs)
             if (delay := _write_retry_delay(method, response)) is not None:
@@ -959,6 +971,31 @@ class CachekitIOBackend:
                 await self._release_lock(lock_key, won)
             raise
 
+    async def _acquire_lock_id(self, key: str, timeout: float, blocking_timeout: Optional[float]) -> tuple[str | None, bool]:
+        """Run the lock attempts. Returns ``(lock_id or None, granted on the first attempt)``.
+
+        The SaaS endpoint returns immediately; client-side polling implements
+        ``blocking_timeout`` with proportional jitter (0.5×–1× the capped delay) to
+        avoid lockstep retries on concurrent waiters. Each retry is a billable SaaS
+        request — keep the cap tight.
+        """
+        lock_id = await self._try_acquire_lock_drained(key, timeout)
+        if lock_id is not None or blocking_timeout is None:
+            return lock_id, lock_id is not None
+
+        deadline = time.monotonic() + blocking_timeout
+        delay = 0.05
+        while lock_id is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
+            jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
+            await asyncio.sleep(min(delay, remaining) * jitter)
+            lock_id = await self._try_acquire_lock_drained(key, timeout)
+            delay = min(delay * 2, 0.5)
+        return lock_id, False
+
     @asynccontextmanager
     async def acquire_lock(
         self,
@@ -968,10 +1005,8 @@ class CachekitIOBackend:
     ) -> AsyncIterator[bool]:
         """Acquire distributed lock (LockableBackend protocol).
 
-        The SaaS endpoint returns immediately; client-side polling implements
-        ``blocking_timeout`` with proportional jitter (0.5×–1× the capped delay) to
-        avoid lockstep retries on concurrent waiters. Each retry is a billable SaaS
-        request — keep the cap tight.
+        Polls up to ``blocking_timeout`` (see ``_acquire_lock_id``), and releases on exit before
+        the ``async with`` returns.
 
         Args:
             key: Lock key
@@ -981,27 +1016,90 @@ class CachekitIOBackend:
         Yields:
             True if acquired, False if ``blocking_timeout`` elapsed without acquisition
         """
-        lock_id: str | None = None
+        lock_id, _ = await self._acquire_lock_id(key, timeout, blocking_timeout)
         try:
-            lock_id = await self._try_acquire_lock_drained(key, timeout)
-
-            if lock_id is None and blocking_timeout is not None:
-                deadline = time.monotonic() + blocking_timeout
-                delay = 0.05
-                while lock_id is None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    # Proportional jitter (not crypto): spread concurrent waiters, 0.5×–1× the capped delay.
-                    jitter = 0.5 + random.random() * 0.5  # noqa: S311 — backoff jitter, not security
-                    await asyncio.sleep(min(delay, remaining) * jitter)
-                    lock_id = await self._try_acquire_lock_drained(key, timeout)
-                    delay = min(delay * 2, 0.5)
-
             yield lock_id is not None
         finally:
             if lock_id is not None:
                 await self._release_lock(key, lock_id)
+
+    @asynccontextmanager
+    async def acquire_fill_lock(
+        self,
+        key: str,
+        timeout: float,
+        blocking_timeout: Optional[float] = None,
+    ) -> AsyncIterator[tuple[bool, bool]]:
+        """``acquire_lock`` for the decorator's miss path; not part of the LockableBackend protocol.
+
+        Two differences, both so the caller does not wait on a request it does not need (LAB-7064):
+
+        - It yields ``(acquired, uncontended)``. ``uncontended`` is True when the first lock POST
+          won: this caller never waited behind another holder. A fill that completed between the
+          caller's read and that POST is not seen, so it is recomputed; last write wins.
+        - It releases in the background: the DELETE is sent from an executor thread and the
+          ``async with`` returns at once (see ``_release_lock_in_background``). If the default
+          executor is already shut down, ``run_in_executor`` refuses the job with ``RuntimeError``,
+          and the release is awaited instead, as ``acquire_lock`` does it.
+        """
+        lock_id, uncontended = await self._acquire_lock_id(key, timeout, blocking_timeout)
+        try:
+            yield lock_id is not None, uncontended
+        finally:
+            if lock_id is not None:
+                try:
+                    self._release_lock_in_background(key, lock_id)
+                except RuntimeError as e:
+                    logger.debug(
+                        "CachekitIO lock release for %s awaited: the default executor refused it (%s)",
+                        redact_cache_key(key),
+                        redact_error_for_log(e),
+                    )
+                    await self._release_lock(key, lock_id)
+
+    def _release_lock_in_background(self, lock_key: str, lock_id: str) -> None:
+        """Send the lock DELETE without waiting for it, in a way loop shutdown cannot drop.
+
+        The DELETE runs on the sync client in the default executor, submitted here, before this
+        returns. It is a plain future, which ``asyncio.run`` teardown does not cancel, and that
+        teardown then waits for the executor. A Task around the async client would be cancelled by
+        the teardown sweep whenever the decorated call is the process's last await, and the lock
+        would then be held until its server-side timeout. The sync client also survives
+        ``close_async_client()`` called straight after the call.
+
+        Nothing on the loop holds or reads the future: the executor's work item keeps it alive until
+        the DELETE finishes, and ``_delete_lock_sync`` handles every outcome itself. So a loop that
+        is closed without ``asyncio.run`` (``run_until_complete`` then ``close()``) retains nothing.
+        The DELETE copies this context, so it carries the same metrics headers an awaited release does.
+        """
+        ctx = contextvars.copy_context()
+        asyncio.get_running_loop().run_in_executor(None, lambda: ctx.run(self._delete_lock_sync, lock_key, lock_id))
+
+    def _delete_lock_sync(self, lock_key: str, lock_id: str) -> None:
+        """``_delete_lock`` on the sync client, for an executor thread. Never raises.
+
+        The caller has already returned, so it may close the sync client (``close_sync_client()``)
+        before or while this runs. That client is the one the backend's lease holds, so a failure
+        on that closed client sends the DELETE once more on a new lease; the server matches the
+        DELETE on the holder, so a repeat is harmless. The new lease stays local to this call and is
+        dropped when it returns. It is cached on this executor thread, so on the backend it would
+        keep a client open that the caller's ``close_sync_client()`` cannot reach, and another
+        release would test that open client instead of the closed one it failed on.
+
+        Every failure is logged here, not left on the future: nothing reads the future, and an
+        exception left on it would surface only as asyncio's unredacted "never retrieved" report.
+        """
+        try:
+            path, headers = self._lock_release_request(lock_key, lock_id)
+            lease = self._own_sync_lease()
+            try:
+                self._request_sync("DELETE", path, headers=headers, lease=lease)
+            except BackendError:
+                if lease.client.is_closed is not True:  # `is True`: a Mock client is never closed
+                    raise
+                self._request_sync("DELETE", path, headers=headers, lease=lease_sync_http_client(self._config))
+        except Exception as exc:
+            _log_release_failure(lock_key, exc)
 
     async def _release_lock(self, lock_key: str, lock_id: str) -> bool:
         """Release distributed lock. Internal helper for ``acquire_lock``'s cleanup.
@@ -1015,14 +1113,18 @@ class CachekitIOBackend:
         """
         return await _await_uninterrupted(asyncio.ensure_future(self._delete_lock(lock_key, lock_id)))
 
-    async def _delete_lock(self, lock_key: str, lock_id: str) -> bool:
+    def _lock_release_request(self, lock_key: str, lock_id: str) -> tuple[str, dict[str, str]]:
+        """Path and headers of the lock DELETE, shared by the awaited and the background release."""
         # lock_key is caller-controlled → percent-encode it into the path. lock_id is a
         # capability token and travels in the X-CacheKit-Lock-Id header, NOT the query
         # string (CWE-532): a ?lock_id= query leaks it into access/proxy logs and OTel
         # http.url spans. It is server-issued, so it needs no URL-encoding.
-        encoded_key = self._encode_key(lock_key)
+        return f"{self._encode_key(lock_key)}/lock", {LOCK_ID_HEADER: lock_id}
+
+    async def _delete_lock(self, lock_key: str, lock_id: str) -> bool:
+        path, headers = self._lock_release_request(lock_key, lock_id)
         try:
-            await self._request_async("DELETE", f"{encoded_key}/lock", headers={LOCK_ID_HEADER: lock_id})
+            await self._request_async("DELETE", path, headers=headers)
             return True
         except BackendError:
             # Swallowed inside the drained Task, not around the drain: once a cancel has landed the

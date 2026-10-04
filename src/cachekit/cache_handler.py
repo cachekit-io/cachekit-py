@@ -7,10 +7,12 @@ single-responsibility classes that are easier to test and maintain.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import threading
 import types
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Optional, Protocol, TypeGuard, Union, runtime_checkable
 
 from pydantic import SecretBytes, SecretStr
@@ -239,6 +241,28 @@ def supports_locking(backend: object) -> TypeGuard[LockableBackend]:
     return callable(getattr(backend, "acquire_lock", None))
 
 
+class FillLockBackend(Protocol):
+    """Backend whose miss-path lock reports contention and releases without blocking (LAB-7064).
+
+    Not part of LockableBackend: only the decorator's miss path uses it. Currently only
+    CachekitIOBackend. ``acquire_fill_lock`` yields ``(acquired, uncontended)``.
+    """
+
+    def acquire_fill_lock(
+        self, key: str, timeout: float, blocking_timeout: Optional[float] = None
+    ) -> contextlib.AbstractAsyncContextManager[tuple[bool, bool]]: ...
+
+
+def supports_fill_lock(backend: object) -> TypeGuard[FillLockBackend]:
+    """Type guard: backend provides ``acquire_fill_lock``.
+
+    Checked on the CLASS, like ``supports_swr``: a Mock or ``__getattr__`` proxy must keep the
+    plain ``acquire_lock`` path, and with it the post-lock double-check read. A false negative
+    costs one read and one blocking release; a false positive would skip a read on a guess.
+    """
+    return callable(getattr(type(backend), "acquire_fill_lock", None))
+
+
 # Backend type names already warned about, so refresh_ttl_on_get degradation warns at most
 # once per backend type per process (avoids per-hit log spam). Tests clear this set.
 _TTL_REFRESH_UNSUPPORTED_WARNED: set[str] = set()
@@ -369,6 +393,44 @@ def _supports_multi_delete(backend: object) -> TypeGuard[_MultiDeleteBackend]:
             return False  # the instance resolves this name to something other than the class's function
         owners[name] = owner  # type: ignore[assignment]
     return issubclass(owners["_delete_many"], owners["delete"])
+
+
+class L2MissProbe:
+    """Whether the async L2 read in a ``probe_l2_miss`` scope found no entry, cleanly (LAB-7064).
+
+    ``clean_miss`` is set only where the backend's freshness read itself returned None: the read
+    every backend with ``acquire_fill_lock`` takes. Any other read leaves it False, which costs
+    only a re-read. A read that failed is reported to the caller as a miss too, but leaves it
+    False, so anything other than a confirmed miss reads as "not known to be absent".
+    """
+
+    __slots__ = ("clean_miss",)
+
+    def __init__(self) -> None:
+        self.clean_miss = False
+
+
+_l2_miss_probe: contextvars.ContextVar[L2MissProbe | None] = contextvars.ContextVar("cachekit_l2_miss_probe", default=None)
+
+
+@contextlib.contextmanager
+def probe_l2_miss(probe: L2MissProbe) -> Iterator[None]:
+    """Scope an async L2 read so ``probe`` tells a clean miss from a swallowed read failure.
+
+    The read paths report both as None; the decorator's miss path needs the difference, because
+    after a failed read the entry may still be live and the post-lock double-check is its only
+    retry.
+    """
+    token = _l2_miss_probe.set(probe)
+    try:
+        yield
+    finally:
+        _l2_miss_probe.reset(token)
+
+
+def _note_clean_l2_miss() -> None:
+    if (probe := _l2_miss_probe.get()) is not None:
+        probe.clean_miss = True
 
 
 def _normalize_freshness_hit(hit: Any) -> Optional[tuple[bytes, bool, Optional[int]]]:
@@ -2218,9 +2280,10 @@ class StandardCacheHandler:
             value = await self.get_async(key)
             return (value, False, None) if value is not None else None
         try:
-            return _normalize_freshness_hit(
-                await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
-            )
+            hit = await self._with_backpressure_and_timeout_async(self.backend.get_with_freshness, key)
+            if hit is None:
+                _note_clean_l2_miss()
+            return _normalize_freshness_hit(hit)
         except BackendError as e:
             get_logger().error(f"Backend error getting key {redact_cache_key(key)}: {redact_error_for_log(e)}")
             return None
