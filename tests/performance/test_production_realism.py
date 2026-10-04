@@ -381,25 +381,34 @@ def test_concurrent_cache_access() -> None:
     for _ in range(5_000):
         get_data(1)
 
+    errors: list[Exception] = []
+
     def worker(barrier: threading.Barrier, samples: list[float]) -> None:
-        for _ in range(100):
-            get_data(1)
-        barrier.wait()  # every thread measures at once, so they contend
-        for _ in range(iterations_per_thread):
-            start = time.perf_counter_ns()
-            get_data(1)  # Same key = L1 hit with lock contention
-            samples.append(time.perf_counter_ns() - start)
+        try:
+            for _ in range(100):
+                get_data(1)
+            barrier.wait()  # every thread measures at once, so they contend
+            for _ in range(iterations_per_thread):
+                start = time.perf_counter_ns()
+                get_data(1)  # Same key = L1 hit with lock contention
+                samples.append(time.perf_counter_ns() - start)
+        except Exception as e:
+            # A thread's exception is otherwise only printed; abort so the others leave the barrier.
+            errors.append(e)
+            barrier.abort()
 
     per_run: list[list[float]] = []
     for _ in range(runs):
         gc.collect()
-        barrier = threading.Barrier(num_threads)
+        barrier = threading.Barrier(num_threads, timeout=30)
         thread_samples: list[list[float]] = [[] for _ in range(num_threads)]
         threads = [threading.Thread(target=worker, args=(barrier, samples)) for samples in thread_samples]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        if errors:
+            raise errors[0]  # the first is the cause; the rest are the BrokenBarrierErrors it released
         per_run.append([s for samples in thread_samples for s in samples])
 
     result = summarize(f"Concurrent L1 hit, {num_threads} threads, one key", per_run, "ns")
