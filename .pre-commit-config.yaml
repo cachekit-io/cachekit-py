@@ -119,13 +119,29 @@ repos:
       - id: no-internal-references
         name: No internal references in docs
         language: pygrep
-        entry: 'LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        entry: '\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
-        language: pygrep
-        # Same patterns, skipping git's "#" comment lines and "Merge" subjects, which quote branch names.
-        entry: '^(?!#|Merge ).*?(?:LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-]))'
+        # Same patterns. git hands this hook the raw message file: "#" comment lines, the diff
+        # below the `git commit -v` scissors line, and its own merge and revert subjects, which
+        # quote branch names and earlier subjects. Only the text the author wrote is checked.
+        language: python
+        entry: python -c
+        args:
+          - |
+            import re, sys
+            P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
+            GIT_SUBJECT = re.compile(r"Merge (?:branch|branches|remote-tracking branch|tag|commit) '[^']*'(?: and '[^']*')*(?: of \S+)?(?: into \S+)?|Revert \".*\"")
+            text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+            text = text.split("# ------------------------ >8 ------------------------")[0]
+            lines = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+            if lines and GIT_SUBJECT.fullmatch(lines[0]):
+                lines = lines[1:]
+            bad = [line for line in lines if P.search(line)]
+            for line in bad:
+                print(f"{sys.argv[1]}: {line}")
+            sys.exit(1 if bad else 0)
         stages: [commit-msg]
