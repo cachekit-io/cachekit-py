@@ -1949,7 +1949,7 @@ class CacheOperationHandler:
             if stored:
                 get_logger().cache_stored(cache_key, ttl)
 
-            # The envelope goes to L1 even when the backend write failed (L1 still serves it)
+            # The envelope goes to L1 even when the backend write failed (L1 serves it only within the per-entry share)
             return StoreOutcome(envelope=serialized_data, stored=bool(stored))
         except (InteropError, KeyringConfigurationError):
             # Interop/v1 data-model rejection (spec-mandated; matches cachekit-ts), or

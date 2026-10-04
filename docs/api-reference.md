@@ -99,7 +99,7 @@ def your_function(args):
   - `failure_threshold` (`int`, default: `5`) - Failures within a 60 s rolling window that open the circuit; successes do not reset the count
   - `success_threshold` (`int`, default: `3`) - Consecutive successes in half-open state before closing circuit
   - `recovery_timeout` (`float`, default: `30.0`) - Cooldown in seconds before an open circuit admits a recovery probe (reported as `timeout_seconds`); must be finite and `> 0`
-  - `half_open_requests` (`int`, default: `3`) - Total probe requests admitted per half-open cycle (not a concurrency limit); must be `>= success_threshold`, or `@cache` raises `ConfigurationError`, because a half-open cycle could never close
+  - `half_open_requests` (`int`, default: `3`) - Probe slots per half-open cycle (not a concurrency limit). Every admitted probe holds one until the cycle ends, cancelled ones included, except a probe whose function raises: it gives its slot back, so more calls than this can reach the backend in one cycle. Must be `>= success_threshold`, or `@cache` raises `ConfigurationError`: every success holds one of a cycle's slots, so a half-open cycle could never close
 - **`backpressure`** (`BackpressureConfig`, default: `BackpressureConfig()`) - Backpressure configuration:
   - `enabled` (`bool`, default: `True`) - Enable backpressure protection
   - `max_concurrent_requests` (`int`, default: `100`) - Maximum concurrent cache requests
@@ -317,12 +317,6 @@ Non-blocking metrics collection system that prevents performance degradation:
 - Background thread processing
 - Self-healing worker thread management
 - Zero impact on critical path latency
-
-#### `RedisErrorClassifier`
-Intelligent error categorization for circuit breaker decisions:
-- Distinguishes transient vs. permanent failures
-- Prevents application errors from triggering circuit breaker
-- Enables targeted recovery strategies
 
 #### `get_cached_redis_client()`
 Thread-local Redis client caching (`cachekit.backends.redis.client`):
@@ -591,7 +585,7 @@ Configuration class for backend-agnostic cache settings. Based on `pydantic-sett
 
 **Key Fields:**
 - **`max_value_size`** (`int`, default: `104857600`) - Maximum serialized value size in bytes; larger values are not cached (env: `CACHEKIT_MAX_VALUE_SIZE`)
-- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB (env: `CACHEKIT_L1_MAX_SIZE_MB`)
+- **`l1_max_size_mb`** (`int`, default: `100`) - Maximum L1 cache size per namespace in MB. With a backend, a single value larger than an eighth of it is not kept in L1: it is served from L2, or recomputed if L2 did not store it (env: `CACHEKIT_L1_MAX_SIZE_MB`)
 - **`invalidation_listener_enabled`** (`bool`, default: `False`) - Run the cross-process L1 invalidation listener in this process: one thread and one Redis connection that evict this process's L1 copies of keys other processes invalidate; tenant-scoped Redis backend only (env: `CACHEKIT_INVALIDATION_LISTENER_ENABLED`). See [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)
 - **`master_key`** (`SecretStr | None`, default: `None`) - Master encryption key for `@cache.secure` and explicit `encryption=True` (env: `CACHEKIT_MASTER_KEY`). A key source, not a switch — see [Encryption Parameters](#encryption-parameters)
 
@@ -641,7 +635,7 @@ The Redis backend wraps each redis-py exception in a `BackendError` whose `error
 
 ### Connection Failures
 When Redis is unavailable:
-1. Function executes without caching
+1. Function executes. Its result is still stored in L1, unless Redis was already down when the backend was first built: then nothing is cached (see [Connection Errors](error-codes.md#connection-errors))
 2. Warning is logged (if logging configured)
 3. No exception is raised to the caller
 

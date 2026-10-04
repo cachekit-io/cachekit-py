@@ -8,10 +8,12 @@ caching for objects that do not need to cross process boundaries or survive rest
 from __future__ import annotations
 
 import math
+import os
 import random
 import sys
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -64,6 +66,43 @@ class _Entry:
     refresh_failed_at: float | None = None  # time.monotonic() of the last failed SWR refresh (retry back-off)
 
 
+class _ObjectCacheState:
+    """The entries, their byte total, their in-flight refresh markers, and the lock guarding all three.
+
+    One object so the at-fork hook can replace all of it with a single attribute store: a thread
+    still inside a critical section finishes on the state it bound. The stats and the generation
+    counter stay on the cache, so a swap keeps them.
+    """
+
+    __slots__ = ("lock", "refreshing", "size_bytes", "store")
+
+    def __init__(self) -> None:
+        self.store: OrderedDict[str, _Entry] = OrderedDict()
+        self.size_bytes = 0
+        # In-flight refresh ownership: key -> owning generation. A refresh captures the entry's
+        # generation at read time and only lands — or clears/cancels its marker — for that exact
+        # generation, so a stale refresh from a replaced entry can neither resurrect data nor
+        # release a newer refresh's marker (which would allow duplicate concurrent refreshes racing
+        # last-write-wins). Invariant: a present marker always equals the live entry's generation,
+        # because every single-key entry change funnels through remove(), which pops it, and
+        # clear() and the fork reset empty every marker at once. Removal leaves no per-key residue.
+        self.refreshing: dict[str, int] = {}
+        self.lock = threading.RLock()
+
+    def remove(self, key: str) -> None:
+        """Remove an entry and update all bookkeeping; call with lock held.
+
+        Every single-key removal funnels here so byte accounting and in-flight refresh cancellation
+        stay consistent. Anti-resurrection needs no per-key residue: a refresh can only land on the exact
+        entry (generation) it was started against.
+        """
+        entry = self.store.pop(key, None)
+        if entry is None:
+            return
+        self.size_bytes -= entry.size_bytes
+        self.refreshing.pop(key, None)
+
+
 class ObjectCache:
     """Thread-safe in-memory cache storing Python object references directly.
 
@@ -92,6 +131,16 @@ class ObjectCache:
 
     Thread safety: RLock on every public method so callers need no external
     synchronisation.
+
+    Fork safety: in a forked child an at-fork hook (``_reset_caches_after_fork``)
+    repairs every live cache before the child's first call. The parent's threads
+    did not survive the fork, so their in-flight refresh markers are emptied and
+    the next stale read refreshes again. Entries carry over, unless a thread held
+    the lock at fork and so may have left them half-updated: then the cache starts
+    empty, with a fresh lock. A child forked without at-fork hooks (uWSGI without
+    ``--py-call-uwsgi-fork-hooks``) gets no repair: its first call to a cached
+    function hangs if a parent thread held that cache's lock at fork, and a key
+    whose refresh was in flight in the parent is served stale until it expires.
 
     Examples:
         Basic usage with TTL:
@@ -147,23 +196,16 @@ class ObjectCache:
         self._max_size_bytes = max_size_bytes
         self._swr_threshold_ratio = swr_threshold_ratio
         self._swr_retry_interval = swr_retry_interval
-        self._store: OrderedDict[str, _Entry] = OrderedDict()
-        self._lock = threading.RLock()
+        # Every critical section binds this once: `s = self._state; with s.lock: ...`. Reading
+        # self._state again inside one would mix states if the at-fork hook replaced it meanwhile.
+        self._state = _ObjectCacheState()
+        # Kept outside _state, so the at-fork hook keeps them: lifetime stats, and the generation
+        # counter stamped onto every stored entry. A generation is never reused across states, so a
+        # refresh started before a swap cannot land on an entry stored after it.
         self._hits = 0
         self._misses = 0
-        self._current_size_bytes = 0
-
-        # SWR state: in-flight refresh ownership (key -> owning generation) plus
-        # a monotonic generation counter stamped onto every stored entry. A
-        # refresh captures the entry's generation at read time and only lands —
-        # or clears/cancels its marker — for that exact generation, so a stale
-        # refresh from a replaced entry can neither resurrect data nor release
-        # a newer refresh's marker (which would allow duplicate concurrent
-        # refreshes racing last-write-wins). Invariant: a present marker always
-        # equals the live entry's generation, because every entry change funnels
-        # through _remove(), which pops it. Removal leaves no per-key residue.
-        self._refreshing: dict[str, int] = {}
         self._generation = 0
+        _caches.add(self)
 
     # ------------------------------------------------------------------
     # Public API
@@ -181,20 +223,21 @@ class ObjectCache:
             A (found, value) tuple. found is False on miss or expiry;
             value is None in that case.
         """
-        with self._lock:
-            entry = self._store.get(key)
+        s = self._state
+        with s.lock:
+            entry = s.store.get(key)
             if entry is None:
                 self._misses += 1
                 return False, None
 
             if time.monotonic() >= entry.expires_at:
                 # Lazy expiry — remove and report miss
-                self._remove(key)
+                s.remove(key)
                 self._misses += 1
                 return False, None
 
             # Move to end (most-recently-used)
-            self._store.move_to_end(key)
+            s.store.move_to_end(key)
             self._hits += 1
             return True, entry.value
 
@@ -221,19 +264,20 @@ class ObjectCache:
             - needs_refresh: Whether the caller should trigger a background refresh
             - version: Entry version at read time (pass to complete_refresh)
         """
-        with self._lock:
-            entry = self._store.get(key)
+        s = self._state
+        with s.lock:
+            entry = s.store.get(key)
             if entry is None:
                 self._misses += 1
                 return False, None, False, 0
 
             now = time.monotonic()
             if now >= entry.expires_at:
-                self._remove(key)
+                s.remove(key)
                 self._misses += 1
                 return False, None, False, 0
 
-            self._store.move_to_end(key)
+            s.store.move_to_end(key)
             self._hits += 1
 
             version = entry.generation
@@ -243,10 +287,10 @@ class ObjectCache:
             backing_off = entry.refresh_failed_at is not None and now - entry.refresh_failed_at < self._swr_retry_interval
             if (
                 (now - entry.cached_at) > ttl * self._swr_threshold_ratio * jitter
-                and key not in self._refreshing
+                and key not in s.refreshing
                 and not backing_off
             ):
-                self._refreshing[key] = entry.generation
+                s.refreshing[key] = entry.generation
                 needs_refresh = True
 
             return True, entry.value, needs_refresh, version
@@ -275,14 +319,15 @@ class ObjectCache:
             raise ValueError(f"ttl must be a finite number >= 1, got {ttl!r}")
 
         size = _estimate_object_size(value) if self._max_size_bytes is not None else 0
-        with self._lock:
+        s = self._state
+        with s.lock:
             # Clear the in-flight marker only if this refresh still owns it — a
             # stale refresh must not release a newer refresh's marker (that
             # would let a third reader schedule a duplicate concurrent refresh)
-            if self._refreshing.get(key) == version:
-                del self._refreshing[key]
+            if s.refreshing.get(key) == version:
+                del s.refreshing[key]
 
-            entry = self._store.get(key)
+            entry = s.store.get(key)
             if entry is None:
                 # Entry was invalidated or evicted during refresh — don't resurrect it
                 return False
@@ -294,19 +339,19 @@ class ObjectCache:
             if self._max_size_bytes is not None and size > self._max_size_bytes:
                 # Refreshed value can no longer fit — drop the entry rather than
                 # keep serving the stale one forever
-                self._remove(key)
+                s.remove(key)
                 return False
 
             now = time.monotonic()
-            self._current_size_bytes += size - entry.size_bytes
+            s.size_bytes += size - entry.size_bytes
             entry.value = value
             entry.cached_at = now
             entry.expires_at = now + ttl
             entry.size_bytes = size
             entry.refresh_failed_at = None  # success ends any retry back-off
-            self._store.move_to_end(key)
+            s.store.move_to_end(key)
             # New value may be larger — restore the byte bound by evicting LRU others
-            self._evict(extra_bytes=0, need_slot=False)
+            self._evict(s, extra_bytes=0, need_slot=False)
             return True
 
     def cancel_refresh(self, key: str, version: int) -> None:
@@ -320,9 +365,10 @@ class ObjectCache:
             key: Cache key whose refresh failed or was abandoned.
             version: Version token returned by ``get_with_swr``.
         """
-        with self._lock:
-            if self._refreshing.get(key) == version:
-                del self._refreshing[key]
+        s = self._state
+        with s.lock:
+            if s.refreshing.get(key) == version:
+                del s.refreshing[key]
 
     def fail_refresh(self, key: str, version: int) -> None:
         """Finish a background refresh that ran and raised.
@@ -336,12 +382,13 @@ class ObjectCache:
             key: Cache key whose refresh failed.
             version: Version token returned by ``get_with_swr``.
         """
-        with self._lock:
-            if self._refreshing.get(key) != version:
+        s = self._state
+        with s.lock:
+            if s.refreshing.get(key) != version:
                 return
-            del self._refreshing[key]
+            del s.refreshing[key]
             # The marker invariant guarantees the live entry has this generation
-            entry = self._store[key]
+            entry = s.store[key]
             entry.refresh_failed_at = time.monotonic()
 
     def put(self, key: str, value: Any, ttl: int) -> None:
@@ -367,28 +414,25 @@ class ObjectCache:
             raise ValueError(f"ttl must be a finite number >= 1, got {ttl!r}")
 
         size = _estimate_object_size(value) if self._max_size_bytes is not None else 0
+        s = self._state
         if self._max_size_bytes is not None and size > self._max_size_bytes:
-            with self._lock:
-                if key in self._store:
-                    self._remove(key)
+            with s.lock:
+                s.remove(key)
             return
 
-        with self._lock:
-            # Replacing? Remove through _remove so byte accounting and any
+        with s.lock:
+            # Replacing? Remove through remove() so byte accounting and any
             # in-flight refresh marker stay consistent (the new entry re-appends
             # at MRU below). The fresh generation below makes an older in-flight
             # refresh unable to overwrite this newer value.
-            if key in self._store:
-                self._remove(key)
+            s.remove(key)
 
-            self._evict(extra_bytes=size, need_slot=True)
+            self._evict(s, extra_bytes=size, need_slot=True)
 
             now = time.monotonic()
             self._generation += 1
-            self._store[key] = _Entry(
-                value=value, expires_at=now + ttl, cached_at=now, size_bytes=size, generation=self._generation
-            )
-            self._current_size_bytes += size
+            s.store[key] = _Entry(value=value, expires_at=now + ttl, cached_at=now, size_bytes=size, generation=self._generation)
+            s.size_bytes += size
             # No move_to_end needed — OrderedDict.__setitem__ appends new keys to end
 
     def delete(self, key: str) -> bool:
@@ -403,9 +447,10 @@ class ObjectCache:
         Returns:
             True if the key existed and was removed, False otherwise.
         """
-        with self._lock:
-            if key in self._store:
-                self._remove(key)
+        s = self._state
+        with s.lock:
+            if key in s.store:
+                s.remove(key)
                 return True
             return False
 
@@ -416,10 +461,11 @@ class ObjectCache:
         In-flight SWR refreshes cannot resurrect cleared entries — their
         target entries no longer exist.
         """
-        with self._lock:
-            self._store.clear()
-            self._current_size_bytes = 0
-            self._refreshing.clear()
+        s = self._state
+        with s.lock:
+            s.store.clear()
+            s.size_bytes = 0
+            s.refreshing.clear()
 
     # ------------------------------------------------------------------
     # Properties
@@ -428,26 +474,28 @@ class ObjectCache:
     @property
     def hits(self) -> int:
         """Total number of successful cache lookups since creation."""
-        with self._lock:
+        with self._state.lock:
             return self._hits
 
     @property
     def misses(self) -> int:
         """Total number of failed cache lookups (including expired) since creation."""
-        with self._lock:
+        with self._state.lock:
             return self._misses
 
     @property
     def size(self) -> int:
         """Current number of entries (may include not-yet-evicted expired entries)."""
-        with self._lock:
-            return len(self._store)
+        s = self._state
+        with s.lock:
+            return len(s.store)
 
     @property
     def size_bytes(self) -> int:
         """Current estimated bytes held (always 0 when not byte-bounded)."""
-        with self._lock:
-            return self._current_size_bytes
+        s = self._state
+        with s.lock:
+            return s.size_bytes
 
     @property
     def max_entries(self) -> int | None:
@@ -463,38 +511,25 @@ class ObjectCache:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _remove(self, key: str) -> None:
-        """Remove an entry and update all bookkeeping.
-
-        Must be called with self._lock held. Every removal path funnels here so
-        byte accounting and in-flight refresh cancellation stay consistent.
-        Anti-resurrection needs no per-key residue: a refresh can only land on
-        the exact entry (generation) it was started against.
-        """
-        entry = self._store.pop(key, None)
-        if entry is None:
-            return
-        self._current_size_bytes -= entry.size_bytes
-        self._refreshing.pop(key, None)
-
-    def _evict(self, extra_bytes: int, need_slot: bool) -> None:
+    def _evict(self, s: _ObjectCacheState, extra_bytes: int, need_slot: bool) -> None:
         """Evict entries until both bounds accommodate the pending write.
 
-        Must be called with self._lock held.
+        Must be called with s.lock held.
 
         Strategy:
         1. If any bound is exceeded, remove all expired entries first.
         2. While still over a bound, evict the oldest (LRU) fresh entry.
 
         Args:
+            s: The state the caller bound and holds the lock of.
             extra_bytes: Estimated size of the value about to be stored.
             need_slot: Whether the pending write adds a new entry (entry-count
                 bound only applies then).
         """
 
         def over_bounds() -> bool:
-            over_entries = need_slot and self._max_entries is not None and len(self._store) >= self._max_entries
-            over_bytes = self._max_size_bytes is not None and self._current_size_bytes + extra_bytes > self._max_size_bytes
+            over_entries = need_slot and self._max_entries is not None and len(s.store) >= self._max_entries
+            over_bytes = self._max_size_bytes is not None and s.size_bytes + extra_bytes > self._max_size_bytes
             return over_entries or over_bytes
 
         if not over_bounds():
@@ -502,10 +537,48 @@ class ObjectCache:
 
         # Sweep expired entries first
         now = time.monotonic()
-        expired_keys = [k for k, e in self._store.items() if now >= e.expires_at]
+        expired_keys = [k for k, e in s.store.items() if now >= e.expires_at]
         for k in expired_keys:
-            self._remove(k)
+            s.remove(k)
 
         # Still over a bound — evict the least-recently-used fresh entries
-        while self._store and over_bounds():
-            self._remove(next(iter(self._store)))
+        while s.store and over_bounds():
+            s.remove(next(iter(s.store)))
+
+    def _reset_after_fork(self) -> None:
+        """Retire what the parent's threads left in this cache; call only from _reset_caches_after_fork.
+
+        A free lock means nothing was mid-update: the entries stay, and the in-flight refresh
+        markers, whose threads did not survive the fork, are emptied. A held lock may never come
+        free and its holder may have left the entries half-updated, so the cache gets a fresh state
+        in one attribute store, never a clear in place: a forking thread that returns into its
+        critical section finishes on the state it bound. _is_owned() comes first because the
+        forking thread's own hold is reentrant, and a try-acquire alone would report it free.
+        """
+        s = self._state
+        if not s.lock._is_owned() and s.lock.acquire(blocking=False):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            s.lock.release()
+            s.refreshing.clear()
+            return
+        self._state = _ObjectCacheState()
+
+
+# Every live ObjectCache, for the at-fork hook. Weak: each decorated function owns one, and callers
+# and tests may build and drop more.
+_caches: weakref.WeakSet[ObjectCache] = weakref.WeakSet()
+
+
+def _reset_caches_after_fork() -> None:
+    """Repair every live ObjectCache in a forked child, before the child's first call.
+
+    Runs while the child is single-threaded, so it takes no lock that can block, starts no
+    thread and logs nothing. A fork made from C without at-fork hooks (uWSGI without
+    --py-call-uwsgi-fork-hooks) never runs it, and nothing repairs the caches there: the check
+    that could, an owner-PID check, would cost a getpid() on every cached call.
+    """
+    for oc in list(_caches):
+        oc._reset_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_caches_after_fork)

@@ -90,6 +90,24 @@ def test_every_path_has_a_committed_budget() -> None:
         assert set(entry["budgets"]) == set(PATHS), key
 
 
+def test_performance_docs_state_the_committed_budgets() -> None:
+    """docs/performance.md's Budgets table is ir_baselines.json, figure for figure.
+
+    A ratchet that rewrote the JSON and not the table once left seven rows stale, the worst by 60% (LAB-7801).
+    """
+    interpreters = json.loads(ir_budget.BASELINES.read_text())["interpreters"]
+    columns = ("cpython-3.12-x86_64", "cpython-3.14-x86_64")  # the table's two figure columns, in order
+    assert sorted(interpreters) == sorted(columns), "add or remove a column in docs/performance.md's Budgets table"
+    lines = (ir_budget.BASELINES.parents[2] / "docs" / "performance.md").read_text().splitlines()
+    rows = lines[lines.index("| Path | What one call does | CPython 3.12 | CPython 3.14 |") + 2 :]
+    end = next(i for i, line in enumerate(rows) if not line.startswith("|"))
+    table = {}
+    for row in rows[:end]:
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        table[cells[0].strip("`")] = tuple(int(cell.replace(",", "")) for cell in cells[2:])
+    assert table == {path: tuple(interpreters[key]["budgets"][path] for key in columns) for path in PATHS}
+
+
 def test_batched_metrics_path_queues_every_call_and_never_records_synchronously(monkeypatch) -> None:
     """``l2_hit_async_metrics`` claims to budget batched mode; a collector change must not turn it synchronous."""
     pytest.importorskip("pandas")  # the workload builder makes the Arrow path's DataFrame too

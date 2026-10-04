@@ -243,6 +243,7 @@ def test_cached_function():
 
 - Circuit breaker with graceful degradation
 - Connection pooling with thread affinity (+28% throughput)
+- CachekitIO keeps an idle connection for up to 390 s, with TCP keepalive probes, so a request after a pause skips a new TLS handshake
 - Distributed locking prevents cache stampedes
 - Pluggable backend abstraction (Redis, CachekitIO, File, Memcached, custom)
 - Untrusted-decode bounds: nesting depth and header-declared allocation are capped on every cache read (a forged entry is a bounded cache miss), verified against the protocol's shared [`decode-bounds.json`](https://github.com/cachekit-io/protocol/blob/2736a81f2f853cf08c5563c0fe7c8361331fa3ad/test-vectors/decode-bounds.json) vectors
@@ -257,7 +258,7 @@ def test_cached_function():
 | **StandardSerializer** | ★★★★☆ | General Python types, NumPy, Pandas |
 | **OrjsonSerializer** | ★★★★★ | JSON APIs (2-5x faster than stdlib) — requires `cachekit[json]` |
 | **ArrowSerializer** | ★★★★★ | Large DataFrames (6-23x faster for 10K+ rows) |
-| **EncryptionWrapper** | ★★★★☆ | Wraps any serializer with AES-256-GCM |
+| **+ Encryption** | ★★★★☆ | Any serializer above, AES-256-GCM encrypted: `@cache.secure(master_key=..., serializer=...)` |
 
 <details>
 <summary><strong>Serializer Examples</strong></summary>
@@ -396,7 +397,9 @@ free-threaded 3.14 with the GIL verified disabled (CI job
 `test-freethreaded`), and the Rust extension declares free-threaded safety
 (`gil_used = false`). Free-threaded wheels are **not yet published** and
 free-threaded builds are not officially supported — blocked upstream on
-orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import). See
+orjson (no free-threaded wheels) and hiredis (re-enables the GIL on import;
+cachekit loads redis-py only for its Redis backend, and keeps hiredis out there,
+so redis-py uses its pure-Python parser). See
 [measured performance results](docs/free-threading.md#measured-performance) and the
 full concurrency audit: [docs/free-threading.md](docs/free-threading.md).
 

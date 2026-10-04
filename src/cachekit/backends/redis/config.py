@@ -28,7 +28,8 @@ class RedisBackendConfig(BaseBackendConfig):
         socket_connect_timeout: Socket connect timeout in seconds
         socket_keepalive: Enable TCP keepalive (SO_KEEPALIVE) on TCP connections;
             not applied to unix:// URLs
-        disable_hiredis: Disable hiredis parser (use pure Python)
+        disable_hiredis: Reports CACHEKIT_DISABLE_HIREDIS. cachekit.hiredis_compat reads that
+            variable at import, before redis loads; setting this field changes nothing
 
     Examples:
         Create with defaults:
@@ -86,7 +87,10 @@ class RedisBackendConfig(BaseBackendConfig):
     )
     disable_hiredis: bool = Field(
         default=False,
-        description="Disable hiredis parser (use pure Python)",
+        description=(
+            "Reports CACHEKIT_DISABLE_HIREDIS; the parser is chosen from that variable at import cachekit "
+            "(see cachekit.hiredis_compat), so setting this field changes nothing"
+        ),
     )
 
     @classmethod

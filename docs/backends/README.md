@@ -361,7 +361,7 @@ Other changes you may notice:
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
 | **File** | set = fsync + per-entry scan; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Production default |
-| **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTP/2; depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
+| **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (sync HTTP/1.1, async HTTP/2); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |
 | **DynamoDB** | 100-500ms | Serverless, low-traffic | High availability |
 | **Memcached** | 1-5ms | Alternative to Redis | No persistence |

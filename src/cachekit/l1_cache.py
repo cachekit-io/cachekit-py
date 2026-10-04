@@ -26,6 +26,14 @@ DEFAULT_L1_TTL_SECONDS = 300
 # Keys removed per lock acquisition in invalidate_many.
 _INVALIDATE_BATCH = 1_000
 
+# The largest share of max_memory_bytes one entry may take. Storing an entry first evicts whole LRU
+# entries until it fits, and an entry read back from L2 is stored again each time it falls out, so a
+# near-budget entry could empty most of L1 on every read. With an eighth, one store evicts less than
+# a quarter of L1 (under an eighth to make room, plus the last whole entry, itself at most an
+# eighth), and the share is far above what ordinary values take. Internal calibration, not a
+# setting; cachekit-ts uses the same share.
+_MAX_ENTRY_SHARE = 1 / 8
+
 logger = logging.getLogger(__name__)
 
 _P = ParamSpec("_P")
@@ -87,7 +95,7 @@ class L1Cache:
     Key features:
     - Thread-safe with RLock for concurrent access
     - Respects Redis TTL (entries expire at Redis TTL time)
-    - Memory bounded (100MB default limit)
+    - Memory bounded (100MB default limit; one entry at most an eighth of it)
     - LRU eviction when memory limit reached
     - Fast lookups (~50ns for hits)
     - Background TTL synchronization
@@ -197,6 +205,9 @@ class L1Cache:
     ) -> None:
         """Store value in L1 cache with TTL.
 
+        A value larger than an eighth of max_memory_bytes is not stored, and any older entry under
+        the key is dropped; callers serve it from L2, or recompute it if L2 did not store it.
+
         Args:
             key: Cache key
             value: Bytes to cache (encrypted or plaintext msgpack, not deserialized object)
@@ -245,18 +256,18 @@ class L1Cache:
         # Estimate size
         size = self._estimate_size(value)
 
-        # Reject entries that cannot fit even in an empty cache. Storing one would push L1
-        # permanently over its budget, and a multi-GB serialized DataFrame envelope is a
-        # direct OOM vector (it would also evict every other useful entry on the way in).
-        # The value is still available from L2; we only decline to mirror it in L1. If a
-        # smaller entry for this key was cached, drop it so L1 stops serving the stale value.
-        if size > self.max_memory_bytes:
+        # Reject entries above the per-entry share (_MAX_ENTRY_SHARE). Above the whole budget one
+        # would also push L1 permanently over its limit (a multi-GB DataFrame envelope is a direct
+        # OOM vector). We only decline to mirror the value in L1. If a smaller entry for this key
+        # was cached, drop it so L1 stops serving the stale value.
+        max_entry_bytes = self.max_memory_bytes * _MAX_ENTRY_SHARE
+        if size > max_entry_bytes:
             self._on_current_state(_L1State.remove, key)
             logger.debug(
-                "Skipping L1 cache for key %s - value %d bytes exceeds L1 budget %d bytes (served from L2 only)",
+                "Skipping L1 cache for key %s - value %d bytes exceeds L1 per-entry limit %d bytes (not kept in L1)",
                 redact_key_for_log(key),
                 size,
-                self.max_memory_bytes,
+                max_entry_bytes,
             )
             return
 
@@ -475,13 +486,13 @@ class L1CacheManager:
         stopped; a one-shot thread frees the L1 states the child inherited instead
         (_release_inherited_states). Decorated functions get() before
         they put(), so _empty_caches_after_fork gives every cache a fresh state, and so a free lock,
-        before that first get() on os.fork() servers; without at-fork hooks (uWSGI unless
-        --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
+        before that first get() on os.fork() servers; without at-fork hooks (uWSGI without
+        --py-call-uwsgi-fork-hooks) a get() on an orphaned cache lock before the first put still hangs.
         The take-over resets cache locks only when that hook did not run in this PID
         (_forked_without_hooks): after it, a held cache lock belongs to a live child thread. Without
         hooks it cannot tell a dead holder from a live child thread holding a cache lock past the
         1 s probe, and then drops that cache's entries; the holder finishes unharmed on the state
-        it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
+        it bound (L1Cache._reset_lock_after_fork). --py-call-uwsgi-fork-hooks avoids that drop too.
         A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
         a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
         starts no thread in it, start_background_cleanup refuses there too (also for a manager
@@ -642,7 +653,7 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 # The processes a thread may start in: the one that imported this module, and the latest child
 # _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
 # So import cachekit before any fork made from C: a process that first imports it after such a fork
-# (uWSGI --lazy-apps without --py-call-osafterfork) is taken for safe, and cleanup starts a thread there.
+# (uWSGI --lazy-apps without --py-call-uwsgi-fork-hooks) is taken for safe, and cleanup starts a thread there.
 # No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
 # thread idents match a fresh process's, and a fresh process may import on any thread.
 _import_pid = os.getpid()
@@ -654,7 +665,7 @@ _inherited_states: list[_L1State] = []
 
 
 def _forked_without_hooks() -> bool:
-    """Whether this process was forked without at-fork hooks (uWSGI unless --py-call-osafterfork)."""
+    """Whether this process was forked without at-fork hooks (uWSGI without --py-call-uwsgi-fork-hooks)."""
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_pid
 

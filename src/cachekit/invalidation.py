@@ -26,10 +26,10 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any, Optional
 
 import msgpack
-import redis
 
 from cachekit import l1_cache
 from cachekit.cache_handler import supports_key_tracking
@@ -54,8 +54,12 @@ _RESUBSCRIBE_SECONDS = 60.0
 # How long a start waits, in all, for Redis to answer its SUBSCRIBE and its PING.
 _CONFIRM_SECONDS = 5.0
 
-# uWSGI options under which a worker runs Python's at-fork hooks, or imports the app after the fork.
-_UWSGI_FORK_OPTIONS = ("py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy")
+# The uWSGI option (2.0.21+) that runs CPython's whole fork protocol, at-fork hooks included, around each
+# worker fork. Not py-call-osafterfork: with enable-threads it aborts every worker on Python 3.13+, and on
+# earlier versions it does not hold the master's threads off at the fork. Not lazy-apps (or lazy) alone: a
+# worker that first imports cachekit after a fork made from C looks like a fresh process, and may start a
+# thread that hangs. enable-threads is not checked: uWSGI 2.0.27+ enables threads by default.
+_UWSGI_FORK_HOOKS = "py-call-uwsgi-fork-hooks"
 
 Evictor = Callable[[Optional[str]], None]
 
@@ -66,6 +70,8 @@ _publish_failed_warn = _WarnThrottle()
 _too_long_warn = _WarnThrottle()
 # A forged or foreign publisher controls how many bad events arrive: one WARNING a minute here too.
 _dropped_event_warn = _WarnThrottle()
+# A listener that cannot reach Redis fails once a second while it retries: one WARNING a minute.
+_listener_error_warn = _WarnThrottle()
 
 
 def encode_event(registry_id: str, key: Optional[str]) -> Optional[bytes]:
@@ -245,7 +251,7 @@ def listener_start_due(backend: object) -> bool:
     one-time WARNING, whether or not another function's listener already runs. Then it compares the
     process id with the listener's owner, so a forked child starts its own listener instead of
     believing it has its parent's; the parent's socket is the parent's. A child forked without
-    at-fork hooks (uWSGI without the options in _UWSGI_FORK_OPTIONS) runs no listener at all and
+    at-fork hooks (uWSGI without py-call-uwsgi-fork-hooks) runs no listener at all and
     this logs nothing there: a thread started in such a child can hang in Thread.start(), and a
     log call on a handler lock a parent thread held at fork hangs too. Its L1 heals by TTL.
     """
@@ -276,6 +282,21 @@ def _warn_untrackable(backend: object) -> None:
         )
 
 
+def _redis() -> ModuleType:
+    """redis-py, imported only once a listener needs it.
+
+    A module-level import would load redis-py, and with it hiredis, for every program that imports
+    cachekit. cachekit's redis package is imported first so its hiredis decision runs before
+    redis-py loads (see cachekit.hiredis_compat).
+    """
+    import cachekit.backends.redis  # noqa: F401
+
+    # isort: split
+    import redis
+
+    return redis
+
+
 def start_listener(backend: Any) -> None:
     """Start this process's listener on ``backend``'s Redis, unless another thread is starting it.
 
@@ -302,7 +323,7 @@ def start_listener(backend: Any) -> None:
             return
         pubsub = None
         try:
-            pubsub = redis.Redis(connection_pool=backend.listener_pool()).pubsub()
+            pubsub = _redis().Redis(connection_pool=backend.listener_pool()).pubsub()
             pubsub.subscribe(**{CHANNEL: _on_message})
             _confirm_subscription(pubsub)
             thread = pubsub.run_in_thread(sleep_time=1.0, daemon=True, exception_handler=_on_listener_error)
@@ -346,7 +367,7 @@ def _confirm_subscription(pubsub: Any) -> None:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise redis.TimeoutError(f"Redis sent no {expected} reply in {_CONFIRM_SECONDS:g} s")
+                raise _redis().TimeoutError(f"Redis sent no {expected} reply in {_CONFIRM_SECONDS:g} s")
             reply = pubsub.get_message(timeout=remaining)  # a refusal raises here (NoPermissionError)
             if reply is not None and reply.get("type") == expected:
                 break
@@ -389,7 +410,7 @@ def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
     _RESUBSCRIBE_SECONDS and drops the connection, and its next read reconnects and subscribes again.
     A grant therefore takes effect within that wait, with no restart.
     """
-    if isinstance(error, redis.ResponseError):
+    if isinstance(error, _redis().ResponseError):
         logger.warning(
             "Invalidation listener refused by Redis; subscribing again in %d s: %s",
             _RESUBSCRIBE_SECONDS,
@@ -400,7 +421,15 @@ def _on_listener_error(error: BaseException, pubsub: Any, thread: Any) -> None:
         if connection is not None:
             connection.disconnect()
         return
-    logger.warning("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
+    errors = _listener_error_warn.claim()
+    if not errors:
+        logger.debug("Invalidation listener error; retrying in 1 s: %s", redact_error_for_log(error))
+    else:
+        logger.warning(
+            "Invalidation listener error (errors since the last warning: %d); retrying every second. Latest: %s",
+            errors,
+            redact_error_for_log(error),
+        )
     time.sleep(1.0)
 
 
@@ -413,24 +442,41 @@ def _stop_listener() -> None:
         thread.join(timeout=5)
 
 
+def _uwsgi_forked_this_process(uwsgi: Any) -> bool:
+    """Whether uWSGI forked this process from C (a worker, mule or spooler), or cannot say.
+
+    l1_cache._forked_without_hooks misses a process that first imports cachekit after such a fork:
+    a worker under lazy-apps, or one whose app imports cachekit on its first request. With --master,
+    uWSGI forked every process but the master; without it, masterpid() is 0 and worker_id() stays 0
+    in the process that loads the app until it forks the workers.
+    """
+    try:
+        master = uwsgi.masterpid()
+        return os.getpid() != master if master else uwsgi.worker_id() > 0
+    except Exception:  # not uWSGI's own module: never log when unsure, never fail import cachekit
+        return True
+
+
 def _warn_if_uwsgi_skips_fork_hooks() -> None:
-    """One WARNING when this process runs under uWSGI with none of _UWSGI_FORK_OPTIONS set.
+    """One WARNING when this process runs under uWSGI without _UWSGI_FORK_HOOKS set.
 
     uWSGI forks its workers from C and runs no Python at-fork hook unless told to, so a worker
-    keeps its master's L1 entries and runs no invalidation listener. Called once, at import, which
-    is in the master before any worker exists: a worker forked without hooks must not log at all.
+    keeps the master's L1 entries and runs no invalidation listener. Called once, at import, and
+    logs only in a process uWSGI did not fork, the one that loads the app: a process forked without
+    hooks must not log at all, since a handler lock a master thread held at the fork would hang it.
+    So under lazy-apps, where each worker first imports cachekit after the fork, nothing logs.
     uWSGI registers its ``uwsgi`` module before it imports the app, so this looks it up rather than
     importing it: an import outside uWSGI would run any ``uwsgi.py`` on ``sys.path``.
     """
-    if l1_cache._forked_without_hooks():
-        return
-    options = getattr(sys.modules.get("uwsgi"), "opt", None)
-    if not isinstance(options, dict) or any(name in options for name in _UWSGI_FORK_OPTIONS):
+    uwsgi = sys.modules.get("uwsgi")
+    options = getattr(uwsgi, "opt", None)
+    if not isinstance(options, dict) or _UWSGI_FORK_HOOKS in options or _uwsgi_forked_this_process(uwsgi):
         return
     logger.warning(
-        "uWSGI forks its workers without running Python's at-fork hooks: each worker keeps the "
-        "master's L1 entries and runs no invalidation listener. Set py-call-uwsgi-fork-hooks "
-        "(uWSGI 2.0.21+), py-call-osafterfork or lazy-apps."
+        "uWSGI is running without py-call-uwsgi-fork-hooks, so its worker forks skip all or part of "
+        "CPython's fork protocol: a worker keeps the master's L1 entries and runs no invalidation "
+        "listener, or under py-call-osafterfork can hang or abort at start. Run uWSGI with "
+        "--enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+)."
     )
 
 

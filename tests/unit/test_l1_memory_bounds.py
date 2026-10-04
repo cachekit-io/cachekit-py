@@ -1,27 +1,25 @@
 """L1 memory-bound guarantees, especially the oversized-single-entry vector.
 
-A cached value larger than the entire L1 budget must NOT be stored (it would push L1
-permanently over its own limit and, for multi-GB DataFrame envelopes, become an OOM
-vector that also evicts every other useful entry). Such values still live in L2.
+A cached value larger than an eighth of the L1 budget must NOT be stored: admitting it could
+evict up to that much of L1 on its way in, and again on every read that refills it from L2. Above
+the whole budget it would also push L1 permanently over its limit (for multi-GB DataFrame
+envelopes, an OOM vector). Such values are served from L2, or recomputed if L2 did not store them.
 """
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 import random
-import select
 import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
-from typing import NoReturn
 
 import pytest
 
 from cachekit.l1_cache import CacheEntry, L1Cache, L1CacheManager
+from tests.utils.fork_helpers import child_outcome, on_new_thread, report
 
 MB = 1024 * 1024
 
@@ -39,7 +37,8 @@ class TestOversizedEntryRejection:
     def test_rejected_oversized_put_does_not_evict_existing_entries(self):
         """A doomed oversized put must not evict good entries on its way to failing."""
         cache = L1Cache(max_memory_mb=1)
-        cache.put("keep", b"\x00" * (512 * 1024), redis_ttl=300)  # fits
+        cache.put("keep", b"\x00" * (64 * 1024), redis_ttl=300)  # fits
+        assert cache.get("keep")[0] is True
 
         cache.put("toobig", b"\x00" * (5 * MB), redis_ttl=300)  # cannot ever fit
 
@@ -50,7 +49,7 @@ class TestOversizedEntryRejection:
     def test_oversized_update_drops_stale_smaller_entry(self):
         """An oversized put for an EXISTING key must drop the stale value, not serve it."""
         cache = L1Cache(max_memory_mb=1)
-        cache.put("k", b"\x00" * (256 * 1024), redis_ttl=300)  # fits
+        cache.put("k", b"\x00" * (64 * 1024), redis_ttl=300)  # fits
         assert cache.get("k")[0] is True
 
         cache.put("k", b"\x00" * (5 * MB), redis_ttl=300)  # same key, now oversized
@@ -58,10 +57,38 @@ class TestOversizedEntryRejection:
         assert cache.get("k")[0] is False  # stale smaller value evicted, not served
         assert cache._state.memory_bytes == 0
 
-    def test_entry_equal_to_budget_is_stored(self):
+    def test_entry_at_the_share_is_stored(self):
         cache = L1Cache(max_memory_mb=1)
-        cache.put("exact", b"\x00" * (1 * MB), redis_ttl=300)
+        cache.put("exact", b"\x00" * (MB // 8), redis_ttl=300)
         assert cache.get("exact")[0] is True
+
+    def test_entry_just_above_the_share_is_refused_and_drops_older_entry(self):
+        cache = L1Cache(max_memory_mb=1)
+        cache.put("other", b"\x00" * 1024, redis_ttl=300)
+        cache.put("k", b"\x00" * 1024, redis_ttl=300)
+        assert cache.get("k")[0] is True
+
+        cache.put("k", b"\x00" * (MB // 8 + 1), redis_ttl=300)
+
+        assert cache.get("k")[0] is False  # refused, and the older value is not served
+        assert cache.get("other")[0] is True  # nothing evicted
+        assert _consistent(cache)
+        assert cache._state.memory_bytes == 1024
+
+    def test_small_entries_survive_repeated_reads_of_a_near_budget_key(self):
+        """A key refilled from L2 on every L1 miss must not flush the rest of L1 each time."""
+        cache = L1Cache(max_memory_mb=1)
+        small = [f"small{i}" for i in range(100)]
+        for key in small:
+            cache.put(key, b"\x00" * 8 * 1024, redis_ttl=300)
+        assert cache._state.memory_bytes > cache.max_memory_bytes // 2  # L1 is well used
+
+        for _ in range(20):  # each read misses L1 and stores the L2 value again
+            if not cache.get("near-budget")[0]:
+                cache.put("near-budget", b"\x00" * (MB - 1024), redis_ttl=300)
+
+        assert all(cache.get(key)[0] for key in small)
+        assert cache._evictions == 0
 
     def test_normal_entry_still_stored(self):
         cache = L1Cache(max_memory_mb=10)
@@ -71,8 +98,10 @@ class TestOversizedEntryRejection:
     def test_memory_never_exceeds_budget_under_mixed_load(self):
         cache = L1Cache(max_memory_mb=2)
         for i in range(20):
-            cache.put(f"k{i}", b"\x00" * (300 * 1024), redis_ttl=300)  # 300KB each
+            cache.put(f"k{i}", b"\x00" * (200 * 1024), redis_ttl=300)  # 200KB each, 4MB in all
         cache.put("huge", b"\x00" * (50 * MB), redis_ttl=300)  # rejected
+        assert cache._evictions > 0  # the puts were stored, so the budget was actually tested
+        assert cache.get("k19")[0] is True
         assert cache._state.memory_bytes <= cache.max_memory_bytes
 
 
@@ -86,22 +115,26 @@ class TestUpdateUnderPressure:
 
     def test_lru_first_update_keeps_count_and_budget(self):
         cache = L1Cache(max_memory_mb=1)
-        cache.put("A", b"\x00" * 512_000, redis_ttl=300)
-        cache.put("B", b"\x00" * 512_000, redis_ttl=300)
-        cache.put("A", b"\x00" * 614_400, redis_ttl=300)  # A is LRU: eviction walks past it first
+        for key in "ABCDEFGHIJ":  # 10 x 104,000 B: just under the 1 MiB budget
+            cache.put(key, b"\x00" * 104_000, redis_ttl=300)
+        cache.put("A", b"\x00" * (MB // 8), redis_ttl=300)  # A is LRU: eviction walks past it first
+        assert cache.get("A")[0] is True
+        assert cache._evictions > 0
         assert _consistent(cache)
         assert _held_bytes(cache) <= cache.max_memory_bytes
 
     @pytest.mark.parametrize(
         ("keys", "min_size", "max_size"),
-        [(200, 10 * 1024, 60 * 1024), (8, 100 * 1024, 300 * 1024)],
-        ids=["200-keys-10-60KB", "8-keys-100-300KB"],
+        [(200, 10 * 1024, 60 * 1024), (12, 60 * 1024, 128 * 1024)],
+        ids=["200-keys-10-60KB", "12-keys-60-128KB"],
     )
     def test_random_update_heavy_load_keeps_count_and_budget(self, keys, min_size, max_size):
         rng = random.Random(6897)
         cache = L1Cache(max_memory_mb=1)
         for i in range(5000):
-            cache.put(f"k{rng.randrange(keys)}", b"\x00" * rng.randint(min_size, max_size), redis_ttl=300)
+            key = f"k{rng.randrange(keys)}"
+            cache.put(key, b"\x00" * rng.randint(min_size, max_size), redis_ttl=300)
+            assert key in cache._state.cache, f"put {i} refused: sizes must stay within the per-entry share"
             assert _consistent(cache), f"count drifted at put {i}"
             assert cache._state.memory_bytes >= 0, f"count negative at put {i}"
             assert _held_bytes(cache) <= cache.max_memory_bytes, f"over budget at put {i}"
@@ -166,12 +199,12 @@ class TestConfiguredBudgetWiring:
     def test_configured_budget_enforced_with_eviction(self):
         """Filling past a configured (non-default) 2MB budget evicts LRU entries."""
         cache = L1Cache(max_memory_mb=2)
-        for i in range(5):  # 5 x 512KB = 2.5MB > 2MB budget
-            cache.put(f"k{i}", b"\x00" * (512 * 1024), redis_ttl=300)
+        for i in range(10):  # 10 x 256KB = 2.5MB > 2MB budget; 256KB is the per-entry share
+            cache.put(f"k{i}", b"\x00" * (256 * 1024), redis_ttl=300)
 
         assert cache._state.memory_bytes <= 2 * MB
         assert cache.get("k0")[0] is False  # oldest evicted
-        assert cache.get("k4")[0] is True  # newest survives
+        assert cache.get("k9")[0] is True  # newest survives
         assert cache._evictions > 0
 
     def test_manager_default_reads_settings(self, monkeypatch):
@@ -265,34 +298,6 @@ def _wait_for(predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
-def _report(w: int, outcome: object) -> NoReturn:
-    """End a child forked with os.fork() with an outcome for its parent; never return into pytest."""
-    try:
-        os.write(w, repr(outcome).encode())  # literals only: ast.literal_eval reads it
-    finally:
-        os._exit(0)
-
-
-def _child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
-    """What the child at pid reported on the pipe r; a hung child is killed."""
-    assert pid > 0, "no child was forked"  # os.kill(0, ...) would signal pytest's whole process group
-    data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
-    if not data:
-        os.kill(pid, signal.SIGKILL)
-    os.waitpid(pid, 0)
-    os.close(r)
-    return ast.literal_eval(data.decode()) if data else "no outcome: the child hung or died"
-
-
-def _on_new_thread(fn: Callable[[], object], timeout: float = 5.0) -> object:
-    """fn's result from a new thread, or "hung" if it holds the thread past timeout."""
-    out: list[object] = []
-    thread = threading.Thread(target=lambda: out.append(fn()), daemon=True)
-    thread.start()
-    thread.join(timeout)
-    return out[0] if out else "hung"
-
-
 def _consistent(cache: L1Cache) -> bool:
     s = cache._state
     return s.memory_bytes == sum(entry.size_bytes for entry in s.cache.values())
@@ -305,7 +310,7 @@ def _as_if_forked(manager: L1CacheManager, parent_ran_cleanup: bool) -> None:
 
 
 def _as_if_hookless(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make this process a child the at-fork hook never reached (uWSGI without --py-call-osafterfork)."""
+    """Make this process a child the at-fork hook never reached (uWSGI without --py-call-uwsgi-fork-hooks)."""
     from cachekit import l1_cache
 
     monkeypatch.setattr(l1_cache, "_import_pid", -1)
@@ -547,7 +552,7 @@ class TestCleanupThreadAfterFork:
         holder.start()
         assert held.wait(5)
         try:
-            assert _on_new_thread(l1_cache._empty_caches_after_fork, timeout=5) is None  # returned, never blocked
+            assert on_new_thread(l1_cache._empty_caches_after_fork, timeout=5) is None  # returned, never blocked
         finally:
             release.set()
             holder.join(5)
@@ -744,10 +749,10 @@ class TestCleanupThreadAfterFork:
                 }
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
-        assert _child_outcome(child, r) == {"kept_at_fork": True, "freed": True, "cleanup": None}
+        assert child_outcome(child, r) == {"kept_at_fork": True, "freed": True, "cleanup": None}
 
     def test_orphaned_cache_lock_reset_leaves_the_old_state_alone_and_logs_nothing(self, monkeypatch, caplog):
         manager = L1CacheManager(default_max_memory_mb=10)
@@ -791,22 +796,22 @@ class TestCleanupThreadAfterFork:
             found = cache.get("k")
         except BaseException as e:
             if os.getpid() != parent:
-                _report(w, {"error": repr(e)})  # the reset emptied the dict under the in-flight get()
+                report(w, {"error": repr(e)})  # the reset emptied the dict under the in-flight get()
             raise
         if os.getpid() != parent:
             try:
                 outcome = {
                     "found": found,
                     "consistent": _consistent(cache),
-                    "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                    "new_thread": on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
                 }
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
         assert child, "get() no longer calls CacheEntry.is_expired"
-        assert _child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
+        assert child_outcome(child, r) == {"found": (True, b"v"), "consistent": True, "new_thread": (True, b"v")}
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_fork_inside_a_critical_section_the_child_never_leaves(self, monkeypatch):
@@ -825,12 +830,12 @@ class TestCleanupThreadAfterFork:
             if child == 0:
                 try:  # this thread holds the old lock for good, so new threads must not need it
                     outcome = {
-                        "pre_fork": _on_new_thread(lambda: cache.get("pre-fork")),
-                        "new_thread": _on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
+                        "pre_fork": on_new_thread(lambda: cache.get("pre-fork")),
+                        "new_thread": on_new_thread(lambda: (cache.put("n", b"v"), cache.get("n"))[1]),
                     }
                 except BaseException as e:
                     outcome = {"error": repr(e)}
-                _report(w, outcome)
+                report(w, outcome)
             return real(entry)
 
         monkeypatch.setattr(CacheEntry, "is_expired", fork_here)
@@ -839,7 +844,7 @@ class TestCleanupThreadAfterFork:
         assert child, "get() no longer calls CacheEntry.is_expired"
 
         # The fork dropped the namespace's entries; L2 still has them.
-        assert _child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
+        assert child_outcome(child, r) == {"pre_fork": (False, None), "new_thread": (True, b"v")}
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() not available on this platform")
     def test_hookless_take_over_past_a_live_holder_leaves_it_unharmed(self, monkeypatch):
@@ -884,10 +889,10 @@ class TestCleanupThreadAfterFork:
                 outcome = {"holder": got, "found": cache.get("k"), "consistent": _consistent(cache)}
             except BaseException as e:
                 outcome = {"error": repr(e)}
-            _report(w, outcome)
+            report(w, outcome)
         os.close(w)
 
-        assert _child_outcome(child, r) == {"holder": [(True, b"v")], "found": (True, b"v"), "consistent": True}
+        assert child_outcome(child, r) == {"holder": [(True, b"v")], "found": (True, b"v"), "consistent": True}
 
     def test_invalidation_queued_behind_a_replaced_lock_reaches_the_fresh_state(self):
         cache = L1Cache(namespace="requeue-ns")
@@ -1009,7 +1014,7 @@ class TestCleanupThreadAfterFork:
                     manager.start_background_cleanup(interval_seconds=60)
                     l1_cache._global_l1_manager = None
                     born = l1_cache.get_l1_cache_manager()  # starts its cleanup unless refused
-                    _report(
+                    report(
                         w,
                         {
                             "requested": requested,
@@ -1022,7 +1027,7 @@ class TestCleanupThreadAfterFork:
                 finally:
                     os._exit(1)
             os.close(w)
-            assert _child_outcome(child, r) == {
+            assert child_outcome(child, r) == {
                 "requested": [],
                 "thread": None,
                 "born_thread": None,

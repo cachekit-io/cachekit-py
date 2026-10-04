@@ -180,11 +180,11 @@ def _reset_metric_locks_once() -> None:
 def _in_hookless_child() -> bool:
     """Return whether this process is the child of a fork made from C, which ran no at-fork hook.
 
-    Such a fork, as uWSGI's is without ``--py-call-osafterfork``, also skips CPython's own after-fork repair, so a
+    Such a fork, as uWSGI's is without ``--py-call-uwsgi-fork-hooks``, also skips CPython's own after-fork repair, so a
     thread started in that child can hang or crash the interpreter. No collector starts one there, provided this
     module was imported before the fork. Imported only after it, as under uWSGI ``--lazy-apps``, the child looks
     like a fresh process and this returns False, so a collector there may start a worker; that case is open, and
-    ``--py-call-osafterfork`` avoids it.
+    ``--py-call-uwsgi-fork-hooks`` avoids it.
     """
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_fork_pid
@@ -208,11 +208,15 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def _get_shared_metric(name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
+def _get_shared_metric(
+    name: str, metric_class: type, description: str, labels: list[str], buckets: tuple[float, ...] | None = None
+) -> Any:
     """Get or create the process-wide metric instance for ``name``.
 
     Module-level so ``circuit_breaker_gauge()`` shares the collectors' metric cache without
-    creating a collector. ``kwargs`` (such as ``buckets``) reach ``metric_class`` only on first creation.
+    creating a collector. ``buckets`` reach a ``Histogram`` only on first creation. It is a named
+    parameter, not ``**kwargs``: every recorded cache operation calls this up to three times, and
+    forwarding ``**kwargs`` cost about 2,500 instructions per call (LAB-7801).
 
     Raises:
         ValueError: If ``name`` is already cached as a different metric kind, as prometheus_client
@@ -225,7 +229,8 @@ def _get_shared_metric(name: str, metric_class: type, description: str, labels: 
             metric = _metrics_cache.get(name)
             if metric is None:
                 try:
-                    metric = metric_class(name, description, labels, **kwargs)
+                    extra = {} if buckets is None else {"buckets": buckets}
+                    metric = metric_class(name, description, labels, **extra)
                 except ValueError as e:
                     if "Duplicated timeseries" not in str(e):
                         raise
@@ -306,8 +311,8 @@ class AsyncMetricsCollector:
                 until a mode check starts a worker of the child's own, which never happens with auto-detect off.
                 In the child of a fork made from C, every collector, inherited or built there, records
                 synchronously for good, provided this module was imported before the fork. Imported only after
-                it (uWSGI ``--lazy-apps``), the child looks like a fresh process; ``--py-call-osafterfork`` avoids
-                that case.
+                it (uWSGI ``--lazy-apps``), the child looks like a fresh process; ``--py-call-uwsgi-fork-hooks``
+                avoids that case.
             auto_detect_mode: Automatically switch between sync/async based on frequency
         """
         self.batch_size = batch_size
@@ -661,12 +666,12 @@ class AsyncMetricsCollector:
                         f"Failed to update histogram {name} ({failures} observations): {redact_error_for_log(last_error)}"
                     )
 
-    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str], **kwargs: Any) -> Any:
+    def _get_metric(self, name: str, metric_class: type, description: str, labels: list[str]) -> Any:
         """Get or create the process-wide metric instance for ``name`` (see ``_get_shared_metric``)."""
-        return _get_shared_metric(name, metric_class, description, labels, **kwargs)
+        return _get_shared_metric(name, metric_class, description, labels)
 
     def _duration_histogram(self) -> Any:
-        return self._get_metric(
+        return _get_shared_metric(
             "cache_operation_duration_ms",
             Histogram,
             "Cache operation duration",
@@ -675,7 +680,7 @@ class AsyncMetricsCollector:
         )
 
     def _size_histogram(self) -> Any:
-        return self._get_metric(
+        return _get_shared_metric(
             "cache_operation_size_bytes",
             Histogram,
             "Cache operation size",
@@ -760,7 +765,7 @@ class AsyncMetricsCollector:
         and records synchronously until a mode check starts a worker of its own. With auto-detect off it stays
         synchronous. The metrics it now records into directly get fresh locks too (``_reset_metric_locks``).
 
-        A changed PID is the signal. A fork made from C, as uWSGI's is without ``--py-call-osafterfork``, runs
+        A changed PID is the signal. A fork made from C, as uWSGI's is without ``--py-call-uwsgi-fork-hooks``, runs
         no at-fork hook, and the dead worker's ``Thread.is_alive()`` still returns True. It also skips CPython's
         own after-fork repair, so a thread started in that child can hang or crash the interpreter. A child the
         at-fork hook did not reach therefore never starts a worker, and records synchronously for good; ``__init__``

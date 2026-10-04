@@ -73,12 +73,9 @@ __version__ = "0.21.0"
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-# Configure hiredis compatibility BEFORE any Redis imports
-# This prevents GIL warnings in Python 3.13+ free-threading mode
-try:
-    from . import hiredis_compat
-except ImportError:
-    pass
+# Must run BEFORE any redis import: CACHEKIT_DISABLE_HIREDIS=true keeps hiredis out from here on.
+# The free-threaded default runs later, when cachekit.backends.redis loads (see cachekit.hiredis_compat).
+from . import hiredis_compat  # noqa: F401
 
 # Import the configuration classes
 # Redis client is automatically fast - no special import needed

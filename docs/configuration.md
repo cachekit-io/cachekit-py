@@ -98,12 +98,18 @@ CACHEKIT_ENCRYPTION_FAIL_CLOSED=false
 # Fallback: REDIS_URL also supported (lower priority)
 REDIS_URL=redis://localhost:6379/0
 
+# Evict this process's L1 copies when another process invalidates them (default: false).
+# Tenant-scoped Redis backend only; see the link below this block.
+CACHEKIT_INVALIDATION_LISTENER_ENABLED=false
+
 # Logging
 LOG_LEVEL=INFO
 
 # Performance Testing
 REQUESTS_CA_BUNDLE=  # Unset to avoid SSL issues
 ```
+
+`CACHEKIT_INVALIDATION_LISTENER_ENABLED` runs one invalidation listener per process; see [Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction) for what it does and what it needs from Redis.
 
 ---
 
@@ -125,9 +131,9 @@ CACHEKIT_API_URL=https://api.cachekit.io
 # Optional: Request timeout in seconds (default: 5.0, must be > 0)
 CACHEKIT_TIMEOUT=5.0
 
-# Optional: HTTP connection pool size (default: 10, must be > 0)
+# Optional: HTTP connection pool size (default: 32, must be > 0)
 # The same variable sizes the Redis pool, whose default is 50
-CACHEKIT_CONNECTION_POOL_SIZE=10
+CACHEKIT_CONNECTION_POOL_SIZE=32
 
 # Optional: Allow custom API hostname - disables SSRF hostname allowlist (default: false)
 # Only set to true when pointing at a private test server
@@ -141,7 +147,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `10` | No | Max HTTP connections in pool. The same variable sizes the Redis pool, whose default is 50 |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `32` | No | Max HTTP connections in pool. The sync client uses one per concurrent request (HTTP/1.1). The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
 **Security notes:**
@@ -189,6 +195,7 @@ Rules and behavior:
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
 - **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
+- At most 32 revalidations per decorated function run at once. A stale hit that finds the limit reached serves stale without revalidating, and a later hit retries. An async revalidation stranded on a stopped event loop (sync code that calls `loop.run_until_complete` and leaves the loop stopped, or closes it without cancelling its tasks) gives up its turn 30 seconds after it was scheduled and is cancelled, so a stale hit on another loop can revalidate that key again. If its loop resumes, it stores nothing, even when your function swallows the cancellation and returns. A write it had already sent before its loop stopped is not recalled, and can land after a newer revalidation's.
 - A failed background recompute never reaches the caller: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path. It logs a WARNING `SWR revalidation failed`, as does a revalidation skipped because the call's arguments cannot be deep-copied (`SWR revalidation skipped`) or one that could not be scheduled. It names the function by the same digest as the L1-only refresh WARNING. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
@@ -262,7 +269,7 @@ def my_function():
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `enabled` | bool | `True` | Enable L1 in-memory cache |
-| `max_size_mb` | int | `100` | Maximum L1 cache size in MB |
+| `max_size_mb` | int | `100` | Maximum L1 cache size in MB. With a backend, a single value larger than an eighth of it is not kept in L1: it is served from L2, or recomputed if L2 did not store it |
 | `swr_enabled` | bool | `True` | Enable stale-while-revalidate (SWR) — [L1-only mode](#l1-only-mode-backendnone) only |
 | `swr_threshold_ratio` | float | `0.5` | Refresh at X% of TTL, in `(0.0, 1.0]` — L1-only mode only |
 | `swr_retry_interval` | float | `10.0` | Seconds after a failed background refresh before that key is refreshed again, `>= 0`; `0` retries on the next stale read — L1-only mode only |
@@ -280,7 +287,9 @@ honored as follows:
 - **`max_size_mb`** bounds the cache by *estimated bytes*, not entry count. Sizes of
   raw objects are estimated best-effort (builtin containers are walked recursively;
   other objects are counted via `sys.getsizeof`). A single value larger than the whole
-  budget is returned to the caller but never cached.
+  budget is returned to the caller but never cached. This is looser than with a backend,
+  where a value larger than an eighth of the budget is not kept in L1: in L1-only mode
+  there is no L2 to serve it from, so refusing it would recompute it on every call.
 - **SWR requires a `ttl`.** With `swr_enabled=True` and a `ttl` set, a cache hit past
   `ttl * swr_threshold_ratio` (±10% jitter) serves the cached value immediately and
   refreshes it in the background — via `asyncio.create_task` for `async def` functions,
@@ -298,6 +307,14 @@ honored as follows:
   exception. Set `swr_retry_interval=0` to retry on every stale hit. The refresh runs on a deep copy
   of the call's arguments; when they cannot be copied (a lock, an open connection), it is
   skipped, so that call is only ever recomputed in the foreground after expiry.
+- **At most 32 background refreshes run at once per function.** A stale hit that finds the
+  limit reached serves the cached value without refreshing, and a later stale hit retries.
+  An `async def` refresh stranded on a stopped event loop (sync code that calls
+  `loop.run_until_complete` and leaves the loop stopped, or closes it without cancelling its
+  tasks) gives up its turn 30 seconds after it was scheduled and is cancelled. The next
+  refresh attempt on another key of that function releases it; from then on stale hits on
+  other loops refresh that key again. Until then the key keeps serving its cached value,
+  and past its `ttl` the next call recomputes it in the foreground.
 - **Failed and skipped refreshes log a WARNING** (`L1-only SWR refresh failed`, `… skipped`,
   `… could not be started`) with the redacted function, the redacted key and the exception
   type. The function appears as the `<redacted:…>` digest of its `module.qualname`;
@@ -330,7 +347,7 @@ from cachekit import cache
 def minimal_function():
     pass
 
-# Development - SWR enabled, invalidation disabled
+# Development - L1-only SWR, verbose logs
 @cache.dev(backend=None)
 def dev_function():
     pass
@@ -359,16 +376,18 @@ def secure_function():
 
 **Feature Matrix by Intent:**
 
-| Intent | Default TTL | SWR | Invalidation | Max Size | Notes |
-|--------|-------------|-----|--------------|----------|-------|
-| `minimal()` | 300 s | ❌ | ❌ | 100 MB | Speed-first, no integrity check |
-| `test()` | 300 s | ❌ | ❌ | 100 MB | Deterministic, no monitoring |
-| `dev()` | 300 s | L1-only¹ | ❌ | 100 MB | Verbose logs, no Prometheus except `circuit_breaker_state` |
-| `production()` | 600 s | L1-only¹ | ✓ | 100 MB | Full observability |
-| `secure()` | 600 s | ❌ | ✓ | 100 MB | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
-| `io()` | 3600 s | ✓ | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
+| Intent | Default TTL | SWR | Max Size | Notes |
+|--------|-------------|-----|----------|-------|
+| `minimal()` | 300 s | ❌ | 100 MB | Speed-first, no integrity check |
+| `test()` | 300 s | ❌ | 100 MB | Deterministic, no monitoring |
+| `dev()` | 300 s | L1-only¹ | 100 MB | Verbose logs, no Prometheus except `circuit_breaker_state` |
+| `production()` | 600 s | L1-only¹ | 100 MB | Full observability |
+| `secure()` | 600 s | ❌ | 100 MB | AES-256-GCM encryption required; refuses `backend=None`, so no L1-only SWR |
+| `io()` | 3600 s | ✓ | 100 MB | CachekitIO managed SaaS backend (closed beta — [request access](https://cachekit.io)); past-TTL [SWR](#stale-while-revalidate-stale_ttl) default-on (`stale_ttl = ttl`) |
 
 **Default TTL** is fixed by the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) so a `production` entry expires at the same moment in Python, Rust and TypeScript; `dev()` / `test()` are Python-only presets and take `minimal`'s 300 s. Pass `ttl=<seconds>` to override, or `ttl=None` to opt in to never-expire explicitly. The spec forbids a process-wide TTL override, so there is no `CACHEKIT_DEFAULT_TTL` (the name is reserved and ignored). Two consequences of a finite default: an entry this process writes also lives in its L1 for the same TTL (previously L1's own 300 s when no `ttl` was set), and the presets' `swr_enabled` / `stale_ttl` features — which need a positive `ttl` — are now active without an explicit `ttl=`.
+
+**Invalidation is not a preset feature.** Every preset's `invalidate_cache()` deletes from L1 and L2 alike. Evicting other processes' L1 copies is the process-wide `CACHEKIT_INVALIDATION_LISTENER_ENABLED` ([Environment Variables](#environment-variables)), off by default and set by no preset ([Cross-Process L1 Eviction](features/l1-invalidation.md#cross-process-l1-eviction)). On the tenant-scoped Redis backend, an entry with `ttl=None` or a TTL above 7 days outlives the key registry's tracking set, so call `invalidate_cache()` before you retire such a function (**Set lifetime** under [Whole-Function Invalidation](features/l1-invalidation.md#whole-function-invalidation)).
 
 ¹ Within-TTL refresh-ahead SWR runs **only in L1-only mode** (`backend=None`), where the SDK re-runs your function in the background past `ttl * swr_threshold_ratio`. With a backend configured, these presets have no SWR — `swr_enabled` has no effect outside L1-only mode (Redis exposes no read-side freshness signal). The only backed SWR is `@cache.io`'s past-TTL [`stale_ttl`](#stale-while-revalidate-stale_ttl) mode.
 
@@ -623,11 +642,11 @@ export CACHEKIT_ARROW_COMPRESSION=zstd
 
 ### Connection Pooling
 
-One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 10. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins.
+One variable sizes the pool of whichever backend is in use: Redis defaults to 50 connections, CachekitIO to 32. A Redis operation that finds every connection in use waits up to the socket timeout for one, then fails as a cache miss. That timeout is `CACHEKIT_SOCKET_TIMEOUT`, unless the Redis URL sets `?socket_timeout=`, which wins. A CachekitIO sync request holds a connection for its whole round trip (HTTP/1.1), so the pool caps how many run at once: size it to at least the number of threads that share one backend ([details](backends/cachekitio.md#characteristics)).
 
 ```bash
 # Tune connection pool size based on concurrency
-export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 10
+export CACHEKIT_CONNECTION_POOL_SIZE=100  # Defaults: Redis 50, CachekitIO 32
 
 # Higher for:
 # - Many concurrent requests

@@ -100,15 +100,14 @@ class TestREADMEClaims:
         assert EncryptionWrapper is not None, "README.md:148 - EncryptionWrapper import failed"
 
     def test_serializer_parameter_syntax(self):
-        """README.md:157 - @cache(serializer='encrypted', master_key=...) must work."""
+        """README.md:156 - @cache.secure(master_key=...) must decorate."""
 
-        # README.md:157 shows encryption with master_key
-        # This requires using @cache.secure preset with master_key parameter
+        # README.md:156 shows encryption with master_key on the @cache.secure preset
         @cache.secure(master_key="0" * 64)
         def test_func():
             return "test"
 
-        assert callable(test_func), "README.md:157 - serializer parameter failed"
+        assert callable(test_func), "README.md:156 - @cache.secure(master_key=...) failed to decorate"
 
     def test_env_var_priority(self):
         """README.md:203-213 - CACHEKIT_REDIS_URL must take precedence over REDIS_URL."""

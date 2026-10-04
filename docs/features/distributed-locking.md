@@ -342,8 +342,8 @@ The decorator wrapper calls it with `timeout=30.0` (lock self-expiry) and
 @cache(ttl=300)  # Both enabled
 async def operation(x):
     # L2 backend down: lock acquisition fails too (the lock lives in L2),
-    # so every caller executes without the lock while the circuit breaker
-    # keeps the function serving. Locking resumes when the backend recovers.
+    # so every caller executes without the lock and the function keeps
+    # serving. Locking resumes when the backend recovers.
     return compute(x)
 ```
 

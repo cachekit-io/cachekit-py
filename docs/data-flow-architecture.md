@@ -112,7 +112,7 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  Backend types:                                                             │
 │  • RedisBackend: Distributed Redis storage (default)                        │
-│  • CachekitIOBackend: Managed cloud storage via HTTP/2 (api.cachekit.io)    │
+│  • CachekitIOBackend: Managed cloud storage via HTTPS (api.cachekit.io)     │
 │  • Future: DynamoDBBackend, etc.                                            │
 │                                                                             │
 │  RedisBackend internal flow:                                                │
@@ -291,9 +291,10 @@ cachekit uses a hybrid Python-Rust architecture to provide production caching wi
 │                                                                             │
 │  1. Calculate expiry: time.time() + ttl - buffer (1s)                       │
 │  2. Estimate size: len(serialized_bytes)  # O(1), not recursive             │
-│  3. Evict LRU entries if needed (max 100MB)                                 │
-│  4. Store bytes in OrderedDict with metadata                                │
-│  5. Mark as most recently used (move_to_end)                                │
+│  3. If size > budget/8: drop any older entry for the key, store nothing     │
+│  4. Evict LRU entries if needed (max 100MB)                                 │
+│  5. Store bytes in OrderedDict with metadata                                │
+│  6. Mark as most recently used (move_to_end)                                │
 │                                                                             │
 │  Note: Stores bytes (encrypted or plaintext msgpack), not Python objects    │
 └──────────────────────────────────┬──────────────────────────────────────────┘
@@ -449,7 +450,7 @@ def _blake2b_pickle_hash(args, kwargs):
 ┌─────────────────────────────────────────┐
 │ L2 Backend (Pluggable Storage Layer)    │
 │ • RedisBackend (default)                │
-│ • CachekitIOBackend (HTTP/2, managed)   │
+│ • CachekitIOBackend (HTTPS, managed)    │
 │ • Network call (~1-2ms latency)         │
 │ • Bytes-based protocol (BaseBackend)    │
 │ • Persistent across process restarts    │
@@ -784,7 +785,7 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 ### Error Scenarios
 
-1. **Redis Connection Failed** → Execute function without caching
+1. **Redis Connection Failed** → Execute function; the result is still stored in L1, unless Redis was down when the backend was first built (then nothing is cached)
 2. **Lock Acquisition Timeout** → Execute without lock (thundering herd risk accepted)
 3. **Serialization Failed** → Return result, skip caching
 4. **Deserialization Failed** → Execute function as if cache miss
@@ -793,13 +794,8 @@ For comprehensive breakdown, see [Performance Guide](performance.md).
 
 **States:**
 - **CLOSED**: Normal operation (requests allowed)
-- **OPEN**: Too many failures (requests blocked, fallback used)
+- **OPEN**: Too many failures (L2 skipped: L1 hits still served, an L1 miss runs the function)
 - **HALF_OPEN**: Testing recovery (limited requests)
-
-**Fallback Strategies:**
-- `fail_open` (default): Execute function without caching
-- `fail_closed`: Raise exception
-- `custom`: Call custom_fallback function
 
 ---
 

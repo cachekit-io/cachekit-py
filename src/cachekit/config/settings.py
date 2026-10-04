@@ -47,7 +47,8 @@ class CachekitConfig(RedactingSettings):
 
     Attributes:
         max_value_size: Maximum cache value size in bytes
-        l1_max_size_mb: Maximum L1 cache size per namespace in megabytes
+        l1_max_size_mb: Maximum L1 cache size per namespace in megabytes. With a backend, one value
+            larger than an eighth of it is not kept in L1
         l1_cleanup_interval_seconds: Background cleanup interval for expired entries
 
     Examples:
@@ -148,7 +149,7 @@ class CachekitConfig(RedactingSettings):
     l1_max_size_mb: int = Field(
         default=100,
         gt=0,
-        description="Maximum L1 cache size per namespace in megabytes (prevents OOM)",
+        description="Maximum L1 cache size per namespace in megabytes (prevents OOM); with a backend, one value larger than an eighth of it is not kept in L1",
     )
     l1_cleanup_interval_seconds: int = Field(
         default=30,

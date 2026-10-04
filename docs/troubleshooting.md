@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): exceptions raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). Exceptions raised by the decorated function itself never count. A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
 - Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
@@ -33,7 +33,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
 3. **Let the breaker recover** — no restart is needed:
-- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
+- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN with three probe slots (a probe whose function raises hands its slot to the next call, so while it keeps raising, more than three calls can probe in one cycle); three successes close it, and a counted failure reopens it for another cooldown
 - While open, sync and async functions with an L2 backend still serve L1 hits and run without caching on an L1 miss (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many within 60 seconds open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count.
+Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions never count toward the circuit breaker, so a function that raises does not stop its own caching.
 
 </details>
 
@@ -114,7 +114,7 @@ def get_user(user_id: int) -> dict:
 
 **Issue**: Redis connection timeout or refused
 
-`@cache` does not raise these: it logs the failure and runs the function uncached. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
+`@cache` does not raise these: it logs the failure and runs the function. If Redis was unreachable when the backend was first built (the `Connection refused` line below comes from that first ping), nothing is cached, the failure counts toward the circuit breaker, and the next call tries again. If Redis went away later, the result is still stored in L1. The log line names a `BackendError` wrapping one of these redis-py errors (see [Connection Errors](error-codes.md#connection-errors)):
 ```
 Error 111 connecting to localhost:6379. Connection refused.
 Timeout connecting to server
@@ -179,6 +179,7 @@ lsof -i :6379
 ```
 cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable
 A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...
+EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...
 CACHEKIT_MASTER_KEY must be hex-encoded: ...
 CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ...
 Decryption failed: ...
@@ -191,9 +192,10 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 **Common causes**:
 1. Master key not set when using `@cache.secure()`
 2. Master key set, but a cache states no encryption intent — add `encryption=False` for plaintext ([details](error-codes.md#master-key-present-no-encryption-intent))
-3. Master key format invalid (not hex-encoded)
-4. Master key rotated (can't decrypt old cached data)
-5. Data corruption during storage/retrieval
+3. An `EncryptionWrapper` passed as a decorator's `serializer=` — pass its inner serializer to `@cache.secure(master_key=..., serializer=...)` instead ([details](error-codes.md#encrypting-serializer-on-a-decorator))
+4. Master key format invalid (not hex-encoded)
+5. Master key rotated (can't decrypt old cached data)
+6. Data corruption during storage/retrieval
 
 **Quick fix**:
 ```bash
@@ -293,7 +295,7 @@ def expensive_query(id):
     return fetch(id)
 ```
 
-2. **Sync calls do not retry a rate-limited request** — the call runs uncached, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs uncached (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
+2. **Sync calls do not retry a rate-limited request** — the function runs, its result is still stored in L1, and the failure does not count toward the circuit breaker. Async calls do not retry it either: a 429 on the lock request ends the lock wait, and the function runs without the lock (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)). If you're hitting 429 consistently, reduce request concurrency or upgrade your plan.
 
 3. **Check your current usage** at [cachekit.io](https://cachekit.io) dashboard.
 
@@ -354,7 +356,7 @@ curl -o /dev/null -s -w "Connect: %{time_connect}s  Total: %{time_total}s\n" \
     https://api.cachekit.io/healthz
 ```
 
-4. **A timeout does not fail the call**: the request is logged and the function runs uncached. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
+4. **A timeout does not fail the call**: the request is logged, the function runs, and its result is still stored in L1. Timeouts do not count toward the circuit breaker. A timed-out async lock request ends the lock wait at once (see [CachekitIO HTTP Errors](error-codes.md#cachekitio-http-errors)).
 
 </details>
 

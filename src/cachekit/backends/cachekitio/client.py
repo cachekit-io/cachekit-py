@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import threading
+import urllib.request
 import weakref
 from contextlib import AsyncExitStack, ExitStack
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -30,6 +33,22 @@ if TYPE_CHECKING:
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
 _ClientKey = tuple[str, str, float, int]
+
+
+def _user_agent() -> str:
+    # Edge analytics group SaaS traffic by User-Agent; without this every request reads as a bare python-httpx client.
+    # The version comes from the installed distribution, so it cannot drift from the release. A source-only or vendored
+    # copy has no distribution metadata; it still identifies as cachekit-py rather than failing the import.
+    # Stdlib logger, not _logger: this runs once at import, and the structured logger samples records away.
+    try:
+        sdk = version("cachekit")
+    except PackageNotFoundError:
+        logging.getLogger(__name__).debug("No cachekit distribution metadata; User-Agent reports cachekit-py/unknown")
+        sdk = "unknown"
+    return f"cachekit-py/{sdk} httpx/{httpx.__version__}"
+
+
+_USER_AGENT = _user_agent()
 
 _logger = get_structured_logger(__name__)
 
@@ -52,7 +71,7 @@ class SyncClientLease:
     # weak references still resolve, so the racing lookup revives the object and inherits the close.
     def __init__(self, config: CachekitIOBackendConfig) -> None:
         self.pid = os.getpid()
-        self.client = httpx.Client(**_client_kwargs(config))
+        self.client = httpx.Client(**_client_kwargs(config, httpx.HTTPTransport))
         # atexit=False: exit-time finalizers run while daemon threads (stale-while-revalidate) are still
         # alive, so closing then could pull a client out from under an in-flight request. The process
         # reclaims the sockets at exit anyway.
@@ -93,7 +112,7 @@ class _LoopBoundClient:
         if self._client is None or self._loop is None or self._loop() is not loop:
             # The replaced client is dropped unclosed: its loop has finished, so its connections
             # cannot be awaited closed (the same ResourceWarning as a released async client).
-            self._client = httpx.AsyncClient(**_client_kwargs(self._config))
+            self._client = httpx.AsyncClient(**_client_kwargs(self._config, httpx.AsyncHTTPTransport))
             self._loop = weakref.ref(loop)
         return self._client
 
@@ -183,7 +202,7 @@ _hpack_logger = logging.getLogger("hpack")
 
 
 def _pin_hpack_logger() -> None:
-    # hpack (httpx's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
+    # hpack (the async client's HTTP/2 header encoder) logs every header block it encodes at DEBUG, and that block
     # decodes back to the Authorization bearer key and X-CacheKit-Lock-Id (CWE-532). A root logger at
     # DEBUG would publish the key, so hold hpack at INFO while its level is unset. A level the application
     # sets, before or after a client is built, wins: setting DEBUG is an explicit opt-in (SECURITY.md).
@@ -191,20 +210,61 @@ def _pin_hpack_logger() -> None:
         _hpack_logger.setLevel(logging.INFO)
 
 
-def _client_kwargs(config: CachekitIOBackendConfig) -> dict[str, Any]:
+# Pool policy. Cloudflare closes an idle client connection at 400 s, so an idle pooled connection is kept for
+# 390 s instead of httpx's 5 s default, and a request after a gap of up to 390 s skips a new TCP+TLS handshake.
+# NAT gateways drop idle flows sooner (AWS 350 s, Azure 4 min); TCP keepalive probes from 60 s idle keep their
+# mappings alive and detect a dead path in about 90 s instead of a 5 s read timeout on the next request.
+_KEEPALIVE_EXPIRY = 390.0
+# Without keepalive probes (behind an env proxy, below), keep httpx's 5 s default: a proxy's own idle limit is
+# unknown, and a connection it dropped silently would cost the next request its whole timeout and a miss.
+_KEEPALIVE_EXPIRY_NO_PROBES = 5.0
+
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # macOS names the idle option TCP_KEEPALIVE; a platform without one keeps the kernel's defaults.
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    for name, value in ((idle, 60), (getattr(socket, "TCP_KEEPINTVL", None), 10), (getattr(socket, "TCP_KEEPCNT", None), 3)):
+        if name is not None:
+            options.append((socket.IPPROTO_TCP, name, value))
+    return options
+
+
+_KEEPALIVE_SOCKET_OPTIONS = _keepalive_socket_options()
+
+
+def _client_kwargs(
+    config: CachekitIOBackendConfig, transport_cls: type[httpx.HTTPTransport] | type[httpx.AsyncHTTPTransport]
+) -> dict[str, Any]:
     # Every client carries the bearer key, so no client is built before the pin.
     _pin_hpack_logger()
+    # Keepalive probes need our own transport, and passing transport= turns off httpx's env proxies. So the
+    # transport is mounted for all:// instead. With any proxy setting present (getproxies() is what httpx reads),
+    # that mount would replace an ALL_PROXY proxy or miss a NO_PROXY host, so the client keeps httpx's own
+    # transports and today's 5 s expiry instead.
+    probes = not urllib.request.getproxies()
+    limits = httpx.Limits(
+        max_connections=config.connection_pool_size,
+        max_keepalive_connections=config.connection_pool_size,
+        keepalive_expiry=_KEEPALIVE_EXPIRY if probes else _KEEPALIVE_EXPIRY_NO_PROBES,
+    )
+    # The sync client is HTTP/1.1. Every thread that calls a backend sends on its one sync client, and over HTTP/2
+    # they would share one connection, which httpcore's sync HTTP/2 path does not lock (encode/httpcore#1118): a
+    # ReadError or RemoteProtocolError fails every request in flight on it, and the cache reads a miss (LAB-7062).
+    # HTTP/1.1 gives each concurrent request its own pooled connection, and h11 costs less CPU per request than h2.
+    # The async client stays on HTTP/2: one event loop drives it.
+    http2 = transport_cls is httpx.AsyncHTTPTransport
+    mounts = {"all://": transport_cls(http2=http2, limits=limits, socket_options=_KEEPALIVE_SOCKET_OPTIONS)} if probes else None
     return {
         "base_url": config.api_url,
         "timeout": config.timeout,
-        "http2": True,
-        "limits": httpx.Limits(
-            max_connections=config.connection_pool_size,
-            max_keepalive_connections=config.connection_pool_size,
-        ),
+        "http2": http2,
+        "limits": limits,
+        "mounts": mounts,
         "headers": {
             "Authorization": f"Bearer {config.api_key.get_secret_value()}",
             "Content-Type": "application/octet-stream",
+            "User-Agent": _USER_AGENT,
         },
     }
 
