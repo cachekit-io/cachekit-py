@@ -497,7 +497,7 @@ logging.getLogger("redis").setLevel(logging.DEBUG)
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-With the CachekitIO backend, cachekit keeps the `hpack` logger (HTTP/2 header encoding) at `INFO` even under a `DEBUG` root, because its `DEBUG` output decodes to your API key and lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) before you set it to `DEBUG`.
+With the CachekitIO backend, a `DEBUG` root also shows urllib3's request lines, raw cache keys in their paths, never the API key or lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) if your keys carry identifiers.
 
 </details>
 

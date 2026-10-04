@@ -147,7 +147,7 @@ CACHEKIT_ALLOW_CUSTOM_HOST=false
 | `CACHEKIT_API_KEY` | `SecretStr` | — | Unless `api_key=` is passed | API key (`ck_live_...`) for authentication. Required from one source: this variable or the `api_key=` argument to `CachekitIOBackend` / `@cache.io` |
 | `CACHEKIT_API_URL` | `str` | `https://api.cachekit.io` | No | API endpoint URL (must use HTTPS) |
 | `CACHEKIT_TIMEOUT` | `float` | `5.0` | No | Per-request timeout in seconds |
-| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `32` | No | Max HTTP connections in pool. The sync client uses one per concurrent request (HTTP/1.1). The same variable sizes the Redis pool, whose default is 50 |
+| `CACHEKIT_CONNECTION_POOL_SIZE` | `int` | `32` | No | Max HTTP connections in the backend's one pool, shared by every thread and by async calls. Each concurrent request uses one (HTTP/1.1); a request that finds all in use waits up to `CACHEKIT_TIMEOUT` for one. The same variable sizes the Redis pool, whose default is 50 |
 | `CACHEKIT_ALLOW_CUSTOM_HOST` | `bool` | `false` | No | Disable hostname allowlist (testing only) |
 
 **Security notes:**
