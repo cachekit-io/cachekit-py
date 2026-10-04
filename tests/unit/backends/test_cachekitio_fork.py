@@ -94,7 +94,7 @@ async def _exchange_async(backend: CachekitIOBackend, tag: str) -> dict[str, int
 
 
 def _libc_fork() -> int:
-    """fork() from C, skipping Python's at-fork hooks as uWSGI does without --py-call-osafterfork."""
+    """fork() from C, skipping Python's at-fork hooks as uWSGI does without --py-call-uwsgi-fork-hooks."""
     import ctypes
 
     return ctypes.PyDLL(None).fork()  # PyDLL keeps the GIL through the call

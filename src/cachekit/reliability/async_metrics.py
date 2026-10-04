@@ -180,11 +180,11 @@ def _reset_metric_locks_once() -> None:
 def _in_hookless_child() -> bool:
     """Return whether this process is the child of a fork made from C, which ran no at-fork hook.
 
-    Such a fork, as uWSGI's is without ``--py-call-osafterfork``, also skips CPython's own after-fork repair, so a
+    Such a fork, as uWSGI's is without ``--py-call-uwsgi-fork-hooks``, also skips CPython's own after-fork repair, so a
     thread started in that child can hang or crash the interpreter. No collector starts one there, provided this
     module was imported before the fork. Imported only after it, as under uWSGI ``--lazy-apps``, the child looks
     like a fresh process and this returns False, so a collector there may start a worker; that case is open, and
-    ``--py-call-osafterfork`` avoids it.
+    ``--py-call-uwsgi-fork-hooks`` avoids it.
     """
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_fork_pid
@@ -311,8 +311,8 @@ class AsyncMetricsCollector:
                 until a mode check starts a worker of the child's own, which never happens with auto-detect off.
                 In the child of a fork made from C, every collector, inherited or built there, records
                 synchronously for good, provided this module was imported before the fork. Imported only after
-                it (uWSGI ``--lazy-apps``), the child looks like a fresh process; ``--py-call-osafterfork`` avoids
-                that case.
+                it (uWSGI ``--lazy-apps``), the child looks like a fresh process; ``--py-call-uwsgi-fork-hooks``
+                avoids that case.
             auto_detect_mode: Automatically switch between sync/async based on frequency
         """
         self.batch_size = batch_size
@@ -765,7 +765,7 @@ class AsyncMetricsCollector:
         and records synchronously until a mode check starts a worker of its own. With auto-detect off it stays
         synchronous. The metrics it now records into directly get fresh locks too (``_reset_metric_locks``).
 
-        A changed PID is the signal. A fork made from C, as uWSGI's is without ``--py-call-osafterfork``, runs
+        A changed PID is the signal. A fork made from C, as uWSGI's is without ``--py-call-uwsgi-fork-hooks``, runs
         no at-fork hook, and the dead worker's ``Thread.is_alive()`` still returns True. It also skips CPython's
         own after-fork repair, so a thread started in that child can hang or crash the interpreter. A child the
         at-fork hook did not reach therefore never starts a worker, and records synchronously for good; ``__init__``

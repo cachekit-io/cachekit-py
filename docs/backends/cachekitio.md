@@ -230,9 +230,11 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 - Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
   opens its own connections on its first request and never reuses its parent's, so a backend built
   before the fork works in every worker. One exception, for a fork made from C that skips Python's
-  at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
-  that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
-  avoid it; [Free-threading](../free-threading.md) gives the detail
+  at-fork hooks (uWSGI without `--py-call-uwsgi-fork-hooks`): if a parent thread was inside `logging`
+  at that moment, the child's first request can hang on logging's lock. Run uWSGI with
+  `--enable-threads --py-call-uwsgi-fork-hooks` to avoid it, as
+  [Forked Processes](../features/l1-invalidation.md#forked-processes) explains;
+  [Free-threading](../free-threading.md) gives the detail
 - Every request identifies the SDK with a `User-Agent: cachekit-py/<version> httpx/<version>` header,
   taken from the installed packages, so cachekit.io can attribute traffic to an SDK release
 - Distributed locking via server-side Durable Objects
