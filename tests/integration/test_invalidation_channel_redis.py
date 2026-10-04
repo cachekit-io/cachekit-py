@@ -8,6 +8,8 @@ import logging
 import multiprocessing
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -490,6 +492,118 @@ class TestListenerResilience:
         evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
         _run_peer(client, f"invalidate([1], {ns!r})")
         assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+
+
+_SO_ATTACH_FILTER = 26  # Linux; the socket module does not export it
+_DROP_ALL = struct.pack("HBBI", 0x06, 0, 0, 0)  # classic BPF: BPF_RET | BPF_K, accept 0 bytes
+
+
+class _Relay:
+    """A TCP relay to Redis whose client-facing sockets can be turned into a black hole.
+
+    ``blackhole()`` attaches a drop-all classic-BPF filter (SO_ATTACH_FILTER, no privilege needed)
+    to every client-facing socket and closes the upstream: the kernel discards the client's segments
+    before TCP sees them, so nothing is acknowledged and nothing is sent, as with a peer that went
+    silent. A relay that only read and discarded the bytes would not do: its kernel still ACKs them,
+    and TCP_USER_TIMEOUT counts unacknowledged data. Connections accepted afterwards relay normally.
+    """
+
+    def __init__(self, upstream: tuple[str, int]) -> None:
+        self._upstream = upstream
+        self._server = socket.create_server(("127.0.0.1", 0))
+        self.port = self._server.getsockname()[1]
+        self._pairs: list[tuple[socket.socket, socket.socket]] = []
+        self._dead: set[socket.socket] = set()
+        self._filter = ctypes.create_string_buffer(_DROP_ALL)  # kept alive while attached
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._server.accept()
+            except OSError:
+                return
+            upstream = socket.create_connection(self._upstream)
+            self._pairs.append((client, upstream))
+            threading.Thread(target=self._pump, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=self._pump, args=(upstream, client), daemon=True).start()
+
+    def _pump(self, src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+        if dst not in self._dead:  # a black-holed client hears nothing, not even a FIN
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def blackhole(self) -> None:
+        program = struct.pack("HL", 1, ctypes.addressof(self._filter))  # struct sock_fprog
+        for client, upstream in self._pairs:
+            client.setsockopt(socket.SOL_SOCKET, _SO_ATTACH_FILTER, program)
+            self._dead.add(client)
+            upstream.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        self._server.close()
+        for pair in self._pairs:
+            for sock in pair:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)  # wakes the pump blocked on it
+                except OSError:
+                    pass
+                sock.close()
+
+
+@pytest.fixture
+def tcp_client(client: redis.Redis, request: pytest.FixtureRequest) -> redis.Redis:
+    """The test Redis over TCP: CI's external service, else the pytest-redis process's port."""
+    proc = request.getfixturevalue("redis_noproc" if os.environ.get("REDIS_URL") else "redis_proc")
+    kwargs = {k: v for k, v in client.connection_pool.connection_kwargs.items() if k != "path"}
+    return redis.Redis(connection_pool=redis.ConnectionPool(**{**kwargs, "host": proc.host, "port": proc.port}))
+
+
+@pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+class TestListenerSilentPeer:
+    """On Linux the listener's TCP_USER_TIMEOUT finds a Redis that stopped answering in about 40 s,
+    instead of the 15 minutes TCP takes by default: redis-py never waits for the health-check PONG."""
+
+    def test_live_listener_socket_sets_tcp_user_timeout(self, tcp_client: redis.Redis, listening: None) -> None:
+        worker.cached_lookup(tcp_client, namespace="chan_user_timeout")(1)
+        sock = invalidation._listener.pubsub.connection._sock
+        assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT) == 30_000
+
+    def test_listener_resubscribes_after_its_peer_goes_silent(
+        self, tcp_client: redis.Redis, listening: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kw = tcp_client.connection_pool.connection_kwargs
+        relay = _Relay((kw["host"], kw["port"]))
+        try:
+            through_relay = redis.Redis(connection_pool=redis.ConnectionPool(**{**kw, "host": "127.0.0.1", "port": relay.port}))
+            ns = "chan_silent_peer"
+            fn = worker.cached_lookup(through_relay, namespace=ns)
+            fn(1)
+            assert _wait_for(lambda: _subscribers(tcp_client) == 1)
+
+            relay.blackhole()
+            silent_at = time.monotonic()
+            assert _wait_for(lambda: _subscribers(tcp_client) == 0)  # Redis lost the relay's upstream
+            assert _wait_for(lambda: _subscribers(tcp_client) == 1, timeout=60), "listener never came back"
+            elapsed = time.monotonic() - silent_at
+            # Up to 11 s to the next PING (10 s idle, 1 s poll) + 30 s TCP_USER_TIMEOUT + the handler's 1 s
+            # wait is 42 s; without the option it is TCP's retransmission limit, about 15 minutes.
+            assert elapsed < 50, f"resubscribed after {elapsed:.1f} s"
+
+            evictions = _spy_evictions(get_l1_cache(ns), monkeypatch)
+            _run_peer(tcp_client, f"invalidate([1], {ns!r})")
+            assert _wait_for(lambda: len(evictions) == 1, timeout=5)
+            print(f"listener resubscribed {elapsed:.1f} s after its peer went silent")
+        finally:
+            invalidation._stop_listener()
+            relay.close()
 
 
 class TestListenerConfiguration:

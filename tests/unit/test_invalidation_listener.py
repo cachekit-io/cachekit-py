@@ -12,6 +12,7 @@ import logging
 import multiprocessing
 import os
 import queue as queue_mod
+import socket
 import subprocess
 import sys
 import threading
@@ -953,6 +954,39 @@ class TestListenerPool:
         clone = self._backend("redis://cache.example:6379/0").listener_pool()
         assert clone.connection_class is redis.Connection
         assert clone.connection_kwargs["socket_keepalive"] is True
+
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    @pytest.mark.parametrize("url", ["redis://cache.example:6379/0", "rediss://cache.example:6380/0"])
+    def test_tcp_user_timeout_added_to_the_source_options(self, url: str) -> None:
+        backend = self._backend(url)
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {socket.TCP_KEEPIDLE: 60}
+        options = backend.listener_pool().connection_kwargs["socket_keepalive_options"]
+        assert options == {socket.TCP_KEEPIDLE: 60, socket.TCP_USER_TIMEOUT: 30_000}
+        assert backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] == {socket.TCP_KEEPIDLE: 60}
+
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    def test_source_tcp_user_timeout_wins(self) -> None:
+        backend = self._backend("redis://cache.example:6379/0")
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: 5_000}
+        assert backend.listener_pool().connection_kwargs["socket_keepalive_options"] == {socket.TCP_USER_TIMEOUT: 5_000}
+
+    def test_no_tcp_user_timeout_off_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delattr(socket, "TCP_USER_TIMEOUT", raising=False)
+        backend = self._backend("redis://cache.example:6379/0")
+        assert "socket_keepalive_options" not in backend.listener_pool().connection_kwargs
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {1: 2}
+        assert backend.listener_pool().connection_kwargs["socket_keepalive_options"] == {1: 2}  # cloned untouched
+
+    def test_unix_socket_gets_no_keepalive_options(self) -> None:
+        kwargs = self._backend("unix:///run/redis/redis.sock").listener_pool().connection_kwargs
+        assert "socket_keepalive" not in kwargs and "socket_keepalive_options" not in kwargs
+
+    @pytest.mark.parametrize("url", ["redis://cache.example:6379/0", "unix:///run/redis/redis.sock"])
+    def test_backend_pool_is_left_alone(self, url: str) -> None:
+        backend = self._backend(url)
+        before = dict(backend._client.connection_pool.connection_kwargs)
+        backend.listener_pool()
+        assert backend._client.connection_pool.connection_kwargs == before
 
     async def test_clone_inside_a_with_timeout_window_keeps_the_configured_timeout(self) -> None:
         backend = self._backend("redis://cache.example:6379/0")
