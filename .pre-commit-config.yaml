@@ -134,8 +134,13 @@ repos:
           - |
             import re, sys
             P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
-            GIT_SUBJECT = re.compile(r"Merge (?:branch|branches|remote-tracking branch|tag|commit) '[^']*'(?: and '[^']*')*(?: of \S+)?(?: into \S+)?|Revert \".*\"")
-            text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+            KIND = r"(?:branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits)"
+            GIT_SUBJECT = re.compile(rf"Merge {KIND} '[^']*'(?:(?:, | and ){KIND}? ?'[^']*')*(?: of \S+)?(?: into \S+)?|(?:Revert|Reapply) \".*\"")
+            try:
+                with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                sys.exit(f"{sys.argv[1]}: cannot read the commit message: {e}")
             text = text.split("# ------------------------ >8 ------------------------")[0]
             lines = [line for line in text.splitlines() if line.strip() and not re.match(r"#(?:[ \t]|$)", line)]
             if lines and GIT_SUBJECT.fullmatch(lines[0]):
