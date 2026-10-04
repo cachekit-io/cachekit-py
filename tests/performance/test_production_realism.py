@@ -18,7 +18,9 @@ CACHEKIT_MASTER_KEY set, and a present key with no stated intent raises at decor
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -37,7 +39,7 @@ except ImportError:
 from cachekit.config.decorator import DecoratorConfig
 from cachekit.decorators import cache
 
-from .stats_utils import benchmark_with_gc_handling
+from .stats_utils import balanced_order, benchmark_with_gc_handling, difference_band, measure_with_jit_warmup, summarize
 
 # =============================================================================
 # Realistic Test Payloads
@@ -55,6 +57,30 @@ class User:
     settings: dict[str, Any]
     permissions: list[str]
     metadata: dict[str, Any]
+
+
+class DictBackend:
+    """In-process L2: an L1 hit never reaches it, so it isolates the decorator's bytes-in-L1 path from any transport."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+        self.gets = 0
+
+    def get(self, key: str) -> bytes | None:
+        self.gets += 1
+        return self.store.get(key)
+
+    def set(self, key: str, value: bytes, ttl: int | None = None) -> None:
+        self.store[key] = value
+
+    def delete(self, key: str) -> bool:
+        return self.store.pop(key, None) is not None
+
+    def exists(self, key: str) -> bool:
+        return key in self.store
+
+    def health_check(self) -> tuple[bool, dict[str, str]]:
+        return True, {"backend_type": "dict"}
 
 
 def create_complex_dict(size: str = "medium") -> dict[str, Any]:
@@ -269,6 +295,59 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
     print(f"\n✅ DataFrame validated: {result.p95:.0f}μs < {target_us}μs target")
 
 
+@pytest.mark.performance
+def test_decorator_overhead_l1_hit_with_backend() -> None:
+    """Measure the L1 hit users get with an L2 backend configured (Redis, CachekitIO).
+
+    With a backend, L1 holds the serialized bytes and a hit deserializes them, unlike the
+    @cache(backend=None) guards above, whose L1 hands back the stored object. The in-process
+    backend is never reached on a hit, so this times the decorator, the L1 lookup and msgpack
+    deserialization of the 100-user dict, and needs no running service.
+    """
+    payload = create_complex_dict("medium")
+    backend = DictBackend()
+
+    @cache(backend=backend, encryption=False)
+    def get_api_response(request_id: int) -> dict[str, Any]:
+        return payload
+
+    # Prime: the miss writes L2 and L1
+    get_api_response(1)
+    gets_after_prime = backend.gets
+
+    def measure_fn():
+        get_api_response(1)
+
+    result = benchmark_with_gc_handling(
+        name="Decorator + L1 Hit with L2 backend (100-user dict)",
+        fn=measure_fn,
+        iterations_per_run=10_000,
+        runs=5,
+        unit="ns",
+    )
+
+    # Every measured call must have been an L1 hit; one that reached L2 would time the wrong path.
+    assert backend.gets == gets_after_prime, f"{backend.gets - gets_after_prime} measured calls reached L2"
+
+    print("\n" + "=" * 80)
+    print("DECORATOR OVERHEAD - L1 HIT WITH L2 BACKEND CONFIGURED")
+    print("=" * 80)
+    print(result)
+    print("\nContext:")
+    print("  Payload: 100-user nested dict (23.5KB as MessagePack)")
+    print("  Stack:   Decorator + key gen + L1 bytes lookup + msgpack deserialize (L2 never reached)")
+
+    # Smoke ceiling, not a claim. Deserializing 23.5KB dominates: raw p95 measured 431μs (2026-10-04),
+    # against 9μs for the L1-only hit of the same dict, which never deserializes.
+    target_ns = 3_000_000
+    if result.exceeded_target(target_ns):
+        raise AssertionError(f"L1 hit with backend {result.p95:.0f}ns exceeds {target_ns}ns target (p95)")
+
+    print(
+        f"\n✅ L1 hit with backend validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target"
+    )
+
+
 # =============================================================================
 # Test 2: Concurrent Access - Lock Contention
 # =============================================================================
@@ -276,84 +355,79 @@ def test_decorator_overhead_dataframe(medium_dataframe: pd.DataFrame) -> None:
 
 @pytest.mark.performance
 def test_concurrent_cache_access() -> None:
-    """Measure decorator performance under concurrent thread access.
+    """Measure per-call execution time while 10 threads call one key at once.
 
     Tests:
-    - L1 cache RLock contention
+    - L1 cache lock contention
     - Decorator overhead under load
     - Key generator thread safety
-    - Serialization concurrency
 
-    This is realistic production usage - NOT single-threaded benchmarks.
+    Each run starts 10 threads together and keeps all their samples as that run's samples: the
+    threads of one run share the host's state, so the run, not the thread, is the unit summarize
+    infers over. Each sample starts inside the thread's loop, so it is execution time once the
+    thread is scheduled: on a GIL build, a thread that waits for its turn before its first call
+    waits outside every sample. This is not a request-latency or contention figure.
     """
     payload = create_complex_dict("medium")
     num_threads = 10
     iterations_per_thread = 1_000
+    runs = 5
 
     @cache(backend=None, encryption=False)
     def get_data(item_id: int) -> dict[str, Any]:
         return payload
 
-    # Prime cache
-    get_data(1)
+    # Prime the cache and warm up as the single-threaded guards do
+    for _ in range(5_000):
+        get_data(1)
 
-    latencies: list[int] = []
-    lock = threading.Lock()
+    errors: list[Exception] = []
 
-    def worker(thread_id: int) -> None:
-        """Worker thread that hammers the cache."""
-        # Warm up
-        for _ in range(100):
-            get_data(1)
+    def worker(barrier: threading.Barrier, samples: list[float]) -> None:
+        try:
+            for _ in range(100):
+                get_data(1)
+            barrier.wait()  # every thread measures at once, so they contend
+            for _ in range(iterations_per_thread):
+                start = time.perf_counter_ns()
+                get_data(1)  # Same key = L1 hit with lock contention
+                samples.append(time.perf_counter_ns() - start)
+        except Exception as e:
+            # A thread's exception is otherwise only printed; abort so the others leave the barrier.
+            errors.append(e)
+            barrier.abort()
 
-        # Measure
-        for _ in range(iterations_per_thread):
-            start = time.perf_counter_ns()
-            get_data(1)  # Same key = L1 hit with lock contention
-            end = time.perf_counter_ns()
+    per_run: list[list[float]] = []
+    for _ in range(runs):
+        gc.collect()
+        barrier = threading.Barrier(num_threads, timeout=30)
+        thread_samples: list[list[float]] = [[] for _ in range(num_threads)]
+        threads = [threading.Thread(target=worker, args=(barrier, samples)) for samples in thread_samples]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]  # the first is the cause; the rest are the BrokenBarrierErrors it released
+        per_run.append([s for samples in thread_samples for s in samples])
 
-            with lock:
-                latencies.append(end - start)
-
-    # Launch threads
-    threads = []
-    for i in range(num_threads):
-        t = threading.Thread(target=worker, args=(i,))
-        threads.append(t)
-        t.start()
-
-    # Wait for completion
-    for t in threads:
-        t.join()
-
-    # Analyze results
-    import statistics
-
-    mean = statistics.mean(latencies)
-    median = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    p99 = statistics.quantiles(latencies, n=100)[98]
+    result = summarize(f"Concurrent L1 hit, {num_threads} threads, one key", per_run, "ns")
 
     print("\n" + "=" * 80)
     print(f"CONCURRENT ACCESS - {num_threads} THREADS")
     print("=" * 80)
-    print(f"Total operations: {len(latencies):,}")
-    print(f"Mean:             {mean:>10.2f} ns ({mean / 1000:>6.2f} μs)")
-    print(f"Median:           {median:>10.2f} ns ({median / 1000:>6.2f} μs)")
-    print(f"P95:              {p95:>10.2f} ns ({p95 / 1000:>6.2f} μs)")
-    print(f"P99:              {p99:>10.2f} ns ({p99 / 1000:>6.2f} μs)")
+    print(result)
     print("\nContext:")
-    print(f"  Threads:    {num_threads}")
-    print("  Payload:    10KB complex dict")
+    print(f"  Threads:    {num_threads} x {iterations_per_thread:,} calls per run")
+    print("  Payload:    100-user nested dict, @cache(backend=None)")
     print("  Contention: All threads hitting same key (worst case)")
 
     # Conservative target: <500μs p95 under 10-thread contention
-    # (Single-threaded is ~240μs, allow 2x overhead for lock contention)
     target_ns = 500_000
-    if p95 >= target_ns:
-        raise AssertionError(f"Concurrent access p95 {p95:.0f}ns exceeds {target_ns}ns target")
+    if result.exceeded_target(target_ns):
+        raise AssertionError(f"Concurrent access p95 {result.p95:.0f}ns exceeds {target_ns}ns target")
 
-    print(f"\n✅ Concurrent access validated: {p95:.0f}ns ({p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target")
+    print(f"\n✅ Concurrent access validated: {result.p95:.0f}ns ({result.p95 / 1000:.0f}μs) < {target_ns / 1000:.0f}μs target")
 
 
 # =============================================================================
@@ -378,20 +452,20 @@ def test_encryption_overhead() -> None:
 
     payload = create_complex_dict("medium")
 
-    from cachekit.config.nested import EncryptionConfig, L1CacheConfig
+    from cachekit.config.nested import EncryptionConfig
 
-    # Config without encryption
-    config_plain = DecoratorConfig(backend=None, encryption=False)
-
-    # Config with encryption (single-tenant mode)
+    # Both arms get an explicit in-process backend. A backend=None inside config= is not L1-only
+    # mode: the backend would resolve from the default provider (Redis at REDIS_URL) at first call.
+    # With a backend, L1 holds bytes: msgpack in the plain arm, ciphertext in the encrypted arm.
+    backend_plain, backend_encrypted = DictBackend(), DictBackend()
+    config_plain = DecoratorConfig(backend=backend_plain, encryption=False)
     config_encrypted = DecoratorConfig(
-        backend=None,
+        backend=backend_encrypted,
         encryption=EncryptionConfig(
             enabled=True,
             master_key=master_key,
             single_tenant_mode=True,
         ),
-        l1=L1CacheConfig(enabled=True),  # L1 stores encrypted bytes
     )
 
     @cache(config=config_plain)
@@ -405,60 +479,46 @@ def test_encryption_overhead() -> None:
     # Prime both caches
     get_data_plain(1)
     get_data_encrypted(1)
+    gets_after_prime = backend_plain.gets, backend_encrypted.gets
 
-    # Benchmark plain
-    def measure_plain():
-        get_data_plain(1)
+    # Interleave the two arms' runs in a shuffled, balanced order, so slow host drift lands on both
+    # arms instead of loading whichever arm would run second.
+    arms = {"P": lambda: get_data_plain(1), "E": lambda: get_data_encrypted(1)}
+    per_run: dict[str, list[list[float]]] = {"P": [], "E": []}
+    for arm in balanced_order(5, random.Random(0), arms="PE"):
+        gc.collect()
+        samples, _ = measure_with_jit_warmup(arms[arm], 5_000)
+        per_run[arm].append([float(x) for x in samples])
 
-    result_plain = benchmark_with_gc_handling(
-        name="Without encryption",
-        fn=measure_plain,
-        iterations_per_run=5_000,
-        runs=5,
-        unit="ns",
-    )
+    result_plain = summarize("Without encryption", per_run["P"], "ns")
+    result_encrypted = summarize("With encryption (AES-256-GCM)", per_run["E"], "ns")
 
-    # Benchmark encrypted
-    def measure_encrypted():
-        get_data_encrypted(1)
+    # Every measured call must have been an L1 hit; one that reached L2 would time the wrong path.
+    assert (backend_plain.gets, backend_encrypted.gets) == gets_after_prime, "measured calls reached L2"
 
-    result_encrypted = benchmark_with_gc_handling(
-        name="With encryption (AES-256-GCM)",
-        fn=measure_encrypted,
-        iterations_per_run=5_000,
-        runs=5,
-        unit="ns",
-    )
+    ratio = result_encrypted.center / result_plain.center
+    overhead = result_encrypted.center - result_plain.center
 
     print("\n" + "=" * 80)
     print("ENCRYPTION OVERHEAD")
     print("=" * 80)
-    print("\nWithout encryption:")
-    print(f"  Mean:   {result_plain.mean:>10.2f} ns ({result_plain.mean / 1000:>6.2f} μs)")
-    print(f"  P95:    {result_plain.p95:>10.2f} ns ({result_plain.p95 / 1000:>6.2f} μs)")
-    print("\nWith encryption (AES-256-GCM):")
-    print(f"  Mean:   {result_encrypted.mean:>10.2f} ns ({result_encrypted.mean / 1000:>6.2f} μs)")
-    print(f"  P95:    {result_encrypted.p95:>10.2f} ns ({result_encrypted.p95 / 1000:>6.2f} μs)")
-    print("\nOverhead:")
-    print(
-        f"  Absolute: {result_encrypted.p95 - result_plain.p95:>10.2f} ns ({(result_encrypted.p95 - result_plain.p95) / 1000:>6.2f} μs)"
-    )
-    print(f"  Ratio:    {result_encrypted.p95 / result_plain.p95:>10.2f}x")
+    print(result_plain)
+    print(result_encrypted)
+    print("\nOverhead (run medians):")
+    print(f"  Absolute: {overhead:.2f} ± {difference_band(result_plain, result_encrypted):.2f} ns (Welch 95%)")
+    print(f"  Ratio:    {ratio:.2f}x")
     print("\nContext:")
-    print("  Payload:     10KB complex dict")
+    print("  Payload:     100-user nested dict (23.5KB as MessagePack)")
     print("  Algorithm:   AES-256-GCM")
     print("  L1 storage:  Encrypted bytes (no plaintext in memory)")
 
-    # Target: encryption overhead <3x (conservative)
-    # Rust encryption is fast, but we allow headroom for key derivation
-    # Ratio measured 1.0-1.4x (2026-10-03); back-to-back drift: each side's p95 moved 49-95% between
-    # back-to-back runs on a loaded host, so only the ratio is a guard, never either p95 alone.
+    # Target: encryption overhead <3x (conservative), on run medians: the raw p95 of either arm
+    # moved 49-95% between back-to-back runs on a loaded host (2026-10-03).
     max_ratio = 3.0
-    actual_ratio = result_encrypted.p95 / result_plain.p95
-    if actual_ratio >= max_ratio:
-        raise AssertionError(f"Encryption overhead {actual_ratio:.2f}x exceeds {max_ratio}x target")
+    if ratio >= max_ratio:
+        raise AssertionError(f"Encryption overhead {ratio:.2f}x exceeds {max_ratio}x target (run medians)")
 
-    print(f"\n✅ Encryption overhead validated: {actual_ratio:.2f}x < {max_ratio}x target")
+    print(f"\n✅ Encryption overhead validated: {ratio:.2f}x < {max_ratio}x target")
 
 
 # =============================================================================
