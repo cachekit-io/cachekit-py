@@ -2,8 +2,8 @@
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
 Requests go through a real httpx client on a MockTransport whose DELETEs each take ``_DELAY``
-seconds, so invalidation wall time divided by ``_DELAY`` counts the round-trip waves: about
-``ceil(N / 16)``, where the serial per-key path took ``N``.
+seconds. The fan-out tests read its shape from the fake server (which threads sent DELETEs, how
+many were in flight at once), never from wall time, which load stretches.
 """
 
 from __future__ import annotations
@@ -138,7 +138,8 @@ def test_empty_batch_sends_nothing() -> None:
 
 @pytest.mark.parametrize("n", [1, 16, 100])
 def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
-    server = _Server()
+    workers = min(n, _DELETE_FANOUT)
+    server = _Server(hold=workers)
 
     @cache(backend=_backend(server), ttl=60, namespace=f"fanout_sync_{n}", l1_enabled=False)
     def f(x: int) -> int:
@@ -148,12 +149,14 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
         f(i)
     assert len(server.store) == n
 
-    start = time.perf_counter()
     f.invalidate_cache()
-    waves = (time.perf_counter() - start) / _DELAY
 
-    waves_expected = math.ceil(n / _DELETE_FANOUT)
-    assert waves_expected - 0.5 < waves < waves_expected + 2, waves  # serial: n waves
+    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts every
+    # worker in flight on its own pool thread. A key deleted outside the pool (per-key loop, serial
+    # tail) brings an extra thread, or for n = 1 the caller's own; a pool of len(keys) workers
+    # brings more than 16.
+    assert len(server.threads) == workers, len(server.threads)
+    assert threading.get_ident() not in server.threads
     assert sorted(server.deleted) == sorted(set(server.deleted))  # each key DELETEd exactly once
     assert len(server.deleted) == n and server.store == {}
     assert server.peak == min(n, _DELETE_FANOUT)
