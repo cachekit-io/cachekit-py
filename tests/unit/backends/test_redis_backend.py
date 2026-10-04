@@ -235,11 +235,11 @@ class TestRedisPoolSizing:
         assert threads and threads[0] != threading.get_ident()
 
     def test_cachekitio_keeps_its_own_default(self, monkeypatch):
-        """CACHEKIT_CONNECTION_POOL_SIZE also sizes the CachekitIO HTTP pool, whose default stays 10."""
+        """CACHEKIT_CONNECTION_POOL_SIZE also sizes the CachekitIO HTTP pool, whose default stays 32."""
         from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_test_123")  # pragma: allowlist secret
-        assert CachekitIOBackendConfig.from_env().connection_pool_size == 10
+        assert CachekitIOBackendConfig.from_env().connection_pool_size == 32
 
 
 @pytest.mark.unit

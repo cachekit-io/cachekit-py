@@ -7,10 +7,9 @@ StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock, patch
+from collections.abc import Iterator
+from unittest.mock import patch
 
-import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import (
@@ -20,35 +19,21 @@ from cachekit.backends.cachekitio.backend import (
     STALE_TTL_HEADER,
     TTL_HEADER,
     CachekitIOBackend,
+    _parse_fresh_for,
 )
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import StandardCacheHandler, supports_swr
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
-
-_DUMMY_REQUEST = httpx.Request("GET", "https://api.cachekit.io/v1/cache/key")
-
-
-def _response(status: int, content: bytes = b"", headers: dict[str, str] | None = None) -> httpx.Response:
-    response = httpx.Response(status, content=content, headers=headers)
-    response.request = _DUMMY_REQUEST
-    return response
+from tests.utils.cachekitio_fakes import fake_backend
+from tests.utils.cachekitio_fakes import response as _response
 
 
 @pytest.fixture
-def backend() -> CachekitIOBackend:
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def backend() -> Iterator[CachekitIOBackend]:
+    """A backend whose tests patch ``_request_sync``, so its pool must never be reached."""
+    backend, pool = fake_backend(lambda request: _response(500))
+    yield backend
+    assert pool.requests == [], f"a request bypassed the patched _request_sync: {pool.requests}"
 
 
 class TestFreshnessRead:
@@ -65,7 +50,7 @@ class TestFreshnessRead:
         ],
     )
     def test_header_mapping(self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_stale: bool) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result == (b"payload", expected_stale, None)
 
@@ -78,7 +63,7 @@ class TestFreshnessRead:
         err = BackendError(
             "boom",
             error_type=BackendErrorType.TRANSIENT,
-            original_exception=httpx.HTTPStatusError("500", request=_DUMMY_REQUEST, response=_response(500)),
+            original_exception=HTTPStatusError(_response(500)),
         )
         with patch.object(backend, "_request_sync", side_effect=err):
             with pytest.raises(BackendError):
@@ -87,8 +72,8 @@ class TestFreshnessRead:
 
 class TestFreshForRead:
     """X-CacheKit-Fresh-For mapping (LAB-557, spec/saas-api.md#remaining-freshness):
-    absent = None (pre-signal server, legacy); unparseable/negative = 0 (never
-    extend local service on drift — mirrors unrecognized-freshness → stale)."""
+    absent = None (pre-signal server, legacy); anything but 1-7 ASCII digits at most
+    2,592,000 = 0 (never extend local service on drift — mirrors unrecognized-freshness → stale)."""
 
     @pytest.mark.parametrize(
         ("headers", "expected_fresh_for"),
@@ -104,15 +89,37 @@ class TestFreshForRead:
     def test_fresh_for_mapping(
         self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_fresh_for: int | None
     ) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result is not None
         assert result[2] == expected_fresh_for
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, None),  # absent header: no bound
+            ("30", 30),
+            ("0", 0),
+            ("2592000", 2592000),  # exactly the 30-day cap
+            ("", 0),
+            ("+5", 0),  # int() accepts a sign
+            ("1_0", 0),  # int() accepts underscores
+            (" 5", 0),  # int() strips whitespace
+            ("00000005", 0),  # eight digits: the length check runs first
+            ("3000000", 0),  # seven digits, over the cap
+            ("4297559296", 0),  # wraps to 2,592,000 under a 32-bit atoi
+            ("٥", 0),  # Arabic-Indic five: int() and str.isdigit() accept it
+            ("²", 0),  # superscript two: str.isdigit() accepts it
+        ],
+    )
+    def test_parse_fresh_for_grammar(self, value: str | None, expected: int | None) -> None:
+        """LAB-7838: 1-7 ASCII digits at most 2,592,000, else 0 — the header string alone, no response."""
+        assert _parse_fresh_for(value) == expected
+
     def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
         """A stale-window read carries 0 remaining freshness (server emits both headers)."""
         headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             assert backend.get_with_freshness("k") == (b"payload", True, 0)
 
 

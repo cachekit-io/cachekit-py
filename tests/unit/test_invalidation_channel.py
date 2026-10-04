@@ -476,3 +476,20 @@ class TestEventEncoding:
         assert backend._client.published == []
         assert "Invalidation announcement failed" in caplog.text
         assert "\ud800" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("registry_id", "key"),
+        [("ck:reg:sur\ud800ns:00", None), ("ck:reg:sur\ud800ns:00", "sur\ud800ns:k"), ("ck:reg:\udcffns:00", "k")],
+        ids=["registry-id", "registry-id-and-key", "low-surrogate"],
+    )
+    def test_publish_with_an_unencodable_registry_id_never_raises(
+        self, registry_id: str, key: str | None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """LAB-7624: the failure log redacts the registry id, so it must not raise on a surrogate."""
+        backend = TrackingBackend()
+        with caplog.at_level(logging.WARNING, logger=invalidation.__name__):
+            invalidation.publish(backend, registry_id, key)
+        assert backend._client.published == []
+        assert "Invalidation announcement failed" in caplog.text
+        assert hash_utils.redact_cache_key(registry_id) in caplog.text
+        assert registry_id not in caplog.text

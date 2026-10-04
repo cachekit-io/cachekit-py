@@ -4,7 +4,7 @@
 
 > *cachekit.io is in closed beta — [request access](https://cachekit.io)*
 
-`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTP/2. It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
+`CachekitIOBackend` connects to the cachekit.io managed cache API over HTTPS (HTTP/1.1, through urllib3). It implements the full `BaseBackend` protocol plus distributed locking (`LockableBackend`) and TTL inspection (`TTLInspectableBackend`).
 
 ## Setup
 
@@ -188,7 +188,6 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
 **When NOT to use**:
 - Sub-millisecond latency requirements — use Redis or L1 cache
 - Fully offline/air-gapped environments
-- Applications that cannot tolerate HTTP/2 dependency
 
 ## Characteristics
 
@@ -197,34 +196,52 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   hit served by the store is p50 42–45ms (n=200 per run), and a miss, GET then SET, is p50 112–116ms
   (n=50 per run). Your numbers depend on where your client enters Cloudflare, the store's region and
   how many reads the edge serves. No p95 is published yet: these samples are too few to claim one.
-- Sync and async support (hybrid client architecture)
-- Connection pooling built-in (default: 10 connections). Backends used on the same thread with the
-  same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
-  when the last one is released; the async pool is not, and Python reclaims its sockets with a
-  `ResourceWarning` each. Create one backend per key and reuse it
-- Idle connections stay pooled for up to 390 s, just under Cloudflare's 400 s idle close, so a request
-  after a pause of up to 390 s reuses its connection instead of paying a new TCP and TLS handshake
-  (about 25–30 ms from a client entering at MEL). Each pooled connection sends TCP keepalive probes
-  after 60 s idle (every 10 s, 3 probes), which keeps NAT gateway mappings alive (AWS NAT Gateway drops
-  idle flows at 350 s, Azure at 4 min). If a network path does die, the probes find it in about 90 s, and
-  the next request no longer waits out the 5 s timeout: over HTTP/1.1 it reconnects, and over HTTP/2 it
-  fails at once and that call is a cache miss. Probes cannot run while a process is suspended (a frozen
-  serverless runtime, a stopped container), so the first request after such a pause can still wait out
-  the timeout on a dead connection and miss. With any proxy setting in the
-  environment (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the rest), requests go through httpx's own
-  transports so the proxy is honoured, without probes, and idle connections keep httpx's 5 s default:
-  a proxy's own idle limit is unknown, and a connection it dropped silently would cost a timeout and a miss
-- Safe across event loops: the async pool belongs to the thread's running event loop and is built on
-  the first async call, so one backend can serve `asyncio.run()` per job, Celery tasks, or a loop per
-  thread. Each new loop opens a new connection, and its first lock or TTL call succeeds on the first
-  attempt. A sync-only caller never builds an async client
+- Sync and async support on one client: an async method runs its request on a worker thread
+  (`asyncio.to_thread`, the event loop's default executor), so it holds no per-loop state, and one
+  backend serves `asyncio.run()` per job, Celery tasks, or a loop per thread
+- Connection pooling built-in (default: 32 connections): one urllib3 pool per backend configuration and
+  process, shared by every thread that calls the backend: a thread pool, every async-decorator L2
+  operation and every async backend method, which run on the default executor's threads (at most 32).
+  Each request takes its own HTTP/1.1 connection, so threads never share one, and the pool is
+  thread-safe with and without the GIL. Each connection costs one TCP and TLS handshake on first use,
+  then stays pooled. A request that finds every pooled connection in use opens one more rather than
+  waiting for another thread's request to finish; urllib3 closes that connection when it comes back to a
+  full pool, and logs a `Connection pool is full, discarding connection` warning. Each such request pays
+  a new handshake, so set `connection_pool_size` to at least the number of threads that call one backend
+  at once. Whole-function invalidation sends up to 16 deletes at once, never more than the pool size. Backends
+  with the same key, URL, timeout and pool size share one pool while any of them is alive, and the pool
+  is closed when the last one is released. Create one backend per key and reuse it
+- Idle connections stay pooled until the server closes them: urllib3 has no client-side idle expiry.
+  Cloudflare documents a 400 s idle close for client connections; on the dev environment, with the
+  keepalive probes below running, pooled connections were still reused after idle gaps of 405–600 s
+  (2026-10-04, 6 threads, 0 errors and 0 new connections). Either way, urllib3 checks a pooled
+  connection for a close before reusing it, so a connection the server closed while it sat idle is
+  replaced. A close that races the request itself fails that request, as a miss. Each pooled connection sends TCP keepalive probes after 60 s idle (every 10 s, 3 probes),
+  which keeps NAT gateway mappings alive (AWS NAT Gateway drops idle flows at 350 s, Azure at 4 min). If
+  a network path does die, the probes find it in about 90 s, and the next request reconnects instead of
+  waiting out the timeout. Probes cannot run while a process is suspended (a frozen serverless runtime,
+  a stopped container), so the first request after such a pause can still wait out the timeout on a
+  dead connection and miss
+- Proxy settings in the environment are honoured: `HTTPS_PROXY`, then `ALL_PROXY`, unless `NO_PROXY`
+  covers the API host (the macOS and Windows system proxy settings too). A proxy URL with no scheme is
+  taken as `http://`, and credentials in it are sent as `Proxy-Authorization` on the `CONNECT`; the
+  bearer key only travels inside the TLS tunnel. Proxied connections send keepalive probes too
+- Server certificates are verified against the system trust store (OpenSSL's default CA paths, which
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` override). cachekit does not ship a CA bundle of its own: on a host
+  without one, such as a container image without `ca-certificates`, or a python.org macOS build that has
+  not run `Install Certificates.command`, every request fails certificate verification and is a cache
+  miss. Install the system bundle, or point `SSL_CERT_FILE` at one (`python -m certifi` prints the
+  path of certifi's, if it is installed)
 - Fork-safe connections: a forked child (Gunicorn `--preload`, Celery prefork, `multiprocessing` fork, uWSGI)
   opens its own connections on its first request and never reuses its parent's, so a backend built
-  before the fork works in every worker. One exception, for a fork made from C that skips Python's
-  at-fork hooks (uWSGI without `--py-call-osafterfork`): if a parent thread was inside `logging` at
-  that moment, the child's first request can hang on logging's lock. Pass `--py-call-osafterfork` to
-  avoid it; [Free-threading](../free-threading.md) gives the detail
-- Every request identifies the SDK with a `User-Agent: cachekit-py/<version> httpx/<version>` header,
+  before the fork works in every worker. A child runs async calls on an event loop of its own
+  (`asyncio.run`), not its parent's loop object. One exception, for a fork made from C that skips Python's
+  at-fork hooks (uWSGI without `--py-call-uwsgi-fork-hooks`): if a parent thread was inside `logging`
+  at that moment, the child's first request can hang on logging's lock. Run uWSGI with
+  `--enable-threads --py-call-uwsgi-fork-hooks` to avoid it, as
+  [Forked Processes](../features/l1-invalidation.md#forked-processes) explains;
+  [Free-threading](../free-threading.md) gives the detail
+- Every request identifies the SDK with a `User-Agent: cachekit-py/<version> urllib3/<version>` header,
   taken from the installed packages, so cachekit.io can attribute traffic to an SDK release
 - Distributed locking via server-side Durable Objects
 - TTL inspection and in-place refresh supported

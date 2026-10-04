@@ -458,7 +458,7 @@ class _UnstartedThread(threading.Thread):
 
 @needs_c_fork
 def test_child_of_a_c_level_fork_records_synchronously_and_starts_no_thread():
-    """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-osafterfork."""
+    """A fork made from C skips Python's after-fork handling, as uWSGI's does without --py-call-uwsgi-fork-hooks."""
     namespace = f"fork-hookless-{uuid.uuid4().hex}"
     collector = AsyncMetricsCollector(flush_interval=0.05, sync_mode=False)
     inherited_worker, q = collector._worker_thread, collector._queue

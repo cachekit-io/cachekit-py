@@ -12,6 +12,7 @@ import logging
 import multiprocessing
 import os
 import queue as queue_mod
+import socket
 import subprocess
 import sys
 import threading
@@ -954,6 +955,39 @@ class TestListenerPool:
         assert clone.connection_class is redis.Connection
         assert clone.connection_kwargs["socket_keepalive"] is True
 
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    @pytest.mark.parametrize("url", ["redis://cache.example:6379/0", "rediss://cache.example:6380/0"])
+    def test_tcp_user_timeout_added_to_the_source_options(self, url: str) -> None:
+        backend = self._backend(url)
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {socket.TCP_KEEPIDLE: 60}
+        options = backend.listener_pool().connection_kwargs["socket_keepalive_options"]
+        assert options == {socket.TCP_KEEPIDLE: 60, socket.TCP_USER_TIMEOUT: 30_000}
+        assert backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] == {socket.TCP_KEEPIDLE: 60}
+
+    @pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux only")
+    def test_source_tcp_user_timeout_wins(self) -> None:
+        backend = self._backend("redis://cache.example:6379/0")
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {socket.TCP_USER_TIMEOUT: 5_000}
+        assert backend.listener_pool().connection_kwargs["socket_keepalive_options"] == {socket.TCP_USER_TIMEOUT: 5_000}
+
+    def test_no_tcp_user_timeout_off_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delattr(socket, "TCP_USER_TIMEOUT", raising=False)
+        backend = self._backend("redis://cache.example:6379/0")
+        assert "socket_keepalive_options" not in backend.listener_pool().connection_kwargs
+        backend._client.connection_pool.connection_kwargs["socket_keepalive_options"] = {1: 2}
+        assert backend.listener_pool().connection_kwargs["socket_keepalive_options"] == {1: 2}  # cloned untouched
+
+    def test_unix_socket_gets_no_keepalive_options(self) -> None:
+        kwargs = self._backend("unix:///run/redis/redis.sock").listener_pool().connection_kwargs
+        assert "socket_keepalive" not in kwargs and "socket_keepalive_options" not in kwargs
+
+    @pytest.mark.parametrize("url", ["redis://cache.example:6379/0", "unix:///run/redis/redis.sock"])
+    def test_backend_pool_is_left_alone(self, url: str) -> None:
+        backend = self._backend(url)
+        before = dict(backend._client.connection_pool.connection_kwargs)
+        backend.listener_pool()
+        assert backend._client.connection_pool.connection_kwargs == before
+
     async def test_clone_inside_a_with_timeout_window_keeps_the_configured_timeout(self) -> None:
         backend = self._backend("redis://cache.example:6379/0")
         configured = backend._client.connection_pool.connection_kwargs["socket_timeout"]
@@ -976,11 +1010,14 @@ class TestListenerPool:
 
 @pytest.mark.unit
 class TestUwsgiWarning:
-    """One WARNING under uWSGI when no option runs Python's at-fork hooks in workers."""
+    """One WARNING under uWSGI unless py-call-uwsgi-fork-hooks runs Python's at-fork hooks in workers."""
 
     @pytest.fixture
     def fake_uwsgi(self, monkeypatch: pytest.MonkeyPatch) -> Any:
-        module = types.ModuleType("uwsgi")
+        """uWSGI's module as the master sees it, while it loads the app before forking any worker."""
+        module: Any = types.ModuleType("uwsgi")
+        module.masterpid = os.getpid
+        module.worker_id = lambda: 0
         monkeypatch.setitem(sys.modules, "uwsgi", module)
         return module
 
@@ -989,23 +1026,67 @@ class TestUwsgiWarning:
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         (record,) = caplog.records
-        assert "py-call-uwsgi-fork-hooks" in record.getMessage() and "lazy-apps" in record.getMessage()
+        assert record.getMessage().endswith("Run uWSGI with --enable-threads --py-call-uwsgi-fork-hooks (uWSGI 2.0.21+).")
 
-    @pytest.mark.parametrize("option", ["py-call-uwsgi-fork-hooks", "py-call-osafterfork", "lazy-apps", "lazy"])
-    def test_any_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
-        fake_uwsgi.opt = {"master": True, option: True}
+    @pytest.mark.parametrize("option", ["py-call-osafterfork", "lazy-apps", "lazy"])
+    def test_no_other_fork_option_silences_it(self, option: str, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        """py-call-osafterfork aborts every worker on 3.13+; under lazy-apps a worker's thread can hang.
+
+        The master imports cachekit under lazy-apps only when something it loads (shared-import) imports it.
+        """
+        fake_uwsgi.opt = {"master": True, "enable-threads": True, option: True}
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert len(caplog.records) == 1
+
+    @pytest.mark.parametrize("extra", [{}, {"lazy-apps": True}])
+    def test_fork_hooks_silence_it(self, extra: dict[str, bool], fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        fake_uwsgi.opt = {"master": True, "py-call-uwsgi-fork-hooks": True, **extra}
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
         assert caplog.records == []
 
-    def test_never_from_a_child_forked_without_hooks(
-        self, fake_uwsgi: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize(
+        ("masterpid", "worker_id"),
+        [(-1, 1), (-1, 0), (0, 1)],
+        ids=["worker", "mule-or-spooler", "worker-without-master"],
+    )
+    def test_never_from_a_process_uwsgi_forked(
+        self, masterpid: int, worker_id: int, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
-        fake_uwsgi.opt = {}
-        monkeypatch.setattr(l1_cache, "_import_pid", -1)
-        monkeypatch.setattr(l1_cache, "_hooked_pid", None)
+        """A process uWSGI forked ran no at-fork hook, so a log call there can hang on a lock a master thread held.
+
+        That includes a worker that first imports cachekit after the fork (lazy-apps), which looks like a fresh
+        process to l1_cache._forked_without_hooks.
+        """
+        fake_uwsgi.opt = {"lazy-apps": True}
+        fake_uwsgi.masterpid = lambda: masterpid
+        fake_uwsgi.worker_id = lambda: worker_id
         with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
             invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert caplog.records == []
+
+    def test_warns_in_the_loading_process_without_a_master(self, fake_uwsgi: Any, caplog: pytest.LogCaptureFixture) -> None:
+        fake_uwsgi.opt = {"processes": b"4"}
+        fake_uwsgi.masterpid = lambda: 0  # no --master: the process that loads the app forks the workers
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()
+        assert len(caplog.records) == 1
+
+    @pytest.mark.parametrize(
+        "foreign",
+        [
+            types.SimpleNamespace(opt={}),  # has opt, but not uWSGI's module
+            types.SimpleNamespace(opt={}, masterpid=lambda: int("not a pid")),  # its API raises ValueError
+        ],
+        ids=["no-api", "api-raises"],
+    )
+    def test_silent_without_the_uwsgi_api(
+        self, foreign: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "uwsgi", foreign)
+        with caplog.at_level(logging.WARNING, logger=INVALIDATION_LOGGER):
+            invalidation._warn_if_uwsgi_skips_fork_hooks()  # no raise: import cachekit must not break
         assert caplog.records == []
 
     def test_silent_outside_uwsgi(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -1028,9 +1109,9 @@ class TestUwsgiWarning:
 
     def test_import_warns_once(self) -> None:
         code = (
-            "import logging, sys, types\n"
+            "import logging, os, sys, types\n"
             "logging.basicConfig(level=logging.WARNING, format='%(name)s %(message)s')\n"
-            "sys.modules['uwsgi'] = types.SimpleNamespace(opt={})\n"
+            "sys.modules['uwsgi'] = types.SimpleNamespace(opt={}, masterpid=os.getpid, worker_id=lambda: 0)\n"
             "import cachekit, cachekit.invalidation\n"
             "from cachekit import cache\n"
         )
@@ -1042,4 +1123,4 @@ class TestUwsgiWarning:
             timeout=60,
         )
         assert proc.returncode == 0, proc.stderr
-        assert proc.stderr.count("uWSGI forks its workers") == 1, proc.stderr
+        assert proc.stderr.count("uWSGI is running without py-call-uwsgi-fork-hooks") == 1, proc.stderr

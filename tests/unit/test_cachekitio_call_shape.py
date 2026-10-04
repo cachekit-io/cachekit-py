@@ -1,16 +1,27 @@
 """Call shape of each decorated path over CachekitIO: which HTTP requests block the caller (LAB-7054).
 
-Each test runs one decorated call against a fake SaaS behind a real ``httpx`` client and pins two
-things: the ordered list of requests the caller waits on, and the set of requests that run in the
-background after it returns. A path that gains a blocking round trip, or a background request that
-becomes blocking, changes the list and fails here. A round-trip fix edits the pinned list in its own
-PR, and that diff is its proof.
+Each test runs one decorated call against a fake SaaS behind the backend's real urllib3 client, on a
+fake pool (tests/utils/cachekitio_fakes.py), and pins two things: the ordered list of requests the
+caller waits on, and the set of requests that run in the background after it returns. A path that gains
+a blocking round trip, or a background request that becomes blocking, changes the list and fails here.
+A round-trip fix edits the pinned list in its own PR, and that diff is its proof.
 
-Blocking is decided by state, never by a clock. Async: every request is parked on a gate. Once the
-event loop has run everything it can, a parked request blocks if the caller is still pending, and is
-background if the caller has returned. Sync: a request blocks if it runs on the caller's thread, where
-the caller cannot return until it does; a request on any other thread is held until the caller has
-returned, so it can only be background.
+Blocking is decided by state, never by a clock: a request blocks if the caller is still waiting on it.
+The thread a request arrives on cannot tell that for an async caller. The async backend methods send on
+the backend's one client through ``asyncio.to_thread``, so the caller's own requests and its background tasks'
+all arrive on worker threads. The gate goes by what the caller is doing instead.
+
+Async: every request is parked on the gate, its worker thread held until the event loop releases it.
+Once the loop has run everything it can and the caller is still pending, the caller waits on a parked
+request: the oldest is released as blocking. With none parked yet, the gate waits for one to arrive or
+for the caller to finish, because a request still on its way through a worker thread has not parked.
+Once the caller has returned, whatever it left running is background. A task the caller spawns cannot
+send before the caller's current step ends, and on every pinned path the caller returns in that step.
+A caller that kept awaiting after spawning one would let the task's request read as blocking: the pinned
+list fails, it does not pass by mistake.
+
+Sync: a request blocks if it runs on the caller's thread, where the caller cannot return until it does;
+a request on any other thread is held until the caller has returned, so it can only be background.
 
 Only single-caller paths are pinned exactly. Herd paths (several callers on one key) vary in lock-poll
 count and order from run to run, so they belong to invariant tests, not here.
@@ -21,24 +32,23 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-import os
 import threading
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import FRESH_FOR_HEADER, FRESHNESS_HEADER, CachekitIOBackend
+from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
 
 pytestmark = pytest.mark.unit
 
-_API_URL = "https://api.cachekit.io"
 _API_KEY = "ck_test_call_shape"  # pragma: allowlist secret — fake key, test fixture
 _PREFIX = "/v1/cache/"
 # Loop turns a parked request is given to show it is not awaited. The paths below need a few turns per
@@ -55,48 +65,53 @@ class _FakeSaaS:
     store: dict[str, bytes] = field(default_factory=dict)
     stale: bool = False  # serve hits labelled stale (X-CacheKit-Freshness: stale)
     fail_reads: bool = False  # answer every entry GET with a 503
+    fail_next_reads: int = 0  # answer this many entry GETs with a 503, then serve normally
     fresh_for: int | None = 60  # X-CacheKit-Fresh-For on a fresh hit; None omits the header (pre-signal server)
     ttl_left: int = 1  # GET .../ttl answer; under the refresh threshold, so a refresh is due
     lock_held_for: int = 0  # answer this many lock POSTs "held elsewhere" ({"lock_id": null})
     filled_by_holder: bytes | None = None  # stored when the other holder's lock is first reported
 
-    def respond(self, request: httpx.Request) -> httpx.Response:
+    def respond(self, request: FakeRequest) -> HTTPResponse:
         key, op = _parse(request)
         if op == "GET":
             if self.fail_reads:
-                return httpx.Response(503)
+                return response(503)
+            if self.fail_next_reads:
+                self.fail_next_reads -= 1
+                return response(503)
             if key not in self.store:
-                return httpx.Response(404)
+                return response(404)
             if self.stale:
                 headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
             else:
                 headers = {} if self.fresh_for is None else {FRESH_FOR_HEADER: str(self.fresh_for)}
-            return httpx.Response(200, content=self.store[key], headers=headers)
+            return response(200, self.store[key], headers=headers)
         if op == "PUT":
-            self.store[key] = request.content
-            return httpx.Response(200)
+            assert request.body is not None, "a PUT carries the value"
+            self.store[key] = request.body
+            return response(200)
         if op == "DELETE":
             self.store.pop(key, None)
-            return httpx.Response(200)
+            return response(200)
         if op == "POST /lock":
             if self.lock_held_for:
                 self.lock_held_for -= 1
                 if self.filled_by_holder is not None:
                     self.store[key] = self.filled_by_holder
-                return httpx.Response(200, json={"lock_id": None})
-            return httpx.Response(200, json={"lock_id": "lock-1"})
+                return response(200, json={"lock_id": None})
+            return response(200, json={"lock_id": "lock-1"})
         if op == "GET /ttl":
-            return httpx.Response(200, content=json.dumps({"ttl": self.ttl_left}).encode())
-        return httpx.Response(200)  # DELETE /lock, PATCH /ttl, HEAD
+            return response(200, json.dumps({"ttl": self.ttl_left}).encode())
+        return response(200)  # DELETE /lock, PATCH /ttl, HEAD
 
 
-def _parse(request: httpx.Request) -> tuple[str, str]:
+def _parse(request: FakeRequest) -> tuple[str, str]:
     """Split a request into (cache key, op label), e.g. ``POST .../k/lock`` -> ``("k", "POST /lock")``.
 
-    A path outside the cache API is labelled with the whole path instead of raising: inside a transport an
+    A path outside the cache API is labelled with the whole path instead of raising: inside the pool an
     exception becomes a BackendError the decorator swallows, while an odd label fails the pinned list.
     """
-    path = request.url.raw_path.decode()
+    path = request.path
     if not path.startswith(_PREFIX):
         return "", f"{request.method} {path}"
     encoded_key, _, suffix = path[len(_PREFIX) :].partition("/")
@@ -110,14 +125,14 @@ class _Shape:
 
 
 class _Gate:
-    """Transport handlers for both httpx clients, classifying each request as blocking or background."""
+    """The fake pool's handler, classifying each request as blocking or background."""
 
     def __init__(self, saas: _FakeSaaS) -> None:
         self.saas = saas
         self.shape = _Shape()
         self.errors: list[str] = []  # a handler's failure would surface as a swallowed BackendError
         self._respond_lock = threading.Lock()
-        # Async run: requests from either client wait here until run_async releases them.
+        # Async run: every request, each on a worker thread, waits here until run_async releases it.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._parked: list[tuple[str, Callable[[], None]]] = []
         self._arrived = asyncio.Event()
@@ -125,7 +140,7 @@ class _Gate:
         self._caller: threading.Thread | None = None
         self._caller_returned = threading.Event()
 
-    def _respond(self, request: httpx.Request) -> httpx.Response:
+    def _respond(self, request: FakeRequest) -> HTTPResponse:
         with self._respond_lock:
             return self.saas.respond(request)
 
@@ -133,10 +148,10 @@ class _Gate:
         self._parked.append((op, release))
         self._arrived.set()
 
-    def sync_handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: FakeRequest) -> HTTPResponse:
         op = _parse(request)[1]
         if self._loop is not None:
-            # An async caller reaching the sync client, e.g. through asyncio.to_thread: park it like any other.
+            # An async run: the request comes from a worker thread (asyncio.to_thread), never the loop's own.
             released = threading.Event()
             self._loop.call_soon_threadsafe(self._park, op, released.set)
             if not released.wait(_GUARD_SECONDS):
@@ -147,12 +162,6 @@ class _Gate:
             if not self._caller_returned.wait(_GUARD_SECONDS):
                 self.errors.append(f"the caller waited on {op}, sent from another thread")
             self.shape.background.append(op)
-        return self._respond(request)
-
-    async def async_handler(self, request: httpx.Request) -> httpx.Response:
-        released = asyncio.Event()
-        self._park(_parse(request)[1], released.set)
-        await released.wait()
         return self._respond(request)
 
     def run_sync(self, call: Callable[[], Any]) -> _Shape:
@@ -174,6 +183,7 @@ class _Gate:
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
         self._loop = asyncio.get_running_loop()
+        executor = _track_default_executor(self._loop)
         try:
             caller = asyncio.ensure_future(call)
             while True:
@@ -186,7 +196,8 @@ class _Gate:
                     shape.blocking.append(op)
                     release()
                 else:
-                    # Nothing parked: the caller is computing, polling or in a worker thread.
+                    # Nothing parked: the caller is computing, polling, or its request is still on the way
+                    # through a worker thread.
                     await self._next_event({caller})
             caller.result()
             # The caller has returned: whatever it left running is background. Drain it to the end.
@@ -198,7 +209,9 @@ class _Gate:
                         release()
                     self._parked.clear()
                     continue
-                if not (pending := asyncio.all_tasks() - {asyncio.current_task()}):
+                # Background work is a Task, or an executor job (the lock release runs in a thread).
+                tasks = asyncio.all_tasks() - {asyncio.current_task()}
+                if not (pending := tasks | {asyncio.wrap_future(job) for job in executor.unfinished()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -206,7 +219,7 @@ class _Gate:
         assert not self.errors, self.errors
         return shape
 
-    async def _next_event(self, tasks: set[asyncio.Task[Any]] | set[asyncio.Future[Any]]) -> None:
+    async def _next_event(self, tasks: set[Any]) -> None:
         """Wait until one of ``tasks`` finishes or a request is parked."""
         self._arrived.clear()
         if self._parked:
@@ -216,6 +229,32 @@ class _Gate:
         arrived.cancel()
         await asyncio.gather(arrived, return_exceptions=True)
         assert done, "nothing finished and no request arrived"
+
+
+class _TrackingExecutor(ThreadPoolExecutor):
+    """The default executor, remembering its unfinished jobs so the gate can wait for background thread work."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._jobs: set[Future[Any]] = set()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        job = super().submit(fn, *args, **kwargs)
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
+        return job
+
+    def unfinished(self) -> list[Future[Any]]:
+        return [job for job in list(self._jobs) if not job.done()]
+
+
+def _track_default_executor(loop: asyncio.AbstractEventLoop) -> _TrackingExecutor:
+    executor = getattr(loop, "_call_shape_executor", None)
+    if executor is None:
+        executor = _TrackingExecutor()
+        loop.set_default_executor(executor)
+        loop._call_shape_executor = executor  # type: ignore[attr-defined]
+    return executor
 
 
 async def _settle() -> None:
@@ -234,22 +273,10 @@ def gate(saas: _FakeSaaS) -> _Gate:
 
 
 @pytest.fixture
-def backend(gate: _Gate) -> Iterator[CachekitIOBackend]:
-    """A CachekitIOBackend whose real httpx clients reach the fake SaaS through ``gate``."""
-    sync_client = httpx.Client(base_url=_API_URL, transport=httpx.MockTransport(gate.sync_handler))
-    async_client = httpx.AsyncClient(base_url=_API_URL, transport=httpx.MockTransport(gate.async_handler))
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=sync_client),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=async_client),
-        ),
-    ):
-        yield CachekitIOBackend(api_url=_API_URL, api_key=_API_KEY)
-    sync_client.close()
+def backend(gate: _Gate) -> CachekitIOBackend:
+    """A CachekitIOBackend whose real client reaches the fake SaaS through ``gate``, sync and async alike."""
+    backend, _ = fake_backend(gate.handler, api_key=_API_KEY)
+    return backend
 
 
 def _op_counts(shape: _Shape) -> dict[str, int]:
@@ -325,7 +352,7 @@ class TestSyncCallShape:
 
 
 class TestAsyncCallShape:
-    """Async decorators: a miss takes the SaaS lock and re-reads before computing."""
+    """Async decorators: a miss takes the SaaS lock, re-reads only if it had to wait or its read failed, and releases in the background."""
 
     async def test_cold_miss(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60)
@@ -333,7 +360,8 @@ class TestAsyncCallShape:
             return x * 2
 
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT", "DELETE /lock"])
+        # The first lock POST won after a clean miss: no re-read, and the release is not waited on (LAB-7064).
+        assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, l1_enabled=False)
@@ -365,7 +393,8 @@ class TestAsyncCallShape:
         saas.filled_by_holder = saas.store.pop(_only_key(saas))
         saas.lock_held_for = 1
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET", "DELETE /lock"])
+        # A waited grant keeps the double-check read: the holder may have filled the key meanwhile.
+        assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET"], background=["DELETE /lock"])
 
     # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller (LAB-7074).
 
@@ -458,7 +487,7 @@ class TestAsyncCallShape:
         assert _op_counts(shape) == {"GET": 2, "PATCH /ttl": 2}
 
     async def test_invalidate(self, backend: CachekitIOBackend, gate: _Gate) -> None:
-        """ainvalidate_cache sends its DELETE from a worker thread through the sync client, and awaits it."""
+        """ainvalidate_cache sends its DELETE from a worker thread, and awaits it."""
 
         @cache(backend=backend, ttl=60)
         async def fn(x: int) -> int:
@@ -473,6 +502,22 @@ class TestAsyncCallShape:
         async def fn(x: int) -> int:
             return x * 2
 
-        saas.fail_reads = True  # a failed read is treated as a miss: the full locked-miss sequence follows
+        saas.fail_reads = True  # a failed read is treated as a miss, and is read again once the lock is won
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT", "DELETE /lock"])
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT"], background=["DELETE /lock"])
+
+    async def test_failed_read_of_a_live_entry(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
+        """The primary read fails on an entry that is still live, and the first lock POST wins. The post-lock
+        read is the only retry, so it still runs and serves the entry: no recompute, no PUT (LAB-7064)."""
+        calls: list[int] = []
+
+        @cache(backend=backend, ttl=60, l1_enabled=False)
+        async def fn(x: int) -> int:
+            calls.append(x)
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.fail_next_reads = 1
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert calls == [1]

@@ -486,13 +486,13 @@ class L1CacheManager:
         stopped; a one-shot thread frees the L1 states the child inherited instead
         (_release_inherited_states). Decorated functions get() before
         they put(), so _empty_caches_after_fork gives every cache a fresh state, and so a free lock,
-        before that first get() on os.fork() servers; without at-fork hooks (uWSGI unless
-        --py-call-osafterfork) a get() on an orphaned cache lock before the first put still hangs.
+        before that first get() on os.fork() servers; without at-fork hooks (uWSGI without
+        --py-call-uwsgi-fork-hooks) a get() on an orphaned cache lock before the first put still hangs.
         The take-over resets cache locks only when that hook did not run in this PID
         (_forked_without_hooks): after it, a held cache lock belongs to a live child thread. Without
         hooks it cannot tell a dead holder from a live child thread holding a cache lock past the
         1 s probe, and then drops that cache's entries; the holder finishes unharmed on the state
-        it bound (L1Cache._reset_lock_after_fork). --py-call-osafterfork avoids that drop too.
+        it bound (L1Cache._reset_lock_after_fork). --py-call-uwsgi-fork-hooks avoids that drop too.
         A child no hook reached was forked from C, which also skips CPython's own after-fork repair:
         a thread started there can hang in Thread.start() or crash the interpreter. So the take-over
         starts no thread in it, start_background_cleanup refuses there too (also for a manager
@@ -653,7 +653,7 @@ _managers: "weakref.WeakSet[L1CacheManager]" = weakref.WeakSet()
 # The processes a thread may start in: the one that imported this module, and the latest child
 # _empty_caches_after_fork ran in. Any other PID was forked from C, without at-fork hooks.
 # So import cachekit before any fork made from C: a process that first imports it after such a fork
-# (uWSGI --lazy-apps without --py-call-osafterfork) is taken for safe, and cleanup starts a thread there.
+# (uWSGI --lazy-apps without --py-call-uwsgi-fork-hooks) is taken for safe, and cleanup starts a thread there.
 # No check made at import can tell it apart: a uWSGI master forks from its main thread, so the child's
 # thread idents match a fresh process's, and a fresh process may import on any thread.
 _import_pid = os.getpid()
@@ -665,7 +665,7 @@ _inherited_states: list[_L1State] = []
 
 
 def _forked_without_hooks() -> bool:
-    """Whether this process was forked without at-fork hooks (uWSGI unless --py-call-osafterfork)."""
+    """Whether this process was forked without at-fork hooks (uWSGI without --py-call-uwsgi-fork-hooks)."""
     pid = os.getpid()
     return pid != _import_pid and pid != _hooked_pid
 

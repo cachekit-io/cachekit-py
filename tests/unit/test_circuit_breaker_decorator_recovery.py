@@ -12,8 +12,8 @@ together kept a breaker opened by the decorator from ever closing again:
 3. The default ``CircuitBreakerConfig`` admitted 1 HALF_OPEN probe but needed
    3 successes to close.
 4. A HALF_OPEN cycle ended only on a recorded outcome, so probes that exit
-   without one (cancellation, fail-closed raises, the async lock path's
-   re-raise) held the breaker HALF_OPEN for good.
+   without one (cancellation, fail-closed raises, an interop rejection on the
+   async lock path) held the breaker HALF_OPEN for good.
 
 A rejected async call also escaped as ``UnboundLocalError``; it now runs the
 function uncached, as a sync one does.
@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, Optional
@@ -37,6 +39,7 @@ import pytest
 import time_machine
 
 from cachekit import cache
+from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators import wrapper as wrapper_module
@@ -154,6 +157,13 @@ async def _open(fn: Callable[[str], Any], resolver: _FlakyResolver, breaker: Cir
         assert await _call(fn, f"trip-{i}") == f"v:trip-{i}"  # degrades to uncached, never raises
     assert breaker.state == CircuitState.OPEN
     resolver.down = False
+
+
+def _trip(breaker: CircuitBreaker) -> None:
+    """Open the breaker directly, for a decorator built with an explicit backend."""
+    for _ in range(breaker.config.failure_threshold):
+        breaker.record_failure()
+    assert breaker.state == CircuitState.OPEN
 
 
 async def _recovers(fn: Callable[[str], Any], backend: _CountingBackend, breaker: CircuitBreaker) -> None:
@@ -339,37 +349,25 @@ class TestRecovery:
 class TestKnobPathRecovery:
     """``@cache(circuit_breaker=nested CircuitBreakerConfig(...))`` recovers on the configured cooldown.
 
-    Uses an explicit backend and the public ``get_health_status()``. The breaker is
-    tripped by function exceptions, which reach ``record_failure`` with an explicit
-    backend today. Recovery closes only if the nested probe budget reaches
+    Reads state through the public ``get_health_status()``. The breaker is tripped by
+    client-creation failures, as ``_open`` does: the function's own exceptions never
+    count. Recovery closes only if the nested probe budget reaches
     ``success_threshold``, so this also pins the nested default.
     """
 
     _KNOBS = NestedCircuitBreakerConfig(failure_threshold=2, recovery_timeout=5.0)  # far below the 30s default
 
-    async def test_recovers_after_configured_recovery_timeout(self, is_async, backend, clock):
+    async def test_recovers_after_configured_recovery_timeout(self, is_async, resolver, backend, clock):
         executions: list[str] = []
-
-        def body(x: str) -> str:
-            executions.append(x)
-            if x.startswith("boom"):
-                raise RuntimeError("function failed")
-            return f"v:{x}"
-
-        async def async_body(x: str) -> str:
-            return body(x)
-
-        fn = cache(
-            ttl=300, l1_enabled=False, namespace=f"lab5326-knob-{is_async}", backend=backend, circuit_breaker=self._KNOBS
-        )(async_body if is_async else body)
+        fn = _decorate(f"lab5326-knob-{is_async}", is_async=is_async, executions=executions, circuit_breaker=self._KNOBS)
 
         def breaker_state() -> str:
             return fn.get_health_status()["circuit_breaker"]["state"]
 
         for i in range(self._KNOBS.failure_threshold):
-            with pytest.raises(RuntimeError, match="function failed"):
-                await _call(fn, f"boom-{i}")
+            assert await _call(fn, f"trip-{i}") == f"v:trip-{i}"  # degrades to uncached, never raises
         assert breaker_state() == "open"
+        resolver.down = False
 
         clock.shift(timedelta(seconds=self._KNOBS.recovery_timeout / 2))
         gets = backend.gets
@@ -430,25 +428,6 @@ class TestUnreportedProbesDoNotStrandTheBreaker:
                 await asyncio.wait_for(fn(x), timeout=0.01)
 
         await self._strand_then_recover(fn, backend, breaker, clock, cancel)
-
-    async def test_async_lock_path_function_raise(self, resolver, live_breakers, clock):
-        """The lock path re-raises a function exception without recording it."""
-        locking = resolver.backend = _LockingBackend()
-
-        @cache(ttl=300, l1_enabled=False, namespace="lab5326-strand-lock-raise")
-        async def fn(x: str) -> str:
-            if x.startswith("stranded"):
-                raise ValueError("probe failed inside the lock")
-            return f"v:{x}"
-
-        (breaker,) = live_breakers
-        await _open(fn, resolver, breaker)
-
-        async def raise_in_lock(x: str) -> None:
-            with pytest.raises(ValueError, match="inside the lock"):
-                await fn(x)
-
-        await self._strand_then_recover(fn, locking, breaker, clock, raise_in_lock)
 
     async def test_async_lock_path_interop_output_rejection(self, resolver, live_breakers, clock):
         """Interop refuses an out-of-model return value; the lock path re-raises it unrecorded."""
@@ -516,12 +495,6 @@ class TestL1HitsBypassTheBreaker:
         resolver.down = False
         assert await _call(fn, "hot") == "v:hot"  # a miss: runs once, fills L1 and L2
 
-    @staticmethod
-    def _trip(breaker: CircuitBreaker) -> None:
-        for _ in range(breaker.config.failure_threshold):
-            breaker.record_failure()
-        assert breaker.state == CircuitState.OPEN
-
     async def test_l1_hit_skips_admission_and_records_nothing(
         self, is_async, resolver, live_breakers, clock, monkeypatch: pytest.MonkeyPatch
     ):
@@ -531,7 +504,7 @@ class TestL1HitsBypassTheBreaker:
         await self._warm(fn, resolver)
 
         touched: list[str] = []
-        for name in ("should_attempt_call", "_on_success", "_on_failure"):  # what the orchestrator calls
+        for name in ("admit", "_on_success", "_on_failure"):  # what the orchestrator calls
             real = getattr(breaker, name)
 
             def spy(*args: Any, _name: str = name, _real: Any = real, **kwargs: Any) -> Any:
@@ -545,14 +518,14 @@ class TestL1HitsBypassTheBreaker:
         assert touched == []
 
         assert await _call(fn, "cold") == "v:cold"  # the spies are live: a miss is admitted
-        assert "should_attempt_call" in touched
+        assert "admit" in touched
 
     async def test_open_breaker_serves_l1_hit(self, is_async, resolver, backend, live_breakers, clock):
         executions: list[str] = []
         fn = _decorate(f"lab5351-open-hit-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
-        self._trip(breaker)
+        _trip(breaker)
         gets = backend.gets
 
         for _ in range(3):
@@ -567,7 +540,7 @@ class TestL1HitsBypassTheBreaker:
         fn = _decorate(f"lab5351-open-miss-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
-        self._trip(breaker)
+        _trip(breaker)
         gets, sets = backend.gets, backend.sets
 
         for _ in range(2):
@@ -582,7 +555,7 @@ class TestL1HitsBypassTheBreaker:
         fn = _decorate(f"lab5351-half-open-{is_async}", is_async=is_async, executions=executions, l1_enabled=True)
         (breaker,) = live_breakers
         await self._warm(fn, resolver)
-        self._trip(breaker)
+        _trip(breaker)
 
         clock.shift(_PAST_TIMEOUT)
         assert await _call(fn, "probe-0") == "v:probe-0"  # admitted: enters HALF_OPEN
@@ -618,3 +591,158 @@ class TestL1HitsBypassTheBreaker:
 
         assert resolver.calls == resolutions
         assert executions[-3:] == ["rejected-0", "rejected-1", "rejected-2"]
+
+
+class TestFunctionExceptionsDoNotCount:
+    """An exception the decorated function raises is not a backend failure (LAB-5319).
+
+    It reaches the caller unchanged and never counts toward the breaker, so a function
+    that keeps raising against a healthy backend never turns caching off.
+    """
+
+    _RAISES = _DEFAULTS.failure_threshold + 2
+
+    @staticmethod
+    def _decorate_raising(namespace: str, is_async: bool, backend: _CountingBackend, make_error: Callable[[], Exception]):
+        executions: list[str] = []
+        raised: list[Exception] = []
+
+        def body(x: str) -> str:
+            executions.append(x)
+            if x.startswith("bad"):
+                raised.append(make_error())
+                raise raised[-1]
+            return f"v:{x}"
+
+        async def async_body(x: str) -> str:
+            return body(x)
+
+        fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
+        return fn, executions, raised
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            lambda: ValueError("negative input"),
+            lambda: BackendError("raised by the function", error_type=BackendErrorType.TRANSIENT),
+        ],
+        ids=["application-error", "function-raised-backend-error"],
+    )
+    async def test_breaker_stays_closed_and_caching_continues(self, is_async, backend, live_breakers, make_error):
+        fn, executions, raised = self._decorate_raising(f"lab5319-{is_async}", is_async, backend, make_error)
+        (breaker,) = live_breakers
+
+        for i in range(self._RAISES):
+            with pytest.raises(Exception) as excinfo:
+                await _call(fn, f"bad-{i}")
+            assert excinfo.value is raised[-1]  # the very object the function raised
+
+        assert len(raised) == self._RAISES
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.failure_count == 0
+
+        runs = len(executions)
+        assert await _call(fn, "fresh") == "v:fresh"
+        assert await _call(fn, "fresh") == "v:fresh"
+        assert len(executions) == runs + 1  # the second call is a cache hit
+
+    @pytest.mark.parametrize(
+        ("is_async", "backend_cls"),
+        [(False, _CountingBackend), (True, _CountingBackend), (True, _LockingBackend)],
+        ids=["sync", "async", "async-lock"],
+    )
+    async def test_raising_probe_gives_its_slot_to_the_next_call(self, is_async, backend_cls, live_breakers, clock):
+        """A HALF_OPEN probe whose function raises records nothing and hands its slot on.
+
+        Kept, the slot would stay spent until the cycle expires, and every call before
+        then would run uncached: a raising function would still switch off its own caching.
+        """
+        backend = backend_cls()
+        fn, _, raised = self._decorate_raising(f"lab5319-probe-{is_async}-{backend_cls.__name__}", is_async, backend, ValueError)
+        (breaker,) = live_breakers
+        _trip(breaker)
+
+        clock.shift(_PAST_TIMEOUT)
+        for i in range(breaker.config.half_open_requests + 2):  # more than a cycle's budget
+            gets = backend.gets
+            with pytest.raises(ValueError):
+                await _call(fn, f"bad-{i}")
+            assert backend.gets > gets  # admitted: it read L2, where a rejected call reads nothing
+        assert len(raised) == breaker.config.half_open_requests + 2
+        assert breaker.state == CircuitState.HALF_OPEN
+
+        await _recovers(fn, backend, breaker)  # the same cycle still has every slot
+
+    @pytest.mark.parametrize(
+        ("is_async", "backend_cls"),
+        [(False, _CountingBackend), (True, _CountingBackend), (True, _LockingBackend)],
+        ids=["sync", "async", "async-lock"],
+    )
+    async def test_call_admitted_while_closed_gives_a_later_cycle_nothing(self, is_async, backend_cls, live_breakers, clock):
+        """Calls admitted while CLOSED that raise once HALF_OPEN has spent its budget add no probe.
+
+        Each would otherwise hand the cycle a slot it never took, so enough slow calls in
+        flight would let any number of probes through to a backend still under test.
+        """
+        backend = backend_cls()
+        stale = _DEFAULTS.half_open_requests + 2
+        entered: list[str] = []
+        all_in, gate = threading.Event(), threading.Event()
+
+        def body(x: str) -> str:
+            entered.append(x)
+            if len(entered) == stale:
+                all_in.set()
+            gate.wait(timeout=10)
+            raise ValueError(x)
+
+        async def async_body(x: str) -> str:
+            entered.append(x)
+            if len(entered) == stale:
+                all_in.set()
+            while not gate.is_set():
+                await asyncio.sleep(0)
+            raise ValueError(x)
+
+        namespace = f"lab5319-stale-{is_async}-{backend_cls.__name__}"
+        fn = cache(ttl=300, l1_enabled=False, namespace=namespace, backend=backend)(async_body if is_async else body)
+        (breaker,) = live_breakers
+
+        with ThreadPoolExecutor(max_workers=stale) as pool:
+            if is_async:
+                calls = [asyncio.ensure_future(fn(f"stale-{i}")) for i in range(stale)]
+                while not all_in.is_set():
+                    await asyncio.sleep(0)
+            else:
+                calls = [asyncio.wrap_future(pool.submit(fn, f"stale-{i}")) for i in range(stale)]
+                assert await asyncio.to_thread(all_in.wait, 10)
+            assert breaker.state == CircuitState.CLOSED  # every stale call is in flight, admitted
+
+            _trip(breaker)
+            clock.shift(_PAST_TIMEOUT)
+            for _ in range(breaker.config.half_open_requests):
+                assert breaker.should_attempt_call()  # the cycle's own probes, still in flight
+
+            gate.set()
+            for outcome in await asyncio.gather(*calls, return_exceptions=True):
+                assert isinstance(outcome, ValueError)
+
+        gets = backend.gets
+        with pytest.raises(ValueError):
+            await _call(fn, "next")
+        assert backend.gets == gets  # rejected: the budget is still spent
+        assert breaker.state == CircuitState.HALF_OPEN
+
+    async def test_backend_failures_still_open_the_breaker(self, is_async, live_breakers, monkeypatch):
+        """Transient backend errors recorded through ``handle_cache_error`` (client creation) still open it."""
+
+        def unreachable() -> _CountingBackend:
+            raise BackendError("backend unreachable", error_type=BackendErrorType.TRANSIENT)
+
+        monkeypatch.setattr(wrapper_module, "_resolve_lazy_backend", unreachable)
+        fn = _decorate(f"lab5319-backend-{is_async}", is_async=is_async)
+        (breaker,) = live_breakers
+
+        for i in range(_DEFAULTS.failure_threshold):
+            assert await _call(fn, f"k-{i}") == f"v:k-{i}"  # degrades to uncached, never raises
+        assert breaker.state == CircuitState.OPEN

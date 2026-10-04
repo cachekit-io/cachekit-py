@@ -21,13 +21,16 @@ from ..cache_handler import (
     CacheHit,
     CacheOperationHandler,
     CacheSerializationHandler,
+    L2MissProbe,
     StandardCacheHandler,
     TenantResolutionError,
     _supports_multi_delete,
     get_backend_provider,
     get_logger,
     handle_decrypt_failure,
+    probe_l2_miss,
     redact_cache_key,
+    supports_fill_lock,
     supports_key_tracking,
     supports_locking,
     supports_swr,
@@ -62,7 +65,7 @@ from .tenant_context import TenantContextExtractor
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
-    from ..backends.base import BaseBackend
+    from ..backends.base import BaseBackend, LockableBackend
     from ..serializers.base import SerializerProtocol
 
 
@@ -83,6 +86,7 @@ def _resolve_lazy_backend() -> BaseBackend:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 _logger = logging.getLogger(__name__)
 
@@ -110,6 +114,80 @@ _TTL_REFRESH_MAX_CONCURRENT = 32
 # this lease is what releases the slot. It is an assumption, not a server bound: a PATCH the
 # refresh already sent is assumed answered within it (see _schedule_ttl_refresh).
 _TTL_REFRESH_STOPPED_LOOP_HOLD_SECONDS = 30.0
+# The same lease, for the same reason, on an SWR refresh (both pools, see _RefreshPool).
+_SWR_STOPPED_LOOP_HOLD_SECONDS = 30.0
+
+
+class _RefreshPool:
+    """One decorated function's pool of SWR background refreshes: a cap, plus optional per-key dedup.
+
+    The cap has _schedule_ttl_refresh's two tiers. It is hard on threads and running event loops:
+    at most cap holders, counted across threads under the lock. It is best-effort on stopped loops:
+    a task whose loop is not running keeps its slot and key for _SWR_STOPPED_LOOP_HOLD_SECONDS from
+    admission, and the next acquire after that drops it, calls its on_prune and cancels it on its own
+    loop. A finished task that never released (cancelled before it first ran) is dropped at once.
+
+    A holder ends with release, which says whether it still held its slot. A pruned task that runs
+    again gets False and must leave its key alone, as a newer refresh may hold it by then.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._lock = threading.Lock()
+        # slot -> (dedup key, task once bound, admitted at, on_prune)
+        self._holders: dict[object, tuple[str | None, asyncio.Task[None] | None, float, Callable[[], None] | None]] = {}
+        self._pid = os.getpid()
+
+    def acquire(self, key: str | None = None, on_prune: Callable[[], None] | None = None) -> object | None:
+        """Prune, then admit a refresh: a slot for bind and release, or None if key is held or the pool is full."""
+        if self._pid != os.getpid():
+            # Forked child: the parent's holders never end here, and its lock may be held. A thread
+            # racing this swap can lose its new holder: that refresh then settles nothing, and its
+            # key waits for its hard TTL.
+            self._lock, self._holders, self._pid = threading.Lock(), {}, os.getpid()
+        now = time.monotonic()
+        pruned: list[tuple[asyncio.Task[None], Callable[[], None] | None]] = []
+        with self._lock:
+            for slot, (_, task, admitted, prune_cb) in list(self._holders.items()):
+                if task is not None and (
+                    task.done() or (not task.get_loop().is_running() and now - admitted >= _SWR_STOPPED_LOOP_HOLD_SECONDS)
+                ):
+                    del self._holders[slot]
+                    pruned.append((task, prune_cb))
+            slot = None
+            if len(self._holders) < self._cap and (key is None or all(held != key for held, *_ in self._holders.values())):
+                slot = object()
+                self._holders[slot] = (key, None, now, on_prune)
+        for task, prune_cb in pruned:
+            if prune_cb is not None:
+                prune_cb()
+            # Its slot is free for reuse now, so the task must not run on if its loop resumes.
+            with contextlib.suppress(RuntimeError):  # a closed loop never runs it again
+                task.get_loop().call_soon_threadsafe(task.cancel)
+        return slot
+
+    def bind(self, slot: object, task: asyncio.Task[None]) -> None:
+        """Attach the task admitted under slot: the pool can then prune it, and its strong ref keeps
+        a fire-and-forget refresh from being collected mid-flight (asyncio keeps only weak refs)."""
+        with self._lock:
+            held = self._holders.get(slot)
+            if held is not None:  # an eager task may already have finished and released
+                self._holders[slot] = (held[0], task, held[2], held[3])
+
+    def holds(self, slot: object) -> bool:
+        """Whether slot is still held. A pruned task checks this before a write: its cancellation
+        lands only if the code it awaits lets CancelledError through."""
+        if self._pid != os.getpid():
+            return False
+        with self._lock:
+            return slot in self._holders
+
+    def release(self, slot: object) -> bool:
+        """End a holder. False if it no longer held a slot: pruned, or admitted before a fork."""
+        if self._pid != os.getpid():
+            return False
+        with self._lock:
+            return self._holders.pop(slot, None) is not None
 
 
 def _ttl_refresh_done_callback(task: asyncio.Task, cache_key: str) -> None:
@@ -146,12 +224,30 @@ class _LockPhase:
 
 
 @contextlib.asynccontextmanager
-async def _phased(lock: contextlib.AbstractAsyncContextManager[bool], phase: _LockPhase) -> AsyncIterator[bool]:
+async def _phased(lock: contextlib.AbstractAsyncContextManager[_T], phase: _LockPhase) -> AsyncIterator[_T]:
     """Enter ``lock`` and record each phase it reaches in ``phase``."""
     async with lock as acquired:
         phase.entered = True
         yield acquired
         phase.body_exited = True
+
+
+@contextlib.asynccontextmanager
+async def _fill_lock(
+    backend: LockableBackend, key: str, timeout: float, blocking_timeout: float
+) -> AsyncIterator[tuple[bool, bool]]:
+    """The miss path's lock: ``(acquired, uncontended)``.
+
+    A backend with ``acquire_fill_lock`` reports whether its first lock attempt won, and releases
+    without blocking the caller (LAB-7064). Any other lockable backend reports every grant as
+    contended, so the caller keeps the post-lock double-check read.
+    """
+    if supports_fill_lock(backend):
+        async with backend.acquire_fill_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as grant:
+            yield grant
+    else:
+        async with backend.acquire_lock(key, timeout=timeout, blocking_timeout=blocking_timeout) as acquired:
+            yield acquired, False
 
 
 class CacheInfo(NamedTuple):
@@ -442,6 +538,25 @@ def logger():
     return get_logger()
 
 
+# An encrypting serializer is refused on a decorator in every mode. EncryptionWrapper binds each ciphertext to its
+# cache key, but the handler never passes a key to the serializer it is given, so every store would raise and the
+# function would run on every call. Encryption on a decorator is encryption=True / @cache.secure: the handler then
+# builds the wrapper itself, behind its tenant-mode and cross-SDK serializer checks.
+_ENCRYPTING_SERIALIZER_REFUSAL = (
+    "EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: "
+    "the decorator never gives it the cache key each ciphertext is bound to, so it would never store an "
+    "entry. To encrypt, use @cache.secure(master_key=..., serializer=...) with the inner serializer "
+    "(omit serializer= for the default MessagePack); it builds the EncryptionWrapper itself."
+)
+
+
+def _is_encrypting_serializer(serializer: object) -> bool:
+    """An EncryptionWrapper instance (subclasses included) or a registry name that resolves to one."""
+    return isinstance(serializer, EncryptionWrapper) or (
+        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
+    )
+
+
 def create_cache_wrapper(
     func: F,
     config: Any = None,  # DecoratorConfig | None (avoid circular import)
@@ -488,6 +603,8 @@ def create_cache_wrapper(
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
+                   An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
+                   encrypt with encryption=True (@cache.secure) and pass the inner serializer here.
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
                    - None (default): no intent stated. Plaintext when no master key is present;
@@ -690,9 +807,7 @@ def create_cache_wrapper(
     # `encryption` is the pre-resolution tri-state: None is not refused here. With a master
     # key present, None is refused by CacheSerializationHandler instead (no stated intent,
     # L1-only included); with no key, it is plaintext, which L1-only stores correctly.
-    _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
-        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
-    )
+    _encrypting_serializer = _is_encrypting_serializer(serializer)
     if _l1_only_mode and (encryption or _encrypting_serializer):
         raise ConfigurationError(
             "encryption requires a backend: backend=None is L1-only and stores raw Python "
@@ -703,6 +818,14 @@ def create_cache_wrapper(
             "docs/backends/README.md) or pass one explicitly to keep @cache.secure / "
             "encryption=True."
         )
+
+    # ENCRYPTING SERIALIZER, ANY MODE (why: _ENCRYPTING_SERIALIZER_REFUSAL). Placed after the L1-only check, so
+    # backend=None keeps that message, and before the handler is built, so it fires ahead of the handler's own
+    # errors (no stated intent, cross-SDK serializer, missing key), none of which names this fix. Except with
+    # backend=None, the decorator front end (intent.py) refuses a serializer= keyword earlier still; this check
+    # covers config= and direct callers.
+    if _encrypting_serializer:
+        raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
@@ -863,10 +986,7 @@ def create_cache_wrapper(
     # backend's async lock as a non-blocking lease (contested = serve stale, no
     # wait, no retry — only 200 with a null lock_id is contested, LAB-240; any lock
     # error abandons the attempt). The lease is best-effort per spec.
-    _l2_swr_inflight: set[str] = set()
-    _l2_swr_tasks: set[asyncio.Task[None]] = set()
-    _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
-    _l2_swr_pid = os.getpid()  # owner process — a forked child must not inherit scheduler state
+    _l2_swr_pool = _RefreshPool(_L2_SWR_MAX_CONCURRENT_REFRESHES)  # keyed by cache key: the in-flight dedup
     _l2_swr_lease_seconds = 30.0  # same server-side lease bound as the miss-path lock
 
     # One background TTL refresh per key at a time: concurrent hits in the refresh window
@@ -1150,39 +1270,16 @@ def create_cache_wrapper(
             redact_error_for_log(exc),
         )
 
-    def _l2_swr_try_begin(cache_key: str) -> bool:
-        """Claim a revalidation slot for this key; False = already in flight or at capacity.
-
-        The check-then-add on _l2_swr_inflight is not atomic across OS threads; a rare
-        duplicate schedule is benign (the backend lease or last-write-wins between two
-        freshly computed values absorbs it — spec explicitly allows duplicates).
-        """
-        nonlocal _l2_swr_inflight, _l2_swr_tasks, _l2_swr_slots, _l2_swr_pid
-        if _l2_swr_pid != os.getpid():
-            # Forked child: inherited in-flight keys would never clear (the parent
-            # threads that call _l2_swr_end don't survive fork), permanently starving
-            # those keys of revalidation, and the inherited semaphore may carry
-            # consumed slots or a lock captured mid-acquire (even a non-blocking
-            # acquire would then hang). Replace wholesale. Sibling threads racing
-            # this swap are as benign as the dedup race above: worst case one
-            # duplicate schedule or one lost slot, both self-healing.
-            _l2_swr_inflight = set()
-            _l2_swr_tasks = set()
-            _l2_swr_slots = threading.BoundedSemaphore(_L2_SWR_MAX_CONCURRENT_REFRESHES)
-            _l2_swr_pid = os.getpid()
-        if cache_key in _l2_swr_inflight:
-            return False
-        if not _l2_swr_slots.acquire(blocking=False):
-            return False
-        _l2_swr_inflight.add(cache_key)
-        return True
-
-    def _l2_swr_end(cache_key: str) -> None:
-        _l2_swr_inflight.discard(cache_key)
-        _l2_swr_slots.release()
-
-    async def _l2_swr_recompute_store_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    async def _l2_swr_recompute_store_async(
+        slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> None:
         result = await func(*call_args, **call_kwargs)
+        if not _l2_swr_pool.holds(slot):
+            # Pruned while its loop was stopped, and func swallowed the cancellation: a newer
+            # revalidation may already have stored a later value. Past this check only cachekit
+            # code runs, which lets a later prune's cancellation through; a write it has already
+            # sent when its loop stops is not recalled.
+            return
         serialized_data = operation_handler.serialization_handler.serialize_data(
             result, call_args, call_kwargs, cache_key=cache_key
         )
@@ -1194,25 +1291,27 @@ def create_cache_wrapper(
         if stored:
             await _track_and_record_async(cache_key)
 
-    async def _l2_swr_revalidate_async(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    async def _l2_swr_revalidate_async(
+        slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> None:
         """Background revalidation for async functions. Failures never reach the caller, only
         the log (_warn_refresh): the caller already got the stale value; the entry hard-expires
         at evict_at and the next request takes the ordinary synchronous miss path (spec
-        degradation)."""
+        degradation). Holds the slot, which also holds the key, until it ends."""
         try:
             if supports_locking(_backend):
                 async with _backend.acquire_lock(cache_key, timeout=_l2_swr_lease_seconds, blocking_timeout=None) as got_lease:
                     if not got_lease:
                         return  # another client is revalidating — stale already served
-                    await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                    await _l2_swr_recompute_store_async(slot, cache_key, call_args, call_kwargs)
             else:
-                await _l2_swr_recompute_store_async(cache_key, call_args, call_kwargs)
+                await _l2_swr_recompute_store_async(slot, cache_key, call_args, call_kwargs)
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
             _warn_refresh(_refresh_failed_warn, "SWR revalidation failed", cache_key, exc)
         finally:
-            _l2_swr_end(cache_key)
+            _l2_swr_pool.release(slot)
 
-    def _l2_swr_revalidate_sync(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    def _l2_swr_revalidate_sync(slot: object, cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
         """Background revalidation for sync functions (daemon thread).
 
         ponytail: per-process single-flight only — the distributed lease API is
@@ -1234,7 +1333,7 @@ def create_cache_wrapper(
         except Exception as exc:  # noqa: BLE001 — spec: revalidation failure must never surface to callers
             _warn_refresh(_refresh_failed_warn, "SWR revalidation failed", cache_key, exc)
         finally:
-            _l2_swr_end(cache_key)
+            _l2_swr_pool.release(slot)
 
     def _l2_swr_schedule(cache_key: str, call_args: tuple[Any, ...], call_kwargs: dict[str, Any], *, is_async: bool) -> None:
         """Kick off background revalidation for a stale hit (at most one per key).
@@ -1247,19 +1346,19 @@ def create_cache_wrapper(
         later hit retries). Any scheduling failure releases the slot so the key
         never becomes permanently unrevalidatable.
         """
-        if not _l2_swr_try_begin(cache_key):
+        slot = _l2_swr_pool.acquire(cache_key)
+        if slot is None:
             return
         try:
             call_args, call_kwargs = copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
-            _l2_swr_end(cache_key)
+            _l2_swr_pool.release(slot)
             _warn_refresh(_refresh_skipped_warn, "SWR revalidation skipped", cache_key, exc, _NOT_DEEP_COPYABLE)
             return
         try:
             if is_async:
-                task = asyncio.create_task(_l2_swr_revalidate_async(cache_key, call_args, call_kwargs))
-                _l2_swr_tasks.add(task)  # strong ref until done (same pattern as _l1_swr_tasks)
-                task.add_done_callback(_l2_swr_tasks.discard)
+                task = asyncio.create_task(_l2_swr_revalidate_async(slot, cache_key, call_args, call_kwargs))
+                _l2_swr_pool.bind(slot, task)
             else:
                 # Snapshot the caller's context (captured in-request, where e.g. a
                 # ContextVarExtractor's tenant var is set) so the daemon thread sees
@@ -1269,12 +1368,12 @@ def create_cache_wrapper(
                 ctx = contextvars.copy_context()
                 threading.Thread(
                     target=ctx.run,
-                    args=(_l2_swr_revalidate_sync, cache_key, call_args, call_kwargs),
+                    args=(_l2_swr_revalidate_sync, slot, cache_key, call_args, call_kwargs),
                     daemon=True,
                     name="cachekit-swr-revalidate",  # no key material (CWE-532)
                 ).start()
         except Exception as exc:  # e.g. Thread.start() RuntimeError under resource pressure
-            _l2_swr_end(cache_key)
+            _l2_swr_pool.release(slot)
             _warn_refresh(_refresh_unstarted_warn, "SWR revalidation could not be scheduled", cache_key, exc)
 
     # Create per-function statistics tracker with lazy session ID generation
@@ -1393,52 +1492,42 @@ def create_cache_wrapper(
     # on first use). Re-decoration reuses the same counters — see _get_function_stats.
     _stats = _get_function_stats(function_identifier, l1_enabled)
 
-    # L1-only SWR: strong refs to in-flight refresh tasks. asyncio only keeps weak
-    # refs to tasks, so a fire-and-forget refresh could be GC'd mid-flight otherwise.
-    _l1_swr_tasks: set[asyncio.Task[None]] = set()
-
     # Per-key suppression alone doesn't bound refresh concurrency: a workload
     # crossing the SWR threshold on many distinct keys at once would spawn one
-    # task/thread per key. This semaphore caps in-flight refreshes per wrapped
+    # task/thread per key. This pool caps in-flight refreshes per wrapped
     # function; at capacity the refresh is skipped (stale keeps being served)
-    # and a later qualifying hit retries.
-    _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
-    _l1_swr_pid = os.getpid()  # owner process — see _l2_swr_try_begin's fork note
+    # and a later qualifying hit retries. ObjectCache does the per-key dedup.
+    _l1_swr_pool = _RefreshPool(_L1_SWR_MAX_CONCURRENT_REFRESHES)
 
     def _l1_swr_acquire(
         cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
-    ) -> tuple[Any, Any] | None:
+    ) -> tuple[object, Any, Any] | None:
         """Reserve a refresh slot and snapshot the live arguments.
 
         The cache key was computed from the arguments as they were at call
         time; the refresh runs later, so it must not see mutations the caller
         makes after receiving the stale value (it would store the new state
-        under the old key). Returns deep-copied (args, kwargs), or None when at
-        capacity or the arguments can't be copied — in both cases this exact
-        refresh (version) is cancelled so a later call retries, and the caller
-        must not schedule a refresh.
+        under the old key). Returns the slot and the deep-copied args and
+        kwargs, or None when at capacity or the arguments can't be copied — in
+        both cases this exact refresh (version) is cancelled so a later call
+        retries, and the caller must not schedule a refresh. A refresh pruned
+        from a stopped loop is cancelled the same way.
         """
-        nonlocal _l1_swr_tasks, _l1_swr_slots, _l1_swr_pid
         assert _object_cache is not None  # noqa: S101 - only called when scheduling a refresh
-        if _l1_swr_pid != os.getpid():
-            # Forked child: same wholesale reset as _l2_swr_try_begin — the inherited
-            # semaphore is parent state (consumed slots, possibly a poisoned lock).
-            _l1_swr_tasks = set()
-            _l1_swr_slots = threading.BoundedSemaphore(_L1_SWR_MAX_CONCURRENT_REFRESHES)
-            _l1_swr_pid = os.getpid()
-        if not _l1_swr_slots.acquire(blocking=False):
+        slot = _l1_swr_pool.acquire(on_prune=functools.partial(_object_cache.cancel_refresh, cache_key, version))
+        if slot is None:
             _object_cache.cancel_refresh(cache_key, version)
             return None
         try:
-            return copy.deepcopy((call_args, call_kwargs))
+            snapshot_args, snapshot_kwargs = copy.deepcopy((call_args, call_kwargs))
         except Exception as exc:
-            _l1_swr_slots.release()
+            _l1_swr_pool.release(slot)
             _object_cache.cancel_refresh(cache_key, version)
             _warn_refresh(_refresh_skipped_warn, "L1-only SWR refresh skipped", cache_key, exc, _NOT_DEEP_COPYABLE)
             return None
+        return slot, snapshot_args, snapshot_kwargs
 
     def _l1_swr_task_done(task: asyncio.Task[None], cache_key: str) -> None:
-        _l1_swr_tasks.discard(task)
         if task.cancelled():  # e.g. loop shutdown: nothing failed
             return
         exc = task.exception()
@@ -1446,30 +1535,33 @@ def create_cache_wrapper(
             _warn_refresh(_refresh_failed_warn, "L1-only SWR refresh failed", cache_key, exc)
 
     async def _l1_swr_refresh_async(
-        cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+        slot: object, cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
     ) -> None:
         """Background SWR refresh for async functions in L1-only mode.
 
-        Only ever scheduled with a slot held via _l1_swr_acquire; releases it.
+        Only ever scheduled with the slot from _l1_swr_acquire; releases it. It settles
+        the key only if it still held the slot: once pruned from a stopped loop, it may resume
+        after a newer refresh of the same entry, which shares its version, has taken the key.
         """
         assert _object_cache is not None and ttl is not None  # noqa: S101 - _l1_swr_active guarantees both
         try:
-            try:
-                result = await func(*call_args, **call_kwargs)
-            except BaseException:
-                # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
-                # apart from cancelling this task. Backing off after a real cancellation only delays
-                # the next refresh by one interval; the held value is still served.
+            result = await func(*call_args, **call_kwargs)
+        except BaseException:
+            # CancelledError included: an upstream can raise it, and on 3.10 it cannot be told
+            # apart from cancelling this task. Backing off after a real cancellation only delays
+            # the next refresh by one interval; the held value is still served.
+            if _l1_swr_pool.release(slot):
                 _object_cache.fail_refresh(cache_key, version)  # retry after swr_retry_interval
-                raise  # logged by _l1_swr_task_done
+            raise  # logged by _l1_swr_task_done
+        if _l1_swr_pool.release(slot):
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
-        finally:
-            _l1_swr_slots.release()
 
-    def _l1_swr_refresh_sync(cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> None:
+    def _l1_swr_refresh_sync(
+        slot: object, cache_key: str, version: int, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+    ) -> None:
         """Background SWR refresh for sync functions in L1-only mode (runs on a daemon thread).
 
-        Only ever scheduled with a slot held via _l1_swr_acquire; releases it.
+        Only ever scheduled with the slot from _l1_swr_acquire; releases it.
         """
         assert _object_cache is not None and ttl is not None  # noqa: S101 - _l1_swr_active guarantees both
         try:
@@ -1481,7 +1573,7 @@ def create_cache_wrapper(
                 return
             _object_cache.complete_refresh(cache_key, version, result, ttl=ttl)
         finally:
-            _l1_swr_slots.release()
+            _l1_swr_pool.release(slot)
 
     # L1-only mode: debug log if backend would have been available
     # Helps developers understand that Redis config is being intentionally ignored
@@ -1562,18 +1654,18 @@ def create_cache_wrapper(
                     # (sync functions have no event loop to schedule a task on)
                     snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
                     if snapshot is not None:
-                        refresh_args, refresh_kwargs = snapshot
+                        slot, refresh_args, refresh_kwargs = snapshot
                         try:
                             threading.Thread(
                                 target=_l1_swr_refresh_sync,
-                                args=(cache_key, version, refresh_args, refresh_kwargs),
+                                args=(slot, cache_key, version, refresh_args, refresh_kwargs),
                                 name="cachekit-swr-refresh",  # no function or key metadata (CWE-532)
                                 daemon=True,
                             ).start()
                         except RuntimeError as exc:
                             # Thread couldn't start (resource pressure) — release
                             # the slot and this exact refresh so a later call retries
-                            _l1_swr_slots.release()
+                            _l1_swr_pool.release(slot)
                             _object_cache.cancel_refresh(cache_key, version)
                             _warn_refresh(_refresh_unstarted_warn, "L1-only SWR refresh could not be started", cache_key, exc)
                 reset_current_function_stats(token)
@@ -1717,7 +1809,8 @@ def create_cache_wrapper(
         # outside the try below on purpose: that except records a failure, and a
         # rejection is not one. Recorded, every rejected call would push the OPEN
         # window forward and reopen HALF_OPEN, so the breaker never recovers.
-        if not features.should_allow_request():
+        probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+        if probe_cycle is None:
             features.log_cache_operation(
                 operation="circuit_breaker_open",
                 key=cache_key,
@@ -1893,8 +1986,16 @@ def create_cache_wrapper(
         _stats.record_miss()
 
         try:
-            # Execute the original function
-            result = func(*args, **kwargs)
+            # Execute the original function. Its exception is not a backend failure, so it is
+            # never counted, but an admitted HALF_OPEN probe hands its slot to the next call
+            # instead of holding it until the cycle expires. probe_cycle confines that to a
+            # slot this call took: a call admitted while CLOSED, or by an ended cycle, gives
+            # the current cycle nothing back.
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                features.release_probe(probe_cycle)
+                raise
 
             # Serialize and cache the result
             try:
@@ -1942,19 +2043,10 @@ def create_cache_wrapper(
 
             return result
 
-        # No `except BackendError` degradation here: the store's own failures are caught
-        # above, so only the function can raise one this far, and rerunning the function
-        # for it would repeat its side effects (LAB-5360). It is the function's exception.
-        except KeyringConfigurationError:
-            # From the write, or a nested cached call's: a local config fault, not a
-            # backend failure. Counting it would open the breaker, and an open breaker
-            # skips the L2 read and write that raise it, so every later call would run
-            # uncached without a word.
-            raise
-        except Exception as e:
-            # Other exceptions - record and re-raise
-            features.record_failure(e)
-            raise
+        # No handler here: the store's own failures are caught above, so what reaches this
+        # point is the function's exception (or a fail-loud write error). It is not a backend
+        # failure, so it never counts toward the breaker, and rerunning the function for a
+        # BackendError it raised would repeat its side effects.
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
@@ -2012,11 +2104,11 @@ def create_cache_wrapper(
                         # without blocking the caller
                         snapshot = _l1_swr_acquire(cache_key, version, args, kwargs)
                         if snapshot is not None:
-                            refresh_args, refresh_kwargs = snapshot
+                            slot, refresh_args, refresh_kwargs = snapshot
                             refresh_task = asyncio.create_task(
-                                _l1_swr_refresh_async(cache_key, version, refresh_args, refresh_kwargs)
+                                _l1_swr_refresh_async(slot, cache_key, version, refresh_args, refresh_kwargs)
                             )
-                            _l1_swr_tasks.add(refresh_task)
+                            _l1_swr_pool.bind(slot, refresh_task)
                             refresh_task.add_done_callback(functools.partial(_l1_swr_task_done, cache_key=cache_key))
                     return cached_value
 
@@ -2111,7 +2203,8 @@ def create_cache_wrapper(
             # with its probe budget spent) - run the function uncached, as
             # sync_wrapper does. Not recorded as a failure: a rejection is not one.
             # The outer finally resets the stats context.
-            if not features.should_allow_request():
+            probe_cycle = features.admit()  # None when rejected; 0 is an admission too
+            if probe_cycle is None:
                 features.log_cache_operation(
                     operation="circuit_breaker_open",
                     key=cache_key,
@@ -2162,6 +2255,9 @@ def create_cache_wrapper(
             # Try to get from Redis cache (always measure time for L2 latency tracking)
             start_time = time.perf_counter()
 
+            # The read paths report a failed read as a miss; the probe tells the two apart, so
+            # the post-lock double-check is skipped only after a clean miss (LAB-7064).
+            _l2_read = L2MissProbe()
             try:
                 # Route through the operation handler so corrupt/tampered entries inherit
                 # eviction + the cache_get_deserialize metric instead of persisting (#159),
@@ -2172,13 +2268,14 @@ def create_cache_wrapper(
                 # backfilled to L1, and a fresh hit's backfill can't outlive fresh_until.
                 _l2_is_stale = False
                 _l2_fresh_for: int | None = None
-                if _l2_freshness_capable():
-                    _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
-                    cached_result = _fresh_hit[0] if _fresh_hit is not None else None
-                    _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
-                    _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
-                else:
-                    cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
+                with probe_l2_miss(_l2_read):
+                    if _l2_freshness_capable():
+                        _fresh_hit = await operation_handler.get_cached_value_with_freshness_async(cache_key, args, kwargs)
+                        cached_result = _fresh_hit[0] if _fresh_hit is not None else None
+                        _l2_is_stale = _fresh_hit[1] if _fresh_hit is not None else False
+                        _l2_fresh_for = _fresh_hit[2] if _fresh_hit is not None else None
+                    else:
+                        cached_result = await operation_handler.get_cached_value_async(cache_key, args=args, kwargs=kwargs)
 
                 if cached_result is not None:
                     # Cache hit: envelope is the raw serialized bytes for L1 backfill
@@ -2251,16 +2348,45 @@ def create_cache_wrapper(
                 try:
                     # Use backend's async lock protocol
                     async with _phased(
-                        _backend.acquire_lock(
-                            cache_key,
-                            timeout=lock_timeout,
-                            blocking_timeout=blocking_timeout,
-                        ),
+                        _fill_lock(_backend, cache_key, lock_timeout, blocking_timeout),
                         lock_phase,
-                    ) as lock_acquired:
-                        if lock_acquired:
-                            # Lock acquired - double-check cache
-                            # Another request may have populated it while we waited.
+                    ) as (lock_acquired, lock_uncontended):
+                        if not lock_acquired:
+                            # Lock timeout - double-check cache before giving up
+                            # Another request may have populated it while we waited
+                            logger().warning(
+                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
+                            )
+                            try:
+                                # Routed through the operation handler: corrupt entries evict (#159),
+                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
+                                _dc_start = time.perf_counter()
+                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
+                                if cached_result is not None:
+                                    # Cache was populated while waiting - use it
+                                    result, cached_data = cached_result.value, cached_result.envelope
+                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
+                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
+                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
+                                    return result
+                            except (DecryptionAuthenticationError, KeyringConfigurationError):
+                                # Same as the lock-acquired double-check below.
+                                raise
+                            except Exception as e:
+                                # Cache check failed - fall through to execute function
+                                logger().warning(
+                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, "
+                                    f"executing without lock: {redact_error_for_log(e)}"
+                                )
+
+                        elif not (lock_uncontended and _l2_read.clean_miss):
+                            # Lock acquired after a wait, or after a failed primary read - double-check
+                            # cache: another request may have populated it while we waited, or the
+                            # entry may still be live. Skipped after a clean miss and an uncontended
+                            # grant (LAB-7064): this caller never waited behind another holder, so
+                            # the read would almost always miss again, and be billed as one. A fill
+                            # that completed between our read and our lock request is recomputed;
+                            # last write wins.
                             # Routed through the operation handler: corrupt entries evict (#159),
                             # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
                             try:
@@ -2289,32 +2415,6 @@ def create_cache_wrapper(
                                     redact_cache_key(cache_key),
                                     redact_error_for_log(e),
                                 )
-                        else:
-                            # Lock timeout - double-check cache before giving up
-                            # Another request may have populated it while we waited
-                            logger().warning(
-                                f"Failed to acquire lock for {redact_cache_key(cache_key)} after {blocking_timeout}s, checking cache"
-                            )
-                            try:
-                                # Routed through the operation handler: corrupt entries evict (#159),
-                                # stale hits skip L1, fresh backfill bounded by fresh_for (LAB-557).
-                                _dc_start = time.perf_counter()
-                                cached_result, _dc_stale, _dc_fresh_for = await _l2_double_check(cache_key, args, kwargs)
-                                if cached_result is not None:
-                                    # Cache was populated while waiting - use it
-                                    result, cached_data = cached_result.value, cached_result.envelope
-                                    _dc_duration_ms = (time.perf_counter() - _dc_start) * 1000
-                                    _record_l2_hit_async(cached_result.size_bytes, _dc_duration_ms)
-                                    _l1_backfill_from_l2(cache_key, cached_data, _dc_stale, _dc_fresh_for, twin=twin_key)
-                                    return result
-                            except (DecryptionAuthenticationError, KeyringConfigurationError):
-                                # Same as the lock-acquired double-check above.
-                                raise
-                            except Exception:
-                                # Cache check failed - fall through to execute function
-                                logger().warning(
-                                    f"Cache check after lock timeout failed for {redact_cache_key(cache_key)}, executing without lock"
-                                )
 
                         # Execute the original function (with or without lock). Its exception
                         # is held here, outside the lock's error handling, and re-raised once
@@ -2324,6 +2424,7 @@ def create_cache_wrapper(
                         try:
                             result = await func(*args, **kwargs)
                         except Exception as e:
+                            features.release_probe(probe_cycle)  # not a backend outcome (see the sync wrapper)
                             func_error = e
                         else:
                             # Serialize and cache the result
@@ -2439,68 +2540,63 @@ def create_cache_wrapper(
                     f"Backend doesn't support locking for {redact_cache_key(cache_key)}, executing without thundering herd protection"
                 )
 
+            # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
             try:
-                # Execute the original function
                 result = await func(*args, **kwargs)
+            except Exception:
+                features.release_probe(probe_cycle)
+                raise
 
-                # Serialize and cache the result
-                try:
-                    serialized_data = operation_handler.serialization_handler.serialize_data(
-                        result, args, kwargs, cache_key=cache_key
-                    )
+            # Serialize and cache the result
+            try:
+                serialized_data = operation_handler.serialization_handler.serialize_data(
+                    result, args, kwargs, cache_key=cache_key
+                )
 
-                    # Store in Redis with TTL
-                    stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
-                        cache_key,
-                        serialized_data,
-                        ttl=ttl,
-                        stale_ttl=_stale_ttl,
-                    )
+                # Store in Redis with TTL
+                stored = await operation_handler.cache_handler.set_async(  # type: ignore[attr-defined]
+                    cache_key,
+                    serialized_data,
+                    ttl=ttl,
+                    stale_ttl=_stale_ttl,
+                )
 
-                    # Also store in L1 cache for fast subsequent access (using serialized bytes)
-                    _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
-                    if stored:
-                        await _track_and_record_async(cache_key)
+                # Also store in L1 cache for fast subsequent access (using serialized bytes)
+                _put_l1(cache_key, serialized_data, ttl, twin=twin_key)
+                if stored:
+                    await _track_and_record_async(cache_key)
 
-                    # Record successful cache set
-                    set_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.set_operation_context("set", duration_ms=set_duration_ms)
-                    features.record_success()
+                # Record successful cache set
+                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.set_operation_context("set", duration_ms=set_duration_ms)
+                features.record_success()
 
-                    if features.collect_stats:
-                        features.record_cache_operation(
-                            operation="set",
-                            namespace=namespace or "default",
-                            success=True,
-                            duration_ms=set_duration_ms,
-                            serializer="rust",
-                        )
-
-                except (InteropError, KeyringConfigurationError):
-                    # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
-                    # keyring config fault (see the sync write): fail loud.
-                    raise
-                except Exception as e:
-                    # Caching failed but function succeeded - return result anyway
-                    set_duration_ms = (time.perf_counter() - start_time) * 1000
-                    features.handle_cache_error(
-                        error=e,
-                        operation="cache_set",
-                        cache_key=cache_key or "unknown",
+                if features.collect_stats:
+                    features.record_cache_operation(
+                        operation="set",
                         namespace=namespace or "default",
+                        success=True,
                         duration_ms=set_duration_ms,
-                        count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
+                        serializer="rust",
                     )
 
-                return result
-
-            except KeyringConfigurationError:
-                # From the write, or a nested cached call's: never counted (see the sync wrapper).
+            except (InteropError, KeyringConfigurationError):
+                # Interop/v1 data-model rejection (spec-mandated), or a LOCAL
+                # keyring config fault (see the sync write): fail loud.
                 raise
             except Exception as e:
-                # Function execution failed - record and re-raise
-                features.record_failure(e)
-                raise
+                # Caching failed but function succeeded - return result anyway
+                set_duration_ms = (time.perf_counter() - start_time) * 1000
+                features.handle_cache_error(
+                    error=e,
+                    operation="cache_set",
+                    cache_key=cache_key or "unknown",
+                    namespace=namespace or "default",
+                    duration_ms=set_duration_ms,
+                    count_toward_breaker=not isinstance(e, SerializationError),  # as the locked write above
+                )
+
+            return result
         finally:
             # ALWAYS reset stats context, even on exception
             reset_current_function_stats(token)
@@ -2751,9 +2847,9 @@ def create_cache_wrapper(
 
         # Single-key invalidation (specific args provided, or zero-param function).
         # Same derivation as the write path (LAB-4387), plus the pre-0.20.0 twin (LAB-5288). The
-        # sync deletes run off the loop; never a backend's delete_async. CachekitIO's async client
-        # follows the running loop, but the Redis provider caches one async client per provider,
-        # whose pool stays bound to the first event loop that used it (asyncio.run per job).
+        # sync deletes run off the loop; never a backend's delete_async. The Redis provider caches one
+        # async client per provider, whose pool stays bound to the first event loop that used it
+        # (asyncio.run per job).
         await asyncio.to_thread(_invalidate_keys, _resolve_invalidation_keys(args, kwargs))
 
     def check_health() -> dict[str, Any]:

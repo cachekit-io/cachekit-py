@@ -2,6 +2,10 @@
 # Install: pre-commit install
 # Run manually: pre-commit run --all-files
 
+default_install_hook_types: [pre-commit, commit-msg]
+# Hooks with no `stages` run at commit and push, never on the commit message.
+default_stages: [pre-commit, pre-push]
+
 repos:
   # Python formatting and linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -105,3 +109,44 @@ repos:
             tests/fixtures/.*|
             docs/.*\.md$
           )$
+
+  # Keeps internal references (ticket ids, secret-store paths, internal hosts and process
+  # names) out of user-facing docs and commit messages. The patterns are generic on purpose:
+  # a list of specific internal names would itself disclose them.
+  # Scope rule: https://docs.cachekit.io/contributing/#what-belongs-in-these-docs
+  - repo: local
+    hooks:
+      - id: no-internal-references
+        name: No internal references in docs
+        language: pygrep
+        entry: '\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
+        types: [text]
+        stages: [pre-commit]
+      - id: no-internal-references-commit-msg
+        name: No internal references in commit message
+        # Same patterns. git hands this hook the raw message file: "# " comment lines, the diff
+        # below the `git commit -v` scissors line, and its own merge and revert subjects, which
+        # quote branch names and earlier subjects. Only the text the author wrote is checked.
+        language: python
+        entry: python -c
+        args:
+          - |
+            import re, sys
+            P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
+            KIND = r"(?:branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits)"
+            GIT_SUBJECT = re.compile(rf"Merge {KIND} '[^']*'(?:(?:, |; | and ){KIND}? ?'[^']*')*(?: of \S+)?(?: into \S+)?|(?:Revert|Reapply) \".*\"")
+            try:
+                with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                sys.exit(f"{sys.argv[1]}: cannot read the commit message: {e}")
+            text = text.split("# ------------------------ >8 ------------------------")[0]
+            lines = [line for line in text.splitlines() if line.strip() and not re.match(r"#(?:[ \t]|$)", line)]
+            if lines and GIT_SUBJECT.fullmatch(lines[0]):
+                lines = lines[1:]
+            bad = [line for line in lines if P.search(line)]
+            for line in bad:
+                print(f"{sys.argv[1]}: {line}")
+            sys.exit(1 if bad else 0)
+        stages: [commit-msg]

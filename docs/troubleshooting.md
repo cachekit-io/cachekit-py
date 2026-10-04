@@ -14,7 +14,7 @@
 **Issue**: Circuit breaker is open and calls run uncached
 
 **What it means**:
-- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): exceptions raised by the decorated function itself, a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
+- Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md); successes do not reset the count, and older failures stop counting): a failure to create the backend client, or another failure listed under [Circuit breaker open](error-codes.md#circuit-breaker-open). Exceptions raised by the decorated function itself never count. A return value that fails to serialize or encrypt for the cache write does not count. A cached entry that fails to deserialize or decrypt does not count under either policy: fail-open (the default) evicts it and recomputes, and with `fail_closed=True` an authentication failure raises and keeps the entry. Backend read and write failures do not currently count
 - Calls to this function that miss L1 run uncached until the breaker recovers (L1 hits are still served): after the cooldown (30 seconds by default) it goes HALF_OPEN and probes, then closes after three successes or reopens on a counted failure
 
 **Solutions**:
@@ -33,7 +33,7 @@ export CACHEKIT_REDIS_URL=redis://localhost:6379/0
 ```
 
 3. **Let the breaker recover** — no restart is needed:
-- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN and admits up to three probe calls; three successes close it, and a counted failure reopens it for another cooldown
+- After the cooldown (`recovery_timeout`, 30 seconds by default) it goes HALF_OPEN with three probe slots (a probe whose function raises hands its slot to the next call, so while it keeps raising, more than three calls can probe in one cycle); three successes close it, and a counted failure reopens it for another cooldown
 - While open, sync and async functions with an L2 backend still serve L1 hits and run without caching on an L1 miss (L1-only mode, `backend=None`, never consults the breaker) — see [Circuit breaker open](error-codes.md#circuit-breaker-open)
 
 4. **Increase timeout if network is slow** (both default to 5.0 seconds):
@@ -42,7 +42,7 @@ export CACHEKIT_SOCKET_TIMEOUT=10.0
 export CACHEKIT_SOCKET_CONNECT_TIMEOUT=10.0
 ```
 
-Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions also count toward the breaker's `failure_threshold` (five by default): that many within 60 seconds open the breaker for that function and stop caching it until the breaker recovers, even with a healthy backend. When an async call goes through distributed locking, as on Redis or CachekitIO, your function's exceptions do not count.
+Exceptions raised by your own function reach the caller unchanged, and `@cache` runs the function at most once per call: an exception it raises, a `BackendError` included, is never retried. Your function's exceptions never count toward the circuit breaker, so a function that raises does not stop its own caching.
 
 </details>
 
@@ -179,6 +179,7 @@ lsof -i :6379
 ```
 cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable
 A master key is present (CACHEKIT_MASTER_KEY) but this cache states no encryption intent ...
+EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...
 CACHEKIT_MASTER_KEY must be hex-encoded: ...
 CACHEKIT_MASTER_KEY must be at least 32 bytes (256 bits). Got ... bytes. ...
 Decryption failed: ...
@@ -191,9 +192,10 @@ See [Zero-Knowledge Encryption - Troubleshooting](features/zero-knowledge-encryp
 **Common causes**:
 1. Master key not set when using `@cache.secure()`
 2. Master key set, but a cache states no encryption intent — add `encryption=False` for plaintext ([details](error-codes.md#master-key-present-no-encryption-intent))
-3. Master key format invalid (not hex-encoded)
-4. Master key rotated (can't decrypt old cached data)
-5. Data corruption during storage/retrieval
+3. An `EncryptionWrapper` passed as a decorator's `serializer=` — pass its inner serializer to `@cache.secure(master_key=..., serializer=...)` instead ([details](error-codes.md#encrypting-serializer-on-a-decorator))
+4. Master key format invalid (not hex-encoded)
+5. Master key rotated (can't decrypt old cached data)
+6. Data corruption during storage/retrieval
 
 **Quick fix**:
 ```bash
@@ -495,7 +497,7 @@ logging.getLogger("redis").setLevel(logging.DEBUG)
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-With the CachekitIO backend, cachekit keeps the `hpack` logger (HTTP/2 header encoding) at `INFO` even under a `DEBUG` root, because its `DEBUG` output decodes to your API key and lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) before you set it to `DEBUG`.
+With the CachekitIO backend, a `DEBUG` root also shows urllib3's request lines, raw cache keys in their paths, never the API key or lock tokens. Read [transport logs](../SECURITY.md#cache-key-redaction-in-logs-cwe-532) if your keys carry identifiers.
 
 </details>
 

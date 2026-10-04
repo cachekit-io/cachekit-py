@@ -71,6 +71,13 @@ This project follows a standard code of conduct. Please be respectful and profes
    git commit -m "feat: add new feature"
    ```
 
+## Documentation scope
+
+User-facing docs (the README and `docs/`) follow CacheKit's shared rule on what belongs in them:
+[What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
+`prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
+files, `docs/` and commit messages.
+
 ## Code Style Guidelines
 
 ### Python

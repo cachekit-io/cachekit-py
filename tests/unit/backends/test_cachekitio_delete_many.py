@@ -1,88 +1,100 @@
 """Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time (LAB-7070).
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
-Requests go through a real httpx client on a MockTransport whose DELETEs each take ``_DELAY``
-seconds, so invalidation wall time divided by ``_DELAY`` counts the round-trip waves: about
-``ceil(N / 16)``, where the serial per-key path took ``N``.
+Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py) whose
+DELETEs each take ``_DELAY`` seconds. The fan-out tests read its shape from the fake server (which threads
+sent DELETEs, how many were in flight at once), never from wall time, which load stretches.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-import os
 import threading
 import time
-from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from urllib.parse import unquote
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import _DELETE_FANOUT, CachekitIOBackend
 from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import _supports_multi_delete
+from tests.utils.cachekitio_fakes import FakeRequest, Handler, fake_backend, response
 
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
 _DELAY = 0.05
+_HOLD_STALL = 10.0
 
 
 class _Server:
-    """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight."""
+    """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight.
 
-    def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429) -> None:
+    ``threads`` holds the id of every thread that sent a DELETE. With ``hold``, DELETEs wait until
+    ``hold`` of them are in flight at once, then none waits again. A pool starts workers lazily
+    and reuses one that went idle, so without the hold a slow submit loop lets an early DELETE
+    finish and the pool never starts all its workers. Held, no worker goes idle before the last
+    starts, so a 16-worker pool uses exactly 16 threads however the host schedules it; a DELETE
+    sent outside the pool adds one more.
+
+    A wave that cannot fill (fewer workers, a per-key loop) stops gaining DELETEs for good, and a
+    starved submitter only for a while; nothing the server sees tells the two apart. So the hold
+    gives up only after ``_HOLD_STALL`` s in which no DELETE arrived, however long the wave took.
+    """
+
+    def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429, hold: int = 0) -> None:
         self.store: dict[str, bytes] = {}
         self.deleted: list[str] = []
         self.reject, self.status = reject, status
         self.in_flight = self.peak = 0
+        self.threads: set[int] = set()
+        self.hold = hold
+        self._released = threading.Event()
         self._lock = threading.Lock()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.raw_path.decode().split("?")[0]
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
+        path = request.path.split("?")[0]
         rest = path.removeprefix("/v1/cache/")
         if rest.endswith("/lock"):  # async miss path: always grant, always release
-            return httpx.Response(200, json={"lock_id": "l"} if request.method == "POST" else {})
+            return response(200, json={"lock_id": "l"} if request.method == "POST" else {})
         key = unquote(rest)
         if request.method == "GET":
-            return httpx.Response(200, content=self.store[key]) if key in self.store else httpx.Response(404)
+            return response(200, self.store[key]) if key in self.store else response(404)
         if request.method == "PUT":
-            self.store[key] = request.read()
-            return httpx.Response(200)
+            assert request.body is not None
+            self.store[key] = request.body
+            return response(200)
         assert request.method == "DELETE", request.method
         with self._lock:
+            self.threads.add(threading.get_ident())
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
+            if self.in_flight >= self.hold:
+                self._released.set()
+            seen = self.in_flight
         try:
+            while not self._released.wait(_HOLD_STALL):
+                with self._lock:  # held, nothing finishes: in_flight grows exactly when a DELETE arrives
+                    if self.in_flight == seen:
+                        self._released.set()  # cannot fill: let the rest through, the peak assertion reports it
+                    seen = self.in_flight
             time.sleep(_DELAY)
             if key in self.reject:
-                return httpx.Response(self.status, json={"error": "rejected"})
+                return response(self.status, json={"error": "rejected"})
             self.store.pop(key, None)
             with self._lock:
                 self.deleted.append(key)
-            return httpx.Response(200)
+            return response(200)
         finally:
             with self._lock:
                 self.in_flight -= 1
 
 
-def _backend(server: Callable[[httpx.Request], httpx.Response]) -> CachekitIOBackend:
-    transport = httpx.MockTransport(server)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def _backend(server: Handler) -> CachekitIOBackend:
+    return fake_backend(server)[0]
 
 
 def _cached_keys(fn: Any) -> set[tuple[str, str]]:
@@ -113,7 +125,8 @@ def test_empty_batch_sends_nothing() -> None:
 
 @pytest.mark.parametrize("n", [1, 16, 100])
 def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
-    server = _Server()
+    workers = min(n, _DELETE_FANOUT)
+    server = _Server(hold=workers)
 
     @cache(backend=_backend(server), ttl=60, namespace=f"fanout_sync_{n}", l1_enabled=False)
     def f(x: int) -> int:
@@ -123,12 +136,14 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
         f(i)
     assert len(server.store) == n
 
-    start = time.perf_counter()
     f.invalidate_cache()
-    waves = (time.perf_counter() - start) / _DELAY
 
-    waves_expected = math.ceil(n / _DELETE_FANOUT)
-    assert waves_expected - 0.5 < waves < waves_expected + 2, waves  # serial: n waves
+    # Fan-out shape from the server, not the clock: the held first wave puts every
+    # worker in flight on its own pool thread. A key deleted outside the pool (per-key loop, serial
+    # tail) brings an extra thread, or for n = 1 the caller's own; a pool of len(keys) workers
+    # brings more than 16.
+    assert len(server.threads) == workers, len(server.threads)
+    assert threading.get_ident() not in server.threads
     assert sorted(server.deleted) == sorted(set(server.deleted))  # each key DELETEd exactly once
     assert len(server.deleted) == n and server.store == {}
     assert server.peak == min(n, _DELETE_FANOUT)
@@ -138,7 +153,7 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
 @pytest.mark.asyncio
 async def test_ainvalidate_cache_takes_the_fan_out() -> None:
     n = 48
-    server = _Server()
+    server = _Server(hold=_DELETE_FANOUT)
 
     @cache(backend=_backend(server), ttl=60, namespace="fanout_async", l1_enabled=False)
     async def f(x: int) -> int:
@@ -148,11 +163,12 @@ async def test_ainvalidate_cache_takes_the_fan_out() -> None:
         await f(i)
     assert len(server.store) == n
 
-    start = time.perf_counter()
     await f.ainvalidate_cache()
-    waves = (time.perf_counter() - start) / _DELAY
 
-    assert waves < math.ceil(n / _DELETE_FANOUT) + 2, waves
+    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts 16 DELETEs
+    # in flight on 16 pool threads. A key deleted outside the pool (per-key loop, serial tail)
+    # brings a 17th thread; a pool of fewer than 16 never fills the hold and peaks below 16.
+    assert len(server.threads) == _DELETE_FANOUT, len(server.threads)
     assert server.peak == _DELETE_FANOUT
     assert server.store == {} and _cached_keys(f) == set()
 
@@ -236,24 +252,55 @@ def test_runs_from_a_thread_with_a_running_event_loop() -> None:
 
 # ---- Pacing: a rate-limited fan-out waits out Retry-After instead of failing keys ----------
 
-_SCALE = 20  # one real second is 20 virtual seconds: a real 10 ms DELETE is a 200 ms round trip
-_REAL_RTT = 0.01
+_RTT = 0.2  # virtual seconds per DELETE round trip
+_REAL_RTT = 0.01  # real seconds each DELETE holds its thread, so the fan-out's DELETEs overlap
 
 
 class _Clock:
-    """Virtual time: real elapsed time x _SCALE, plus every sleep, which returns at once."""
+    """Virtual time that only sleeps and DELETEs move; neither real time nor thread scheduling does.
+
+    A sleep returns at once and adds its seconds; a DELETE takes ``_RTT``. The thread that made
+    the clock (the test's, which also runs the paced phase) reads shared time, and the bucket
+    refills on it. Shared time moves by every sleep, by ``_RTT`` per DELETE from the test's
+    thread, and by ``_RTT / _DELETE_FANOUT`` per fan-out DELETE: the fan-out runs
+    ``_DELETE_FANOUT`` DELETEs per round trip whichever workers the host lets send them.
+
+    Any other thread is a fan-out worker with its own time: it starts where the test's thread
+    last read the clock, just before the pool, and moves by ``_RTT`` per DELETE of its own. So
+    every fan-out round trip the backend measures is exactly ``_RTT``, and so is the pacing
+    deadline it derives from them.
+    """
 
     def __init__(self) -> None:
-        self._t0 = time.monotonic()
-        self._slept = 0.0
+        self._now = self._read = 0.0
+        self._owner = threading.get_ident()
+        self._worker = threading.local()
         self.sleeps: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
-        return (time.monotonic() - self._t0) * _SCALE + self._slept
+        if threading.get_ident() == self._owner:
+            self._read = self._now
+            return self._now
+        if not hasattr(self._worker, "now"):
+            self._worker.now = self._read
+        return self._worker.now
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self._slept += seconds
+        assert threading.get_ident() == self._owner, "only the paced phase sleeps, on the test's thread"
+        with self._lock:
+            self.sleeps.append(seconds)
+            self._now += seconds
+
+    def round_trip(self) -> float:
+        """End this thread's DELETE; returns shared time, for the bucket."""
+        with self._lock:
+            if threading.get_ident() == self._owner:
+                self._now += _RTT
+            else:
+                self._worker.now = self.monotonic() + _RTT
+                self._now += _RTT / _DELETE_FANOUT
+            return self._now
 
 
 class _Limited:
@@ -274,12 +321,12 @@ class _Limited:
         self._last = clock.monotonic()
         self._lock = threading.Lock()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
         if request.method == "GET":
-            return httpx.Response(404)
+            return response(404)
         if request.method == "PUT":
-            return httpx.Response(200)
-        key = unquote(request.url.raw_path.decode().removeprefix("/v1/cache/"))
+            return response(200)
+        key = unquote(request.path.removeprefix("/v1/cache/"))
         with self._lock:
             self.sent.append(key)
             late = self.first_429 is not None and time.monotonic() > self.first_429 + _REAL_RTT / 2
@@ -289,19 +336,19 @@ class _Limited:
         try:
             time.sleep(_REAL_RTT)
             with self._lock:
-                now = self.clock.monotonic()
+                now = self.clock.round_trip()
                 self.tokens = min(self.burst, self.tokens + (now - self._last) * self.rate)
                 self._last = now
                 if self.tokens >= 1:
                     self.tokens -= 1
                     self.deleted.append(key)
-                    return httpx.Response(200)
+                    return response(200)
                 if self.quota:
-                    return httpx.Response(429, headers={"X-CacheKit-Deny-Reason": "quota"})
+                    return response(429, headers={"X-CacheKit-Deny-Reason": "quota"})
                 if self.first_429 is None:
                     self.first_429 = time.monotonic()
                 wait = math.ceil((1 - self.tokens) / self.rate)
-                return httpx.Response(429, headers={"Retry-After": str(wait)})
+                return response(429, headers={"Retry-After": str(wait)})
         finally:
             if late:
                 with self._lock:
@@ -368,7 +415,7 @@ def test_spent_budget_stops_at_the_deadline_and_returns_exactly_the_rest(
     assert failed == set(keys) - set(server.deleted)
     assert 0 < len(server.deleted) < len(keys)
     # The deadline is about the serial loop's time (50 x 200 ms), not a wait for every key.
-    assert clock.monotonic() - start < 50 * 0.2 * 2
+    assert clock.monotonic() - start < len(keys) * _RTT * 2
     unsent = [key for key in keys if key in failed and key not in server.sent]
     assert unsent  # keys past the deadline are failed without being sent
     assert any("rate limit" in record.getMessage() for record in caplog.records)

@@ -79,6 +79,27 @@ Or use `@cache.secure(...)` for the encrypted ones. On bare `@cache` the flat sp
 
 ---
 
+### Encrypting serializer on a decorator
+
+**Message**: `EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...`
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied
+
+**Cause**: an `EncryptionWrapper` instance, or the `"encrypted"` serializer name, was passed as `serializer=` to a cache decorator: bare `@cache`, any preset that takes `serializer=` (`@cache.secure` included), or a `DecoratorConfig`. The decorator never gives that serializer the cache key each ciphertext is bound to, so it could not store an entry. Earlier releases accepted some of these spellings and ran the function on every call. With `backend=None` you get a different error instead: the L1-only `encryption requires a backend` error, or an error from a check that runs before that one, such as `@cache.secure`'s missing-key error when no key is set outside the wrapper.
+
+**Solution**: pass the master key and the inner serializer to `@cache.secure`, which applies `EncryptionWrapper` itself. Omit `serializer=` for the default MessagePack.
+```python notest
+from cachekit.serializers import OrjsonSerializer
+
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer())  # the serializer EncryptionWrapper wrapped
+def get_api_keys(tenant_id: str):
+    return fetch_api_keys(tenant_id)
+```
+
+`EncryptionWrapper` stays available for direct use outside a decorator.
+
+---
+
 ### Invalid key format
 
 **Message**: one of
@@ -504,11 +525,11 @@ One specific cause worth naming: `... envelope format 'X' disagrees with header 
 
 **Exception**: none: while the breaker is open, a function with an L2 backend still serves L1 hits, skips L2, and runs uncached on an L1 miss, sync or async. An L1 hit is never a probe and records no outcome, so it neither holds the breaker open nor closes it. In L1-only mode (`backend=None`) the breaker is never consulted.
 
-**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is an exception raised by the decorated function itself, or an `InteropError` for a return value the interop data model can't represent (when an async call goes through distributed locking, as on Redis or CachekitIO, neither counts); a failure to create the backend client; and, for async functions only, a result too large to cache (over `max_value_size`) or a multi-tenant encrypted write whose tenant id cannot be extracted. A result that fails to serialize or encrypt for the cache write never counts, sync or async: the write is skipped with an ERROR and a WARNING log line, and the function's result is returned uncached. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
+**Cause**: Five failures within a 60-second rolling window (five is the default [`failure_threshold`](features/circuit-breaker.md)) — successes do not reset the count, and a failure older than 60 seconds stops counting. Backend read and write failures (connection errors, timeouts, CachekitIO HTTP errors) do not currently count: they are logged, a failed read is a miss, and a failed write skips only L2. With L1 enabled (the default) a buffered write still stores the result in L1, so later calls in the same process can hit it. A sync function using the plaintext Arrow serializer on the File backend streams its writes instead, and a streamed write never goes to L1, so after a failed one the next call recomputes. What counts is a failure to create the backend client and, for async functions only, a result too large to cache (over `max_value_size`) or a multi-tenant encrypted write whose tenant id cannot be extracted. An exception raised by the decorated function never counts, and neither does an `InteropError` for a return value the interop data model can't represent: both reach the caller unchanged, sync or async. A result that fails to serialize or encrypt for the cache write never counts, sync or async: the write is skipped with an ERROR and a WARNING log line, and the function's result is returned uncached. A keyring configuration fault (`KeyringConfigurationError`) never counts, whether the cache write raised it or the decorated function did (from a nested cached call, for example): it reaches the caller, sync or async. A cached entry that fails to deserialize, decrypt or pass its integrity check, or that an encrypting reader refuses, does not count under either policy (see *Deserialization failed* and *Decryption failed*). Under fail-open, the default, it is a miss: cachekit attempts to evict it (best effort: a failed delete is only logged, and the entry stays) and the function recomputes. With `fail_closed=True`, an authentication failure raises `DecryptionAuthenticationError` and keeps the entry as evidence; any other such failure is a miss, as under fail-open. Each decorated function has its own breaker, and that many counted failures open it even when the backend is healthy.
 
 **What it means**:
-- Your function has raised, or another failure listed under **Cause** has occurred, `failure_threshold` times (five by default) within 60 seconds
-- Calls to this function that miss L1 run uncached until the breaker recovers; L1 hits are still served. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which admits up to three probe calls (`half_open_requests`) while further calls run uncached. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
+- A failure listed under **Cause** has occurred `failure_threshold` times (five by default) within 60 seconds
+- Calls to this function that miss L1 run uncached until the breaker recovers; L1 hits are still served. Once the cooldown has passed (`recovery_timeout`, 30 seconds after the breaker opened by default), the next call moves it to HALF_OPEN, which has three probe slots (`half_open_requests`); calls that find none free run uncached. Every admitted probe holds its slot until the cycle ends, cancelled ones included, except a probe whose function raises: it records no outcome and hands its slot to the next call, so while the function keeps raising, more than three calls in one cycle can reach the backend. Three successes (`success_threshold`) close it; a counted failure reopens it for another cooldown. See [What It Does](features/circuit-breaker.md#what-it-does)
 
 **Solutions**:
 
@@ -738,7 +759,7 @@ export CACHEKIT_TIMEOUT=10.0
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
-**Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable
+**Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable. `Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)` means the host has no CA bundle cachekit can use: install the system bundle (`ca-certificates`), or point `SSL_CERT_FILE` at one
 
 **Behavior**: TRANSIENT — logged; the function runs and its result is still stored in L1.
 
@@ -767,8 +788,8 @@ echo $CACHEKIT_API_URL
 | 429 | `TRANSIENT` |
 | 5xx | `TRANSIENT` |
 | 413, other 4xx | `PERMANENT` |
-| `TimeoutException` | `TIMEOUT` |
-| `ConnectError`, `NetworkError` | `TRANSIENT` |
+| urllib3 `ConnectTimeoutError`, `ReadTimeoutError` | `TIMEOUT` |
+| urllib3 `NewConnectionError`, `ProtocolError`, `SSLError`, `ProxyError` | `TRANSIENT` (a failed certificate verification says so: see `SSL_CERT_FILE` in [CachekitIO](backends/cachekitio.md#characteristics)) |
 | Other | `UNKNOWN` |
 
 No type counts toward the circuit breaker. Only a `503` to a write or delete with a `Retry-After` of 2 seconds or less is retried, once, for sync and async functions alike (see [Server error (5xx)](#server-error-5xx)). A failed lock request is not retried: it ends the lock wait, as the note at the top of this section says.
