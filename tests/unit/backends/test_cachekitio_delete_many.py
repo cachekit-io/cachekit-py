@@ -267,28 +267,42 @@ _REAL_RTT = 0.01  # real seconds each DELETE holds its thread, so the fan-out's 
 
 
 class _Clock:
-    """Virtual time that only sleeps and DELETE round trips move; real time never does.
+    """Virtual time that only sleeps and DELETE round trips move; neither real time nor scheduling does.
 
-    A sleep returns at once and adds its seconds. A DELETE that began at ``t`` ends at
-    ``t + _RTT``, so DELETEs in flight together take one round trip between them, not one each:
-    the backend sets its pacing deadline from fan-out round trips measured on this clock.
+    A sleep returns at once and adds its seconds; a DELETE takes ``_RTT``. The thread that made
+    the clock (the test's, which also runs the paced phase) reads shared time. Any other thread is
+    a fan-out worker with its own time: it starts where the test's thread last read the clock,
+    just before the pool, and moves only by the worker's own DELETEs. So every fan-out round trip
+    measures exactly ``_RTT`` however the host schedules the workers, and the pacing deadline the
+    backend derives from them is fixed. Shared time is the latest DELETE end of any thread, so the
+    paced phase starts after the fan-out's last DELETE.
     """
 
     def __init__(self) -> None:
-        self._now = 0.0
+        self._now = self._read = 0.0
+        self._owner = threading.get_ident()
+        self._worker = threading.local()
         self.sleeps: list[float] = []
         self._lock = threading.Lock()
 
     def monotonic(self) -> float:
-        return self._now
+        if threading.get_ident() == self._owner:
+            self._read = self._now
+            return self._now
+        if not hasattr(self._worker, "now"):
+            self._worker.now = self._read
+        return self._worker.now
 
     def sleep(self, seconds: float) -> None:
+        assert threading.get_ident() == self._owner, "only the paced phase sleeps, on the test's thread"
         with self._lock:
             self.sleeps.append(seconds)
             self._now += seconds
 
     def round_trip(self, began: float) -> float:
-        """End a DELETE that began at ``began``; returns the time now."""
+        """End this thread's DELETE that began at ``began``; returns shared time, for the bucket."""
+        if threading.get_ident() != self._owner:
+            self._worker.now = began + _RTT
         with self._lock:
             self._now = max(self._now, began + _RTT)
             return self._now
