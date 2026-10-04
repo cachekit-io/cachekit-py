@@ -30,18 +30,22 @@ from cachekit.cache_handler import _supports_multi_delete
 _TEST_API_URL = "https://api.cachekit.io"
 _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
 _DELAY = 0.05
-_HOLD_TIMEOUT = 10.0
+_HOLD_STALL = 10.0
 
 
 class _Server:
     """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight.
 
     ``threads`` holds the id of every thread that sent a DELETE. With ``hold``, DELETEs wait until
-    ``hold`` of them are in flight at once (or ``_HOLD_TIMEOUT`` passes), then none waits again.
-    A pool starts workers lazily and reuses one that went idle, so without the hold a slow submit
-    loop lets an early DELETE finish and the pool never starts all its workers. Held, no worker
-    goes idle before the last starts, so a 16-worker pool uses exactly 16 threads however the
-    host schedules it; a DELETE sent outside the pool adds one more.
+    ``hold`` of them are in flight at once, then none waits again. A pool starts workers lazily
+    and reuses one that went idle, so without the hold a slow submit loop lets an early DELETE
+    finish and the pool never starts all its workers. Held, no worker goes idle before the last
+    starts, so a 16-worker pool uses exactly 16 threads however the host schedules it; a DELETE
+    sent outside the pool adds one more.
+
+    A wave that cannot fill (fewer workers, a per-key loop) stops gaining DELETEs for good, and a
+    starved submitter only for a while; nothing the server sees tells the two apart. So the hold
+    gives up only after ``_HOLD_STALL`` s in which no DELETE arrived, however long the wave took.
     """
 
     def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429, hold: int = 0) -> None:
@@ -72,9 +76,13 @@ class _Server:
             self.peak = max(self.peak, self.in_flight)
             if self.in_flight >= self.hold:
                 self._released.set()
+            seen = self.in_flight
         try:
-            if not self._released.wait(_HOLD_TIMEOUT):
-                self._released.set()  # never reached: let the rest through, the peak assertion reports it
+            while not self._released.wait(_HOLD_STALL):
+                with self._lock:  # held, nothing finishes: in_flight grows exactly when a DELETE arrives
+                    if self.in_flight == seen:
+                        self._released.set()  # cannot fill: let the rest through, the peak assertion reports it
+                    seen = self.in_flight
             time.sleep(_DELAY)
             if key in self.reject:
                 return httpx.Response(self.status, json={"error": "rejected"})
