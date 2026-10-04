@@ -93,7 +93,7 @@ SLEEPER = """
 import os, sys, time
 from pathlib import Path
 Path(__file__).with_name("pids").joinpath(str(os.getpid())).write_text(sys.argv[2])
-if sys.argv[2] != "1":
+if sys.argv[2] != "1" or Path(__file__).with_name("sleep-warmup").exists():
     time.sleep(60)
 """
 
@@ -105,7 +105,15 @@ sys.path.insert(0, sys.argv[2])
 from tests.performance import ir_budget as b
 b.WORKLOAD = Path(sys.argv[1])
 b._measure_one = lambda path, n, workdir, env, *timeout: b._run([], path, n, env, *timeout) or 0
-if len(sys.argv) > 3:  # signal itself while submitting the second run, the first one live
+if len(sys.argv) > 3 and sys.argv[4] == "spawn":  # signal itself as soon as the first run is spawned
+    import os
+    class SignalOnSpawn(b.subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            Path(sys.argv[1]).with_name("spawned").write_text(str(self.pid))
+            os.kill(os.getpid(), int(sys.argv[3]))
+    b.subprocess.Popen = SignalOnSpawn
+elif len(sys.argv) > 3:  # signal itself while submitting the second run, the first one live
     import os, signal, time
     submit = b.ThreadPoolExecutor.submit
     calls = []
@@ -181,7 +189,7 @@ def test_a_signal_while_runs_are_being_submitted_leaves_no_run_behind(tmp_path, 
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER)
     repo = Path(__file__).resolve().parents[2]
-    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig))])  # noqa: S603 (trusted: this test's files)
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "submit"])  # noqa: S603 (trusted: this test's files)
     try:
         code = gate.wait(timeout=20)  # the stub run sleeps 60 s: a gate that waits for it times out here
         runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
@@ -196,6 +204,30 @@ def test_a_signal_while_runs_are_being_submitted_leaves_no_run_behind(tmp_path, 
         for f in pids.iterdir():
             if _alive(int(f.name)):
                 os.kill(int(f.name), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+    script, pids = _sleeper(tmp_path)
+    (tmp_path / "sleep-warmup").touch()  # the warm-up run sleeps too, so an orphan stays visible
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "spawn"])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)
+        run = int((tmp_path / "spawned").read_text())  # the run may be killed before it records its own pid
+        deadline = time.monotonic() + 5
+        while _alive(run) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(run), "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
+    finally:
+        gate.kill()
+        for f in [*pids.iterdir(), tmp_path / "spawned"]:
+            pid = int(f.read_text() if f.name == "spawned" else f.name) if f.exists() else 0
+            if pid and _alive(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 def test_every_path_has_a_committed_budget() -> None:
