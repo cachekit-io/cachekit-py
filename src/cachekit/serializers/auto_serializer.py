@@ -16,13 +16,21 @@ Uses MessagePack as the default format with graceful degradation for optional de
 Type Checking Note:
 Optional imports (numpy, pandas) are guarded at runtime by HAS_NUMPY, HAS_PANDAS flags.
 Type checker cannot statically verify these; suppressed via pyright config comments above.
+
+The data stack (numpy, pandas, pyarrow) is never imported by ``import cachekit``: it cost ~250 ms
+per process start, and pandas 2.x re-enables the GIL on free-threaded builds. Serialize reads
+numpy and pandas from ``sys.modules`` (an ndarray or DataFrame cannot exist unless its module is
+already loaded); decode imports them on first use.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import date, datetime, time
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from functools import cached_property
+from importlib.util import find_spec
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, cast
 from uuid import UUID
 
 import msgpack
@@ -32,31 +40,7 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
 
-# Optional imports with feature flags
-try:
-    import numpy as np
-
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-    np = None  # type: ignore[assignment]
-
-try:
-    import pandas as pd
-
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
-    pd = None  # type: ignore[assignment]
-
-# Optional: ArrowSerializer for fast DataFrame serialization
-try:
     from .arrow_serializer import ArrowSerializer
-
-    HAS_ARROW_SERIALIZER = True
-except ImportError:
-    HAS_ARROW_SERIALIZER = False
-    ArrowSerializer = None  # type: ignore[assignment,misc]
 
 from cachekit._rust_serializer import ByteStorage, EnvelopeIntegrityError
 from cachekit.hash_utils import redact_error_for_log
@@ -72,6 +56,11 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Installed, not imported: find_spec locates a top-level package without executing it.
+HAS_NUMPY = find_spec("numpy") is not None
+HAS_PANDAS = find_spec("pandas") is not None
+_BUILTIN_TYPES = frozenset({dict, list, tuple, str, int, float, bool, bytes, type(None)})
 
 # Every `format` a ByteStorage envelope can carry out of serialize(): _serialize_msgpack stores
 # `self.default_format` ("msgpack", enforced in __init__), _serialize_dataframe "dataframe",
@@ -151,7 +140,11 @@ def _is_plain_numpy_numeric(dtype: Any) -> bool:
     dtype-name matching is unreliable ("Int64" misses ``startswith("int")`` while
     "int64[pyarrow]" wrongly matches it). Used by the no-pyarrow columnar fallback.
     """
-    return HAS_PANDAS and not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
+    if not HAS_PANDAS:
+        return False
+    import pandas as pd
+
+    return not pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in ("i", "u", "f")
 
 
 def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
@@ -162,6 +155,8 @@ def _dtype_from_untrusted(spec: Any, *, numeric_only: bool = False) -> np.dtype:
     before any array is built. Columnar (DataFrame/Series) entries only ever carry dtypes that
     pass ``_is_plain_numpy_numeric``, the write-side predicate, so ``numeric_only`` mirrors it.
     """
+    import numpy as np
+
     dtype = np.dtype(spec)
     if numeric_only and not _is_plain_numpy_numeric(dtype):
         raise SerializationError(
@@ -192,6 +187,8 @@ def _column_values(info: dict[str, Any], what: str) -> Any:
     """
     marker = info["type"]
     if marker == "numeric":
+        import numpy as np
+
         # .copy() → writable values that do not alias the source buffer (#157).
         return np.frombuffer(info["data"], dtype=_dtype_from_untrusted(info["dtype"], numeric_only=True)).copy()
     if marker == "object":
@@ -300,8 +297,10 @@ def _auto_default(obj: Any) -> Any:
         return {"__set__": True, "value": list(obj), "frozen": isinstance(obj, frozenset)}
 
     # NumPy array support (nested in dicts/lists via msgpack custom encoder)
-    if HAS_NUMPY and isinstance(obj, np.ndarray):
-        return {"__ndarray__": True, "data": obj.tobytes(), "shape": list(obj.shape), "dtype": str(obj.dtype)}
+    np_loaded = sys.modules.get("numpy")
+    if np_loaded is not None and isinstance(obj, np_loaded.ndarray):
+        arr = cast("np.ndarray", obj)
+        return {"__ndarray__": True, "data": arr.tobytes(), "shape": list(arr.shape), "dtype": str(arr.dtype)}
 
     # NEW: Helpful error detection for common unsupported types
     if _safe_hasattr(obj, "model_dump"):  # Pydantic BaseModel
@@ -387,6 +386,8 @@ def _auto_object_hook(obj: Any) -> Any:
                 raise SerializationError("Cannot deserialize numpy array: numpy is not installed")
             if "data" not in obj or "shape" not in obj or "dtype" not in obj:
                 raise SerializationError("Invalid ndarray format: missing required fields in cached data")
+            import numpy as np
+
             # .copy(): writable result that does not alias the source buffer (the L1-cached bytes on a hit) — #157.
             return np.frombuffer(obj["data"], dtype=_dtype_from_untrusted(obj["dtype"])).reshape(obj["shape"]).copy()
 
@@ -511,12 +512,6 @@ class AutoSerializer:
         if self.enable_integrity_checking:
             self._byte_storage = ByteStorage(default_format)
 
-        # Initialize ArrowSerializer for fast DataFrame serialization (if available)
-        if HAS_ARROW_SERIALIZER:
-            self._arrow_serializer = ArrowSerializer()  # type: ignore[misc]
-        else:
-            self._arrow_serializer = None
-
         # MessagePack configuration for speed
         self._msgpack_pack_opts = {
             "use_bin_type": True,  # Use bin type for bytes (faster)
@@ -534,6 +529,19 @@ class AutoSerializer:
             "raw": False,  # Decode strings properly
             "object_hook": _auto_object_hook,  # Restore datetime, UUID, set, frozenset
         }
+
+    @cached_property
+    def _arrow_serializer(self) -> ArrowSerializer | None:
+        """ArrowSerializer for fast DataFrame serialization, built on first use; None without pyarrow.
+
+        Lazy so ``import cachekit`` never loads pyarrow. Assignable: tests set it to None to force
+        the msgpack-columnar fallback.
+        """
+        try:
+            from .arrow_serializer import ArrowSerializer
+        except ImportError:
+            return None
+        return ArrowSerializer()
 
     def serialize(self, obj: Any) -> tuple[bytes, SerializationMetadata]:
         """Serialize object to bytes using auto detection.
@@ -564,38 +572,43 @@ class AutoSerializer:
         # gate ByteStorage.store on the same flag).
         enveloped = self.enable_integrity_checking
 
-        # NumPy detection (only if numpy installed)
-        if HAS_NUMPY and isinstance(obj, np.ndarray):  # type: ignore[union-attr]
-            data = self._serialize_numpy(obj)
-            metadata = SerializationMetadata(
-                serialization_format=SerializationFormat.MSGPACK, compressed=False, original_type="numpy"
-            )
-            return data, metadata
+        # An exact builtin is never an ndarray, DataFrame or Series, so plain values skip these checks.
+        # Otherwise a value of these types implies its module is loaded, so a sys.modules miss rules
+        # it out without importing anything.
+        if type(obj) not in _BUILTIN_TYPES:
+            np = sys.modules.get("numpy")
+            if np is not None and isinstance(obj, np.ndarray):
+                data = self._serialize_numpy(obj)
+                metadata = SerializationMetadata(
+                    serialization_format=SerializationFormat.MSGPACK, compressed=False, original_type="numpy"
+                )
+                return data, metadata
 
-        # DataFrame detection (delegate to ArrowSerializer if available)
-        if HAS_PANDAS and isinstance(obj, pd.DataFrame):  # type: ignore[union-attr]
-            if self._arrow_serializer is not None:
-                # Use ArrowSerializer for 50-100x faster DataFrame serialization
-                # (its metadata already reflects its own configured codec)
-                return self._arrow_serializer.serialize(obj)
-            # Fallback to msgpack columnar format
-            data = self._serialize_dataframe(obj)
-            metadata = SerializationMetadata(
-                serialization_format=SerializationFormat.MSGPACK,
-                compressed=enveloped,
-                original_type="dataframe",
-            )
-            return data, metadata
+            # DataFrame detection (delegate to ArrowSerializer if available)
+            pd = sys.modules.get("pandas")
+            if pd is not None and isinstance(obj, pd.DataFrame):
+                if self._arrow_serializer is not None:
+                    # Use ArrowSerializer for 50-100x faster DataFrame serialization
+                    # (its metadata already reflects its own configured codec)
+                    return self._arrow_serializer.serialize(obj)
+                # Fallback to msgpack columnar format
+                data = self._serialize_dataframe(obj)
+                metadata = SerializationMetadata(
+                    serialization_format=SerializationFormat.MSGPACK,
+                    compressed=enveloped,
+                    original_type="dataframe",
+                )
+                return data, metadata
 
-        # Series detection (only if pandas installed)
-        if HAS_PANDAS and isinstance(obj, pd.Series):  # type: ignore[union-attr]
-            data = self._serialize_series(obj)
-            metadata = SerializationMetadata(
-                serialization_format=SerializationFormat.MSGPACK,
-                compressed=enveloped,
-                original_type="series",
-            )
-            return data, metadata
+            # Series detection
+            if pd is not None and isinstance(obj, pd.Series):
+                data = self._serialize_series(obj)
+                metadata = SerializationMetadata(
+                    serialization_format=SerializationFormat.MSGPACK,
+                    compressed=enveloped,
+                    original_type="series",
+                )
+                return data, metadata
 
         # Default: MessagePack (always available)
         data = self._serialize_msgpack(obj)
@@ -1008,6 +1021,8 @@ class AutoSerializer:
         """
         if not HAS_NUMPY:
             raise RuntimeError("NumPy not installed. Install with: pip install cachekit[data]")
+        import numpy as np
+
         # A memoryview has no .startswith/.decode; compare slices and decode a bytes copy.
         if data[:9] != b"NUMPY_RAW":
             raise SerializationError("Invalid NumPy data format - expected NUMPY_RAW header")
@@ -1062,6 +1077,7 @@ class AutoSerializer:
             RuntimeError: If pandas not installed"""
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
+        import pandas as pd
 
         # Column-wise serialization
         serialized = {
@@ -1098,6 +1114,7 @@ class AutoSerializer:
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
+        import pandas as pd
 
         serialized = _expect(document, dict, "document")
         columns_data = {}
@@ -1121,6 +1138,7 @@ class AutoSerializer:
             RuntimeError: If pandas not installed"""
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
+        import pandas as pd
 
         serialized = {
             "name": series.name,
@@ -1153,6 +1171,7 @@ class AutoSerializer:
         """
         if not HAS_PANDAS:
             raise RuntimeError("Pandas not installed. Install with: pip install cachekit[data]")
+        import pandas as pd
 
         serialized = _expect(document, dict, "document")
         series = pd.Series(_column_values(serialized, "series"), name=serialized["name"])
