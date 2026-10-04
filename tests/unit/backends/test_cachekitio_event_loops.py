@@ -1,36 +1,134 @@
-"""CachekitIOBackend across consecutive event loops (asyncio.run per job, Celery, test suites).
+"""CachekitIOBackend across consecutive event loops (asyncio.run per job, Celery, test suites) and concurrent coroutines.
 
-An httpx.AsyncClient's pooled connections belong to the loop that opened them, so a client reused on a
-later loop fails its next request with RuntimeError('Event loop is closed'). The backend filed that as
-UNKNOWN, and the lock path read it as "held": with a live pooled connection the server granted a lock
-the client never saw, the caller polled the full blocking_timeout and left the lock orphaned.
-
-These tests drive the real backend over real sockets: httpx.MockTransport has no connection pool, so
-it cannot reproduce the bug.
+Under httpx every loop needed an AsyncClient of its own, since pooled connections belong to the loop that opened them:
+a client reused on a later loop failed with RuntimeError('Event loop is closed'), and the lock path read that as
+"held", so the server granted a lock the client never saw and the caller polled the full blocking_timeout. Now
+every async method sends on the backend's one thread-safe client through ``asyncio.to_thread``, and the client
+holds nothing bound to a loop. These tests pin that: every async method goes through that client, on any number of
+successive loops and on many coroutines at once, and over real pooled sockets a new loop locks on its first attempt.
 """
 
 from __future__ import annotations
 
 import asyncio
-import gc
 import json
 import threading
 import time
 import uuid
-import weakref
 from collections.abc import Iterator
-from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
 
 from cachekit.backends.cachekitio import client as client_module
 from cachekit.backends.cachekitio.backend import LOCK_ID_HEADER, CachekitIOBackend
+from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, response
 
 _KEY = "ns:t:func:m.f:args:" + "a" * 64 + ":1s"
+_PATH = "/v1/cache/ns%3At%3Afunc%3Am.f%3Aargs%3A" + "a" * 64 + "%3A1s"
 _LOOPS = 5
+
+
+# ---------------------------------------------------------------------------
+# Every async method, on the fake pool
+# ---------------------------------------------------------------------------
+
+
+class _Api:
+    """Answers each SaaS endpoint and records the thread each request was sent from."""
+
+    def __init__(self) -> None:
+        self.threads: set[int] = set()
+        self._lock = threading.Lock()
+
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
+        with self._lock:
+            self.threads.add(threading.get_ident())
+        if request.path.endswith("/lock"):
+            return response(200, json={"lock_id": "L1"} if request.method == "POST" else {})
+        if request.path.endswith("/ttl"):
+            return response(200, json={"ttl": 60} if request.method == "GET" else {})
+        if request.path == "/v1/cache/health":
+            return response(200, json={"version": "9.9.9"})
+        if request.method == "GET":
+            return response(200, b"value")
+        return response(200, json={"success": True})
+
+
+_EXPECTED_REQUESTS = [
+    ("GET", _PATH),
+    ("PUT", _PATH),
+    ("HEAD", _PATH),
+    ("DELETE", _PATH),
+    ("GET", "/v1/cache/health"),
+    ("POST", f"{_PATH}/lock"),
+    ("DELETE", f"{_PATH}/lock"),
+    ("GET", f"{_PATH}/ttl"),
+    ("PATCH", f"{_PATH}/ttl"),
+]
+
+
+async def _every_async_method(backend: CachekitIOBackend) -> dict[str, Any]:
+    results: dict[str, Any] = {
+        "client": backend._lease.client,
+        "get": await backend.get_async(_KEY),
+        "set": await backend.set_async(_KEY, b"value", ttl=60),
+        "exists": await backend.exists_async(_KEY),
+        "delete": await backend.delete_async(_KEY),
+        "health": (await backend.health_check_async())[0],
+    }
+    async with backend.acquire_lock(_KEY, timeout=5.0) as acquired:
+        results["lock"] = acquired
+    results["ttl"] = await backend.get_ttl(_KEY)
+    results["refresh"] = await backend.refresh_ttl(_KEY, 120)
+    return results
+
+
+def _sent(pool: FakePool) -> list[tuple[str, str]]:
+    return [(r.method, r.path) for r in pool.requests]
+
+
+@pytest.mark.unit
+def test_every_async_method_sends_on_the_backends_client_on_each_new_loop() -> None:
+    """Successor of the per-loop AsyncClient: one client, nothing bound to a loop, so a later loop needs nothing new."""
+    api = _Api()
+    backend, pool = fake_backend(api)
+    client = backend._lease.client
+    expected = {
+        "client": client,
+        "get": b"value",
+        "set": None,
+        "exists": True,
+        "delete": True,
+        "health": True,
+        "lock": True,
+        "ttl": 60,
+        "refresh": True,
+    }
+    for _ in range(_LOOPS):
+        assert asyncio.run(_every_async_method(backend)) == expected
+    assert _sent(pool) == _EXPECTED_REQUESTS * _LOOPS
+    # The fake pool sits on the backend's own client, so every request above went through it, under its key.
+    assert all(r.headers["Authorization"] == client.headers["Authorization"] for r in pool.requests)
+    # Sent from worker threads: a blocking urllib3 call on the loop's thread would stall every other coroutine.
+    assert threading.get_ident() not in api.threads
+
+
+@pytest.mark.unit
+async def test_concurrent_async_ops_share_the_client_without_error() -> None:
+    """Many coroutines at once each run their request on a worker thread, all on the one thread-safe pool."""
+    backend, pool = fake_backend(_Api())
+    rounds = 25
+    results = await asyncio.gather(*(_every_async_method(backend) for _ in range(rounds)))
+    assert all(r["get"] == b"value" and r["lock"] is True and r["ttl"] == 60 and r["refresh"] is True for r in results)
+    assert sorted(_sent(pool)) == sorted(_EXPECTED_REQUESTS * rounds)
+
+
+# ---------------------------------------------------------------------------
+# Real sockets: the lock path on successive loops
+# ---------------------------------------------------------------------------
 
 
 class _FakeSaaS(ThreadingHTTPServer):
@@ -43,6 +141,7 @@ class _FakeSaaS(ThreadingHTTPServer):
         self.mutex = threading.Lock()
         self.locks: dict[str, tuple[str, float]] = {}
         self.lock_posts = 0
+        self.connections = 0
 
     def held(self) -> list[str]:
         now = time.monotonic()
@@ -53,6 +152,11 @@ class _FakeSaaS(ThreadingHTTPServer):
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive, so the client pools connections
     server: _FakeSaaS
+
+    def setup(self) -> None:
+        super().setup()
+        with self.server.mutex:
+            self.server.connections += 1
 
     def _reply(self, body: dict[str, Any]) -> None:
         data = json.dumps(body).encode()
@@ -89,15 +193,6 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def _api_key() -> str:
-    # Unique per test: a backend still alive from an earlier test must never lend this one its client.
-    return f"ck_test_loops_{uuid.uuid4().hex}"
-
-
-def _slots_for(api_key: str) -> list[Any]:
-    return [slot for key, slot in client_module._clients().async_slots.items() if key[1] == api_key]
-
-
 @pytest.fixture
 def saas() -> Iterator[_FakeSaaS]:
     server = _FakeSaaS()
@@ -108,31 +203,30 @@ def saas() -> Iterator[_FakeSaaS]:
     server.server_close()
 
 
-def _point_clients_at(monkeypatch: pytest.MonkeyPatch, saas: _FakeSaaS, keepalive_expiry: float) -> None:
-    # Config validation (rightly) refuses a plain-HTTP loopback URL, so the client kwargs are redirected
-    # instead; the backend, its lease and httpx's real connection pool all run unchanged.
-    real_kwargs = client_module._client_kwargs
+def _backend_on(saas: _FakeSaaS) -> CachekitIOBackend:
+    """A backend whose client's pool is the SDK's own pool policy, pointed at the loopback server.
 
-    def local_kwargs(config: Any, transport_cls: Any) -> dict[str, Any]:
-        kwargs = real_kwargs(config, transport_cls)
-        kwargs["base_url"] = f"http://127.0.0.1:{saas.server_address[1]}"
-        kwargs["http2"] = False
-        kwargs["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=10, keepalive_expiry=keepalive_expiry)
-        kwargs["mounts"] = None  # the keepalive mount would bypass the overrides above
-        return kwargs
-
-    monkeypatch.setattr(client_module, "_client_kwargs", local_kwargs)
+    Config validation (rightly) refuses a plain-HTTP loopback URL, so only the pool is built from an
+    unvalidated copy of the config; the backend, its lease and client, and urllib3's real pool run unchanged.
+    """
+    # Unique per test: a backend still alive from an earlier test must never lend this one its client.
+    backend = CachekitIOBackend(api_key=f"ck_test_loops_{uuid.uuid4().hex}")
+    client = backend._lease.client
+    client.pool.close()
+    local = backend._config.model_copy(update={"api_url": f"http://127.0.0.1:{saas.server_address[1]}"})
+    client.pool = client_module._connection_pool(local)  # type: ignore[assignment]
+    return backend
 
 
 async def _one_job(backend: CachekitIOBackend, saas: _FakeSaaS, first: str) -> dict[str, Any]:
-    # The loop's first request is the one a stale pooled connection fails, so each call takes a turn first.
+    # The loop's first request is the one a stale pooled connection would fail, so each call takes a turn first.
     ttl = await backend.get_ttl(_KEY) if first == "ttl" else None
     posts_before = saas.lock_posts
     attempts: list[str | None] = []
     real_try = backend._try_acquire_lock
 
     async def counted(lock_key: str, timeout: float) -> str | None:
-        # Counted client-side too: past keepalive the failed attempt never reaches the server.
+        # Counted client-side too: a failed attempt may never reach the server.
         attempts.append(await real_try(lock_key, timeout))
         return attempts[-1]
 
@@ -160,94 +254,11 @@ async def _one_job(backend: CachekitIOBackend, saas: _FakeSaaS, first: str) -> d
 
 @pytest.mark.unit
 @pytest.mark.parametrize("first", ["lock", "ttl"])
-@pytest.mark.parametrize(
-    ("gap", "keepalive_expiry"),
-    [
-        pytest.param(0.0, 5.0, id="gap-0s-live-pooled-connection"),
-        # Same regime as a gap past httpx's 5 s keepalive, without the 5 s: the pooled connection expires first.
-        pytest.param(0.3, 0.1, id="gap-past-keepalive"),
-        pytest.param(5.5, 5.0, id="gap-5.5s-default-keepalive", marks=pytest.mark.slow),
-    ],
-)
-def test_every_new_loop_locks_on_its_first_attempt(
-    monkeypatch: pytest.MonkeyPatch, saas: _FakeSaaS, gap: float, keepalive_expiry: float, first: str
-) -> None:
-    _point_clients_at(monkeypatch, saas, keepalive_expiry)
-    backend = CachekitIOBackend(api_key=_api_key())
-    results = []
-    for _ in range(3):
-        results.append(asyncio.run(_one_job(backend, saas, first)))
-        time.sleep(gap)
+def test_every_new_loop_locks_on_its_first_attempt(saas: _FakeSaaS, first: str) -> None:
+    """Back-to-back loops on live pooled connections: each locks at once and leaves nothing held."""
+    backend = _backend_on(saas)
+    results = [asyncio.run(_one_job(backend, saas, first)) for _ in range(3)]
     expected = {"ttl": 60, "got_lock": True, "lock_attempts": 1, "lock_posts": 1, "got_lease": True, "held": []}
     assert results == [expected] * 3
-
-
-@pytest.mark.unit
-def test_finished_loops_and_their_clients_are_released(monkeypatch: pytest.MonkeyPatch, saas: _FakeSaaS) -> None:
-    """One cached client per thread and config; a finished loop is not kept alive past the next one."""
-    _point_clients_at(monkeypatch, saas, keepalive_expiry=5.0)
-    api_key = _api_key()
-    backend = CachekitIOBackend(api_key=api_key)
-    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
-
-    async def job(b: CachekitIOBackend) -> None:
-        loops.append(weakref.ref(asyncio.get_running_loop()))
-        assert await b.get_ttl(_KEY) == 60
-
-    for _ in range(_LOOPS):
-        asyncio.run(job(backend))
-    gc.collect()
-    # The last loop's client stays cached for the next job, and its pooled connection holds that loop.
-    assert [ref() is None for ref in loops] == [True] * (_LOOPS - 1) + [False]
-    assert len(_slots_for(api_key)) == 1
-    del backend
-    gc.collect()
-    assert all(ref() is None for ref in loops)
-    assert _slots_for(api_key) == []
-
-
-@pytest.mark.unit
-def test_threads_running_their_own_loops_never_share_a_client(monkeypatch: pytest.MonkeyPatch, saas: _FakeSaaS) -> None:
-    _point_clients_at(monkeypatch, saas, keepalive_expiry=5.0)
-    backend = CachekitIOBackend(api_key=_api_key())
-    clients: list[httpx.AsyncClient] = []
-    ready = threading.Barrier(2)
-
-    async def job() -> None:
-        ready.wait(5)  # both loops running at once
-        clients.append(backend._async_lease.client)
-        assert await backend.get_ttl(_KEY) == 60
-
-    def run(future: Future[None]) -> None:
-        # Forwarded, not handled: result() below re-raises it on the test thread with its own traceback.
-        try:
-            asyncio.run(job())
-        except BaseException as exc:
-            future.set_exception(exc)
-        else:
-            future.set_result(None)
-
-    # Daemon threads, not a pool: a hung worker fails here as TimeoutError and is left behind, where a
-    # pool's shutdown would wait for it and hang the test.
-    futures: list[Future[None]] = [Future(), Future()]
-    for future in futures:
-        threading.Thread(target=run, args=(future,), daemon=True).start()
-    for future in futures:
-        future.result(timeout=10)
-    assert len(clients) == 2
-    assert clients[0] is not clients[1]
-
-
-@pytest.mark.unit
-def test_construction_builds_no_async_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    built: list[httpx.AsyncClient] = []
-    real_init = httpx.AsyncClient.__init__
-
-    def spy(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
-        built.append(self)
-        real_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", spy)
-    backend = CachekitIOBackend(api_key=_api_key())
-    assert backend._sync_lease.client is not None
-    assert built == []
+    # One pooled connection carried every request of every loop: the regime in which httpx's loop-bound pool broke.
+    assert saas.connections == 1

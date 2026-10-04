@@ -200,9 +200,12 @@ def _decorated(scenario: str, port: int, computed: list[int], errors: list[str])
 
 def _fake_cpu(port: int) -> list[float]:
     """CPU seconds used so far by each worker of the loopback fake (on its own HTTP/1.1 connection)."""
-    import httpx
+    import urllib3
 
-    return httpx.get(f"https://127.0.0.1:{port}/__stats").raise_for_status().json()["worker_cpu_s"]
+    response = urllib3.request("GET", f"https://127.0.0.1:{port}/__stats", retries=False)
+    if response.status != 200:
+        raise RuntimeError(f"loopback fake /__stats answered HTTP {response.status}")
+    return response.json()["worker_cpu_s"]
 
 
 def cell_main(port: int, dur: float, warm: float) -> None:

@@ -1,72 +1,26 @@
 """Critical path tests for CachekitIO metrics header injection.
 
-Covers the _inject_metrics_headers() function and the _make_request/_request_async
-header merging logic changed in the standalone L1-Status fix.
+Covers the _inject_metrics_headers() function and the _request_sync/_request_async
+header merging logic changed in the standalone L1-Status fix. Requests go through the
+backend's real client on a fake pool (tests/utils/cachekitio_fakes.py), so the headers
+asserted are the ones the pool is handed, after the client merges its own in.
 
 Performance target: < 1 second total.
 """
 
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock, patch
-
-import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend, _inject_metrics_headers
+from tests.utils.cachekitio_fakes import FakePool, fake_backend, response
 
-_TEST_API_URL = "https://api.cachekit.io"
 _TEST_API_KEY = "ck_test_critical_metrics"
-_DUMMY_REQUEST = httpx.Request("GET", f"{_TEST_API_URL}/v1/cache/key")
-
-
-def _make_response(status_code: int = 200, content: bytes = b"") -> httpx.Response:
-    response = httpx.Response(status_code, content=content)
-    response.request = _DUMMY_REQUEST
-    return response
 
 
 @pytest.fixture
-def mock_sync_client():
-    client = MagicMock(spec=httpx.Client)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client", return_value=MagicMock(pid=os.getpid(), client=client)
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-        ),
-    ):
-        yield client
-
-
-@pytest.fixture
-def mock_async_client():
-    """Mock both clients but yield the async one for async tests."""
-    async_client = MagicMock(spec=httpx.AsyncClient)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=async_client),
-        ),
-    ):
-        yield async_client
-
-
-@pytest.fixture
-def backend(mock_sync_client: MagicMock) -> CachekitIOBackend:
-    return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
-
-
-@pytest.fixture
-def async_backend(mock_async_client: MagicMock) -> CachekitIOBackend:
-    return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def backend_and_pool() -> tuple[CachekitIOBackend, FakePool]:
+    return fake_backend(lambda request: response(200, b"value"), api_key=_TEST_API_KEY)
 
 
 @pytest.mark.critical
@@ -90,28 +44,25 @@ class TestInjectMetricsHeaders:
 
 
 @pytest.mark.critical
-class TestMakeRequestHeaderInjection:
-    """Test that _make_request always injects metrics headers."""
+class TestSyncRequestHeaderInjection:
+    """Test that _request_sync always injects metrics headers."""
 
-    def test_headers_injected_without_stats_context(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
+    def test_headers_injected_without_stats_context(self, backend_and_pool: tuple[CachekitIOBackend, FakePool]) -> None:
         """When no @cache context, L1-Status: disabled header is still sent."""
-        mock_sync_client.request.return_value = _make_response(200, b"value")
+        backend, pool = backend_and_pool
 
         # Call outside any @cache context — get_current_function_stats() returns None
         backend.get("test-key")
 
-        call_kwargs = mock_sync_client.request.call_args[1]
-        headers = call_kwargs.get("headers", {})
-        assert headers.get("X-CacheKit-L1-Status") == "disabled"
+        assert pool.requests[0].headers.get("X-CacheKit-L1-Status") == "disabled"
 
-    def test_headers_merged_with_existing(self, backend: CachekitIOBackend, mock_sync_client: MagicMock) -> None:
+    def test_headers_merged_with_existing(self, backend_and_pool: tuple[CachekitIOBackend, FakePool]) -> None:
         """Metrics headers merge with (not replace) existing headers like X-TTL."""
-        mock_sync_client.request.return_value = _make_response(200)
+        backend, pool = backend_and_pool
 
         backend.set("test-key", b"data", ttl=60)
 
-        call_kwargs = mock_sync_client.request.call_args[1]
-        headers = call_kwargs.get("headers", {})
+        headers = pool.requests[0].headers
         # Both X-TTL (from set) and L1-Status (from metrics) present
         assert "X-TTL" in headers
         assert "X-CacheKit-L1-Status" in headers
@@ -123,27 +74,22 @@ class TestAsyncRequestHeaderInjection:
 
     @pytest.mark.asyncio
     async def test_async_headers_injected_without_stats_context(
-        self, async_backend: CachekitIOBackend, mock_async_client: MagicMock
+        self, backend_and_pool: tuple[CachekitIOBackend, FakePool]
     ) -> None:
         """Async path: L1-Status: disabled header sent when no @cache context."""
-        mock_async_client.request.return_value = _make_response(200, b"value")
+        backend, pool = backend_and_pool
 
-        await async_backend.get_async("test-key")
+        await backend.get_async("test-key")
 
-        call_kwargs = mock_async_client.request.call_args[1]
-        headers = call_kwargs.get("headers", {})
-        assert headers.get("X-CacheKit-L1-Status") == "disabled"
+        assert pool.requests[0].headers.get("X-CacheKit-L1-Status") == "disabled"
 
     @pytest.mark.asyncio
-    async def test_async_headers_merged_with_existing(
-        self, async_backend: CachekitIOBackend, mock_async_client: MagicMock
-    ) -> None:
+    async def test_async_headers_merged_with_existing(self, backend_and_pool: tuple[CachekitIOBackend, FakePool]) -> None:
         """Async path: metrics headers merge with existing headers like X-TTL."""
-        mock_async_client.request.return_value = _make_response(200)
+        backend, pool = backend_and_pool
 
-        await async_backend.set_async("test-key", b"data", ttl=60)
+        await backend.set_async("test-key", b"data", ttl=60)
 
-        call_kwargs = mock_async_client.request.call_args[1]
-        headers = call_kwargs.get("headers", {})
+        headers = pool.requests[0].headers
         assert "X-TTL" in headers
         assert "X-CacheKit-L1-Status" in headers

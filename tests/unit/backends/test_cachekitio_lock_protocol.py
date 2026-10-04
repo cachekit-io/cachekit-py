@@ -19,51 +19,39 @@ import asyncio
 import logging
 import os
 import urllib.parse
+from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import LOCK_ID_HEADER, CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.hash_utils import redact_cache_key, redact_error_for_log
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, not a real key
+from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, fake_client, response
 
 _HELD = {"lock_id": None}
 
 
-def _json_response(status_code: int, body: dict[str, Any]) -> httpx.Response:
-    """Build a real httpx.Response with JSON body and a request attached."""
-    import json as _json
-
-    response = httpx.Response(status_code, content=_json.dumps(body).encode())
-    response.request = httpx.Request("POST", f"{_TEST_API_URL}/v1/cache/key/lock")
-    return response
+def _json_response(status_code: int, body: dict[str, Any]) -> HTTPResponse:
+    """A real urllib3 response with a JSON body."""
+    return response(status_code, json=body)
 
 
-def _raw_response(status_code: int, content: bytes) -> httpx.Response:
-    """Build an httpx.Response with arbitrary bytes (for malformed-body tests)."""
-    response = httpx.Response(status_code, content=content)
-    response.request = httpx.Request("POST", f"{_TEST_API_URL}/v1/cache/key/lock")
-    return response
+def _raw_response(status_code: int, content: bytes) -> HTTPResponse:
+    """A urllib3 response with arbitrary bytes (for malformed-body tests)."""
+    return response(status_code, content)
 
 
 @pytest.fixture
-def backend() -> CachekitIOBackend:
-    """Build a CachekitIOBackend with mocked HTTP clients."""
-    with patch(
-        "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-        return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
-    ):
-        with patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-        ):
-            return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def backend() -> Iterator[CachekitIOBackend]:
+    """A CachekitIOBackend whose tests replace ``_request_async``, so its pool must never be reached."""
+    backend, pool = fake_backend(lambda request: response(500))
+    yield backend
+    assert pool.requests == [], f"a request bypassed the replaced _request_async: {pool.requests}"
 
 
 def _method_calls(mock: AsyncMock) -> list[str]:
@@ -195,7 +183,7 @@ class TestLockRelease:
     async def test_release_failure_does_not_mask_user_exception(self, backend: CachekitIOBackend) -> None:
         """If DELETE raises, the user's exception must still propagate (not be masked)."""
 
-        async def side_effect(method: str, *_args: Any, **_kwargs: Any) -> httpx.Response:
+        async def side_effect(method: str, *_args: Any, **_kwargs: Any) -> HTTPResponse:
             if method == "POST":
                 return _json_response(200, {"lock_id": "lock-x"})
             raise BackendError("release failed", error_type=BackendErrorType.TRANSIENT)
@@ -307,7 +295,7 @@ class TestSecurityHardening:
         async with backend.acquire_lock("k", timeout=bad_timeout, blocking_timeout=None) as acquired:
             assert acquired is False
 
-        post_body = _json.loads(request_mock.await_args_list[0].kwargs["content"])
+        post_body = _json.loads(request_mock.await_args_list[0].kwargs["body"])
         sent = post_body["timeout_ms"]
         assert isinstance(sent, int) and sent >= 1, f"expected clamped finite int ≥1, got {sent!r}"
         assert _math.isfinite(sent)
@@ -420,7 +408,7 @@ class _GatedRequests:
         self.posts_done = 0
         self.deleted: list[str] = []  # lock ids of DELETEs that ran to completion
 
-    async def __call__(self, method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+    async def __call__(self, method: str, endpoint: str, **kwargs: Any) -> HTTPResponse:
         index = self.calls.count(method)
         self.calls.append(method)
         if method == "POST":
@@ -592,7 +580,8 @@ class TestCancellationMidRequest:
         """End to end: the cancelled caller sees CancelledError and never runs the function without the lock."""
         fake = _GatedRequests(BackendError("bad key", error_type=BackendErrorType.AUTHENTICATION))
         backend._request_async = fake  # type: ignore[method-assign]
-        backend.get = MagicMock(return_value=None)  # type: ignore[method-assign]  # L2 miss: the lock path runs
+        # L2 miss, so the lock path runs. The decorator reads through get_with_freshness (SWR), not get.
+        backend.get_with_freshness = MagicMock(return_value=None)  # type: ignore[method-assign]
         calls = 0
 
         @cache(backend=backend, ttl=300, l1_enabled=False)
@@ -613,30 +602,17 @@ class TestCancellationMidRequest:
         assert calls == 0
 
 
-def _lock_failing_backend(lock_status: int, lock_body: bytes) -> tuple[CachekitIOBackend, list[httpx.Request]]:
-    """A backend over a real httpx client whose lock POST fails; every read misses, writes succeed."""
-    seen: list[httpx.Request] = []
+def _lock_failing_backend(lock_status: int, lock_body: bytes) -> tuple[CachekitIOBackend, FakePool]:
+    """A backend over its real client whose lock POST fails; every read misses, writes succeed."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        if request.method == "POST" and request.url.raw_path.endswith(b"/lock"):
-            return httpx.Response(lock_status, content=lock_body)
+    def handler(request: FakeRequest) -> HTTPResponse:
+        if request.method == "POST" and request.path.endswith("/lock"):
+            return response(lock_status, lock_body)
         if request.method == "GET":
-            return httpx.Response(404)
-        return httpx.Response(200, content=b"{}")
+            return response(404)
+        return response(200, b"{}")
 
-    transport = httpx.MockTransport(handler)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY), seen
+    return fake_backend(handler)
 
 
 @pytest.mark.unit
@@ -644,8 +620,8 @@ class TestDecoratorDegradesOnLockError:
     """End to end: a failed lock POST never reaches an async caller, and ends the lock wait.
 
     The function runs once, uncached, as a sync call would, and no ``cachekit.*`` log record
-    names the cache key in either form: the raw ``HTTPStatusError`` carries the request URL, in
-    which the key is percent-encoded.
+    names the cache key in either form, raw or percent-encoded as in the request path. The
+    ``HTTPStatusError`` behind the BackendError names the status only; this keeps it so.
     """
 
     @pytest.mark.parametrize(
@@ -661,7 +637,7 @@ class TestDecoratorDegradesOnLockError:
     async def test_runs_once_uncached_with_one_lock_post(
         self, status: int, body: bytes, caplog: pytest.LogCaptureFixture
     ) -> None:
-        backend, seen = _lock_failing_backend(status, body)
+        backend, pool = _lock_failing_backend(status, body)
         runs: list[int] = []
 
         @cache(backend=backend, ttl=300, l1_enabled=False, namespace="lab5346")
@@ -673,10 +649,10 @@ class TestDecoratorDegradesOnLockError:
             assert await compute(1) == 2
 
         assert runs == [1]
-        lock_posts = [r for r in seen if r.method == "POST" and r.url.raw_path.endswith(b"/lock")]
+        lock_posts = [r for r in pool.requests if r.method == "POST" and r.path.endswith("/lock")]
         assert len(lock_posts) == 1, "a lock error ends the wait: no polling"
 
-        encoded_key = lock_posts[0].url.raw_path.decode().removeprefix("/v1/cache/").removesuffix("/lock")
+        encoded_key = lock_posts[0].path.removeprefix("/v1/cache/").removesuffix("/lock")
         raw_key = urllib.parse.unquote(encoded_key)
         assert raw_key != encoded_key, "the key must carry a ':' for the encoded check to mean anything"
         formatter = logging.Formatter()
@@ -723,7 +699,7 @@ class TestFillLock:
 
         in_flight, finish = threading.Event(), threading.Event()
 
-        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+        def delete(method: str, endpoint: str, **kwargs: Any) -> HTTPResponse:
             in_flight.set()
             assert finish.wait(5.0)
             return _json_response(200, {})
@@ -750,7 +726,7 @@ class TestFillLock:
         in_flight, finish, sent = threading.Event(), threading.Event(), threading.Event()
         done: list[str] = []
 
-        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+        def delete(method: str, endpoint: str, **kwargs: Any) -> HTTPResponse:
             in_flight.set()
             assert finish.wait(5.0)
             done.append(endpoint)
@@ -797,7 +773,7 @@ class TestFillLock:
         left on the future for asyncio to report unredacted."""
         key = "ns:secret-tenant:func:m.f:args:cd:1s"
         backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-u"}))  # type: ignore[method-assign]
-        backend._own_sync_lease = MagicMock(side_effect=RuntimeError("lease bug"))  # type: ignore[method-assign]
+        backend._own_lease = MagicMock(side_effect=RuntimeError("lease bug"))  # type: ignore[method-assign]
         loop = asyncio.get_running_loop()
         unhandled: list[dict[str, Any]] = []
         loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
@@ -825,7 +801,7 @@ class TestFillLock:
 
         sent = threading.Event()
 
-        def delete(method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
+        def delete(method: str, endpoint: str, **kwargs: Any) -> HTTPResponse:
             sent.set()
             return _json_response(200, {})
 
@@ -866,56 +842,52 @@ class TestFillLock:
         assert _method_calls(request_mock) == ["POST", "DELETE"]
         backend._request_sync.assert_not_called()
 
-    async def test_release_survives_the_sync_client_closing_first(self) -> None:
-        """The release is still queued (one busy executor thread) when the caller closes the sync client,
-        as close_sync_client() does to the client a backend's lease holds. The DELETE still lands, on a
-        new lease that stays local to the release: the backend keeps its own lease, so no client cached
-        on the executor thread outlives the caller's close_sync_client()."""
+    async def test_release_survives_the_client_closing_first(self) -> None:
+        """The release is still queued (one busy executor thread) when the caller closes the client, as
+        close_http_clients() does to the client a backend's lease holds. The DELETE still lands, on a new
+        lease that stays local to the release: the backend keeps its own lease, so no client opened for
+        the release outlives it on the backend."""
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
         sent: list[tuple[str, str]] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            sent.append((request.method, request.url.path))
-            return httpx.Response(200)
+        def handler(request: FakeRequest) -> HTTPResponse:
+            sent.append((request.method, request.path))
+            return response(200)
 
-        clients = [httpx.Client(base_url=_TEST_API_URL, transport=httpx.MockTransport(handler)) for _ in range(2)]
-        leases = iter([MagicMock(pid=os.getpid(), client=client) for client in clients])
+        backend, first_pool = fake_backend(handler)
+        first = backend._lease
+        second_client, _ = fake_client(handler, backend)
         loop = asyncio.get_running_loop()
-        pool = ThreadPoolExecutor(max_workers=1)
-        loop.set_default_executor(pool)
-        with (
-            patch("cachekit.backends.cachekitio.backend.lease_sync_http_client", side_effect=lambda _config: next(leases)),
-            patch(
-                "cachekit.backends.cachekitio.backend.lease_async_http_client",
-                return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-            ),
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-c"}))  # type: ignore[method-assign]
+        with patch(
+            "cachekit.backends.cachekitio.backend.lease_http_client",
+            return_value=SimpleNamespace(pid=os.getpid(), client=second_client),
         ):
-            backend = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
-            backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-c"}))  # type: ignore[method-assign]
             gate = threading.Event()
             busy = loop.run_in_executor(None, gate.wait, 5.0)
 
             async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
                 pass
-            clients[0].close()
+            first.client.close()
             gate.set()
             await busy
             await _drain_background_releases()
 
-        clients[1].close()
+        assert first_pool.closed and first_pool.requests == []
         assert sent == [("DELETE", "/v1/cache/k/lock")]
-        assert backend._sync_lease.client is clients[0]
+        assert backend._lease is first
 
     @pytest.mark.parametrize("refusal", ["loop-executor-shut-down", "own-executor-shut-down"])
-    async def test_release_is_awaited_when_the_executor_refuses_it(
+    async def test_release_is_sent_inline_when_the_executor_refuses_it(
         self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture, refusal: str
     ) -> None:
         """run_in_executor raises RuntimeError once the default executor is shut down, before it queues
-        anything. The release then falls back to the awaited DELETE on the async client, as acquire_lock
-        sends it, rather than leaving the lock held until its server-side timeout. The fallback is
-        logged at DEBUG with the key redacted."""
+        anything. The release then sends the DELETE inline on the loop thread, rather than leaving the
+        lock held until its server-side timeout: an awaited release would need that same executor. The
+        fallback is logged at DEBUG with the key redacted."""
         from concurrent.futures import ThreadPoolExecutor
 
         key = "ns:secret-tenant:func:m.f:args:ab:1s"
@@ -933,9 +905,11 @@ class TestFillLock:
                 if refusal == "loop-executor-shut-down":
                     await _drain_background_releases()
 
-        assert _method_calls(request_mock) == ["POST", "DELETE"]
-        assert request_mock.await_args_list[1].kwargs["headers"] == {LOCK_ID_HEADER: "lock-r"}
-        backend._request_sync.assert_not_called()
+        # Inline on the loop thread: an awaited release would need the refused executor too.
+        assert _method_calls(request_mock) == ["POST"]
+        (call,) = backend._request_sync.call_args_list
+        assert call.args == ("DELETE", f"{CachekitIOBackend._encode_key(key)}/lock")
+        assert call.kwargs["headers"] == {LOCK_ID_HEADER: "lock-r"}
         (record,) = [r for r in caplog.records if "executor refused" in r.getMessage()]
         assert record.levelno == logging.DEBUG
         assert redact_cache_key(key) in record.getMessage()
@@ -946,6 +920,7 @@ class TestFillLock:
         the cancel, not as the executor's RuntimeError."""
         request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-x"}))
         backend._request_async = request_mock  # type: ignore[method-assign]
+        backend._request_sync = MagicMock(return_value=_json_response(200, {}))  # type: ignore[method-assign]
         entered = asyncio.Event()
 
         async def fill() -> None:
@@ -960,4 +935,5 @@ class TestFillLock:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert _method_calls(request_mock) == ["POST", "DELETE"]
+        assert _method_calls(request_mock) == ["POST"]
+        assert [c.args for c in backend._request_sync.call_args_list] == [("DELETE", "k/lock")]

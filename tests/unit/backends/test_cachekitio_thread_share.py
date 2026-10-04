@@ -1,16 +1,15 @@
 """Threads sharing one CachekitIOBackend never fail a request (LAB-7062).
 
-A backend keeps the one sync client it leased at construction and sends every request on it, from
-whichever thread calls: a thread pool calling a decorated function, and every async-decorator L2 op,
-which StandardCacheHandler runs through asyncio.to_thread. Over HTTP/2 those threads multiplex one
-connection, and httpcore's sync HTTP/2 path races there (encode/httpcore#1118): about 1% of ops under the
-GIL raised ReadError or RemoteProtocolError, which the handler turned into a spurious miss or an unstored
-SET. The sync client is HTTP/1.1, one request per pooled connection. The async client keeps HTTP/2: one
-event loop drives it.
+A backend keeps the one client it leased at construction and sends every request on it, from whichever
+thread calls: a thread pool calling a decorated function, every async-decorator L2 op, which
+StandardCacheHandler runs through asyncio.to_thread, and every async backend method, which does the same.
+On httpx, threads sharing one HTTP/2 connection raced in httpcore (encode/httpcore#1118, about 1% of ops
+under the GIL), and without the GIL its HTTP/1.1 pool raced too (has_expired() raised TypeError on about 1
+request in 1,000). Either failure became a spurious miss or an unstored SET. urllib3's pool is
+thread-safe: these run with the GIL and without it, and must not fail once.
 
-The backend runs with the SDK's own client kwargs (mount, limits, keepalive) against
-tests/performance/loopback_saas.py, which offers both protocols by ALPN, as the edge does. Only the
-loopback guard is lifted and the fake's CA trusted.
+The backend runs with the SDK's own client (pool size, keepalive) against tests/performance/loopback_saas.py.
+Only the loopback guard is lifted and the fake's CA trusted.
 """
 
 from __future__ import annotations
@@ -18,10 +17,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import shutil
-import sys
 import threading
 import uuid
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -38,20 +35,12 @@ pytestmark = [
     pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl for the loopback certificate"),
 ]
 
-# 3,600 ops: at the ~1.3% degraded rate measured on HTTP/2, about 47 expected failures.
+# 3,600 ops: at the ~1.3% degraded rate httpx showed on HTTP/2, about 47 expected failures, and about 4
+# at its GIL-off HTTP/1.1 rate.
 _THREADS = 8
 _OPS_PER_THREAD = 450
 _KEY = "ns:t:func:m.f:args:" + "ab" * 32 + ":1s"
 _VALUE = b"v" * 4096
-
-# Without the GIL, httpcore's HTTP/1.1 pool races too, far more rarely: has_expired() reads _expire_at twice
-# while a thread starting a request sets it to None, and the comparison raises TypeError (about 1 request in
-# 1,000 at 8 threads on 3.14t). No upstream fix yet. Free-threaded support is not declared (docs/free-threading.md).
-_gil_off_h11_race = pytest.mark.xfail(
-    not getattr(sys, "_is_gil_enabled", lambda: True)(),
-    reason="httpcore HTTP/1.1 has_expired() races without the GIL",
-    strict=False,
-)
 
 
 @pytest.fixture
@@ -59,7 +48,7 @@ def backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path]) -> Cac
     port, cert = fake_saas
     monkeypatch.setattr(config_module, "is_private_ip", lambda hostname: False)
     monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")
-    monkeypatch.setenv("SSL_CERT_FILE", str(cert))  # httpx trusts it for the SDK's own transport mount
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))  # OpenSSL's default trust store reads it
     # Unique per test: a backend still alive from an earlier test must never lend this one its client.
     return CachekitIOBackend(api_url=f"https://127.0.0.1:{port}", api_key=f"ck_test_{uuid.uuid4().hex}")
 
@@ -97,7 +86,6 @@ def _assert_clean(outcomes: collections.Counter[str], errors: collections.Counte
     assert not errors, dict(errors)
 
 
-@_gil_off_h11_race
 def test_threads_sharing_one_backend_never_degrade(monkeypatch: pytest.MonkeyPatch, backend: CachekitIOBackend) -> None:
     handler = StandardCacheHandler(backend)
     assert handler.set(_KEY, _VALUE, ttl=60)
@@ -119,7 +107,6 @@ def test_threads_sharing_one_backend_never_degrade(monkeypatch: pytest.MonkeyPat
     _assert_clean(outcomes, errors)
 
 
-@_gil_off_h11_race
 def test_async_l2_ops_via_to_thread_never_degrade(monkeypatch: pytest.MonkeyPatch, backend: CachekitIOBackend) -> None:
     handler = StandardCacheHandler(backend)
     assert handler.set(_KEY, _VALUE, ttl=60)
@@ -140,13 +127,21 @@ def test_async_l2_ops_via_to_thread_never_degrade(monkeypatch: pytest.MonkeyPatc
     _assert_clean(outcomes, errors)
 
 
-@pytest.mark.parametrize(
-    ("send", "expected"),
-    [
-        pytest.param(lambda b: b._request_sync("GET", "probe", miss_on_404=True), "HTTP/1.1", id="sync"),
-        pytest.param(lambda b: asyncio.run(b._request_async("GET", "probe", miss_on_404=True)), "HTTP/2", id="async"),
-    ],
-)
-def test_protocol_per_client(backend: CachekitIOBackend, send: Callable[[CachekitIOBackend], Any], expected: str) -> None:
-    # The peer offers h2 first by ALPN, as the edge does; only the client's own offer decides.
-    assert send(backend).http_version == expected
+def test_a_full_pool_opens_another_connection_rather_than_waiting(backend: CachekitIOBackend) -> None:
+    """Every thread shares the one pool, so a request that finds it exhausted must not queue behind another's.
+
+    Each connection slot is checked out by hand, as busy threads would hold them; the next request still
+    completes, on a connection opened past the pool size.
+    """
+    pool = backend._own_lease().client.pool
+    held = [pool._get_conn() for _ in range(pool.pool.maxsize)]
+    assert pool.pool.empty()
+    # In a thread with a deadline: a blocking pool would wait here forever rather than fail.
+    one = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert one.submit(backend.get, f"{uuid.uuid4().hex}:absent").result(timeout=10) is None
+        assert pool.num_connections == pool.pool.maxsize + 1
+    finally:
+        for conn in held:
+            pool._put_conn(conn)  # also frees a request a blocking pool left waiting
+        one.shutdown(wait=True)

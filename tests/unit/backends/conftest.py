@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -12,9 +13,21 @@ import pytest
 _FAKE = Path(__file__).parents[2] / "performance" / "loopback_saas.py"
 
 
+@pytest.fixture(autouse=True)
+def _no_env_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No proxy from the developer's environment: the client honours one, and would send loopback TLS through it.
+
+    Tests that exercise proxy selection set their own variables after this runs.
+    """
+    # urllib.request.getproxies() reads every *_proxy variable, in either case.
+    for name in list(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name)
+
+
 @pytest.fixture(scope="module")
 def fake_saas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[int, Path]]:
-    """tests/performance/loopback_saas.py on a free loopback port, HTTP/1.1 and HTTP/2 by ALPN: (port, CA cert).
+    """tests/performance/loopback_saas.py on a free loopback port, over TLS (HTTP/1.1): (port, CA cert).
 
     Needs ``openssl`` on PATH; a module using it skips without one.
     """

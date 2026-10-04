@@ -759,7 +759,7 @@ export CACHEKIT_TIMEOUT=10.0
 
 **Exception**: none — logged as `BackendError` (`BackendErrorType.TRANSIENT`)
 
-**Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable
+**Cause**: Network-level failure — DNS resolution failed, connection refused, or network unreachable. `Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)` means the host has no CA bundle cachekit can use: install the system bundle (`ca-certificates`), or point `SSL_CERT_FILE` at one
 
 **Behavior**: TRANSIENT — logged; the function runs and its result is still stored in L1.
 
@@ -788,8 +788,8 @@ echo $CACHEKIT_API_URL
 | 429 | `TRANSIENT` |
 | 5xx | `TRANSIENT` |
 | 413, other 4xx | `PERMANENT` |
-| `TimeoutException` | `TIMEOUT` |
-| `ConnectError`, `NetworkError` | `TRANSIENT` |
+| urllib3 `ConnectTimeoutError`, `ReadTimeoutError` | `TIMEOUT` |
+| urllib3 `NewConnectionError`, `ProtocolError`, `SSLError`, `ProxyError` | `TRANSIENT` (a failed certificate verification says so: see `SSL_CERT_FILE` in [CachekitIO](backends/cachekitio.md#characteristics)) |
 | Other | `UNKNOWN` |
 
 No type counts toward the circuit breaker. Only a `503` to a write or delete with a `Retry-After` of 2 seconds or less is retried, once, for sync and async functions alike (see [Server error (5xx)](#server-error-5xx)). A failed lock request is not retried: it ends the lock wait, as the note at the top of this section says.

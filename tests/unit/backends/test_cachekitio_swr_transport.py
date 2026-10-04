@@ -7,10 +7,9 @@ StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock, patch
+from collections.abc import Iterator
+from unittest.mock import patch
 
-import httpx
 import pytest
 
 from cachekit.backends.cachekitio.backend import (
@@ -22,34 +21,19 @@ from cachekit.backends.cachekitio.backend import (
     CachekitIOBackend,
     _parse_fresh_for,
 )
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.cache_handler import StandardCacheHandler, supports_swr
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
-
-_DUMMY_REQUEST = httpx.Request("GET", "https://api.cachekit.io/v1/cache/key")
-
-
-def _response(status: int, content: bytes = b"", headers: dict[str, str] | None = None) -> httpx.Response:
-    response = httpx.Response(status, content=content, headers=headers)
-    response.request = _DUMMY_REQUEST
-    return response
+from tests.utils.cachekitio_fakes import fake_backend
+from tests.utils.cachekitio_fakes import response as _response
 
 
 @pytest.fixture
-def backend() -> CachekitIOBackend:
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def backend() -> Iterator[CachekitIOBackend]:
+    """A backend whose tests patch ``_request_sync``, so its pool must never be reached."""
+    backend, pool = fake_backend(lambda request: _response(500))
+    yield backend
+    assert pool.requests == [], f"a request bypassed the patched _request_sync: {pool.requests}"
 
 
 class TestFreshnessRead:
@@ -66,7 +50,7 @@ class TestFreshnessRead:
         ],
     )
     def test_header_mapping(self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_stale: bool) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result == (b"payload", expected_stale, None)
 
@@ -79,7 +63,7 @@ class TestFreshnessRead:
         err = BackendError(
             "boom",
             error_type=BackendErrorType.TRANSIENT,
-            original_exception=httpx.HTTPStatusError("500", request=_DUMMY_REQUEST, response=_response(500)),
+            original_exception=HTTPStatusError(_response(500)),
         )
         with patch.object(backend, "_request_sync", side_effect=err):
             with pytest.raises(BackendError):
@@ -105,7 +89,7 @@ class TestFreshForRead:
     def test_fresh_for_mapping(
         self, backend: CachekitIOBackend, headers: dict[str, str] | None, expected_fresh_for: int | None
     ) -> None:
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             result = backend.get_with_freshness("k")
         assert result is not None
         assert result[2] == expected_fresh_for
@@ -135,7 +119,7 @@ class TestFreshForRead:
     def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
         """A stale-window read carries 0 remaining freshness (server emits both headers)."""
         headers = {FRESHNESS_HEADER: "stale", FRESH_FOR_HEADER: "0"}
-        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers)):
+        with patch.object(backend, "_request_sync", return_value=_response(200, b"payload", headers=headers)):
             assert backend.get_with_freshness("k") == (b"payload", True, 0)
 
 

@@ -1,34 +1,31 @@
 """Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time (LAB-7070).
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
-Requests go through a real httpx client on a MockTransport whose DELETEs each take ``_DELAY``
-seconds. The fan-out tests read its shape from the fake server (which threads sent DELETEs, how
-many were in flight at once), never from wall time, which load stretches.
+Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py) whose
+DELETEs each take ``_DELAY`` seconds. The fan-out tests read its shape from the fake server (which threads
+sent DELETEs, how many were in flight at once), never from wall time, which load stretches.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-import os
 import threading
 import time
-from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from urllib.parse import unquote
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
 
 from cachekit import cache
 from cachekit.backends.cachekitio.backend import _DELETE_FANOUT, CachekitIOBackend
 from cachekit.backends.errors import BackendError
 from cachekit.cache_handler import _supports_multi_delete
+from tests.utils.cachekitio_fakes import FakeRequest, Handler, fake_backend, response
 
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
 _DELAY = 0.05
 _HOLD_STALL = 10.0
 
@@ -58,17 +55,18 @@ class _Server:
         self._released = threading.Event()
         self._lock = threading.Lock()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.raw_path.decode().split("?")[0]
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
+        path = request.path.split("?")[0]
         rest = path.removeprefix("/v1/cache/")
         if rest.endswith("/lock"):  # async miss path: always grant, always release
-            return httpx.Response(200, json={"lock_id": "l"} if request.method == "POST" else {})
+            return response(200, json={"lock_id": "l"} if request.method == "POST" else {})
         key = unquote(rest)
         if request.method == "GET":
-            return httpx.Response(200, content=self.store[key]) if key in self.store else httpx.Response(404)
+            return response(200, self.store[key]) if key in self.store else response(404)
         if request.method == "PUT":
-            self.store[key] = request.read()
-            return httpx.Response(200)
+            assert request.body is not None
+            self.store[key] = request.body
+            return response(200)
         assert request.method == "DELETE", request.method
         with self._lock:
             self.threads.add(threading.get_ident())
@@ -85,29 +83,18 @@ class _Server:
                     seen = self.in_flight
             time.sleep(_DELAY)
             if key in self.reject:
-                return httpx.Response(self.status, json={"error": "rejected"})
+                return response(self.status, json={"error": "rejected"})
             self.store.pop(key, None)
             with self._lock:
                 self.deleted.append(key)
-            return httpx.Response(200)
+            return response(200)
         finally:
             with self._lock:
                 self.in_flight -= 1
 
 
-def _backend(server: Callable[[httpx.Request], httpx.Response]) -> CachekitIOBackend:
-    transport = httpx.MockTransport(server)
-    with (
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.Client(base_url=_TEST_API_URL, transport=transport)),
-        ),
-        patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=httpx.AsyncClient(base_url=_TEST_API_URL, transport=transport)),
-        ),
-    ):
-        return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+def _backend(server: Handler) -> CachekitIOBackend:
+    return fake_backend(server)[0]
 
 
 def _cached_keys(fn: Any) -> set[tuple[str, str]]:
@@ -334,12 +321,12 @@ class _Limited:
         self._last = clock.monotonic()
         self._lock = threading.Lock()
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: FakeRequest) -> HTTPResponse:
         if request.method == "GET":
-            return httpx.Response(404)
+            return response(404)
         if request.method == "PUT":
-            return httpx.Response(200)
-        key = unquote(request.url.raw_path.decode().removeprefix("/v1/cache/"))
+            return response(200)
+        key = unquote(request.path.removeprefix("/v1/cache/"))
         with self._lock:
             self.sent.append(key)
             late = self.first_429 is not None and time.monotonic() > self.first_429 + _REAL_RTT / 2
@@ -355,13 +342,13 @@ class _Limited:
                 if self.tokens >= 1:
                     self.tokens -= 1
                     self.deleted.append(key)
-                    return httpx.Response(200)
+                    return response(200)
                 if self.quota:
-                    return httpx.Response(429, headers={"X-CacheKit-Deny-Reason": "quota"})
+                    return response(429, headers={"X-CacheKit-Deny-Reason": "quota"})
                 if self.first_429 is None:
                     self.first_429 = time.monotonic()
                 wait = math.ceil((1 - self.tokens) / self.rate)
-                return httpx.Response(429, headers={"Retry-After": str(wait)})
+                return response(429, headers={"Retry-After": str(wait)})
         finally:
             if late:
                 with self._lock:

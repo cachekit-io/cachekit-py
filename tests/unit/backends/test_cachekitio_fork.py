@@ -3,9 +3,18 @@
 A forked child inherits its parent's pooled TLS connections, and with them one TLS session's keys and
 sequence numbers. Whichever process writes second on that session desynchronises it, so its next request
 fails; raced, one process can read the other's response, a value for a different key. These tests drive
-the real backend over real TLS sockets, HTTP/1.1 and HTTP/2 by ALPN, against tests/performance/loopback_saas.py:
-plain-HTTP loopback cannot reproduce the bug, because a socket shared in sequence is harmless without TLS.
-Every request checks the value it gets back, so a response delivered to the wrong process fails too.
+the real backend and its one process-wide urllib3 client over real TLS sockets against
+tests/performance/loopback_saas.py: plain-HTTP loopback cannot reproduce the bug, because a socket shared in
+sequence is harmless without TLS. Every request checks the value it gets back, so a response delivered to the
+wrong process fails too.
+
+The client cache is owned by a PID (client.py, ``_own_leases``): a child, forked by ``os.fork()`` or from C
+without Python's at-fork hooks, replaces the inherited cache and its lock, re-leases a client of its own, and
+drops the inherited lease without closing it. Sync and async methods share that one client, since async
+methods send on it through ``asyncio.to_thread``. So a child runs async methods on an event loop of its own
+(``asyncio.run``): a child that keeps running its parent's loop object waits forever on that loop's inherited
+default executor, whose worker threads did not survive the fork, as every async decorator's L2 operation
+already did. That case is not tested.
 """
 
 from __future__ import annotations
@@ -17,19 +26,19 @@ import logging
 import os
 import shutil
 import signal
-import ssl
 import sys
 import threading
 import traceback
 import uuid
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 
 from cachekit.backends.cachekitio import client as client_module
+from cachekit.backends.cachekitio import config as config_module
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError
 
@@ -40,32 +49,27 @@ pytestmark = [
 ]
 
 _REQUESTS = 5
-_PROTOCOLS = [pytest.param(False, id="h1"), pytest.param(True, id="h2")]
 
 
-def _backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool) -> CachekitIOBackend:
-    # Config validation (rightly) refuses a loopback URL, so the client kwargs are redirected instead; the
-    # backend, its lease and httpx's real connection pool run unchanged. A long keepalive keeps the parent's
-    # pooled connection alive across the fork whatever the timing.
+@pytest.fixture
+def backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path]) -> CachekitIOBackend:
+    # Config validation (rightly) refuses a loopback URL, so only that guard is lifted and the fake's CA trusted;
+    # the backend, its lease and urllib3's real connection pool run unchanged.
     port, cert = fake_saas
-    real_kwargs = client_module._client_kwargs
-
-    def local_kwargs(config: Any, transport_cls: Any) -> dict[str, Any]:
-        kwargs = real_kwargs(config, transport_cls)
-        kwargs["base_url"] = f"https://127.0.0.1:{port}"
-        kwargs["verify"] = ssl.create_default_context(cafile=str(cert))
-        kwargs["http2"] = http2
-        kwargs["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=10, keepalive_expiry=60.0)
-        kwargs["mounts"] = None  # the keepalive mount would bypass the overrides above
-        return kwargs
-
-    monkeypatch.setattr(client_module, "_client_kwargs", local_kwargs)
+    monkeypatch.setattr(config_module, "is_private_ip", lambda hostname: False)
+    monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))  # OpenSSL's default trust store reads it
     # Unique per test: a backend still alive from an earlier test must never lend this one its client.
-    backend = CachekitIOBackend(api_key=f"ck_test_fork_{uuid.uuid4().hex}")
+    backend = CachekitIOBackend(api_url=f"https://127.0.0.1:{port}", api_key=f"ck_test_fork_{uuid.uuid4().hex}")
     # Warm the pool: the parent's connection is open and idle when the fork lands.
     response = backend._request_sync("GET", "warm", miss_on_404=True)
-    assert response.http_version == ("HTTP/2" if http2 else "HTTP/1.1")
+    assert response.version_string == "HTTP/1.1"
+    assert _pool(backend).num_connections == 1
     return backend
+
+
+def _pool(backend: CachekitIOBackend) -> Any:
+    return backend._lease.client.pool
 
 
 def _exchange(backend: CachekitIOBackend, tag: str) -> dict[str, int]:
@@ -158,38 +162,31 @@ def _run(backend: CachekitIOBackend, order: str, fork: Callable[[], int] = os.fo
 _CLEAN = {"errors": 0, "wrong": 0}
 
 
-@pytest.mark.parametrize("http2", _PROTOCOLS)
 @pytest.mark.parametrize("order", ["child-then-parent", "parent-then-child", "two-children"])
-def test_each_process_uses_its_own_connection(
-    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool, order: str
-) -> None:
-    backend = _backend(monkeypatch, fake_saas, http2)
+def test_each_process_uses_its_own_connection(backend: CachekitIOBackend, order: str) -> None:
+    parent_client = backend._lease.client
     results = _run(backend, order)
     assert results == [_CLEAN] * len(results)
+    # The parent kept its client, and its one warm connection served every request: no child's traffic broke it.
+    assert backend._lease.client is parent_client
+    assert _pool(backend).num_connections == 1
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
-@pytest.mark.parametrize("http2", _PROTOCOLS)
-def test_a_fork_that_skips_at_fork_hooks_is_detected(
-    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool
-) -> None:
+def test_a_fork_that_skips_at_fork_hooks_is_detected(backend: CachekitIOBackend) -> None:
     """The owner-PID check alone covers it: a fork from C runs none of Python's at-fork hooks."""
-    backend = _backend(monkeypatch, fake_saas, http2)
     results = _run(backend, "child-then-parent", fork=_libc_fork)
     assert results == [_CLEAN, _CLEAN]
+    assert _pool(backend).num_connections == 1
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs glibc fork() via ctypes")
-@pytest.mark.parametrize("http2", _PROTOCOLS)
-def test_a_fork_from_c_while_a_parent_thread_holds_the_logging_lock(
-    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool
-) -> None:
+def test_a_fork_from_c_while_a_parent_thread_holds_the_logging_lock(backend: CachekitIOBackend) -> None:
     """A fork from C also skips logging's at-fork lock reset, so the child's re-lease must not take that lock.
 
     The child inherits logging's module lock held by a thread that does not exist there; building its new
     client must not wait on it (the child's alarm ends a hang).
     """
-    backend = _backend(monkeypatch, fake_saas, http2)
     held, release = threading.Event(), threading.Event()
 
     def hold() -> None:
@@ -209,70 +206,93 @@ def test_a_fork_from_c_while_a_parent_thread_holds_the_logging_lock(
     assert child.result() == _CLEAN
 
 
-@pytest.mark.parametrize("http2", _PROTOCOLS)
-def test_async_child_on_the_inherited_loop_gets_a_new_client(
-    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], http2: bool
-) -> None:
-    """A child that keeps running its parent's loop object would pass the per-loop check with the parent's client."""
-    backend = _backend(monkeypatch, fake_saas, http2)
-    tag = uuid.uuid4().hex
-    loop = asyncio.new_event_loop()
-    try:
+@pytest.mark.parametrize("fork", [pytest.param(os.fork, id="os.fork"), pytest.param(_libc_fork, id="libc-fork")])
+def test_child_replaces_the_inherited_lease_cache(backend: CachekitIOBackend, fork: Callable[[], int]) -> None:
+    """The process-wide cache is the parent's in a child until first use, and its lock may be held by a parent thread.
 
-        async def warm() -> httpx.AsyncClient:
-            await backend.set_async(f"{tag}-warm", b"w")
-            return backend._async_lease.client
-
-        parent_client = loop.run_until_complete(warm())
-
-        async def child_job() -> dict[str, Any]:
-            result: dict[str, Any] = await _exchange_async(backend, f"{tag}-child")
-            # parent_client stays referenced, so a new client cannot reuse its id.
-            result["parents_client"] = backend._async_lease.client is parent_client
-            return result
-
-        # Child first, then parent: the two processes never run the shared loop object at once.
-        child = _Child(lambda: loop.run_until_complete(child_job()))
-        child.go()
-        results = [child.result(), loop.run_until_complete(_exchange_async(backend, f"{tag}-parent"))]
-    finally:
-        loop.close()
-    assert results == [{**_CLEAN, "parents_client": False}, _CLEAN]
-
-
-def test_async_child_on_a_new_loop(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path]) -> None:
-    backend = _backend(monkeypatch, fake_saas, http2=True)
-    tag = uuid.uuid4().hex
-    asyncio.run(backend.set_async(f"{tag}-warm", b"w"))
-    child = _Child(lambda: asyncio.run(_exchange_async(backend, f"{tag}-child")))
-    child.go()
-    results = [child.result(), asyncio.run(_exchange_async(backend, f"{tag}-parent"))]
-    assert results == [_CLEAN, _CLEAN]
-
-
-def test_child_drops_inherited_clients_without_closing_them(
-    monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path]
-) -> None:
-    """close() would take the inherited pool's lock, which a parent thread may have held at fork."""
-    backend = _backend(monkeypatch, fake_saas, http2=True)
-    closed: list[httpx.Client] = []
-    real_close = httpx.Client.close
-
-    def spy(self: httpx.Client) -> None:
-        closed.append(self)
-        real_close(self)
-
-    monkeypatch.setattr(httpx.Client, "close", spy)
+    The child must build a cache of its own, owned by its PID with a fresh lock, and lease from it; the parent's
+    cache is untouched.
+    """
+    if fork is _libc_fork and not sys.platform.startswith("linux"):
+        pytest.skip("needs glibc fork() via ctypes")
+    parent_leases = client_module._own_leases()
 
     def child_job() -> dict[str, Any]:
-        inherited = backend._sync_lease.client
+        inherited = client_module._leases
         result: dict[str, Any] = _exchange(backend, f"{uuid.uuid4().hex}-child")
-        gc.collect()  # the replaced lease is unreferenced now; its finalizer runs here at the latest
-        result["closed"] = len(closed)
-        result["replaced"] = backend._sync_lease.client is not inherited
+        own = client_module._leases
+        result["inherited_was_parents"] = inherited is parent_leases and inherited.pid != os.getpid()
+        result["replaced"] = own is not inherited
+        result["owned_by_child"] = own.pid == os.getpid()
+        result["fresh_lock"] = own.lock is not inherited.lock
+        # The backend's re-lease came from the child's cache, so a second backend there shares it.
+        result["cached"] = client_module.lease_http_client(backend._config) is backend._lease
+        return result
+
+    child = _Child(child_job, fork)
+    child.go()
+    assert child.result() == {
+        **_CLEAN,
+        "inherited_was_parents": True,
+        "replaced": True,
+        "owned_by_child": True,
+        "fresh_lock": True,
+        "cached": True,
+    }
+    assert client_module._leases is parent_leases
+    assert parent_leases.pid == os.getpid()
+
+
+def test_async_child_on_a_new_loop_uses_the_re_leased_client(backend: CachekitIOBackend) -> None:
+    """Async methods send on the same client through asyncio.to_thread, so a child's async ops re-lease too.
+
+    The child's async and sync requests then share its one re-leased client, never the parent's.
+    """
+    tag = uuid.uuid4().hex
+    asyncio.run(backend.set_async(f"{tag}-warm", b"w"))
+    parent_client = backend._lease.client
+
+    def child_job() -> dict[str, Any]:
+        result: dict[str, Any] = asyncio.run(_exchange_async(backend, f"{tag}-child"))
+        client = backend._lease.client
+        result["sync"] = _exchange(backend, f"{tag}-child-sync")
+        # parent_client stays referenced, so a new client cannot reuse its id.
+        result["parents_client"] = client is parent_client
+        result["sync_shares_it"] = backend._lease.client is client
         return result
 
     child = _Child(child_job)
     child.go()
-    assert child.result() == {**_CLEAN, "closed": 0, "replaced": True}
+    results = [child.result(), asyncio.run(_exchange_async(backend, f"{tag}-parent"))]
+    assert results == [{**_CLEAN, "sync": _CLEAN, "parents_client": False, "sync_shares_it": True}, _CLEAN]
+    assert backend._lease.client is parent_client
+    assert _pool(backend).num_connections == 1
+
+
+def test_child_drops_inherited_clients_without_closing_them(monkeypatch: pytest.MonkeyPatch, backend: CachekitIOBackend) -> None:
+    """close() would take the inherited pool's lock, which a parent thread may have held at fork."""
+    closed: list[client_module.HTTPClient] = []
+    real_close = client_module.HTTPClient.close
+
+    def spy(self: client_module.HTTPClient) -> None:
+        closed.append(self)
+        real_close(self)
+
+    monkeypatch.setattr(client_module.HTTPClient, "close", spy)
+
+    def child_job() -> dict[str, Any]:
+        inherited = weakref.ref(backend._lease)
+        inherited_client = backend._lease.client
+        result: dict[str, Any] = _exchange(backend, f"{uuid.uuid4().hex}-child")
+        gc.collect()  # the replaced lease is unreferenced now; its finalizer runs here at the latest
+        # The finalizer ran (the lease is gone) and its PID guard skipped the close.
+        result["finalized"] = inherited() is None
+        result["closed"] = len(closed)
+        result["replaced"] = backend._lease.client is not inherited_client
+        return result
+
+    child = _Child(child_job)
+    child.go()
+    assert child.result() == {**_CLEAN, "finalized": True, "closed": 0, "replaced": True}
     assert _exchange(backend, f"{uuid.uuid4().hex}-parent") == _CLEAN
+    assert _pool(backend).num_connections == 1

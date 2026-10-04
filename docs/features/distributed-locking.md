@@ -177,8 +177,7 @@ as asyncio Tasks, and `asyncio.run()` teardown cancels every Task, so a request
 cut short there falls back on that same server-side timeout. The decorator's own
 release is the exception (see below): it is sent from a worker thread, which
 `asyncio.run()` waits for, so it lands even when the decorated call is the last
-thing the process does, and even if `close_async_client()` or `close_sync_client()`
-runs straight after. On CPython 3.10.0-3.10.7 and 3.11.0 only, a loop closed by hand
+thing the process does, and even if `close_http_clients()` runs straight after. On CPython 3.10.0-3.10.7 and 3.11.0 only, a loop closed by hand
 (`loop.close()`, not `asyncio.run()`) before that release finishes logs one
 `concurrent.futures` "Event loop is closed" error; the release still lands.
 
@@ -197,8 +196,8 @@ waits on: the read, the lock `POST`, and the write. Two steps are trimmed:
 - **The release does not block the return.** The `DELETE …/lock` is sent in the
   background once the value is stored, as cachekit-ts does. Waiters in other
   processes see the lock released just as before. If the event loop's default
-  executor has already been shut down, the release is awaited instead, so the
-  lock is still released.
+  executor has already been shut down, the release is sent inline on the event
+  loop's thread instead, one blocking round trip, so the lock is still released.
 
 The Redis backend keeps both steps: its release is one Redis round trip.
 

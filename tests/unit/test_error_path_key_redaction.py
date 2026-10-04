@@ -474,7 +474,7 @@ class TestClassifierMessagesAreKeyFree:
     """Every backend classifier must build a key-free BackendError.message (CWE-532).
 
     This is the invariant ``redact_error_for_log`` relies on when it logs a BackendError
-    verbatim: provider exception text (redis ACL/WRONGTYPE, httpx URL, pymemcache) can
+    verbatim: provider exception text (redis ACL/WRONGTYPE, urllib3 URL, pymemcache) can
     echo the raw key, so no classifier may interpolate ``str(exc)`` into the message —
     only ``type(exc).__name__``. Detail stays on ``original_exception``; the key rides
     the ``.key`` attribute, which ``_format_message`` redacts. Guards against the wrapped
@@ -494,15 +494,16 @@ class TestClassifierMessagesAreKeyFree:
         assert redact_cache_key(TENANT_KEY) in str(err)  # key present only as its digest
 
     def test_http_classifier_does_not_leak_key(self) -> None:
-        import httpx
+        from urllib3.exceptions import NewConnectionError, ReadTimeoutError
 
         from cachekit.backends.cachekitio.error_handler import classify_http_error
 
-        # httpx exception text carries the request URL, which embeds the raw key in its path.
-        exc = httpx.ConnectError(f"Connection refused to https://api.cachekit.io/v1/cache/{TENANT_KEY}")
-        err = classify_http_error(exc, operation="get", key=TENANT_KEY)
-        assert TENANT_KEY not in str(err)
-        assert redact_cache_key(TENANT_KEY) in str(err)
+        # urllib3 exception text can carry the request URL, which embeds the raw key in its path.
+        url = f"https://api.cachekit.io/v1/cache/{TENANT_KEY}"
+        for exc in (NewConnectionError(None, f"Connection refused to {url}"), ReadTimeoutError(None, url, f"timed out: {url}")):  # type: ignore[arg-type]
+            err = classify_http_error(exc, operation="get", key=TENANT_KEY)
+            assert TENANT_KEY not in str(err)
+            assert redact_cache_key(TENANT_KEY) in str(err)
 
     def test_memcached_classifier_does_not_leak_key(self) -> None:
         from cachekit.backends.memcached.error_handler import classify_memcached_error

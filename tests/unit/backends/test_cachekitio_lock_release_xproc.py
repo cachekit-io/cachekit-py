@@ -7,7 +7,7 @@ each process is ``asyncio.run(main())`` against a loopback fake SaaS that record
 (a) The holder's DELETE /lock reaches the server before the process exits.
 (b) A second process waiting on the same key's lock acquires it within seconds of that DELETE, not
     at its 5 s blocking timeout, whether the holder exits straight after the call or calls
-    ``close_async_client()`` first.
+    ``close_http_clients()`` first.
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def test_release_lands_when_the_miss_is_the_last_await(saas: _FakeSaaS, tmp_path
     assert released[2] == granted
 
 
-@pytest.mark.parametrize("after", ["exit", "close_async_client"])
+@pytest.mark.parametrize("after", ["exit", "close_http_clients"])
 def test_waiter_acquires_promptly_after_the_holder_exits(saas: _FakeSaaS, tmp_path: Path, after: str) -> None:
     go = tmp_path / "go"
     holder = _spawn(saas, go, after)
