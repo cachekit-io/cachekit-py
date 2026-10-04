@@ -516,6 +516,25 @@ def logger():
     return get_logger()
 
 
+# An encrypting serializer is refused on a decorator in every mode. EncryptionWrapper binds each ciphertext to its
+# cache key, but the handler never passes a key to the serializer it is given, so every store would raise and the
+# function would run on every call. Encryption on a decorator is encryption=True / @cache.secure: the handler then
+# builds the wrapper itself, behind its tenant-mode and cross-SDK serializer checks.
+_ENCRYPTING_SERIALIZER_REFUSAL = (
+    "EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: "
+    "the decorator never gives it the cache key each ciphertext is bound to, so it would never store an "
+    "entry. To encrypt, use @cache.secure(master_key=..., serializer=...) with the inner serializer "
+    "(omit serializer= for the default MessagePack); it builds the EncryptionWrapper itself."
+)
+
+
+def _is_encrypting_serializer(serializer: object) -> bool:
+    """An EncryptionWrapper instance (subclasses included) or a registry name that resolves to one."""
+    return isinstance(serializer, EncryptionWrapper) or (
+        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
+    )
+
+
 def create_cache_wrapper(
     func: F,
     config: Any = None,  # DecoratorConfig | None (avoid circular import)
@@ -562,6 +581,8 @@ def create_cache_wrapper(
         serializer: Serializer instance or name. Accepts either:
                    - String name: "default" (MessagePack), "arrow" (DataFrame zero-copy)
                    - SerializerProtocol instance: Custom serializer implementing the protocol
+                   An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
+                   encrypt with encryption=True (@cache.secure) and pass the inner serializer here.
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
                    to serializer - wraps ANY serializer with encryption.
                    - None (default): no intent stated. Plaintext when no master key is present;
@@ -764,9 +785,7 @@ def create_cache_wrapper(
     # `encryption` is the pre-resolution tri-state: None is not refused here. With a master
     # key present, None is refused by CacheSerializationHandler instead (no stated intent,
     # L1-only included); with no key, it is plaintext, which L1-only stores correctly.
-    _encrypting_serializer = isinstance(serializer, EncryptionWrapper) or (
-        isinstance(serializer, str) and SERIALIZER_REGISTRY.get(serializer) is EncryptionWrapper
-    )
+    _encrypting_serializer = _is_encrypting_serializer(serializer)
     if _l1_only_mode and (encryption or _encrypting_serializer):
         raise ConfigurationError(
             "encryption requires a backend: backend=None is L1-only and stores raw Python "
@@ -777,6 +796,14 @@ def create_cache_wrapper(
             "docs/backends/README.md) or pass one explicitly to keep @cache.secure / "
             "encryption=True."
         )
+
+    # ENCRYPTING SERIALIZER, ANY MODE (why: _ENCRYPTING_SERIALIZER_REFUSAL). Placed after the L1-only check, so
+    # backend=None keeps that message, and before the handler is built, so it fires ahead of the handler's own
+    # errors (no stated intent, cross-SDK serializer, missing key), none of which names this fix. Except with
+    # backend=None, the decorator front end (intent.py) refuses a serializer= keyword earlier still; this check
+    # covers config= and direct callers.
+    if _encrypting_serializer:
+        raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
     # Store backend and handler type for consistent access
     # If explicit backend provided, use it; otherwise get from provider on first use
