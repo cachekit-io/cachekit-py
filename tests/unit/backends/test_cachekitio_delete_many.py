@@ -265,24 +265,55 @@ def test_runs_from_a_thread_with_a_running_event_loop() -> None:
 
 # ---- Pacing: a rate-limited fan-out waits out Retry-After instead of failing keys ----------
 
-_SCALE = 20  # one real second is 20 virtual seconds: a real 10 ms DELETE is a 200 ms round trip
-_REAL_RTT = 0.01
+_RTT = 0.2  # virtual seconds per DELETE round trip
+_REAL_RTT = 0.01  # real seconds each DELETE holds its thread, so the fan-out's DELETEs overlap
 
 
 class _Clock:
-    """Virtual time: real elapsed time x _SCALE, plus every sleep, which returns at once."""
+    """Virtual time that only sleeps and DELETEs move; neither real time nor thread scheduling does.
+
+    A sleep returns at once and adds its seconds; a DELETE takes ``_RTT``. The thread that made
+    the clock (the test's, which also runs the paced phase) reads shared time, and the bucket
+    refills on it. Shared time moves by every sleep, by ``_RTT`` per DELETE from the test's
+    thread, and by ``_RTT / _DELETE_FANOUT`` per fan-out DELETE: the fan-out runs
+    ``_DELETE_FANOUT`` DELETEs per round trip whichever workers the host lets send them.
+
+    Any other thread is a fan-out worker with its own time: it starts where the test's thread
+    last read the clock, just before the pool, and moves by ``_RTT`` per DELETE of its own. So
+    every fan-out round trip the backend measures is exactly ``_RTT``, and so is the pacing
+    deadline it derives from them.
+    """
 
     def __init__(self) -> None:
-        self._t0 = time.monotonic()
-        self._slept = 0.0
+        self._now = self._read = 0.0
+        self._owner = threading.get_ident()
+        self._worker = threading.local()
         self.sleeps: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
-        return (time.monotonic() - self._t0) * _SCALE + self._slept
+        if threading.get_ident() == self._owner:
+            self._read = self._now
+            return self._now
+        if not hasattr(self._worker, "now"):
+            self._worker.now = self._read
+        return self._worker.now
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self._slept += seconds
+        assert threading.get_ident() == self._owner, "only the paced phase sleeps, on the test's thread"
+        with self._lock:
+            self.sleeps.append(seconds)
+            self._now += seconds
+
+    def round_trip(self) -> float:
+        """End this thread's DELETE; returns shared time, for the bucket."""
+        with self._lock:
+            if threading.get_ident() == self._owner:
+                self._now += _RTT
+            else:
+                self._worker.now = self.monotonic() + _RTT
+                self._now += _RTT / _DELETE_FANOUT
+            return self._now
 
 
 class _Limited:
@@ -318,7 +349,7 @@ class _Limited:
         try:
             time.sleep(_REAL_RTT)
             with self._lock:
-                now = self.clock.monotonic()
+                now = self.clock.round_trip()
                 self.tokens = min(self.burst, self.tokens + (now - self._last) * self.rate)
                 self._last = now
                 if self.tokens >= 1:
@@ -367,7 +398,6 @@ def test_cobels_case_through_the_decorator_leaves_nothing_tracked(clock: _Clock)
     for i in range(100):
         f(i)
 
-    server._last = clock.monotonic()  # the writes took no tokens; their real time must not refill the bucket
     f.invalidate_cache()
 
     assert len(server.deleted) == 100 and clock.sleeps
@@ -398,7 +428,7 @@ def test_spent_budget_stops_at_the_deadline_and_returns_exactly_the_rest(
     assert failed == set(keys) - set(server.deleted)
     assert 0 < len(server.deleted) < len(keys)
     # The deadline is about the serial loop's time (50 x 200 ms), not a wait for every key.
-    assert clock.monotonic() - start < 50 * 0.2 * 2
+    assert clock.monotonic() - start < len(keys) * _RTT * 2
     unsent = [key for key in keys if key in failed and key not in server.sent]
     assert unsent  # keys past the deadline are failed without being sent
     assert any("rate limit" in record.getMessage() for record in caplog.records)
