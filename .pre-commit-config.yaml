@@ -119,13 +119,13 @@ repos:
       - id: no-internal-references
         name: No internal references in docs
         language: pygrep
-        entry: 'LAB-[0-9]+|op://|\.ts\.net|\bk3s\b|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
-        files: ^(packages/[^/]+/)?README[^/]*$|^docs/
+        entry: 'LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
         language: pygrep
-        # Same patterns, skipping git's "#" comment lines, which quote the branch name.
-        entry: '^(?!#).*?(?:LAB-[0-9]+|op://|\.ts\.net|\bk3s\b|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-]))'
+        # Same patterns, skipping git's "#" comment lines and "Merge" subjects, which quote branch names.
+        entry: '^(?!#|Merge ).*?(?:LAB-[0-9]+|op://|\.ts\.net|(?i:k3s cluster)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-]))'
         stages: [commit-msg]
