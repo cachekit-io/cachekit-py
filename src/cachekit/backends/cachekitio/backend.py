@@ -1035,7 +1035,12 @@ class CachekitIOBackend:
             if lock_id is not None:
                 try:
                     self._release_lock_in_background(key, lock_id)
-                except RuntimeError:
+                except RuntimeError as e:
+                    logger.debug(
+                        "CachekitIO lock release for %s awaited: the default executor refused it (%s)",
+                        redact_cache_key(key),
+                        redact_error_for_log(e),
+                    )
                     await self._release_lock(key, lock_id)
 
     def _release_lock_in_background(self, lock_key: str, lock_id: str) -> None:

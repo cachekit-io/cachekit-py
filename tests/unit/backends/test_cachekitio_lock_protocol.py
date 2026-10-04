@@ -909,12 +909,16 @@ class TestFillLock:
         assert backend._sync_lease.client is clients[0]
 
     @pytest.mark.parametrize("refusal", ["loop-executor-shut-down", "own-executor-shut-down"])
-    async def test_release_is_awaited_when_the_executor_refuses_it(self, backend: CachekitIOBackend, refusal: str) -> None:
+    async def test_release_is_awaited_when_the_executor_refuses_it(
+        self, backend: CachekitIOBackend, caplog: pytest.LogCaptureFixture, refusal: str
+    ) -> None:
         """run_in_executor raises RuntimeError once the default executor is shut down, before it queues
         anything. The release then falls back to the awaited DELETE on the async client, as acquire_lock
-        sends it, rather than leaving the lock held until its server-side timeout."""
+        sends it, rather than leaving the lock held until its server-side timeout. The fallback is
+        logged at DEBUG with the key redacted."""
         from concurrent.futures import ThreadPoolExecutor
 
+        key = "ns:secret-tenant:func:m.f:args:ab:1s"
         request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-r"}))
         backend._request_async = request_mock  # type: ignore[method-assign]
         backend._request_sync = MagicMock()  # type: ignore[method-assign]
@@ -924,13 +928,18 @@ class TestFillLock:
             loop.set_default_executor(pool)
             pool.shutdown()
 
-        async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
-            if refusal == "loop-executor-shut-down":
-                await _drain_background_releases()
+        with caplog.at_level(logging.DEBUG, logger="cachekit.backends.cachekitio.backend"):
+            async with backend.acquire_fill_lock(key, timeout=30.0, blocking_timeout=None):
+                if refusal == "loop-executor-shut-down":
+                    await _drain_background_releases()
 
         assert _method_calls(request_mock) == ["POST", "DELETE"]
         assert request_mock.await_args_list[1].kwargs["headers"] == {LOCK_ID_HEADER: "lock-r"}
         backend._request_sync.assert_not_called()
+        (record,) = [r for r in caplog.records if "executor refused" in r.getMessage()]
+        assert record.levelno == logging.DEBUG
+        assert redact_cache_key(key) in record.getMessage()
+        assert "secret-tenant" not in record.getMessage()
 
     async def test_cancel_stays_a_cancel_when_the_executor_refuses_the_release(self, backend: CachekitIOBackend) -> None:
         """A cancel that lands in the body still releases through the fallback, and still propagates as
