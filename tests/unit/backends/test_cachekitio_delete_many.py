@@ -267,15 +267,18 @@ _REAL_RTT = 0.01  # real seconds each DELETE holds its thread, so the fan-out's 
 
 
 class _Clock:
-    """Virtual time that only sleeps and DELETE round trips move; neither real time nor scheduling does.
+    """Virtual time that only sleeps and DELETEs move; neither real time nor thread scheduling does.
 
     A sleep returns at once and adds its seconds; a DELETE takes ``_RTT``. The thread that made
-    the clock (the test's, which also runs the paced phase) reads shared time. Any other thread is
-    a fan-out worker with its own time: it starts where the test's thread last read the clock,
-    just before the pool, and moves only by the worker's own DELETEs. So every fan-out round trip
-    measures exactly ``_RTT`` however the host schedules the workers, and the pacing deadline the
-    backend derives from them is fixed. Shared time is the latest DELETE end of any thread, so the
-    paced phase starts after the fan-out's last DELETE.
+    the clock (the test's, which also runs the paced phase) reads shared time, and the bucket
+    refills on it. Shared time moves by every sleep, by ``_RTT`` per DELETE from the test's
+    thread, and by ``_RTT / _DELETE_FANOUT`` per fan-out DELETE: the fan-out runs
+    ``_DELETE_FANOUT`` DELETEs per round trip whichever workers the host lets send them.
+
+    Any other thread is a fan-out worker with its own time: it starts where the test's thread
+    last read the clock, just before the pool, and moves by ``_RTT`` per DELETE of its own. So
+    every fan-out round trip the backend measures is exactly ``_RTT``, and so is the pacing
+    deadline it derives from them.
     """
 
     def __init__(self) -> None:
@@ -299,12 +302,14 @@ class _Clock:
             self.sleeps.append(seconds)
             self._now += seconds
 
-    def round_trip(self, began: float) -> float:
-        """End this thread's DELETE that began at ``began``; returns shared time, for the bucket."""
-        if threading.get_ident() != self._owner:
-            self._worker.now = began + _RTT
+    def round_trip(self) -> float:
+        """End this thread's DELETE; returns shared time, for the bucket."""
         with self._lock:
-            self._now = max(self._now, began + _RTT)
+            if threading.get_ident() == self._owner:
+                self._now += _RTT
+            else:
+                self._worker.now = self.monotonic() + _RTT
+                self._now += _RTT / _DELETE_FANOUT
             return self._now
 
 
@@ -332,7 +337,6 @@ class _Limited:
         if request.method == "PUT":
             return httpx.Response(200)
         key = unquote(request.url.raw_path.decode().removeprefix("/v1/cache/"))
-        began = self.clock.monotonic()
         with self._lock:
             self.sent.append(key)
             late = self.first_429 is not None and time.monotonic() > self.first_429 + _REAL_RTT / 2
@@ -342,7 +346,7 @@ class _Limited:
         try:
             time.sleep(_REAL_RTT)
             with self._lock:
-                now = self.clock.round_trip(began)
+                now = self.clock.round_trip()
                 self.tokens = min(self.burst, self.tokens + (now - self._last) * self.rate)
                 self._last = now
                 if self.tokens >= 1:
