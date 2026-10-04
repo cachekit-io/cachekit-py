@@ -137,6 +137,11 @@ class HTTPClient:
             redirect=False,
         )
 
+    @property
+    def is_closed(self) -> bool:
+        """True once ``close()`` has run: urllib3 drops a closed pool's connection queue."""
+        return self.pool.pool is None
+
     def close(self) -> None:
         self.pool.close()
 

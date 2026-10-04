@@ -35,6 +35,7 @@ import json
 import threading
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
@@ -64,6 +65,7 @@ class _FakeSaaS:
     store: dict[str, bytes] = field(default_factory=dict)
     stale: bool = False  # serve hits labelled stale (X-CacheKit-Freshness: stale)
     fail_reads: bool = False  # answer every entry GET with a 503
+    fail_next_reads: int = 0  # answer this many entry GETs with a 503, then serve normally
     fresh_for: int | None = 60  # X-CacheKit-Fresh-For on a fresh hit; None omits the header (pre-signal server)
     ttl_left: int = 1  # GET .../ttl answer; under the refresh threshold, so a refresh is due
     lock_held_for: int = 0  # answer this many lock POSTs "held elsewhere" ({"lock_id": null})
@@ -73,6 +75,9 @@ class _FakeSaaS:
         key, op = _parse(request)
         if op == "GET":
             if self.fail_reads:
+                return response(503)
+            if self.fail_next_reads:
+                self.fail_next_reads -= 1
                 return response(503)
             if key not in self.store:
                 return response(404)
@@ -178,6 +183,7 @@ class _Gate:
     async def run_async(self, call: Awaitable[Any]) -> _Shape:
         self.shape = shape = _Shape()
         self._loop = asyncio.get_running_loop()
+        executor = _track_default_executor(self._loop)
         try:
             caller = asyncio.ensure_future(call)
             while True:
@@ -203,7 +209,9 @@ class _Gate:
                         release()
                     self._parked.clear()
                     continue
-                if not (pending := asyncio.all_tasks() - {asyncio.current_task()}):
+                # Background work is a Task, or an executor job (the lock release runs in a thread).
+                tasks = asyncio.all_tasks() - {asyncio.current_task()}
+                if not (pending := tasks | {asyncio.wrap_future(job) for job in executor.unfinished()}):
                     break
                 await self._next_event(pending)
         finally:
@@ -211,7 +219,7 @@ class _Gate:
         assert not self.errors, self.errors
         return shape
 
-    async def _next_event(self, tasks: set[asyncio.Task[Any]] | set[asyncio.Future[Any]]) -> None:
+    async def _next_event(self, tasks: set[Any]) -> None:
         """Wait until one of ``tasks`` finishes or a request is parked."""
         self._arrived.clear()
         if self._parked:
@@ -221,6 +229,32 @@ class _Gate:
         arrived.cancel()
         await asyncio.gather(arrived, return_exceptions=True)
         assert done, "nothing finished and no request arrived"
+
+
+class _TrackingExecutor(ThreadPoolExecutor):
+    """The default executor, remembering its unfinished jobs so the gate can wait for background thread work."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._jobs: set[Future[Any]] = set()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        job = super().submit(fn, *args, **kwargs)
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
+        return job
+
+    def unfinished(self) -> list[Future[Any]]:
+        return [job for job in list(self._jobs) if not job.done()]
+
+
+def _track_default_executor(loop: asyncio.AbstractEventLoop) -> _TrackingExecutor:
+    executor = getattr(loop, "_call_shape_executor", None)
+    if executor is None:
+        executor = _TrackingExecutor()
+        loop.set_default_executor(executor)
+        loop._call_shape_executor = executor  # type: ignore[attr-defined]
+    return executor
 
 
 async def _settle() -> None:
@@ -318,7 +352,7 @@ class TestSyncCallShape:
 
 
 class TestAsyncCallShape:
-    """Async decorators: a miss takes the SaaS lock and re-reads before computing."""
+    """Async decorators: a miss takes the SaaS lock, re-reads only if it had to wait or its read failed, and releases in the background."""
 
     async def test_cold_miss(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60)
@@ -326,7 +360,8 @@ class TestAsyncCallShape:
             return x * 2
 
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT", "DELETE /lock"])
+        # The first lock POST won after a clean miss: no re-read, and the release is not waited on (LAB-7064).
+        assert shape == _Shape(blocking=["GET", "POST /lock", "PUT"], background=["DELETE /lock"])
 
     async def test_l2_hit(self, backend: CachekitIOBackend, gate: _Gate) -> None:
         @cache(backend=backend, ttl=60, l1_enabled=False)
@@ -358,7 +393,8 @@ class TestAsyncCallShape:
         saas.filled_by_holder = saas.store.pop(_only_key(saas))
         saas.lock_held_for = 1
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET", "DELETE /lock"])
+        # A waited grant keeps the double-check read: the holder may have filled the key meanwhile.
+        assert shape == _Shape(blocking=["GET", "POST /lock", "POST /lock", "GET"], background=["DELETE /lock"])
 
     # refresh_ttl_on_get decides from the hit's Fresh-For and never blocks the caller (LAB-7074).
 
@@ -466,6 +502,22 @@ class TestAsyncCallShape:
         async def fn(x: int) -> int:
             return x * 2
 
-        saas.fail_reads = True  # a failed read is treated as a miss: the full locked-miss sequence follows
+        saas.fail_reads = True  # a failed read is treated as a miss, and is read again once the lock is won
         shape = await gate.run_async(fn(1))
-        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT", "DELETE /lock"])
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET", "PUT"], background=["DELETE /lock"])
+
+    async def test_failed_read_of_a_live_entry(self, backend: CachekitIOBackend, gate: _Gate, saas: _FakeSaaS) -> None:
+        """The primary read fails on an entry that is still live, and the first lock POST wins. The post-lock
+        read is the only retry, so it still runs and serves the entry: no recompute, no PUT (LAB-7064)."""
+        calls: list[int] = []
+
+        @cache(backend=backend, ttl=60, l1_enabled=False)
+        async def fn(x: int) -> int:
+            calls.append(x)
+            return x * 2
+
+        await gate.run_async(fn(1))
+        saas.fail_next_reads = 1
+        shape = await gate.run_async(fn(1))
+        assert shape == _Shape(blocking=["GET", "POST /lock", "GET"], background=["DELETE /lock"])
+        assert calls == [1]

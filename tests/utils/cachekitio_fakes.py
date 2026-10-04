@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from urllib3 import HTTPHeaderDict, HTTPResponse
+from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.cachekitio.client import HTTPClient
@@ -78,10 +79,17 @@ class FakePool:
     def urlopen(
         self, method: str, url: str, body: bytes | None = None, headers: dict[str, str] | None = None, **options: Any
     ) -> HTTPResponse:
+        if self.closed:
+            raise ClosedPoolError(None, "Pool is closed.")  # type: ignore[arg-type]  # as urllib3's own pool
         request = FakeRequest(method, url, HTTPHeaderDict(headers or {}), body, options)
         with self._lock:
             self.requests.append(request)
         return self.handler(request)
+
+    @property
+    def pool(self) -> object | None:
+        """urllib3's connection queue, which a closed pool drops: ``HTTPClient.is_closed`` reads it."""
+        return None if self.closed else self.requests
 
     def close(self) -> None:
         self.closed = True
