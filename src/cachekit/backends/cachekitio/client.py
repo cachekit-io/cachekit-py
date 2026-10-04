@@ -242,7 +242,7 @@ def lease_http_client(config: CachekitIOBackendConfig) -> ClientLease:
 def close_http_clients() -> None:
     """Close this process's cached clients (useful for cleanup).
 
-    A backend built earlier keeps its closed client, and its requests then fail: build a new backend.
+    Currently a backend built before the close still holds its closed client, so its requests fail.
     """
     leases = _own_leases()
     with leases.lock:
