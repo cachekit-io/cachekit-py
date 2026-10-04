@@ -211,9 +211,11 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   with the same key, URL, timeout and pool size share one pool while any of them is alive, and the pool
   is closed when the last one is released. Create one backend per key and reuse it
 - Idle connections stay pooled until the server closes them: urllib3 has no client-side idle expiry.
-  Cloudflare closes an idle connection at 400 s, and urllib3 checks a pooled connection for a close
-  before reusing it, so a request after a longer pause opens a new connection instead of failing
-  ([IDLE]). Each pooled connection sends TCP keepalive probes after 60 s idle (every 10 s, 3 probes),
+  Cloudflare documents a 400 s idle close for client connections; on the dev environment, with the
+  keepalive probes below running, pooled connections were still reused after idle gaps of 405–600 s
+  (2026-10-04, 6 threads, 0 errors and 0 new connections). Either way, urllib3 checks a pooled
+  connection for a close before reusing it, so a connection the server closed is replaced, never failed
+  on. Each pooled connection sends TCP keepalive probes after 60 s idle (every 10 s, 3 probes),
   which keeps NAT gateway mappings alive (AWS NAT Gateway drops idle flows at 350 s, Azure at 4 min). If
   a network path does die, the probes find it in about 90 s, and the next request reconnects instead of
   waiting out the timeout. Probes cannot run while a process is suspended (a frozen serverless runtime,
