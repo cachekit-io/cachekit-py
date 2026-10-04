@@ -25,8 +25,8 @@ def run(port: str, go: str, after: str) -> None:
 
     real_client_kwargs = client_module._client_kwargs
 
-    def loopback_client_kwargs(config: Any) -> dict[str, Any]:
-        return {**real_client_kwargs(config), "base_url": f"http://127.0.0.1:{port}", "http2": False}
+    def loopback_client_kwargs(*args: Any) -> dict[str, Any]:  # forwards whatever _client_kwargs takes
+        return {**real_client_kwargs(*args), "base_url": f"http://127.0.0.1:{port}", "http2": False}
 
     client_module._client_kwargs = loopback_client_kwargs
     backend = CachekitIOBackend(api_url="https://api.cachekit.io", api_key="ck_test_lock_release")  # pragma: allowlist secret
