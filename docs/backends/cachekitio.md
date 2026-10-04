@@ -202,9 +202,12 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   async-decorator L2 operation, which runs on the default executor's threads (at most 32). Over HTTP/2
   those threads would multiplex one connection, which httpx's sync HTTP/2 support does not make
   thread-safe, and 1–4% of operations failed as cache misses. Each extra connection costs one TCP and
-  TLS handshake on first use, then stays pooled. A request that finds all 32 in use waits up to the
-  request timeout for one. The async client keeps HTTP/2: one event loop drives it, so its requests
-  share one connection safely. Backends used on the same thread with the
+  TLS handshake on first use, then stays pooled. A request that finds every connection in use waits for
+  one to free, and fails only if none frees within the request timeout. The waits are not served in
+  order (a thread starting a new request can take a freed connection first), so with more threads than
+  connections a few requests wait many round trips: keep `connection_pool_size` at least as large as
+  the number of threads that share one backend. The async client keeps HTTP/2: one event loop drives
+  it, so its requests share one connection safely. Backends used on the same thread with the
   same key, URL, timeout and pool size share one pool while any of them is alive. The sync pool is closed
   when the last one is released; the async pool is not, and Python reclaims its sockets with a
   `ResourceWarning` each. Create one backend per key and reuse it
