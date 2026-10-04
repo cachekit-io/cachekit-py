@@ -14,7 +14,7 @@ _FAKE = Path(__file__).parents[2] / "performance" / "loopback_saas.py"
 
 @pytest.fixture(scope="module")
 def fake_saas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[int, Path]]:
-    """tests/performance/loopback_saas.py on a free loopback port, HTTP/1.1 and HTTP/2 by ALPN: (port, CA cert).
+    """tests/performance/loopback_saas.py on a free loopback port, over TLS (HTTP/1.1): (port, CA cert).
 
     Needs ``openssl`` on PATH; a module using it skips without one.
     """

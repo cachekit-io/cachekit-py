@@ -17,6 +17,7 @@ import socket
 import threading
 import urllib.request
 import weakref
+from contextlib import ExitStack
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -45,7 +46,7 @@ def _user_agent() -> str:
     except PackageNotFoundError:
         logging.getLogger(__name__).debug("No cachekit distribution metadata; User-Agent reports cachekit-py/unknown")
         sdk = "unknown"
-    return f"cachekit-py/{sdk} urllib3/{version('urllib3')}"
+    return f"cachekit-py/{sdk} urllib3/{urllib3.__version__}"  # pyright: ignore[reportPrivateImportUsage]
 
 
 _USER_AGENT = _user_agent()
@@ -247,8 +248,11 @@ def close_sync_client() -> None:
     with leases.lock:
         held = list(leases.by_key.values())
         leases.by_key.clear()
-    for lease in held:
-        lease.client.close()
+    # The exit stack runs every close even when an earlier one raises, then re-raises: one failing client cannot
+    # leave the rest open.
+    with ExitStack() as stack:
+        for lease in held:
+            stack.callback(lease.client.close)
 
 
 def reset_global_client() -> None:

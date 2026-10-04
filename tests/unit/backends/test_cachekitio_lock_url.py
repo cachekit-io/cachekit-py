@@ -17,81 +17,59 @@ LockableBackend method receives the **bare cache key** — identical to what
 derivation (Redis still uses ``key:lock`` on the wire; SaaS has no such notion
 because the lock endpoint is ``/v1/cache/{key}/lock``).
 
-These tests pin the URL path that lands at the SaaS edge to a bare 7-segment
-key — no ``%3Alock`` smuggled in via the encoded key portion. The Rust and
+These tests pin the request path the backend's client hands its connection pool,
+which urllib3 sends as the request target, to a bare 7-segment key — no
+``%3Alock`` smuggled in via the encoded key portion. The Rust and
 TypeScript SDKs already implement this contract; this regression test prevents
 the Python SDK from drifting back out of conformance.
 """
 
 from __future__ import annotations
 
-import json as _json
-import os
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
-import httpx
 import pytest
+from urllib3 import HTTPResponse
+from urllib3.util.url import _encode_target
 
-from cachekit.backends.cachekitio.backend import CachekitIOBackend
-
-_TEST_API_URL = "https://api.cachekit.io"
-_TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake fixture, not a real key
+from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
 
 # Canonical 7-segment cache key (matches saas/apps/cache/src/index.ts validator):
 # ns:{namespace}:func:{module.function}:args:{64-hex-blake2b}:{flags}
 _CANONICAL_KEY = "ns:articles-prod:func:insight_times.api.routes._list_articles_cached:args:" + ("a" * 64) + ":1s"
 
 
-def _json_response(status_code: int, body: dict[str, Any]) -> httpx.Response:
-    """Build a real httpx.Response with JSON body and request attached."""
-    response = httpx.Response(status_code, content=_json.dumps(body).encode())
-    response.request = httpx.Request("POST", f"{_TEST_API_URL}/v1/cache/key/lock")
-    return response
-
-
-@pytest.fixture
-def backend() -> CachekitIOBackend:
-    """Build a CachekitIOBackend with mocked HTTP clients."""
-    with patch(
-        "cachekit.backends.cachekitio.backend.lease_sync_http_client",
-        return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.Client)),
-    ):
-        with patch(
-            "cachekit.backends.cachekitio.backend.lease_async_http_client",
-            return_value=MagicMock(pid=os.getpid(), client=MagicMock(spec=httpx.AsyncClient)),
-        ):
-            return CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
-
-
-def _path_calls(mock: AsyncMock) -> list[str]:
-    """Extract endpoint-path arg order from mock's await history."""
-    return [call.args[1] for call in mock.await_args_list]
+def _lock_api(request: FakeRequest) -> HTTPResponse:
+    """The SaaS lock endpoint: POST grants, DELETE releases."""
+    return response(200, json={"lock_id": "lock-1"} if request.method == "POST" else {})
 
 
 @pytest.mark.unit
 class TestBareCacheKeyContract:
     """The wrapper must pass the bare 7-segment cache key — no ``:lock`` suffix."""
 
-    async def test_acquire_lock_url_preserves_seven_segments(self, backend: CachekitIOBackend) -> None:
-        """The POST endpoint must be ``{url-encoded bare 7-seg key}/lock`` — not 8 segments.
+    async def test_acquire_lock_url_preserves_seven_segments(self) -> None:
+        """The POST path must be ``/v1/cache/{url-encoded bare 7-seg key}/lock`` — not 8 segments.
 
         Decoding the encoded-key portion must yield exactly 7 colon-separated parts.
         If the wrapper (or the backend) appends ``:lock`` to the key, the decoded key has
         8 segments and the SaaS validator returns 400.
         """
-        request_mock = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-1"}))
-        backend._request_async = request_mock  # type: ignore[method-assign]
+        backend, pool = fake_backend(_lock_api)
 
         async with backend.acquire_lock(_CANONICAL_KEY, timeout=30.0, blocking_timeout=None):
             pass
 
-        post_path = _path_calls(request_mock)[0]
+        assert [r.method for r in pool.requests] == ["POST", "DELETE"]
+        post_path = pool.requests[0].path
+        # The path the pool receives is the request target on the wire: urlopen re-encodes only characters
+        # that are invalid in a path, and a percent-encoded key has none, so nothing below is undone in flight.
+        assert _encode_target(post_path) == post_path
 
-        # Endpoint must be of the form "<encoded-key>/lock" — exactly one "/lock" suffix.
-        assert post_path.endswith("/lock"), f"POST endpoint must end with /lock, got {post_path!r}"
-        encoded_key_portion = post_path[: -len("/lock")]
+        # Path must be of the form "/v1/cache/<encoded-key>/lock" — exactly one "/lock" suffix.
+        assert post_path.startswith("/v1/cache/"), f"POST path escaped /v1/cache/: {post_path!r}"
+        assert post_path.endswith("/lock"), f"POST path must end with /lock, got {post_path!r}"
+        encoded_key_portion = post_path[len("/v1/cache/") : -len("/lock")]
 
         # The encoded key portion must NOT itself end with the encoded form of `:lock`
         # (i.e. `%3Alock`). That is exactly the bug the canonical 7-segment validator

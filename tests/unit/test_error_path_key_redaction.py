@@ -473,7 +473,7 @@ class TestClassifierMessagesAreKeyFree:
     """Every backend classifier must build a key-free BackendError.message (CWE-532).
 
     This is the invariant ``redact_error_for_log`` relies on when it logs a BackendError
-    verbatim: provider exception text (redis ACL/WRONGTYPE, httpx URL, pymemcache) can
+    verbatim: provider exception text (redis ACL/WRONGTYPE, urllib3 URL, pymemcache) can
     echo the raw key, so no classifier may interpolate ``str(exc)`` into the message —
     only ``type(exc).__name__``. Detail stays on ``original_exception``; the key rides
     the ``.key`` attribute, which ``_format_message`` redacts. Guards against the wrapped
