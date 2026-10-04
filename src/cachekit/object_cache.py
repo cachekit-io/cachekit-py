@@ -70,8 +70,8 @@ class _ObjectCacheState:
     """The entries, their byte total, their in-flight refresh markers, and the lock guarding all three.
 
     One object so the at-fork hook can replace all of it with a single attribute store: a thread
-    still inside a critical section finishes on the state it bound, and nothing is shared across
-    the swap.
+    still inside a critical section finishes on the state it bound. The stats and the generation
+    counter stay on the cache, so a swap keeps them.
     """
 
     __slots__ = ("lock", "refreshing", "size_bytes", "store")
@@ -84,16 +84,16 @@ class _ObjectCacheState:
         # generation, so a stale refresh from a replaced entry can neither resurrect data nor
         # release a newer refresh's marker (which would allow duplicate concurrent refreshes racing
         # last-write-wins). Invariant: a present marker always equals the live entry's generation,
-        # because every entry change funnels through remove(), which pops it. Removal leaves no
-        # per-key residue.
+        # because every single-key entry change funnels through remove(), which pops it, and
+        # clear() and the fork reset empty every marker at once. Removal leaves no per-key residue.
         self.refreshing: dict[str, int] = {}
         self.lock = threading.RLock()
 
     def remove(self, key: str) -> None:
         """Remove an entry and update all bookkeeping; call with lock held.
 
-        Every removal path funnels here so byte accounting and in-flight refresh cancellation stay
-        consistent. Anti-resurrection needs no per-key residue: a refresh can only land on the exact
+        Every single-key removal funnels here so byte accounting and in-flight refresh cancellation
+        stay consistent. Anti-resurrection needs no per-key residue: a refresh can only land on the exact
         entry (generation) it was started against.
         """
         entry = self.store.pop(key, None)
@@ -548,17 +548,12 @@ class ObjectCache:
     def _reset_after_fork(self) -> None:
         """Retire what the parent's threads left in this cache; call only from _reset_caches_after_fork.
 
-        The parent's other threads did not survive the fork, so a refresh one of them was running
-        will never clear its in-flight marker: the markers are emptied, and the next stale read
-        starts a refresh again. The lock is taken
-        only inside a critical section, so a free one means nothing was mid-update, and the entries
-        stay, as they would in a process that computed them itself. A held one may never come free:
-        a parent thread that held it is gone, and the forking thread, if it forked inside a critical
-        section (from a signal handler or a finalizer), may never return there; multiprocessing's
-        child runs its target and exits. Its holder may also have left the entries half-updated.
-        So the cache gets a fresh, empty state in one attribute store, never a clear in place: a
-        forking thread that does return finishes on the state it bound. _is_owned() first: the
-        forking thread's own hold is reentrant, so a try-acquire alone would report it free.
+        A free lock means nothing was mid-update: the entries stay, and the in-flight refresh
+        markers, whose threads did not survive the fork, are emptied. A held lock may never come
+        free and its holder may have left the entries half-updated, so the cache gets a fresh state
+        in one attribute store, never a clear in place: a forking thread that returns into its
+        critical section finishes on the state it bound. _is_owned() comes first because the
+        forking thread's own hold is reentrant, and a try-acquire alone would report it free.
         """
         s = self._state
         if not s.lock._is_owned() and s.lock.acquire(blocking=False):  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]

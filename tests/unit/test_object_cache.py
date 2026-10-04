@@ -24,6 +24,13 @@ from tests.utils.fork_helpers import child_outcome, on_new_thread, report
 from tests.utils.timing_helper import TimingHelper
 
 
+def _fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> types.SimpleNamespace:
+    """Replace ObjectCache's clock with one that reads start until the test sets its monotonic."""
+    fake_time = types.SimpleNamespace(monotonic=lambda: start)
+    monkeypatch.setattr("cachekit.object_cache.time", fake_time)
+    return fake_time
+
+
 @pytest.mark.unit
 class TestObjectCacheBasic:
     """Fundamental get/put/delete/clear behaviour."""
@@ -331,14 +338,8 @@ class TestObjectCacheSWR:
     jitter window (threshold in [0.9, 1.1] * ttl * ratio) so tests stay deterministic.
     """
 
-    @staticmethod
-    def _fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> types.SimpleNamespace:
-        fake_time = types.SimpleNamespace(monotonic=lambda: start)
-        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
-        return fake_time
-
     def test_fresh_entry_no_refresh_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -350,7 +351,7 @@ class TestObjectCacheSWR:
         assert needs_refresh is False
 
     def test_stale_entry_flags_refresh_exactly_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -366,7 +367,7 @@ class TestObjectCacheSWR:
         assert needs_refresh2 is False
 
     def test_hard_expired_entry_is_miss_not_stale(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache()
         oc.put("k", "v1", ttl=10)
 
@@ -380,7 +381,7 @@ class TestObjectCacheSWR:
 
     def test_complete_refresh_updates_value_and_extends_expiry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """L1-only has no L2 source of truth — a refresh restarts the TTL clock."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)  # expires at 1010
 
@@ -397,7 +398,7 @@ class TestObjectCacheSWR:
 
     def test_complete_refresh_after_delete_does_not_resurrect(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A refresh landing after invalidation must not bring stale data back (#207)."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -411,7 +412,7 @@ class TestObjectCacheSWR:
         assert oc.get("k")[0] is False
 
     def test_complete_refresh_after_clear_does_not_resurrect(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -430,7 +431,7 @@ class TestObjectCacheSWR:
         Regression: put() used a bare pop() that kept the old refresh valid, so
         an older in-flight refresh could overwrite the newer value.
         """
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -447,7 +448,7 @@ class TestObjectCacheSWR:
 
     def test_put_replacement_clears_refreshing_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """After put() replaces mid-refresh, a later stale hit can flag a new refresh."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -463,7 +464,7 @@ class TestObjectCacheSWR:
 
     def test_complete_refresh_after_delete_and_reput_does_not_overwrite(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """delete() + a fresh put() of the same key must still reject the old refresh."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -479,7 +480,7 @@ class TestObjectCacheSWR:
 
     def test_cancel_refresh_allows_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """After a failed refresh is cancelled, the next stale hit flags again."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -497,7 +498,7 @@ class TestObjectCacheSWR:
         release the newer refresh's marker (that would allow duplicate concurrent
         refreshes racing last-write-wins) nor overwrite its result.
         """
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -523,7 +524,7 @@ class TestObjectCacheSWR:
 
     def test_stale_cancel_cannot_clear_newer_refresh_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A failed old refresh cancelling late must not release a newer refresh's marker."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5)
         oc.put("k", "v1", ttl=10)
 
@@ -545,7 +546,7 @@ class TestObjectCacheSWR:
     def test_oversized_refresh_result_drops_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If the refreshed value no longer fits the byte budget, the stale entry
         is dropped rather than served forever."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         small = "x" * 100
         oc = ObjectCache(
             max_entries=None,
@@ -572,19 +573,13 @@ class TestObjectCacheRefreshRetryBackoff:
     """
 
     @staticmethod
-    def _fake_clock(monkeypatch: pytest.MonkeyPatch, start: float = 1000.0) -> types.SimpleNamespace:
-        fake_time = types.SimpleNamespace(monotonic=lambda: start)
-        monkeypatch.setattr("cachekit.object_cache.time", fake_time)
-        return fake_time
-
-    @staticmethod
     def _fail_once(oc: ObjectCache, key: str) -> None:
         _, _, needs_refresh, version = oc.get_with_swr(key, ttl=100)
         assert needs_refresh
         oc.fail_refresh(key, version)
 
     def test_no_refresh_flagged_inside_interval_and_value_served(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
         oc.put("k", "held", ttl=100)
 
@@ -597,7 +592,7 @@ class TestObjectCacheRefreshRetryBackoff:
             assert (hit, value, needs_refresh) == (True, "held", False)
 
     def test_first_read_after_interval_flags_exactly_one_refresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
         oc.put("k", "held", ttl=100)
 
@@ -609,7 +604,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert flags == [True, False, False, False, False]
 
     def test_success_clears_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
         oc.put("k", "held", ttl=100)
 
@@ -624,7 +619,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc._state.store["k"].refresh_failed_at is None
 
     def test_backoff_is_per_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
         oc.put("a", 1, ttl=100)
         oc.put("b", 2, ttl=100)
@@ -636,7 +631,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc.get_with_swr("b", ttl=100)[2] is True
 
     def test_invalidated_entry_takes_its_backoff_with_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
         oc.put("k", "held", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -648,7 +643,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc.get_with_swr("k", ttl=100)[2] is True
 
     def test_evicted_entry_takes_its_backoff_with_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(max_entries=1, swr_threshold_ratio=0.5, swr_retry_interval=1000)
         oc.put("k", "held", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -661,7 +656,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc.get_with_swr("k", ttl=100)[2] is True
 
     def test_zero_interval_retries_on_next_stale_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=0)
         oc.put("k", "held", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -671,7 +666,7 @@ class TestObjectCacheRefreshRetryBackoff:
 
     def test_cancel_does_not_back_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A refresh that never ran (capacity, uncopyable args) made no upstream call."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=20)
         oc.put("k", "held", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -682,7 +677,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc.get_with_swr("k", ttl=100)[2] is True
 
     def test_stale_fail_cannot_back_off_newer_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
         oc.put("k", "v1", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -696,7 +691,7 @@ class TestObjectCacheRefreshRetryBackoff:
         assert oc.get_with_swr("k", ttl=100)[2] is True
 
     def test_hard_expiry_still_misses_during_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(swr_threshold_ratio=0.5, swr_retry_interval=1000)
         oc.put("k", "held", ttl=100)
         fake.monotonic = lambda: 1060.0
@@ -727,12 +722,6 @@ class TestObjectCacheFork:
     one of them was running never clears its in-flight marker. Each child reports over a pipe and
     os._exit()s, so it never returns into pytest.
     """
-
-    @staticmethod
-    def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
-        fake = types.SimpleNamespace(monotonic=lambda: 1000.0)
-        monkeypatch.setattr("cachekit.object_cache.time", fake)
-        return fake
 
     @staticmethod
     def _decorate(make: Callable[[], Any], fn: Callable[[int], int]) -> tuple[Callable[[int], int], ObjectCache]:
@@ -788,7 +777,7 @@ class TestObjectCacheFork:
         assert child_outcome(child, r) == {"first": 2, "again": 2, "calls": 2}
 
     def test_forked_child_refreshes_a_key_whose_refresh_was_in_flight_at_fork(self, monkeypatch) -> None:
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         gate = threading.Event()
         calls: list[int] = []
         parent_pid = os.getpid()
@@ -827,7 +816,7 @@ class TestObjectCacheFork:
 
     def test_forked_child_keeps_entries_and_restarts_refreshes(self, monkeypatch) -> None:
         """With the lock free at fork nothing was mid-update: entries stay, in-flight markers go."""
-        fake = self._fake_clock(monkeypatch)
+        fake = _fake_clock(monkeypatch)
         oc = ObjectCache(max_entries=None, max_size_bytes=1 << 20, swr_threshold_ratio=0.5)
         oc.put("k", "v", ttl=100)
         fake.monotonic = lambda: 1060.0
