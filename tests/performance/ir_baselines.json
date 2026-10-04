@@ -2,6 +2,7 @@
   "interpreters": {
     "cpython-3.12-x86_64": {
       "budgets": {
+        "file_set": 100723,
         "l1_hit": 61244,
         "l2_hit": 312228,
         "l2_hit_async_metrics": 261598,
@@ -18,6 +19,7 @@
     },
     "cpython-3.14-x86_64": {
       "budgets": {
+        "file_set": 86297,
         "l1_hit": 62410,
         "l2_hit": 313909,
         "l2_hit_async_metrics": 265142,

@@ -231,6 +231,7 @@ The regression gate is the instruction budget, run locally with `make perf-ir`.
 | `serializer_orjson` | `OrjsonSerializer` round trip | 23,792 | 23,833 |
 | `serializer_arrow` | `ArrowSerializer` round trip, 100-row DataFrame | 1,946,487 | 1,955,979 |
 | `serializer_encrypted` | `EncryptionWrapper` encrypt + decrypt round trip | 115,652 | 117,851 |
+| `file_set` | `FileBackend.set()` overwriting one key in a 1,000-entry cache (no eviction) | 100,723 | 86,297 |
 
 Budgets are per interpreter (minor version, build flavour, machine); an interpreter without budgets fails with `no budget`. They were recorded on CPython 3.12.12 and 3.14.3, x86_64, glibc 2.39, with the release extension that `uv sync` builds. Counts depend on that whole build, so on a different interpreter, extension or C library, record a baseline on `main` first (`--update --allow-increase`) and compare your branch against it. Batched mode costs the caller about 50,000 fewer instructions per L2 hit than synchronous recording, because the Prometheus update moves to the worker thread.
 
@@ -239,7 +240,7 @@ Budgets are per interpreter (minor version, build flavour, machine); an interpre
 **Limits:** instruction counts do not weight cache misses or branch mispredictions. A claimed speed-up still needs an interleaved wall-clock comparison; the instruction count only guarantees the work did not grow. Paths that wait on a network backend are not covered. Cyclic-GC cost is outside the budgets; allocation and reference counting are inside. In batched mode the worker's Prometheus update runs on its own thread and is not budgeted. The orjson round trip's 1 KB output buffer comes from glibc malloc, whose path length depends on heap state that no layout sample pins, so its figure moved 1.3% between unrelated changes; it is gated at 2%. Unrelated changes can still move another path's figure by up to 0.6% (a `WARN`), and a `LOWER` verdict on a path the change did not touch is a layout shift, not a saving: ratchet only the paths the change touched (`--update --path <path>`).
 
 ```bash
-make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 110 runs, several minutes)
+make perf-ir         # gate: fail on a >=1% per-call regression (orjson 2%; needs valgrind; 120 runs, several minutes)
 make perf-ir-update  # ratchet: write lower measured figures back as budgets, never higher
 ```
 

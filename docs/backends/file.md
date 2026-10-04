@@ -74,7 +74,7 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: `get` does no directory scan, so on its own it stays flat as the cache grows; `set` grows with the number of cached entries (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks it for that whole `set()`, because `set()` holds the backend's lock through its fsync and directory scans.
+- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 - Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported
@@ -141,25 +141,35 @@ the cached payload is left untouched.
 
 ## Performance Characteristics
 
-`set()` does three things whose cost adds up: it scans the whole cache directory to check the
-entry-count limit, writes and fsyncs a temp file and renames it into place, then scans the
-directory again to check whether eviction is due (and walks it a third time when eviction
-fires). Its cost is an fsync floor plus a per-entry scan cost, so it grows linearly with the
-number of cached entries; on a cache near the default `max_entry_count` the scan term
-dominates. `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same
-process blocks them for that whole `set()`, because `set()` holds the backend's lock through
-its fsync and directory scans.
+The backend keeps its entry count and total size in memory. It seeds them with one directory
+scan when it starts and updates them on every write, delete, eviction and expired-entry
+cleanup it makes. So a `set()` checks the entry-count limit and the eviction trigger without
+scanning the directory, and its usual cost is one fsync whatever the cache size: about 25
+syscalls per `set()` at 0, 1,000 or 5,000 entries, against twice the entry count before.
 
-The fsync floor and the per-entry cost both depend heavily on your disk, filesystem and load,
-so measure them where you will run. The harness reports set/get/delete p50 and p99 at 0, 1,000,
-5,000 and 9,000 cached entries (1 KB values, n = 200 per point):
+Three things still scan the directory, and each scan costs time in proportion to the number
+of entries. A `set()` that pushes the cache past the eviction trigger rescans first, so it never
+evicts on a stale count, and then evicts the oldest-written entries; that happens about once
+every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `max_entry_count`
+scans before it rejects. And the first `set()` more than 30 seconds after the last scan
+rescans, because the counters cannot see other processes' writes to the same directory. So
+the latency tail of `set()` still grows with the cache, but the typical `set()` no longer does.
+`get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
+blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
+
+Concurrent writers in several processes are unsupported (see [Characteristics](#characteristics)). If you
+run them anyway, each process sees the others' writes only at its next scan, so the cache can
+overshoot `max_size_mb` and `max_entry_count` by up to 30 seconds' worth of their writes.
+
+The fsync cost depends heavily on your disk, filesystem and load, so measure it where you will
+run. The harness reports set/get/delete p50 and p99 at 0, 1,000, 5,000 and 9,000 cached
+entries (1 KB values, n = 200 per point):
 
 ```bash
 uv run pytest tests/performance/test_file_backend_perf.py -k scaling -s -m performance --basetemp=<dir on the filesystem to measure>
 ```
 
-Run it more than once and compare: the spread between runs is your noise floor. If you write
-often to a large cache, keep `max_entry_count` low or use another backend.
+Run it more than once and compare: the spread between runs is your noise floor.
 
 ## See Also
 
