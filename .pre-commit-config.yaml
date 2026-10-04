@@ -119,7 +119,7 @@ repos:
       - id: no-internal-references
         name: No internal references in docs
         language: pygrep
-        entry: '\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        entry: '\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
         stages: [pre-commit]
@@ -133,9 +133,9 @@ repos:
         args:
           - |
             import re, sys
-            P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
+            P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
             KIND = r"(?:branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits)"
-            GIT_SUBJECT = re.compile(rf"Merge {KIND} '[^']*'(?:(?:, | and ){KIND}? ?'[^']*')*(?: of \S+)?(?: into \S+)?|(?:Revert|Reapply) \".*\"")
+            GIT_SUBJECT = re.compile(rf"Merge {KIND} '[^']*'(?:(?:, |; | and ){KIND}? ?'[^']*')*(?: of \S+)?(?: into \S+)?|(?:Revert|Reapply) \".*\"")
             try:
                 with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
                     text = f.read()
