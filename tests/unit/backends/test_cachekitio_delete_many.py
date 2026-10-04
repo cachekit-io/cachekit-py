@@ -151,7 +151,7 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
 
     f.invalidate_cache()
 
-    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts every
+    # Fan-out shape from the server, not the clock: the held first wave puts every
     # worker in flight on its own pool thread. A key deleted outside the pool (per-key loop, serial
     # tail) brings an extra thread, or for n = 1 the caller's own; a pool of len(keys) workers
     # brings more than 16.
