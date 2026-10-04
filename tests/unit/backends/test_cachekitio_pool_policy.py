@@ -59,13 +59,15 @@ class _ConnectProxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self) -> None:
-        self.request_lines: list[str] = []
+        self.request_targets: list[str] = []
         self.request_headers: list[HTTPHeaderDict] = []
         proxy = self
 
         class Handler(socketserver.StreamRequestHandler):
             def handle(self) -> None:
-                proxy.request_lines.append(self.rfile.readline().decode().strip())
+                # Method and target only: CPython's tunnel sends CONNECT as HTTP/1.0 before 3.12 and HTTP/1.1 after.
+                method, target, _version = self.rfile.readline().decode().split()
+                proxy.request_targets.append(f"{method} {target}")
                 headers = HTTPHeaderDict()
                 while (line := self.rfile.readline()) not in (b"\r\n", b""):
                     name, _, value = line.decode().partition(":")
@@ -230,7 +232,7 @@ def test_env_proxy_routes_requests(
     client = HTTPClient(config)
     with pytest.raises(ProxyError):
         client.request("GET", "/v1/cache/k")
-    assert connect_proxy.request_lines == [f"CONNECT {_API_HOST}:443 HTTP/1.1"]
+    assert connect_proxy.request_targets == [f"CONNECT {_API_HOST}:443"]
     assert "Proxy-Authorization" not in connect_proxy.request_headers[0]
 
 
@@ -243,7 +245,7 @@ def test_env_proxy_credentials_reach_the_proxy(
     client = HTTPClient(config)
     with pytest.raises(ProxyError):
         client.request("GET", "/v1/cache/k")
-    assert connect_proxy.request_lines == [f"CONNECT {_API_HOST}:443 HTTP/1.1"]
+    assert connect_proxy.request_targets == [f"CONNECT {_API_HOST}:443"]
     headers = connect_proxy.request_headers[0]
     assert headers["Proxy-Authorization"] == "Basic " + base64.b64encode(b"us@er:p:ss").decode()
     assert "Authorization" not in headers
