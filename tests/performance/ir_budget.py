@@ -211,13 +211,15 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
         with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
-            futures = {
-                (p, n, shift): pool.submit(
-                    _measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)}, child_timeout_s
-                )
-                for p, n, shift in runs
-            }
+            # Leaving the pool waits for its live runs, so they are killed first, on any error from the
+            # first submit on.
             try:
+                futures = {
+                    (p, n, shift): pool.submit(
+                        _measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)}, child_timeout_s
+                    )
+                    for p, n, shift in runs
+                }
                 ir = {key: future.result() for key, future in futures.items()}
             except BaseException:
                 pool.shutdown(wait=False, cancel_futures=True)

@@ -105,6 +105,18 @@ sys.path.insert(0, sys.argv[2])
 from tests.performance import ir_budget as b
 b.WORKLOAD = Path(sys.argv[1])
 b._measure_one = lambda path, n, workdir, env, *timeout: b._run([], path, n, env, *timeout) or 0
+if len(sys.argv) > 3:  # signal itself while submitting the second run, the first one live
+    import os, signal, time
+    submit = b.ThreadPoolExecutor.submit
+    calls = []
+    def submit_then_signal(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            while sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) < 1:
+                time.sleep(0.05)
+            os.kill(os.getpid(), int(sys.argv[3]))
+        return submit(self, *args, **kwargs)
+    b.ThreadPoolExecutor.submit = submit_then_signal
 b.measure(["l1_hit"], 2)
 """
 
@@ -155,6 +167,30 @@ def test_a_signal_to_the_gate_leaves_no_run_behind(tmp_path, sig: signal.Signals
             time.sleep(0.05)
         assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
         assert code == (128 + sig if sig == signal.SIGTERM else -sig)  # an uncaught KeyboardInterrupt re-raises SIGINT
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_signal_while_runs_are_being_submitted_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+    """The pool waits for live runs when it unwinds, so they must be killed before it does."""
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig))])  # noqa: S603 (trusted: this test's files)
+    try:
+        code = gate.wait(timeout=20)  # the stub run sleeps 60 s: a gate that waits for it times out here
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        assert runs, "the stub run never started"
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == (128 + sig if sig == signal.SIGTERM else -sig)
     finally:
         gate.kill()
         for f in pids.iterdir():
