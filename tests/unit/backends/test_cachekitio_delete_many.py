@@ -30,21 +30,28 @@ from cachekit.cache_handler import _supports_multi_delete
 _TEST_API_URL = "https://api.cachekit.io"
 _TEST_API_KEY = "ck_test_abc123"  # pragma: allowlist secret — fake key, test fixture
 _DELAY = 0.05
+_HOLD_TIMEOUT = 10.0
 
 
 class _Server:
     """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight.
 
-    ``threads`` holds the id of every thread that sent a DELETE. A 16-worker pool never uses more
-    than 16 threads however the host schedules it; a DELETE sent outside the pool adds one more.
+    ``threads`` holds the id of every thread that sent a DELETE. With ``hold``, DELETEs wait until
+    ``hold`` of them are in flight at once (or ``_HOLD_TIMEOUT`` passes), then none waits again.
+    A pool starts workers lazily and reuses one that went idle, so without the hold a slow submit
+    loop lets an early DELETE finish and the pool never starts all its workers. Held, no worker
+    goes idle before the last starts, so a 16-worker pool uses exactly 16 threads however the
+    host schedules it; a DELETE sent outside the pool adds one more.
     """
 
-    def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429) -> None:
+    def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429, hold: int = 0) -> None:
         self.store: dict[str, bytes] = {}
         self.deleted: list[str] = []
         self.reject, self.status = reject, status
         self.in_flight = self.peak = 0
         self.threads: set[int] = set()
+        self.hold = hold
+        self._released = threading.Event()
         self._lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -63,7 +70,11 @@ class _Server:
             self.threads.add(threading.get_ident())
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
+            if self.in_flight >= self.hold:
+                self._released.set()
         try:
+            if not self._released.wait(_HOLD_TIMEOUT):
+                self._released.set()  # never reached: let the rest through, the peak assertion reports it
             time.sleep(_DELAY)
             if key in self.reject:
                 return httpx.Response(self.status, json={"error": "rejected"})
@@ -144,7 +155,7 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
 @pytest.mark.asyncio
 async def test_ainvalidate_cache_takes_the_fan_out() -> None:
     n = 48
-    server = _Server()
+    server = _Server(hold=_DELETE_FANOUT)
 
     @cache(backend=_backend(server), ttl=60, namespace="fanout_async", l1_enabled=False)
     async def f(x: int) -> int:
@@ -156,8 +167,9 @@ async def test_ainvalidate_cache_takes_the_fan_out() -> None:
 
     await f.ainvalidate_cache()
 
-    # Fan-out shape from the server, not the clock (LAB-7889): every DELETE went through one
-    # 16-worker pool. A key deleted outside it (per-key loop, serial tail) brings a 17th thread.
+    # Fan-out shape from the server, not the clock (LAB-7889): the held first wave puts 16 DELETEs
+    # in flight on 16 pool threads. A key deleted outside the pool (per-key loop, serial tail)
+    # brings a 17th thread; a pool of fewer than 16 never fills the hold and peaks below 16.
     assert len(server.threads) == _DELETE_FANOUT, len(server.threads)
     assert server.peak == _DELETE_FANOUT
     assert server.store == {} and _cached_keys(f) == set()
