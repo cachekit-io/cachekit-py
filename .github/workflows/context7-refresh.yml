@@ -32,8 +32,10 @@ jobs:
             --data '{"libraryName": "/cachekit-io/cachekit-py"}')
           cat "$RUNNER_TEMP/context7-response.json"
           echo
+          # Patterns keep their opening paren: ci.yml's runner drift guard reads a
+          # line that starts with `*` as a YAML alias and fails the build.
           case "$status" in
-            202) echo "::warning::Context7 has not finalized this library yet (HTTP 202). Re-run this workflow later." ;;
-            2??) echo "Context7 accepted the refresh (HTTP $status)." ;;
-            *) echo "::error::Context7 refresh failed with HTTP $status."; exit 1 ;;
+            (202) echo "::warning::Context7 has not finalized this library yet (HTTP 202). Re-run this workflow later." ;;
+            (2??) echo "Context7 accepted the refresh (HTTP $status)." ;;
+            (*) echo "::error::Context7 refresh failed with HTTP $status."; exit 1 ;;
           esac
