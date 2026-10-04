@@ -67,6 +67,9 @@ LEGACY_TTL_HEADER = "X-TTL"
 STALE_TTL_HEADER = "X-CacheKit-Stale-TTL"
 FRESHNESS_HEADER = "X-CacheKit-Freshness"
 FRESH_FOR_HEADER = "X-CacheKit-Fresh-For"
+# A Fresh-For value never exceeds the 30-day TTL cap, which is seven digits.
+_FRESH_FOR_MAX_S = 2_592_000
+_FRESH_FOR_MAX_DIGITS = 7
 
 # A write the server sheds with 503 + a short Retry-After (request deadline, a retryable store
 # fault) is sent once more, inline, after exactly that delay (LAB-7686). PUT and DELETE are
@@ -137,6 +140,33 @@ def _rate_limit_delay(error: BackendError) -> int | None:
     if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 429:
         return _retry_after_seconds(cause.response, _MAX_RATE_LIMIT_WAIT_S)
     return None
+
+
+def _parse_fresh_for(value: str | None) -> int | None:
+    """Map an ``X-CacheKit-Fresh-For`` value to seconds (LAB-557, spec/saas-api.md#remaining-freshness).
+
+    Absent = pre-signal server → None (legacy behavior: no bound). Anything but 1-7 ASCII
+    digits at most the 30-day TTL cap = drift → 0 (do not extend local service — the
+    conservative action, mirroring the unrecognized-freshness → stale rule). The shape check
+    runs before ``int()``, which accepts ``+5``, ``1_0``, whitespace and non-ASCII digits
+    (LAB-7838). Takes the header string, not a response, so it outlives the HTTP client.
+
+    Examples:
+        >>> _parse_fresh_for("30"), _parse_fresh_for(None), _parse_fresh_for("+5"), _parse_fresh_for("3000000")
+        (30, None, 0, 0)
+    """
+    if value is None:
+        return None
+    # Length first, per spec: a valid value never needs more than seven digits.
+    if len(value) <= _FRESH_FOR_MAX_DIGITS and value.isascii() and value.isdigit():
+        parsed = int(value)
+        if parsed <= _FRESH_FOR_MAX_S:
+            return parsed
+    # Drift signal, not a crash: a server/proxy emitting garbage here disables L1 backfill
+    # for affected reads — log so a fleet-wide latency regression is diagnosable.
+    # Truncated, because the value is unbounded.
+    _logger.debug(f"Invalid {FRESH_FOR_HEADER} header {value[:32]!r}; treating as 0 (no L1 backfill)")
+    return 0
 
 
 # Protocol spec/saas-api.md § Cache-Key Path Encoding, rule 2; rationale in _encode_key.
@@ -566,24 +596,8 @@ class CachekitIOBackend:
 
     @staticmethod
     def _fresh_for(response: httpx.Response) -> int | None:
-        """Parse X-CacheKit-Fresh-For (LAB-557, spec/saas-api.md#remaining-freshness).
-
-        Absent = pre-signal server → None (legacy behavior: no bound).
-        Unparseable or negative = drift → 0 (do not extend local service — the
-        conservative action, mirroring the unrecognized-freshness → stale rule).
-        """
-        value = response.headers.get(FRESH_FOR_HEADER)
-        if value is None:
-            return None
-        try:
-            parsed = int(value)
-        except ValueError:
-            # Drift signal, not a crash: a server/proxy emitting garbage here
-            # disables L1 backfill for affected reads — log so a fleet-wide
-            # latency regression is diagnosable (expert-panel finding).
-            _logger.debug(f"Unparseable {FRESH_FOR_HEADER} header {value!r}; treating as 0 (no L1 backfill)")
-            return 0
-        return parsed if parsed >= 0 else 0
+        """Read X-CacheKit-Fresh-For off ``response``; the grammar lives in ``_parse_fresh_for``."""
+        return _parse_fresh_for(response.headers.get(FRESH_FOR_HEADER))
 
     def get_with_freshness(self, key: str) -> tuple[bytes, bool, int | None] | None:
         """Retrieve value plus its SWR freshness and remaining-freshness bound (sync).
