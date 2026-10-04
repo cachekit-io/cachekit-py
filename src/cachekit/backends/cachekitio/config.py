@@ -124,12 +124,12 @@ class CachekitIOBackendConfig(BaseBackendConfig):
         gt=0,
         description="Request timeout in seconds",
     )
-    # 32 = the most threads the default executor runs (min(32, cpu + 4)). The sync client is HTTP/1.1, one request
-    # per connection, so async-decorator L2 ops (asyncio.to_thread) never wait on the pool for a connection.
+    # 32 = the most threads the default executor runs (min(32, cpu + 4)), which every async L2 op uses. One request
+    # per HTTP/1.1 connection; more concurrent requests than this open short-lived extra connections.
     connection_pool_size: int = Field(
         default=32,
         gt=0,
-        description="Maximum HTTP connections in pool",
+        description="HTTP connections kept in the shared pool",
     )
     allow_custom_host: bool = Field(
         default=False,

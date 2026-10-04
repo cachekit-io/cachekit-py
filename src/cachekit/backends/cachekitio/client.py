@@ -88,10 +88,12 @@ def _env_proxy(host: str) -> str | None:
 def _connection_pool(config: CachekitIOBackendConfig) -> HTTPSConnectionPool:
     pool_kw: dict[str, Any] = {
         "timeout": Timeout(connect=config.timeout, read=config.timeout),
-        # A request that finds every connection busy waits for one, up to the timeout (pool_timeout in request()),
-        # rather than opening connections past the configured size.
+        # The pool keeps up to this many idle connections. A request that finds every connection busy opens one more
+        # rather than waiting: every thread in the process shares this pool, and a thread must never queue behind
+        # another's slow request into a timeout and a miss. urllib3 closes the extra connection when it comes back
+        # to a full pool, and logs a WARNING that the pool is too small for the load.
         "maxsize": config.connection_pool_size,
-        "block": True,
+        "block": False,
         "socket_options": _KEEPALIVE_SOCKET_OPTIONS,
     }
     proxy = _env_proxy(parse_url(config.api_url).host or "")
@@ -112,7 +114,6 @@ class HTTPClient:
     def __init__(self, config: CachekitIOBackendConfig) -> None:
         # A path on api_url prefixes every request path.
         self._prefix = (parse_url(config.api_url).path or "").rstrip("/")
-        self._timeout = config.timeout
         self.headers = {
             "Authorization": f"Bearer {config.api_key.get_secret_value()}",
             "Content-Type": "application/octet-stream",
@@ -134,17 +135,16 @@ class HTTPClient:
             headers={**self.headers, **headers} if headers else self.headers,
             retries=False,
             redirect=False,
-            pool_timeout=self._timeout,  # type: ignore[arg-type]  # annotated int; queue.get takes a float
         )
 
     def close(self) -> None:
         self.pool.close()
 
 
-class SyncClientLease:
+class ClientLease:
     """Sole owner of a cached client, which is closed once its last holder drops the lease.
 
-    Keep the lease for as long as ``.client`` is used: ``lease_sync_http_client(config).client``
+    Keep the lease for as long as ``.client`` is used: ``lease_http_client(config).client``
     on its own drops the lease at once, and with it the client.
 
     A lease belongs to the process that built it (``.pid``). In a forked child, ``.client`` is still the
@@ -193,7 +193,7 @@ class _Leases:
     def __init__(self) -> None:
         self.pid = os.getpid()
         self.lock = threading.Lock()
-        self.by_key: weakref.WeakValueDictionary[_ClientKey, SyncClientLease] = weakref.WeakValueDictionary()
+        self.by_key: weakref.WeakValueDictionary[_ClientKey, ClientLease] = weakref.WeakValueDictionary()
 
 
 _leases = _Leases()
@@ -219,14 +219,14 @@ def _client_key(config: CachekitIOBackendConfig) -> _ClientKey:
     return (config.api_url, config.api_key.get_secret_value(), config.timeout, config.connection_pool_size)
 
 
-def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
+def lease_http_client(config: CachekitIOBackendConfig) -> ClientLease:
     """Lease this process's HTTP client for this config (created on first use).
 
     Args:
         config: cachekit.io backend configuration
 
     Returns:
-        SyncClientLease: its ``.client`` is the client for exactly this config, open for as long as the
+        ClientLease: its ``.client`` is the client for exactly this config, open for as long as the
         lease is held
     """
     leases = _own_leases()
@@ -235,11 +235,11 @@ def lease_sync_http_client(config: CachekitIOBackendConfig) -> SyncClientLease:
         # Bind to a local first: the weak dict alone would let a fresh lease die on insertion.
         lease = leases.by_key.get(key)
         if lease is None:
-            lease = leases.by_key[key] = SyncClientLease(config)
+            lease = leases.by_key[key] = ClientLease(config)
     return lease
 
 
-def close_sync_client() -> None:
+def close_http_clients() -> None:
     """Close this process's cached clients (useful for cleanup).
 
     A backend built earlier keeps its closed client, and its requests then fail: build a new backend.
@@ -258,7 +258,7 @@ def close_sync_client() -> None:
 def reset_global_client() -> None:
     """Drop this process's cached clients without closing them (useful for testing).
 
-    Note: This does not properly close clients. Use close_sync_client() for proper cleanup.
+    Note: This does not properly close clients. Use close_http_clients() for proper cleanup.
     """
     leases = _own_leases()
     with leases.lock:
@@ -267,8 +267,8 @@ def reset_global_client() -> None:
 
 __all__ = [
     "HTTPClient",
-    "SyncClientLease",
-    "lease_sync_http_client",
-    "close_sync_client",
+    "ClientLease",
+    "lease_http_client",
+    "close_http_clients",
     "reset_global_client",
 ]

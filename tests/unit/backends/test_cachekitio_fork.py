@@ -69,7 +69,7 @@ def backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path]) -> Cac
 
 
 def _pool(backend: CachekitIOBackend) -> Any:
-    return backend._sync_lease.client.pool
+    return backend._lease.client.pool
 
 
 def _exchange(backend: CachekitIOBackend, tag: str) -> dict[str, int]:
@@ -164,11 +164,11 @@ _CLEAN = {"errors": 0, "wrong": 0}
 
 @pytest.mark.parametrize("order", ["child-then-parent", "parent-then-child", "two-children"])
 def test_each_process_uses_its_own_connection(backend: CachekitIOBackend, order: str) -> None:
-    parent_client = backend._sync_lease.client
+    parent_client = backend._lease.client
     results = _run(backend, order)
     assert results == [_CLEAN] * len(results)
     # The parent kept its client, and its one warm connection served every request: no child's traffic broke it.
-    assert backend._sync_lease.client is parent_client
+    assert backend._lease.client is parent_client
     assert _pool(backend).num_connections == 1
 
 
@@ -226,7 +226,7 @@ def test_child_replaces_the_inherited_lease_cache(backend: CachekitIOBackend, fo
         result["owned_by_child"] = own.pid == os.getpid()
         result["fresh_lock"] = own.lock is not inherited.lock
         # The backend's re-lease came from the child's cache, so a second backend there shares it.
-        result["cached"] = client_module.lease_sync_http_client(backend._config) is backend._sync_lease
+        result["cached"] = client_module.lease_http_client(backend._config) is backend._lease
         return result
 
     child = _Child(child_job, fork)
@@ -244,28 +244,28 @@ def test_child_replaces_the_inherited_lease_cache(backend: CachekitIOBackend, fo
 
 
 def test_async_child_on_a_new_loop_uses_the_re_leased_client(backend: CachekitIOBackend) -> None:
-    """Async methods send on the sync client through asyncio.to_thread, so a child's async ops re-lease too.
+    """Async methods send on the same client through asyncio.to_thread, so a child's async ops re-lease too.
 
     The child's async and sync requests then share its one re-leased client, never the parent's.
     """
     tag = uuid.uuid4().hex
     asyncio.run(backend.set_async(f"{tag}-warm", b"w"))
-    parent_client = backend._sync_lease.client
+    parent_client = backend._lease.client
 
     def child_job() -> dict[str, Any]:
         result: dict[str, Any] = asyncio.run(_exchange_async(backend, f"{tag}-child"))
-        async_client = backend._sync_lease.client
+        client = backend._lease.client
         result["sync"] = _exchange(backend, f"{tag}-child-sync")
         # parent_client stays referenced, so a new client cannot reuse its id.
-        result["parents_client"] = async_client is parent_client
-        result["sync_shares_it"] = backend._sync_lease.client is async_client
+        result["parents_client"] = client is parent_client
+        result["sync_shares_it"] = backend._lease.client is client
         return result
 
     child = _Child(child_job)
     child.go()
     results = [child.result(), asyncio.run(_exchange_async(backend, f"{tag}-parent"))]
     assert results == [{**_CLEAN, "sync": _CLEAN, "parents_client": False, "sync_shares_it": True}, _CLEAN]
-    assert backend._sync_lease.client is parent_client
+    assert backend._lease.client is parent_client
     assert _pool(backend).num_connections == 1
 
 
@@ -281,14 +281,14 @@ def test_child_drops_inherited_clients_without_closing_them(monkeypatch: pytest.
     monkeypatch.setattr(client_module.HTTPClient, "close", spy)
 
     def child_job() -> dict[str, Any]:
-        inherited = weakref.ref(backend._sync_lease)
-        inherited_client = backend._sync_lease.client
+        inherited = weakref.ref(backend._lease)
+        inherited_client = backend._lease.client
         result: dict[str, Any] = _exchange(backend, f"{uuid.uuid4().hex}-child")
         gc.collect()  # the replaced lease is unreferenced now; its finalizer runs here at the latest
         # The finalizer ran (the lease is gone) and its PID guard skipped the close.
         result["finalized"] = inherited() is None
         result["closed"] = len(closed)
-        result["replaced"] = backend._sync_lease.client is not inherited_client
+        result["replaced"] = backend._lease.client is not inherited_client
         return result
 
     child = _Child(child_job)

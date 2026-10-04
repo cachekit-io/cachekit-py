@@ -347,8 +347,8 @@ class TestIoPreset:
         a = DecoratorConfig.io(api_key="ck_tenant_a").backend  # pragma: allowlist secret
         b = DecoratorConfig.io(api_key="ck_tenant_b").backend  # pragma: allowlist secret
         assert isinstance(a, CachekitIOBackend) and isinstance(b, CachekitIOBackend)
-        assert a._sync_lease.client.headers["Authorization"] == "Bearer ck_tenant_a"
-        assert b._sync_lease.client.headers["Authorization"] == "Bearer ck_tenant_b"
+        assert a._lease.client.headers["Authorization"] == "Bearer ck_tenant_a"
+        assert b._lease.client.headers["Authorization"] == "Bearer ck_tenant_b"
 
     @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
     def test_backend_kwarg_rejected(self, backend: object) -> None:

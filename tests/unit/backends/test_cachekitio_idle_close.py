@@ -96,8 +96,6 @@ def backend(monkeypatch: pytest.MonkeyPatch, fake_saas: tuple[int, Path], server
     monkeypatch.setattr(config_module, "is_private_ip", lambda hostname: False)
     monkeypatch.setenv("CACHEKIT_ALLOW_CUSTOM_HOST", "true")
     monkeypatch.setenv("SSL_CERT_FILE", str(cert))
-    for var in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
-        monkeypatch.delenv(var, raising=False)
     api_key = "ck_test_idle_close"  # pragma: allowlist secret — fake key, test fixture
     return CachekitIOBackend(api_url=f"https://127.0.0.1:{server.port}", api_key=api_key)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import ssl
 from collections.abc import Callable
 
 import pytest
@@ -159,9 +160,10 @@ _TRANSPORT_RULES: list[tuple[Callable[[], Exception], BackendErrorType, str]] = 
         "Request timeout: ReadTimeoutError",
     ),
     (
-        lambda: u3.EmptyPoolError(None, f"Pool for {_URL} reached maximum size and no more connections are allowed."),  # type: ignore[arg-type]
-        BackendErrorType.TIMEOUT,
-        "Request timeout: EmptyPoolError",
+        # A host with no CA bundle: the message names the fix, still with no URL.
+        lambda: u3.SSLError(ssl.SSLCertVerificationError(1, f"certificate verify failed for {_URL}")),
+        BackendErrorType.TRANSIENT,
+        "Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)",
     ),
     (
         lambda: u3.ClosedPoolError(None, f"Pool for {_URL} is closed."),  # type: ignore[arg-type]

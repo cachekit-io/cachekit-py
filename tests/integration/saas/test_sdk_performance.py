@@ -57,24 +57,26 @@ def vantage(sdk_config) -> str:
 
 
 @pytest.fixture
-def response_headers(cache_io_decorator):
+def response_headers(cache_io_decorator, monkeypatch):
     """Headers of every response the SDK's HTTP client receives, in order.
 
-    The decorator's backend leases the per-thread client for this exact config, so leasing it
-    here returns the same client; the hook only reads.
+    The decorator's backend leases the process's client for this exact config, so leasing it
+    here returns the same client; the wrapper only reads.
     """
-    from cachekit.backends.cachekitio.client import lease_sync_http_client
+    from cachekit.backends.cachekitio.client import lease_http_client
     from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 
-    lease = lease_sync_http_client(CachekitIOBackendConfig())
+    lease = lease_http_client(CachekitIOBackendConfig())
     seen: list = []
+    send = lease.client.request
 
-    def hook(response) -> None:
+    def recording(*args, **kwargs):
+        response = send(*args, **kwargs)
         seen.append(response.headers)
+        return response
 
-    lease.client.event_hooks["response"].append(hook)
+    monkeypatch.setattr(lease.client, "request", recording)
     yield seen
-    lease.client.event_hooks["response"].remove(hook)
 
 
 def _timed_ms(fn, arg) -> float:

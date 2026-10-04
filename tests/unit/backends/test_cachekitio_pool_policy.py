@@ -9,7 +9,6 @@ keepalive options, and a client under a proxy setting tunnels through the proxy.
 from __future__ import annotations
 
 import base64
-import os
 import socket
 import socketserver
 import threading
@@ -40,14 +39,6 @@ def config() -> CachekitIOBackendConfig:
         timeout=3.5,
         connection_pool_size=7,
     )
-
-
-@pytest.fixture(autouse=True)
-def _no_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # urllib.request.getproxies() reads every *_proxy variable in either case; a developer's own must not leak in.
-    for name in list(os.environ):
-        if name.lower().endswith("_proxy"):
-            monkeypatch.delenv(name)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -189,16 +180,16 @@ class TestPoolLimits:
                 (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
             ]
 
-    def test_size_blocking_and_timeouts(self, pool: Any, config: CachekitIOBackendConfig) -> None:
-        """A request that finds every connection busy waits for one rather than opening one past the size."""
+    def test_size_overflow_and_timeouts(self, pool: Any, config: CachekitIOBackendConfig) -> None:
+        """A request that finds every connection busy opens one more rather than queueing behind another thread."""
         assert pool.pool.maxsize == config.connection_pool_size  # the queue of pooled connections
-        assert pool.block is True
+        assert pool.block is False
         assert pool.timeout.connect_timeout == config.timeout
         assert pool.timeout.read_timeout == config.timeout
         assert (pool.scheme, pool.host, pool.port) == ("https", _API_HOST, 443)
 
 
-def test_every_request_sends_once_without_redirect_and_waits_the_timeout_for_a_connection() -> None:
+def test_every_request_sends_once_without_redirect() -> None:
     """Retries and redirects are the backend's call, never urllib3's: a redirect would carry the bearer key elsewhere."""
     backend, pool = fake_backend(
         lambda request: response(404) if request.method in ("GET", "HEAD") else response(200), timeout=2.5
@@ -207,7 +198,7 @@ def test_every_request_sends_once_without_redirect_and_waits_the_timeout_for_a_c
     backend.set("k", b"v")
     backend.exists("k")
     backend.delete("k")
-    assert [r.options for r in pool.requests] == [{"retries": False, "redirect": False, "pool_timeout": 2.5}] * 4
+    assert [r.options for r in pool.requests] == [{"retries": False, "redirect": False}] * 4
 
 
 def test_keepalive_socket_options_are_applied(config: CachekitIOBackendConfig, local_server: str) -> None:

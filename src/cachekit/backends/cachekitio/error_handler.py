@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ssl
 from typing import TYPE_CHECKING
 
 from urllib3 import exceptions as u3
@@ -50,8 +51,7 @@ def classify_http_error(
         - HTTP 413: PERMANENT (value too large — retrying never helps)
         - HTTP 5xx: TRANSIENT (server error)
         - HTTP 4xx: PERMANENT (client error)
-        - urllib3 TimeoutError, EmptyPoolError: TIMEOUT (request, or the wait for a pooled
-          connection, exceeded the time limit)
+        - urllib3 TimeoutError: TIMEOUT (connect or read exceeded the time limit)
         - NewConnectionError, ProtocolError, SSLError, ProxyError: TRANSIENT (network issue)
         - All others: UNKNOWN (log and investigate)
     """
@@ -117,16 +117,21 @@ def classify_http_error(
     # can embed the request URL, which carries the raw cache key in its path, and the message reaches
     # log sinks via str(e) (CWE-532, LAB-304). Detail stays on original_exception.
     if isinstance(exc, (u3.NewConnectionError, u3.ProtocolError, u3.SSLError, u3.ProxyError)):
+        # A host with no CA bundle fails every request here; name the fix rather than look like a network flake.
+        if any(isinstance(arg, ssl.SSLCertVerificationError) for arg in exc.args):
+            message = "Connection failed: certificate verification failed against the system trust store (see SSL_CERT_FILE)"
+        else:
+            message = f"Connection failed: {type(exc).__name__}"
         return BackendError(
-            f"Connection failed: {type(exc).__name__}",
+            message,
             error_type=BackendErrorType.TRANSIENT,
             original_exception=exc,
             operation=operation,
             key=key,
         )
 
-    # TIMEOUT: Request, or the wait for a free pooled connection, exceeded the time limit.
-    if isinstance(exc, (u3.TimeoutError, u3.EmptyPoolError)):
+    # TIMEOUT: Request exceeded the time limit.
+    if isinstance(exc, u3.TimeoutError):
         return BackendError(
             f"Request timeout: {type(exc).__name__}",
             error_type=BackendErrorType.TIMEOUT,

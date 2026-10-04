@@ -21,7 +21,7 @@ from urllib.parse import quote
 from pydantic import SecretStr, ValidationError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted
-from cachekit.backends.cachekitio.client import SyncClientLease, lease_sync_http_client
+from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -72,7 +72,7 @@ _RETRY_METHODS = frozenset({"PUT", "DELETE"})
 _MAX_RETRY_AFTER_S = 2
 
 # The SaaS has no bulk delete, so whole-function invalidation sends this many DELETEs at once over
-# the sync client's pool, one HTTP/1.1 connection each (LAB-7070). Each still takes its own limiter verdict.
+# the client's pool, one HTTP/1.1 connection each (LAB-7070). Each still takes its own limiter verdict.
 _DELETE_FANOUT = 16
 # A longer rate-limit hint than this is treated as a deny, not waited out. The tenant limiter's
 # window is 60 s, so a real hint is far below it; the cap only bounds the parse.
@@ -322,11 +322,11 @@ class CachekitIOBackend:
 
         # One thread-safe client per config and process, for sync and async methods alike: an async method sends
         # on it through asyncio.to_thread. Holding the lease keeps the client open; dropping it closes the client.
-        # Fork: each request re-leases when the lease's PID is not this process's (see _own_sync_lease).
-        self._sync_lease = lease_sync_http_client(self._config)
+        # Fork: each request re-leases when the lease's PID is not this process's (see _own_lease).
+        self._lease = lease_http_client(self._config)
 
-    def _own_sync_lease(self) -> SyncClientLease:
-        """This process's sync lease: a forked child re-leases, so it never sends on its parent's connections.
+    def _own_lease(self) -> ClientLease:
+        """This process's lease: a forked child re-leases, so it never sends on its parent's connections.
 
         Those connections share the parent's TLS sessions: whichever process writes second on one breaks
         it, and a raced read can return the other process's response. Checked per request rather than by
@@ -334,9 +334,9 @@ class CachekitIOBackend:
         negligible next to the request. The lease is published through one reference and carries its own
         PID, so a thread never pairs a new PID with an inherited client.
         """
-        lease = self._sync_lease
+        lease = self._lease
         if lease.pid != os.getpid():
-            lease = self._sync_lease = lease_sync_http_client(self._config)
+            lease = self._lease = lease_http_client(self._config)
         return lease
 
     @staticmethod
@@ -387,7 +387,7 @@ class CachekitIOBackend:
     def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> BaseHTTPResponse:
         """One attempt on this process's client, any status. Raises BackendError for a transport failure."""
         # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
-        lease = self._own_sync_lease()
+        lease = self._own_lease()
         try:
             return lease.client.request(method, url, body=body, headers=headers)
         except Exception as exc:
@@ -433,8 +433,8 @@ class CachekitIOBackend:
             more after exactly that delay (see ``_write_retry_delay``); nothing else retries.
 
             Automatically injects cache metrics headers (L1/L2 hits, session ID) when
-            called from within a @cache decorated function. If no stats available in
-            context, headers are not injected (backward compatible).
+            called from within a @cache decorated function; with no stats in context,
+            only ``X-CacheKit-L1-Status: disabled``.
         """
         url = f"/v1/cache/{endpoint}"
         headers = self._request_headers(headers)

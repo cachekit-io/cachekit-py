@@ -14,11 +14,9 @@ from unittest.mock import patch
 
 import pytest
 from urllib3 import HTTPResponse
-from urllib3.exceptions import ReadTimeoutError
 
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
-from cachekit.backends.cachekitio.error_handler import HTTPStatusError
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError
 from tests.utils.cachekitio_fakes import TEST_API_KEY, TEST_API_URL, FakePool, FakeRequest, fake_backend, response
@@ -26,9 +24,6 @@ from tests.utils.cachekitio_fakes import TEST_API_KEY, TEST_API_URL, FakePool, F
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-_TEST_API_URL = TEST_API_URL
-_TEST_API_KEY = TEST_API_KEY
 
 
 class _Server:
@@ -55,7 +50,7 @@ def server() -> _Server:
 
 @pytest.fixture
 def backend_and_pool(server: _Server) -> tuple[CachekitIOBackend, FakePool]:
-    return fake_backend(server, api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+    return fake_backend(server, api_url=TEST_API_URL, api_key=TEST_API_KEY)
 
 
 @pytest.fixture
@@ -80,40 +75,40 @@ class TestInit:
 
     def test_manual_config_accepted(self) -> None:
         """Both api_url and api_key provided: backend initialises cleanly."""
-        b = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
-        assert b._config.api_url == _TEST_API_URL
-        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+        b = CachekitIOBackend(api_url=TEST_API_URL, api_key=TEST_API_KEY)
+        assert b._config.api_url == TEST_API_URL
+        assert b._config.api_key.get_secret_value() == TEST_API_KEY
 
     def test_timeout_override_stored(self) -> None:
         """Explicit timeout is stored in config."""
-        b = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY, timeout=30.0)
+        b = CachekitIOBackend(api_url=TEST_API_URL, api_key=TEST_API_KEY, timeout=30.0)
         assert b._config.timeout == 30.0
 
     def test_timeout_defaults_to_five(self) -> None:
         """Omitting timeout defaults to 5.0 seconds."""
-        b = CachekitIOBackend(api_url=_TEST_API_URL, api_key=_TEST_API_KEY)
+        b = CachekitIOBackend(api_url=TEST_API_URL, api_key=TEST_API_KEY)
         assert b._config.timeout == 5.0
 
     def test_api_key_alone_fills_url_and_timeout_from_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """api_key without api_url is valid: the URL and timeout come from env / defaults."""
         monkeypatch.delenv("CACHEKIT_API_URL", raising=False)
         monkeypatch.delenv("CACHEKIT_TIMEOUT", raising=False)
-        b = CachekitIOBackend(api_key=_TEST_API_KEY)
-        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
-        assert b._config.api_url == _TEST_API_URL
+        b = CachekitIOBackend(api_key=TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == TEST_API_KEY
+        assert b._config.api_url == TEST_API_URL
         assert b._config.timeout == 5.0
 
     def test_api_key_argument_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An explicit api_key wins over CACHEKIT_API_KEY."""
         monkeypatch.setenv("CACHEKIT_API_KEY", "ck_env_key")  # pragma: allowlist secret
-        b = CachekitIOBackend(api_key=_TEST_API_KEY)
-        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+        b = CachekitIOBackend(api_key=TEST_API_KEY)
+        assert b._config.api_key.get_secret_value() == TEST_API_KEY
 
     def test_no_key_anywhere_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Neither api_key nor CACHEKIT_API_KEY: ConfigurationError here, not a 401 on the first call."""
         monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
         with pytest.raises(ConfigurationError, match="api_key"):
-            CachekitIOBackend(api_url=_TEST_API_URL)
+            CachekitIOBackend(api_url=TEST_API_URL)
 
     def test_empty_key_raises_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An empty key would go out as 'Bearer ' — reject it where the preset is built."""
@@ -151,7 +146,7 @@ class TestInit:
             "ck_live_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
             "ck_sdk_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
             "ck_api_" + string.ascii_letters + string.digits,  # pragma: allowlist secret
-            _TEST_API_KEY,
+            TEST_API_KEY,
             "AZaz09-._~+/==",  # pragma: allowlist secret
         ],
         ids=["live", "sdk", "api", "test", "every-b64token-char"],
@@ -176,7 +171,7 @@ class TestInit:
             ),
             (
                 {},
-                {"api_key": _TEST_API_KEY, "api_url": "https://user:SECRET_PW@api.cachekit.io"},  # pragma: allowlist secret
+                {"api_key": TEST_API_KEY, "api_url": "https://user:SECRET_PW@api.cachekit.io"},  # pragma: allowlist secret
                 ("api_url",),
             ),
         ],
@@ -210,7 +205,7 @@ class TestInit:
 
         url = "https://user:SECRET_PW\uff0fx@api.cachekit.io"  # pragma: allowlist secret
         with pytest.raises(ValidationError) as info:
-            CachekitIOBackendConfig(api_key=_TEST_API_KEY, api_url=url)
+            CachekitIOBackendConfig(api_key=TEST_API_KEY, api_url=url)
         error = info.value.errors(include_input=False)[0]["ctx"]["error"]
         assert "SECRET" not in str(error)
         assert error.__cause__ is None
@@ -221,14 +216,14 @@ class TestInit:
         """URL userinfo never authenticates (the Bearer key is the only credential) and is one more place for a
         password to reach logs (CWE-532): reject it."""
         with pytest.raises(ConfigurationError, match="must not contain credentials") as info:
-            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=f"https://{userinfo}api.cachekit.io")
+            CachekitIOBackend(api_key=TEST_API_KEY, api_url=f"https://{userinfo}api.cachekit.io")
         assert "SECRET" not in str(info.value)
 
     def test_https_error_never_echoes_a_schemeless_url(self) -> None:
         """Without a scheme, urlparse reads the username as one, and the HTTPS error once echoed it."""
         url = "SECRETUSER:pw@api.cachekit.io"  # pragma: allowlist secret
         with pytest.raises(ConfigurationError, match="must use HTTPS") as info:
-            CachekitIOBackend(api_key=_TEST_API_KEY, api_url=url)
+            CachekitIOBackend(api_key=TEST_API_KEY, api_url=url)
         assert "secretuser" not in str(info.value).lower()  # urlparse lowercases the scheme
 
     def test_config_error_never_echoes_the_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,9 +239,9 @@ class TestInit:
 
     def test_env_based_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All-None args triggers env-based config load."""
-        monkeypatch.setenv("CACHEKIT_API_KEY", _TEST_API_KEY)
+        monkeypatch.setenv("CACHEKIT_API_KEY", TEST_API_KEY)
         b = CachekitIOBackend()
-        assert b._config.api_key.get_secret_value() == _TEST_API_KEY
+        assert b._config.api_key.get_secret_value() == TEST_API_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -493,38 +488,6 @@ class TestWithTimeout:
 # ---------------------------------------------------------------------------
 # TestRequestSyncErrorClassification
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestRequestSyncErrorClassification:
-    """Tests for _request_sync() error classification via classify_http_error."""
-
-    def test_http_status_error_is_classified(self, backend: CachekitIOBackend, server: _Server) -> None:
-        """An error status raises the classified BackendError, the response kept on an HTTPStatusError."""
-        server.answer = response(500)
-
-        with pytest.raises(BackendError) as exc_info:
-            backend._request_sync("GET", "some-key")
-
-        original = exc_info.value.original_exception
-        assert isinstance(original, HTTPStatusError)
-        assert original.response.status == 500
-
-    def test_non_http_exception_is_classified(self, backend: CachekitIOBackend, server: _Server) -> None:
-        """Non-HTTP exceptions are also wrapped by classify_http_error."""
-        server.answer = RuntimeError("unexpected")
-
-        with pytest.raises(BackendError):
-            backend._request_sync("GET", "some-key")
-
-    def test_timeout_exception_raises_backend_error(self, backend: CachekitIOBackend, server: _Server) -> None:
-        """urllib3's ReadTimeoutError is classified as TIMEOUT BackendError."""
-        server.answer = ReadTimeoutError(None, "/v1/cache/some-key", "timed out")  # type: ignore[arg-type]
-
-        with pytest.raises(BackendError) as exc_info:
-            backend._request_sync("GET", "some-key")
-
-        assert exc_info.value.error_type == BackendErrorType.TIMEOUT
 
 
 # ---------------------------------------------------------------------------

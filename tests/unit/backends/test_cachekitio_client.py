@@ -6,7 +6,7 @@ Tests for backends/cachekitio/client.py covering:
 - Client lifecycle: open while its lease is held, closed once the last lease is dropped
 - Client configuration (host, timeout, Authorization and User-Agent headers, a path prefix on api_url)
 - Headers on the wire: the client's own on every request, a per-request header replacing the client's
-- Cleanup via close_sync_client(); reset_global_client() drops without closing
+- Cleanup via close_http_clients(); reset_global_client() drops without closing
 - State a forked child inherits: replaced, never closed (real forks: test_cachekitio_fork.py)
 
 Pool policy (proxies, keepalive, limits): test_cachekitio_pool_policy.py. Async methods: test_cachekitio_event_loops.py.
@@ -29,10 +29,10 @@ from urllib3 import HTTPResponse, HTTPSConnectionPool
 from cachekit.backends.cachekitio import client as client_module
 from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.cachekitio.client import (
+    ClientLease,
     HTTPClient,
-    SyncClientLease,
-    close_sync_client,
-    lease_sync_http_client,
+    close_http_clients,
+    lease_http_client,
     reset_global_client,
 )
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
@@ -56,7 +56,7 @@ def _cleanup() -> None:  # type: ignore[return]
     reset_global_client()
 
 
-def _cached() -> list[SyncClientLease]:
+def _cached() -> list[ClientLease]:
     return list(client_module._own_leases().by_key.values())
 
 
@@ -74,40 +74,25 @@ class TestLeaseSyncHttpClient:
     """HTTP client factory behaviour."""
 
     def test_lease_holds_an_http_client_on_one_https_pool(self, config: CachekitIOBackendConfig) -> None:
-        lease = lease_sync_http_client(config)
+        lease = lease_http_client(config)
         assert isinstance(lease.client, HTTPClient)
         assert isinstance(lease.client.pool, HTTPSConnectionPool)
 
     def test_same_instance_on_repeated_calls(self, config: CachekitIOBackendConfig) -> None:
         """Process-wide caching: same lease (and client) returned every time."""
-        l1 = lease_sync_http_client(config)
-        l2 = lease_sync_http_client(config)
+        l1 = lease_http_client(config)
+        l2 = lease_http_client(config)
         assert l1 is l2
-
-    def test_host_configured(self, config: CachekitIOBackendConfig) -> None:
-        """The pool connects to config.api_url's host, over HTTPS."""
-        pool = lease_sync_http_client(config).client.pool
-        assert (pool.scheme, pool.host, pool.port) == ("https", "api.cachekit.io", 443)
-
-    def test_timeout_configured(self, config: CachekitIOBackendConfig) -> None:
-        """Pool timeout matches config.timeout."""
-        pool = lease_sync_http_client(config).client.pool
-        assert pool.timeout.read_timeout == config.timeout
-
-    def test_authorization_header(self, config: CachekitIOBackendConfig) -> None:
-        """Authorization header is Bearer <api_key>."""
-        lease = lease_sync_http_client(config)
-        assert lease.client.headers["Authorization"] == f"Bearer {config.api_key.get_secret_value()}"
 
     def test_distinct_keys_get_distinct_clients(self, config: CachekitIOBackendConfig) -> None:
         """Regression: a single per-thread client sent every backend's traffic under the FIRST key."""
         other = CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=1.0)  # noqa: S106
-        l1 = lease_sync_http_client(config)
-        l2 = lease_sync_http_client(other)
+        l1 = lease_http_client(config)
+        l2 = lease_http_client(other)
         assert l1.client is not l2.client
         assert l2.client.headers["Authorization"] == "Bearer ck_other_key"
         assert l2.client.pool.timeout.read_timeout == 1.0
-        assert lease_sync_http_client(config) is l1
+        assert lease_http_client(config) is l1
 
     @pytest.mark.parametrize(
         "change",
@@ -117,7 +102,7 @@ class TestLeaseSyncHttpClient:
     def test_every_baked_in_value_keys_its_own_client(self, config: CachekitIOBackendConfig, change: dict[str, object]) -> None:
         """Each of these is fixed at client creation, so a client shared across them would apply the first one's."""
         other = CachekitIOBackendConfig(**{**config.model_dump(), **change})
-        l1, l2 = lease_sync_http_client(config), lease_sync_http_client(other)
+        l1, l2 = lease_http_client(config), lease_http_client(other)
         assert l1.client is not l2.client
         if "connection_pool_size" in change:
             assert l2.client.pool.pool.maxsize == 4
@@ -127,10 +112,8 @@ class TestLeaseSyncHttpClient:
 
         The SaaS reads only the first product token.
         """
-        user_agent = lease_sync_http_client(config).client.headers["User-Agent"]
+        user_agent = lease_http_client(config).client.headers["User-Agent"]
         assert user_agent == f"cachekit-py/{version('cachekit')} urllib3/{version('urllib3')}"
-        assert user_agent.split()[0] == f"cachekit-py/{version('cachekit')}"
-        assert user_agent.split()[1].startswith("urllib3/")
 
     def test_user_agent_without_distribution_metadata(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -206,23 +189,23 @@ class TestSharedAcrossThreads:
             t.join(5)
         backends.append(CachekitIOBackend(api_key=api_key))
         assert len(backends) == 5
-        assert len({id(b._sync_lease.client) for b in backends}) == 1
+        assert len({id(b._lease.client) for b in backends}) == 1
 
 
 @pytest.mark.unit
-class TestCloseSyncClient:
-    """close_sync_client() cleanup behaviour."""
+class TestCloseHttpClients:
+    """close_http_clients() cleanup behaviour."""
 
     def test_closes_and_empties_the_cache(self, config: CachekitIOBackendConfig) -> None:
         """After close, the process's client cache is empty and the held client is closed."""
-        lease = lease_sync_http_client(config)
-        close_sync_client()
+        lease = lease_http_client(config)
+        close_http_clients()
         assert _is_closed(lease.client)
         assert not _cached()
 
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
-        close_sync_client()  # no client created yet — must not raise
+        close_http_clients()  # no client created yet — must not raise
 
 
 def _raise() -> None:
@@ -239,11 +222,11 @@ class TestCloseSurvivesAFailingClient:
         return CachekitIOBackendConfig(api_url=config.api_url, api_key=SecretStr("ck_other_key"), timeout=config.timeout)  # noqa: S106
 
     def test_sync(self, config: CachekitIOBackendConfig, other: CachekitIOBackendConfig, fail_idx: int) -> None:
-        leases = [lease_sync_http_client(config), lease_sync_http_client(other)]
+        leases = [lease_http_client(config), lease_http_client(other)]
         leases[fail_idx].client.close = _raise  # type: ignore[method-assign]
         try:
             with pytest.raises(RuntimeError, match="close failed"):
-                close_sync_client()
+                close_http_clients()
             assert _is_closed(leases[1 - fail_idx].client)
             assert not _cached()
         finally:
@@ -260,7 +243,7 @@ def test_discarded_backends_do_not_accumulate_clients() -> None:
         CachekitIOBackend(api_key=f"{prefix}_rotated_{i}")  # built and dropped at once
     gc.collect()
     mine = [lease for key, lease in client_module._own_leases().by_key.items() if key[1].startswith(prefix)]
-    assert mine == [live._sync_lease]
+    assert mine == [live._lease]
 
 
 @pytest.mark.unit
@@ -269,8 +252,8 @@ def test_releasing_the_last_backend_closes_its_client() -> None:
     api_key = _unique_key("released")
     first = CachekitIOBackend(api_key=api_key)
     second = CachekitIOBackend(api_key=api_key)
-    client = first._sync_lease.client
-    assert second._sync_lease.client is client
+    client = first._lease.client
+    assert second._lease.client is client
     del first
     gc.collect()
     assert not _is_closed(client)  # still shared with a live backend
@@ -297,7 +280,7 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
     # Handing it the last reference instead is not enough: on a free-threaded build, an object whose count
     # a non-owner thread takes to zero is queued back to its owner, and freed on this thread once it wakes.
     def release() -> None:
-        lease = holder[0]._sync_lease
+        lease = holder[0]._lease
         taken.set()
         dropped.wait(5)
         del lease
@@ -315,7 +298,7 @@ def test_backend_built_during_a_release_on_another_thread_gets_an_open_client(mo
     resume.set()
     releaser.join(5)
     assert not releaser.is_alive()
-    assert not _is_closed(rebuilt._sync_lease.client)
+    assert not _is_closed(rebuilt._lease.client)
 
 
 @pytest.mark.unit
@@ -324,12 +307,12 @@ def test_rebuilt_backend_never_inherits_a_released_client() -> None:
     backend with the same key, which would then fail every call."""
     api_key = _unique_key("rebuilt")
     released = CachekitIOBackend(api_key=api_key)
-    old = released._sync_lease.client
+    old = released._lease.client
     del released
     gc.collect()
     rebuilt = CachekitIOBackend(api_key=api_key)
-    assert rebuilt._sync_lease.client is not old
-    assert not _is_closed(rebuilt._sync_lease.client)
+    assert rebuilt._lease.client is not old
+    assert not _is_closed(rebuilt._lease.client)
 
 
 @pytest.mark.unit
@@ -357,11 +340,11 @@ class TestStateInheritedAcrossFork:
     """A forked child's view of its parent's state, in process; real forks over TLS: test_cachekitio_fork.py."""
 
     def test_an_inherited_cache_starts_empty(self, config: CachekitIOBackendConfig) -> None:
-        inherited = lease_sync_http_client(config)
+        inherited = lease_http_client(config)
         client_module._leases.pid = _PARENT_PID
-        lease = lease_sync_http_client(config)
+        lease = lease_http_client(config)
         assert lease is not inherited
-        assert lease_sync_http_client(config) is lease
+        assert lease_http_client(config) is lease
 
     def test_an_inherited_client_is_released_unclosed(
         self, monkeypatch: pytest.MonkeyPatch, config: CachekitIOBackendConfig
@@ -373,12 +356,12 @@ class TestStateInheritedAcrossFork:
 
     def test_the_backend_replaces_an_inherited_lease(self) -> None:
         backend = CachekitIOBackend(api_key=_unique_key("inherited"))
-        inherited = backend._sync_lease
+        inherited = backend._lease
         inherited.pid = client_module._leases.pid = _PARENT_PID  # a child inherits both
-        lease = backend._own_sync_lease()
+        lease = backend._own_lease()
         assert lease is not inherited
         assert lease.pid == os.getpid()
-        assert backend._own_sync_lease() is lease
+        assert backend._own_lease() is lease
 
 
 @pytest.mark.unit
@@ -387,14 +370,14 @@ class TestResetGlobalClient:
 
     def test_drops_the_cache_without_closing(self, config: CachekitIOBackendConfig) -> None:
         """After reset, the cache is empty, and the held client stays open for whoever holds it."""
-        lease = lease_sync_http_client(config)  # held, so only the reset can empty the cache
+        lease = lease_http_client(config)  # held, so only the reset can empty the cache
         reset_global_client()
         assert not _cached()
         assert not _is_closed(lease.client)
 
     def test_new_client_created_after_reset(self, config: CachekitIOBackendConfig) -> None:
         """After reset, next call returns a fresh client (different object)."""
-        l1 = lease_sync_http_client(config)
+        l1 = lease_http_client(config)
         reset_global_client()
-        l2 = lease_sync_http_client(config)
+        l2 = lease_http_client(config)
         assert l1.client is not l2.client

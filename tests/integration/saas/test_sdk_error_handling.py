@@ -263,7 +263,7 @@ def test_503_service_unavailable(sdk_config, clean_cache):
         return x * 7
 
     # Mock the backend to return 503
-    with patch.object(backend._sync_lease.client, "request") as mock_request:
+    with patch.object(backend._lease.client, "request") as mock_request:
         mock_response = response(503, json={"error": "Service temporarily unavailable"})
         mock_request.return_value = mock_response
 
@@ -300,7 +300,7 @@ def test_malformed_response(sdk_config, clean_cache):
         return x * 8
 
     # Mock the backend to return malformed response
-    with patch.object(backend._sync_lease.client, "request") as mock_request:
+    with patch.object(backend._lease.client, "request") as mock_request:
         # Create response with invalid JSON
         mock_response = response(200, b"not valid json at all")
         mock_request.return_value = mock_response
@@ -341,7 +341,7 @@ def test_retry_on_transient_error(sdk_config, clean_cache):
         return x * 9
 
     # Mock transient error (503)
-    with patch.object(backend._sync_lease.client, "request") as mock_request:
+    with patch.object(backend._lease.client, "request") as mock_request:
         mock_response = response(503, json={"error": "Temporary service issue"})
         mock_request.return_value = mock_response
 
@@ -373,7 +373,7 @@ def test_no_retry_on_permanent_error(sdk_config, clean_cache):
         return x * 10
 
     # Mock permanent error (401)
-    with patch.object(backend._sync_lease.client, "request") as mock_request:
+    with patch.object(backend._lease.client, "request") as mock_request:
         mock_response = response(401, json={"error": "Invalid API key"})
         mock_request.return_value = mock_response
 

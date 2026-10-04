@@ -203,19 +203,20 @@ CACHEKIT_TIMEOUT=5.0                  # Optional — request timeout in seconds
   process, shared by every thread that calls the backend: a thread pool, every async-decorator L2
   operation and every async backend method, which run on the default executor's threads (at most 32).
   Each request takes its own HTTP/1.1 connection, so threads never share one, and the pool is
-  thread-safe with and without the GIL. Each extra connection costs one TCP and TLS handshake on first
-  use, then stays pooled. A request that finds every connection in use waits for one to free, and fails
-  as a timeout if it gets none within the request timeout. The waits are not served strictly in order,
-  so with more threads than connections a few requests can wait several round trips: keep
-  `connection_pool_size` at least as large as the number of threads that share one backend. Backends
+  thread-safe with and without the GIL. Each connection costs one TCP and TLS handshake on first use,
+  then stays pooled. A request that finds every pooled connection in use opens one more rather than
+  waiting for another thread's request to finish; urllib3 closes that connection when it comes back to a
+  full pool, and logs a `Connection pool is full, discarding connection` warning. Each such request pays
+  a new handshake, so set `connection_pool_size` to at least the number of threads that call one backend
+  at once. Backends
   with the same key, URL, timeout and pool size share one pool while any of them is alive, and the pool
   is closed when the last one is released. Create one backend per key and reuse it
 - Idle connections stay pooled until the server closes them: urllib3 has no client-side idle expiry.
   Cloudflare documents a 400 s idle close for client connections; on the dev environment, with the
   keepalive probes below running, pooled connections were still reused after idle gaps of 405–600 s
   (2026-10-04, 6 threads, 0 errors and 0 new connections). Either way, urllib3 checks a pooled
-  connection for a close before reusing it, so a connection the server closed is replaced, never failed
-  on. Each pooled connection sends TCP keepalive probes after 60 s idle (every 10 s, 3 probes),
+  connection for a close before reusing it, so a connection the server closed while it sat idle is
+  replaced. A close that races the request itself fails that request, as a miss. Each pooled connection sends TCP keepalive probes after 60 s idle (every 10 s, 3 probes),
   which keeps NAT gateway mappings alive (AWS NAT Gateway drops idle flows at 350 s, Azure at 4 min). If
   a network path does die, the probes find it in about 90 s, and the next request reconnects instead of
   waiting out the timeout. Probes cannot run while a process is suspended (a frozen serverless runtime,

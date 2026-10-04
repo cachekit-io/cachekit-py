@@ -5,7 +5,7 @@ thread calls: a thread pool calling a decorated function, every async-decorator 
 StandardCacheHandler runs through asyncio.to_thread, and every async backend method, which does the same.
 On httpx, threads sharing one HTTP/2 connection raced in httpcore (encode/httpcore#1118, about 1% of ops
 under the GIL), and without the GIL its HTTP/1.1 pool raced too (has_expired() raised TypeError on about 1
-request in 1,000, LAB-7865). Either failure became a spurious miss or an unstored SET. urllib3's pool is
+request in 1,000). Either failure became a spurious miss or an unstored SET. urllib3's pool is
 thread-safe: these run with the GIL and without it, and must not fail once.
 
 The backend runs with the SDK's own client (pool size, keepalive) against tests/performance/loopback_saas.py.
@@ -19,7 +19,6 @@ import collections
 import shutil
 import threading
 import uuid
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -128,13 +127,21 @@ def test_async_l2_ops_via_to_thread_never_degrade(monkeypatch: pytest.MonkeyPatc
     _assert_clean(outcomes, errors)
 
 
-@pytest.mark.parametrize(
-    "send",
-    [
-        pytest.param(lambda b: b._request_sync("GET", "probe", miss_on_404=True), id="sync"),
-        pytest.param(lambda b: asyncio.run(b._request_async("GET", "probe", miss_on_404=True)), id="async"),
-    ],
-)
-def test_sync_and_async_share_one_http11_client(backend: CachekitIOBackend, send: Callable[[CachekitIOBackend], Any]) -> None:
-    assert send(backend).version_string == "HTTP/1.1"
-    assert backend._own_sync_lease().client.pool.num_connections == 1  # each test's own fresh backend
+def test_a_full_pool_opens_another_connection_rather_than_waiting(backend: CachekitIOBackend) -> None:
+    """Every thread shares the one pool, so a request that finds it exhausted must not queue behind another's.
+
+    Each connection slot is checked out by hand, as busy threads would hold them; the next request still
+    completes, on a connection opened past the pool size.
+    """
+    pool = backend._own_lease().client.pool
+    held = [pool._get_conn() for _ in range(pool.pool.maxsize)]
+    assert pool.pool.empty()
+    # In a thread with a deadline: a blocking pool would wait here forever rather than fail.
+    one = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert one.submit(backend.get, f"{uuid.uuid4().hex}:absent").result(timeout=10) is None
+        assert pool.num_connections == pool.pool.maxsize + 1
+    finally:
+        for conn in held:
+            pool._put_conn(conn)  # also frees a request a blocking pool left waiting
+        one.shutdown(wait=True)

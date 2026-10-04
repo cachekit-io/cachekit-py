@@ -8,7 +8,7 @@ A round-trip fix edits the pinned list in its own PR, and that diff is its proof
 
 Blocking is decided by state, never by a clock: a request blocks if the caller is still waiting on it.
 The thread a request arrives on cannot tell that for an async caller. The async backend methods send on
-the sync client through ``asyncio.to_thread``, so the caller's own requests and its background tasks'
+the backend's one client through ``asyncio.to_thread``, so the caller's own requests and its background tasks'
 all arrive on worker threads. The gate goes by what the caller is doing instead.
 
 Async: every request is parked on the gate, its worker thread held until the event loop releases it.

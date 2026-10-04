@@ -44,7 +44,7 @@ class FakeRequest:
     path: str
     headers: HTTPHeaderDict
     body: bytes | None
-    # The rest of urlopen's keyword arguments (retries, redirect, pool_timeout).
+    # The rest of urlopen's keyword arguments (retries, redirect).
     options: dict[str, Any]
 
     def json(self) -> Any:
@@ -103,5 +103,5 @@ def fake_backend(handler: Handler, *, api_url: str = TEST_API_URL, **kwargs: Any
     kwargs.setdefault("api_key", TEST_API_KEY)
     backend = CachekitIOBackend(api_url=api_url, **kwargs)
     client, pool = fake_client(handler, backend)
-    backend._sync_lease = SimpleNamespace(pid=os.getpid(), client=client)  # type: ignore[assignment]
+    backend._lease = SimpleNamespace(pid=os.getpid(), client=client)  # type: ignore[assignment]
     return backend, pool
