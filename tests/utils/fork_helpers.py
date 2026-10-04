@@ -21,7 +21,8 @@ def report(w: int, outcome: object) -> NoReturn:
 
 def child_outcome(pid: int, r: int, timeout: float = 20.0) -> object:
     """What the child at pid reported on the pipe r; a hung child is killed."""
-    assert pid > 0, "no child was forked"  # os.kill(0, ...) would signal pytest's whole process group
+    if pid <= 0:  # not an assert: python -O strips those, and os.kill(0, ...) signals pytest's whole process group
+        raise ValueError("no child was forked")
     data = os.read(r, 65536) if select.select([r], [], [], timeout)[0] else b""
     if not data:
         os.kill(pid, signal.SIGKILL)
