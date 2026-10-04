@@ -79,6 +79,27 @@ Or use `@cache.secure(...)` for the encrypted ones. On bare `@cache` the flat sp
 
 ---
 
+### Encrypting serializer on a decorator
+
+**Message**: `EncryptionWrapper (or the serializer name 'encrypted') cannot be a cache decorator's serializer: ...`
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied
+
+**Cause**: an `EncryptionWrapper` instance, or the `"encrypted"` serializer name, was passed as `serializer=` to a cache decorator: bare `@cache`, any preset that takes `serializer=` (`@cache.secure` included), or a `DecoratorConfig`. The decorator never gives that serializer the cache key each ciphertext is bound to, so it could not store an entry. Earlier releases accepted some of these spellings and ran the function on every call. With `backend=None` you get a different error instead: the L1-only `encryption requires a backend` error, or an error from a check that runs before that one, such as `@cache.secure`'s missing-key error when no key is set outside the wrapper.
+
+**Solution**: pass the master key and the inner serializer to `@cache.secure`, which applies `EncryptionWrapper` itself. Omit `serializer=` for the default MessagePack.
+```python notest
+from cachekit.serializers import OrjsonSerializer
+
+@cache.secure(master_key=secret_key, serializer=OrjsonSerializer())  # the serializer EncryptionWrapper wrapped
+def get_api_keys(tenant_id: str):
+    return fetch_api_keys(tenant_id)
+```
+
+`EncryptionWrapper` stays available for direct use outside a decorator.
+
+---
+
 ### Invalid key format
 
 **Message**: one of
