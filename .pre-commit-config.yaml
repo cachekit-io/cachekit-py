@@ -2,6 +2,10 @@
 # Install: pre-commit install
 # Run manually: pre-commit run --all-files
 
+default_install_hook_types: [pre-commit, commit-msg]
+# Hooks with no `stages` run at commit and push, never on the commit message.
+default_stages: [pre-commit, pre-push]
+
 repos:
   # Python formatting and linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -105,3 +109,23 @@ repos:
             tests/fixtures/.*|
             docs/.*\.md$
           )$
+
+  # Keeps internal references (ticket ids, secret-store paths, internal hosts and process
+  # names) out of user-facing docs and commit messages. The patterns are generic on purpose:
+  # a list of specific internal names would itself disclose them.
+  # Scope rule: https://docs.cachekit.io/contributing/#what-belongs-in-these-docs
+  - repo: local
+    hooks:
+      - id: no-internal-references
+        name: No internal references in docs
+        language: pygrep
+        entry: 'LAB-[0-9]+|op://|\.ts\.net|\bk3s\b|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
+        files: ^(packages/[^/]+/)?README[^/]*$|^docs/
+        types: [text]
+        stages: [pre-commit]
+      - id: no-internal-references-commit-msg
+        name: No internal references in commit message
+        language: pygrep
+        # Same patterns, skipping git's "#" comment lines, which quote the branch name.
+        entry: '^(?!#).*?(?:LAB-[0-9]+|op://|\.ts\.net|\bk3s\b|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-]))'
+        stages: [commit-msg]
