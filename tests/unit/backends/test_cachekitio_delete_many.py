@@ -1,9 +1,9 @@
 """Whole-function invalidation on CachekitIO fans its DELETEs out, 16 at a time (LAB-7070).
 
 The SaaS has no bulk delete, so ``_delete_many`` sends one DELETE per key on a bounded pool.
-Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py)
-whose DELETEs each take ``_DELAY`` seconds, so invalidation wall time divided by ``_DELAY`` counts the round-trip waves: about
-``ceil(N / 16)``, where the serial per-key path took ``N``.
+Requests go through the backend's real client on a fake pool (tests/utils/cachekitio_fakes.py) whose
+DELETEs each take ``_DELAY`` seconds. The fan-out tests read its shape from the fake server (which threads
+sent DELETEs, how many were in flight at once), never from wall time, which load stretches.
 """
 
 from __future__ import annotations
@@ -125,7 +125,8 @@ def test_empty_batch_sends_nothing() -> None:
 
 @pytest.mark.parametrize("n", [1, 16, 100])
 def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
-    server = _Server()
+    workers = min(n, _DELETE_FANOUT)
+    server = _Server(hold=workers)
 
     @cache(backend=_backend(server), ttl=60, namespace=f"fanout_sync_{n}", l1_enabled=False)
     def f(x: int) -> int:
@@ -135,12 +136,14 @@ def test_sync_invalidate_runs_in_ceil_n_over_16_waves(n: int) -> None:
         f(i)
     assert len(server.store) == n
 
-    start = time.perf_counter()
     f.invalidate_cache()
-    waves = (time.perf_counter() - start) / _DELAY
 
-    waves_expected = math.ceil(n / _DELETE_FANOUT)
-    assert waves_expected - 0.5 < waves < waves_expected + 2, waves  # serial: n waves
+    # Fan-out shape from the server, not the clock: the held first wave puts every
+    # worker in flight on its own pool thread. A key deleted outside the pool (per-key loop, serial
+    # tail) brings an extra thread, or for n = 1 the caller's own; a pool of len(keys) workers
+    # brings more than 16.
+    assert len(server.threads) == workers, len(server.threads)
+    assert threading.get_ident() not in server.threads
     assert sorted(server.deleted) == sorted(set(server.deleted))  # each key DELETEd exactly once
     assert len(server.deleted) == n and server.store == {}
     assert server.peak == min(n, _DELETE_FANOUT)
@@ -249,24 +252,55 @@ def test_runs_from_a_thread_with_a_running_event_loop() -> None:
 
 # ---- Pacing: a rate-limited fan-out waits out Retry-After instead of failing keys ----------
 
-_SCALE = 20  # one real second is 20 virtual seconds: a real 10 ms DELETE is a 200 ms round trip
-_REAL_RTT = 0.01
+_RTT = 0.2  # virtual seconds per DELETE round trip
+_REAL_RTT = 0.01  # real seconds each DELETE holds its thread, so the fan-out's DELETEs overlap
 
 
 class _Clock:
-    """Virtual time: real elapsed time x _SCALE, plus every sleep, which returns at once."""
+    """Virtual time that only sleeps and DELETEs move; neither real time nor thread scheduling does.
+
+    A sleep returns at once and adds its seconds; a DELETE takes ``_RTT``. The thread that made
+    the clock (the test's, which also runs the paced phase) reads shared time, and the bucket
+    refills on it. Shared time moves by every sleep, by ``_RTT`` per DELETE from the test's
+    thread, and by ``_RTT / _DELETE_FANOUT`` per fan-out DELETE: the fan-out runs
+    ``_DELETE_FANOUT`` DELETEs per round trip whichever workers the host lets send them.
+
+    Any other thread is a fan-out worker with its own time: it starts where the test's thread
+    last read the clock, just before the pool, and moves by ``_RTT`` per DELETE of its own. So
+    every fan-out round trip the backend measures is exactly ``_RTT``, and so is the pacing
+    deadline it derives from them.
+    """
 
     def __init__(self) -> None:
-        self._t0 = time.monotonic()
-        self._slept = 0.0
+        self._now = self._read = 0.0
+        self._owner = threading.get_ident()
+        self._worker = threading.local()
         self.sleeps: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
-        return (time.monotonic() - self._t0) * _SCALE + self._slept
+        if threading.get_ident() == self._owner:
+            self._read = self._now
+            return self._now
+        if not hasattr(self._worker, "now"):
+            self._worker.now = self._read
+        return self._worker.now
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self._slept += seconds
+        assert threading.get_ident() == self._owner, "only the paced phase sleeps, on the test's thread"
+        with self._lock:
+            self.sleeps.append(seconds)
+            self._now += seconds
+
+    def round_trip(self) -> float:
+        """End this thread's DELETE; returns shared time, for the bucket."""
+        with self._lock:
+            if threading.get_ident() == self._owner:
+                self._now += _RTT
+            else:
+                self._worker.now = self.monotonic() + _RTT
+                self._now += _RTT / _DELETE_FANOUT
+            return self._now
 
 
 class _Limited:
@@ -302,7 +336,7 @@ class _Limited:
         try:
             time.sleep(_REAL_RTT)
             with self._lock:
-                now = self.clock.monotonic()
+                now = self.clock.round_trip()
                 self.tokens = min(self.burst, self.tokens + (now - self._last) * self.rate)
                 self._last = now
                 if self.tokens >= 1:
@@ -351,7 +385,6 @@ def test_cobels_case_through_the_decorator_leaves_nothing_tracked(clock: _Clock)
     for i in range(100):
         f(i)
 
-    server._last = clock.monotonic()  # the writes took no tokens; their real time must not refill the bucket
     f.invalidate_cache()
 
     assert len(server.deleted) == 100 and clock.sleeps
@@ -382,7 +415,7 @@ def test_spent_budget_stops_at_the_deadline_and_returns_exactly_the_rest(
     assert failed == set(keys) - set(server.deleted)
     assert 0 < len(server.deleted) < len(keys)
     # The deadline is about the serial loop's time (50 x 200 ms), not a wait for every key.
-    assert clock.monotonic() - start < 50 * 0.2 * 2
+    assert clock.monotonic() - start < len(keys) * _RTT * 2
     unsent = [key for key in keys if key in failed and key not in server.sent]
     assert unsent  # keys past the deadline are failed without being sent
     assert any("rate limit" in record.getMessage() for record in caplog.records)

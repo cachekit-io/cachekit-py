@@ -19,6 +19,7 @@ from cachekit.backends.cachekitio.backend import (
     STALE_TTL_HEADER,
     TTL_HEADER,
     CachekitIOBackend,
+    _parse_fresh_for,
 )
 from cachekit.backends.cachekitio.error_handler import HTTPStatusError
 from cachekit.backends.errors import BackendError, BackendErrorType
@@ -71,8 +72,8 @@ class TestFreshnessRead:
 
 class TestFreshForRead:
     """X-CacheKit-Fresh-For mapping (LAB-557, spec/saas-api.md#remaining-freshness):
-    absent = None (pre-signal server, legacy); unparseable/negative = 0 (never
-    extend local service on drift — mirrors unrecognized-freshness → stale)."""
+    absent = None (pre-signal server, legacy); anything but 1-7 ASCII digits at most
+    2,592,000 = 0 (never extend local service on drift — mirrors unrecognized-freshness → stale)."""
 
     @pytest.mark.parametrize(
         ("headers", "expected_fresh_for"),
@@ -92,6 +93,28 @@ class TestFreshForRead:
             result = backend.get_with_freshness("k")
         assert result is not None
         assert result[2] == expected_fresh_for
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, None),  # absent header: no bound
+            ("30", 30),
+            ("0", 0),
+            ("2592000", 2592000),  # exactly the 30-day cap
+            ("", 0),
+            ("+5", 0),  # int() accepts a sign
+            ("1_0", 0),  # int() accepts underscores
+            (" 5", 0),  # int() strips whitespace
+            ("00000005", 0),  # eight digits: the length check runs first
+            ("3000000", 0),  # seven digits, over the cap
+            ("4297559296", 0),  # wraps to 2,592,000 under a 32-bit atoi
+            ("٥", 0),  # Arabic-Indic five: int() and str.isdigit() accept it
+            ("²", 0),  # superscript two: str.isdigit() accepts it
+        ],
+    )
+    def test_parse_fresh_for_grammar(self, value: str | None, expected: int | None) -> None:
+        """LAB-7838: 1-7 ASCII digits at most 2,592,000, else 0 — the header string alone, no response."""
+        assert _parse_fresh_for(value) == expected
 
     def test_fresh_for_rides_alongside_staleness(self, backend: CachekitIOBackend) -> None:
         """A stale-window read carries 0 remaining freshness (server emits both headers)."""
