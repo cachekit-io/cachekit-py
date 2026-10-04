@@ -195,6 +195,7 @@ Rules and behavior:
 - Requires a positive `ttl`; `ttl + stale_ttl` is capped at 2,592,000 s (30 days). Violations raise `ConfigurationError` at decoration time.
 - **CachekitIO only, known at decoration time** — `@cache.io` or an explicit `backend=CachekitIOBackend()`. Other backends have no read-side freshness signal and raise `ConfigurationError` if `stale_ttl` is set; so does a CachekitIO backend resolved lazily from `CACHEKIT_API_KEY` under another preset (the remaining-freshness bound below still applies to its reads).
 - Concurrent stale hits trigger at most one revalidation: per-process dedup plus (async functions) a non-blocking distributed lease on the backend's lock. Contested = serve stale, don't wait.
+- At most 32 revalidations per decorated function run at once. A stale hit that finds the limit reached serves stale without revalidating, and a later hit retries. An async revalidation stranded on a stopped event loop (sync code that calls `loop.run_until_complete` and leaves the loop stopped, or closes it without cancelling its tasks) gives up its turn 30 seconds after it was scheduled and is cancelled, so a stale hit on another loop can revalidate that key again. If its loop resumes, it stores nothing, even when your function swallows the cancellation and returns. A write it had already sent before its loop stopped is not recalled, and can land after a newer revalidation's.
 - A failed background recompute never reaches the caller: the entry keeps serving stale until its hard eviction bound, after which the next call takes the ordinary synchronous miss path. It logs a WARNING `SWR revalidation failed`, as does a revalidation skipped because the call's arguments cannot be deep-copied (`SWR revalidation skipped`) or one that could not be scheduled. It names the function by the same digest as the L1-only refresh WARNING. Each fires at most once a minute per function and carries the count since the last one; the occurrences in between log at DEBUG.
 - The background recompute runs with a **snapshot of the caller's `contextvars`** (contextvar-based tenant extraction works), but outside the request otherwise — don't rely on other request-scoped resources (open sessions, connections) inside functions that enable SWR.
 - Stale values are never written to the L1 in-memory cache, and stale reads still count as cache **hits** for metered-misses billing.
@@ -306,6 +307,14 @@ honored as follows:
   exception. Set `swr_retry_interval=0` to retry on every stale hit. The refresh runs on a deep copy
   of the call's arguments; when they cannot be copied (a lock, an open connection), it is
   skipped, so that call is only ever recomputed in the foreground after expiry.
+- **At most 32 background refreshes run at once per function.** A stale hit that finds the
+  limit reached serves the cached value without refreshing, and a later stale hit retries.
+  An `async def` refresh stranded on a stopped event loop (sync code that calls
+  `loop.run_until_complete` and leaves the loop stopped, or closes it without cancelling its
+  tasks) gives up its turn 30 seconds after it was scheduled and is cancelled. The next
+  refresh attempt on another key of that function releases it; from then on stale hits on
+  other loops refresh that key again. Until then the key keeps serving its cached value,
+  and past its `ttl` the next call recomputes it in the foreground.
 - **Failed and skipped refreshes log a WARNING** (`L1-only SWR refresh failed`, `… skipped`,
   `… could not be started`) with the redacted function, the redacted key and the exception
   type. The function appears as the `<redacted:…>` digest of its `module.qualname`;
