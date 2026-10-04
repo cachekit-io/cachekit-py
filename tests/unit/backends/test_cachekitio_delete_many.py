@@ -338,6 +338,7 @@ def test_cobels_case_through_the_decorator_leaves_nothing_tracked(clock: _Clock)
     for i in range(100):
         f(i)
 
+    server._last = clock.monotonic()  # the writes took no tokens; their real time must not refill the bucket
     f.invalidate_cache()
 
     assert len(server.deleted) == 100 and clock.sleeps
