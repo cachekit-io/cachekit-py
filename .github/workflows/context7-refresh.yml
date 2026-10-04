@@ -1,0 +1,41 @@
+# Context7 serves this repo's docs to coding agents, and re-indexes on its own
+# schedule, which can lag a release by weeks. This asks it to re-index when a
+# release is published, so agents read the docs for the version users install.
+# Scope and agent rules live in context7.json.
+# Endpoint: https://context7.com/docs/integrations/github-actions
+name: Context7 Refresh
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask Context7 to re-index /cachekit-io/cachekit-py
+        env:
+          CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
+        run: |
+          if [ -z "$CONTEXT7_API_KEY" ]; then
+            echo "::error::The CONTEXT7_API_KEY secret is not available to this repository."
+            exit 1
+          fi
+          status=$(curl -sS --max-time 60 -o "$RUNNER_TEMP/context7-response.json" -w '%{http_code}' \
+            -X POST https://context7.com/api/v1/refresh \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $CONTEXT7_API_KEY" \
+            --data '{"libraryName": "/cachekit-io/cachekit-py"}')
+          cat "$RUNNER_TEMP/context7-response.json"
+          echo
+          # Patterns keep their opening paren: ci.yml's runner drift guard reads a
+          # line that starts with `*` as a YAML alias and fails the build.
+          case "$status" in
+            (202) echo "::warning::Context7 has not finalized this library yet (HTTP 202). Re-run this workflow later." ;;
+            (2??) echo "Context7 accepted the refresh (HTTP $status)." ;;
+            (*) echo "::error::Context7 refresh failed with HTTP $status."; exit 1 ;;
+          esac
