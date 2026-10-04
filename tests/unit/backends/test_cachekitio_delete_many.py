@@ -33,13 +33,17 @@ _DELAY = 0.05
 
 
 class _Server:
-    """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight."""
+    """An in-memory cache API whose entry DELETEs take ``_DELAY`` s; tracks DELETEs in flight.
+
+    ``busy_periods`` counts DELETEs that start while none is in flight: 1 for a sliding pool,
+    ``ceil(N / 16)`` for fixed waves, one per key for a serial path. Load cannot shrink it.
+    """
 
     def __init__(self, reject: frozenset[str] = frozenset(), status: int = 429) -> None:
         self.store: dict[str, bytes] = {}
         self.deleted: list[str] = []
         self.reject, self.status = reject, status
-        self.in_flight = self.peak = 0
+        self.in_flight = self.peak = self.busy_periods = 0
         self._lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -55,6 +59,7 @@ class _Server:
             return httpx.Response(200)
         assert request.method == "DELETE", request.method
         with self._lock:
+            self.busy_periods += self.in_flight == 0
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
         try:
@@ -148,11 +153,11 @@ async def test_ainvalidate_cache_takes_the_fan_out() -> None:
         await f(i)
     assert len(server.store) == n
 
-    start = time.perf_counter()
     await f.ainvalidate_cache()
-    waves = (time.perf_counter() - start) / _DELAY
 
-    assert waves < math.ceil(n / _DELETE_FANOUT) + 2, waves
+    # Wave count from the server, not the clock (LAB-7889): a stretched run cannot add a busy
+    # period while another DELETE is still in flight, but a serial tail adds one per key.
+    assert server.busy_periods <= math.ceil(n / _DELETE_FANOUT), server.busy_periods
     assert server.peak == _DELETE_FANOUT
     assert server.store == {} and _cached_keys(f) == set()
 
