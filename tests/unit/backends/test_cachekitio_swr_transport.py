@@ -1,7 +1,7 @@
 """SWR transport layer (LAB-381, protocol spec/saas-api.md#stale-while-revalidate).
 
 Covers the freshness-aware read (X-CacheKit-Freshness mapping), the stale-grace
-write headers (X-CacheKit-Stale-TTL + canonical/legacy TTL dual-send), and the
+write headers (X-CacheKit-Stale-TTL + the canonical TTL), and the
 StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 """
 
