@@ -631,3 +631,29 @@ class TestPresetFieldOverrides:
 
         assert _resolved[0].l1.enabled is False
         assert _resolved[0].l1.max_size_mb == 200
+
+
+class TestIntegrityCheckingIsABool:
+    """integrity_checking becomes the encryption AAD's `compressed` token, frozen as exactly True or
+    False (spec/encryption.md): a truthy non-bool is refused when the config is built, on every path."""
+
+    @pytest.mark.parametrize("value", [1, 0, "yes", None], ids=["one", "zero", "str", "none"])
+    def test_constructor_rejects_non_bool(self, value: object) -> None:
+        with pytest.raises(ConfigurationError, match="integrity_checking must be a bool"):
+            DecoratorConfig(integrity_checking=value)  # type: ignore[arg-type]
+
+    def test_replace_rejects_non_bool(self) -> None:
+        with pytest.raises(ConfigurationError, match="integrity_checking must be a bool"):
+            replace(DecoratorConfig(), integrity_checking=1)
+
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS), ids=list(_PRESET_KWARGS))
+    def test_presets_reject_non_bool(self, preset: str) -> None:
+        with pytest.raises(ConfigurationError, match="integrity_checking"):
+            getattr(DecoratorConfig, preset)(integrity_checking=1, **_PRESET_KWARGS[preset])
+
+    def test_decorator_rejects_non_bool(self) -> None:
+        with pytest.raises(ConfigurationError, match="integrity_checking must be a bool"):
+
+            @cache(backend=None, integrity_checking=1)
+            def fn() -> int:
+                return 1
