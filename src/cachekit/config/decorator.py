@@ -11,8 +11,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, Union
 
-from pydantic import SecretBytes
-
 from .nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -20,7 +18,7 @@ from .nested import (
     L1CacheConfig,
     MonitoringConfig,
 )
-from .validation import ConfigurationError, hide_secret, reveal_secret
+from .validation import ConfigurationError, hide_any_secret, hide_secret, refuse_bytes_key, reveal_secret
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -448,6 +446,7 @@ class DecoratorConfig:
         Raises:
             ConfigurationError: If a falsy ``integrity_checking``, ``encryption=`` or a keyword that names no
                 field is passed.
+            TypeError: If master_key is bytes: pass ``key.hex()``.
 
         Example:
             >>> config = DecoratorConfig.secure(master_key="a" * 64)
@@ -458,8 +457,9 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
-        master_key = hide_secret(master_key)  # unwrapped only into the EncryptionConfig (CWE-532)
+        master_key = hide_any_secret(master_key)  # unwrapped only into the EncryptionConfig (CWE-532)
         _reject_unsupported("The secure preset", kwargs, _FIELD_NAMES | _SECURE_ENCRYPTION_KWARGS)
+        master_key = refuse_bytes_key(master_key)  # after the check above has wrapped every refused keyword
         # encryption= is a field, but not one this preset takes: the EncryptionConfig below is the preset.
         if "encryption" in kwargs:
             raise ConfigurationError(
@@ -711,11 +711,6 @@ _PRESET_EXTRA_KWARGS = {
 }
 
 
-def _hide_refused(value: object) -> object:
-    """``hide_secret`` for a value a check refuses. Nothing uses it after that, so a bytes value is wrapped too."""
-    return SecretBytes(value) if isinstance(value, bytes) else hide_secret(value)
-
-
 def _reject_unsupported(
     where: str,
     kwargs: dict[str, Any],
@@ -737,5 +732,5 @@ def _reject_unsupported(
     hidden = _SECRET_KWARGS | set(unsupported)
     for mapping in (kwargs, *held_by):
         for name in mapping.keys() & hidden:
-            mapping[name] = _hide_refused(mapping[name])
+            mapping[name] = hide_any_secret(mapping[name])
     raise ConfigurationError(f"{where} does not accept {', '.join(unsupported)}.")

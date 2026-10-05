@@ -32,7 +32,8 @@ data = get_sensitive_data(123)  # Encrypted in Redis
 ```
 
 Later examples pass the key explicitly as `master_key=secret_key`: your 64-hex-char key string,
-loaded from a secret store. Never a literal in source.
+loaded from a secret store. Never a literal in source. A bytes key raises `TypeError`: pass
+`key.hex()` ([details](../error-codes.md#bytes-key-where-a-hex-string-is-taken)).
 
 > **`@cache.secure` needs a backend.** `backend=None` (L1-only) stores raw Python objects,
 > which cannot be ciphertext, so the combination is refused at decoration time with a

@@ -34,7 +34,7 @@ from cachekit.backends.provider import (
     LoggerProvider,
 )
 from cachekit.config import ConfigurationError, get_settings
-from cachekit.config.validation import hide_secret, reveal_secret
+from cachekit.config.validation import hide_any_secret, refuse_bytes_key, reveal_secret
 from cachekit.di import DIContainer
 
 # Re-exported for backwards compatibility — redact_cache_key moved to the hash_utils
@@ -695,13 +695,15 @@ class CacheSerializationHandler:
         Raises:
             ConfigurationError: If encryption config is invalid (missing mode or both modes), or a
                 master key is present while encryption is None.
-            TypeError: If serializer_name is not a string or SerializerProtocol instance.
+            TypeError: If serializer_name is not a string or SerializerProtocol instance, or master_key is
+                bytes (pass ``key.hex()``).
 
         Note:
             No shared-key fallback: If encryption=True and tenant_extractor provided
             but extraction fails, ValueError propagates to caller (no fallback to shared key).
         """
-        master_key = hide_secret(master_key)
+        master_key = hide_any_secret(master_key)  # rebound before the refusal below can raise (CWE-532)
+        master_key = refuse_bytes_key(master_key)
         self.serializer_name = serializer_name
         self.enable_integrity_checking = enable_integrity_checking
         self.interop_mode = interop_mode
