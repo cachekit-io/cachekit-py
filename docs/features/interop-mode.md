@@ -144,6 +144,6 @@ assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 34 key vectors, 4 value vectors, 11 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 35 key vectors, 4 value vectors, 13 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
 > **CachekitIO note**: the api.cachekit.io cache-key validator accepts interop keys. The segment rules above (reserved `ns`/`nsapi` namespaces, no `..`) are what keep every interop key inside what it accepts — see the spec's [SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations).
