@@ -1,15 +1,17 @@
 """Byte-verification of interop mode against the protocol test vectors.
 
 Fixture: tests/unit/protocol/fixtures/interop-mode.json, vendored from
-cachekit-io/protocol test-vectors/interop-mode.json 1.2.0
-(https://github.com/cachekit-io/protocol/pull/94)
-(sha256 702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40).
+cachekit-io/protocol test-vectors/interop-mode.json 1.3.0
+(https://github.com/cachekit-io/protocol/pull/164)
+(sha256 e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72).
 Regenerate ONLY by re-copying from the protocol repo — never by hand.
 
 Every group is exercised through the SDK's own implementation:
-- 35 key vectors: canonical argument bytes, args hash, and full key
-- 4 value vectors: canonical plain-MessagePack value bytes (and decode round-trip)
-- 13 error vectors: inputs that MUST be rejected
+- 44 key vectors: canonical argument bytes, args hash, and full key
+- 6 value vectors: canonical plain-MessagePack value bytes (and decode round-trip)
+- 34 error vectors: inputs that MUST be rejected
+- 6 reader accept vectors: well-formed, non-canonical documents the value reader MUST decode
+- 1 reader reject vector: a document the value reader MUST reject
 - 1 AAD vector: the REAL EncryptionWrapper AAD builder over an interop key
 - 1 encryption vector: HKDF-SHA256 key derivation + AES-256-GCM decrypt through
   the REAL Rust encryption stack (cross-SDK decryption capability, not just
@@ -28,6 +30,7 @@ from uuid import UUID
 import pytest
 
 from cachekit.interop import (
+    InteropDecodeError,
     InteropError,
     args_hash,
     canonical_args_bytes,
@@ -37,13 +40,21 @@ from cachekit.interop import (
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "interop-mode.json"
-FIXTURE_SHA256 = "702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40"  # pragma: allowlist secret
+FIXTURE_SHA256 = "e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72"  # pragma: allowlist secret
 
 VECTORS = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 # The counts below are part of the conformance claim: a fixture update that
 # adds or removes vectors must be a conscious change, not a silent drift.
-EXPECTED_COUNTS = {"key_vectors": 35, "value_vectors": 4, "error_vectors": 13, "aad_vectors": 1, "encryption_vectors": 1}
+EXPECTED_COUNTS = {
+    "key_vectors": 44,
+    "value_vectors": 6,
+    "error_vectors": 34,
+    "reader_accept_vectors": 6,
+    "reader_reject_vectors": 1,
+    "aad_vectors": 1,
+    "encryption_vectors": 1,
+}
 
 
 class _TaggedSet:
@@ -144,6 +155,22 @@ def test_error_vectors(vector: dict[str, Any]):
             generate_interop_key(vector["namespace"], vector["operation"], vector_args(vector["args"]))
         else:
             canonical_args_bytes(vector_args(vector["args"]))
+
+
+@pytest.mark.parametrize("vector", VECTORS["reader_accept_vectors"], ids=lambda v: v["name"])
+def test_reader_accept_vectors(vector: dict[str, Any]):
+    """The value reader decodes every well-formed, non-canonical document; where tagged JSON
+    can carry the value (not an integer map key or an ext type), it is the decoded value."""
+    decoded = decode_interop_value(bytes.fromhex(vector["input_hex"]))
+    if "value" in vector:
+        assert decoded == from_tagged(vector["value"])
+
+
+@pytest.mark.parametrize("vector", VECTORS["reader_reject_vectors"], ids=lambda v: v["name"])
+def test_reader_reject_vectors(vector: dict[str, Any]):
+    """The value reader rejects every reader reject vector (message text is not normative)."""
+    with pytest.raises(InteropDecodeError):
+        decode_interop_value(bytes.fromhex(vector["input_hex"]))
 
 
 def test_lone_surrogate_rejected():

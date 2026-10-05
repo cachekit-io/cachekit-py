@@ -142,8 +142,10 @@ assert data.hex() == "82a36167651ea46e616d65a5616c696365"  # canonical: sorted k
 assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 ```
 
+`decode_interop_value` accepts any well-formed document, canonical or not: padded widths, unsorted keys, a float32, an ext type, and a non-string map key such as `{1: 42}` all decode. A map with an array or map as a key raises `InteropDecodeError`, as do trailing bytes after the one document.
+
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 35 key vectors, 4 value vectors, 13 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 44 key vectors, 6 value vectors, 34 must-error vectors, 6 non-canonical documents the reader must decode and 1 it must reject, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
 > **CachekitIO note**: the api.cachekit.io cache-key validator accepts interop keys. The segment rules above (reserved `ns`/`nsapi` namespaces, no `..`) are what keep every interop key inside what it accepts — see the spec's [SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations).

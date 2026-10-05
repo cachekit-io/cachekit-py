@@ -506,8 +506,12 @@ def decode_interop_value(data: bytes | bytearray | memoryview) -> Any:
             "interop value. An auto-mode writer and an interop reader are sharing a key — "
             "check that every writer for this key uses @cache(interop=...)."
         )
+    # strict_map_key=False: IOP-18 makes a non-string key (e.g. {1: 42}) well-formed input this reader must
+    # accept. msgpack's default exists against hash flooding, but array/map keys still fail as unhashable, and
+    # a 64-bit int shares its full hash with at most 8 others and a float64 with at most one per exponent
+    # (str/bytes are SipHash-keyed), so a forged entry's colliding-key chains stay bounded, not O(n).
     try:
-        return unpackb_bounded(raw, raw=False, strict_map_key=True, object_hook=_revive_sentinels)
+        return unpackb_bounded(raw, raw=False, strict_map_key=False, object_hook=_revive_sentinels)
     except Exception as e:
         raise InteropDecodeError(f"stored value is not a single well-formed MessagePack document: {e}") from e
 
