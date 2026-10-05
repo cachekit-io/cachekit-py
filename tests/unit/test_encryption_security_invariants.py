@@ -138,7 +138,7 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
             reset_settings()
 
     def test_marked_custom_serializer_accepted(self):
-        class MarkedSerializer(StandardSerializer):
+        class MarkedSerializer(_UnmarkedSerializer):
             cross_sdk_compatible = True
 
         custom = MarkedSerializer()
@@ -166,7 +166,7 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
             assert recovered == data
 
     def test_registry_encrypted_goes_through_the_guard(self, monkeypatch):
-        """get_serializer("encrypted") builds through the guarded constructor: default inner, and the guard fires."""
+        """get_serializer("encrypted") builds the default inner serializer through the guard."""
         import cachekit.serializers as serializers
         from cachekit.config.singleton import reset_settings
 
@@ -177,18 +177,16 @@ class TestEncryptionWrapperRefusesSingleSDKSerializer:
             wrapper = get_serializer("encrypted")
             assert isinstance(wrapper, EncryptionWrapper)
             assert type(wrapper.serializer).cross_sdk_compatible is True
-
-            # A registry entry that hands the wrapper a sniffing serializer is refused at build time.
-            monkeypatch.setitem(
-                serializers.SERIALIZER_REGISTRY,
-                "encrypted",
-                lambda: EncryptionWrapper(serializer=AutoSerializer()),
-            )
-            monkeypatch.setattr(serializers, "_serializer_cache", {})
-            with pytest.raises(ConfigurationError, match="cross_sdk_compatible"):
-                get_serializer("encrypted")
         finally:
             reset_settings()
+
+    def test_default_serializer_goes_through_the_guard(self, monkeypatch):
+        """The default inner serializer is checked too, not trusted: a default that sniffs is refused."""
+        import cachekit.serializers.standard_serializer as standard
+
+        monkeypatch.setattr(standard, "StandardSerializer", AutoSerializer)
+        with pytest.raises(ConfigurationError, match="'AutoSerializer' does not declare"):
+            EncryptionWrapper(master_key=b"a" * 32)
 
 
 class TestCacheSerializationHandlerEncryptionSerializerValidation:

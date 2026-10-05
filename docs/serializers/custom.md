@@ -91,6 +91,24 @@ _registry["custom"] = CustomSerializer
 > [!NOTE]
 > String alias registration uses an internal API that may change. Prefer passing instances directly for stability.
 
+## Under Encryption
+
+`@cache.secure`, `encryption=True` and a directly built `EncryptionWrapper` refuse a serializer whose
+class does not declare `cross_sdk_compatible = True`. Set it as a class attribute, not on an instance:
+
+```python notest
+from typing import ClassVar
+
+class CustomSerializer:
+    cross_sdk_compatible: ClassVar[bool] = True
+    ...
+```
+
+Set it only when other-language SDKs can read your wire format and `deserialize` never inspects the
+bytes to choose a format: after decryption, the protocol lets only the configured serializer decide how
+to decode. A serializer that cannot promise both stays unencrypted
+([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+
 ## Example: Pydantic Serializer
 
 A serializer that converts Pydantic models to dicts before packing them, with an example that checks the second call is a cache hit, is in [Caching Pydantic Models → Advanced: Custom PydanticSerializer](pydantic.md#advanced-custom-pydanticserializer).

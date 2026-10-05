@@ -58,8 +58,9 @@ def require_cross_sdk_serializer(serializer: object) -> None:
         raise ConfigurationError(
             f"Encryption requires a cross-SDK-compatible serializer for cross-language interop. "
             f"The serializer instance '{type(serializer).__name__}' does not declare "
-            f"cross_sdk_compatible=True. Custom serializers used with encryption must set the "
-            f"cross_sdk_compatible ClassVar to True and guarantee a language-agnostic wire format."
+            f"cross_sdk_compatible=True. Use StandardSerializer (the default), OrjsonSerializer or "
+            f"ArrowSerializer. Set the cross_sdk_compatible ClassVar to True only on a custom serializer "
+            f"whose wire format other-language SDKs can read and which never inspects the bytes to choose a format."
         )
 
 
@@ -112,8 +113,7 @@ class EncryptionWrapper:
     - Per-tenant key derivation (not a tenancy boundary)
     - Domain separation for security
     - Works with any serializer whose type declares ``cross_sdk_compatible = True``
-      (StandardSerializer, OrjsonSerializer, ArrowSerializer, or a custom one). Any other
-      serializer, AutoSerializer included, raises ConfigurationError at construction.
+      (StandardSerializer, OrjsonSerializer, ArrowSerializer, or a custom one)
 
     Security Model:
     - Storage backend never sees plaintext values
@@ -251,13 +251,12 @@ class EncryptionWrapper:
         # Initialize base serializer — StandardSerializer (MessagePack) for cross-language
         # compatibility. Encrypted data may be shared across SDKs via secrets manager,
         # so the wire format must be language-agnostic.
-        if serializer is not None:
-            require_cross_sdk_serializer(serializer)
-            self.serializer = serializer
-        else:
+        if serializer is None:
             from cachekit.serializers.standard_serializer import StandardSerializer
 
-            self.serializer = StandardSerializer()
+            serializer = StandardSerializer()
+        require_cross_sdk_serializer(serializer)
+        self.serializer = serializer
 
         # Setup encryption — mandatory. EncryptionWrapper without encryption
         # is a security misconfiguration, not a valid operating mode.

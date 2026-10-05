@@ -2,13 +2,13 @@
 
 # Encryption Wrapper
 
-**EncryptionWrapper** adds client-side AES-256-GCM encryption to **any** serializer. It is a composable wrapper — it serializes data using an inner serializer, then encrypts the result before storage.
+**EncryptionWrapper** adds client-side AES-256-GCM encryption to any serializer whose class declares `cross_sdk_compatible = True` ([Composability](#composability)). It is a composable wrapper — it serializes data using an inner serializer, then encrypts the result before storage.
 
 For comprehensive documentation of cachekit's zero-knowledge encryption architecture, key management, multi-tenant limits, nonce handling, and authentication guarantees, see [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md).
 
 ## Overview
 
-EncryptionWrapper wraps any other serializer:
+EncryptionWrapper wraps a cross-SDK serializer:
 
 ```
 serialize(data) → inner.serialize(data) → encrypt(bytes) → stored bytes
@@ -87,15 +87,10 @@ EncryptionWrapper works with any serializer whose class declares `cross_sdk_comp
 | StandardSerializer (default) | Encrypted cross-language MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
-| Custom serializers that set `cross_sdk_compatible = True` | Any data type with encryption |
+| [Custom serializers](custom.md#under-encryption) that set `cross_sdk_compatible = True` | Any data type with encryption |
 
-Any other serializer raises `ConfigurationError` when the wrapper is built: `AutoSerializer`, and any
-custom serializer that does not declare the flag. The protocol requires the step after decryption to
-be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer`
-picks its format by inspecting them. `@cache.secure` and `encryption=True` refuse the same serializers
-when the decorator is applied. Earlier releases let a directly built wrapper take any serializer, so
-`EncryptionWrapper(serializer=AutoSerializer(), ...)` code that ran before now raises
-([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+Any other serializer, `AutoSerializer` included, raises `ConfigurationError` when the wrapper is built,
+as the decorators already do ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
 
 ```python
 from cachekit.config import ConfigurationError

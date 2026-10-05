@@ -345,14 +345,10 @@ df = get_patient_records(42)
 ```
 
 ### Serializer Requirement
-Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`:
-`StandardSerializer` (the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that
-sets the flag. The protocol requires the step after decryption to be the reader's configured
-serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by
-inspecting them. The decorators refuse `serializer="auto"`, an `AutoSerializer` instance and an
-unmarked custom serializer when they are applied. Code that builds an `EncryptionWrapper` directly
-gets the same `ConfigurationError` when the wrapper is constructed; earlier releases accepted any
-serializer there ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`: `StandardSerializer`
+(the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that sets the flag. Anything
+else, `AutoSerializer` included, raises `ConfigurationError` in the decorators and in a directly built
+`EncryptionWrapper` ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
 
 ### Multi-Tenant Isolation
 
