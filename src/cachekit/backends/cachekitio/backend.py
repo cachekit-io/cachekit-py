@@ -24,7 +24,7 @@ from urllib3.exceptions import ClosedPoolError
 from cachekit.backends._uninterrupted import _await_uninterrupted
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
-from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from cachekit.config.validation import ConfigurationError, hide_secret
 from cachekit.decorators.stats_context import get_current_function_stats
@@ -442,7 +442,11 @@ class CachekitIOBackend:
         try:
             return lease.client.request(method, url, body=body, headers=headers)
         except Exception as exc:
-            raise classify_http_error(exc, operation=method.lower()) from exc
+            error = classify_http_error(exc, operation=method.lower())
+        # Raised OUTSIDE the except block, from a cause that keeps only urllib3's exception class (CWE-532): urllib3's
+        # exception carries a traceback through its request frames, whose locals hold the Authorization header, and
+        # a raise in the block would chain it as __context__, which `raise ... from` does not clear.
+        raise error from error.original_exception
 
     @staticmethod
     def _checked(method: str, response: BaseHTTPResponse, miss_on_404: bool) -> BaseHTTPResponse:
@@ -1045,7 +1049,8 @@ class CachekitIOBackend:
             try:
                 self._request_sync("DELETE", path, headers=headers)
             except BackendError as exc:
-                if not isinstance(exc.__cause__, ClosedPoolError):
+                cause = exc.original_exception
+                if not (isinstance(cause, HTTPTransportError) and issubclass(cause.exc_type, ClosedPoolError)):
                     raise
                 self._request_sync("DELETE", path, headers=headers)
         except Exception as exc:

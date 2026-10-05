@@ -17,7 +17,7 @@ from urllib3 import BaseHTTPResponse
 from urllib3 import exceptions as u3
 
 from cachekit.backends.cachekitio.backend import _rate_limit_delay
-from cachekit.backends.cachekitio.error_handler import HTTPStatusError, classify_http_error
+from cachekit.backends.cachekitio.error_handler import HTTPStatusError, HTTPTransportError, classify_http_error
 from cachekit.backends.errors import BackendError, BackendErrorType
 from tests.utils.cachekitio_fakes import TEST_API_KEY, FakeRequest, fake_backend, response
 
@@ -200,6 +200,16 @@ def _assert_type_only(err: BackendError) -> None:
     assert TEST_API_KEY not in text
 
 
+def _assert_class_only_cause(err: BackendError, exc: Exception) -> None:
+    """CWE-532: the error keeps urllib3's exception class, never the exception, whose traceback runs through urllib3's
+    request frames and their Authorization header (tests/unit/backends/test_cachekitio_transport_error_frames.py)."""
+    cause = err.original_exception
+    assert isinstance(cause, HTTPTransportError)
+    assert cause.exc_type is type(exc)
+    assert str(cause) == type(exc).__name__
+    assert cause.__traceback__ is None
+
+
 class TestNetworkExceptionClassification:
     """Tests for network-level exception → error type mapping."""
 
@@ -209,7 +219,7 @@ class TestNetworkExceptionClassification:
         result = classify_http_error(exc)
         assert result.error_type == error_type
         assert result.message == message
-        assert result.original_exception is exc
+        _assert_class_only_cause(result, exc)
         _assert_type_only(result)
 
     @pytest.mark.parametrize("make_exc", [_TRANSPORT_RULES[0][0], _TRANSPORT_RULES[1][0]], ids=_TRANSPORT_IDS[:2])
@@ -241,7 +251,10 @@ class TestNetworkExceptionEndToEnd:
         assert err.error_type == error_type
         assert err.message == message
         assert err.operation == "put"
-        assert err.original_exception is exc
+        _assert_class_only_cause(err, exc)
+        # Raised outside the except block: urllib3's exception is not even the implicit __context__.
+        assert err.__cause__ is err.original_exception
+        assert err.__context__ is None
         _assert_type_only(err)
 
 

@@ -24,6 +24,19 @@ class HTTPStatusError(Exception):
         self.response = response
 
 
+class HTTPTransportError(Exception):
+    """A transport failure, kept as the BackendError's ``original_exception``: urllib3's exception class, nothing more.
+
+    urllib3's exception itself is not kept (CWE-532). Its traceback runs through urllib3's request frames, whose locals
+    hold the request headers, ``Authorization: Bearer <api key>`` included, and an error tracker that captures frame
+    locals (Sentry does by default) sends them. Its text can also carry the request URL, and with it the cache key.
+    """
+
+    def __init__(self, exc_type: type[Exception]) -> None:
+        super().__init__(exc_type.__name__)
+        self.exc_type = exc_type
+
+
 def classify_http_error(
     exc: Exception,
     response: BaseHTTPResponse | None = None,
@@ -43,7 +56,8 @@ def classify_http_error(
         key: Cache key involved (optional, for debugging)
 
     Returns:
-        BackendError with appropriate error_type classification
+        BackendError with appropriate error_type classification. Its ``original_exception`` is ``exc`` for a
+        response status, and an HTTPTransportError naming ``exc``'s class for a transport failure, never ``exc``.
 
     Classification rules:
         - HTTP 401/403: AUTHENTICATION (alert ops)
@@ -112,10 +126,13 @@ def classify_http_error(
                 key=key,
             )
 
+    # A transport failure keeps urllib3's exception class only (see HTTPTransportError).
+    cause = HTTPTransportError(type(exc))
+
     # TRANSIENT: Connection failures. Checked before TIMEOUT: urllib3's NewConnectionError subclasses
     # its ConnectTimeoutError. Only the exception TYPE goes in the message: urllib3 exception text
     # can embed the request URL, which carries the raw cache key in its path, and the message reaches
-    # log sinks via str(e) (CWE-532, LAB-304). Detail stays on original_exception.
+    # log sinks via str(e) (CWE-532, LAB-304).
     if isinstance(exc, (u3.NewConnectionError, u3.ProtocolError, u3.SSLError, u3.ProxyError)):
         # A host with no CA bundle fails every request here; name the fix rather than look like a network flake.
         # A hostname mismatch (X509_V_ERR_HOSTNAME_MISMATCH, 62) is not a trust-store problem, so it keeps the type.
@@ -126,7 +143,7 @@ def classify_http_error(
         return BackendError(
             message,
             error_type=BackendErrorType.TRANSIENT,
-            original_exception=exc,
+            original_exception=cause,
             operation=operation,
             key=key,
         )
@@ -136,17 +153,17 @@ def classify_http_error(
         return BackendError(
             f"Request timeout: {type(exc).__name__}",
             error_type=BackendErrorType.TIMEOUT,
-            original_exception=exc,
+            original_exception=cause,
             operation=operation,
             key=key,
         )
 
     # UNKNOWN: Unclassified error. Type-only message (CWE-532): arbitrary urllib3 text
-    # can echo the request URL, which carries the raw key. Detail on original_exception.
+    # can echo the request URL, which carries the raw key.
     return BackendError(
         f"Unknown HTTP error: {type(exc).__name__}",
         error_type=BackendErrorType.UNKNOWN,
-        original_exception=exc,
+        original_exception=cause,
         operation=operation,
         key=key,
     )
