@@ -792,7 +792,7 @@ class TestCacheDirStructure:
         assert cache_files[0].exists()
 
     def test_relative_cache_dir_is_resolved_once_at_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """LAB-7076: writes, scans and eviction all stay in the init-time directory after a chdir."""
+        """Writes, scans and eviction all stay in the init-time directory after a chdir."""
         (tmp_path / "a").mkdir()
         (tmp_path / "b").mkdir()
         monkeypatch.chdir(tmp_path / "a")
@@ -2388,7 +2388,7 @@ class TestShortIOFailClosed:
 
 @pytest.mark.unit
 class TestSetLockScope:
-    """LAB-7076: set() writes and fsyncs outside the process lock and re-checks the cap at commit."""
+    """set() writes and fsyncs outside the process lock and re-checks the cap at commit."""
 
     def test_get_does_not_wait_for_a_concurrent_set_fsync(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
         import threading

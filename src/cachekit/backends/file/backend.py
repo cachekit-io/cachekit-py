@@ -766,7 +766,7 @@ class FileBackend:
         expired. Expired/corrupt entries are unlinked on read, mirroring ``get``/``exists``.
 
         Runs in a worker thread, as the async get/set paths do: on the event-loop thread it
-        would stall every coroutine while it waits for the process lock (LAB-7076).
+        would stall every coroutine while it waits for the process lock.
         """
         return await asyncio.to_thread(self._get_ttl, key)
 

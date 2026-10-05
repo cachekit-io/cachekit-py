@@ -164,7 +164,7 @@ class TestFileBackendTTLInspection:
             await file_backend.refresh_ttl("k", 100)
 
     async def test_ttl_ops_leave_the_event_loop_free_while_the_lock_is_held(self, file_backend: FileBackend) -> None:
-        """LAB-7076: get_ttl/refresh_ttl wait for the process lock in a worker thread, not on the loop."""
+        """get_ttl/refresh_ttl wait for the process lock in a worker thread, not on the loop."""
         import threading
 
         file_backend.set("k", b"v", ttl=100)
