@@ -763,6 +763,7 @@ class TestFillLock:
         (record,) = [r for r in caplog.records if "lock release" in r.getMessage()]
         assert redact_cache_key(key) in record.getMessage()
         assert "secret-tenant" not in record.getMessage()
+        backend._request_sync.assert_called_once()  # only a closed pool is retried
 
     @pytest.mark.parametrize("sweep", [False, True], ids=["plain", "teardown-sweep"])
     async def test_unexpected_release_error_is_logged_redacted(
@@ -844,9 +845,8 @@ class TestFillLock:
 
     async def test_release_survives_the_client_closing_first(self) -> None:
         """The release is still queued (one busy executor thread) when the caller closes the client, as
-        close_http_clients() does to the client a backend's lease holds. The DELETE still lands, on a new
-        lease that stays local to the release: the backend keeps its own lease, so no client opened for
-        the release outlives it on the backend."""
+        close_http_clients() does to the client a backend's lease holds. The DELETE lands on the client
+        the backend re-leases, at the first attempt."""
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
@@ -878,7 +878,30 @@ class TestFillLock:
 
         assert first_pool.closed and first_pool.requests == []
         assert sent == [("DELETE", "/v1/cache/k/lock")]
-        assert backend._lease is first
+        assert backend._lease.client is second_client
+
+    async def test_release_retries_once_when_the_close_lands_mid_request(self) -> None:
+        """The close lands after the backend checked its lease and before the pool hands out a connection,
+        so the DELETE fails on a closed pool. It is sent once more, on the client the backend re-leases."""
+        from urllib3.exceptions import ClosedPoolError
+
+        def closed_under_it(request: FakeRequest) -> HTTPResponse:
+            first_pool.close()
+            raise ClosedPoolError(None, "Pool is closed.")  # type: ignore[arg-type]  # as urllib3's own pool
+
+        backend, first_pool = fake_backend(closed_under_it)
+        second_client, second_pool = fake_client(lambda request: response(200), backend)
+        backend._request_async = AsyncMock(return_value=_json_response(200, {"lock_id": "lock-m"}))  # type: ignore[method-assign]
+        with patch(
+            "cachekit.backends.cachekitio.backend.lease_http_client",
+            return_value=SimpleNamespace(pid=os.getpid(), client=second_client),
+        ):
+            async with backend.acquire_fill_lock("k", timeout=30.0, blocking_timeout=None):
+                pass
+            await _drain_background_releases()
+
+        assert [r.method for r in first_pool.requests] == ["DELETE"]
+        assert [(r.method, r.path) for r in second_pool.requests] == [("DELETE", "/v1/cache/k/lock")]
 
     @pytest.mark.parametrize("refusal", ["loop-executor-shut-down", "own-executor-shut-down"])
     async def test_release_is_sent_inline_when_the_executor_refuses_it(

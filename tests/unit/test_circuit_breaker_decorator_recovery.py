@@ -40,10 +40,12 @@ import time_machine
 
 from cachekit import cache
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.cache_handler import CacheOperationHandler
 from cachekit.config.nested import CircuitBreakerConfig as NestedCircuitBreakerConfig
 from cachekit.config.validation import ConfigurationError
 from cachekit.decorators import wrapper as wrapper_module
 from cachekit.decorators.orchestrator import FeatureOrchestrator
+from cachekit.decorators.stats_context import get_current_function_stats
 from cachekit.interop import InteropError
 from cachekit.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 
@@ -746,3 +748,154 @@ class TestFunctionExceptionsDoNotCount:
         for i in range(_DEFAULTS.failure_threshold):
             assert await _call(fn, f"k-{i}") == f"v:k-{i}"  # degrades to uncached, never raises
         assert breaker.state == CircuitState.OPEN
+
+
+class TestInteropValueContractOnDegradedPaths:
+    """Interop refuses an out-of-model return value whatever the breaker state (LAB-5375).
+
+    A call the breaker rejects, and a call whose backend cannot be created, run the
+    function uncached and never reach the store path, where the value check used to run.
+    The value is now checked on those paths too: an in-model value still returns
+    uncached, an out-of-model one raises ``InteropError`` as it does on a cached call.
+    """
+
+    _SCENARIOS = ["open", "half-open-spent", "open-before-resolution", "client-creation-fallback"]
+
+    @staticmethod
+    async def _degrade(scenario: str, is_async: bool, resolver: _FlakyResolver, live_breakers, clock):
+        """Decorate an interop function and put it in ``scenario``; returns ``(fn, executions, breaker)``."""
+        executions: list[str] = []
+
+        def body(x: str) -> Any:
+            executions.append(x)
+            if x.startswith("deep"):
+                return _deeply_nested()
+            return {"bad": {1}} if x.startswith("bad") else f"v:{x}"  # a set is outside the data model
+
+        async def async_body(x: str) -> Any:
+            return body(x)
+
+        kwargs: dict[str, Any] = {"interop": "op"}
+        if scenario in ("open", "half-open-spent"):
+            kwargs["backend"] = resolver.backend  # resolved before the breaker rejects anything
+        fn = cache(ttl=300, l1_enabled=False, namespace=f"lab5375-{scenario}-{int(is_async)}", **kwargs)(
+            async_body if is_async else body
+        )
+        (breaker,) = live_breakers
+
+        if scenario in ("open", "half-open-spent"):
+            _trip(breaker)
+        if scenario == "half-open-spent":
+            clock.shift(_PAST_TIMEOUT)
+            for _ in range(breaker.config.half_open_requests):  # every probe slot is in flight
+                assert breaker.should_attempt_call()
+            assert breaker.state == CircuitState.HALF_OPEN
+        if scenario == "open-before-resolution":
+            await _open(fn, resolver, breaker)  # leaves no backend resolved
+            del executions[:]
+        # client-creation-fallback: the resolver is still down and the breaker CLOSED
+        return fn, executions, breaker
+
+    @pytest.mark.parametrize("scenario", _SCENARIOS)
+    async def test_out_of_model_return_raises(self, scenario, is_async, resolver, backend, live_breakers, clock):
+        fn, executions, breaker = await self._degrade(scenario, is_async, resolver, live_breakers, clock)
+        state, failures = breaker.state, breaker.failure_count
+
+        with pytest.raises(InteropError):
+            await _call(fn, "bad")
+
+        assert executions == ["bad"]  # the function ran once; its value was refused
+        assert backend.gets == backend.sets == 0  # nothing reached the backend
+        assert get_current_function_stats() is None  # the raise left no stats context behind
+        if scenario != "client-creation-fallback":  # that one records its client failure, as before
+            assert (breaker.state, breaker.failure_count) == (state, failures)
+
+    @pytest.mark.parametrize("scenario", _SCENARIOS)
+    async def test_in_model_return_still_runs_uncached(self, scenario, is_async, resolver, backend, live_breakers, clock):
+        fn, executions, breaker = await self._degrade(scenario, is_async, resolver, live_breakers, clock)
+        state, failures = breaker.state, breaker.failure_count
+
+        assert await _call(fn, "good") == "v:good"
+
+        assert executions == ["good"]
+        assert backend.gets == backend.sets == 0
+        assert get_current_function_stats() is None
+        if scenario != "client-creation-fallback":
+            assert (breaker.state, breaker.failure_count) == (state, failures)
+
+    @pytest.mark.parametrize("scenario", _SCENARIOS)
+    async def test_unencodable_in_model_return_still_runs_uncached(
+        self, scenario, is_async, resolver, backend, live_breakers, clock
+    ):
+        """An encode failure that is not a data-model rejection degrades, as on the store path.
+
+        Too deep a nesting raises RecursionError, not InteropError. The store path wraps it in
+        SerializationError and returns the value uncached, so an uncached call returns it too.
+        """
+        fn, executions, _ = await self._degrade(scenario, is_async, resolver, live_breakers, clock)
+
+        assert await _call(fn, "deep") == _deeply_nested()
+
+        assert executions == ["deep"]
+        assert backend.gets == backend.sets == 0
+        assert get_current_function_stats() is None
+
+    @staticmethod
+    def _failing_read(monkeypatch: pytest.MonkeyPatch, backend: _CountingBackend, is_async: bool):
+        """An interop function whose L2 read raises past the handler; returns ``(fn, executions)``.
+
+        The handler reads a backend error as a miss, so that call goes on to the store path. Only an
+        exception that escapes the read reaches the wrapper's fallback, which runs the function uncached.
+        """
+        executions: list[str] = []
+
+        def failing_read(*_: Any, **__: Any) -> None:
+            raise RuntimeError("read failed past the handler")
+
+        async def failing_read_async(*_: Any, **__: Any) -> None:
+            failing_read()
+
+        monkeypatch.setattr(CacheOperationHandler, "get_cached_value", failing_read)
+        monkeypatch.setattr(CacheOperationHandler, "get_cached_value_async", failing_read_async)
+
+        def body(x: str) -> Any:
+            executions.append(x)
+            if x.startswith("deep"):
+                return _deeply_nested()
+            return {"bad": {1}} if x.startswith("bad") else f"v:{x}"
+
+        async def async_body(x: str) -> Any:
+            return body(x)
+
+        fn = cache(ttl=300, l1_enabled=False, namespace=f"lab5375-read-{int(is_async)}", interop="op", backend=backend)(
+            async_body if is_async else body
+        )
+        return fn, executions
+
+    async def test_out_of_model_return_raises_after_a_failed_read(self, monkeypatch, is_async, backend):
+        """Sync returns the function's value uncached, async goes on to the store path: both refuse it."""
+        fn, executions = self._failing_read(monkeypatch, backend, is_async)
+
+        with pytest.raises(InteropError):
+            await _call(fn, "bad")
+
+        assert executions == ["bad"]
+        assert backend.sets == 0
+        assert get_current_function_stats() is None
+
+    @pytest.mark.parametrize("x", ["good", "deep"])
+    async def test_value_the_store_path_accepts_returns_after_a_failed_read(self, monkeypatch, is_async, backend, x):
+        fn, executions = self._failing_read(monkeypatch, backend, is_async)
+
+        assert await _call(fn, x) == (_deeply_nested() if x == "deep" else f"v:{x}")
+
+        assert executions == [x]
+        assert get_current_function_stats() is None
+
+
+def _deeply_nested() -> list[Any]:
+    """A list nested past the encoder's recursion limit."""
+    value: list[Any] = []
+    for _ in range(5000):
+        value = [value]
+    return value

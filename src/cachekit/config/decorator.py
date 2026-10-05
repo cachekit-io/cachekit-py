@@ -463,14 +463,13 @@ class DecoratorConfig:
         # encryption= is a field, but not one this preset takes: the EncryptionConfig below is the preset.
         if "encryption" in kwargs:
             raise ConfigurationError(
-                "The secure preset sets its own encryption; encryption= cannot override it. Pass fail_closed=, "
-                "single_tenant_mode=, deployment_uuid= or tenant_extractor= to it directly."
+                "The secure preset sets its own encryption; encryption= cannot override it. Pass any of "
+                f"{_SECURE_ENCRYPTION_OPTIONS} to it directly."
             )
-        # Extract encryption-specific params from kwargs
-        explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
-        deployment_uuid = kwargs.pop("deployment_uuid", None)
-        # Tri-state: None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open)
-        fail_closed = kwargs.pop("fail_closed", None)
+        # The EncryptionConfig settings this preset takes through **kwargs, passed through by name. An omitted
+        # deployment_uuid or fail_closed keeps EncryptionConfig's default (fail_closed=None defers to
+        # CACHEKIT_ENCRYPTION_FAIL_CLOSED, default fail open); single_tenant_mode is resolved below.
+        encryption_kwargs = {k: kwargs.pop(k) for k in _SECURE_ENCRYPTION_KWARGS if k in kwargs}
 
         # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
         # rejected, never silently dropped (protocol intent-presets.md § Explicit Configuration).
@@ -484,11 +483,9 @@ class DecoratorConfig:
         # Normalize empty string to None (security: empty string treated as single-tenant)
         tenant_extractor = tenant_extractor or None
 
-        # Determine tenant mode: explicit param > tenant_extractor check
-        if explicit_single_tenant is not None:
-            single_tenant_mode = explicit_single_tenant
-        else:
-            single_tenant_mode = tenant_extractor is None
+        # Tenant mode: an explicit non-None single_tenant_mode wins; otherwise derived from tenant_extractor
+        if encryption_kwargs.get("single_tenant_mode") is None:
+            encryption_kwargs["single_tenant_mode"] = tenant_extractor is None
 
         defaults: dict[str, Any] = {
             "ttl": 600,
@@ -512,9 +509,7 @@ class DecoratorConfig:
                 enabled=True,
                 master_key=reveal_secret(master_key),
                 tenant_extractor=tenant_extractor,
-                single_tenant_mode=single_tenant_mode,
-                deployment_uuid=deployment_uuid,
-                fail_closed=fail_closed,
+                **encryption_kwargs,
             ),
             **(defaults | kwargs),
         )
@@ -702,12 +697,17 @@ class DecoratorConfig:
 
 # The keywords a preset or a config= override may name: DecoratorConfig's fields, less the private ones.
 _FIELD_NAMES = frozenset(f.name for f in fields(DecoratorConfig) if not f.name.startswith("_"))
-# The EncryptionConfig settings DecoratorConfig.secure() takes as keywords of its own.
-_SECURE_ENCRYPTION_KWARGS = frozenset({"single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The EncryptionConfig settings bare @cache and @cache.secure take as flat keywords. The single list: each form folds
+# every name here into its EncryptionConfig, so an option added here reaches both.
+_ENCRYPTION_FLAT_KWARGS = frozenset({"master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The EncryptionConfig settings DecoratorConfig.secure() takes through **kwargs: all but its named parameters.
+_SECURE_ENCRYPTION_KWARGS = _ENCRYPTION_FLAT_KWARGS - {"master_key", "tenant_extractor"}
+# The options secure()'s encryption= refusal names instead: every flat keyword but master_key.
+_SECURE_ENCRYPTION_OPTIONS = ", ".join(f"{k}=" for k in sorted(_ENCRYPTION_FLAT_KWARGS - {"master_key"}))
 # The keywords a @cache.<preset> decorator takes beside the fields: its classmethod's own parameters, and secure's above.
 _PRESET_EXTRA_KWARGS = {
     "io": frozenset({"api_key"}),
-    "secure": _SECURE_ENCRYPTION_KWARGS | {"master_key", "tenant_extractor"},
+    "secure": _ENCRYPTION_FLAT_KWARGS,
 }
 
 

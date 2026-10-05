@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 from urllib.parse import quote
 
 from pydantic import SecretBytes, SecretStr, ValidationError
+from urllib3.exceptions import ClosedPoolError
 
 from cachekit.backends._uninterrupted import _await_uninterrupted
 from cachekit.backends.cachekitio.client import ClientLease, lease_http_client
@@ -376,20 +377,24 @@ class CachekitIOBackend:
 
         # One thread-safe client per config and process, for sync and async methods alike: an async method sends
         # on it through asyncio.to_thread. Holding the lease keeps the client open; dropping it closes the client.
-        # Fork: each request re-leases when the lease's PID is not this process's (see _own_lease).
+        # Each request re-leases after a fork or a close_http_clients() (see _own_lease).
         self._lease = lease_http_client(self._config)
 
     def _own_lease(self) -> ClientLease:
-        """This process's lease: a forked child re-leases, so it never sends on its parent's connections.
+        """This process's open lease: re-leased after a fork, or once close_http_clients() closed its client.
 
-        Those connections share the parent's TLS sessions: whichever process writes second on one breaks
-        it, and a raced read can return the other process's response. Checked per request rather than by
-        an at-fork hook, because uWSGI forks without running Python's at-fork hooks; os.getpid() is
-        negligible next to the request. The lease is published through one reference and carries its own
-        PID, so a thread never pairs a new PID with an inherited client.
+        A forked child must never send on its parent's connections. Those connections share the parent's
+        TLS sessions: whichever process writes second on one breaks it, and a raced read can return the
+        other process's response. Checked per request rather than by an at-fork hook, because uWSGI forks
+        without running Python's at-fork hooks; os.getpid() is negligible next to the request. The lease is
+        published through one reference and carries its own PID, so a thread never pairs a new PID with an
+        inherited client.
+
+        A closed client would fail every request for the backend's lifetime. The new lease comes from the
+        process-wide cache, which close_http_clients() emptied, so a later close reaches it too.
         """
         lease = self._lease
-        if lease.pid != os.getpid():
+        if lease.pid != os.getpid() or lease.client.is_closed:
             lease = self._lease = lease_http_client(self._config)
         return lease
 
@@ -438,13 +443,10 @@ class CachekitIOBackend:
             )
         return encoded
 
-    def _send(
-        self, method: str, url: str, body: bytes | None, headers: dict[str, str], lease: ClientLease | None = None
-    ) -> BaseHTTPResponse:
-        """One attempt on ``lease``'s client (default: this process's), any status. Raises BackendError for a transport failure."""
-        # Held for the whole request: a concurrent re-lease after a fork must not close this client under it.
-        if lease is None:
-            lease = self._own_lease()
+    def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> BaseHTTPResponse:
+        """One attempt on this process's client, any status. Raises BackendError for a transport failure."""
+        # Held for the whole request: a concurrent re-lease must not close this client under it.
+        lease = self._own_lease()
         try:
             return lease.client.request(method, url, body=body, headers=headers)
         except Exception as exc:
@@ -466,7 +468,6 @@ class CachekitIOBackend:
         miss_on_404: bool = False,
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
-        lease: ClientLease | None = None,
     ) -> BaseHTTPResponse:
         """Make sync HTTP request with error handling and metrics injection.
 
@@ -478,7 +479,6 @@ class CachekitIOBackend:
                 saves the HTTPStatusError + BackendError round-trip on every miss.
             body: Request body
             headers: Request headers, over the client's own
-            lease: Send on this lease's client instead of the backend's own lease.
 
         Returns:
             The response, its body already read
@@ -497,11 +497,11 @@ class CachekitIOBackend:
         """
         url = f"/v1/cache/{endpoint}"
         headers = self._request_headers(headers)
-        response = self._send(method, url, body, headers, lease)
+        response = self._send(method, url, body, headers)
         if (delay := _write_retry_delay(method, response)) is not None:
             _logger.debug(f"CachekitIO {method} got HTTP 503; retrying once after Retry-After {delay}s")
             time.sleep(delay)
-            response = self._send(method, url, body, headers, lease)
+            response = self._send(method, url, body, headers)
         return self._checked(method, response, miss_on_404)
 
     async def _request_async(
@@ -1039,25 +1039,23 @@ class CachekitIOBackend:
         """``_delete_lock`` on the backend's client, for an executor thread. Never raises.
 
         The caller has already returned, so it may close the client (``close_http_clients()``)
-        before or while this runs. That client is the one the backend's lease holds, so a failure
-        on that closed client sends the DELETE once more on a new lease; the server matches the
-        DELETE on the holder, so a repeat is harmless. The new lease stays local to this call and is
-        dropped, its client closed, when it returns. Stored on the backend, it would keep a client
-        open after the caller's ``close_http_clients()``, and another release would test that open
-        client instead of the closed one it failed on.
+        before or while this runs. A close before it makes the backend re-lease, as for any request.
+        A close between that check and the request fails the DELETE on a closed pool, so that one
+        failure is sent once more, on the client the backend re-leases; the server matches the DELETE
+        on the holder, so a repeat is harmless. Without it the lock would stay held until its
+        server-side timeout, blocking every other process's fill of the key.
 
         Every failure is logged here, not left on the future: nothing reads the future, and an
         exception left on it would surface only as asyncio's unredacted "never retrieved" report.
         """
         try:
             path, headers = self._lock_release_request(lock_key, lock_id)
-            lease = self._own_lease()
             try:
-                self._request_sync("DELETE", path, headers=headers, lease=lease)
-            except BackendError:
-                if lease.client.is_closed is not True:  # `is True`: a Mock client is never closed
+                self._request_sync("DELETE", path, headers=headers)
+            except BackendError as exc:
+                if not isinstance(exc.__cause__, ClosedPoolError):
                     raise
-                self._request_sync("DELETE", path, headers=headers, lease=lease_http_client(self._config))
+                self._request_sync("DELETE", path, headers=headers)
         except Exception as exc:
             _log_release_failure(lock_key, exc)
 

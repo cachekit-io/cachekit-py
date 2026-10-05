@@ -10,15 +10,17 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import fields, replace
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
 
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
-from cachekit.config.decorator import DecoratorConfig
+from cachekit.config.decorator import _ENCRYPTION_FLAT_KWARGS, _SECURE_ENCRYPTION_KWARGS, DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -616,6 +618,43 @@ class TestPresetFieldOverrides:
 
         assert resolved == []
 
+    def test_bare_and_secure_fold_every_flat_encryption_keyword(self, resolved: list[DecoratorConfig]) -> None:
+        # One sample per flat keyword: a keyword added to the shared list fails here until both forms carry it.
+        class Extractor:
+            def extract(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+                return "tenant"
+
+        samples: dict[str, Any] = {
+            "master_key": _SECURE_KEY,
+            "tenant_extractor": Extractor(),
+            "single_tenant_mode": True,
+            "deployment_uuid": "00000000-0000-4000-8000-000000000001",
+            "fail_closed": True,
+        }
+        assert samples.keys() == _ENCRYPTION_FLAT_KWARGS
+        # secure()'s named parameters are the flat keywords it does not take through **kwargs. One added to its signature
+        # alone would work on DecoratorConfig.secure() and be refused by @cache.secure and bare @cache.
+        assert set(inspect.signature(DecoratorConfig.secure).parameters) - {"kwargs"} == (
+            _ENCRYPTION_FLAT_KWARGS - _SECURE_ENCRYPTION_KWARGS
+        )
+        for name, value in samples.items():
+            secure_kwargs = {"master_key": _SECURE_KEY, name: value}
+
+            @cache(**{name: value})
+            def fn() -> int:
+                return 1
+
+            for config in (resolved.pop(), DecoratorConfig.secure(**secure_kwargs)):
+                assert getattr(config.encryption, name) == value, (name, config)
+        # An explicit single_tenant_mode reaches EncryptionConfig rather than being re-derived from tenant_extractor:
+        # each of these contradicts the derived value, so EncryptionConfig refuses it.
+        for bad in ({"tenant_extractor": Extractor(), "single_tenant_mode": True}, {"single_tenant_mode": False}):
+            with pytest.raises(ConfigurationError, match="tenant"):
+                DecoratorConfig.secure(master_key=_SECURE_KEY, **bad)
+        with pytest.raises(ConfigurationError) as excinfo:
+            DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=EncryptionConfig())
+        assert all(f"{k}=" in str(excinfo.value) for k in samples.keys() - {"master_key"})
+
     def test_l1_enabled_applies_on_top_of_l1_override(self, resolved: list[DecoratorConfig]) -> None:
         @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)
         def fn() -> int:
@@ -771,9 +810,7 @@ class TestUnsupportedKeywords:
 
     # Bare @cache folds the encryption ones into its EncryptionConfig and @cache.io takes api_key; beside config=
     # each names nothing.
-    @pytest.mark.parametrize(
-        "name", ["master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed", "api_key"]
-    )
+    @pytest.mark.parametrize("name", sorted(_ENCRYPTION_FLAT_KWARGS | {"api_key"}))
     def test_config_form_rejects_a_keyword_only_another_form_takes(self, resolved: list[DecoratorConfig], name: str) -> None:
         decorator = cache(config=DecoratorConfig.minimal(), **{name: object()})
         with pytest.raises(ConfigurationError, match=f"does not accept {name}"):

@@ -1,0 +1,241 @@
+{
+  "version": "1.3.0",
+  "generator": "extracted from cachekit-rs v0.5.1 + cachekit-ts v0.1.0 (Python ground truth); arrow/orjson/original_type vectors generated with cryptography/OpenSSL (fixed nonces) matching real cachekit-py serializer metadata, verified by tools/encryption-verify.py; master_key_input rows hand-written from one key, the sealed row sealed with the stdlib HKDF + cryptography AES-GCM (fixed nonce)",
+  "algorithm": "AES-256-GCM",
+  "key_derivation": "HKDF-SHA256 with cachekit_v1_ salt prefix",
+  "nonce_size": 12,
+  "tag_size": 16,
+  "aad_version": "0x03",
+  "aad_format": "[version_byte(1)] [len(4BE)][tenant_id] [len(4BE)][cache_key] [len(4BE)][format] [len(4BE)][compressed_flag] ([len(4BE)][original_type])?",
+  "ciphertext_format": "[nonce(12)] || [ciphertext] || [auth_tag(16)]",
+  "master_key_hex": "6161616161616161616161616161616161616161616161616161616161616161",
+  "master_key_note": "32 bytes of 0x61 (ASCII 'a' repeated 32 times)",
+  "tenant_id": "cross-sdk-test",
+  "derived_key_fingerprint_hex": "96179a9bc881aa7ca83f04b78a66afd3",
+  "keyring": {
+    "tenant_id": "keyring-conformance",
+    "entries": [
+      {
+        "id": "k1",
+        "master_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "derived_key_fingerprint_hex": "b6bfaa4119e9d72c87a393b17f1e117b"
+      },
+      {
+        "id": "k2",
+        "master_key_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+        "derived_key_fingerprint_hex": "e066ffdacfb5fb11a6ecc44c7a0ecb4e"
+      }
+    ],
+    "vectors": [
+      {
+        "name": "encrypted_with_k1",
+        "encrypted_with": "k1",
+        "plaintext_hex": "6b312d706c61696e74657874",
+        "cache_key": "keyring:k1:entry",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "03000000136b657972696e672d636f6e666f726d616e6365000000106b657972696e673a6b313a656e747279000000076d73677061636b0000000546616c7365",
+        "ciphertext_hex": "010101010101010101010101ebc2f0799d210e06f1ec990ec8d2b3b1b6876e1cdbecb09600b89292",
+        "key_fingerprint_hex": "b6bfaa4119e9d72c87a393b17f1e117b"
+      },
+      {
+        "name": "encrypted_with_k2",
+        "encrypted_with": "k2",
+        "plaintext_hex": "6b322d706c61696e74657874",
+        "cache_key": "keyring:k2:entry",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "03000000136b657972696e672d636f6e666f726d616e6365000000106b657972696e673a6b323a656e747279000000076d73677061636b0000000546616c7365",
+        "ciphertext_hex": "020202020202020202020202c9e7a0e25b70e67fc71a191af2d8ec795ce7fa3bf69d06e291ec1bce",
+        "key_fingerprint_hex": "e066ffdacfb5fb11a6ecc44c7a0ecb4e"
+      }
+    ]
+  },
+  "vectors": [
+    {
+      "name": "basic_bytes",
+      "plaintext_hex": "0102030405060708",
+      "cache_key": "test:vector:1",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000000d746573743a766563746f723a31000000076d73677061636b0000000546616c7365",
+      "ciphertext_hex": "f8f69c70000000000000000087d9ec09f2c2347a4b37d5330ccf50e3c31e69642801bef5"
+    },
+    {
+      "name": "special_cache_key",
+      "plaintext_hex": "deadbeef",
+      "cache_key": "user@example.com:profile",
+      "format": "msgpack",
+      "compressed": false,
+      "aad_hex": "030000000e63726f73732d73646b2d746573740000001875736572406578616d706c652e636f6d3a70726f66696c65000000076d73677061636b0000000546616c7365",
+      "ciphertext_hex": "f8f69c7000000000000000012bf77e0cfc353ab04d0b941b22aa2ce39167ee63"
+    },
+    {
+      "name": "compressed_basic",
+      "plaintext_hex": "deadbeefcafe",
+      "cache_key": "test:compressed:vector",
+      "format": "msgpack",
+      "compressed": true,
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000016746573743a636f6d707265737365643a766563746f72000000076d73677061636b0000000454727565",
+      "ciphertext_hex": "44cc06e600000000000000000eb8450c4aac2337265323f7f1b03fc3966deaa515f7"
+    },
+    {
+      "name": "arrow_uncompressed",
+      "plaintext_hex": "0011223344556677",
+      "cache_key": "test:arrow:uncompressed",
+      "format": "arrow",
+      "compressed": false,
+      "original_type": "arrow",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000017746573743a6172726f773a756e636f6d70726573736564000000056172726f770000000546616c7365000000056172726f77",
+      "ciphertext_hex": "0a0b0c0d0e0f10110000000066ee6349733c18b89159de7db35910d6b996bdb9150d5f1d"
+    },
+    {
+      "name": "arrow_compressed",
+      "plaintext_hex": "8899aabbccddeeff",
+      "cache_key": "test:arrow:compressed",
+      "format": "arrow",
+      "compressed": true,
+      "original_type": "arrow",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000015746573743a6172726f773a636f6d70726573736564000000056172726f770000000454727565000000056172726f77",
+      "ciphertext_hex": "0a0b0c0d0e0f101100000001a4a4ee2872d4b60054edc7d4973188ad865d239be211796e"
+    },
+    {
+      "name": "orjson_uncompressed",
+      "plaintext_hex": "7b2261223a2231227d",
+      "cache_key": "test:orjson:vector",
+      "format": "orjson",
+      "compressed": false,
+      "original_type": "orjson",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000012746573743a6f726a736f6e3a766563746f72000000066f726a736f6e0000000546616c7365000000066f726a736f6e",
+      "ciphertext_hex": "0a0b0c0d0e0f1011000000024f4b2924c8166fcd7e6ff731f4e02ff46e6879534e8074c0a4"
+    },
+    {
+      "name": "original_type_numpy",
+      "plaintext_hex": "93010203",
+      "cache_key": "test:original-type:numpy",
+      "format": "msgpack",
+      "compressed": false,
+      "original_type": "numpy",
+      "aad_hex": "030000000e63726f73732d73646b2d7465737400000018746573743a6f726967696e616c2d747970653a6e756d7079000000076d73677061636b0000000546616c7365000000056e756d7079",
+      "ciphertext_hex": "0a0b0c0d0e0f101100000003657e765491f9790882c0543d98ab280c5951a1ed"
+    }
+  ],
+  "default_tenant": {
+    "note": "spec/intent-presets.md \u00a7 Master Key Input rule 5: with no caller-supplied tenant every SDK MUST derive keys and build AAD with the literal \"default\". Same master key as the main set; sealed with the stdlib HKDF + cryptography AES-GCM reference (fixed nonce), verified by tools/encryption-verify.py. The cache_key is interop-mode.json key_vectors[single_int].expected_key and the plaintext is value_vectors[issue_example_object] \u2014 the vector is directly loadable as an interop-mode entry.",
+    "tenant_id": "default",
+    "derived_key_fingerprint_hex": "52d54c97f8e5efaa5bdf58a301f92726",
+    "vectors": [
+      {
+        "name": "default_tenant_interop",
+        "plaintext_hex": "82a36167651ea46e616d65a5616c696365",
+        "cache_key": "users:get_user:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000764656661756c740000004f75736572733a6765745f757365723a36313539383731363235353038303038306636343536656230363563326535316261646661613433323062306566653937343639633239636666656538383735000000076d73677061636b0000000546616c7365",
+        "ciphertext_hex": "0d0e0f1011121314151617183c29af318238925ee76d081934adce133c0b4a7c5eb5704102b04582dcbf278ffd"
+      }
+    ]
+  },
+  "master_key_input": {
+    "note": "spec/intent-presets.md \u00a7 Master Key Input. Rules 1 and 3: the secure preset takes the master key as a hex string, derives the key bytes as hex_decode(string), the same in every SDK, accepts 32 bytes and refuses fewer. Rule 4: an entry point that takes raw key bytes takes exactly 32. Every row comes from one key. A conforming SDK passes every row (they are necessary, not sufficient): a hex entry point given an accept row's master_key_hex and no tenant derives the pinned fingerprint and decrypts the sealed entry, every hex entry point refuses each reject row's master_key_hex, and every raw-bytes entry point refuses each raw reject row's bytes (raw_key_hex decoded). The accept row is lowercase hex, which is what openssl rand -hex 32, the key generator encryption.md gives, prints. Rule 1 does not say whether a key may hold uppercase letters, white space or a 0x prefix, so no row's verdict depends on it: a row that holds white space or a 0x prefix is refused whether a decoder drops those characters or refuses them. Each row also gets the same verdict whether an SDK accepts exactly 32 bytes or 32 and more, as rule 3 allows either. Each note names the mistakes its row catches. Sealed with the stdlib HKDF and cryptography's AES-GCM (fixed nonce); verified by tools/encryption-verify.py, which also checks that each mistake a note names misjudges its row.",
+    "tenant_id": "default",
+    "accept_vectors": [
+      {
+        "name": "master_key_every_hex_digit",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+        "derived_key_fingerprint_hex": "f3b07cd5f8ffa96a55243a22fc252200",
+        "plaintext_hex": "9501a374776fcb400c000000000000c0c3",
+        "cache_key": "users:get_all:8064bf5f945dba521b017bb3f32b31a293a6e16944838d171ea9e77fab085e8e",
+        "format": "msgpack",
+        "compressed": false,
+        "aad_hex": "030000000764656661756c740000004e75736572733a6765745f616c6c3a38303634626635663934356462613532316230313762623366333262333161323933613665313639343438333864313731656139653737666162303835653865000000076d73677061636b0000000546616c7365",
+        "ciphertext_hex": "3a3b3c3d3e3f404142434445d282555c393cc14a53d488e005e6db441d92e9fe089e97b3ecc99a86014810c745",
+        "note": "32 distinct bytes: a leading 00 byte, 14 bytes above 7f, and every hex digit, in lowercase, in both places of a byte. A decoder that reverses the bytes, swaps the two digits of each byte or misreads a letter derives another key: its fingerprint differs and the entry does not decrypt. One that passes the bytes through a text string (a str-typed boundary, where each byte above 7f becomes two) reads 46 bytes, so it refuses the key or derives another. A validator that admits only digits or only uppercase letters, a table for a byte's first digit that holds only 0-9, or a signed-byte parser that refuses a pair above 7f refuses the key; so does a big-integer decoder, unsigned or two's complement (BigInteger.toByteArray(), to_signed_bytes_be), whose bytes are checked for 32 without padding: it drops the leading 00 byte, and byte 1 is below 80, so no sign byte restores it. Fed as raw bytes, it catches a raw-bytes entry point that passes them through a text string. The entry is interop-mode.json's empty_args key holding its mixed_array value, sealed under this key and the tenant \"default\". It shares neither cache_key nor plaintext with default_tenant_interop, so a test can plant both in one backend and tell them apart, as reading with one key current and the other previous needs."
+      }
+    ],
+    "reject_vectors": [
+      {
+        "name": "master_key_odd_65_digits",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba0",
+        "note": "The accept row's 64 digits followed by 0: 65 characters, so not hex. A decoder that drops the odd last digit, as Node's Buffer.from does, reads the accept row's key, so it accepts the string unless it checks for an odd length. An entry point that requires exactly 64 characters refuses it for its length."
+      },
+      {
+        "name": "master_key_odd_63_digits",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abb",
+        "note": "The accept row's first 63 digits, so not hex. A decoder that pads an odd string with a leading 0 reads 32 bytes, so it accepts the string even behind a check that the key is exactly 32 bytes. An entry point that requires exactly 64 characters refuses it for its length."
+      },
+      {
+        "name": "master_key_non_hex_digit",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abbg",
+        "note": "The accept row's 64 digits with the last replaced by g. A decoder that reads a character that is not a hex digit as 0 accepts it as 32 bytes. One that stops at that character, as Node's Buffer.from does, keeps the 31 bytes before it, and accepts them when only the string's length is checked, including behind a pattern anchored only at the start (re.match, or /^[0-9a-f]+/ without $): the g comes last, so such a pattern passes it."
+      },
+      {
+        "name": "master_key_trailing_non_hex",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abbagg",
+        "note": "The accept row's 64 digits followed by gg: 66 characters, an even length. A decoder that stops at the first pair that is not hex, as Node's Buffer.from does, reads the accept row's key and accepts it behind either length rule, even after a check that the length is even, which the 65-digit row cannot show: the shape of Buffer.from(key, \"hex\") followed by key.length === 32."
+      },
+      {
+        "name": "master_key_plus_sign",
+        "master_key_hex": "+07f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba",
+        "note": "The accept row's 64 digits with the leading 0 replaced by +, so the first pair is +0. An integer parser that takes a sign reads +0 as 0, so one used pair by pair (Rust's u8::from_str_radix, Python's int(pair, 16)), or on the whole string (int(key, 16) back to 32 bytes), reads the accept row's key behind a 64-character check."
+      },
+      {
+        "name": "master_key_31_bytes",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998ab",
+        "note": "The accept row's first 31 bytes (62 characters). An entry point with no length check, one that accepts 31 bytes (off by one) or 16 (the HKDF floor encryption.md once listed as the minimum), or one that pads a short key to 32 bytes accepts it."
+      },
+      {
+        "name": "master_key_24_bytes",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332",
+        "note": "The accept row's first 24 bytes (48 characters). Besides the mistakes the 31-byte row catches, other than off by one, a validator that admits AES-192 and AES-256 key sizes (24 or 32 bytes), with or without 16, accepts it."
+      },
+      {
+        "name": "master_key_16_bytes",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb46996",
+        "note": "The accept row's first 16 bytes (32 characters). Besides the mistakes the 31-byte row catches, other than off by one, a validator that admits AES-128 and AES-256 key sizes (16 or 32 bytes) accepts it while refusing 24 and 31 bytes."
+      },
+      {
+        "name": "master_key_31_bytes_and_crlf",
+        "master_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998ab\r\n",
+        "note": "The accept row's first 31 bytes followed by CR LF: 64 characters. Whether a decoder drops white space or refuses it, the key is short or malformed, so every reading of rule 1 refuses it. An entry point that checks for 64 characters on the string as given, then trims it and decodes strictly with no check on the key's length, accepts a 31-byte key."
+      },
+      {
+        "name": "master_key_31_bytes_with_spaces",
+        "master_key_hex": "00 7f 80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998ab",
+        "note": "The accept row's first 31 bytes with a space after the first byte and another after the second: 64 characters. Whether a decoder drops white space or refuses it, the key is short or malformed, so every reading of rule 1 refuses it. An entry point that strips white space from the ends, checks for 64 characters, then decodes with Python's bytes.fromhex, which skips the spaces between pairs, accepts a 31-byte key."
+      },
+      {
+        "name": "master_key_0x_and_31_bytes",
+        "master_key_hex": "0x007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998ab",
+        "note": "0x followed by the accept row's first 31 bytes: 64 characters. Whether a decoder strips a 0x prefix or refuses it, the key is short or malformed, so every reading of rule 1 refuses it. An entry point that checks for 64 characters, then strips a 0x prefix and decodes what is left, accepts a 31-byte key."
+      }
+    ],
+    "raw_reject_vectors": [
+      {
+        "name": "raw_key_31_bytes",
+        "raw_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998ab",
+        "note": "Raw key bytes: the accept row's first 31 bytes, written in hex only because JSON holds no bytes. A raw-bytes entry point that admits 31 or 32 bytes accepts them, and so does one with no length check, one that admits 31 bytes or more (off by one), or one that pads a short key to 32 bytes."
+      },
+      {
+        "name": "raw_key_24_bytes",
+        "raw_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332",
+        "note": "Raw key bytes: the accept row's first 24 bytes. A raw-bytes entry point that admits AES-192 and AES-256 key sizes (24 or 32 bytes), with or without 16, accepts them."
+      },
+      {
+        "name": "raw_key_16_bytes",
+        "raw_key_hex": "007f80ffa55ac33c1ee12dd24bb46996",
+        "note": "Raw key bytes: the accept row's first 16 bytes. A raw-bytes entry point that admits AES-128 and AES-256 key sizes (16 or 32 bytes) accepts them while refusing 24."
+      },
+      {
+        "name": "raw_key_33_bytes",
+        "raw_key_hex": "007f80ffa55ac33c1ee12dd24bb469968778f00f01102332455467768998abba20",
+        "note": "Raw key bytes: the accept row's 32 bytes and a 20 byte. A raw-bytes entry point that admits 32 bytes or more, as a hex entry point may, accepts them."
+      },
+      {
+        "name": "raw_key_ascii_hex_string",
+        "raw_key_hex": "30303766383066666135356163333363316565313264643234626234363939363837373866303066303131303233333234353534363737363839393861626261",
+        "note": "Raw key bytes: the 64 ASCII bytes of the accept row's hex string. A raw-bytes entry point that admits 32 bytes or more accepts them and derives a key no hex entry point derives; one that hex-decodes 64 hex digits first accepts them as the accept row's key. Both break the rule that a raw-bytes entry point takes exactly 32 bytes."
+      }
+    ]
+  }
+}

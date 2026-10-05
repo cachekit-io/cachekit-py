@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
 from ..config.decorator import (
+    _ENCRYPTION_FLAT_KWARGS,
     _FIELD_NAMES,
     _PRESET_EXTRA_KWARGS,
     _SECRET_KWARGS,
@@ -26,9 +27,7 @@ from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, 
 F = TypeVar("F", bound=Callable[..., Any])
 
 # The encryption keywords bare @cache folds into its EncryptionConfig.
-_ENCRYPTION_KWARGS = frozenset(
-    {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
-)
+_ENCRYPTION_KWARGS = _ENCRYPTION_FLAT_KWARGS | {"encryption"}
 # Every keyword some form of @cache takes. Each form refuses those it does not take, and every form refuses any other.
 _DECORATOR_KWARGS = _FIELD_NAMES.union(_ENCRYPTION_KWARGS, _LOCAL_KWARGS, {"l1_enabled"}, *_PRESET_EXTRA_KWARGS.values())
 
@@ -222,7 +221,7 @@ def cache(
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in overrides:
                     enc_overrides["enabled"] = overrides.pop("encryption")
-                for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
+                for _k in _ENCRYPTION_FLAT_KWARGS:
                     if _k in overrides:
                         enc_overrides[_k] = overrides.pop(_k)
                 overrides["encryption"] = replace(EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()})
