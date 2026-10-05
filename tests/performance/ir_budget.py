@@ -127,18 +127,21 @@ def per_op(ir_lo: int, ir_hi: int) -> int:
     return round((ir_hi - ir_lo) / (N_HI - N_LO))
 
 
-# Live child processes, so a failing or interrupted gate can kill every one of them. Once _stop is set,
-# a run that starts is killed at once: a pool thread can start one after the others were killed.
-# Re-entrant because the signal handler takes it on the main thread, which may already hold it.
+# Live child processes, so a failing or interrupted gate can kill every one of them. Once _stopped is
+# set, a run that starts is killed at once: a pool thread can start one after the others were killed.
+# Both are guarded by _children_lock, re-entrant because the signal handler takes it on the main
+# thread, which may already hold it. _stopped is a plain bool, not a threading.Event: Event.set() takes
+# a lock of its own that is not re-entrant, so a signal landing inside it would deadlock the handler.
 _children: set[subprocess.Popen[str]] = set()
 _children_lock = threading.RLock()
-_stop = threading.Event()
+_stopped = False
 _signals: list[int] = []  # SIGINT and SIGTERM received during measure(), which raises the first
 
 
 def _kill_children() -> None:
+    global _stopped
     with _children_lock:
-        _stop.set()
+        _stopped = True
         for proc in _children:
             proc.kill()
 
@@ -157,7 +160,7 @@ def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: f
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
     with _children_lock:
         _children.add(proc)
-        if _stop.is_set():
+        if _stopped:
             proc.kill()
     try:
         _, stderr = proc.communicate(timeout=timeout_s)
@@ -211,7 +214,9 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         "CACHEKIT_LOG_FLUSH_INTERVAL": "86400",
         "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
-    _stop.clear()
+    global _stopped
+    with _children_lock:
+        _stopped = False
     _signals.clear()
     previous = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:

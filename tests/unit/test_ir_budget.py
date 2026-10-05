@@ -7,7 +7,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -142,6 +141,20 @@ elif mode == "again":  # signal itself again once the main thread takes the run 
         def __exit__(self, *exc):
             self.lock.release()
     b._children_lock = SignalOnceTaken(b._children_lock)
+elif mode == "inside":  # signal itself again at the Nth line run inside the first _kill_children(), callees included
+    import os, sys
+    state = {"armed": False, "lines": 0}
+    def line(frame, event, arg):
+        if event == "line" and state["lines"] < int(sys.argv[5]):
+            state["lines"] += 1
+            if state["lines"] == int(sys.argv[5]):
+                os.kill(os.getpid(), int(sys.argv[3]))
+        return line
+    def call(frame, event, arg):
+        if frame.f_code is b._kill_children.__code__:
+            state["armed"] = True
+        return line if state["armed"] and state["lines"] < int(sys.argv[5]) else None
+    sys.settrace(call)
 b.measure(["l1_hit"], 2)
 """
 
@@ -189,7 +202,7 @@ def test_a_failed_run_fails_the_gate_without_waiting_for_the_runs_before_it(tmp_
     """Results are read in submission order, and an earlier run can take minutes: a failure must not queue behind it."""
     script, pids = _sleeper(tmp_path)
     monkeypatch.setattr(ir_budget, "WORKLOAD", script)
-    monkeypatch.setattr(ir_budget, "_stop", threading.Event())  # measure() leaves it set, and _run reads it
+    monkeypatch.setattr(ir_budget, "_stopped", False)  # measure() leaves it set, and _run reads it
 
     def measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
         if n == ir_budget.N_LO:  # the earlier run: sleeps 60 s
@@ -294,6 +307,35 @@ def test_a_signal_between_spawning_a_run_and_tracking_it_leaves_no_run_behind(tm
             pid = int(f.read_text() if f.name == "spawned" else f.name) if f.exists() else 0
             if pid and _alive(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("line", range(1, 13))
+def test_a_second_signal_anywhere_inside_the_kill_leaves_no_run_behind(tmp_path, line: int) -> None:
+    """The handler re-enters _kill_children() on the main thread, so nothing on that path may take a plain lock."""
+    script, pids = _sleeper(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    repo = Path(__file__).resolve().parents[2]
+    sig = signal.SIGTERM
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), str(int(sig)), "inside", str(line)])  # noqa: S603 (trusted: this test's files)
+    try:
+        deadline = time.monotonic() + 30
+        while sum(f.read_text() != "1" for f in pids.iterdir()) < 2:  # both measured runs started
+            assert gate.poll() is None and time.monotonic() < deadline, "the stub runs never started"
+            time.sleep(0.05)
+        gate.send_signal(sig)
+        code = gate.wait(timeout=20)  # a handler blocked on a lock its own thread holds never returns
+        runs = [int(f.name) for f in pids.iterdir() if f.read_text() != "1"]
+        deadline = time.monotonic() + 5
+        while any(_alive(pid) for pid in runs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not [pid for pid in runs if _alive(pid)], "a run outlived the gate"
+        assert code == 128 + sig
+    finally:
+        gate.kill()
+        for f in pids.iterdir():
+            if _alive(int(f.name)):
+                os.kill(int(f.name), signal.SIGKILL)
 
 
 def test_every_path_has_a_committed_budget() -> None:
