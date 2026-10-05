@@ -10,6 +10,7 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import fields, replace
 from typing import Any
@@ -19,7 +20,7 @@ from pydantic import SecretStr
 
 from cachekit import cache
 from cachekit.backends.cachekitio import CachekitIOBackend
-from cachekit.config.decorator import _ENCRYPTION_FLAT_KWARGS, DecoratorConfig
+from cachekit.config.decorator import _ENCRYPTION_FLAT_KWARGS, _SECURE_ENCRYPTION_KWARGS, DecoratorConfig
 from cachekit.config.nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -621,6 +622,11 @@ class TestPresetFieldOverrides:
             "fail_closed": True,
         }
         assert samples.keys() == _ENCRYPTION_FLAT_KWARGS
+        # secure()'s named parameters are the flat keywords it does not take through **kwargs. One added to its signature
+        # alone would work on DecoratorConfig.secure() and be refused by @cache.secure and bare @cache.
+        assert set(inspect.signature(DecoratorConfig.secure).parameters) - {"kwargs"} == (
+            _ENCRYPTION_FLAT_KWARGS - _SECURE_ENCRYPTION_KWARGS
+        )
         for name, value in samples.items():
             secure_kwargs = {"master_key": _SECURE_KEY, name: value}
 
