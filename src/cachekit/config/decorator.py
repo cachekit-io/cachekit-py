@@ -253,8 +253,17 @@ class DecoratorConfig:
 
         This method will be removed in Task 6 when wrapper accepts DecoratorConfig directly.
 
+        Lossy, for display only: never feed its values back into a DecoratorConfig. ``backend`` is None both
+        for an omitted backend (UNSET, which resolves a backend) and for an explicit None (L1-only), so
+        ``replace(config, backend=config.to_dict()["backend"])`` would turn the first into L1-only. To derive
+        a config, call ``dataclasses.replace`` on the DecoratorConfig itself.
+
         Returns:
             Dictionary representation with flattened nested configs
+
+        Example:
+            >>> DecoratorConfig().to_dict()["backend"] is DecoratorConfig(backend=None).to_dict()["backend"] is None
+            True
         """
         return {
             # Core fields
