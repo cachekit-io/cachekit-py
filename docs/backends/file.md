@@ -161,10 +161,11 @@ the latency tail of `set()` grows with the cache, and the typical `set()` does n
 blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 
 If the directory cannot be scanned at all, the counters keep their last values and nothing is
-evicted until a scan succeeds. That failure, and an eviction that cannot delete an entry for any
-reason other than the entry already being gone, logs a WARNING on the
-`cachekit.backends.file.backend` logger, at most once a minute for each of the two, with the
-number of failures since the last warning; the failures in between log at DEBUG.
+evicted until a scan succeeds. That failure, an entry whose size cannot be read during a scan,
+and an eviction that cannot delete an entry for any reason other than the entry already being
+gone each log a WARNING on the `cachekit.backends.file.backend` logger, at most once a minute
+for each of the three, with the number of failures since the last warning; the failures in
+between log at DEBUG.
 
 The counters belong to one `FileBackend` instance, not to the directory. Concurrent writers in
 several processes are unsupported (see [Characteristics](#characteristics)). If you run them anyway,
