@@ -60,6 +60,7 @@ def backend(config: FileBackendConfig) -> FileBackend:
 def backend_log(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
     """Capture the backend's log with fresh warning throttles, so an earlier test's WARNING cannot mute this one's."""
     monkeypatch.setattr(file_backend_module, "_scan_failed_warn", _WarnThrottle())
+    monkeypatch.setattr(file_backend_module, "_stat_failed_warn", _WarnThrottle())
     monkeypatch.setattr(file_backend_module, "_unlink_failed_warn", _WarnThrottle())
     caplog.set_level(logging.DEBUG, logger=file_backend_module.__name__)
     return caplog
@@ -1652,7 +1653,7 @@ class TestEntryBookkeeping:
         assert backend._calculate_cache_size()[1] == 70
 
     def test_scan_with_an_unknown_size_is_not_trusted_for_the_size_cap(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_log: pytest.LogCaptureFixture
     ) -> None:
         """A transient stat failure hides an entry's bytes, so the next set() rescans and evicts on size."""
         backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=2, max_value_mb=1))
@@ -1673,6 +1674,9 @@ class TestEntryBookkeeping:
 
         monkeypatch.setattr(os, "scandir", _OneEIO)
         backend._reconcile()  # one entry's bytes unseen: 700,028 counted of 1,400,056
+        assert _levels(backend_log) == ["WARNING"]
+        assert "could not stat" in backend_log.records[0].getMessage()
+        assert "EIO" in backend_log.records[0].getMessage()
         monkeypatch.undo()
         assert backend._entry_bytes < 1_000_000
 

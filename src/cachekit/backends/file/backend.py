@@ -32,9 +32,10 @@ from cachekit.hash_utils import _WarnThrottle
 
 logger = logging.getLogger(__name__)
 
-# A failing directory scan or eviction delete repeats on every set() until the fault clears, so each
-# logs one WARNING a minute and the rest at DEBUG.
+# A failing directory scan, entry stat or eviction delete repeats on every set() until the fault
+# clears, so each logs one WARNING a minute and the rest at DEBUG.
 _scan_failed_warn = _WarnThrottle()
+_stat_failed_warn = _WarnThrottle()
 _unlink_failed_warn = _WarnThrottle()
 
 # Conditional imports for platform-specific locking
@@ -1074,7 +1075,13 @@ class FileBackend:
                         stat_info = entry.stat(follow_symlinks=False)
                     except FileNotFoundError:
                         continue  # Deleted mid-scan
-                    except OSError:
+                    except OSError as stat_exc:
+                        _warn_throttled(
+                            _stat_failed_warn,
+                            "FileBackend could not stat %s (%s); its size is left out of the total and every set() rescans",
+                            entry.path,
+                            errno.errorcode.get(stat_exc.errno or 0, type(stat_exc).__name__),
+                        )
                         entries.append((entry.path, 0.0, None))
                         continue
                     if stat.S_ISREG(stat_info.st_mode):
