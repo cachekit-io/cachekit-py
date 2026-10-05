@@ -11,9 +11,9 @@ MUST return a miss and MUST NOT delete, rewrite, or return the payload. Every re
 is checked against that, plus a derived expired-and-flagged entry: the spec checks flags
 before expiry, and its MUST NOT delete has no expiry exception.
 
-The other vectors are read at the real wall clock, not frozen at ``reader_now_unix_seconds``:
-py's expiry test is a strict ``now > expiry``, so at exactly the vector's clock
-``expired_entry`` would still return its payload. That boundary is out of scope here.
+``expired_entry`` is read with the clock frozen at its ``reader_now_unix_seconds``, which equals
+its expiry: the spec's entry "is expired when the reader wall clock reaches that timestamp", so
+every read path must miss at that exact instant. The other vectors are read at the real wall clock.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import time_machine
 
 from cachekit.backends.file.backend import FileBackend
 from cachekit.backends.file.config import FileBackendConfig
@@ -116,7 +117,15 @@ def test_return_payload(tmp_path: Path, name: str) -> None:
     assert backend.get(vector["key_utf8"]) == bytes.fromhex(vector["payload_hex"])
 
 
-def test_miss_expired(tmp_path: Path) -> None:
+@pytest.mark.parametrize("read,miss", READ_PATHS, ids=lambda p: getattr(p, "__name__", repr(p)))
+async def test_miss_expired(tmp_path: Path, read: Callable[..., Any], miss: Any) -> None:
     vector = VECTORS["expired_entry"]
+    assert vector["reader_now_unix_seconds"] == vector["expiry_unix_seconds"]  # the boundary instant
     backend, _ = _place(tmp_path, vector)
-    assert backend.get(vector["key_utf8"]) is None
+
+    with time_machine.travel(vector["reader_now_unix_seconds"], tick=False):
+        result = read(backend, vector["key_utf8"])
+        if hasattr(result, "__await__"):
+            result = await result
+
+    assert result is miss
