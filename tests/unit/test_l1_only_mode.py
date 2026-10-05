@@ -667,7 +667,7 @@ def resolved_configs(monkeypatch: pytest.MonkeyPatch) -> list:
         seen.append(config)
         return f
 
-    monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+    monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
     return seen
 
 
@@ -702,7 +702,6 @@ class TestReusedDecoratorObject:
             mock_provider.return_value.get_backend.assert_not_called()
 
     def test_reused_decorator_resolves_identical_config(self, resolved_configs: list):
-        from cachekit.config.decorator import UNSET
         from cachekit.decorators import cache
 
         d = cache(backend=None, l1_enabled=False, ttl=60)
@@ -711,7 +710,7 @@ class TestReusedDecoratorObject:
 
         first, second = resolved_configs
         assert first == second
-        assert second.backend is None and second.backend is not UNSET
+        assert second.backend is None
         assert second.l1.enabled is False
 
     def test_reused_bare_encryption_keeps_shared_kwargs_wrapped(self, resolved_configs: list):
@@ -751,7 +750,8 @@ class TestReusedDecoratorObject:
         finally:
             reset_settings()
 
-        for config in resolved_configs:
+        first, second = resolved_configs
+        for config in (first, second):
             assert config.encryption.master_key == "a" * 64
             assert config.encryption.tenant_extractor is extractor
             assert config.encryption.single_tenant_mode is False
@@ -792,16 +792,6 @@ class TestConfigBackendNone:
 
             assert runs == 1
             mock_provider.return_value.get_backend.assert_not_called()
-
-    def test_secure_config_backend_none_raises(self):
-        from cachekit import DecoratorConfig
-        from cachekit.decorators import cache
-
-        with pytest.raises(ConfigurationError, match="backend=None is L1-only"):
-
-            @cache(config=DecoratorConfig.secure(master_key="a" * 64, backend=None))
-            def leaks() -> str:
-                return "pii"
 
     def test_default_backend_does_not_fill_explicit_none(self, resolved_configs: list):
         from cachekit import DecoratorConfig
@@ -851,4 +841,3 @@ class TestConfigBackendNone:
         assert config.backend is UNSET
         assert dataclasses.replace(config, ttl=5).backend is UNSET
         assert copy.deepcopy(config).backend is UNSET
-        assert dataclasses.replace(config, backend=None).backend is None

@@ -30,7 +30,7 @@ class TestRoroConfigBackend:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         yield seen
         set_default_backend(None)
 

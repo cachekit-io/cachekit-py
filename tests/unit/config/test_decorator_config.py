@@ -418,7 +418,7 @@ class TestSecureIntegrityChecking:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
@@ -508,7 +508,7 @@ class TestL1EnabledFlag:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @staticmethod
@@ -574,7 +574,7 @@ class TestPresetFieldOverrides:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @staticmethod

@@ -588,8 +588,6 @@ def create_cache_wrapper(
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
-    # L1-only mode flag
-    _l1_only_mode: bool = False,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -663,6 +661,8 @@ def create_cache_wrapper(
         function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
+    # L1-only (in-process, no backend) is chosen only by config.backend None, below: one switch for every caller.
+    _l1_only_mode = False
 
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values

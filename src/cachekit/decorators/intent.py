@@ -19,19 +19,6 @@ from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _apply_cache_logic(func: Callable[..., Any], decorator_config: DecoratorConfig) -> Callable[..., Any]:
-    """Apply resolved configuration using the wrapper factory.
-
-    Args:
-        func: Function to wrap
-        decorator_config: DecoratorConfig instance with all settings; backend=None in it is L1-only mode
-
-    Returns:
-        Wrapped function
-    """
-    return create_cache_wrapper(func, config=decorator_config)
-
-
 def cache(
     func: F | None = None, *, config: DecoratorConfig | None = None, _intent: str | None = None, **manual_overrides
 ) -> F | Callable[[F], F]:
@@ -170,8 +157,9 @@ def cache(
 
         # Refuse an encrypting serializer= before the preset resolves, ahead of the presets' own key checks: a
         # caller who put the key inside the EncryptionWrapper would otherwise be told the decorator has no key.
-        # backend=None, as keyword or in config=, skips this check, so create_cache_wrapper's L1-only refusal keeps its message. That refusal runs
-        # after the preset's own checks, so one of those (a missing key or tenant mode, say) can still fire first.
+        # backend=None, as keyword or in config=, skips this check, so create_cache_wrapper's L1-only refusal keeps
+        # its message. That refusal runs after the preset's own checks, so one of those (a missing key or tenant
+        # mode, say) can still fire first.
         if not _explicit_l1_only and _is_encrypting_serializer(overrides.get("serializer")):
             raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
@@ -277,7 +265,7 @@ def cache(
 
         # resolved_config.backend is None exactly when the caller asked for L1-only, by keyword or in config=;
         # create_cache_wrapper reads it from there.
-        return _apply_cache_logic(f, resolved_config)  # type: ignore[return-value]
+        return create_cache_wrapper(f, config=resolved_config)  # type: ignore[return-value]
 
     # Handle both @cache and @cache() syntax
     if func is None:
@@ -294,4 +282,4 @@ cache.dev = functools.partial(cache, _intent="dev")  # type: ignore[attr-defined
 cache.test = functools.partial(cache, _intent="test")  # type: ignore[attr-defined]
 cache.io = functools.partial(cache, _intent="io")  # type: ignore[attr-defined]  # SaaS backend
 cache.local = functools.partial(cache, _intent="local")  # type: ignore[attr-defined]
-# Note: L1-only mode is backend=None, as a keyword or inside config= (no preset decorator)
+# Note: L1-only mode is backend=None, as a keyword or inside config=
