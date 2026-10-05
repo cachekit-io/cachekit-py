@@ -4,6 +4,7 @@ This module implements BaseBackend protocol for filesystem-based caching with:
 - Thread-safe operations using RLock and file-level locking (fcntl/msvcrt)
 - Atomic writes via write-then-rename pattern
 - Oldest-written-first (mtime) eviction triggered at 90% capacity, evicting to 70%
+- O(1) capacity bookkeeping: entry count and bytes kept in counters, not rescanned per set()
 - TTL-based expiration with secure 14-byte header format
 - TTL inspection & refresh (TTLInspectableBackend): get_ttl / refresh_ttl off the header
 - Security features: O_NOFOLLOW, realpath resolution, permission enforcement
@@ -14,9 +15,11 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
 import mmap
 import os
 import platform
+import stat
 import struct
 import threading
 import time
@@ -25,6 +28,15 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.hash_utils import _WarnThrottle
+
+logger = logging.getLogger(__name__)
+
+# A failing directory scan, entry stat or eviction delete repeats on every set() until the fault
+# clears, so each logs one WARNING a minute and the rest at DEBUG.
+_scan_failed_warn = _WarnThrottle()
+_stat_failed_warn = _WarnThrottle()
+_unlink_failed_warn = _WarnThrottle()
 
 # Conditional imports for platform-specific locking
 if platform.system() == "Windows":
@@ -47,6 +59,10 @@ EVICTION_TARGET_THRESHOLD: float = 0.7  # Evict to 70% capacity
 # Cleanup settings
 TEMP_FILE_MAX_AGE_SECONDS: int = 60  # Delete orphaned temp files older than 60s
 
+# The entry counters see only this process's writes. Another process writing the same directory
+# (unsupported, but it happens) drifts them, so set() rescans once this long after the last scan.
+RECONCILE_INTERVAL_SECONDS: float = 30.0
+
 # TTL bounds (security: prevent integer overflow)
 MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 
@@ -54,6 +70,15 @@ MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 # misconfigured huge max_value_mb (or an out-of-band file dropped in cache_dir) can't map an
 # unbounded region. Above this, get_buffer() returns None and the caller falls back to os.read.
 MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
+
+
+def _warn_throttled(throttle: _WarnThrottle, msg: str, *args: object) -> None:
+    """Log ``msg`` at WARNING once per throttle window, with the failures since the last one; DEBUG otherwise."""
+    failures = throttle.claim()
+    if failures:
+        logger.warning(msg + " (failures since the last warning: %d)", *args, failures)
+    else:
+        logger.debug(msg, *args)
 
 
 def _read_fully(fd: int, n: int) -> bytes:
@@ -190,6 +215,13 @@ class FileBackend:
 
         # Cleanup orphaned temp files on startup
         self._cleanup_temp_files()
+
+        # Entry count and bytes, seeded by one scan here and kept current by every write, unlink
+        # and eviction in this process, so set() checks capacity without scanning the directory.
+        self._entry_count = 0
+        self._entry_bytes = 0
+        self._reconciled_at = 0.0
+        self._reconcile()
 
     def get(self, key: str) -> bytes | None:
         """Retrieve value from file storage.
@@ -412,7 +444,8 @@ class FileBackend:
         with self._lock:
             try:
                 # Check entry count BEFORE write (security: prevent file persisting on error)
-                self._check_entry_capacity(file_path)
+                old_size = self._regular_file_size(file_path)
+                self._check_entry_capacity(old_size)
 
                 # Write to temp file with O_NOFOLLOW for security
                 fd = os.open(
@@ -438,6 +471,7 @@ class FileBackend:
 
                 # Atomic rename (POSIX guarantees atomicity)
                 os.rename(temp_path, file_path)
+                self._note_write(old_size, len(file_data))
 
                 # Trigger eviction if over threshold
                 self._maybe_evict()
@@ -486,7 +520,7 @@ class FileBackend:
         try:
             # Check entry count BEFORE write (security: prevent file persisting on error)
             with self._lock:
-                self._check_entry_capacity(file_path)
+                self._check_entry_capacity(self._regular_file_size(file_path))
 
             # Stream OUTSIDE self._lock: unlike set()'s bounded os.write, the producer runs
             # the whole serialization here (minutes for multi-GB frames), and holding the
@@ -511,7 +545,8 @@ class FileBackend:
 
                     # Enforce max_value_mb on the real on-disk size (fstat, not tell():
                     # the producer may have seeked back to patch bytes it already wrote).
-                    payload_size = os.fstat(fd).st_size - HEADER_SIZE
+                    file_size = os.fstat(fd).st_size
+                    payload_size = file_size - HEADER_SIZE
                     max_bytes = self.config.max_value_mb * 1024 * 1024
                     if payload_size > max_bytes:
                         raise BackendError(
@@ -531,8 +566,11 @@ class FileBackend:
 
             # Commit under the process lock: atomic rename + eviction bookkeeping only.
             with self._lock:
+                # Sized again here, not at the capacity check: the stream ran outside the lock.
+                old_size = self._regular_file_size(file_path)
                 os.rename(temp_path, file_path)
                 committed = True
+                self._note_write(old_size, file_size)
 
                 # Trigger eviction if over threshold
                 self._maybe_evict()
@@ -569,7 +607,10 @@ class FileBackend:
 
         with self._lock:
             try:
+                size = self._regular_file_size(file_path)
                 os.unlink(file_path)
+                if size is not None:
+                    self._note_removed(size)
                 return True
             except FileNotFoundError:
                 return False
@@ -877,21 +918,52 @@ class FileBackend:
             + struct.pack(">Q", expiry_timestamp)  # [6:14] Expiry timestamp
         )
 
-    def _check_entry_capacity(self, file_path: str) -> None:
+    def _check_entry_capacity(self, old_size: int | None) -> None:
         """Reject a NEW entry when max_entry_count is reached (overwrites always pass).
+
+        Args:
+            old_size: Size of the entry being overwritten, or None for a new entry
+
+        A count at the cap is confirmed by a rescan before rejecting, so a count drifted high by
+        foreign deletes does not reject. If that rescan fails, the check fails closed: it rejects on
+        the count it has, keeping the cap while the directory cannot be read.
 
         Raises:
             BackendError: If storing a new entry would exceed max_entry_count
         """
-        if self.config.max_entry_count <= 0:
+        if self.config.max_entry_count <= 0 or old_size is not None:
             return
-        _, entry_count = self._calculate_cache_size()
-        # Only check if this is a NEW entry (not overwriting existing)
-        if not os.path.exists(file_path) and entry_count >= self.config.max_entry_count:
-            raise BackendError(
-                f"Entry count {entry_count} would exceed max_entry_count ({self.config.max_entry_count})",
-                BackendErrorType.PERMANENT,
-            )
+        if self._entry_count >= self.config.max_entry_count:
+            self._reconcile()
+            if self._entry_count >= self.config.max_entry_count:
+                raise BackendError(
+                    f"Entry count {self._entry_count} would exceed max_entry_count ({self.config.max_entry_count})",
+                    BackendErrorType.PERMANENT,
+                )
+
+    @staticmethod
+    def _regular_file_size(path: str) -> int | None:
+        """Size of the regular file at ``path`` (not followed if a symlink), or None if there is none.
+
+        One lstat both tells the capacity check whether this is an overwrite and gives the counters
+        the overwritten entry's size.
+        """
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        return st.st_size if stat.S_ISREG(st.st_mode) else None
+
+    def _note_write(self, old_size: int | None, new_size: int) -> None:
+        """Count an entry this process just renamed into place (caller holds self._lock)."""
+        if old_size is None:
+            self._entry_count += 1
+        self._entry_bytes += new_size - (old_size or 0)
+
+    def _note_removed(self, size: int) -> None:
+        """Count an entry this process just unlinked (caller holds self._lock)."""
+        self._entry_count -= 1
+        self._entry_bytes -= size
 
     def _key_to_path(self, key: str) -> str:
         """Convert cache key to file path using blake2b hash.
@@ -921,18 +993,20 @@ class FileBackend:
         ns = time.time_ns()
         return os.path.join(dirname, f"{base}.tmp.{pid}.{ns}")
 
-    def _safe_unlink(self, path: str) -> None:
-        """Safely delete file, ignoring ENOENT errors.
+    def _safe_unlink(self, path: str) -> bool:
+        """Best-effort delete: swallows any OSError, ENOENT included.
 
         Args:
             path: File path to delete
+
+        Returns:
+            True if this call removed the file
         """
         try:
             os.unlink(path)
-        except FileNotFoundError:
-            pass
         except OSError:
-            pass  # Best-effort cleanup
+            return False  # Best-effort cleanup; ENOENT included
+        return True
 
     def _safe_unlink_if_same_inode(self, fd: int, path: str) -> None:
         """Unlink ``path`` only if it still resolves to the same inode as the open ``fd``.
@@ -957,12 +1031,11 @@ class FileBackend:
         except OSError:
             return
         if (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino):
-            self._safe_unlink(path)
+            if self._safe_unlink(path) and stat.S_ISREG(path_stat.st_mode):
+                self._note_removed(path_stat.st_size)
 
     def _cleanup_temp_files(self) -> None:
         """Delete orphaned temp files older than 60 seconds on startup."""
-        import stat as stat_module
-
         try:
             cache_dir = Path(self.config.cache_dir)
             current_time = time.time()
@@ -973,7 +1046,7 @@ class FileBackend:
                     stat_info = temp_file.lstat()
 
                     # Skip symlinks entirely (security: never operate on symlinks)
-                    if stat_module.S_ISLNK(stat_info.st_mode):
+                    if stat.S_ISLNK(stat_info.st_mode):
                         continue
 
                     if current_time - stat_info.st_mtime > TEMP_FILE_MAX_AGE_SECONDS:
@@ -983,105 +1056,113 @@ class FileBackend:
         except Exception:  # noqa: S110
             pass  # Don't fail init on cleanup errors
 
+    def _scan_entries(self) -> list[tuple[str, float, int | None]] | None:
+        """One pass over the cache directory: (path, mtime, size) of every cache entry.
+
+        Skips hidden files, temp files, symlinks and anything else that is not a regular file, and
+        entries deleted mid-scan. An entry whose stat fails any other way (EIO, ESTALE) is kept with
+        size None and mtime 0, so the count never runs low on a partial scan and eviction tries it
+        first. Returns None if the directory cannot be read.
+        """
+        entries = []
+        try:
+            with os.scandir(self.config.cache_dir) as it:
+                for entry in it:
+                    if entry.name.startswith(".") or ".tmp." in entry.name:
+                        continue
+                    try:
+                        # lstat, never follow a symlink (security)
+                        stat_info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # Deleted mid-scan
+                    except OSError as stat_exc:
+                        _warn_throttled(
+                            _stat_failed_warn,
+                            "FileBackend could not stat %s (%s); its size is left out of the total and every set() rescans",
+                            entry.path,
+                            errno.errorcode.get(stat_exc.errno or 0, type(stat_exc).__name__),
+                        )
+                        entries.append((entry.path, 0.0, None))
+                        continue
+                    if stat.S_ISREG(stat_info.st_mode):
+                        entries.append((entry.path, stat_info.st_mtime, stat_info.st_size))
+        except OSError as exc:
+            _warn_throttled(
+                _scan_failed_warn,
+                "FileBackend could not scan %s (%s); the entry counters keep their last values until a scan succeeds",
+                self.config.cache_dir,
+                errno.errorcode.get(exc.errno or 0, type(exc).__name__),
+            )
+            return None
+        return entries
+
+    def _reconcile(self) -> list[tuple[str, float, int | None]] | None:
+        """Reset the entry counters from a fresh scan and return the scanned entries.
+
+        A failed scan returns None and leaves the counters and the reconcile clock untouched:
+        zeroing them would switch off the entry cap and eviction until the next rescan. A scan with
+        an entry of unknown size undercounts bytes, so it marks the counters stale: every set()
+        rescans, as it did before the counters, until a scan sees every size.
+        """
+        entries = self._scan_entries()
+        if entries is None:
+            return None
+        self._entry_count = len(entries)
+        self._entry_bytes = sum(size or 0 for _, _, size in entries)
+        complete = all(size is not None for _, _, size in entries)
+        self._reconciled_at = time.monotonic() if complete else float("-inf")
+        return entries
+
     def _calculate_cache_size(self) -> tuple[float, int]:
-        """Calculate total cache size in MB and file count.
+        """Calculate total cache size in MB and file count from a fresh scan.
 
         Returns:
             Tuple of (size_mb, file_count)
         """
-        import stat as stat_module
+        entries = self._scan_entries() or []
+        return sum(size or 0 for _, _, size in entries) / (1024 * 1024), len(entries)
 
-        try:
-            cache_dir = Path(self.config.cache_dir)
-            total_bytes = 0
-            file_count = 0
-
-            for file_path in cache_dir.iterdir():
-                if file_path.name.startswith("."):
-                    continue
-                # Skip temp files
-                if ".tmp." in file_path.name:
-                    continue
-                try:
-                    # Use lstat() to avoid following symlinks (security)
-                    stat_info = file_path.lstat()
-                    # Skip symlinks and non-regular files
-                    if not stat_module.S_ISREG(stat_info.st_mode):
-                        continue
-                    total_bytes += stat_info.st_size
-                    file_count += 1
-                except OSError:
-                    pass  # File might have been deleted
-
-            return total_bytes / (1024 * 1024), file_count
-
-        except Exception:
-            return 0.0, 0
+    def _over_eviction_trigger(self) -> bool:
+        """True when the counters exceed 90% of max_size_mb or max_entry_count."""
+        return (
+            self._entry_bytes > self.config.max_size_mb * 1024 * 1024 * EVICTION_TRIGGER_THRESHOLD
+            or self._entry_count > self.config.max_entry_count * EVICTION_TRIGGER_THRESHOLD
+        )
 
     def _maybe_evict(self) -> None:
-        """Trigger eviction if cache exceeds 90% capacity.
+        """Trigger eviction if cache exceeds 90% capacity (caller holds self._lock).
 
         Evicts the oldest-written files (by mtime; reads do not refresh it) until cache is at 70% capacity.
-        Respects both max_size_mb and max_entry_count limits.
+        Respects both max_size_mb and max_entry_count limits. Decides on the counters, and rescans
+        before evicting anything, so a count drifted by another process never evicts on its own.
         """
-        import stat as stat_module
-
-        cache_size_mb, file_count = self._calculate_cache_size()
-
-        # Check if eviction needed (90% threshold)
-        size_trigger = cache_size_mb > (self.config.max_size_mb * EVICTION_TRIGGER_THRESHOLD)
-        count_trigger = file_count > (self.config.max_entry_count * EVICTION_TRIGGER_THRESHOLD)
-
-        if not (size_trigger or count_trigger):
+        stale = time.monotonic() - self._reconciled_at >= RECONCILE_INTERVAL_SECONDS
+        if not (stale or self._over_eviction_trigger()):
+            return
+        entries = self._reconcile()
+        if entries is None or not self._over_eviction_trigger():
             return
 
-        # Calculate target thresholds (70%)
-        target_size_mb = self.config.max_size_mb * EVICTION_TARGET_THRESHOLD
+        target_bytes = self.config.max_size_mb * 1024 * 1024 * EVICTION_TARGET_THRESHOLD
         target_count = int(self.config.max_entry_count * EVICTION_TARGET_THRESHOLD)
 
-        try:
-            cache_dir = Path(self.config.cache_dir)
-
-            # Collect all cache files with mtime
-            files_with_mtime = []
-            for file_path in cache_dir.iterdir():
-                if file_path.name.startswith("."):
-                    continue
-                # Skip temp files
-                if ".tmp." in file_path.name:
-                    continue
-                try:
-                    # Use lstat() to avoid following symlinks (security)
-                    stat_info = file_path.lstat()
-                    # Skip symlinks and non-regular files
-                    if not stat_module.S_ISREG(stat_info.st_mode):
-                        continue
-                    files_with_mtime.append((file_path, stat_info.st_mtime, stat_info.st_size))
-                except OSError:
-                    pass  # File might have been deleted
-
-            # Sort by mtime (oldest first)
-            files_with_mtime.sort(key=lambda x: x[1])
-
-            # Evict files until below target thresholds
-            current_size_mb = cache_size_mb
-            current_count = file_count
-
-            for file_path, _, file_size in files_with_mtime:
-                # Check if we've reached target thresholds
-                if current_size_mb <= target_size_mb and current_count <= target_count:
-                    break
-
-                # Delete file
-                try:
-                    file_path.unlink()
-                    current_size_mb -= file_size / (1024 * 1024)
-                    current_count -= 1
-                except OSError:
-                    pass  # File might have been deleted by another thread
-
-        except Exception:  # noqa: S110
-            pass  # Best-effort eviction, don't fail the operation
+        entries.sort(key=lambda e: e[1])  # oldest mtime first
+        for path, _, size in entries:
+            if self._entry_bytes <= target_bytes and self._entry_count <= target_count:
+                break
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                continue  # Deleted by another thread or process since the scan
+            except OSError as exc:
+                _warn_throttled(
+                    _unlink_failed_warn,
+                    "FileBackend eviction could not remove %s (%s)",
+                    path,
+                    errno.errorcode.get(exc.errno or 0, type(exc).__name__),
+                )
+                continue
+            self._note_removed(size or 0)
 
     def _acquire_file_lock(self, fd: int, exclusive: bool) -> None:
         """Acquire file-level lock (fcntl on POSIX, msvcrt on Windows).

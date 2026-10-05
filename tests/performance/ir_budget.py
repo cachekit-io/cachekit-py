@@ -99,6 +99,7 @@ PATHS = (
     "serializer_orjson",
     "serializer_arrow",
     "serializer_encrypted",
+    "file_set",
 )
 
 # ── gate ────────────────────────────────────────────────────────────────────────────────────
