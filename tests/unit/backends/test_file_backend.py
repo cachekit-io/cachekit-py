@@ -56,7 +56,7 @@ def backend(config: FileBackendConfig) -> FileBackend:
 def _scan_counters(backend: FileBackend) -> tuple[int, int]:
     """(entry count, bytes) from a fresh scan of the cache directory."""
     entries = backend._scan_entries()
-    return len(entries), sum(size for _, _, size in entries)
+    return len(entries), sum(size or 0 for _, _, size in entries)
 
 
 class _FailingStatEntry:
@@ -67,6 +67,13 @@ class _FailingStatEntry:
 
     def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
         raise OSError(errno.ENOENT, "File deleted")
+
+
+class _FailingEIOEntry(_FailingStatEntry):
+    """os.DirEntry stand-in whose stat() fails with EIO: the file exists but cannot be read."""
+
+    def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+        raise OSError(errno.EIO, "I/O error")
 
 
 def _scandir_failing_stat_on(monkeypatch: pytest.MonkeyPatch, nth: int) -> None:
@@ -1599,6 +1606,35 @@ class TestEntryBookkeeping:
             backend.set(f"new{i}", b"v")
         monkeypatch.undo()
         assert backend._calculate_cache_size()[1] == 70
+
+    def test_scan_with_an_unknown_size_is_not_trusted_for_the_size_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transient stat failure hides an entry's bytes, so the next set() rescans and evicts on size."""
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=2, max_value_mb=1))
+        backend.set("a", b"x" * 700_000)
+        backend.set("b", b"x" * 700_000)
+        real_scandir = os.scandir
+
+        class _OneEIO:
+            def __init__(self, path: Any) -> None:
+                with real_scandir(path) as it:
+                    self._entries = [_FailingEIOEntry(e) if i == 0 else e for i, e in enumerate(it)]
+
+            def __enter__(self) -> list[Any]:
+                return self._entries
+
+            def __exit__(self, *exc: object) -> None:
+                pass
+
+        monkeypatch.setattr(os, "scandir", _OneEIO)
+        backend._reconcile()  # one entry's bytes unseen: 700,028 counted of 1,400,056
+        monkeypatch.undo()
+        assert backend._entry_bytes < 1_000_000
+
+        backend.set("c", b"x" * 600_000)  # the scan was incomplete, so this set rescans and sees 2.0 MB
+        assert backend._calculate_cache_size()[0] <= 2 * EVICTION_TARGET_THRESHOLD
+        assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
 
     def test_failed_capacity_rescan_fails_closed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """At the cap with an unreadable directory, a new entry is rejected on the count it has."""

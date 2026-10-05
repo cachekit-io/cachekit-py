@@ -153,7 +153,9 @@ evicts on a stale count, and then evicts the oldest-written entries; that happen
 every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `max_entry_count`
 scans before it rejects; if the directory cannot be read just then, it rejects on the count it
 has, keeping the cap rather than guessing. And the first `set()` more than 30 seconds after the last scan
-rescans, because the counters cannot see other processes' writes to the same directory. So
+rescans, because the counters cannot see other processes' writes to the same directory. If a scan
+cannot read some entry's size, every `set()` rescans until a scan reads them all, so the
+size cap is never decided on bytes the backend could not see. So
 the latency tail of `set()` grows with the cache, and the typical `set()` does not.
 `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
 blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.

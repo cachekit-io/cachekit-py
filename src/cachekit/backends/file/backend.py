@@ -1037,13 +1037,13 @@ class FileBackend:
         except Exception:  # noqa: S110
             pass  # Don't fail init on cleanup errors
 
-    def _scan_entries(self) -> list[tuple[str, float, int]] | None:
+    def _scan_entries(self) -> list[tuple[str, float, int | None]] | None:
         """One pass over the cache directory: (path, mtime, size) of every cache entry.
 
         Skips hidden files, temp files, symlinks and anything else that is not a regular file, and
         entries deleted mid-scan. An entry whose stat fails any other way (EIO, ESTALE) is kept with
-        size 0 and mtime 0, so the count never runs low on a partial scan and eviction tries it first.
-        Returns None if the directory cannot be read.
+        size None and mtime 0, so the count never runs low on a partial scan and eviction tries it
+        first. Returns None if the directory cannot be read.
         """
         entries = []
         try:
@@ -1057,7 +1057,7 @@ class FileBackend:
                     except FileNotFoundError:
                         continue  # Deleted mid-scan
                     except OSError:
-                        entries.append((entry.path, 0.0, 0))
+                        entries.append((entry.path, 0.0, None))
                         continue
                     if stat.S_ISREG(stat_info.st_mode):
                         entries.append((entry.path, stat_info.st_mtime, stat_info.st_size))
@@ -1065,18 +1065,21 @@ class FileBackend:
             return None
         return entries
 
-    def _reconcile(self) -> list[tuple[str, float, int]] | None:
+    def _reconcile(self) -> list[tuple[str, float, int | None]] | None:
         """Reset the entry counters from a fresh scan and return the scanned entries.
 
         A failed scan returns None and leaves the counters and the reconcile clock untouched:
-        zeroing them would switch off the entry cap and eviction until the next rescan.
+        zeroing them would switch off the entry cap and eviction until the next rescan. A scan with
+        an entry of unknown size undercounts bytes, so it marks the counters stale: every set()
+        rescans, as it did before the counters, until a scan sees every size.
         """
         entries = self._scan_entries()
         if entries is None:
             return None
         self._entry_count = len(entries)
-        self._entry_bytes = sum(size for _, _, size in entries)
-        self._reconciled_at = time.monotonic()
+        self._entry_bytes = sum(size or 0 for _, _, size in entries)
+        complete = all(size is not None for _, _, size in entries)
+        self._reconciled_at = time.monotonic() if complete else float("-inf")
         return entries
 
     def _calculate_cache_size(self) -> tuple[float, int]:
@@ -1086,7 +1089,7 @@ class FileBackend:
             Tuple of (size_mb, file_count)
         """
         entries = self._scan_entries() or []
-        return sum(size for _, _, size in entries) / (1024 * 1024), len(entries)
+        return sum(size or 0 for _, _, size in entries) / (1024 * 1024), len(entries)
 
     def _over_eviction_trigger(self) -> bool:
         """True when the counters exceed 90% of max_size_mb or max_entry_count."""
@@ -1120,7 +1123,7 @@ class FileBackend:
                 os.unlink(path)
             except OSError:
                 continue  # File might have been deleted by another thread or process
-            self._note_removed(size)
+            self._note_removed(size or 0)
 
     def _acquire_file_lock(self, fd: int, exclusive: bool) -> None:
         """Acquire file-level lock (fcntl on POSIX, msvcrt on Windows).
