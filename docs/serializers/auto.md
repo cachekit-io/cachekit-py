@@ -61,6 +61,8 @@ These markers are Python-specific — other language SDKs (Rust, TypeScript, PHP
 
 `import cachekit` never imports numpy, pandas or pyarrow, even when they are installed. Writing an array, DataFrame or Series uses the module your code already imported. The first read of such an entry in a process imports the module it needs, so that read pays the import cost once.
 
+Without pyarrow, DataFrames use the columnar MessagePack format. If pyarrow is installed but fails to import, the first DataFrame write or Arrow read on each `AutoSerializer` logs a warning on the `cachekit.serializers.auto_serializer` logger. New DataFrames are then written in the columnar format, and reading an Arrow entry raises `SerializationError`.
+
 ## When to Use
 
 **Use `serializer='auto'` when:**
