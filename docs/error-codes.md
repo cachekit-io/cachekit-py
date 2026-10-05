@@ -179,7 +179,7 @@ wrapper = EncryptionWrapper(master_key=bytes.fromhex(hex_key))
 
 **Exception**: `TypeError`, raised when `DecoratorConfig.secure()`, `EncryptionConfig`, `CacheSerializationHandler` or `validate_encryption_config` is called, or when `@cache` or `@cache.secure` is applied
 
-**Cause**: `master_key=` takes the key as a hex string everywhere except `EncryptionWrapper`, the one entry point that takes raw key bytes ([Raw key is not 32 bytes](#raw-key-is-not-32-bytes)). Earlier releases raised `AttributeError` for a bytes key when the decorator was applied or `validate_encryption_config` ran, and on Python 3.14 `CacheSerializationHandler` read a bytes key holding ASCII hex digits as that hex.
+**Cause**: `master_key=` takes the key as a hex string everywhere except `EncryptionWrapper`, the one entry point that takes raw key bytes ([Raw key is not 32 bytes](#raw-key-is-not-32-bytes)). Earlier releases did not check the type, so what a bytes key did depended on the encryption setting. With encryption on, the decorator and `validate_encryption_config` raised `AttributeError`. With encryption unset, the decorator raised `ConfigurationError`, as for any key passed without an encryption setting. With encryption off (`encryption=False`, `EncryptionConfig(enabled=False)`), the key was accepted, and failed only when an entry encrypted before encryption was turned off was read. It now raises `TypeError` where it is passed, whatever the encryption setting. On Python 3.14, `CacheSerializationHandler` also read a bytes key holding ASCII hex digits as that hex; that key raises too.
 
 **Solution**: pass the key's hex.
 ```python

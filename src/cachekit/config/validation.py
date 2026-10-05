@@ -56,7 +56,7 @@ def hide_any_secret(value: object) -> object:
     return hide_secret(value)
 
 
-BYTES_KEY_REFUSAL = "master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes."
+_BYTES_KEY_REFUSAL = "master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes."
 
 
 def refuse_bytes_key(master_key: SecretBytes | _T) -> _T:
@@ -67,7 +67,7 @@ def refuse_bytes_key(master_key: SecretBytes | _T) -> _T:
     distinctly named one.
     """
     if isinstance(master_key, SecretBytes):
-        raise TypeError(BYTES_KEY_REFUSAL)
+        raise TypeError(_BYTES_KEY_REFUSAL)
     return master_key
 
 

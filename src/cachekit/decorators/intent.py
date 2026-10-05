@@ -19,7 +19,7 @@ from ..config.decorator import (
     UNSET,
     _reject_unsupported,
 )
-from ..config.validation import hide_any_secret, hide_secret, reveal_secret
+from ..config.validation import hide_any_secret, hide_secret, refuse_bytes_key, reveal_secret
 from .local_wrapper import _ALLOWED_PARAMS as _LOCAL_KWARGS
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
@@ -133,7 +133,7 @@ def cache(
     # A bytes master_key is wrapped too, as every form refuses it; a bytes api_key is taken, and stays as passed.
     for _name in manual_overrides.keys() & _SECRET_KWARGS:
         manual_overrides[_name] = hide_secret(manual_overrides[_name])
-    for _name in (manual_overrides.keys() - _DECORATOR_KWARGS) | (manual_overrides.keys() & {"master_key"}):
+    for _name in manual_overrides.keys() - (_DECORATOR_KWARGS - {"master_key"}):
         manual_overrides[_name] = hide_any_secret(manual_overrides[_name])
 
     def decorator(f: F) -> F:
@@ -281,6 +281,8 @@ def cache(
         elif _intent == "secure":
             # Extract master_key from overrides, fall back to env var via settings
             master_key = overrides.pop("master_key", None)
+            # Before the fallback below: an empty bytes key is falsy, and would be replaced by CACHEKIT_MASTER_KEY.
+            master_key = refuse_bytes_key(master_key)
             tenant_extractor = overrides.pop("tenant_extractor", None) or None
             if not master_key:
                 from cachekit.config.singleton import get_settings
