@@ -254,7 +254,12 @@ dependency chain allows it. Blocking as of 2026-09-29:
 
 numpy, pandas and pyarrow (the `[data]` extra) now publish `cp314t` wheels,
 but the free-threaded CI lane does not install `[data]` yet, so `[data]` on
-3.14t is untested.
+3.14t is untested. pandas 2.x does not declare free-threaded support
+(`pandas._libs.pandas_parser` re-enables the GIL when it loads). `import
+cachekit` never imports numpy, pandas or pyarrow, so installing `[data]` keeps
+the GIL off at import. Reading a cached DataFrame or Series in a fresh process
+imports pandas, and the GIL turns on then, as it does when your own code
+imports pandas.
 
 When those clear: add `-i python3.14t` targets to the `build-wheels` matrix in
 `.github/workflows/release-please.yml`, revisit `redis[hiredis]` (marker or
