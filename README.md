@@ -277,7 +277,7 @@ def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
 ```
 
-Encrypted DataFrames go through `@cache.secure`, which takes any serializer. A file backend keeps this example self-contained; production uses Redis or cachekit.io:
+Encrypted DataFrames go through `@cache.secure`, which takes any serializer whose class declares `cross_sdk_compatible = True` ([details](docs/serializers/encryption.md#composability)). A file backend keeps this example self-contained; production uses Redis or cachekit.io:
 
 ```python
 import tempfile
