@@ -438,9 +438,9 @@ class TestArrowPostDecryptContainer:
         wrapper = self._arrow_wrapper()
         _, meta = wrapper.serialize(df, cache_key="key:a")
         sealed = self._seal_bare(wrapper, df, meta, "key:a")
-        with pytest.raises(EncryptionError, match="after successful decryption"):
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
             wrapper.deserialize(sealed, meta, cache_key="key:a")
-        with pytest.raises(EncryptionError, match="after successful decryption"):
+        with pytest.raises(EncryptionError, match="lacks the checksum prefix"):
             wrapper.deserialize_without_key_identity(sealed, meta, cache_key="key:a")
 
     def test_handler_read_of_sealed_bare_arrow_is_miss_and_evicted(self, df):

@@ -564,27 +564,14 @@ class TestCompressedAadTokenIsFrozen:
 
     KEY = "ns:enc6:func:m.f:args:" + "0" * 64 + ":"
 
-    def test_secure_preset_write_seals_the_true_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_secure_preset_write_seals_the_true_token(self) -> None:
         from cachekit.config.decorator import DecoratorConfig
 
         config = DecoratorConfig.secure(master_key="a" * 64)  # pragma: allowlist secret
-        wrapper = EncryptionWrapper(
-            serializer=StandardSerializer(enable_integrity_checking=config.integrity_checking),
-            master_key=b"\xaa" * 32,
-            tenant_id="t1",
-        )
-        sealed: list[bytes] = []
-        real_create_aad = EncryptionWrapper._create_aad
+        wrapper = EncryptionWrapper(master_key=b"\xaa" * 32, tenant_id="t1")
+        _, meta = StandardSerializer(enable_integrity_checking=config.integrity_checking).serialize({"v": 1})
 
-        def spy(self: EncryptionWrapper, meta: object, key: str) -> bytes:
-            sealed.append(real_create_aad(self, meta, key))  # type: ignore[arg-type]
-            return sealed[-1]
-
-        monkeypatch.setattr(EncryptionWrapper, "_create_aad", spy)
-
-        wrapper.serialize({"v": 1}, cache_key=self.KEY)
-
-        assert wrapper._parse_aad(sealed[0])["compressed"] == "True"
+        assert wrapper._parse_aad(wrapper._create_aad(meta, self.KEY))["compressed"] == "True"
 
     def test_write_refuses_a_non_bool_compressed(self) -> None:
         wrapper = EncryptionWrapper(

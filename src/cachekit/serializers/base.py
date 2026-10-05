@@ -197,6 +197,11 @@ class SerializationFormat(Enum):
 class SerializationMetadata:
     """Metadata about serialized data.
 
+    ``encrypted`` on the metadata ``EncryptionWrapper`` passes to its inner serializer's
+    ``deserialize`` means the bytes are decrypted plaintext, whose container the reader's
+    configuration fixes: a serializer must not fall back to a legacy form it would sniff for
+    on a plaintext read.
+
     Examples:
         Create basic metadata:
 

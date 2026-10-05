@@ -466,15 +466,17 @@ class EncryptionWrapper:
         except Exception as e:
             raise SerializationError(f"Serialization failed: {e}") from e
 
+        # The AAD's compressed component is a frozen token: exactly True or False
+        # (spec/encryption.md). str() of anything else, such as a truthy 1 from a directly
+        # built serializer, would seal the entry under a token no other SDK's reader builds.
+        # Write side only: reads keep accepting what is stored.
+        if not isinstance(raw_metadata.compressed, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — serializer-supplied
+            raise EncryptionError(
+                f"Refusing to seal: serializer metadata compressed must be a bool, got {type(raw_metadata.compressed).__name__}"
+            )
+
         # Encrypt the serialized data
         try:
-            # The AAD's compressed component is a frozen token: exactly True or False
-            # (spec/encryption.md). str() of anything else, such as a truthy 1 from a directly
-            # built serializer, would seal the entry under a token no other SDK's reader builds.
-            # Write side only: reads keep accepting what is stored.
-            if not isinstance(raw_metadata.compressed, bool):  # pyright: ignore[reportUnnecessaryIsInstance] — serializer-supplied
-                raise TypeError(f"serializer metadata compressed must be a bool, got {type(raw_metadata.compressed).__name__}")
-
             # Create Additional Authenticated Data (AAD) v0x03 with cache_key binding
             aad = self._create_aad(raw_metadata, cache_key)
 

@@ -309,8 +309,7 @@ class ArrowSerializer:
 
         Returns:
             Tuple of (Arrow IPC bytes, metadata)
-            Format (integrity ON): [8-byte xxHash3-64 checksum][Arrow IPC bytes]
-            Format (integrity OFF): [Arrow IPC bytes]
+            Format: [8-byte xxHash3-64 checksum][Arrow IPC bytes]
 
         Raises:
             TypeError: If obj is not a DataFrame or dict of arrays
@@ -416,9 +415,7 @@ class ArrowSerializer:
         # than trusting an integrity flag — this auto-handles checksummed, raw (legacy
         # integrity-off), and version-mismatch data, and never feeds a checksum prefix
         # into the IPC reader (which previously leaked a bare OSError). memoryview slicing
-        # avoids the full-body copy that `data[8:]` used to make. Decrypted plaintext is the
-        # exception: the protocol selects the post-decryption container from the reader's
-        # configuration, never by sniffing, and every encrypted Arrow writer checksums.
+        # avoids the full-body copy that `data[8:]` used to make.
         mv = memoryview(data)
         n = mv.nbytes
         if n >= 14 and bytes(mv[8:14]) == b"ARROW1":
@@ -429,12 +426,12 @@ class ArrowSerializer:
                 raise SerializationError("Checksum validation failed - data corruption detected")
         elif n >= 6 and bytes(mv[:6]) == b"ARROW1":
             # Legacy raw Arrow IPC written without a checksum prefix (integrity-off entry).
-            # Plaintext only: no release wrote this form under encryption, so after a decrypt
-            # it is a container mismatch, refused like any other (miss + evict in the handler).
+            # Plaintext only. The protocol selects the post-decryption container from the
+            # reader's configuration, never by sniffing (spec/encryption.md), and no release
+            # wrote this form under encryption through the cache handler. After a decrypt it is
+            # a container mismatch, refused like any other (miss + evict in the handler).
             if metadata is not None and metadata.encrypted:
-                raise SerializationError(
-                    "Invalid data: decrypted Arrow payload lacks the checksum prefix every encrypted writer emits"
-                )
+                raise SerializationError("Invalid data: decrypted Arrow payload lacks the checksum prefix")
             body = mv
         else:
             raise SerializationError(
