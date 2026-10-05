@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
 import mmap
 import os
 import platform
@@ -27,6 +28,14 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from cachekit.backends.errors import BackendError, BackendErrorType
+from cachekit.hash_utils import _WarnThrottle
+
+logger = logging.getLogger(__name__)
+
+# A failing directory scan or eviction delete repeats on every set() until the fault clears, so each
+# logs one WARNING a minute and the rest at DEBUG.
+_scan_failed_warn = _WarnThrottle()
+_unlink_failed_warn = _WarnThrottle()
 
 # Conditional imports for platform-specific locking
 if platform.system() == "Windows":
@@ -60,6 +69,15 @@ MAX_TTL_SECONDS: int = 10 * 365 * 24 * 60 * 60  # 10 years max
 # misconfigured huge max_value_mb (or an out-of-band file dropped in cache_dir) can't map an
 # unbounded region. Above this, get_buffer() returns None and the caller falls back to os.read.
 MMAP_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MB
+
+
+def _warn_throttled(throttle: _WarnThrottle, msg: str, *args: object) -> None:
+    """Log ``msg`` at WARNING once per throttle window, with the failures since the last one; DEBUG otherwise."""
+    failures = throttle.claim()
+    if failures:
+        logger.warning(msg + " (failures since the last warning: %d)", *args, failures)
+    else:
+        logger.debug(msg, *args)
 
 
 def _read_fully(fd: int, n: int) -> bytes:
@@ -1061,7 +1079,13 @@ class FileBackend:
                         continue
                     if stat.S_ISREG(stat_info.st_mode):
                         entries.append((entry.path, stat_info.st_mtime, stat_info.st_size))
-        except Exception:
+        except OSError as exc:
+            _warn_throttled(
+                _scan_failed_warn,
+                "FileBackend could not scan %s (%s); the entry counters keep their last values until a scan succeeds",
+                self.config.cache_dir,
+                errno.errorcode.get(exc.errno or 0, type(exc).__name__),
+            )
             return None
         return entries
 
@@ -1121,8 +1145,16 @@ class FileBackend:
                 break
             try:
                 os.unlink(path)
-            except OSError:
-                continue  # File might have been deleted by another thread or process
+            except FileNotFoundError:
+                continue  # Deleted by another thread or process since the scan
+            except OSError as exc:
+                _warn_throttled(
+                    _unlink_failed_warn,
+                    "FileBackend eviction could not remove %s (%s)",
+                    path,
+                    errno.errorcode.get(exc.errno or 0, type(exc).__name__),
+                )
+                continue
             self._note_removed(size or 0)
 
     def _acquire_file_lock(self, fd: int, exclusive: bool) -> None:

@@ -14,6 +14,7 @@ Tests for backends/file/backend.py covering:
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import struct
 import time
@@ -25,6 +26,7 @@ import pytest
 import time_machine
 
 from cachekit.backends.base import BaseBackend
+from cachekit.backends.file import backend as file_backend_module
 from cachekit.backends.file.backend import (
     EVICTION_TARGET_THRESHOLD,
     EVICTION_TRIGGER_THRESHOLD,
@@ -34,6 +36,7 @@ from cachekit.backends.file.backend import (
     FileBackend,
 )
 from cachekit.backends.file.config import FileBackendConfig
+from cachekit.hash_utils import _WarnThrottle
 
 
 @pytest.fixture
@@ -51,6 +54,19 @@ def config(tmp_path: Path) -> FileBackendConfig:
 def backend(config: FileBackendConfig) -> FileBackend:
     """Create FileBackend instance."""
     return FileBackend(config)
+
+
+@pytest.fixture
+def backend_log(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
+    """Capture the backend's log with fresh warning throttles, so an earlier test's WARNING cannot mute this one's."""
+    monkeypatch.setattr(file_backend_module, "_scan_failed_warn", _WarnThrottle())
+    monkeypatch.setattr(file_backend_module, "_unlink_failed_warn", _WarnThrottle())
+    caplog.set_level(logging.DEBUG, logger=file_backend_module.__name__)
+    return caplog
+
+
+def _levels(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.levelname for r in caplog.records if r.name == file_backend_module.__name__]
 
 
 def _scan_counters(backend: FileBackend) -> tuple[int, int]:
@@ -1213,8 +1229,10 @@ class TestEvictionErrorPaths:
         assert backend.exists("trigger_eviction")
         assert backend._calculate_cache_size()[1] < 6  # evicted despite the failed stat
 
-    def test_eviction_handles_unlink_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test eviction handles unlink failure gracefully."""
+    def test_eviction_handles_unlink_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_log: pytest.LogCaptureFixture
+    ) -> None:
+        """An unlink that fails for a reason other than ENOENT is skipped and logged with its path."""
         config = FileBackendConfig(
             cache_dir=tmp_path / "cache",
             max_size_mb=2,
@@ -1245,6 +1263,32 @@ class TestEvictionErrorPaths:
         # The failed unlink stays counted; eviction moved on to the next-oldest file.
         assert unlink_count[0] > 1
         assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
+        assert _levels(backend_log) == ["WARNING"]
+        assert "could not remove" in backend_log.records[0].getMessage()
+        assert "(EACCES)" in backend_log.records[0].getMessage()
+
+    def test_eviction_skips_an_entry_already_deleted_without_logging(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_log: pytest.LogCaptureFixture
+    ) -> None:
+        """An entry another thread or process deleted since the scan is not a fault."""
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=2, max_value_mb=1))
+        for i in range(5):
+            backend.set(f"key_{i}", b"x" * 300_000)
+        original_unlink = os.unlink
+        unlink_count = [0]
+
+        def mock_unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+            unlink_count[0] += 1
+            if unlink_count[0] == 1:
+                original_unlink(path, *args, **kwargs)  # gone before this unlink lands
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", mock_unlink)
+        backend.set("trigger_eviction", b"y" * 500_000)
+
+        assert unlink_count[0] > 1
+        assert _levels(backend_log) == []
 
     def test_cleanup_temp_files_handles_exceptions(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test temp file cleanup handles exceptions gracefully."""
@@ -1670,18 +1714,32 @@ class TestEntryBookkeeping:
 class TestCalculateCacheSizeEdgeCases:
     """Test _calculate_cache_size error handling."""
 
-    def test_calculate_cache_size_handles_general_exception(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _calculate_cache_size returns (0.0, 0) on exception."""
+    def test_calculate_cache_size_handles_unreadable_directory(
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch, backend_log: pytest.LogCaptureFixture
+    ) -> None:
+        """An OSError from the scan reads as an empty cache and logs a WARNING naming the errno."""
         backend.set("key1", b"value1")
 
         def mock_scandir(path: Any) -> Any:
-            raise RuntimeError("Unexpected error")
+            raise OSError(errno.EACCES, "Permission denied")
 
         monkeypatch.setattr(os, "scandir", mock_scandir)
 
         size_mb, count = backend._calculate_cache_size()
         assert size_mb == 0.0
         assert count == 0
+        assert _levels(backend_log) == ["WARNING"]
+        assert "(EACCES)" in backend_log.records[0].getMessage()
+
+    def test_scan_lets_a_non_os_error_propagate(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Only I/O failures are expected from a scan; anything else is a bug and must surface."""
+
+        def mock_scandir(path: Any) -> Any:
+            raise RuntimeError("Unexpected error")
+
+        monkeypatch.setattr(os, "scandir", mock_scandir)
+        with pytest.raises(RuntimeError, match="Unexpected error"):
+            backend._scan_entries()
 
     def test_calculate_cache_size_skips_hidden_files(self, backend: FileBackend, config: FileBackendConfig) -> None:
         """Test _calculate_cache_size skips hidden files."""
@@ -1727,21 +1785,24 @@ class TestMaybeEvictEdgeCases:
     """Test _maybe_evict error handling."""
 
     def test_failed_rescan_neither_raises_nor_evicts_nor_zeroes_counters(
-        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch
+        self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch, backend_log: pytest.LogCaptureFixture
     ) -> None:
-        """A rescan that fails (EIO, ESTALE) skips eviction and keeps the counters it had."""
+        """A rescan that fails (EIO, ESTALE) skips eviction, keeps the counters it had, and says so once."""
         backend.set("key1", b"value1")
         backend._entry_count = backend.config.max_entry_count  # over the trigger, so eviction rescans
         before = (backend._entry_count, backend._entry_bytes, backend._reconciled_at)
 
         def mock_scandir(path: Any) -> Any:
-            raise RuntimeError("Unexpected error")
+            raise OSError(errno.EIO, "I/O error")
 
         monkeypatch.setattr(os, "scandir", mock_scandir)
 
         backend._maybe_evict()  # must not raise
+        backend._maybe_evict()  # the same fault on the next set() logs at DEBUG
 
         assert (backend._entry_count, backend._entry_bytes, backend._reconciled_at) == before
+        assert _levels(backend_log) == ["WARNING", "DEBUG"]
+        assert "(EIO)" in backend_log.records[0].getMessage()
         monkeypatch.undo()
         assert backend.exists("key1")
 

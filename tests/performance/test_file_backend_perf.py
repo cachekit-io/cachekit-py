@@ -125,9 +125,10 @@ def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> Non
     """Set/get/delete latency with ``entries`` already in the cache directory.
 
     The directory is prefilled by writing entry files directly, without a set() and its fsync
-    per entry, and the measured backend is created afterwards so its counters start from them. The timed loop cycles 10 keys through
-    set/get/delete, so the entry count stays at ``entries`` (+1) throughout. Run it on the
-    filesystem you care about with ``--basetemp``; repeat runs to see the run-to-run spread.
+    per entry, and the measured backend is created afterwards so its counters start from them.
+    The timed loop cycles 10 keys through set/get/delete, so the entry count stays at
+    ``entries`` (+1) throughout. Run it on the filesystem you care about with ``--basetemp``;
+    repeat runs to see the run-to-run spread.
     """
     config = FileBackendConfig(cache_dir=tmp_path, max_size_mb=1024, max_value_mb=100, max_entry_count=20_000)
     backend = FileBackend(config)

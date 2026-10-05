@@ -154,11 +154,17 @@ every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `ma
 scans before it rejects; if the directory cannot be read just then, it rejects on the count it
 has, keeping the cap rather than guessing. And the first `set()` more than 30 seconds after the last scan
 rescans, because the counters cannot see other processes' writes to the same directory. If a scan
-cannot read some entry's size, every `set()` rescans until a scan reads them all, so the
-size cap is never decided on bytes the backend could not see. So
+cannot read some entry's size, every `set()` rescans until a scan reads them all. A file whose
+size stays unreadable is left out of the size total, as it always was. So
 the latency tail of `set()` grows with the cache, and the typical `set()` does not.
 `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
 blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
+
+If the directory cannot be scanned at all, the counters keep their last values and nothing is
+evicted until a scan succeeds. That failure, and an eviction that cannot delete an entry for any
+reason other than the entry already being gone, logs a WARNING on the
+`cachekit.backends.file.backend` logger, at most once a minute for each of the two, with the
+number of failures since the last warning; the failures in between log at DEBUG.
 
 The counters belong to one `FileBackend` instance, not to the directory. Concurrent writers in
 several processes are unsupported (see [Characteristics](#characteristics)). If you run them anyway,
