@@ -459,6 +459,37 @@ class TestEviction:
         # rewrote it.
         assert survivors == {"e0", "new", *keys[22:]}
 
+    @pytest.mark.parametrize("mtimes", ["tied", "older_than_the_rest"])
+    def test_eviction_never_discards_the_entry_that_triggered_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mtimes: str
+    ) -> None:
+        """Rapid writes can share one coarse mtime tick; the tie must not evict the value just stored."""
+        backend = FileBackend(FileBackendConfig(cache_dir=tmp_path / "cache", max_size_mb=2, max_value_mb=1))
+        for i in range(5):  # 1.75 MB of 2 MB: the 500 KB set below crosses the 90% trigger
+            backend.set(f"key_{i}", b"x" * 350_000)
+        trigger_path = backend._key_to_path("trigger")
+        if mtimes == "tied":
+            real_scan = backend._scan_entries
+
+            def tied_scan() -> list[tuple[str, float, int | None]] | None:  # every mtime equal, the new entry listed first
+                entries = real_scan()
+                if entries is None:
+                    return None
+                return sorted(((p, 0.0, size) for p, _, size in entries), key=lambda e: e[0] != trigger_path)
+
+            monkeypatch.setattr(backend, "_scan_entries", tied_scan)
+        else:
+            future = time.time() + 60
+            for i in range(5):
+                os.utime(backend._key_to_path(f"key_{i}"), (future, future))
+
+        backend.set("trigger", b"y" * 500_000)
+        monkeypatch.undo()
+
+        assert backend.get("trigger") == b"y" * 500_000
+        assert backend._calculate_cache_size()[1] < 6  # eviction still ran, on the other entries
+        assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
+
     def test_cache_respects_max_size_and_entry_limits(self, tmp_path: Path) -> None:
         """Test that cache respects both size and entry count limits."""
         config = FileBackendConfig(
@@ -790,6 +821,23 @@ class TestCacheDirStructure:
 
         # File should exist (permissions may vary by OS)
         assert cache_files[0].exists()
+
+    def test_relative_cache_dir_is_resolved_once_at_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Writes, scans and eviction all stay in the init-time directory after a chdir."""
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        monkeypatch.chdir(tmp_path / "a")
+        backend = FileBackend(FileBackendConfig(cache_dir=Path("cache"), max_entry_count=100))
+        monkeypatch.chdir(tmp_path / "b")
+
+        backend.set("k", b"v")
+        assert backend.get("k") == b"v"
+        assert Path(backend._key_to_path("k")).parent == tmp_path / "a" / "cache"
+        for i in range(90):  # 91 > 90: the scan and the eviction must see the init-time directory
+            backend.set(f"fill{i}", b"v")
+        assert len(list((tmp_path / "a" / "cache").iterdir())) == 70
+        assert backend._calculate_cache_size()[1] == 70
+        assert not (tmp_path / "b" / "cache").exists()
 
 
 @pytest.mark.unit
@@ -1217,8 +1265,12 @@ class TestEvictionErrorPaths:
         backend = FileBackend(config)
 
         # Fill to 1.75MB of 2MB: the 500KB set below crosses the 90% trigger even with one file unseen
+        base = time.time() - 60
         for i in range(5):
             backend.set(f"key_{i}", b"x" * 350_000)
+            # Distinct, older mtimes: back-to-back writes can share one coarse timestamp tick, and a
+            # tie would let eviction pick the trigger entry itself.
+            os.utime(backend._key_to_path(f"key_{i}"), (base + i, base + i))
 
         # Fail the stat of the second file during eviction collection (concurrent deletion)
         _scandir_failing_stat_on(monkeypatch, 2)
@@ -2022,7 +2074,7 @@ class TestSecurityBugFixes:
         backend = FileBackend(config)
 
         # Disable eviction from the start to allow filling to exactly 100 entries
-        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
 
         # Fill to exactly max entry count
         for i in range(100):
@@ -2059,7 +2111,7 @@ class TestSecurityBugFixes:
         backend = FileBackend(config)
 
         # Disable eviction from the start
-        monkeypatch.setattr(backend, "_maybe_evict", lambda: None)
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
 
         # Fill to max capacity
         for i in range(100):
@@ -2363,3 +2415,88 @@ class TestShortIOFailClosed:
         assert calls == [1, 1]
         assert get_value(1) == {"result": 1}  # the rewritten entry serves
         assert calls == [1, 1]
+
+
+@pytest.mark.unit
+class TestSetLockScope:
+    """set() writes and fsyncs outside the process lock and re-checks the cap at commit."""
+
+    def test_get_does_not_wait_for_a_concurrent_set_fsync(self, backend: FileBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+        import threading
+
+        backend.set("ready", b"v")
+        in_fsync, release = threading.Event(), threading.Event()
+        real_fsync = os.fsync
+
+        def blocking_fsync(fd: int) -> None:
+            in_fsync.set()
+            release.wait(5)
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", blocking_fsync)
+        writer = threading.Thread(target=backend.set, args=("slow", b"v"))
+        writer.start()
+        try:
+            assert in_fsync.wait(5)
+            got: list[bytes | None] = []
+            reader = threading.Thread(target=lambda: got.append(backend.get("ready")))
+            reader.start()
+            reader.join(2)
+            assert got == [b"v"], "get() waited for a concurrent set()'s fsync"
+        finally:
+            release.set()
+            writer.join(5)
+        assert backend.get("slow") == b"v"
+
+    @pytest.mark.parametrize("method", ["set", "set_streaming"])
+    def test_concurrent_new_keys_at_cap_minus_one_never_exceed_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        """N writers that all pass the pre-write check at cap-1: the commit admits exactly one."""
+        import threading
+
+        from cachekit.backends.errors import BackendError
+
+        cache_dir = tmp_path / "cache"
+        backend = FileBackend(FileBackendConfig(cache_dir=cache_dir, max_entry_count=100))
+        header = backend._build_header(0)
+        for i in range(99):
+            (cache_dir / f"{i:032x}").write_bytes(header + b"v")
+        backend._reconcile()
+        # Eviction that frees nothing (every unlink failing) is what lets the count reach the cap.
+        monkeypatch.setattr(backend, "_maybe_evict", lambda **_: None)
+
+        n = 4
+        barrier = threading.Barrier(n, timeout=5)
+        real_fsync = os.fsync
+
+        def fsync_after_all_writers_checked(fd: int) -> None:
+            barrier.wait()  # every writer has passed the pre-write check before any commits
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync_after_all_writers_checked)
+        outcomes: list[str] = []
+
+        def writer(i: int) -> None:
+            try:
+                if method == "set":
+                    backend.set(f"new{i}", b"v")
+                else:
+                    backend.set_streaming(f"new{i}", lambda f: f.write(b"v"))
+                outcomes.append("ok")
+            except BackendError as exc:
+                outcomes.append("rejected" if "max_entry_count" in str(exc) else repr(exc))
+            except Exception as exc:
+                outcomes.append(repr(exc))
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        monkeypatch.undo()
+
+        assert sorted(outcomes) == ["ok"] + ["rejected"] * (n - 1)
+        assert backend._calculate_cache_size()[1] == 100
+        assert (backend._entry_count, backend._entry_bytes) == _scan_counters(backend)
+        assert not list(cache_dir.glob("*.tmp.*")), "a rejected commit left its temp file behind"

@@ -74,8 +74,8 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due, before rejecting a new entry at `max_entry_count`, or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
-- Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
+- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due, before rejecting a new entry at `max_entry_count`, or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). `set()` writes and fsyncs its temp file outside the backend's lock and takes the lock only to rename it into place, so a `get` on another thread in the same process does not wait for a concurrent `set()`'s fsync.
+- Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. The entry whose write triggered eviction is never evicted by it, even when rapid writes share one coarse mtime. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
 - Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported. Within one process, use one `FileBackend` instance per cache directory: each instance tracks only its own writes against the size and entry caps (see [Performance Characteristics](#performance-characteristics))
 - Locking: non-blocking. An operation that finds an entry's file lock held fails at once with a `TIMEOUT` `BackendError`; it does not wait
@@ -123,7 +123,9 @@ async def get_profile(user_id: str) -> dict:
 ```
 
 `refresh_ttl` rewrites only the 8-byte expiry field in place — no on-disk format change, and
-the cached payload is left untouched.
+the cached payload is left untouched. The decorator runs the TTL check as a background task, and
+`get_ttl` and `refresh_ttl` do their file I/O (and `refresh_ttl`'s fsync) in a worker thread, so
+neither the hit nor any other coroutine on the event loop waits for it.
 
 ## Limitations and Security Notes
 
@@ -157,8 +159,14 @@ rescans, because the counters cannot see other processes' writes to the same dir
 cannot read some entry's size, every `set()` rescans until a scan reads them all. A file whose
 size stays unreadable is left out of the size total, as it always was. So
 the latency tail of `set()` grows with the cache, and the typical `set()` does not.
-`get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
-blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
+`get()` and `delete()` do no scan. They wait for a concurrent `set()` on another thread in the same
+process only while it commits (the rename, the counter update and any scan above), never through its
+write or fsync. The commit checks `max_entry_count` again, so writers racing for the last free slot
+cannot push the count past the cap: one commits and the rest are rejected.
+
+`cache_dir` is resolved to an absolute path once, when the backend is created. A relative
+`cache_dir` stays bound to the working directory at that moment, and no operation pays to resolve
+the path again.
 
 If the directory cannot be scanned at all, the counters keep their last values and nothing is
 evicted until a scan succeeds. That failure, an entry whose size cannot be read during a scan,
