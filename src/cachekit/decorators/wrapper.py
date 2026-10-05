@@ -1733,8 +1733,10 @@ def create_cache_wrapper(
         # Guard clause: L1 cache check first - early return eliminates network latency.
         # It runs before the breaker's admission check and records no breaker outcome:
         # the breaker tracks backend health, and an L1 hit never reaches the backend,
-        # so it is served whatever the breaker state (LAB-5351).
-        if _l1_cache and cache_key and (interop is None or interop_checked):
+        # so it is served whatever the breaker state (LAB-5351). It waits for the backend:
+        # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
+        # then, so an entry another wrapper wrote here would read as tampered.
+        if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
             l1_found, l1_bytes = _l1_cache.get(cache_key)
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
@@ -2148,8 +2150,9 @@ def create_cache_wrapper(
                 interop_checked = True
 
             # Guard clause: L1 cache check first - early return eliminates network latency.
-            # Before admission and recording no breaker outcome, as in sync_wrapper (LAB-5351).
-            if _l1_cache and cache_key and (interop is None or interop_checked):
+            # Before admission and recording no breaker outcome, and only once the backend is
+            # resolved, as in sync_wrapper (LAB-5351).
+            if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes

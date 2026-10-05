@@ -953,9 +953,11 @@ class CacheSerializationHandler:
         prefix included, so an entry copied to another prefix (another Memcached ``key_prefix``,
         another tenant's ``t:{tenant}:``) fails authentication. A tenant-scoped backend resolves
         its prefix per context, so this is read on the same call as the backend operation.
-        An empty or non-string key is passed through as is: the wrapper's own checks refuse it.
+        Interop mode keeps the bare key, which its read path uses too: interop refuses any
+        prefixing backend. An empty or non-string key is passed through as is: the wrapper's own
+        checks refuse it.
         """
-        if not cache_key or not isinstance(cache_key, str):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime arg
+        if self.interop_mode or not cache_key or not isinstance(cache_key, str):  # pyright: ignore[reportUnnecessaryIsInstance] — runtime arg
             return cache_key
         return f"{self.backend_key_prefix()}{cache_key}"
 

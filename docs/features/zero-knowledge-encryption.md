@@ -482,15 +482,24 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
 
 The AAD binds the cache key, so ciphertext moved to another key fails authentication: a
 backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
-the one the backend is handed, after every prefix added in front of it on the client: the
-namespace, a `MemcachedBackend` `key_prefix`, and the `t:{tenant}:` prefix of the tenant-scoped
-Redis backend (env auto-detection, `RedisBackendProvider`). An entry copied from `app-a:` to
-`app-b:`, or from `t:acme:` to `t:globex:`, is refused. Backend encodings of the key (the File backend's
-hashed file name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the
-tenant scoping the CachekitIO server applies.
+the one the backend is handed, with the backend's `key_prefix` in front of it: the namespace is
+already part of the key, a `MemcachedBackend` reports its configured `key_prefix`, and the
+tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`) reports the calling
+tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
+`t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
+`key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
+name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
+scoping the CachekitIO server applies.
 
 There is one AAD per read. A read never retries with another form of the key, such as the key
 without its prefix, so a failed authentication is final.
+
+L1 is shared by every function in a namespace and keyed by the bare cache key, so it can hold
+an entry bound to another prefix: another tenant's, behind the tenant-scoped Redis backend. On a
+backend with a key prefix that read is an L1 miss and goes on to the backend, never an
+`auth_tamper`. Two encrypted functions that share a namespace and a cache key but not a backend
+prefix (one on a prefixing backend, one on an unprefixed one) read each other's L1 entries as
+failed authentication on the unprefixed side; give them separate namespaces.
 
 **Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
 encrypted entries written through a prefixing backend (`MemcachedBackend` with a `key_prefix`,
@@ -498,8 +507,11 @@ the tenant-scoped Redis backend) fail authentication after the upgrade. By defau
 entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
 overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
 until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
-(a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. Unprefixed
-backends (`RedisBackend`, `FileBackend`, `CachekitIOBackend`) and interop mode are unaffected.
+(a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. During a
+rolling upgrade, processes on the earlier release and on this one each read the other's writes
+as failed authentication, and deleting entries does not help while both run. Give the upgraded
+release a fresh key space, or stop every earlier-release process first. Unprefixed backends
+(`RedisBackend`, `FileBackend`, `CachekitIOBackend`) and interop mode are unaffected.
 
 ### Encryption Downgrade Protection (Read Path)
 

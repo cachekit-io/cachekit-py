@@ -21,12 +21,14 @@ from cachekit.backends.memcached.backend import MemcachedBackend
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.provider import PerRequestRedisBackend, tenant_context
 from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.config.decorator import set_default_backend
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 from tests.utils.memcached_helpers import mock_hash_client
 
 pytestmark = pytest.mark.critical
 
 _KEY = "ab" * 32
+_LAZY = object()
 
 
 @pytest.fixture
@@ -42,10 +44,21 @@ def memcached_store() -> Iterator[dict[str, bytes]]:
         yield store
 
 
+@pytest.fixture
+def counted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Every decrypt-failure counter label set the read path records."""
+    seen: list[dict[str, str]] = []
+    monkeypatch.setattr("cachekit.cache_handler._record_security_counter", lambda _name, labels: seen.append(labels))
+    return seen
+
+
 def _secure(backend: Any, calls: list[str], label: str, namespace: str, *, is_async: bool = False, **kwargs: Any) -> Any:
     """A secure cached function. Same name and namespace on every call, so every one of them
-    builds the same cache key; ``label`` tells which one computed a value."""
-    decorator = cache.secure(master_key=_KEY, ttl=300, namespace=namespace, backend=backend, **kwargs)
+    builds the same cache key; ``label`` tells which one computed a value. ``_LAZY`` leaves the
+    backend to be resolved at the first call."""
+    if backend is not _LAZY:  # an explicit backend=None would mean L1-only
+        kwargs["backend"] = backend
+    decorator = cache.secure(master_key=_KEY, ttl=300, namespace=namespace, **kwargs)
     if is_async:
 
         async def lookup(x: int) -> str:
@@ -78,7 +91,7 @@ def _redis_entry(client: Any, tenant: str) -> str:
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 async def test_memcached_entry_moved_to_another_key_prefix_fails_authentication(
-    memcached_store: dict[str, bytes], is_async: bool
+    memcached_store: dict[str, bytes], counted: list[dict[str, str]], is_async: bool
 ) -> None:
     calls: list[str] = []
     ns = f"aad_prefix_mc_{is_async}"
@@ -99,11 +112,12 @@ async def test_memcached_entry_moved_to_another_key_prefix_fails_authentication(
 
     assert await _call(other_prefix, 1) == "b:1"  # the moved entry failed authentication
     assert calls == ["a", "b"]
+    assert counted == [{"reason": "auth_tamper", "tier": "l2"}]
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 async def test_tenant_scoped_redis_entry_moved_to_another_tenant_fails_authentication(
-    redis_test_client: Any, is_async: bool
+    redis_test_client: Any, counted: list[dict[str, str]], is_async: bool
 ) -> None:
     """Same master key and single-tenant mode on both sides: only the ``t:{tenant}:`` prefix differs."""
     client = redis_test_client
@@ -122,10 +136,13 @@ async def test_tenant_scoped_redis_entry_moved_to_another_tenant_fails_authentic
 
     assert await _call(other, 1) == "b:1"
     assert calls == ["a", "b"]
+    assert counted == [{"reason": "auth_tamper", "tier": "l2"}]
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-async def test_shared_l1_entry_of_another_tenant_is_a_miss_not_tamper(redis_test_client: Any, is_async: bool) -> None:
+async def test_shared_l1_entry_of_another_tenant_is_a_miss_not_tamper(
+    redis_test_client: Any, counted: list[dict[str, str]], is_async: bool
+) -> None:
     """L1 is keyed by the bare cache key, so behind a context-following backend it holds one tenant's
     entry for all of them. Its AAD binds that tenant's prefix: another tenant's read is an L1 miss
     that goes on to L2, and never raises, even under fail_closed."""
@@ -145,6 +162,7 @@ async def test_shared_l1_entry_of_another_tenant_is_a_miss_not_tamper(redis_test
     assert calls == ["fn", "fn"]  # tenant-b was not served tenant-a's L1 entry
     assert await as_tenant("tenant-a") == ("fn:1", "tenant-a")  # tenant-a's own L2 entry
     assert calls == ["fn", "fn"]
+    assert counted == []
 
 
 def test_entry_written_without_the_prefix_fails_authentication(memcached_store: dict[str, bytes]) -> None:
@@ -185,3 +203,35 @@ def test_unprefixed_backend_aad_binds_the_bare_cache_key(tmp_path: Any) -> None:
     stored = backend.get(cache_key)
     assert stored is not None
     assert handler.deserialize_data(stored, cache_key=cache_key) == "fn:1"
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+async def test_lazily_resolved_wrapper_reads_l1_only_after_its_backend(
+    memcached_store: dict[str, bytes], counted: list[dict[str, str]], is_async: bool
+) -> None:
+    """A wrapper whose backend resolves at its first call does not know its key prefix before then,
+    so it must not decrypt an L1 entry another wrapper wrote under that prefix (here: the same
+    function decorated twice, which shares one cache key and the namespace's L1)."""
+    backend = MemcachedBackend(MemcachedBackendConfig(key_prefix="app:"))
+    calls: list[str] = []
+
+    def decorate() -> Any:
+        set_default_backend(None)  # no default at decoration: resolved at the first call
+        try:
+            return _secure(_LAZY, calls, "fn", f"aad_prefix_lazy_{is_async}", is_async=is_async, fail_closed=True)
+        finally:
+            set_default_backend(backend)
+
+    try:
+        assert await _call(decorate(), 1) == "fn:1"
+        assert await _call(decorate(), 1) == "fn:1"  # reads the shared L2 entry under app:
+        assert calls == ["fn"]
+        assert counted == []
+    finally:
+        set_default_backend(None)
+
+
+def test_interop_aad_keeps_the_bare_key() -> None:
+    handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=_KEY, interop_mode=True)
+    handler.backend_key_prefix = lambda: "app:"
+    assert handler._aad_key("ns:x:func:m.f:args:00:1s") == "ns:x:func:m.f:args:00:1s"
