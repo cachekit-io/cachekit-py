@@ -6,7 +6,7 @@ Tests for backends/cachekitio/client.py covering:
 - Client lifecycle: open while its lease is held, closed once the last lease is dropped
 - Client configuration (host, timeout, Authorization and User-Agent headers, a path prefix on api_url)
 - Headers on the wire: the client's own on every request, a per-request header replacing the client's
-- Cleanup via close_http_clients(); reset_global_client() drops without closing
+- Cleanup via close_http_clients(), after which a live backend re-leases; reset_global_client() drops without closing
 - State a forked child inherits: replaced, never closed (real forks: test_cachekitio_fork.py)
 
 Pool policy (proxies, keepalive, limits): test_cachekitio_pool_policy.py. Async methods: test_cachekitio_event_loops.py.
@@ -36,7 +36,7 @@ from cachekit.backends.cachekitio.client import (
     reset_global_client,
 )
 from cachekit.backends.cachekitio.config import CachekitIOBackendConfig
-from tests.utils.cachekitio_fakes import FakeRequest, fake_backend, response
+from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, response
 
 
 @pytest.fixture
@@ -206,6 +206,58 @@ class TestCloseHttpClients:
     def test_idempotent_when_no_client(self, config: CachekitIOBackendConfig) -> None:  # noqa: ARG002
         """Calling close when no client exists does not raise."""
         close_http_clients()  # no client created yet — must not raise
+
+
+@pytest.mark.unit
+class TestBackendAfterClose:
+    """A live backend recovers from close_http_clients(): its next request leases a new client.
+
+    The lease machinery is real; only each client's urllib3 pool is a FakePool, so nothing leaves the process.
+    """
+
+    @pytest.fixture
+    def pools(self, monkeypatch: pytest.MonkeyPatch) -> list[FakePool]:
+        built: list[FakePool] = []
+
+        def fake_pool(config: CachekitIOBackendConfig) -> FakePool:
+            built.append(FakePool(lambda request: response(404) if request.method == "GET" else response(200)))
+            return built[-1]
+
+        monkeypatch.setattr(client_module, "_connection_pool", fake_pool)
+        return built
+
+    def test_sync_and_async_calls_succeed_on_a_new_client(self, pools: list[FakePool]) -> None:
+        import asyncio
+
+        backend = CachekitIOBackend(api_key=_unique_key("closed"))
+        first = backend._lease
+        close_http_clients()
+        assert _is_closed(first.client)
+
+        assert backend.get("k") is None
+        backend.set("k", b"v")
+        assert backend.delete("k") is True
+        assert asyncio.run(backend.get_async("k")) is None
+
+        assert backend._lease is not first
+        assert len(pools) == 2
+        assert pools[0].requests == []
+        assert [r.method for r in pools[1].requests] == ["GET", "PUT", "DELETE", "GET"]
+
+    def test_a_later_close_on_another_thread_closes_the_new_client(self, pools: list[FakePool]) -> None:  # noqa: ARG002
+        backend = CachekitIOBackend(api_key=_unique_key("reclosed"))
+        close_http_clients()
+        releaser = threading.Thread(target=backend.get, args=("k",))
+        releaser.start()
+        releaser.join(5)
+        assert not releaser.is_alive()
+        renewed = backend._lease
+        assert not _is_closed(renewed.client)
+
+        close_http_clients()
+        assert _is_closed(renewed.client)
+        assert backend.get("k") is None
+        assert backend._lease is not renewed
 
 
 def _raise() -> None:
