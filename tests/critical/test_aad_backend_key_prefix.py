@@ -21,7 +21,7 @@ from cachekit.backends.memcached.backend import MemcachedBackend
 from cachekit.backends.memcached.config import MemcachedBackendConfig
 from cachekit.backends.redis.provider import PerRequestRedisBackend, tenant_context
 from cachekit.cache_handler import CacheSerializationHandler
-from cachekit.config.decorator import set_default_backend
+from cachekit.config.decorator import get_default_backend, set_default_backend
 from cachekit.serializers.encryption_wrapper import EncryptionWrapper
 from tests.utils.memcached_helpers import mock_hash_client
 
@@ -79,13 +79,9 @@ async def _call(fn: Any, x: int) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-def _text(key: str | bytes) -> str:
-    return key.decode() if isinstance(key, bytes) else key
-
-
 def _redis_entry(client: Any, tenant: str) -> str:
     """The one cache entry under ``tenant``'s prefix (the key registry also lives there)."""
-    [key] = [_text(k) for k in client.keys(f"t:{tenant}:ns:*")]
+    [key] = [k.decode() if isinstance(k, bytes) else k for k in client.keys(f"t:{tenant}:ns:*")]
     return key
 
 
@@ -214,6 +210,7 @@ async def test_lazily_resolved_wrapper_reads_l1_only_after_its_backend(
     function decorated twice, which shares one cache key and the namespace's L1)."""
     backend = MemcachedBackend(MemcachedBackendConfig(key_prefix="app:"))
     calls: list[str] = []
+    original = get_default_backend()
 
     def decorate() -> Any:
         set_default_backend(None)  # no default at decoration: resolved at the first call
@@ -228,10 +225,11 @@ async def test_lazily_resolved_wrapper_reads_l1_only_after_its_backend(
         assert calls == ["fn"]
         assert counted == []
     finally:
-        set_default_backend(None)
+        set_default_backend(original)
 
 
 def test_interop_aad_keeps_the_bare_key() -> None:
-    handler = CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=_KEY, interop_mode=True)
-    handler.backend_key_prefix = lambda: "app:"
+    handler = CacheSerializationHandler(
+        encryption=True, single_tenant_mode=True, master_key=_KEY, interop_mode=True, backend_key_prefix=lambda: "app:"
+    )
     assert handler._aad_key("ns:x:func:m.f:args:00:1s") == "ns:x:func:m.f:args:00:1s"

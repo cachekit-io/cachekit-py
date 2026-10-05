@@ -367,9 +367,8 @@ overwrites the entry, so tenants that share a key keep evicting each other. With
 `fail_closed=True` the read raises `DecryptionAuthenticationError` (its subclass
 `TenantMismatchError`) instead, until the entry expires or is invalidated. That lets
 whichever tenant calls a shared-key function first block every other tenant for the
-entry's TTL, and seed it again once it expires. An L1 copy encrypted for another tenant, or
-bound to another tenant's `t:{tenant}:` key prefix, is only an L1 miss, since L1 holds this
-process's own reads and writes: the read goes on to the backend. A read whose tenant cannot be resolved decrypts nothing and is a plain miss
+entry's TTL, and seed it again once it expires. In L1 such an entry is only a miss (see
+[Cache Key Binding](#cache-key-binding)). A read whose tenant cannot be resolved decrypts nothing and is a plain miss
 that keeps the entry. Either way, keep tenants on separate keys as the caution above says.
 
 ### Key Rotation Pattern
@@ -484,8 +483,10 @@ The AAD binds the cache key, so ciphertext moved to another key fails authentica
 backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
 the one the backend is handed, with the backend's `key_prefix` in front of it: the namespace is
 already part of the key, a `MemcachedBackend` reports its configured `key_prefix`, and the
-tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`) reports the calling
-tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
+tenant-scoped Redis backend reports the calling tenant's `t:{tenant}:`. That tenant-scoped
+backend is what zero-config Redis gives you: env auto-detection (`REDIS_URL`,
+`CACHEKIT_REDIS_URL`) and `RedisBackendProvider` both build it, with `t:default:` when no
+tenant is set. Only a `RedisBackend` you construct yourself is unprefixed. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
 `t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
 `key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
 name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
@@ -495,23 +496,26 @@ There is one AAD per read. A read never retries with another form of the key, su
 without its prefix, so a failed authentication is final.
 
 L1 is shared by every function in a namespace and keyed by the bare cache key, so it can hold
-an entry bound to another prefix: another tenant's, behind the tenant-scoped Redis backend. On a
+an entry bound to another prefix: another tenant's behind the tenant-scoped Redis backend, or
+another function's behind a different Memcached `key_prefix`. On a
 backend with a key prefix that read is an L1 miss and goes on to the backend, never an
 `auth_tamper`. Two encrypted functions that share a namespace and a cache key but not a backend
 prefix (one on a prefixing backend, one on an unprefixed one) read each other's L1 entries as
 failed authentication on the unprefixed side; give them separate namespaces.
 
 **Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
-encrypted entries written through a prefixing backend (`MemcachedBackend` with a `key_prefix`,
-the tenant-scoped Redis backend) fail authentication after the upgrade. By default each such
+encrypted entries written through a prefixing backend fail authentication after the upgrade:
+`MemcachedBackend` with a `key_prefix`, and the tenant-scoped Redis backend, which includes the
+default Redis backend env auto-detection builds (`t:default:` with no tenant set). By default each such
 entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
 overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
 until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
 (a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. During a
 rolling upgrade, processes on the earlier release and on this one each read the other's writes
 as failed authentication, and deleting entries does not help while both run. Give the upgraded
-release a fresh key space, or stop every earlier-release process first. Unprefixed backends
-(`RedisBackend`, `FileBackend`, `CachekitIOBackend`) and interop mode are unaffected.
+release a fresh key space, or stop every earlier-release process first. Unaffected: a
+`RedisBackend` you construct and pass as `backend=`, `FileBackend`, `CachekitIOBackend`, and
+interop mode.
 
 ### Encryption Downgrade Protection (Read Path)
 
@@ -592,10 +596,8 @@ them (cachekit-py#170):
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
   between cache keys or [key prefixes](#cache-key-binding)), or, on a cache with a
   `tenant_extractor`, a backend entry was encrypted for a tenant other than the caller's
-  (`TenantMismatchError`, refused before any decrypt attempt). In L1 these collisions are a
-  plain miss: another tenant's entry, and on a prefixing backend any authentication failure,
-  since L1 holds only this process's own entries, each bound to the prefix it was written
-  under. The
+  (`TenantMismatchError`, refused before any decrypt attempt). In L1 a collision is a plain
+  miss instead ([Cache Key Binding](#cache-key-binding)). The
   plaintext frame header fields built into the AAD
   (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
   them is authenticated by the tag: a header change that produces different AAD bytes

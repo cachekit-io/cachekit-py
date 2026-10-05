@@ -75,6 +75,17 @@ def cached_function(x):
     return expensive_computation(x)
 ```
 
+### Key prefixes: expose them as `key_prefix`
+
+If your backend adds a prefix to every key before it reaches the store, expose that prefix as a
+`key_prefix` property (a `str`, `""` for none). cachekit reads it on every operation. Interop mode
+refuses a backend with a non-empty `key_prefix`, because other SDKs would not find its keys. An
+encrypted cache binds it into each entry's AAD ahead of the cache key, so an entry moved under
+another prefix fails authentication ([Cache Key Binding](../features/zero-knowledge-encryption.md#cache-key-binding)).
+A prefix the backend adds without exposing it gets neither: interop cannot refuse it and the AAD
+does not bind it. Encodings of the whole key (hashing it into a file name, percent-encoding it into
+a URL) are not prefixes and stay out of `key_prefix`.
+
 ---
 
 ## HTTPBackend Example

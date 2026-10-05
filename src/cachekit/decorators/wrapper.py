@@ -887,6 +887,10 @@ def create_cache_wrapper(
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
 
+    def _l2_scope() -> str:
+        """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
+        return getattr(_backend, "key_prefix", None) or ""
+
     # Initialize serialization handler with encryption layer if requested
     # Serializer defines HOW to serialize (default=msgpack), encryption defines WHETHER to encrypt
     serialization_handler = CacheSerializationHandler(
@@ -899,6 +903,9 @@ def create_cache_wrapper(
         enable_integrity_checking=integrity_checking,
         encryption_fail_closed=encryption_fail_closed,
         interop_mode=interop is not None,
+        # The AAD binds the resolved backend's prefix with the cache key; read per call, since
+        # _backend may resolve lazily and a tenant-scoped prefix follows the calling context.
+        backend_key_prefix=_l2_scope,
     )
 
     # Create cache handler strategy (initialized with actual Redis client when first used)
@@ -1442,13 +1449,6 @@ def create_cache_wrapper(
     # tracking — only the calling tenant's (LAB-4773).
     _cached_keys: set[tuple[str, str]] = set()
 
-    def _l2_scope() -> str:
-        """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
-        return getattr(_backend, "key_prefix", None) or ""
-
-    # The AAD binds this prefix with the cache key (CacheSerializationHandler._aad_key).
-    serialization_handler.backend_key_prefix = _l2_scope
-
     def _foreign_l1_entry(error: SerializationError) -> bool:
         """Whether an L1 decrypt failure is a keying collision rather than tamper evidence.
 
@@ -1794,7 +1794,7 @@ def create_cache_wrapper(
                         except DecryptionAuthenticationError:
                             reset_current_function_stats(token)
                             raise
-                    # Fail open, or another tenant's entry: fall through to L2
+                    # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
                 except KeyringConfigurationError:
                     # LOCAL keyring config fault — not a poisoned L1 entry, so
                     # neither the invalidate nor the "deserialization failed"
@@ -2199,7 +2199,7 @@ def create_cache_wrapper(
                                 )
                             except DecryptionAuthenticationError:
                                 raise
-                        # Fail open, or another tenant's entry (_foreign_l1_entry): fall through to L2
+                        # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
                     except KeyringConfigurationError:
                         # LOCAL keyring config fault — see the sync L1 guard above.
                         raise
