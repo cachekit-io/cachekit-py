@@ -539,7 +539,15 @@ class AutoSerializer:
         """
         try:
             from .arrow_serializer import ArrowSerializer
-        except ImportError:
+        except ImportError as exc:
+            # No pyarrow is the expected no-[data]-extra case; an installed pyarrow that fails to import is a
+            # broken install. arrow_serializer wraps pyarrow's own error, so name the cause.
+            level = logging.WARNING if find_spec("pyarrow") is not None else logging.DEBUG
+            logger.log(
+                level,
+                "ArrowSerializer unavailable, DataFrames use the msgpack columnar fallback: %s",
+                redact_error_for_log(exc.__cause__ or exc),
+            )
             return None
         return ArrowSerializer()
 
@@ -1309,7 +1317,8 @@ class AutoSerializer:
             return 1.0  # Python-only mode has no compression
 
         # Serialize without compression to get original size
-        if HAS_NUMPY and isinstance(obj, np.ndarray):  # type: ignore[union-attr]
+        np = sys.modules.get("numpy")
+        if np is not None and isinstance(obj, np.ndarray):
             temp_data = msgpack.packb(
                 {
                     "data": obj.tobytes(),

@@ -6,6 +6,7 @@ the optional [data] extra (pyarrow).
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 
@@ -288,3 +289,26 @@ class TestDataStackLoadsOnFirstUse:
             "columnar",
             "DataFrame",
         ]
+
+    def test_estimate_compression_ratio_reads_numpy_from_sys_modules(self):
+        """estimate_compression_ratio() has no module-level numpy to lean on, plain values included."""
+        import numpy as np
+
+        from cachekit.serializers import AutoSerializer
+
+        serializer = AutoSerializer()
+        assert serializer.estimate_compression_ratio({"a": [1] * 100}) > 1
+        assert serializer.estimate_compression_ratio(np.zeros(1000)) > 1
+
+    @pytest.mark.parametrize(("pyarrow_installed", "level"), [(True, logging.WARNING), (False, logging.DEBUG)])
+    def test_arrow_serializer_unavailable_is_logged(self, monkeypatch, caplog, pyarrow_installed, level):
+        """No pyarrow falls back to msgpack columnar quietly; a pyarrow that is installed but fails to import warns."""
+        from cachekit.serializers import AutoSerializer
+
+        monkeypatch.setitem(sys.modules, "cachekit.serializers.arrow_serializer", None)
+        if not pyarrow_installed:
+            monkeypatch.setitem(sys.modules, "pyarrow", None)
+        with caplog.at_level(logging.DEBUG, logger="cachekit.serializers.auto_serializer"):
+            assert AutoSerializer()._arrow_serializer is None
+        [record] = [r for r in caplog.records if "msgpack columnar fallback" in r.getMessage()]
+        assert record.levelno == level
