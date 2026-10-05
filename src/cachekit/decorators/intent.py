@@ -14,9 +14,17 @@ from typing import Any, TypeVar
 from ..config import ConfigurationError, DecoratorConfig
 from ..config.decorator import _FIELD_NAMES, _PRESET_EXTRA_KWARGS, _SECRET_KWARGS, UNSET, _reject_unsupported
 from ..config.validation import hide_secret, reveal_secret
+from .local_wrapper import _ALLOWED_PARAMS as _LOCAL_KWARGS
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# The encryption keywords bare @cache folds into its EncryptionConfig.
+_ENCRYPTION_KWARGS = frozenset(
+    {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
+)
+# Every keyword some form of @cache takes. Each form refuses those it does not take, and every form refuses any other.
+_DECORATOR_KWARGS = _FIELD_NAMES.union(_ENCRYPTION_KWARGS, _LOCAL_KWARGS, {"l1_enabled"}, *_PRESET_EXTRA_KWARGS.values())
 
 
 def cache(
@@ -114,10 +122,10 @@ def cache(
     """
 
     # Secrets stay wrapped from here down, so no frame on an error's traceback holds them raw in a local or
-    # in this dict (CWE-532); each is unwrapped only where it is used.
-    for _secret in _SECRET_KWARGS:
-        if _secret in manual_overrides:
-            manual_overrides[_secret] = hide_secret(manual_overrides[_secret])
+    # in this dict (CWE-532); each is unwrapped only where it is used. So does a value under a keyword no form takes:
+    # it may be a key under a misspelt name (master_keey=), and a guard below can raise before the check that refuses it.
+    for _name in (manual_overrides.keys() & _SECRET_KWARGS) | (manual_overrides.keys() - _DECORATOR_KWARGS):
+        manual_overrides[_name] = hide_secret(manual_overrides[_name])
 
     def decorator(f: F) -> F:
         # Every application works on its own copy: the pops and rewrites below would otherwise empty the dict
@@ -202,8 +210,7 @@ def cache(
             from cachekit.config.nested import EncryptionConfig
 
             _enc_passthrough = isinstance(overrides.get("encryption"), EncryptionConfig)
-            _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
-            if not _enc_passthrough and (_enc_keys & overrides.keys()):
+            if not _enc_passthrough and (_ENCRYPTION_KWARGS & overrides.keys()):
                 enc_overrides: dict[str, Any] = {}
                 if "encryption" in overrides:
                     enc_overrides["enabled"] = overrides.pop("encryption")

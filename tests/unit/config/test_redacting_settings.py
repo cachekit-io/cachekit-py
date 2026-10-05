@@ -754,6 +754,46 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         ConfigurationError,
         _KEY_HEX,
     ),
+    # And when another guard raises before the keyword check: one row per such guard.
+    "config-form-misspelt-key-beside-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False, master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-misspelt-key-beside-integrity-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), integrity_checking=False, master_keey=_KEY_HEX)(
+            _cached
+        ),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-misspelt-key-beside-io-backend": (
+        {},
+        lambda: cache(config=DecoratorConfig.io(api_key=_API_KEY), backend=None, api_kye=_API_KEY)(_cached),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "minimal-intent-misspelt-key-beside-encrypting-serializer": (
+        {},
+        lambda: cache.minimal(serializer="encrypted", master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "io-intent-misspelt-key-beside-config": (
+        {},
+        lambda: cache.io(config=DecoratorConfig.minimal(), api_kye=_API_KEY)(_cached),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "bare-misspelt-key-beside-non-config": (
+        {},
+        lambda: cache(config="minimal", master_keey=_KEY_HEX)(_cached),  # type: ignore[arg-type]
+        TypeError,
+        _KEY_HEX,
+    ),
+    "local-intent-misspelt-key": ({}, lambda: cache.local(master_keey=_KEY_HEX)(_cached), TypeError, _KEY_HEX),
     "config-form-encryption-override": (
         {},
         lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),
