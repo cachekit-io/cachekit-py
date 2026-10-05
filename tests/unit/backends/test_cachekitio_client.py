@@ -146,7 +146,7 @@ class TestRequestHeaders:
             assert request.headers["Authorization"] == f"Bearer {backend._config.api_key.get_secret_value()}"
             assert request.headers["User-Agent"] == client_module._USER_AGENT
             assert request.headers["Content-Type"] == "application/octet-stream"
-        assert pool.requests[1].headers["X-TTL"] == "60"  # a per-request header rides alongside the client's
+        assert pool.requests[1].headers["X-CacheKit-TTL"] == "60"  # a per-request header rides alongside the client's
 
     async def test_per_request_header_replaces_the_clients(self) -> None:
         """The lock POST is JSON: its Content-Type must replace the client's octet-stream, never duplicate it."""

@@ -294,18 +294,19 @@ class TestSet:
         assert pool.requests[0].method == "PUT"
         assert pool.requests[0].path == "/v1/cache/cache-key"
 
-    def test_set_with_ttl_includes_x_ttl_header(self, backend: CachekitIOBackend, pool: FakePool) -> None:
-        """When ttl is provided, X-TTL header is included in the request."""
+    def test_set_with_ttl_sends_canonical_ttl_header_only(self, backend: CachekitIOBackend, pool: FakePool) -> None:
+        """When ttl is provided, X-CacheKit-TTL is sent and the legacy X-TTL is not (API-44)."""
         backend.set("cache-key", b"data", ttl=300)
 
         headers = pool.requests[0].headers
-        assert "X-TTL" in headers
-        assert headers["X-TTL"] == "300"
+        assert headers["X-CacheKit-TTL"] == "300"
+        assert "X-TTL" not in headers
 
-    def test_set_without_ttl_omits_x_ttl_header(self, backend: CachekitIOBackend, pool: FakePool) -> None:
-        """When ttl is None, X-TTL header is NOT present."""
+    def test_set_without_ttl_omits_ttl_headers(self, backend: CachekitIOBackend, pool: FakePool) -> None:
+        """When ttl is None, no TTL header is present."""
         backend.set("cache-key", b"data", ttl=None)
 
+        assert "X-CacheKit-TTL" not in pool.requests[0].headers
         assert "X-TTL" not in pool.requests[0].headers
 
     def test_set_passes_body_bytes(self, backend: CachekitIOBackend, pool: FakePool) -> None:

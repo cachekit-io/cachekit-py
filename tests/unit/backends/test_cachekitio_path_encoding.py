@@ -42,25 +42,20 @@ from cachekit.backends.cachekitio.backend import CachekitIOBackend
 from cachekit.backends.errors import BackendError, BackendErrorType
 from tests.utils.cachekitio_fakes import FakePool, FakeRequest, fake_backend, response
 
-# Keys that weaponise client-side URL normalisation (the vuln vectors),
-# plus the benign shapes that must still round-trip unchanged.
-_TRAVERSAL_KEYS = [
-    "default:../../admin",  # `/`-bearing traversal (every `/` → %2F, so no collapse)
-    "a:..",  # trailing dots but NOT an all-dot segment → must stay raw dots, must not collapse
-    "..a",  # leading dots, not an all-dot segment → sent verbatim, not rejected
-    "k?x=1#f",  # query + fragment injection
-    "a b",  # space (must not become a raw space / '+' in the path)
-    "ns:articles:func:mod.fn:args:" + ("a" * 64) + ":1s",  # canonical 7-seg key (`:` → %3A)
-]
-
-# Rule 2 reserved segments: no wire form reaches the SaaS key validator, so the
-# client must raise before building the URL (dot segments collapse client- or
-# server-side; the words are route tokens under /v1/cache/; an empty key addresses
-# no stored entry). Taken from the pinned protocol fixture's ``reject`` rows, so a
-# new reserved key reaches every operation below by re-vendoring alone.
+# Every transmittable row of the pinned protocol fixture, asserted on the request path the
+# pool receives (API-15: the rows pin the request, not just the encoder), plus local shapes
+# the fixture lacks. Rule 2 reserved segments are the fixture's ``reject`` rows: no wire
+# form reaches the SaaS key validator, so the client must raise before building the URL
+# (dot segments collapse client- or server-side; the words are route tokens under
+# /v1/cache/; an empty key addresses no stored entry). A new row of either kind reaches
+# every operation below by re-vendoring alone.
 _PATH_ENCODING_FIXTURE = Path(__file__).parents[1] / "protocol" / "fixtures" / "path-encoding.json"
-_RESERVED_KEYS = [
-    v["key"] for v in _json.loads(_PATH_ENCODING_FIXTURE.read_text(encoding="utf-8"))["vectors"] if v.get("reject")
+_VECTORS = _json.loads(_PATH_ENCODING_FIXTURE.read_text(encoding="utf-8"))["vectors"]
+_FIXTURE_ENCODED = {v["key"]: v["encoded"] for v in _VECTORS if not v.get("reject")}
+_RESERVED_KEYS = [v["key"] for v in _VECTORS if v.get("reject")]
+_TRAVERSAL_KEYS = [
+    *_FIXTURE_ENCODED,
+    "ns:articles:func:mod.fn:args:" + ("a" * 64) + ":1s",  # a second canonical 7-seg key (`:` → %3A)
 ]
 
 
@@ -118,6 +113,11 @@ def _assert_contained(request: FakeRequest, key: str, *, suffix: str = "") -> No
     # pins that ``%3A`` decodes back to ``:`` exactly once for the canonical key.
     if ":" in key:
         assert "%3A" in encoded_key, f"colon not percent-encoded in key segment: {encoded_key!r}"
+
+    # A fixture row's wire form is pinned byte-for-byte: Python hits ``encoded`` exactly,
+    # not an alternate, which keeps it byte-identical to cachekit-rs.
+    if key in _FIXTURE_ENCODED:
+        assert encoded_key == _FIXTURE_ENCODED[key], f"wire segment {encoded_key!r} != fixture {_FIXTURE_ENCODED[key]!r}"
 
 
 # ---- sync surface: GET / GET(stale) / PUT / DELETE / HEAD ------------------
