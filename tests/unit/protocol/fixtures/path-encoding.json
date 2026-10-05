@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "generator": "urllib.parse.quote(key, safe=\"\")",
   "spec": "spec/saas-api.md § Cache-Key Path Encoding",
   "ci_verification": "tools/path-encoding-verify.py (stdlib only; mutation self-test first)",
@@ -107,6 +107,96 @@
       "decoded": "f(x)!*'",
       "encoded_alternates": ["f(x)!*'"],
       "note": "Encoder-variance row (spec rule 4): `quote(safe=\"\")` and `urlencoding::encode` produce `encoded`; `encodeURIComponent` produces the alternate. Both decode to `key`. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "a\\..\\health",
+      "encoded": "a%5C..%5Chealth",
+      "decoded": "a\\..\\health",
+      "note": "Backslash traversal: a WHATWG URL parser reads a raw `\\` as `/` in an `https` URL, so a raw `a\\..\\health` reaches `/v1/cache/health`. Sent as `%5C`, it is inert. Server rejects the decoded key (charset; `..` substring)."
+    },
+    {
+      "key": ".\t.",
+      "encoded": ".%09.",
+      "decoded": ".\t.",
+      "note": "Tab between dots: a WHATWG URL parser strips every raw tab, LF and CR, so a tab left raw turns the key into `..`, a dot segment (`/v1/cache/..` collapses to `/v1/`). Server rejects the decoded key (charset)."
+    },
+    {
+      "key": ".\r\n.",
+      "encoded": ".%0D%0A.",
+      "decoded": ".\r\n.",
+      "note": "CR and LF between dots: stripped like the tab above, so left raw they turn the key into `..`; a client that writes them raw into the request line also splits the request. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": ".. ",
+      "encoded": "..%20",
+      "decoded": ".. ",
+      "note": "Trailing space: a WHATWG URL parser strips spaces and C0 controls from both ends of the URL, so a raw one at the end of the key vanishes and `/v1/cache/.. ` collapses to `/v1/`. A request-path test catches this where it cannot see a raw mid-key space, which the parser encodes as `%20` itself. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "health\u000b",
+      "encoded": "health%0B",
+      "decoded": "health\u000b",
+      "note": "Trailing C0 control (VT, 0x0B): stripped from the end of the URL like the space above, so a raw one turns the request into `/v1/cache/health`, the health endpoint. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "a\u0000b\u001fc\u007fd",
+      "encoded": "a%00b%1Fc%7Fd",
+      "decoded": "a\u0000b\u001fc\u007fd",
+      "note": "Control characters at the ends of their ranges: NUL (0x00), US (0x1F, the last C0 control) and DEL (0x7F) are each sent as `%HH`. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "%2e%2e",
+      "encoded": "%252e%252e",
+      "decoded": "%2e%2e",
+      "note": "An existing percent-escape is data: its `%` is `%25`, like any other. An encoder that keeps a valid escape raw, as never-double-encode encoders do, sends `%2e%2e`, which the server's WHATWG parse reads as a dot segment: `/v1/cache/%2e%2e/ttl` becomes `/v1/ttl`. Server rejects the decoded key (charset: `%`)."
+    },
+    {
+      "key": "caf\u00e9",
+      "encoded": "caf%C3%A9",
+      "decoded": "caf\u00e9",
+      "note": "Non-ASCII, two UTF-8 bytes: U+00E9 is `%C3%A9`, never its Latin-1 byte `%E9` (which JavaScript's `escape()` writes). Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "\ud83d\ude00",
+      "encoded": "%F0%9F%98%80",
+      "decoded": "\ud83d\ude00",
+      "note": "Non-ASCII, four UTF-8 bytes: U+1F600 is `%F0%9F%98%80`, never its two UTF-16 surrogates encoded one by one (`%ED%A0%BD%ED%B8%80`, or `escape()`'s `%uD83D%uDE00`). Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "\u2025",
+      "encoded": "%E2%80%A5",
+      "decoded": "\u2025",
+      "note": "Non-ASCII, three UTF-8 bytes: U+2025 TWO DOT LEADER. An encoder that NFKC-normalises the key first turns it into `..`, a dot segment. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "a-b~c",
+      "encoded": "a-b~c",
+      "decoded": "a-b~c",
+      "note": "Unreserved `-` and `~` stay raw, never `%2D` or `%7E` (Python's `quote` escaped `~` before 3.7). Server rejects the decoded key (charset: `~`)."
+    },
+    {
+      "key": "User:Key",
+      "encoded": "User%3AKey",
+      "decoded": "User:Key",
+      "note": "Uppercase letters are unreserved and stay raw. The server accepts this key (the `default` namespace), so these are the wire bytes rule 4 says every SDK sends for it."
+    },
+    {
+      "key": "User%3AKey",
+      "encoded": "User%253AKey",
+      "decoded": "User%3AKey",
+      "note": "As the `%2e%2e` row: an encoder that keeps `%3A` raw makes the server decode it to `:`, so the request reads and writes the entry of `User:Key`, the storable key in the row above. Server rejects the decoded key (charset: `%`)."
+    },
+    {
+      "key": "a+b&c;d,e@f$g[h]i",
+      "encoded": "a%2Bb%26c%3Bd%2Ce%40f%24g%5Bh%5Di",
+      "decoded": "a+b&c;d,e@f$g[h]i",
+      "note": "`+ & ; , @ $` are legal raw in a path segment, so an encoder with a path-segment safe set (`encodeURI`, or RFC 3986's `pchar`) leaves them raw, and a WHATWG parser leaves `[ ]` raw too. Rule 1 encodes all eight, and `+` is `%2B`, never a space. Server rejects the decoded key (charset)."
+    },
+    {
+      "key": "a\"b<c>d^e`f{g|h}i",
+      "encoded": "a%22b%3Cc%3Ed%5Ee%60f%7Bg%7Ch%7Di",
+      "decoded": "a\"b<c>d^e`f{g|h}i",
+      "note": "Printable ASCII that RFC 3986 allows in no URL component: `\" < > ^ { | }` and the backtick (the space and backslash rows hold the other two). Rule 1 encodes each. Server rejects the decoded key (charset)."
     }
   ]
 }
