@@ -129,9 +129,11 @@ def per_op(ir_lo: int, ir_hi: int) -> int:
 
 # Live child processes, so a failing or interrupted gate can kill every one of them. Once _stop is set,
 # a run that starts is killed at once: a pool thread can start one after the others were killed.
+# Re-entrant because the signal handler takes it on the main thread, which may already hold it.
 _children: set[subprocess.Popen[str]] = set()
-_children_lock = threading.Lock()
+_children_lock = threading.RLock()
 _stop = threading.Event()
+_signals: list[int] = []  # SIGINT and SIGTERM received during measure(), which raises the first
 
 
 def _kill_children() -> None:
@@ -141,48 +143,28 @@ def _kill_children() -> None:
             proc.kill()
 
 
-# Signals that arrived while the main thread was between starting a run and tracking it. Python runs
-# signal handlers on the main thread only, so only its runs can be interrupted in that gap.
-_held: list[int] | None = None
-
-
-def _interrupt(signum: int) -> None:
-    if signum == signal.SIGINT:
-        raise KeyboardInterrupt
-    raise SystemExit(128 + signum)
-
-
 def _on_signal(signum: int, _frame: object) -> None:
-    if _held is not None:
-        _held.append(signum)  # raised once the new run is tracked, so it gets killed
-        return
-    _interrupt(signum)  # unwinds measure(), which kills the live runs
+    # Python runs this on the main thread between any two bytecodes. Raising here could leave a lock
+    # taken but not yet released, or skip the rest of a cleanup, so it never raises: it kills the runs,
+    # which fails them, and measure() raises the signal once they are dead.
+    _signals.append(signum)
+    _kill_children()
 
 
 def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: float) -> None:
-    global _held
     cmd = [*prefix, sys.executable, str(WORKLOAD), path, str(n)]
     run = f"{path} n={n} layout={env.get('IR_BUDGET_LAYOUT', '-')}"
-    main = threading.current_thread() is threading.main_thread()
-    if main:
-        _held = []
-    try:
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
-        with _children_lock:
-            _children.add(proc)
-            if _stop.is_set():
-                proc.kill()
-    finally:
-        if main:
-            held, _held = _held, None
-            if held:
-                _interrupt(held[0])
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
+    with _children_lock:
+        _children.add(proc)
+        if _stop.is_set():
+            proc.kill()
     try:
         _, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{run} ran past --child-timeout ({timeout_s / 60:g} min) and was killed") from None
     finally:
-        if proc.returncode is None:  # timed out or interrupted: never leave it running
+        if proc.returncode is None:  # timed out: never leave it running
             proc.kill()
             proc.communicate()
         with _children_lock:
@@ -210,8 +192,9 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
     which moved a small path by up to 0.4% per op. No shell setting (CACHEKIT_* included) reaches
     the measured process; the two CACHEKIT_* settings below keep cachekit's background threads asleep.
 
-    Each run is killed after ``child_timeout_s``. The first failed run, SIGINT or SIGTERM kills every live
-    run before the error propagates, so no callgrind process outlives this call. Call it from the main
+    Each run is killed after ``child_timeout_s``. The first failed run kills every live run before the
+    error propagates, so no callgrind process outlives this call. SIGINT or SIGTERM kills them at once and
+    is raised, as KeyboardInterrupt or SystemExit(128 + signal), once they are dead. Call it from the main
     thread: it handles SIGINT and SIGTERM while it runs.
     """
     env = {
@@ -229,6 +212,7 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
         "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
     _stop.clear()
+    _signals.clear()
     previous = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         for path in paths:
@@ -252,9 +236,12 @@ def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_
                 pool.shutdown(wait=False, cancel_futures=True)
                 _kill_children()
     finally:
-        _kill_children()  # a warm-up run interrupted before its own cleanup could run
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        if _signals:  # every run is dead now, so the signal ends the gate in place of the failures it caused
+            if _signals[0] == signal.SIGINT:
+                raise KeyboardInterrupt from None
+            raise SystemExit(128 + _signals[0]) from None
     return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
 
 

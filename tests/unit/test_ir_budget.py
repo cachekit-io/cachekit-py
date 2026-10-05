@@ -106,7 +106,8 @@ sys.path.insert(0, sys.argv[2])
 from tests.performance import ir_budget as b
 b.WORKLOAD = Path(sys.argv[1])
 b._measure_one = lambda path, n, workdir, env, *timeout: b._run([], path, n, env, *timeout) or 0
-if len(sys.argv) > 3 and sys.argv[4] == "spawn":  # signal itself as soon as the first run is spawned
+mode = sys.argv[4] if len(sys.argv) > 4 else ""
+if mode == "spawn":  # signal itself as soon as the first run is spawned
     import os
     class SignalOnSpawn(b.subprocess.Popen):
         def __init__(self, *args, **kwargs):
@@ -114,7 +115,7 @@ if len(sys.argv) > 3 and sys.argv[4] == "spawn":  # signal itself as soon as the
             Path(sys.argv[1]).with_name("spawned").write_text(str(self.pid))
             os.kill(os.getpid(), int(sys.argv[3]))
     b.subprocess.Popen = SignalOnSpawn
-elif len(sys.argv) > 3:  # signal itself while submitting the second run, the first one live
+elif mode == "submit":  # signal itself while submitting the second run, the first one live
     import os, signal, time
     submit = b.ThreadPoolExecutor.submit
     calls = []
@@ -126,6 +127,21 @@ elif len(sys.argv) > 3:  # signal itself while submitting the second run, the fi
             os.kill(os.getpid(), int(sys.argv[3]))
         return submit(self, *args, **kwargs)
     b.ThreadPoolExecutor.submit = submit_then_signal
+elif mode == "again":  # signal itself again once the main thread takes the run lock after both runs started
+    import os, threading
+    class SignalOnceTaken:
+        def __init__(self, lock):
+            self.lock, self.fired = lock, False
+        def __enter__(self):
+            self.lock.acquire()
+            if self.fired or threading.current_thread() is not threading.main_thread():
+                return
+            if sum(f.read_text() != "1" for f in Path(sys.argv[1]).with_name("pids").iterdir()) >= 2:
+                self.fired = True
+                os.kill(os.getpid(), int(sys.argv[3]))
+        def __exit__(self, *exc):
+            self.lock.release()
+    b._children_lock = SignalOnceTaken(b._children_lock)
 b.measure(["l1_hit"], 2)
 """
 
@@ -202,13 +218,16 @@ def test_a_failed_run_fails_the_gate_without_waiting_for_the_runs_before_it(tmp_
                 os.kill(int(f.name), signal.SIGKILL)
 
 
+@pytest.mark.parametrize("again", [False, True], ids=["once", "again-while-killing"])
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
-def test_a_signal_to_the_gate_leaves_no_run_behind(tmp_path, sig: signal.Signals) -> None:
+def test_a_signal_to_the_gate_leaves_no_run_behind(tmp_path, sig: signal.Signals, again: bool) -> None:
+    """A second signal that lands while the gate holds its run lock must not leave the lock held and the runs alive."""
     script, pids = _sleeper(tmp_path)
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER)
     repo = Path(__file__).resolve().parents[2]
-    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo)])  # noqa: S603 (trusted: this test's files)
+    extra = [str(int(sig)), "again"] if again else []
+    gate = subprocess.Popen([sys.executable, str(driver), str(script), str(repo), *extra])  # noqa: S603 (trusted: this test's files)
     try:
         deadline = time.monotonic() + 30
         while sum(f.read_text() != "1" for f in pids.iterdir()) < 2:  # both measured runs started
