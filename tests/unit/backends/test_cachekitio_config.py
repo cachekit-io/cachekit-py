@@ -282,7 +282,7 @@ class TestSSRFBypassAttempts:
         assert is_private_ip("::ffff:169.254.169.254") is True
 
 
-class TestApiHost:
+class TestParseApiUrl:
     """The host checked is the host the HTTP client connects to."""
 
     @pytest.mark.parametrize(
@@ -292,6 +292,7 @@ class TestApiHost:
             ("https://API.cachekit.io:8443/v1", "api.cachekit.io"),
             ("https://[::1]:443", "::1"),
             ("https://[FE80::1]", "fe80::1"),
+            ("https://xn--mnchen-3ya.example", "xn--mnchen-3ya.example"),
         ],
     )
     def test_host(self, url: str, host: str) -> None:
@@ -318,9 +319,6 @@ class TestApiHost:
         for allow in (False, True):
             with pytest.raises(ValidationError, match="Invalid API URL"):
                 CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=allow)
-
-    def test_idna_host_accepted_in_ascii_form(self) -> None:
-        assert _parse_api_url("https://xn--mnchen-3ya.example")[0] == "xn--mnchen-3ya.example"
 
     def test_error_never_quotes_the_url(self) -> None:
         """Both parsers' own errors quote this userinfo; neither reaches the raised error or its chain."""

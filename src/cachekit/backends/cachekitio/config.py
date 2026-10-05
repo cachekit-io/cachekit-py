@@ -83,8 +83,9 @@ def _parse_api_url(url: str) -> tuple[str, ParseResult]:
 
     The client builds its connection pool with urllib3, so the host is read with urllib3's parser, the one every
     check must see. A URL that the standard library reads with a different host, or that holds a backslash, is
-    rejected: its host depends on which parser reads it. A non-ASCII host is rejected too (urllib3 reads it in its
-    IDNA ``xn--`` form, the standard library does not), so a custom host must be given in that ASCII form.
+    rejected: its host depends on which parser reads it. A non-ASCII host is rejected too (urllib3 reads it as ``xn--``,
+    or refuses it without the ``idna`` package; the standard library does neither), so a custom host must be given
+    in its ASCII ``xn--`` form.
 
     Raises:
         ValueError: If the URL cannot be parsed, holds a backslash, or the two parsers disagree on its host.
@@ -97,10 +98,11 @@ def _parse_api_url(url: str) -> tuple[str, ParseResult]:
         host = (parse_url(url).host or "").lower().strip("[]")
         parsed = urlparse(url)
     except ValueError:  # urllib3's LocationParseError is a ValueError
-        host = parsed = None
-    if host is None or parsed is None or host != (parsed.hostname or ""):
-        raise ValueError("Invalid API URL: could not be parsed")
-    return host, parsed
+        pass
+    else:
+        if host == (parsed.hostname or ""):
+            return host, parsed
+    raise ValueError("Invalid API URL: could not be parsed")
 
 
 class CachekitIOBackendConfig(BaseBackendConfig):

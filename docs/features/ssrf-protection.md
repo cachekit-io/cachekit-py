@@ -127,7 +127,7 @@ config = CachekitIOBackendConfig(
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CACHEKIT_API_URL` | API endpoint URL | `https://api.cachekit.io` |
-| `CACHEKIT_ALLOW_CUSTOM_HOST` | Allow non-cachekit.io hostnames | `false` |
+| `CACHEKIT_ALLOW_CUSTOM_HOST` | Allow hostnames other than `api.cachekit.io` and `api.staging.cachekit.io` | `false` |
 
 ## Cross-SDK Consistency
 
