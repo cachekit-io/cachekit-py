@@ -120,6 +120,8 @@ def your_function(args):
 
 A keyword that none of these parameters names raises `ConfigurationError` when the decorator is applied, on `@cache`, on every preset but `@cache.local` and beside `config=` ([details](error-codes.md#unsupported-keyword-argument)).
 
+`master_key=` (on `@cache` and `@cache.secure`) takes a hex string. A bytes key raises `TypeError` when the decorator is applied: pass `key.hex()` ([details](error-codes.md#bytes-key-where-a-hex-string-is-taken)).
+
 #### Returns
 - Cached function result or fresh computation result
 - Decorated function includes additional health check methods: `get_health_status()` and `check_health()`

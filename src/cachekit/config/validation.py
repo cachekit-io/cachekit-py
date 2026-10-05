@@ -5,9 +5,9 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args, overload
 
-from pydantic import GetCoreSchemaHandler, SecretStr, ValidationError
+from pydantic import GetCoreSchemaHandler, SecretBytes, SecretStr, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
 from pydantic_core.core_schema import ErrorType
 from pydantic_settings import BaseSettings, SettingsError
@@ -39,6 +39,36 @@ def hide_secret(value: str | _T) -> SecretStr | _T:
 def reveal_secret(value: SecretStr | _T) -> str | _T:
     """The raw value of a SecretStr; anything else passes through. Call it inline, never into a local."""
     return value.get_secret_value() if isinstance(value, SecretStr) else value
+
+
+@overload
+def hide_any_secret(value: bytes | bytearray | memoryview) -> SecretBytes: ...
+@overload
+def hide_any_secret(value: str | _T) -> SecretStr | _T: ...
+def hide_any_secret(value: object) -> object:
+    """``hide_secret`` that wraps bytes too, as SecretBytes, for a value refused if it is bytes: a value under a keyword
+    no form of ``@cache`` takes, or a ``master_key=`` that takes a hex string (see ``refuse_bytes_key``).
+
+    Never raises, so a caller rebinds its parameter through it before the refusal does.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return SecretBytes(bytes(value))
+    return hide_secret(value)
+
+
+BYTES_KEY_REFUSAL = "master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes."
+
+
+def refuse_bytes_key(master_key: SecretBytes | _T) -> _T:
+    """Return ``master_key``, which ``hide_any_secret`` has wrapped, unless it is a bytes key: then raise TypeError.
+
+    Every ``master_key=`` but EncryptionWrapper's takes a hex string. Decoding bytes there instead would put a second
+    meaning on one parameter: protocol intent-presets.md, Master Key Input, takes raw key bytes only through a
+    distinctly named one.
+    """
+    if isinstance(master_key, SecretBytes):
+        raise TypeError(BYTES_KEY_REFUSAL)
+    return master_key
 
 
 class ConfigurationError(Exception):
@@ -252,6 +282,7 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
 
     Raises:
         ConfigurationError: If encryption config is invalid
+        TypeError: If master_key is bytes, whatever ``encryption`` is: pass ``key.hex()``.
 
     Security Warning:
         Environment variables are NOT secure key storage for production.
@@ -267,7 +298,8 @@ def validate_encryption_config(encryption: bool | None = False, master_key: str 
 
         >>> validate_encryption_config(encryption=True)  # doctest: +SKIP
     """
-    master_key = hide_secret(master_key)
+    master_key = hide_any_secret(master_key)  # rebound before the refusal below can raise (CWE-532)
+    master_key = refuse_bytes_key(master_key)
     # Only validate if encryption is explicitly enabled
     if not encryption:
         return

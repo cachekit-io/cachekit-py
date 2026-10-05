@@ -17,10 +17,9 @@ from ..config.decorator import (
     _PRESET_EXTRA_KWARGS,
     _SECRET_KWARGS,
     UNSET,
-    _hide_refused,
     _reject_unsupported,
 )
-from ..config.validation import hide_secret, reveal_secret
+from ..config.validation import hide_any_secret, hide_secret, reveal_secret
 from .local_wrapper import _ALLOWED_PARAMS as _LOCAL_KWARGS
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
@@ -131,10 +130,11 @@ def cache(
     # Secrets stay wrapped from here down, so no frame on an error's traceback holds them raw in a local or
     # in this dict (CWE-532); each is unwrapped only where it is used. So does a value under a keyword no form takes:
     # it may be a key under a misspelt name (master_keey=), and a guard below can raise before the check that refuses it.
+    # A bytes master_key is wrapped too, as every form refuses it; a bytes api_key is taken, and stays as passed.
     for _name in manual_overrides.keys() & _SECRET_KWARGS:
         manual_overrides[_name] = hide_secret(manual_overrides[_name])
-    for _name in manual_overrides.keys() - _DECORATOR_KWARGS:
-        manual_overrides[_name] = _hide_refused(manual_overrides[_name])
+    for _name in (manual_overrides.keys() - _DECORATOR_KWARGS) | (manual_overrides.keys() & {"master_key"}):
+        manual_overrides[_name] = hide_any_secret(manual_overrides[_name])
 
     def decorator(f: F) -> F:
         # Every application works on its own copy: the pops and rewrites below would otherwise empty the dict
