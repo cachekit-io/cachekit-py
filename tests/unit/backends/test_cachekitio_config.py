@@ -6,6 +6,7 @@ from pydantic import SecretStr, ValidationError
 from cachekit.backends.cachekitio.config import (
     ALLOWED_HOSTS,
     CachekitIOBackendConfig,
+    _api_host,
     is_private_ip,
 )
 
@@ -51,6 +52,26 @@ class TestIsPrivateIP:
             # Bracketed IPv6
             "[::1]",
             "[fe80::1]",
+            # Unspecified, scoped, and IPv4-mapped in hex
+            "::",
+            "fe80::1%eth0",
+            "[::ffff:7f00:1]",
+            "::ffff:a9fe:a9fe",
+            # IPv4 spellings the resolver reads as these addresses
+            "127.1",
+            "2130706433",
+            "0x7f.1",
+            "0x7f000001",
+            "0177.0.0.1",
+            "10.1",
+            "167772161",
+            "0xa9.0xfe.0xa9.0xfe",
+            "0",
+            # Trailing dot, and RFC 6761 localhost names
+            "127.0.0.1.",
+            "localhost.",
+            "LOCALHOST",
+            "app.localhost",
         ],
     )
     def test_private_ips_detected(self, ip: str) -> None:
@@ -70,10 +91,19 @@ class TestIsPrivateIP:
             "172.32.0.0",  # Just above 172.16.0.0/12
             "192.167.255.255",  # Just below 192.168.0.0/16
             "192.169.0.0",  # Just above 192.168.0.0/16
+            # Public IPv4 in other spellings
+            "8.8",
+            "0x8.0x8.0x8.0x8",
+            "134744072",
+            "[::ffff:8.8.8.8]",
             # Hostnames (not IPs)
             "api.cachekit.io",
             "example.com",
             "google.com",
+            "localhost.example.com",
+            "notlocalhost",
+            "127.0.0.1.example.com",
+            "",
         ],
     )
     def test_public_ips_not_detected(self, ip: str) -> None:
@@ -97,13 +127,32 @@ class TestCachekitIOBackendConfig:
         )
         assert config.api_url == "https://api.staging.cachekit.io"
 
-    def test_subdomain_of_allowed_host(self) -> None:
-        """Subdomains of allowed hosts should be allowed."""
-        config = CachekitIOBackendConfig(
-            api_key=SecretStr("ck_test_123"),
-            api_url="https://v2.api.cachekit.io",
-        )
-        assert config.api_url == "https://v2.api.cachekit.io"
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://API.CACHEKIT.IO",
+            "https://api.cachekit.io:443",
+            "https://api.cachekit.io/v1/",
+            "https://api.staging.cachekit.io/v1?x=1#frag",
+        ],
+    )
+    def test_allowed_host_spellings(self, url: str) -> None:
+        """Case, an explicit port, a path, a query and a fragment do not change the host."""
+        assert CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url).api_url == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://v2.api.cachekit.io",
+            "https://x.api.staging.cachekit.io",
+            "https://api.cachekit.io.",
+            "https://cachekit.io",
+        ],
+    )
+    def test_allowlist_is_exact(self, url: str) -> None:
+        """Only the two API hostnames themselves are allowed; a subdomain needs allow_custom_host."""
+        with pytest.raises(ValidationError, match="not in allowlist"):
+            CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url)
 
     @pytest.mark.parametrize(
         "url",
@@ -133,6 +182,25 @@ class TestCachekitIOBackendConfig:
         """Private/internal IPs should be rejected."""
         with pytest.raises(ValidationError, match="private/internal IP"):
             CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://127.1",
+            "https://2130706433",
+            "https://0x7f.1",
+            "https://0177.0.0.1",
+            "https://[::ffff:7f00:1]",
+            "https://[::]",
+            "https://10.1:8443/v1",
+            "https://app.localhost",
+        ],
+    )
+    def test_private_ip_spellings_rejected_with_custom_host(self, url: str) -> None:
+        """Every spelling of a private address is rejected, with or without allow_custom_host."""
+        for allow in (False, True):
+            with pytest.raises(ValidationError, match="private/internal IP"):
+                CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=allow)
 
     @pytest.mark.parametrize(
         "url",
@@ -211,3 +279,51 @@ class TestSSRFBypassAttempts:
         assert is_private_ip("::ffff:127.0.0.1") is True
         assert is_private_ip("::ffff:10.0.0.1") is True
         assert is_private_ip("::ffff:169.254.169.254") is True
+
+
+class TestApiHost:
+    """The host checked is the host the HTTP client connects to."""
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("https://api.cachekit.io", "api.cachekit.io"),
+            ("https://API.cachekit.io:8443/v1", "api.cachekit.io"),
+            ("https://[::1]:443", "::1"),
+            ("https://[FE80::1]", "fe80::1"),
+        ],
+    )
+    def test_host(self, url: str, host: str) -> None:
+        assert _api_host(url) == host
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com\\.api.cachekit.io/..",
+            "https://169.254.169.254\\.api.cachekit.io/..",
+            "https://api.cachekit.io\\@example.com",
+            "https://api.cachekit.io/\\",
+            "https://ex%61mple.com",
+            "https://[fe80::1%25eth0]",
+            "https://api.cachekit.io:99999",
+            "https://exa mple.com",
+        ],
+    )
+    def test_ambiguous_or_unparseable_url_rejected(self, url: str) -> None:
+        """A URL whose host is not the same to both parsers, or that neither can parse, is rejected at config load."""
+        with pytest.raises(ValueError, match="Invalid API URL"):
+            _api_host(url)
+        for allow in (False, True):
+            with pytest.raises(ValidationError, match="Invalid API URL"):
+                CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=allow)
+
+    def test_error_never_quotes_the_url(self) -> None:
+        url = "https://user:hunter2@exa mple.com"  # pragma: allowlist secret
+        with pytest.raises(ValidationError) as excinfo:
+            CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url=url, allow_custom_host=True)
+        assert "hunter2" not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None or "hunter2" not in repr(excinfo.value.__cause__)
+
+    def test_url_without_host_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must name a host"):
+            CachekitIOBackendConfig(api_key=SecretStr("ck_test_123"), api_url="https://:443", allow_custom_host=True)

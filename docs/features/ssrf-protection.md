@@ -6,7 +6,7 @@ Server-Side Request Forgery (SSRF) protection for the CachekitIO backend.
 
 ## What This Means for @cache.io Users
 
-When you use `@cache.io`, the SDK connects to `api.cachekit.io` on your behalf. To prevent misuse, custom API URLs are blocked by default - only `api.cachekit.io` and its subdomains are allowed. If you need to point the SDK at a custom endpoint (staging, self-hosted, or testing), you must explicitly opt in via `allow_custom_host=True`.
+When you use `@cache.io`, the SDK connects to `api.cachekit.io` on your behalf. To prevent misuse, custom API URLs are blocked by default - only `api.cachekit.io` and `api.staging.cachekit.io` are allowed. If you need to point the SDK at a custom endpoint (staging, self-hosted, or testing), you must explicitly opt in via `allow_custom_host=True`.
 
 If you're seeing URL validation errors in your app, see the [Troubleshooting Guide](../troubleshooting.md) for common causes and fixes.
 
@@ -24,7 +24,7 @@ SSRF (Server-Side Request Forgery) occurs when an attacker can control the desti
 
 ## Protection Layers
 
-The SDK implements three layers of SSRF protection:
+The SDK implements three layers of SSRF protection. Every layer checks the host the HTTP client will connect to: the URL is read with the same parser that builds the connection pool, and a URL whose host is ambiguous is rejected as unparseable.
 
 ### 1. HTTPS Enforcement
 
@@ -42,7 +42,7 @@ config = CachekitIOBackendConfig(
 
 ### 2. Private IP Blocking
 
-Requests to private/internal IP addresses are blocked:
+Requests to private/internal IP addresses are blocked, in every spelling the platform resolver accepts: dotted (`127.0.0.1`), abbreviated (`127.1`), decimal (`2130706433`), hex (`0x7f.1`) and octal (`0177.0.0.1`):
 
 ```python notest
 from cachekit.backends.cachekitio import CachekitIOBackendConfig
@@ -76,14 +76,16 @@ config = CachekitIOBackendConfig(api_key="...", api_url="https://[::ffff:127.0.0
 | `192.168.0.0/16` | Private (Class C) |
 | `169.254.0.0/16` | Link-local / Cloud metadata |
 | `0.0.0.0/8` | Current network |
+| `localhost`, `*.localhost` | Loopback names (RFC 6761) |
 | `::1` | IPv6 loopback |
+| `::` | IPv6 unspecified |
 | `fe80::/10` | IPv6 link-local |
 | `fc00::/7` | IPv6 unique local |
-| `::ffff:x.x.x.x` | IPv4-mapped IPv6 (checked recursively) |
+| `::ffff:x.x.x.x` | IPv4-mapped IPv6 (checked as the IPv4 address it maps to) |
 
 ### 3. Hostname Allowlist
 
-Only known cachekit.io hostnames are allowed by default:
+Only the two cachekit.io API hostnames are allowed by default, matched exactly:
 
 ```python notest
 from cachekit.backends.cachekitio import CachekitIOBackendConfig
@@ -94,10 +96,8 @@ config = CachekitIOBackendConfig(api_key="...", api_url="https://api.cachekit.io
 # ✅ Allowed (staging)
 config = CachekitIOBackendConfig(api_key="...", api_url="https://api.staging.cachekit.io")
 
-# ✅ Allowed (subdomains)
-config = CachekitIOBackendConfig(api_key="...", api_url="https://v2.api.cachekit.io")
-
 # ❌ Raises ValueError: hostname not in allowlist
+config = CachekitIOBackendConfig(api_key="...", api_url="https://v2.api.cachekit.io")  # subdomain
 config = CachekitIOBackendConfig(api_key="...", api_url="https://evil.com")
 ```
 
@@ -136,9 +136,9 @@ This SSRF protection is implemented consistently across all CacheKit SDKs:
 | SDK | Implementation |
 |-----|----------------|
 | Python | `cachekit.backends.cachekitio.config.is_private_ip()` |
-| TypeScript | `@cachekit-io/cachekit` - `config.ts:isPrivateIP()` |
+| TypeScript | `@cachekit-io/cachekit` - `backends/url-validator.ts:validateCachekitUrl()` |
 
-Both implementations block identical IP ranges and enforce the same hostname allowlist.
+Both implementations enforce the same exact hostname allowlist and block the private ranges the protocol spec lists. Each reads the host the way its own HTTP stack will connect to it.
 
 ## Security Considerations
 
@@ -146,16 +146,16 @@ Both implementations block identical IP ranges and enforce the same hostname all
 
 2. **DNS rebinding**: The SDK checks hostnames at configuration time, not at request time. DNS rebinding attacks that resolve to private IPs after validation are mitigated by the hostname allowlist (attackers can't control `*.cachekit.io` DNS).
 
-3. **IPv4-mapped IPv6**: The SDK recursively checks `::ffff:x.x.x.x` addresses to prevent bypasses via IPv4-mapped IPv6 notation.
+3. **IPv4-mapped IPv6**: The SDK checks a `::ffff:x.x.x.x` address (in dotted or hex form) as the IPv4 address it maps to.
 
-4. **Custom hosts require trust**: When using `allow_custom_host=True`, the hostname allowlist is bypassed. This setting should only be used in controlled environments (development, testing, self-hosted). The IP blocking still applies but uses string pattern matching only.
+4. **Custom hosts require trust**: When using `allow_custom_host=True`, the hostname allowlist is bypassed. This setting should only be used in controlled environments (development, testing, self-hosted). The IP blocking still applies to literal addresses, but not to hostnames that resolve to private addresses.
 
 ## Known Limitations
 
-When `allow_custom_host=True`, the IP blocking uses **string pattern matching** (not DNS resolution). This means:
+The IP blocking reads literal addresses only; it does **not** perform DNS resolution. This means:
 
-- **Blocked**: `https://127.0.0.1`, `https://10.0.0.1`, `https://[::1]`
-- **Not blocked**: Alternative IP encodings like hex (`0x7f000001`), decimal (`2130706433`), or abbreviated (`127.1`)
+- **Blocked**: `https://127.0.0.1`, `https://127.1`, `https://0x7f000001`, `https://10.0.0.1`, `https://[::1]`, `https://localhost`
+- **Not blocked**: a hostname whose DNS record points at a private address
 
 This is intentional to avoid network dependencies during configuration loading. If you use `allow_custom_host=True`:
 
