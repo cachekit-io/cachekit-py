@@ -247,7 +247,7 @@ def get_user_data_v2(user_id):
 - [StandardSerializer (MessagePack)](default.md) — General-purpose, handles all Python types
 - [OrjsonSerializer](orjson.md) — JSON-optimized, 2-5x faster than stdlib json
 - [ArrowSerializer](arrow.md) — DataFrame-optimized, 6-23x faster for large DataFrames
-- [Encryption Wrapper](encryption.md) — Wraps any serializer for zero-knowledge caching
+- [Encryption Wrapper](encryption.md) — Wraps any cross-SDK serializer for zero-knowledge caching
 - [Caching Pydantic Models](pydantic.md) — Patterns and pitfalls for Pydantic model caching
 - [Custom Serializers](custom.md) — Implement your own via SerializerProtocol
 

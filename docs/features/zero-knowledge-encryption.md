@@ -43,7 +43,7 @@ loaded from a secret store. Never a literal in source.
 
 ## What It Does
 
-**Encryption pipeline** (works with ANY serializer):
+**Encryption pipeline** (works with any cross-SDK serializer, see [Serializer requirement](#serializer-requirement)):
 ```
 Python object (plaintext)
     ↓
@@ -280,7 +280,7 @@ if it supplies the key.
 @cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
-    # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
+    # Encryption is orthogonal: wraps any cross-SDK serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
@@ -343,6 +343,16 @@ def get_patient_records(hospital_id: int):
 df = get_patient_records(42)
 # DataFrame encrypted client-side, zero-knowledge storage
 ```
+
+### Serializer Requirement
+Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`:
+`StandardSerializer` (the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that
+sets the flag. The protocol requires the step after decryption to be the reader's configured
+serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by
+inspecting them. The decorators refuse `serializer="auto"`, an `AutoSerializer` instance and an
+unmarked custom serializer when they are applied. Code that builds an `EncryptionWrapper` directly
+gets the same `ConfigurationError` when the wrapper is constructed; earlier releases accepted any
+serializer there ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
 
 ### Multi-Tenant Isolation
 

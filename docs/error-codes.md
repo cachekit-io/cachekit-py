@@ -100,6 +100,18 @@ def get_api_keys(tenant_id: str):
 
 ---
 
+### Single-SDK serializer under encryption
+
+**Message**: `Encryption requires a cross-SDK-compatible serializer for cross-language interop. ...`
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied or when an `EncryptionWrapper` is built
+
+**Cause**: encryption was combined with a serializer that is not cross-SDK: `serializer="auto"` (or `"pythonic"`), an `AutoSerializer` instance, or a custom serializer whose class does not declare `cross_sdk_compatible = True`. The protocol requires the step after decryption to be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by inspecting them. The decorators already refuse these. `EncryptionWrapper` built directly now refuses them too; earlier releases accepted any serializer there.
+
+**Solution**: use `StandardSerializer` (the default), `OrjsonSerializer` or `ArrowSerializer`, or set `cross_sdk_compatible = True` on a custom serializer whose wire format other-language SDKs can read.
+
+---
+
 ### Invalid key format
 
 **Message**: one of

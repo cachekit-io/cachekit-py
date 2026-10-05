@@ -25,7 +25,8 @@ name, to `@cache(serializer=...)` or to any preset that takes `serializer=` rais
 when the decorator is applied: the decorator never gives it the cache key each ciphertext is bound to,
 so it could not store an entry. With `backend=None` you get a different error instead
 ([details](../error-codes.md#encrypting-serializer-on-a-decorator)). `EncryptionWrapper` stays
-available for direct use outside a decorator.
+available for direct use outside a decorator, with the same serializer rule as the decorator
+([Composability](#composability)).
 
 ```python fixture:master_key_env
 import os
@@ -65,7 +66,7 @@ def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
 
-Encryption works with any serializer — including DataFrames:
+Encryption works with any cross-SDK serializer — including DataFrames:
 
 ```python notest
 from cachekit import cache
@@ -79,14 +80,40 @@ def get_patient_records(hospital_id: int):
 
 ## Composability
 
-EncryptionWrapper works with **any** serializer:
+EncryptionWrapper works with any serializer whose class declares `cross_sdk_compatible = True`:
 
 | Inner Serializer | Use Case |
 |-----------------|---------|
 | StandardSerializer (default) | Encrypted cross-language MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
-| Custom serializers | Any data type with encryption |
+| Custom serializers that set `cross_sdk_compatible = True` | Any data type with encryption |
+
+Any other serializer raises `ConfigurationError` when the wrapper is built: `AutoSerializer`, and any
+custom serializer that does not declare the flag. The protocol requires the step after decryption to
+be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer`
+picks its format by inspecting them. `@cache.secure` and `encryption=True` refuse the same serializers
+when the decorator is applied. Earlier releases let a directly built wrapper take any serializer, so
+`EncryptionWrapper(serializer=AutoSerializer(), ...)` code that ran before now raises
+([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+
+```python
+from cachekit.config import ConfigurationError
+from cachekit.serializers import AutoSerializer, EncryptionWrapper, StandardSerializer
+
+key = bytes(range(32))  # 32 bytes from your secret store
+
+try:
+    EncryptionWrapper(serializer=AutoSerializer(), master_key=key, previous_master_keys=[])
+except ConfigurationError:
+    pass  # AutoSerializer sniffs the decrypted bytes, so it is refused
+else:
+    raise AssertionError("AutoSerializer must be refused under encryption")
+
+wrapper = EncryptionWrapper(serializer=StandardSerializer(), master_key=key, previous_master_keys=[])
+data, meta = wrapper.serialize({"ssn": "123-45-6789"}, cache_key="users:1:ssn")
+assert wrapper.deserialize(data, meta, cache_key="users:1:ssn") == {"ssn": "123-45-6789"}
+```
 
 EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
 

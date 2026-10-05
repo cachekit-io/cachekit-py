@@ -156,29 +156,6 @@ class TestAutoSerializerNumpyEdgeCases:
             serializer.deserialize(bytes(corrupted))
 
 
-@pytest.mark.unit
-class TestAutoSerializerNumpyUnderEncryption:
-    """Blast-radius check: the numpy checksum envelope must still survive encryption.
-
-    @cache.secure rejects AutoSerializer (cross_sdk_compatible=False), so this exercises the
-    direct EncryptionWrapper(serializer=AutoSerializer()) composition used in tests/tooling.
-    """
-
-    def test_numpy_roundtrip_through_encryption(self) -> None:
-        from cachekit.serializers.encryption_wrapper import EncryptionWrapper
-
-        master_key = bytes(range(32))
-        wrapper = EncryptionWrapper(serializer=AutoSerializer(), master_key=master_key)
-        original = np.arange(2000, dtype=np.float64).reshape(40, 50)
-        cache_key = "numpy:integrity:test"
-
-        # AAD v0x03 binds the cache_key into the ciphertext, so it is required both ways.
-        data, metadata = wrapper.serialize(original, cache_key=cache_key)
-        result = wrapper.deserialize(data, metadata, cache_key)
-
-        np.testing.assert_array_equal(result, original)
-
-
 def _numpy_raw(dtype: bytes, shape: tuple[int, ...], payload: bytes) -> bytes:
     """A NUMPY_RAW entry laid out exactly as ``_serialize_numpy`` writes it, fields attacker-chosen."""
     shape_data = b"".join(dim.to_bytes(4, "little") for dim in shape)

@@ -15,7 +15,6 @@ from __future__ import annotations
 import pytest
 
 from cachekit.config.singleton import get_settings, reset_settings
-from cachekit.serializers.auto_serializer import AutoSerializer
 from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 
 _HEX_KEY = "a" * 64  # 32-byte hex master key
@@ -66,7 +65,7 @@ class TestMissingKeyErrorNamesCorrectEnvVar:
         reset_settings()
         try:
             with pytest.raises(EncryptionError) as exc:
-                EncryptionWrapper(serializer=AutoSerializer(), master_key=None)
+                EncryptionWrapper(master_key=None)
             msg = str(exc.value)
             assert "CACHEKIT_MASTER_KEY" in msg
             assert "REDIS_CACHE_MASTER_KEY" not in msg

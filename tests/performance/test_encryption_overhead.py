@@ -1,7 +1,7 @@
 """Encryption overhead benchmarks for zero-knowledge caching.
 
 Measures the cost of client-side AES-256-GCM encryption across different serializers:
-- AutoSerializer (MessagePack)
+- StandardSerializer (MessagePack)
 - OrjsonSerializer (JSON)
 - ArrowSerializer (DataFrames)
 
@@ -23,7 +23,7 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
-from cachekit.serializers import AutoSerializer, EncryptionWrapper, OrjsonSerializer
+from cachekit.serializers import EncryptionWrapper, OrjsonSerializer, StandardSerializer
 
 if PANDAS_AVAILABLE:
     from cachekit.serializers import ArrowSerializer
@@ -144,7 +144,7 @@ def test_encryption_overhead_json(master_key):
 
 
 def test_encryption_overhead_msgpack(master_key):
-    """Measure encryption overhead for MessagePack data (AutoSerializer).
+    """Measure encryption overhead for MessagePack data (StandardSerializer).
 
     Use case: General Python objects, structured data with PII.
     """
@@ -167,12 +167,12 @@ def test_encryption_overhead_msgpack(master_key):
     }
 
     # Plain MessagePack
-    plain_msgpack = AutoSerializer()
+    plain_msgpack = StandardSerializer()
     result_plain = benchmark_serializer(plain_msgpack, user_data, iterations=10_000)
 
     # Encrypted MessagePack
     encrypted_msgpack = EncryptionWrapper(
-        serializer=AutoSerializer(),
+        serializer=StandardSerializer(),
         master_key=bytes.fromhex(master_key),
         tenant_id="user-tenant",
     )
@@ -183,7 +183,7 @@ def test_encryption_overhead_msgpack(master_key):
     overhead_pct = (overhead_ns / result_plain["p95"]) * 100
 
     print("\n" + "=" * 80)
-    print("ENCRYPTION OVERHEAD: MessagePack (AutoSerializer)")
+    print("ENCRYPTION OVERHEAD: MessagePack (StandardSerializer)")
     print("=" * 80)
     print(f"\nData: User profile with PII ({len(str(user_data))} chars)")
     print("\nPlain MessagePack:")
@@ -272,8 +272,8 @@ def test_encryption_overhead_comparison_summary(master_key):
 
     # MessagePack
     msgpack_data = {"profile": {"ssn": "123-45-6789", "dob": "1990-01-01"}}
-    plain_msgpack = AutoSerializer()
-    encrypted_msgpack = EncryptionWrapper(serializer=AutoSerializer(), master_key=bytes.fromhex(master_key))
+    plain_msgpack = StandardSerializer()
+    encrypted_msgpack = EncryptionWrapper(serializer=StandardSerializer(), master_key=bytes.fromhex(master_key))
     results["msgpack"] = {
         "plain": benchmark_serializer(plain_msgpack, msgpack_data, iterations=5_000),
         "encrypted": benchmark_serializer(encrypted_msgpack, msgpack_data, iterations=5_000),
