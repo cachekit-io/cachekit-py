@@ -5,10 +5,11 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 
 from __future__ import annotations
 
+import enum
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 from .nested import (
     BackpressureConfig,
@@ -28,6 +29,24 @@ if TYPE_CHECKING:
 
 
 # Backend Resolution Layer
+
+
+class _Unset(enum.Enum):
+    """Type of UNSET. An enum member stays one object through copy, deepcopy and pickle, so ``is`` holds."""
+
+    UNSET = "UNSET"
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        # Falsy like the None it replaced as the default, so `if config.backend:` still reads "no backend".
+        return False
+
+
+# DecoratorConfig.backend's default: no backend stated, so it resolves per "Backend Resolution Priority".
+# None is not the default because None states one: L1-only, the meaning backend=None has as a @cache keyword.
+UNSET = _Unset.UNSET
 
 # Module-level default backend (set via set_default_backend())
 _default_backend: BaseBackend | None = None
@@ -122,7 +141,8 @@ class DecoratorConfig:
              Example: @cache(key=lambda arr: hashlib.blake2b(arr.tobytes()).hexdigest())
         refresh_ttl_on_get: Extend TTL on cache hit
         ttl_refresh_threshold: Minimum remaining TTL fraction (0.0-1.0) to trigger refresh
-        backend: L2 backend (RedisBackend, HTTPBackend, None for L1-only)
+        backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
+                 @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".
         l1: L1 in-memory cache configuration
         circuit_breaker: Circuit breaker configuration
         backpressure: Backpressure configuration
@@ -154,7 +174,7 @@ class DecoratorConfig:
     ttl_refresh_threshold: float = 0.5
 
     # Backend abstraction (1 field)
-    backend: BaseBackend | None = None  # L2 backend: RedisBackend, HTTPBackend (future), None (L1-only)
+    backend: BaseBackend | None | Literal[_Unset.UNSET] = UNSET  # L2 backend; None = L1-only; UNSET = resolve
 
     # Nested configuration groups (5 groups)
     l1: L1CacheConfig = field(default_factory=L1CacheConfig)
@@ -244,7 +264,7 @@ class DecoratorConfig:
             "key": self.key,
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,
-            "backend": self.backend,
+            "backend": None if self.backend is UNSET else self.backend,  # the legacy dict's "unset" was None
             # L1 cache (flattened)
             "l1_enabled": self.l1.enabled,
             "l1_max_size_mb": self.l1.max_size_mb,
@@ -382,8 +402,8 @@ class DecoratorConfig:
         Note: .secure does not pin a backend; it resolves like every preset (docs/backends/README.md,
               "Backend Resolution Priority"). With REDIS_URL set and CACHEKIT_API_KEY unset, the
               encrypted values go to Redis. Pass backend= when a particular backend is required.
-              Here backend=None is the unset default; the L1-only refusal applies to
-              @cache.secure(backend=None) and @cache(config=..., backend=None).
+              backend=None is L1-only, which secure refuses at decoration with ConfigurationError:
+              L1-only stores raw objects, which cannot be ciphertext.
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:

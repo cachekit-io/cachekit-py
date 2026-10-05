@@ -281,7 +281,9 @@ def my_function():
 ### L1-Only Mode (`backend=None`)
 
 With `backend=None` the decorator caches raw Python objects in process memory (no
-serialization — tuples, sets, and frozensets keep their types). `L1CacheConfig` is
+serialization — tuples, sets, and frozensets keep their types). The keyword and a
+config's `backend=None` (`DecoratorConfig.minimal(backend=None)`, from 0.23.0) both select
+it; see [In a `DecoratorConfig`](backends/none.md#in-a-decoratorconfig). `L1CacheConfig` is
 honored as follows:
 
 - **`max_size_mb`** bounds the cache by *estimated bytes*, not entry count. Sizes of

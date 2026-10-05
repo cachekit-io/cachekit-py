@@ -88,6 +88,33 @@ The same applies to `encryption=True` and to an `EncryptionWrapper` serializer. 
 builds its own backend and raises `ConfigurationError` on any `backend=`, `None` included.
 `@cache.local` is always in-process and raises `TypeError` on a `backend=` argument.
 
+## In a `DecoratorConfig`
+
+`backend=None` inside a config object means L1-only too, from cachekit 0.23.0:
+
+```python
+from cachekit import DecoratorConfig, cache
+
+runs = []
+
+@cache(config=DecoratorConfig.minimal(ttl=60, backend=None))
+def lookup(key: str) -> str:
+    runs.append(key)
+    return key.upper()
+
+assert lookup("a") == lookup("a") == "A"
+assert runs == ["a"]  # the second call was an L1 hit
+```
+
+A config that leaves `backend` out holds `UNSET` (`from cachekit.config import UNSET`; it is falsy) and
+resolves its backend as usual; only an explicit `None` selects L1-only. `DecoratorConfig.secure(..., backend=None)`
+is refused at decoration with `ConfigurationError`, like `@cache.secure(backend=None)`.
+
+> [!WARNING]
+> Before 0.23.0, `backend=None` inside a config was treated as "not set": the function used the default
+> backend and, with none reachable, ran on every call. On those releases write
+> `@cache(config=..., backend=None)`, which works on every release.
+
 ## Upgrade Path
 
 The key advantage over `functools.lru_cache`: when you're ready to scale, just remove `backend=None`:

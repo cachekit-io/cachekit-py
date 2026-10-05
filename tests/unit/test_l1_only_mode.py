@@ -113,14 +113,9 @@ class TestL1OnlyModeBug:
 
     def test_config_minimal_with_backend_none(self):
         """
-        Test L1-only mode with DecoratorConfig preset AND backend=None.
+        Test L1-only mode with DecoratorConfig preset AND a backend=None keyword.
 
-        NOTE: L1-only mode requires backend=None at the decorator level, not in config.
-        This is because DecoratorConfig.backend defaults to None, and we can't
-        distinguish "explicit None" from "default None" in the config.
-
-        Correct usage for L1-only with presets:
-            @cache(backend=None, config=DecoratorConfig.minimal())
+        The keyword form; backend=None inside the config works too (TestConfigBackendNone).
         """
         from cachekit.config import DecoratorConfig
         from cachekit.decorators import cache
@@ -154,14 +149,11 @@ class TestL1OnlyModeBug:
         This test documents the expected behavior distinction.
         """
         from cachekit.config import DecoratorConfig
+        from cachekit.config.decorator import UNSET
 
-        # Explicit backend=None in config
-        config_explicit = DecoratorConfig(backend=None, ttl=60)
-        # The config stores the backend
-        assert config_explicit.backend is None
-
-        # This test just documents that we CAN configure backend=None
-        # The fix should make the wrapper respect this and NOT call get_backend_provider()
+        # Explicit backend=None in config is stored as None (L1-only); omitted, it is UNSET
+        assert DecoratorConfig(backend=None, ttl=60).backend is None
+        assert DecoratorConfig(ttl=60).backend is UNSET
 
     def test_async_l1_only_mode(self):
         """
@@ -359,7 +351,7 @@ class TestDefaultBackendBehavior:
     CRITICAL: Tests that @cache() WITHOUT backend=None DOES attempt provider lookup.
 
     This is the regression test for the bug where we accidentally made ALL decorators
-    L1-only by checking `config.backend is None` (which is the default).
+    L1-only by checking `config.backend is None` (then the default; UNSET is now).
     """
 
     def test_default_cache_should_call_backend_provider(self):
@@ -408,8 +400,8 @@ class TestDefaultBackendBehavior:
         """
         DecoratorConfig() with default backend SHOULD call get_backend_provider().
 
-        This specifically tests that DecoratorConfig.backend defaulting to None
-        does NOT trigger L1-only mode (the bug we fixed).
+        This specifically tests that DecoratorConfig.backend's default (UNSET)
+        does NOT trigger L1-only mode.
         """
         from cachekit.config import DecoratorConfig
         from cachekit.decorators import cache
@@ -418,7 +410,7 @@ class TestDefaultBackendBehavior:
             mock_backend = MagicMock()
             mock_provider.return_value.get_backend.return_value = mock_backend
 
-            # DecoratorConfig() has backend=None by DEFAULT - should NOT be L1-only
+            # DecoratorConfig() has backend=UNSET by DEFAULT - should NOT be L1-only
             @cache(config=DecoratorConfig(ttl=60))
             def config_func() -> str:
                 return "result"
@@ -664,3 +656,199 @@ class TestEncryptionRefusesL1Only:
             assert plain() == 1
         finally:
             reset_settings()
+
+
+@pytest.fixture
+def resolved_configs(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Capture each DecoratorConfig the decorator resolves, instead of building a wrapper."""
+    seen: list = []
+
+    def spy(f, config, **_kwargs):
+        seen.append(config)
+        return f
+
+    monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+    return seen
+
+
+class TestReusedDecoratorObject:
+    """A decorator object resolves the same configuration for every function it wraps.
+
+    Applying it once used to pop backend, l1_enabled, master_key and tenant_extractor out of the keyword
+    arguments it shares with every later application, so the second function silently lost them.
+    """
+
+    def test_reused_backend_none_caches_both_functions(self):
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = RuntimeError("Should not be called!")
+            runs = {"a": 0, "b": 0}
+            d = cache(backend=None, ttl=60)
+
+            @d
+            def a() -> int:
+                runs["a"] += 1
+                return 1
+
+            @d
+            def b() -> int:
+                runs["b"] += 1
+                return 2
+
+            a(), a(), b(), b()
+
+            assert runs == {"a": 1, "b": 1}
+            mock_provider.return_value.get_backend.assert_not_called()
+
+    def test_reused_decorator_resolves_identical_config(self, resolved_configs: list):
+        from cachekit.config.decorator import UNSET
+        from cachekit.decorators import cache
+
+        d = cache(backend=None, l1_enabled=False, ttl=60)
+        d(lambda: 1)
+        d(lambda: 2)
+
+        first, second = resolved_configs
+        assert first == second
+        assert second.backend is None and second.backend is not UNSET
+        assert second.l1.enabled is False
+
+    def test_reused_bare_encryption_keeps_shared_kwargs_wrapped(self, resolved_configs: list):
+        """The bare path used to fold the encryption kwargs into an EncryptionConfig holding the raw key,
+        stored back in the dict every application shares (CWE-532)."""
+        from pydantic import SecretStr
+
+        from cachekit.decorators import cache
+
+        d = cache(encryption=True, master_key="a" * 64, single_tenant_mode=True, backend=MagicMock())
+        d(lambda: 1)
+        d(lambda: 2)
+
+        (shared,) = (c.cell_contents for c in d.__closure__ if isinstance(c.cell_contents, dict))
+        assert shared["encryption"] is True
+        assert isinstance(shared["master_key"], SecretStr)
+        first, second = resolved_configs
+        assert first.encryption == second.encryption
+        assert second.encryption.master_key == "a" * 64
+
+    @pytest.mark.parametrize("env_key", [None, "b" * 64], ids=["env-unset", "env-other-key"])
+    def test_reused_secure_keeps_key_and_tenant_extractor(self, resolved_configs: list, monkeypatch, env_key):
+        from cachekit.config.singleton import reset_settings
+        from cachekit.decorators import cache
+        from cachekit.decorators.tenant_context import ArgumentNameExtractor
+
+        if env_key is None:
+            monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        else:
+            monkeypatch.setenv("CACHEKIT_MASTER_KEY", env_key)
+        reset_settings()
+        try:
+            extractor = ArgumentNameExtractor("org_id")
+            d = cache.secure(master_key="a" * 64, tenant_extractor=extractor, backend=MagicMock())
+            d(lambda org_id: 1)
+            d(lambda org_id: 2)  # raised ValueError (env unset) or took the env key (env set)
+        finally:
+            reset_settings()
+
+        for config in resolved_configs:
+            assert config.encryption.master_key == "a" * 64
+            assert config.encryption.tenant_extractor is extractor
+            assert config.encryption.single_tenant_mode is False
+
+
+class TestConfigBackendNone:
+    """backend=None inside a DecoratorConfig means L1-only, exactly as the @cache(backend=None) keyword does.
+
+    It used to be indistinguishable from the unset default, so the function fell back to the default
+    backend and, with none reachable, ran its body on every call.
+    """
+
+    @pytest.mark.parametrize(
+        "make_config",
+        [
+            lambda: __import__("cachekit").DecoratorConfig.minimal(ttl=60, backend=None),
+            lambda: __import__("cachekit").DecoratorConfig.production(ttl=60, backend=None),
+            lambda: __import__("cachekit").DecoratorConfig.dev(ttl=60, backend=None),
+            lambda: __import__("cachekit").DecoratorConfig.test(ttl=60, backend=None),
+            lambda: __import__("cachekit").DecoratorConfig(backend=None),
+        ],
+        ids=["minimal", "production", "dev", "test", "bare"],
+    )
+    def test_config_backend_none_caches_in_process(self, make_config):
+        from cachekit.decorators import cache
+
+        with patch("cachekit.decorators.wrapper.get_backend_provider") as mock_provider:
+            mock_provider.return_value.get_backend.side_effect = RuntimeError("Should not be called!")
+            runs = 0
+
+            @cache(config=make_config())
+            def fn() -> int:
+                nonlocal runs
+                runs += 1
+                return 1
+
+            fn(), fn()
+
+            assert runs == 1
+            mock_provider.return_value.get_backend.assert_not_called()
+
+    def test_secure_config_backend_none_raises(self):
+        from cachekit import DecoratorConfig
+        from cachekit.decorators import cache
+
+        with pytest.raises(ConfigurationError, match="backend=None is L1-only"):
+
+            @cache(config=DecoratorConfig.secure(master_key="a" * 64, backend=None))
+            def leaks() -> str:
+                return "pii"
+
+    def test_default_backend_does_not_fill_explicit_none(self, resolved_configs: list):
+        from cachekit import DecoratorConfig
+        from cachekit.config.decorator import set_default_backend
+        from cachekit.decorators import cache
+
+        set_default_backend(MagicMock())
+        try:
+            cache(config=DecoratorConfig.minimal(backend=None))(lambda: 1)
+        finally:
+            set_default_backend(None)
+
+        assert resolved_configs[0].backend is None
+
+    def test_config_backend_none_keeps_l1_only_serializer_message(self):
+        from cachekit import DecoratorConfig
+        from cachekit.decorators import cache
+        from cachekit.serializers import EncryptionWrapper
+
+        with pytest.raises(ConfigurationError, match="backend=None is L1-only"):
+
+            @cache(
+                config=DecoratorConfig.minimal(backend=None),
+                serializer=EncryptionWrapper(master_key=bytes.fromhex("a" * 64)),
+            )
+            def leaks() -> str:
+                return "pii"
+
+    def test_unset_is_falsy_and_legacy_dict_keeps_none(self):
+        """UNSET reads like the None it replaced as the default in truthiness checks and in to_dict()."""
+        import json
+
+        from cachekit.config import UNSET, DecoratorConfig
+
+        assert not UNSET
+        assert DecoratorConfig().to_dict()["backend"] is None
+        json.dumps(DecoratorConfig().to_dict())
+
+    def test_unset_survives_replace_and_copy(self):
+        import copy
+        import dataclasses
+
+        from cachekit import DecoratorConfig
+        from cachekit.config.decorator import UNSET
+
+        config = DecoratorConfig.production()
+        assert config.backend is UNSET
+        assert dataclasses.replace(config, ttl=5).backend is UNSET
+        assert copy.deepcopy(config).backend is UNSET
+        assert dataclasses.replace(config, backend=None).backend is None
