@@ -794,6 +794,27 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         _KEY_HEX,
     ),
     "local-intent-misspelt-key": ({}, lambda: cache.local(master_keey=_KEY_HEX)(_cached), TypeError, _KEY_HEX),
+    # A refused bytes value is wrapped too: no form takes a bytes key, but a caller may still pass one.
+    "minimal-config-misspelt-bytes-key": (
+        {},
+        lambda: DecoratorConfig.minimal(master_keey=bytes.fromhex(_KEY_HEX)),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
+    "minimal-intent-misplaced-bytes-key": (
+        {},
+        lambda: cache.minimal(master_key=bytes.fromhex(_KEY_HEX))(_cached),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
+    "config-form-misspelt-bytes-key-beside-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False, master_keey=bytes.fromhex(_KEY_HEX))(
+            _cached
+        ),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
     "config-form-encryption-override": (
         {},
         lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),

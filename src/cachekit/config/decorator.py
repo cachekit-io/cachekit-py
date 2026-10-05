@@ -11,6 +11,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, Union
 
+from pydantic import SecretBytes
+
 from .nested import (
     BackpressureConfig,
     CircuitBreakerConfig,
@@ -709,6 +711,11 @@ _PRESET_EXTRA_KWARGS = {
 }
 
 
+def _hide_refused(value: object) -> object:
+    """``hide_secret`` for a value a check refuses. Nothing uses it after that, so a bytes value is wrapped too."""
+    return SecretBytes(value) if isinstance(value, bytes) else hide_secret(value)
+
+
 def _reject_unsupported(
     where: str,
     kwargs: dict[str, Any],
@@ -730,5 +737,5 @@ def _reject_unsupported(
     hidden = _SECRET_KWARGS | set(unsupported)
     for mapping in (kwargs, *held_by):
         for name in mapping.keys() & hidden:
-            mapping[name] = hide_secret(mapping[name])
+            mapping[name] = _hide_refused(mapping[name])
     raise ConfigurationError(f"{where} does not accept {', '.join(unsupported)}.")
