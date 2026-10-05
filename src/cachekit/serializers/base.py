@@ -36,7 +36,8 @@ class SerializerProtocol(Protocol):
           EncryptionWrapper and used as-is under encryption.
         - ``False`` (AutoSerializer, which emits Python-specific type tags; and any
           serializer that does not declare the flag): single-SDK only, so combining
-          it with encryption is rejected at decoration time.
+          it with encryption is rejected at decoration time and when an
+          ``EncryptionWrapper`` is built.
 
         This attribute is intentionally NOT part of the runtime-checkable structural
         set: ``runtime_checkable`` would otherwise force every method-only custom

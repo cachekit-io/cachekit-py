@@ -605,7 +605,7 @@ def create_cache_wrapper(
                    An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
                    encrypt with encryption=True (@cache.secure) and pass the inner serializer here.
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
-                   to serializer - wraps ANY serializer with encryption.
+                   to serializer - wraps any cross-SDK serializer (cross_sdk_compatible=True) with encryption.
                    - None (default): no intent stated. Plaintext when no master key is present;
                      ConfigurationError at construction when one is, from master_key= or
                      CACHEKIT_MASTER_KEY (see the activation table in

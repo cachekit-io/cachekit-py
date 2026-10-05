@@ -54,6 +54,7 @@ from cachekit.serializers.encryption_wrapper import (
     DecryptionAuthenticationError,
     EncryptionError,
     KeyringConfigurationError,
+    require_cross_sdk_serializer,
 )
 from cachekit.serializers.wrapper import SerializationWrapper
 
@@ -840,13 +841,8 @@ class CacheSerializationHandler:
                         f"Python-specific types that other SDKs cannot decode, so it cannot be used "
                         f"with encryption."
                     )
-            elif not getattr(type(serializer_name), "cross_sdk_compatible", False):
-                raise ConfigurationError(
-                    f"Encryption requires a cross-SDK-compatible serializer for cross-language interop. "
-                    f"The serializer instance '{type(serializer_name).__name__}' does not declare "
-                    f"cross_sdk_compatible=True. Custom serializers used with encryption must set the "
-                    f"cross_sdk_compatible ClassVar to True and guarantee a language-agnostic wire format."
-                )
+            else:
+                require_cross_sdk_serializer(serializer_name)
 
             # Resolve the single-tenant tenant_id (protocol intent-presets.md § Master Key
             # Input, rule 5): explicit deployment_uuid → CACHEKIT_DEPLOYMENT_UUID → "default".
