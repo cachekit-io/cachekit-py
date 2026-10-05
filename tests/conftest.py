@@ -137,8 +137,12 @@ if PYTEST_REDIS_AVAILABLE:
         redis_noproc = factories.redis_noproc(host=_parsed.hostname or "localhost", port=_parsed.port or 6379)
         redis_isolated = factories.redisdb("redis_noproc")
     else:
-        # Local development - spawn Redis process
-        redis_proc_kwargs = {"timeout": 60}
+        # Local development - spawn Redis process.
+        # Draw the port below 30000. The default pool runs up to the ephemeral range, so it overlaps
+        # Kubernetes' NodePort range (30000-32767). On a k8s node, kube-proxy intercepts connections to
+        # an allocated NodePort on every local address, loopback included: redis listens, but the
+        # readiness probe gets ECONNREFUSED (or another service) until the 60 s startup timeout.
+        redis_proc_kwargs = {"timeout": 60, "port": (1024, 29999)}
         redis_proc = factories.redis_proc(**redis_proc_kwargs)
         redis_isolated = factories.redisdb("redis_proc")
 
