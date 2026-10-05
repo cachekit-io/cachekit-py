@@ -471,7 +471,7 @@ class TestEviction:
         if mtimes == "tied":
             real_scan = backend._scan_entries
 
-            def tied_scan() -> Any:  # every mtime equal, the new entry listed first
+            def tied_scan() -> list[tuple[str, float, int | None]] | None:  # every mtime equal, the new entry listed first
                 entries = real_scan()
                 if entries is None:
                     return None
