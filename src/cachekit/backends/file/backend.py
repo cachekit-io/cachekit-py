@@ -246,7 +246,7 @@ class FileBackend:
                             return None  # miss, file left untouched
 
                         # Check expiration (0 means never expire)
-                        if expiry_timestamp > 0 and time.time() > expiry_timestamp:
+                        if expiry_timestamp > 0 and time.time() >= expiry_timestamp:
                             # Expired, delete it
                             self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
@@ -349,7 +349,7 @@ class FileBackend:
                     if _has_unknown_transform(header):
                         return None  # miss, file left untouched
                     expiry_timestamp = struct.unpack(">Q", header[6:14])[0]
-                    if expiry_timestamp > 0 and time.time() > expiry_timestamp:
+                    if expiry_timestamp > 0 and time.time() >= expiry_timestamp:
                         self._safe_unlink_if_same_inode(fd, file_path)
                         return None
 
@@ -634,7 +634,7 @@ class FileBackend:
                             return False  # miss, file left untouched
 
                         # Check expiration
-                        if expiry_timestamp > 0 and time.time() > expiry_timestamp:
+                        if expiry_timestamp > 0 and time.time() >= expiry_timestamp:
                             # Expired, clean up
                             self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)
@@ -812,7 +812,7 @@ class FileBackend:
                             return False  # miss, header and payload left untouched
 
                         current_expiry = struct.unpack(">Q", header[6:14])[0]
-                        if current_expiry > 0 and time.time() > current_expiry:
+                        if current_expiry > 0 and time.time() >= current_expiry:
                             # Already expired: treat as absent (mirror get/exists) and unlink.
                             self._safe_unlink_if_same_inode(fd, file_path)
                             os.close(fd)

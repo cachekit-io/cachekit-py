@@ -133,7 +133,7 @@ the cached payload is left untouched.
 
 3. **Platform differences**: Windows does not support the O_NOFOLLOW flag used to prevent symlink attacks. FileBackend still works but has slightly reduced symlink protection on Windows.
 
-4. **Wall-clock TTL**: Expiration times rely on system time. Changes to system time (NTP, manual adjustments) may affect TTL accuracy.
+4. **Wall-clock TTL**: Expiration times rely on system time. Changes to system time (NTP, manual adjustments) may affect TTL accuracy. An entry is expired once the clock reaches its stored whole-second expiry, the same boundary cachekit-rs and cachekit-ts apply to a shared cache directory.
 
 5. **Disk space**: FileBackend will evict the oldest-written entries when reaching 90% capacity. Ensure sufficient disk space beyond max_size_mb for temporary writes.
 
