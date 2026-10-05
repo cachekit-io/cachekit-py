@@ -255,9 +255,12 @@ dependency chain allows it. Blocking as of 2026-09-29:
 numpy, pandas and pyarrow (the `[data]` extra) now publish `cp314t` wheels,
 but the free-threaded CI lane does not install `[data]` yet, so `[data]` on
 3.14t is untested. pandas 2.x does not declare free-threaded support
-(`pandas._libs.pandas_parser` re-enables the GIL when it loads). `import
-cachekit` never imports numpy, pandas or pyarrow, so installing `[data]` keeps
-the GIL off at import. Reading a cached DataFrame or Series in a fresh process
+(`pandas._libs.pandas_parser` re-enables the GIL when it loads). Measured on
+CPython 3.14.7t on 2026-10-05, importing each package alone in a fresh
+process: pandas 2.3.3 re-enables the GIL; pandas 3.0.6, numpy 2.3.4 and
+2.5.3, and pyarrow 24.0.0 and 25.0.1 leave it off. cachekit's lockfile pins
+pandas 2.3.3. `import cachekit` never imports numpy, pandas or pyarrow, so
+installing `[data]` keeps the GIL off at import. Reading a cached DataFrame or Series in a fresh process
 imports pandas, and the GIL turns on then, as it does when your own code
 imports pandas.
 
