@@ -223,14 +223,15 @@ class TestROROConfiguration:
 
         assert reliable_function() == {"result": "value"}
 
-    def test_roro_with_secure_preset(self):
-        """RORO pattern with secure preset."""
+    def test_roro_secure_preset_refuses_l1_only(self):
+        """backend=None in a config is L1-only, which holds raw objects, so secure refuses it."""
+        from cachekit.config.validation import ConfigurationError
 
-        @cache(config=DecoratorConfig.secure(master_key="a" * 64, ttl=600, backend=None))
-        def secure_function() -> str:
-            return "encrypted"
+        with pytest.raises(ConfigurationError, match="encryption requires a backend"):
 
-        assert secure_function() == "encrypted"
+            @cache(config=DecoratorConfig.secure(master_key="a" * 64, ttl=600, backend=None))
+            def secure_function() -> str:
+                return "encrypted"
 
 
 class TestManualOverride:

@@ -6,6 +6,7 @@ the optional [data] extra (pyarrow).
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 
@@ -227,3 +228,87 @@ class TestOrjsonIsOptional:
         )
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
         assert result.returncode == 0, result.stderr
+
+
+class TestDataStackLoadsOnFirstUse:
+    """numpy, pandas and pyarrow (the [data] extra) load on first use, never at ``import cachekit``.
+
+    They cost ~250 ms per process start, and pandas 2.x re-enables the GIL on free-threaded
+    builds. Verified in fresh subprocesses because sys.modules is shared across the test session.
+    """
+
+    def test_import_cachekit_does_not_pull_the_data_stack(self):
+        code = "import cachekit, sys; loaded = {'numpy', 'pandas', 'pyarrow'} & set(sys.modules); assert not loaded, loaded"
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize("integrity", [True, False])
+    def test_first_decode_in_a_fresh_process_imports_on_demand(self, integrity):
+        """Every data-stack entry decodes in a process that has not imported numpy or pandas."""
+        import numpy as np
+        import pandas as pd
+
+        from cachekit.serializers import AutoSerializer
+
+        values = {
+            "ndarray": np.arange(6.0).reshape(2, 3),
+            "nested": {"a": np.arange(3, dtype=np.int32)},
+            "arrow": pd.DataFrame({"x": [1, 2], "y": ["a", None]}),
+            "series": pd.Series([1.5, None], name="s"),
+        }
+        entries = {}
+        for name, value in values.items():
+            data, meta = AutoSerializer(enable_integrity_checking=integrity).serialize(value)
+            entries[name] = (data.hex(), meta.to_dict())
+        columnar = AutoSerializer(enable_integrity_checking=integrity)
+        columnar._arrow_serializer = None  # force the msgpack-columnar DataFrame path
+        data, meta = columnar.serialize(values["arrow"])
+        entries["columnar"] = (data.hex(), meta.to_dict())
+
+        code = (
+            "import sys\n"
+            "from cachekit.serializers import AutoSerializer\n"
+            "from cachekit.serializers.base import SerializationMetadata\n"
+            "assert not {'numpy', 'pandas', 'pyarrow'} & set(sys.modules)\n"
+            f"for name, (data, meta) in {entries!r}.items():\n"
+            f"    value = AutoSerializer(enable_integrity_checking={integrity}).deserialize(\n"
+            "        bytes.fromhex(data), SerializationMetadata.from_dict(meta))\n"
+            "    print(name, type(value).__name__)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)  # noqa: S603 (trusted: sys.executable + literal code)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == [
+            "ndarray",
+            "ndarray",
+            "nested",
+            "dict",
+            "arrow",
+            "DataFrame",
+            "series",
+            "Series",
+            "columnar",
+            "DataFrame",
+        ]
+
+    def test_estimate_compression_ratio_reads_numpy_from_sys_modules(self):
+        """estimate_compression_ratio() has no module-level numpy to lean on, plain values included."""
+        import numpy as np
+
+        from cachekit.serializers import AutoSerializer
+
+        serializer = AutoSerializer()
+        assert serializer.estimate_compression_ratio({"a": [1] * 100}) > 1
+        assert serializer.estimate_compression_ratio(np.zeros(1000)) > 1
+
+    @pytest.mark.parametrize(("pyarrow_installed", "level"), [(True, logging.WARNING), (False, logging.DEBUG)])
+    def test_arrow_serializer_unavailable_is_logged(self, monkeypatch, caplog, pyarrow_installed, level):
+        """No pyarrow falls back to msgpack columnar quietly; a pyarrow that is installed but fails to import warns."""
+        from cachekit.serializers import AutoSerializer
+
+        monkeypatch.setitem(sys.modules, "cachekit.serializers.arrow_serializer", None)
+        if not pyarrow_installed:
+            monkeypatch.setitem(sys.modules, "pyarrow", None)
+        with caplog.at_level(logging.DEBUG, logger="cachekit.serializers.auto_serializer"):
+            assert AutoSerializer()._arrow_serializer is None
+        [record] = [r for r in caplog.records if "msgpack columnar fallback" in r.getMessage()]
+        assert record.levelno == level

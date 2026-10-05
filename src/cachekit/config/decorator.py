@@ -5,10 +5,11 @@ Simple frozen dataclass with nested configuration groups and validation via __po
 
 from __future__ import annotations
 
+import enum
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Union
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 from .nested import (
     BackpressureConfig,
@@ -17,7 +18,7 @@ from .nested import (
     L1CacheConfig,
     MonitoringConfig,
 )
-from .validation import ConfigurationError, hide_secret, reveal_secret
+from .validation import ConfigurationError, hide_any_secret, hide_secret, refuse_bytes_key, reveal_secret
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -28,6 +29,28 @@ if TYPE_CHECKING:
 
 
 # Backend Resolution Layer
+
+
+class _Unset(enum.Enum):
+    """Type of UNSET. An enum member stays one object through copy, deepcopy and pickle, so ``is`` holds."""
+
+    UNSET = "UNSET"
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        # Falsy like the None it replaced as the default, so `if config.backend:` still reads "no backend".
+        return False
+
+
+# DecoratorConfig.backend's default: no backend stated, so it resolves per "Backend Resolution Priority".
+# None is not the default because None states one: L1-only, the meaning backend=None has as a @cache keyword.
+UNSET = _Unset.UNSET
+
+# Keywords that carry a key. Each is wrapped before anything can raise, so no frame on an error's traceback holds
+# one raw (CWE-532), including where it was passed by mistake.
+_SECRET_KWARGS = frozenset({"master_key", "api_key"})
 
 # Module-level default backend (set via set_default_backend())
 _default_backend: BaseBackend | None = None
@@ -122,7 +145,8 @@ class DecoratorConfig:
              Example: @cache(key=lambda arr: hashlib.blake2b(arr.tobytes()).hexdigest())
         refresh_ttl_on_get: Extend TTL on cache hit
         ttl_refresh_threshold: Minimum remaining TTL fraction (0.0-1.0) to trigger refresh
-        backend: L2 backend (RedisBackend, HTTPBackend, None for L1-only)
+        backend: L2 backend (RedisBackend, HTTPBackend). None means L1-only (in-process, no network), as
+                 @cache(backend=None) does. The default, UNSET, resolves per "Backend Resolution Priority".
         l1: L1 in-memory cache configuration
         circuit_breaker: Circuit breaker configuration
         backpressure: Backpressure configuration
@@ -154,7 +178,7 @@ class DecoratorConfig:
     ttl_refresh_threshold: float = 0.5
 
     # Backend abstraction (1 field)
-    backend: BaseBackend | None = None  # L2 backend: RedisBackend, HTTPBackend (future), None (L1-only)
+    backend: BaseBackend | None | Literal[_Unset.UNSET] = UNSET  # L2 backend; None = L1-only; UNSET = resolve
 
     # Nested configuration groups (5 groups)
     l1: L1CacheConfig = field(default_factory=L1CacheConfig)
@@ -162,6 +186,12 @@ class DecoratorConfig:
     backpressure: BackpressureConfig = field(default_factory=BackpressureConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     encryption: EncryptionConfig = field(default_factory=EncryptionConfig)
+
+    # Set only by io(), whose CachekitIOBackend is the preset: @cache(config=...) refuses a backend= beside such a
+    # config, as @cache.io(backend=...) is refused. Matching on the backend's type instead would also refuse it beside
+    # a production config that holds a CachekitIOBackend, where a backend= keyword wins. A field, so
+    # dataclasses.replace() keeps it.
+    _from_io: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration after instance creation.
@@ -239,8 +269,17 @@ class DecoratorConfig:
 
         This method will be removed in Task 6 when wrapper accepts DecoratorConfig directly.
 
+        Lossy, for display only: never feed its values back into a DecoratorConfig. ``backend`` is None both
+        for an omitted backend (UNSET, which resolves a backend) and for an explicit None (L1-only), so
+        ``replace(config, backend=config.to_dict()["backend"])`` would turn the first into L1-only. To derive
+        a config, call ``dataclasses.replace`` on the DecoratorConfig itself.
+
         Returns:
             Dictionary representation with flattened nested configs
+
+        Example:
+            >>> DecoratorConfig().to_dict()["backend"] is DecoratorConfig(backend=None).to_dict()["backend"] is None
+            True
         """
         return {
             # Core fields
@@ -250,7 +289,7 @@ class DecoratorConfig:
             "key": self.key,
             "refresh_ttl_on_get": self.refresh_ttl_on_get,
             "ttl_refresh_threshold": self.ttl_refresh_threshold,
-            "backend": self.backend,
+            "backend": None if self.backend is UNSET else self.backend,  # the legacy dict's "unset" was None
             # L1 cache (flattened)
             "l1_enabled": self.l1.enabled,
             "l1_max_size_mb": self.l1.max_size_mb,
@@ -278,7 +317,9 @@ class DecoratorConfig:
 
     # Intent Presets (Class Methods)
     # Each preset builds its defaults and lets the caller's kwargs win (``defaults | kwargs``): an explicit
-    # argument MUST override the preset default (protocol intent-presets.md § Explicit Configuration).
+    # argument MUST override the preset default (protocol intent-presets.md § Explicit Configuration, rule 1).
+    # A keyword that names no field is a ConfigurationError, and so is one naming a field the preset fixes
+    # (secure's encryption, io's backend): rule 2.
 
     @classmethod
     def minimal(cls, **kwargs: Any) -> DecoratorConfig:
@@ -309,6 +350,7 @@ class DecoratorConfig:
             >>> DecoratorConfig.minimal(ttl=None).ttl is None  # explicit no-expiry opt-in
             True
         """
+        _reject_unsupported("The minimal preset", kwargs)
         defaults: dict[str, Any] = {
             "ttl": 300,
             "integrity_checking": False,  # Speed-first: no checksum overhead
@@ -357,6 +399,7 @@ class DecoratorConfig:
             >>> DecoratorConfig.production(circuit_breaker=CircuitBreakerConfig(failure_threshold=3)).circuit_breaker.failure_threshold
             3
         """
+        _reject_unsupported("The production preset", kwargs)
         defaults: dict[str, Any] = {
             "ttl": 600,
             "integrity_checking": True,  # Production: integrity guarantee
@@ -388,8 +431,8 @@ class DecoratorConfig:
         Note: .secure does not pin a backend; it resolves like every preset (docs/backends/README.md,
               "Backend Resolution Priority"). With REDIS_URL set and CACHEKIT_API_KEY unset, the
               encrypted values go to Redis. Pass backend= when a particular backend is required.
-              Here backend=None is the unset default; the L1-only refusal applies to
-              @cache.secure(backend=None) and @cache(config=..., backend=None).
+              backend=None is L1-only, which secure refuses at decoration with ConfigurationError:
+              L1-only stores raw objects, which cannot be ciphertext.
         Note: integrity_checking is forced to True (non-negotiable for security)
 
         Args:
@@ -397,7 +440,7 @@ class DecoratorConfig:
             tenant_extractor: Optional tenant ID extractor (an object with .extract(args, kwargs)) for
                 per-tenant key derivation. Not a tenancy boundary: see docs/features/zero-knowledge-encryption.md
             **kwargs: Overrides (ttl, namespace, backend, l1, circuit_breaker, backpressure, monitoring, etc.)
-                     - integrity_checking other than True is rejected; encryption= is not an override (TypeError).
+                     - integrity_checking other than True is rejected, and encryption= is not an override.
                      Default ttl=600 (protocol/spec/intent-presets.md); ttl=None = never expire.
                      fail_closed=True raises DecryptionAuthenticationError to the caller on AES-GCM
                      auth failure / key-fingerprint mismatch instead of silently recomputing
@@ -407,7 +450,9 @@ class DecoratorConfig:
             DecoratorConfig with encryption enabled and full security features
 
         Raises:
-            ConfigurationError: If ``integrity_checking`` is passed as anything but ``True``.
+            ConfigurationError: If an ``integrity_checking`` other than ``True``, ``encryption=`` or a keyword that names no
+                field is passed.
+            TypeError: If master_key is bytes: pass ``key.hex()``.
 
         Example:
             >>> config = DecoratorConfig.secure(master_key="a" * 64)
@@ -418,7 +463,15 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
-        master_key = hide_secret(master_key)  # unwrapped only into the EncryptionConfig (CWE-532)
+        master_key = hide_any_secret(master_key)  # unwrapped only into the EncryptionConfig (CWE-532)
+        _reject_unsupported("The secure preset", kwargs, _FIELD_NAMES | _SECURE_ENCRYPTION_KWARGS)
+        master_key = refuse_bytes_key(master_key)  # after the check above has wrapped every refused keyword
+        # encryption= is a field, but not one this preset takes: the EncryptionConfig below is the preset.
+        if "encryption" in kwargs:
+            raise ConfigurationError(
+                "The secure preset sets its own encryption; encryption= cannot override it. Pass fail_closed=, "
+                "single_tenant_mode=, deployment_uuid= or tenant_extractor= to it directly."
+            )
         # Extract encryption-specific params from kwargs
         explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
         deployment_uuid = kwargs.pop("deployment_uuid", None)
@@ -459,8 +512,7 @@ class DecoratorConfig:
                 enable_prometheus_metrics=True,
             ),
         }
-        # encryption= stays outside the merge: a caller's encryption= collides with it and raises TypeError,
-        # so no override can replace the preset's EncryptionConfig.
+        # encryption= stays outside the merge, so no override can replace the preset's EncryptionConfig.
         return cls(
             encryption=EncryptionConfig(
                 enabled=True,
@@ -500,6 +552,7 @@ class DecoratorConfig:
             >>> config.integrity_checking
             True
         """
+        _reject_unsupported("The dev preset", kwargs)
         defaults: dict[str, Any] = {
             "ttl": 300,
             "integrity_checking": True,  # Development: catch data corruption early
@@ -545,6 +598,7 @@ class DecoratorConfig:
             >>> config.integrity_checking
             False
         """
+        _reject_unsupported("The test preset", kwargs)
         defaults: dict[str, Any] = {
             "ttl": 300,
             "integrity_checking": False,  # Testing: fast deterministic behavior
@@ -595,7 +649,8 @@ class DecoratorConfig:
         Raises:
             ConfigurationError: If the API key is missing, empty or not an RFC 6750 bearer token
                 (argument and CACHEKIT_API_KEY), if CACHEKIT_API_URL fails validation, or if
-                ``backend=`` is passed.
+                ``backend=`` or a keyword that names no field is passed. ``@cache(config=...)``
+                refuses a ``backend=`` beside the returned config too.
 
         Example:
             >>> config = DecoratorConfig.io(api_key="ck_test_key")  # pragma: allowlist secret
@@ -605,6 +660,8 @@ class DecoratorConfig:
             300
         """
         api_key = hide_secret(api_key)  # passed down wrapped (CWE-532)
+        # Before the backend is built: a rejected call builds none, and a misspelt keyword is not masked by a missing key.
+        _reject_unsupported("The io preset", kwargs)
         # Lazy import to avoid circular dependency and keep SaaS backend optional
         from cachekit.backends.cachekitio import CachekitIOBackend
 
@@ -644,5 +701,42 @@ class DecoratorConfig:
         }
         return cls(
             backend=backend,
+            _from_io=True,
             **(defaults | kwargs),
         )
+
+
+# The keywords a preset or a config= override may name: DecoratorConfig's fields, less the private ones.
+_FIELD_NAMES = frozenset(f.name for f in fields(DecoratorConfig) if not f.name.startswith("_"))
+# The EncryptionConfig settings DecoratorConfig.secure() takes as keywords of its own.
+_SECURE_ENCRYPTION_KWARGS = frozenset({"single_tenant_mode", "deployment_uuid", "fail_closed"})
+# The keywords a @cache.<preset> decorator takes beside the fields: its classmethod's own parameters, and secure's above.
+_PRESET_EXTRA_KWARGS = {
+    "io": frozenset({"api_key"}),
+    "secure": _SECURE_ENCRYPTION_KWARGS | {"master_key", "tenant_extractor"},
+}
+
+
+def _reject_unsupported(
+    where: str,
+    kwargs: dict[str, Any],
+    accepted: frozenset[str] = _FIELD_NAMES,
+    *,
+    held_by: tuple[dict[str, Any], ...] = (),
+) -> None:
+    """Raise ConfigurationError naming every keyword in ``kwargs`` that ``accepted`` lacks.
+
+    An unsupported argument is a configuration error, never the dataclass's TypeError and never a silent drop
+    (protocol intent-presets.md § Explicit Configuration, rule 2). ``held_by`` lists the caller's other dicts that
+    hold the same keywords.
+    """
+    unsupported = sorted(kwargs.keys() - accepted)
+    if not unsupported:
+        return
+    # A key passed where none is taken is still a key, and a refused value may be one under a misspelt name
+    # (master_keey=): wrap both in every dict a frame on the traceback holds before raising.
+    hidden = _SECRET_KWARGS | set(unsupported)
+    for mapping in (kwargs, *held_by):
+        for name in mapping.keys() & hidden:
+            mapping[name] = hide_any_secret(mapping[name])
+    raise ConfigurationError(f"{where} does not accept {', '.join(unsupported)}.")

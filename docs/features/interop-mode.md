@@ -121,7 +121,7 @@ One thing no guardrail can catch: two *binders* of the same `(namespace, operati
 | Missing/invalid `namespace` or `operation`, including the reserved namespaces `ns` and `nsapi` and a segment containing `..` | `ConfigurationError` at decoration time |
 | `interop=` combined with `key=`, `fast_mode`, `backend=None` (L1-only), or a non-default serializer | `ConfigurationError` at decoration time |
 | Explicit deployment UUID not in canonical lowercase-hyphenated form | `ConfigurationError` at decoration time |
-| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` and `ainvalidate_cache()`, with or without arguments (a prefixed key is invisible to other SDKs and would escape the encryption AAD binding) |
+| Backend with a wire-level key prefix (e.g. Memcached `key_prefix`) | `ConfigurationError` — checked at decoration **and re-checked per call**, including `invalidate_cache()` and `ainvalidate_cache()`, with or without arguments (a prefixed key is invisible to other SDKs, and the encryption AAD would bind the prefix, which no other SDK includes) |
 | Out-of-model argument | `InteropError` at call time (function does **not** run) |
 | Out-of-model return value | `InteropError` at store time (never "computed but silently never cached") |
 | CK v3 frame found at an interop key | Diagnostic error, treated as a miss, entry overwritten (self-healing) |
@@ -144,6 +144,6 @@ assert decode_interop_value(data) == {"age": 30, "name": "alice"}
 
 ## Conformance
 
-Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 34 key vectors, 4 value vectors, 11 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
+Every build byte-verifies the implementation against the shared protocol vectors (`tests/unit/protocol/`): 35 key vectors, 4 value vectors, 13 must-error vectors, the interop AAD vector, and a full HKDF-SHA256 → AES-256-GCM decrypt of the published cross-SDK ciphertext through the production Rust stack.
 
 > **CachekitIO note**: the api.cachekit.io cache-key validator accepts interop keys. The segment rules above (reserved `ns`/`nsapi` namespaces, no `..`) are what keep every interop key inside what it accepts — see the spec's [SaaS Considerations](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md#saas-considerations).

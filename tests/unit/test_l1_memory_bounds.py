@@ -699,10 +699,22 @@ class TestCleanupThreadAfterFork:
         manager = L1CacheManager(default_max_memory_mb=10)
         cache = manager.get_cache("one-shot-ns")
         _as_if_forked(manager, parent_ran_cleanup=False)
+        started: list[threading.Thread] = []
+        start = threading.Thread.start
+
+        def record(thread: threading.Thread) -> None:
+            start(thread)
+            started.append(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", record)
 
         cache.put("k", b"v")
 
-        assert _wait_for(lambda: not state.cache)
+        # Joined, not waited on until the state is empty: the releaser looks the module list up again
+        # after each state it frees, so one still running would take the next test's patched states.
+        (releaser,) = started
+        releaser.join(5)
+        assert not releaser.is_alive() and not state.cache
         assert l1_cache._inherited_states == []
         assert manager._cleanup_thread is None  # and no sweeping the parent did not run
 

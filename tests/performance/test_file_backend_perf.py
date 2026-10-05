@@ -8,11 +8,12 @@ Comprehensive performance testing for file-based cache backend with:
 - Oldest-written-first eviction performance
 - Optional Redis comparison
 
-Nothing here asserts a latency target; some tests carry catastrophe guards. Set latency is not a
-constant: every set() scans the cache directory, fsyncs and renames its file, then scans again,
-so it is an fsync floor plus a per-entry cost. test_bench_set_scaling_with_entry_count measures
-both; docs/backends/file.md points at it. get() does no scan, but it waits for a concurrent
-set() in the same process, which holds the backend lock throughout.
+Nothing here asserts a latency target; some tests carry catastrophe guards. A set() fsyncs and
+renames its file and checks capacity on in-memory counters, so its usual cost does not grow with
+the entry count; only eviction, rejection and the 30 s reconcile scan the directory.
+test_bench_set_scaling_with_entry_count measures that; docs/backends/file.md points at it. get()
+does no scan, but it waits for a concurrent set() in the same process, which holds the backend
+lock throughout.
 """
 
 from __future__ import annotations
@@ -123,10 +124,11 @@ def test_bench_sequential_read_write(tmp_path: Path) -> None:
 def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> None:
     """Set/get/delete latency with ``entries`` already in the cache directory.
 
-    The directory is prefilled by writing entry files directly: set() is itself O(entries),
-    so a set() loop would make the prefill quadratic. The timed loop cycles 10 keys through
-    set/get/delete, so the entry count stays at ``entries`` (+1) throughout. Run it on the
-    filesystem you care about with ``--basetemp``; repeat runs to see the run-to-run spread.
+    The directory is prefilled by writing entry files directly, without a set() and its fsync
+    per entry, and the measured backend is created afterwards so its counters start from them.
+    The timed loop cycles 10 keys through set/get/delete, so the entry count stays at
+    ``entries`` (+1) throughout. Run it on the filesystem you care about with ``--basetemp``;
+    repeat runs to see the run-to-run spread.
     """
     config = FileBackendConfig(cache_dir=tmp_path, max_size_mb=1024, max_value_mb=100, max_entry_count=20_000)
     backend = FileBackend(config)
@@ -134,6 +136,7 @@ def test_bench_set_scaling_with_entry_count(tmp_path: Path, entries: int) -> Non
     entry = FileBackend._build_header(0) + value
     for i in range(entries):
         Path(backend._key_to_path(f"fill:{i}")).write_bytes(entry)
+    backend = FileBackend(config)
 
     iterations = 200
     set_ns, get_ns, delete_ns = [], [], []

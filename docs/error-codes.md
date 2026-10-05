@@ -100,6 +100,18 @@ def get_api_keys(tenant_id: str):
 
 ---
 
+### Single-SDK serializer under encryption
+
+**Message**: `Encryption requires a cross-SDK-compatible serializer for cross-language interop. ...`
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied or when an `EncryptionWrapper` is built
+
+**Cause**: encryption was combined with a serializer that is not cross-SDK: `serializer="auto"` (or `"pythonic"`), an `AutoSerializer` instance, or a custom serializer whose class does not declare `cross_sdk_compatible = True`. The protocol requires the step after decryption to be the reader's configured serializer, never a guess from the decrypted bytes, and `AutoSerializer` picks its format by inspecting them. The decorators already refuse these. `EncryptionWrapper` built directly now refuses them too; earlier releases accepted any serializer there.
+
+**Solution**: use `StandardSerializer` (the default), `OrjsonSerializer` or `ArrowSerializer`. Do not subclass `AutoSerializer` to set the flag. Set `cross_sdk_compatible = True` only on a custom serializer whose wire format other-language SDKs can read and which never inspects the bytes to choose a format ([Custom Serializers](serializers/custom.md#under-encryption)).
+
+---
+
 ### Invalid key format
 
 **Message**: one of
@@ -138,6 +150,45 @@ except ValueError:
 else:
     print(f'Valid key: {n} bytes' if n >= 32 else f'Too short: {n} bytes (need at least 32)')
 "
+```
+
+---
+
+### Raw key is not 32 bytes
+
+**Message**: one of
+- `master_key must be exactly 32 bytes (256 bits), got .... It takes the raw key: decode a hex key with bytes.fromhex().`
+- `Previous master key at position ... must be exactly 32 bytes (256 bits), got ... — per-key requirements are identical to master_key.`
+
+**Exception**: `EncryptionError` for `master_key=`, `KeyringConfigurationError` (a `ValueError` subclass) for `previous_master_keys=`, raised when an `EncryptionWrapper` is built
+
+**Cause**: `EncryptionWrapper` takes raw key bytes, exactly 32 of them, from 0.23.0. A hex string's own bytes, such as `hex_key.encode()`, are 64 bytes and are refused. Earlier releases accepted any key of at least 32 bytes, so that call derived a key that no other SDK, and not `@cache.secure`, derives from the same hex key. The decorators and `CACHEKIT_MASTER_KEY` take hex and keep the hex rule above: at least 32 bytes once decoded.
+
+**Solution**: decode the hex key before passing it.
+```python notest
+from cachekit.serializers import EncryptionWrapper
+
+wrapper = EncryptionWrapper(master_key=bytes.fromhex(hex_key))
+```
+
+---
+
+### Bytes key where a hex string is taken
+
+**Message**: `master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes.`
+
+**Exception**: `TypeError`, raised when `DecoratorConfig.secure()`, `EncryptionConfig`, `CacheSerializationHandler` or `validate_encryption_config` is called, or when `@cache` or `@cache.secure` is applied
+
+**Cause**: `master_key=` takes the key as a hex string everywhere except `EncryptionWrapper`, the one entry point that takes raw key bytes ([Raw key is not 32 bytes](#raw-key-is-not-32-bytes)). Earlier releases did not check the type, so what a bytes key did depended on the encryption setting. With encryption on, the decorator and `validate_encryption_config` raised `AttributeError`. With encryption unset, the decorator raised `ConfigurationError`, as for any key passed without an encryption setting. With encryption off (`encryption=False`, `EncryptionConfig(enabled=False)`), the key was accepted, and failed only when an entry encrypted before encryption was turned off was read. It now raises `TypeError` where it is passed, whatever the encryption setting. On Python 3.14, `CacheSerializationHandler` also read a bytes key holding ASCII hex digits as that hex; that key raises too.
+
+**Solution**: pass the key's hex.
+```python
+import secrets
+
+from cachekit import DecoratorConfig
+
+key = secrets.token_bytes(32)  # raw key bytes, as from a key management service
+config = DecoratorConfig.secure(master_key=key.hex())
 ```
 
 ---
@@ -603,6 +654,34 @@ export CACHE_REDIS_URL=redis://localhost:6379
 # CORRECT prefix - will be read
 export CACHEKIT_REDIS_URL=redis://localhost:6379
 ```
+
+---
+
+### Unsupported keyword argument
+
+**Message**: `The <preset> preset does not accept ...`, `@cache does not accept ...` or `@cache(config=...) does not accept ...`, naming each keyword
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied or a `DecoratorConfig` preset is called, before `@cache.secure` or `@cache.io` looks for its key, so a misspelt keyword is reported even when no key is set. Earlier releases raised the dataclass's `TypeError`. `@cache.local`, which takes only the four [parameters](features/reference-caching.md#parameters) it lists, still raises `TypeError`.
+
+**Cause**: a keyword that names no `DecoratorConfig` field, often a typo such as `tll=`, or one that only another form takes: `api_key=` outside `@cache.io`, or `master_key=`, `tenant_extractor=`, `single_tenant_mode=`, `deployment_uuid=` or `fail_closed=` on any preset but `secure`, or beside `config=`. Bare `@cache` folds those into its own `EncryptionConfig`, `secure` takes them as its own options, and a config already holds its own.
+
+**Solution**: fix the spelling, or set the option where the form takes it, such as `@cache(config=DecoratorConfig.secure(master_key=secret_key, fail_closed=True))`.
+
+---
+
+### Keyword overrides a preset's encryption or backend
+
+**Message**: one of
+- `The secure preset sets its own encryption; encryption= cannot override it. ...`
+- `encryption= cannot override an encrypted config= ...`
+- `@cache.io does not accept backend= — it always caches through CachekitIOBackend. ...`
+- `@cache(config=DecoratorConfig.io(...)) does not accept backend= ...`
+
+**Exception**: `ConfigurationError`, raised when the decorator is applied or the preset is called
+
+**Cause**: the keyword names what the preset fixes. The `secure` preset sets its own encryption, so `@cache.secure` and `DecoratorConfig.secure()` refuse `encryption=` (with `TypeError` before 0.23.0), and from 0.23.0 so does any encrypted `config=`: one from `DecoratorConfig.secure()`, or one built with `encryption=EncryptionConfig(enabled=True, ...)`. The `io` preset caches through the `CachekitIOBackend` it builds, so `backend=` is refused by `@cache.io` and, from 0.23.0, beside `config=DecoratorConfig.io(...)`. A `backend=` beside any other config still replaces that config's backend.
+
+**Solution**: set encryption options where the config is built, `DecoratorConfig.secure(master_key=secret_key, fail_closed=True)`. To cache through another backend, use another preset: `@cache(config=DecoratorConfig.production(backend=my_backend))`.
 
 ---
 

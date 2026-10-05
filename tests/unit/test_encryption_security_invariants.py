@@ -2,6 +2,7 @@
 
 Targets:
 - EncryptionWrapper.__init__ `if serializer is not None` branch (explicit serializer)
+- EncryptionWrapper.__init__ refuses a single-SDK serializer (ENC-2), as the handler does
 - CacheSerializationHandler rejects non-default serializer with encryption=True
 - CacheSerializationHandler accepts default/std/standard aliases with encryption=True
 - deserialize_data raises SerializationError when encrypted metadata has no tenant_id
@@ -11,10 +12,17 @@ from __future__ import annotations
 
 import pytest
 
-from cachekit.cache_handler import CacheSerializationHandler
+from cachekit.cache_handler import CROSS_SDK_SERIALIZER_NAMES, CacheSerializationHandler
 from cachekit.config.validation import ConfigurationError
+from cachekit.key_generator import CacheKeyGenerator
+from cachekit.serializers import AutoSerializer, get_serializer
 from cachekit.serializers.base import SerializationError
-from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
+from cachekit.serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+)
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
@@ -64,10 +72,57 @@ class TestEncryptionWrapperSetupErrors:
         finally:
             reset_settings()
 
-    def test_short_master_key_raises(self):
-        """EncryptionError when master_key is shorter than 32 bytes."""
-        with pytest.raises(EncryptionError, match="at least 32 bytes"):
-            EncryptionWrapper(master_key=b"too_short")
+
+# A raw key of any length but 32 is refused, the 64 ASCII bytes of a hex key above all: they pass a
+# length floor and derive a key no other SDK derives (protocol intent-presets.md, Master Key Input rule 4).
+_WRONG_LENGTH_RAW_KEYS = {"31-bytes": b"\x01" * 31, "33-bytes": b"\x01" * 33, "hex-string-ascii": ("ab" * 32).encode()}
+
+
+class TestEncryptionWrapperRawKeyLength:
+    """master_key= and previous_master_keys= take raw bytes, exactly 32 of them (LAB-8223)."""
+
+    @pytest.mark.parametrize("key", _WRONG_LENGTH_RAW_KEYS.values(), ids=list(_WRONG_LENGTH_RAW_KEYS))
+    def test_master_key_must_be_exactly_32_bytes(self, key: bytes) -> None:
+        with pytest.raises(EncryptionError, match=f"exactly 32 bytes .*got {len(key)}"):
+            EncryptionWrapper(master_key=key, previous_master_keys=[])
+
+    @pytest.mark.parametrize("key", _WRONG_LENGTH_RAW_KEYS.values(), ids=list(_WRONG_LENGTH_RAW_KEYS))
+    def test_previous_master_key_must_be_exactly_32_bytes(self, key: bytes) -> None:
+        with pytest.raises(KeyringConfigurationError, match=f"position 1 must be exactly 32 bytes .*got {len(key)}"):
+            EncryptionWrapper(master_key=b"\x02" * 32, previous_master_keys=[b"\x03" * 32, key])
+
+    def test_hex_string_bytes_never_reach_the_keyring(self) -> None:
+        """The ASCII bytes of a hex key are refused, and their decoded bytes are the 32-byte key that is accepted."""
+        hex_key = "ab" * 32  # pragma: allowlist secret
+        with pytest.raises(EncryptionError, match="bytes.fromhex"):
+            EncryptionWrapper(master_key=hex_key.encode(), previous_master_keys=[])
+        assert EncryptionWrapper(master_key=bytes.fromhex(hex_key), previous_master_keys=[]).is_encryption_enabled
+
+    @pytest.mark.parametrize("env", ["CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"])
+    def test_hex_keys_from_the_environment_may_be_longer(self, monkeypatch: pytest.MonkeyPatch, env: str) -> None:
+        """A hex key keeps the hex rule, at least 32 bytes (Master Key Input rule 3): only raw bytes must be 32."""
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv(env, "cd" * 48)
+        reset_settings()
+        wrapper = EncryptionWrapper(master_key=None if env == "CACHEKIT_MASTER_KEY" else b"\x02" * 32)
+        encrypted, metadata = wrapper.serialize({"v": 1}, cache_key="k")
+        assert wrapper.deserialize(encrypted, metadata, cache_key="k") == {"v": 1}
+
+    def test_decorator_hex_key_may_be_longer(self, tmp_path) -> None:
+        """@cache.secure decodes its hex key and hands the bytes to EncryptionWrapper: a 48-byte key still caches."""
+        from cachekit import cache
+        from cachekit.backends.file import FileBackend, FileBackendConfig
+
+        calls = []
+
+        @cache.secure(master_key="cd" * 48, backend=FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
+        def secret(n: int) -> dict[str, int]:
+            calls.append(n)
+            return {"pin": n}
+
+        assert secret(7) == secret(7) == {"pin": 7}
+        assert calls == [7]
 
 
 class TestEncryptionWrapperExplicitSerializer:
@@ -95,6 +150,95 @@ class TestEncryptionWrapperExplicitSerializer:
         encrypted, metadata = wrapper.serialize(data, cache_key=cache_key)
         recovered = wrapper.deserialize(encrypted, metadata, cache_key=cache_key)
         assert recovered == data
+
+
+class _UnmarkedSerializer:
+    """Method-only custom serializer: no cross_sdk_compatible, so single-SDK."""
+
+    def serialize(self, obj):
+        return b"", None
+
+    def deserialize(self, data, metadata=None):
+        return None
+
+
+class TestEncryptionWrapperRefusesSingleSDKSerializer:
+    """ENC-2: a direct EncryptionWrapper refuses what the handler refuses under encryption.
+
+    The step after decryption must be the reader's configured serializer, never a sniff of the
+    plaintext. AutoSerializer sniffs; an unmarked custom serializer makes no cross-SDK promise.
+    """
+
+    def test_auto_serializer_refused(self):
+        with pytest.raises(ConfigurationError, match="'AutoSerializer' does not declare cross_sdk_compatible=True"):
+            EncryptionWrapper(serializer=AutoSerializer(), master_key=b"a" * 32)
+
+    def test_unmarked_custom_serializer_refused(self):
+        with pytest.raises(ConfigurationError, match="'_UnmarkedSerializer' does not declare cross_sdk_compatible=True"):
+            EncryptionWrapper(serializer=_UnmarkedSerializer(), master_key=b"a" * 32)
+
+    def test_refused_before_key_resolution(self, monkeypatch):
+        """The serializer is a config error even when the key is missing too, so it is named first."""
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.delenv("CACHEKIT_MASTER_KEY", raising=False)
+        reset_settings()
+        try:
+            with pytest.raises(ConfigurationError, match="cross_sdk_compatible"):
+                EncryptionWrapper(serializer=AutoSerializer(), master_key=None)
+        finally:
+            reset_settings()
+
+    def test_marked_custom_serializer_accepted(self):
+        class MarkedSerializer(_UnmarkedSerializer):
+            cross_sdk_compatible = True
+
+        custom = MarkedSerializer()
+        assert EncryptionWrapper(serializer=custom, master_key=b"a" * 32).serializer is custom
+
+    @pytest.mark.parametrize("name", CROSS_SDK_SERIALIZER_NAMES)
+    def test_handler_accepted_serializers_round_trip(self, name):
+        """Every serializer the handler accepts under encryption still builds and round-trips here."""
+        if name == "orjson":
+            pytest.importorskip("orjson")
+        if name == "arrow":
+            pd = pytest.importorskip("pandas")
+            pytest.importorskip("pyarrow")
+            data = pd.DataFrame({"a": [1, 2, 3]})
+        else:
+            data = {"key": "value", "number": 42}
+        serializer = get_serializer(CacheKeyGenerator.SERIALIZER_NAME_ALIASES.get(name, name))
+        wrapper = EncryptionWrapper(serializer=serializer, master_key=b"a" * 32)
+
+        encrypted, metadata = wrapper.serialize(data, cache_key=f"enc2:{name}")
+        recovered = wrapper.deserialize(encrypted, metadata, cache_key=f"enc2:{name}")
+        if name == "arrow":
+            assert recovered.equals(data)
+        else:
+            assert recovered == data
+
+    def test_registry_encrypted_goes_through_the_guard(self, monkeypatch):
+        """get_serializer("encrypted") builds the default inner serializer through the guard."""
+        import cachekit.serializers as serializers
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv("CACHEKIT_MASTER_KEY", "a" * 64)
+        monkeypatch.setattr(serializers, "_serializer_cache", {})
+        reset_settings()
+        try:
+            wrapper = get_serializer("encrypted")
+            assert isinstance(wrapper, EncryptionWrapper)
+            assert type(wrapper.serializer).cross_sdk_compatible is True
+        finally:
+            reset_settings()
+
+    def test_default_serializer_goes_through_the_guard(self, monkeypatch):
+        """The default inner serializer is checked too, not trusted: a default that sniffs is refused."""
+        import cachekit.serializers.standard_serializer as standard
+
+        monkeypatch.setattr(standard, "StandardSerializer", AutoSerializer)
+        with pytest.raises(ConfigurationError, match="'AutoSerializer' does not declare"):
+            EncryptionWrapper(master_key=b"a" * 32)
 
 
 class TestCacheSerializationHandlerEncryptionSerializerValidation:

@@ -74,10 +74,10 @@ backend = FileBackend(config)
 
 ## Characteristics
 
-- Latency: `get` does no directory scan, so on its own it stays flat as the cache grows; `set` grows with the number of cached entries (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks it for that whole `set()`, because `set()` holds the backend's lock through its fsync and directory scans.
+- Latency: `get` and `set` stay flat as the cache grows. `set` costs an fsync, plus a directory scan when eviction is due, before rejecting a new entry at `max_entry_count`, or every 30 seconds (see [Performance Characteristics](#performance-characteristics)). A concurrent `set()` on another thread in the same process blocks `get` for that whole `set()`, because `set()` holds the backend's lock through its fsync.
 - Eviction: oldest-written first, by file mtime. Triggered at 90%, evicts to 70% capacity. Reads do not refresh an entry's mtime, so a hot key that is never rewritten is evicted as early as a cold one; `refresh_ttl` and `set` do refresh it
 - TTL support: Yes (expiration checking + inspection/refresh via `TTLInspectableBackend`)
-- Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported
+- Cross-process: the on-disk format is shared across processes and SDKs (cachekit-rs reads and writes the same files), but concurrent writers in multiple processes are not supported. Within one process, use one `FileBackend` instance per cache directory: each instance tracks only its own writes against the size and entry caps (see [Performance Characteristics](#performance-characteristics))
 - Locking: non-blocking. An operation that finds an entry's file lock held fails at once with a `TIMEOUT` `BackendError`; it does not wait
 - Platform support: Full on Linux/macOS, limited on Windows (no O_NOFOLLOW)
 
@@ -133,7 +133,7 @@ the cached payload is left untouched.
 
 3. **Platform differences**: Windows does not support the O_NOFOLLOW flag used to prevent symlink attacks. FileBackend still works but has slightly reduced symlink protection on Windows.
 
-4. **Wall-clock TTL**: Expiration times rely on system time. Changes to system time (NTP, manual adjustments) may affect TTL accuracy.
+4. **Wall-clock TTL**: Expiration times rely on system time. Changes to system time (NTP, manual adjustments) may affect TTL accuracy. An entry is expired once the clock reaches its stored whole-second expiry, the same boundary cachekit-rs and cachekit-ts apply to a shared cache directory.
 
 5. **Disk space**: FileBackend will evict the oldest-written entries when reaching 90% capacity. Ensure sufficient disk space beyond max_size_mb for temporary writes.
 
@@ -141,25 +141,47 @@ the cached payload is left untouched.
 
 ## Performance Characteristics
 
-`set()` does three things whose cost adds up: it scans the whole cache directory to check the
-entry-count limit, writes and fsyncs a temp file and renames it into place, then scans the
-directory again to check whether eviction is due (and walks it a third time when eviction
-fires). Its cost is an fsync floor plus a per-entry scan cost, so it grows linearly with the
-number of cached entries; on a cache near the default `max_entry_count` the scan term
-dominates. `get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same
-process blocks them for that whole `set()`, because `set()` holds the backend's lock through
-its fsync and directory scans.
+The backend keeps its entry count and total size in memory. It seeds them with one directory
+scan when it starts and updates them on every write, delete, eviction and expired-entry
+cleanup it makes. So a `set()` checks the entry-count limit and the eviction trigger without
+scanning the directory, and its usual cost is one fsync whatever the cache size: about 25
+syscalls per `set()` at 0, 1,000 or 5,000 entries.
 
-The fsync floor and the per-entry cost both depend heavily on your disk, filesystem and load,
-so measure them where you will run. The harness reports set/get/delete p50 and p99 at 0, 1,000,
-5,000 and 9,000 cached entries (1 KB values, n = 200 per point):
+Three things still scan the directory, and each scan costs time in proportion to the number
+of entries. A `set()` that pushes the cache past the eviction trigger rescans first, so it never
+evicts on a stale count, and then evicts the oldest-written entries; that happens about once
+every `0.2 × max_entry_count` new keys. A `set()` that would be rejected at `max_entry_count`
+scans before it rejects; if the directory cannot be read just then, it rejects on the count it
+has, keeping the cap rather than guessing. And the first `set()` more than 30 seconds after the last scan
+rescans, because the counters cannot see other processes' writes to the same directory. If a scan
+cannot read some entry's size, every `set()` rescans until a scan reads them all. A file whose
+size stays unreadable is left out of the size total, as it always was. So
+the latency tail of `set()` grows with the cache, and the typical `set()` does not.
+`get()` and `delete()` do no scan, but a concurrent `set()` on another thread in the same process
+blocks them for that whole `set()`, because `set()` holds the backend's lock through its fsync.
+
+If the directory cannot be scanned at all, the counters keep their last values and nothing is
+evicted until a scan succeeds. That failure, an entry whose size cannot be read during a scan,
+and an eviction that cannot delete an entry for any reason other than the entry already being
+gone each log a WARNING on the `cachekit.backends.file.backend` logger, at most once a minute
+for each of the three, with the number of failures since the last warning; the failures in
+between log at DEBUG.
+
+The counters belong to one `FileBackend` instance, not to the directory. Concurrent writers in
+several processes are unsupported (see [Characteristics](#characteristics)). If you run them anyway,
+each process sees the others' writes only at its next scan, so the cache can overshoot
+`max_size_mb` and `max_entry_count` by up to 30 seconds' worth of their writes. Two instances on
+one `cache_dir` in the same process behave the same way, so use one instance per directory.
+
+The fsync cost depends heavily on your disk, filesystem and load, so measure it where you will
+run. The harness reports set/get/delete p50 and p99 at 0, 1,000, 5,000 and 9,000 cached
+entries (1 KB values, n = 200 per point):
 
 ```bash
 uv run pytest tests/performance/test_file_backend_perf.py -k scaling -s -m performance --basetemp=<dir on the filesystem to measure>
 ```
 
-Run it more than once and compare: the spread between runs is your noise floor. If you write
-often to a large cache, keep `max_entry_count` low or use another backend.
+Run it more than once and compare: the spread between runs is your noise floor.
 
 ## See Also
 

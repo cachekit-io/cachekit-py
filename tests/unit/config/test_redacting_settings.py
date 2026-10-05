@@ -33,7 +33,8 @@ from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError, singleton, validate_encryption_config
 from cachekit.config.nested import EncryptionConfig
 from cachekit.config.settings import CachekitConfig
-from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+from cachekit.config.validation import _BYTES_KEY_REFUSAL
+from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 
 _KEY_HEX = "ab" * 32
 
@@ -685,6 +686,7 @@ class TestRedactingSettingsFrameLocals:
 
 
 _API_KEY = "ck_test_frameLocalsApiKey0123456789"  # pragma: allowlist secret
+_KEY_BYTES = bytes.fromhex(_KEY_HEX)
 _SHORT_KEY_HEX = "cd" * 16
 _REDIS_PASSWORD = "frameLocalsRedisPassword"  # pragma: allowlist secret
 
@@ -700,6 +702,37 @@ def _lazy_wrapper_build() -> object:
         env.setenv("CACHEKIT_MAX_VALUE_SIZE", "-1")
         singleton.reset_settings()
         return handler.serialize_data({"v": 1})
+
+
+# Every master_key= but EncryptionWrapper's takes a hex string, and refuses a bytes key with TypeError rather than decode
+# it (protocol intent-presets.md, Master Key Input): whatever the encryption setting, and an empty one too, which must not
+# fall back to CACHEKIT_MASTER_KEY. Each call passes the key the row name says.
+_BYTES_KEY_ROWS: dict[str, Callable[[], object]] = {
+    "secure-intent-bytes-key": lambda: cache.secure(master_key=_KEY_BYTES)(_cached),
+    "secure-intent-bytearray-key": lambda: cache.secure(master_key=bytearray(_KEY_BYTES))(_cached),
+    "secure-intent-empty-bytes-key": lambda: cache.secure(master_key=b"")(_cached),
+    "secure-intent-empty-bytearray-key": lambda: cache.secure(master_key=bytearray())(_cached),
+    "secure-intent-empty-memoryview-key": lambda: cache.secure(master_key=memoryview(b""))(_cached),
+    "bare-encryption-off-bytes-key": lambda: cache(encryption=False, master_key=_KEY_BYTES)(_cached),
+    "bare-encryption-bytes-key": lambda: cache(encryption=True, single_tenant_mode=True, master_key=_KEY_BYTES)(_cached),
+    "bare-bytes-key": lambda: cache(master_key=_KEY_BYTES)(_cached),
+    "secure-config-bytes-key": lambda: DecoratorConfig.secure(master_key=_KEY_BYTES),
+    "secure-config-memoryview-key": lambda: DecoratorConfig.secure(master_key=memoryview(_KEY_BYTES)),  # type: ignore[arg-type]
+    "encryption-config-bytes-key": lambda: EncryptionConfig(enabled=True, master_key=_KEY_BYTES, single_tenant_mode=True),  # type: ignore[arg-type]
+    "encryption-config-positional-bytes-key": lambda: EncryptionConfig(True, _KEY_BYTES),  # type: ignore[arg-type]
+    "encryption-config-disabled-bytes-key": lambda: EncryptionConfig(enabled=False, master_key=_KEY_BYTES),  # type: ignore[arg-type]
+    "validate-bytes-key": lambda: validate_encryption_config(True, _KEY_BYTES),  # type: ignore[arg-type]
+    "validate-bytearray-key": lambda: validate_encryption_config(True, bytearray(_KEY_BYTES)),  # type: ignore[arg-type]
+    "validate-encryption-off-bytes-key": lambda: validate_encryption_config(False, _KEY_BYTES),  # type: ignore[arg-type]
+    "handler-bytes-key": lambda: CacheSerializationHandler(encryption=True, single_tenant_mode=True, master_key=_KEY_BYTES),  # type: ignore[arg-type]
+    "handler-encryption-off-bytes-key": lambda: CacheSerializationHandler(encryption=False, master_key=_KEY_BYTES),  # type: ignore[arg-type]
+    # Python 3.14's bytes.fromhex reads ASCII hex bytes, so this one used to work there: hex is a str.
+    "handler-ascii-hex-bytes-key": lambda: CacheSerializationHandler(
+        encryption=True,
+        single_tenant_mode=True,
+        master_key=_KEY_HEX.encode(),  # type: ignore[arg-type]
+    ),
+}
 
 
 # (env, call, raised, secret) per public entry point that takes a secret or reads one from the environment.
@@ -719,8 +752,116 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
     ),
     "io-backend-bad-token": ({}, lambda: CachekitIOBackend(api_key=_API_KEY + "\n"), ConfigurationError, _API_KEY),
     "io-backend-with-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY).with_timeout(-1), ConfigurationError, _API_KEY),
-    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), TypeError, _API_KEY),
-    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), TypeError, _API_KEY),
+    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), ConfigurationError, _API_KEY),
+    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), ConfigurationError, _API_KEY),
+    # A key passed where no form takes one is still a key (LAB-8223).
+    "minimal-config-misplaced-key": ({}, lambda: DecoratorConfig.minimal(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "io-config-misplaced-key": (
+        {},
+        lambda: DecoratorConfig.io(api_key=_API_KEY, master_key=_KEY_HEX),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "secure-config-misplaced-api-key": (
+        {},
+        lambda: DecoratorConfig.secure(master_key=_KEY_HEX, api_key=_API_KEY),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "config-form-misplaced-key": (
+        {},
+        lambda: cache(config=DecoratorConfig.minimal(), master_key=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    # So is a key under a misspelt name: every refused value is wrapped, in each dict a frame holds.
+    "minimal-config-misspelt-key": ({}, lambda: DecoratorConfig.minimal(master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "minimal-intent-misspelt-key": ({}, lambda: cache.minimal(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "secure-intent-misspelt-key": ({}, lambda: cache.secure(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "io-intent-misspelt-key": ({}, lambda: cache.io(api_kye=_API_KEY)(_cached), ConfigurationError, _API_KEY),
+    "bare-misspelt-key": ({}, lambda: cache(master_keey=_KEY_HEX)(_cached), ConfigurationError, _KEY_HEX),
+    "bare-call-misspelt-key": ({}, lambda: cache(_cached, master_keey=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "config-form-misspelt-key": (
+        {},
+        lambda: cache(config=DecoratorConfig.minimal(), master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    # And when another guard raises before the keyword check: one row per such guard.
+    "config-form-misspelt-key-beside-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False, master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-misspelt-key-beside-integrity-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), integrity_checking=False, master_keey=_KEY_HEX)(
+            _cached
+        ),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-misspelt-key-beside-io-backend": (
+        {},
+        lambda: cache(config=DecoratorConfig.io(api_key=_API_KEY), backend=None, api_kye=_API_KEY)(_cached),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "minimal-intent-misspelt-key-beside-encrypting-serializer": (
+        {},
+        lambda: cache.minimal(serializer="encrypted", master_keey=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "io-intent-misspelt-key-beside-config": (
+        {},
+        lambda: cache.io(config=DecoratorConfig.minimal(), api_kye=_API_KEY)(_cached),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "bare-misspelt-key-beside-non-config": (
+        {},
+        lambda: cache(config="minimal", master_keey=_KEY_HEX)(_cached),  # type: ignore[arg-type]
+        TypeError,
+        _KEY_HEX,
+    ),
+    "local-intent-misspelt-key": ({}, lambda: cache.local(master_keey=_KEY_HEX)(_cached), TypeError, _KEY_HEX),
+    # A refused bytes value is wrapped too: no form takes a bytes key, but a caller may still pass one.
+    "minimal-config-misspelt-bytes-key": (
+        {},
+        lambda: DecoratorConfig.minimal(master_keey=bytes.fromhex(_KEY_HEX)),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
+    "minimal-intent-misplaced-bytes-key": (
+        {},
+        lambda: cache.minimal(master_key=bytes.fromhex(_KEY_HEX))(_cached),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
+    "config-form-misspelt-bytes-key-beside-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False, master_keey=bytes.fromhex(_KEY_HEX))(
+            _cached
+        ),
+        ConfigurationError,
+        bytes.fromhex(_KEY_HEX),
+    ),
+    # A bytes key is held only wrapped where a form refuses master_key= itself (_BYTES_KEY_ROWS cover the rest).
+    "local-intent-bytes-key": ({}, lambda: cache.local(master_key=_KEY_BYTES)(_cached), TypeError, _KEY_HEX),
+    "secure-config-bytes-key-beside-misspelt-key": (
+        {},
+        lambda: DecoratorConfig.secure(master_key=_KEY_BYTES, master_keey=_KEY_HEX),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "io-intent-env-timeout": (
         {"CACHEKIT_TIMEOUT": "-1"},
         lambda: cache.io(api_key=_API_KEY)(_cached),
@@ -777,6 +918,18 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         b"\x01" * 32,
     ),
     "wrapper-str-key": ({}, lambda: EncryptionWrapper(master_key=_KEY_HEX), TypeError, _KEY_HEX),  # type: ignore[arg-type]
+    "wrapper-long-raw-key": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX) + b"\x01"),
+        EncryptionError,
+        _KEY_HEX,
+    ),
+    "wrapper-long-raw-previous": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX), previous_master_keys=[b"\x01" * 33]),
+        KeyringConfigurationError,
+        _KEY_HEX,
+    ),
     "redis-backend-env-pool": (
         {"CACHEKIT_CONNECTION_POOL_SIZE": "notint"},
         lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@localhost:6379/0"),
@@ -875,6 +1028,9 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
 }
 
 
+_CLEARED_ENV = ("CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS", "CACHEKIT_API_KEY", "CACHEKIT_MAX_VALUE_SIZE")
+
+
 @pytest.mark.unit
 class TestEntryPointFrameLocals:
     """No cachekit frame on an error raised from a public entry point holds a secret it was passed or read
@@ -889,7 +1045,7 @@ class TestEntryPointFrameLocals:
         raised: type[BaseException],
         secret: str | bytes,
     ) -> None:
-        for name in ("CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS", "CACHEKIT_API_KEY", "CACHEKIT_MAX_VALUE_SIZE"):
+        for name in _CLEARED_ENV:
             monkeypatch.delenv(name, raising=False)
         for name, value in env.items():
             monkeypatch.setenv(name, value)
@@ -899,3 +1055,22 @@ class TestEntryPointFrameLocals:
             call()
 
         assert _cachekit_locals_holding(exc_info.value, secret) == []
+
+    @pytest.mark.parametrize("env_key", [None, "ef" * 32], ids=["no-env-key", "env-key"])
+    @pytest.mark.parametrize("call", _BYTES_KEY_ROWS.values(), ids=_BYTES_KEY_ROWS.keys())
+    def test_bytes_key_refusal_quotes_no_key_and_leaves_no_frame_local_below_the_caller(
+        self, monkeypatch: pytest.MonkeyPatch, call: Callable[[], object], env_key: str | None
+    ) -> None:
+        """Every frame below the caller's, not only cachekit's: EncryptionConfig refuses the key before its
+        generated __init__, whose frame would hold it raw, runs. A CACHEKIT_MASTER_KEY never stands in for it."""
+        for name in _CLEARED_ENV:
+            monkeypatch.delenv(name, raising=False)
+        if env_key is not None:
+            monkeypatch.setenv("CACHEKIT_MASTER_KEY", env_key)
+        singleton.reset_settings()
+
+        with pytest.raises(TypeError) as exc_info:
+            call()
+
+        assert str(exc_info.value) == _BYTES_KEY_REFUSAL
+        assert _cachekit_locals_holding(exc_info.value, _KEY_HEX, below_caller=True) == []

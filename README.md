@@ -177,7 +177,7 @@ Setting `CACHEKIT_MASTER_KEY` instead of passing `master_key=` means every prese
 
 > ¹ `@cache.dev` exports no Prometheus metrics except `circuit_breaker_state`, which is recorded for every function whose circuit breaker is enabled.
 >
-> 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
+> 🔒 `@cache.secure` forces `integrity_checking=True` — passing `integrity_checking=False` raises `ConfigurationError` at decoration, including as an override next to `config=DecoratorConfig.secure(...)`. Its encryption is fixed the same way: `encryption=` raises `ConfigurationError` on `@cache.secure` and next to `config=DecoratorConfig.secure(...)`, so pass `fail_closed=` and the other encryption options to the preset itself. `@cache.secure` also rejects `config=`; the RORO form is `@cache(config=DecoratorConfig.secure(...))`.
 >
 > **Default TTL** follows the cross-SDK [intent-preset spec](https://github.com/cachekit-io/protocol/blob/main/spec/intent-presets.md#default-ttl) (`@cache.io` 3600 s) — the same numbers as cachekit-rs and cachekit-ts. `ttl=` overrides it; `ttl=None` is the explicit never-expire opt-in ([details](docs/configuration.md#intent-presets)).
 >
@@ -277,7 +277,7 @@ def get_large_dataset(date: str):
     return pd.read_csv(f"data/{date}.csv")
 ```
 
-Encrypted DataFrames go through `@cache.secure`, which takes any serializer. A file backend keeps this example self-contained; production uses Redis or cachekit.io:
+Encrypted DataFrames go through `@cache.secure`, which takes any serializer whose class declares `cross_sdk_compatible = True` ([details](docs/serializers/encryption.md#composability)). A file backend keeps this example self-contained; production uses Redis or cachekit.io:
 
 ```python
 import tempfile

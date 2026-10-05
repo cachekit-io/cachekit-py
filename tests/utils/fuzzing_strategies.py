@@ -21,12 +21,12 @@ class SecurityFuzzingStrategies:
 
     @staticmethod
     def encryption_keys() -> st.SearchStrategy[bytes]:
-        """Generate valid encryption keys (32+ bytes).
+        """Generate valid raw encryption keys: EncryptionWrapper takes exactly 32 bytes.
 
         Returns:
-            Hypothesis strategy that generates 32-64 byte binary keys.
+            Hypothesis strategy that generates 32-byte binary keys.
         """
-        return st.binary(min_size=32, max_size=64)
+        return st.binary(min_size=32, max_size=32)
 
     @staticmethod
     def cache_payloads() -> st.SearchStrategy[Any]:

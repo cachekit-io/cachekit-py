@@ -2,13 +2,13 @@
 
 # Encryption Wrapper
 
-**EncryptionWrapper** adds client-side AES-256-GCM encryption to **any** serializer. It is a composable wrapper — it serializes data using an inner serializer, then encrypts the result before storage.
+**EncryptionWrapper** adds client-side AES-256-GCM encryption to any serializer whose class declares `cross_sdk_compatible = True` ([Composability](#composability)). It is a composable wrapper — it serializes data using an inner serializer, then encrypts the result before storage.
 
 For comprehensive documentation of cachekit's zero-knowledge encryption architecture, key management, multi-tenant limits, nonce handling, and authentication guarantees, see [Zero-Knowledge Encryption Guide](../features/zero-knowledge-encryption.md).
 
 ## Overview
 
-EncryptionWrapper wraps any other serializer:
+EncryptionWrapper wraps a cross-SDK serializer:
 
 ```
 serialize(data) → inner.serialize(data) → encrypt(bytes) → stored bytes
@@ -25,7 +25,8 @@ name, to `@cache(serializer=...)` or to any preset that takes `serializer=` rais
 when the decorator is applied: the decorator never gives it the cache key each ciphertext is bound to,
 so it could not store an entry. With `backend=None` you get a different error instead
 ([details](../error-codes.md#encrypting-serializer-on-a-decorator)). `EncryptionWrapper` stays
-available for direct use outside a decorator.
+available for direct use outside a decorator, with the same serializer rule as the decorator
+([Composability](#composability)).
 
 ```python fixture:master_key_env
 import os
@@ -65,7 +66,7 @@ def get_user_ssn(user_id: int):
     return {"ssn": "123-45-6789", "dob": "1990-01-01"}
 ```
 
-Encryption works with any serializer — including DataFrames:
+Encryption works with any cross-SDK serializer — including DataFrames:
 
 ```python notest
 from cachekit import cache
@@ -79,16 +80,54 @@ def get_patient_records(hospital_id: int):
 
 ## Composability
 
-EncryptionWrapper works with **any** serializer:
+EncryptionWrapper works with any serializer whose class declares `cross_sdk_compatible = True`:
 
 | Inner Serializer | Use Case |
 |-----------------|---------|
 | StandardSerializer (default) | Encrypted cross-language MessagePack data |
 | OrjsonSerializer | Encrypted API responses, JSON data |
 | ArrowSerializer | Encrypted DataFrames (patient data, ML features) |
-| Custom serializers | Any data type with encryption |
+| [Custom serializers](custom.md#under-encryption) that set `cross_sdk_compatible = True` | Any data type with encryption |
+
+Any other serializer, `AutoSerializer` included, raises `ConfigurationError` when the wrapper is built,
+as the decorators already do ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+
+```python
+from cachekit.config import ConfigurationError
+from cachekit.serializers import AutoSerializer, EncryptionWrapper, StandardSerializer
+
+key = bytes(range(32))  # 32 bytes from your secret store
+
+try:
+    EncryptionWrapper(serializer=AutoSerializer(), master_key=key, previous_master_keys=[])
+except ConfigurationError:
+    pass  # AutoSerializer sniffs the decrypted bytes, so it is refused
+else:
+    raise AssertionError("AutoSerializer must be refused under encryption")
+
+wrapper = EncryptionWrapper(serializer=StandardSerializer(), master_key=key, previous_master_keys=[])
+data, meta = wrapper.serialize({"ssn": "123-45-6789"}, cache_key="users:1:ssn")
+assert wrapper.deserialize(data, meta, cache_key="users:1:ssn") == {"ssn": "123-45-6789"}
+```
 
 EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
+
+## Direct Use
+
+Built directly, `EncryptionWrapper` takes the raw key: exactly 32 bytes for `master_key=` and for each
+of `previous_master_keys=`, not the hex string the decorators and `CACHEKIT_MASTER_KEY` take. Decode a
+hex key with `bytes.fromhex()`:
+
+```python
+from cachekit.serializers import EncryptionWrapper
+
+# secret_key: the 64-character hex key from your secret store, as @cache.secure takes it
+wrapper = EncryptionWrapper(master_key=bytes.fromhex(secret_key), previous_master_keys=[])
+```
+
+From 0.23.0, any other length raises when the wrapper is built. That includes the hex string's own
+64 bytes, `secret_key.encode()`, which earlier releases accepted as a different key
+([details](../error-codes.md#raw-key-is-not-32-bytes)).
 
 ## Zero-Knowledge Caching
 

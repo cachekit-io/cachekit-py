@@ -41,6 +41,16 @@ _logger = get_structured_logger(__name__)
 logger = logging.getLogger(__name__)
 
 
+def _wire_seconds(seconds: float) -> int:
+    """Whole seconds for a TTL or stale window on the wire, ceiled so a sub-second value
+    goes out as 1, never 0 or a fraction the server rejects (spec/saas-api.md API-42, API-54).
+
+    ``ttl`` is annotated ``int`` but nothing enforces it, so a float reaches here.
+    Zero stays 0: the server rejects it rather than the SDK inventing a 1-second entry.
+    """
+    return math.ceil(seconds)
+
+
 def _log_release_failure(lock_key: str, exc: BaseException) -> None:
     logger.warning(
         "CachekitIO lock release for %s failed (%s); the lock is held until its timeout",
@@ -56,12 +66,9 @@ def _log_release_failure(lock_key: str, exc: BaseException) -> None:
 # preferring the header. See protocol spec/saas-api.md (DELETE .../lock).
 LOCK_ID_HEADER = "X-CacheKit-Lock-Id"
 
-# Protocol-canonical TTL header (spec/saas-api.md). The legacy X-TTL is sent
-# alongside it until the dual-reading server (saas#245) is deployed everywhere;
-# sending both is value-identical and safe against either server generation.
-# TODO(LAB-381 follow-up): drop X-TTL once saas#245 is live in prod.
+# Protocol-canonical TTL header (spec/saas-api.md). SDKs send it alone: the
+# legacy X-TTL is server-side migration only (API-44).
 TTL_HEADER = "X-CacheKit-TTL"
-LEGACY_TTL_HEADER = "X-TTL"
 
 # Stale-while-revalidate (LAB-381, spec/saas-api.md#stale-while-revalidate).
 # STALE_TTL_HEADER rides PUTs to open a stale-grace window past the fresh TTL;
@@ -590,13 +597,12 @@ class CachekitIOBackend:
 
     @staticmethod
     def _set_headers(ttl: int | None, stale_ttl: int | None) -> dict[str, str]:
-        """PUT timing headers: canonical + legacy TTL (dual-send until saas#245 deploys), stale window."""
+        """PUT timing headers: TTL and stale window, in the wire's whole seconds."""
         headers: dict[str, str] = {}
         if ttl is not None:
-            headers[TTL_HEADER] = str(ttl)
-            headers[LEGACY_TTL_HEADER] = str(ttl)
+            headers[TTL_HEADER] = str(_wire_seconds(ttl))
         if stale_ttl is not None and stale_ttl > 0 and ttl is not None:
-            headers[STALE_TTL_HEADER] = str(stale_ttl)
+            headers[STALE_TTL_HEADER] = str(_wire_seconds(stale_ttl))
         return headers
 
     def delete(self, key: str) -> bool:
@@ -1115,7 +1121,7 @@ class CachekitIOBackend:
         """
         encoded_key = self._encode_key(key)
         try:
-            payload = json.dumps({"ttl": ttl})
+            payload = json.dumps({"ttl": _wire_seconds(ttl)})
             await self._request_async(
                 "PATCH",
                 f"{encoded_key}/ttl",

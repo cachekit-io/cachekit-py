@@ -1,12 +1,13 @@
 """SWR transport layer (LAB-381, protocol spec/saas-api.md#stale-while-revalidate).
 
 Covers the freshness-aware read (X-CacheKit-Freshness mapping), the stale-grace
-write headers (X-CacheKit-Stale-TTL + canonical/legacy TTL dual-send), and the
+write headers (X-CacheKit-Stale-TTL + the canonical TTL), and the
 StandardCacheHandler plumbing incl. the non-SWR-backend fallbacks.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from unittest.mock import patch
 
@@ -15,7 +16,6 @@ import pytest
 from cachekit.backends.cachekitio.backend import (
     FRESH_FOR_HEADER,
     FRESHNESS_HEADER,
-    LEGACY_TTL_HEADER,
     STALE_TTL_HEADER,
     TTL_HEADER,
     CachekitIOBackend,
@@ -124,15 +124,28 @@ class TestFreshForRead:
 
 
 class TestStaleGraceWrite:
-    """PUT timing headers: canonical+legacy TTL dual-send, stale window rules."""
+    """PUT timing headers: the canonical TTL alone, stale window rules."""
 
-    def test_ttl_dual_send(self, backend: CachekitIOBackend) -> None:
+    def test_ttl_sent_canonical_only(self, backend: CachekitIOBackend) -> None:
+        """API-44: SDKs send X-CacheKit-TTL only, never the legacy X-TTL."""
         with patch.object(backend, "_request_sync") as req:
             backend.set("k", b"v", ttl=300)
         headers = req.call_args.kwargs["headers"]
-        assert headers[TTL_HEADER] == "300"
-        assert headers[LEGACY_TTL_HEADER] == "300"
-        assert STALE_TTL_HEADER not in headers
+        assert headers == {TTL_HEADER: "300"}
+
+    @pytest.mark.parametrize(
+        ("ttl", "stale_ttl", "wire_ttl", "wire_stale"),
+        [(0.5, 0.5, "1", "1"), (0.001, None, "1", None), (1.5, 2.25, "2", "3"), (60, 30, "60", "30")],
+    )
+    def test_ttls_ceiled_to_whole_seconds(
+        self, backend: CachekitIOBackend, ttl: float, stale_ttl: float | None, wire_ttl: str, wire_stale: str | None
+    ) -> None:
+        """API-42 / API-54: a sub-second TTL or stale window goes out as 1, never 0 or a fraction."""
+        with patch.object(backend, "_request_sync") as req:
+            backend.set("k", b"v", ttl=ttl, stale_ttl=stale_ttl)  # type: ignore[arg-type]  # nothing enforces the int annotation
+        headers = req.call_args.kwargs["headers"]
+        assert headers[TTL_HEADER] == wire_ttl
+        assert headers.get(STALE_TTL_HEADER) == wire_stale
 
     def test_stale_ttl_sent_with_ttl(self, backend: CachekitIOBackend) -> None:
         with patch.object(backend, "_request_sync") as req:
@@ -140,6 +153,13 @@ class TestStaleGraceWrite:
         headers = req.call_args.kwargs["headers"]
         assert headers[STALE_TTL_HEADER] == "600"
         assert headers[TTL_HEADER] == "300"
+
+    @pytest.mark.parametrize(("ttl", "wire"), [(0.5, 1), (90, 90)])
+    async def test_refresh_ttl_ceiled_to_whole_seconds(self, backend: CachekitIOBackend, ttl: float, wire: int) -> None:
+        """PATCH /ttl takes the same validation as X-CacheKit-TTL, so a sub-second value goes out as 1."""
+        with patch.object(backend, "_request_async") as req:
+            assert await backend.refresh_ttl("k", ttl) is True  # type: ignore[arg-type]
+        assert json.loads(req.call_args.kwargs["body"]) == {"ttl": wire}
 
     @pytest.mark.parametrize(("ttl", "stale_ttl"), [(None, 600), (300, 0), (300, None), (None, None)])
     def test_stale_ttl_omitted(self, backend: CachekitIOBackend, ttl: int | None, stale_ttl: int | None) -> None:

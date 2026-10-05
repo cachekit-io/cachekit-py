@@ -31,21 +31,35 @@ branch mispredictions, so a claimed wall-clock win still needs an interleaved wa
 
 Run ``python tests/performance/ir_budget.py --help`` for the gate and ``--update`` (ratchet-down)
 options. Measuring requires valgrind; the unit tests import this module's helpers without it.
+
+Callgrind runs need a bound. Each path here peaks at 0.5 to 1.0 GiB per run, but a workload that
+grows under callgrind can use many GiB: a FileBackend ``set()`` workload passed 9 GiB in under four
+minutes. Each run is killed after ``--child-timeout`` minutes, and every live run is killed when the
+gate exits, fails, or gets SIGINT or SIGTERM. On Linux with systemd, also cap the whole gate's
+memory and run time from outside::
+
+    systemd-run --user --scope -p MemoryMax=10G -p MemorySwapMax=0 -p RuntimeMaxSec=90min -- \
+        uv run python tests/performance/ir_budget.py
+
+The gate does not call ``systemd-run`` itself: CI runners and macOS lack it.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import sysconfig
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 
 N_LO, N_HI = 1000, 3000
@@ -63,10 +77,13 @@ WARN_PCT = 0.2  # above the A/A floor: report but pass
 # moves by more than the 1% threshold between unrelated changes, so it is gated at what this
 # harness resolves for it.
 TOLERANCE_PCT = {"serializer_orjson": (2.0, 1.0)}  # path: (fail, warn)
-# Callgrind runs at a time by default. Each holds about half a gigabyte, so the default stays small
-# enough to share the machine with other work rather than growing with its core count; --jobs
-# overrides it.
+# Callgrind runs at a time by default. Each path peaks at 0.5 to 1.0 GiB per run (the L2, miss and
+# secure paths at the top), so the default stays small enough to share the machine with other work
+# rather than growing with its core count; --jobs overrides it. A workload that grows under callgrind
+# can hold many GiB per run, so each run also has a time limit and the module docstring gives a
+# memory cap to run the gate under.
 JOBS = min(8, os.cpu_count() or 1)
+CHILD_TIMEOUT_MIN = 15.0  # wall-clock limit per callgrind run; --child-timeout overrides it
 BASELINES = Path(__file__).with_name("ir_baselines.json")
 WORKLOAD = Path(__file__).with_name("ir_workload.py")  # the measured process
 PATHS = (
@@ -82,6 +99,7 @@ PATHS = (
     "serializer_orjson",
     "serializer_arrow",
     "serializer_encrypted",
+    "file_set",
 )
 
 # ── gate ────────────────────────────────────────────────────────────────────────────────────
@@ -111,22 +129,64 @@ def per_op(ir_lo: int, ir_hi: int) -> int:
     return round((ir_hi - ir_lo) / (N_HI - N_LO))
 
 
-def _run(prefix: list[str], path: str, n: int, env: dict[str, str]) -> None:
+# Live child processes, so a failing or interrupted gate can kill every one of them. Once _stopped is
+# set, a run that starts is killed at once: a pool thread can start one after the others were killed.
+# Both are guarded by _children_lock, re-entrant because the signal handler takes it on the main
+# thread, which may already hold it. _stopped is a plain bool, not a threading.Event: Event.set() takes
+# a lock of its own that is not re-entrant, so a signal landing inside it would deadlock the handler.
+_children: set[subprocess.Popen[str]] = set()
+_children_lock = threading.RLock()
+_stopped = False
+_signals: list[int] = []  # SIGINT and SIGTERM received during measure(), which raises the first
+
+
+def _kill_children() -> None:
+    global _stopped
+    with _children_lock:
+        _stopped = True
+        for proc in _children:
+            proc.kill()
+
+
+def _on_signal(signum: int, _frame: object) -> None:
+    # Python runs this on the main thread between any two bytecodes. Raising here could leave a lock
+    # taken but not yet released, or skip the rest of a cleanup, so it never raises: it kills the runs,
+    # which fails them, and measure() raises the signal once they are dead.
+    _signals.append(signum)
+    _kill_children()
+
+
+def _run(prefix: list[str], path: str, n: int, env: dict[str, str], timeout_s: float) -> None:
     cmd = [*prefix, sys.executable, str(WORKLOAD), path, str(n)]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)  # noqa: S603 (trusted: valgrind + this file)
+    run = f"{path} n={n} layout={env.get('IR_BUDGET_LAYOUT', '-')}"
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603 (trusted: valgrind + this file)
+    with _children_lock:
+        _children.add(proc)
+        if _stopped:
+            proc.kill()
+    try:
+        _, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{run} ran past --child-timeout ({timeout_s / 60:g} min) and was killed") from None
+    finally:
+        if proc.returncode is None:  # timed out: never leave it running
+            proc.kill()
+            proc.communicate()
+        with _children_lock:
+            _children.discard(proc)
     if proc.returncode != 0:
-        raise RuntimeError(f"{path} n={n} exited {proc.returncode}:\n{proc.stderr[-2000:]}")
+        raise RuntimeError(f"{run} exited {proc.returncode}:\n{stderr[-2000:]}")
 
 
-def _measure_one(path: str, n: int, workdir: Path, env: dict[str, str]) -> int:
+def _measure_one(path: str, n: int, workdir: Path, env: dict[str, str], timeout_s: float) -> int:
     workdir.mkdir(exist_ok=True)
     out = workdir / f"{path}.{n}.cg"
     valgrind = shutil.which("valgrind") or "valgrind"
-    _run([valgrind, "--tool=callgrind", "--separate-threads=yes", f"--callgrind-out-file={out}"], path, n, env)
+    _run([valgrind, "--tool=callgrind", "--separate-threads=yes", f"--callgrind-out-file={out}"], path, n, env, timeout_s)
     return main_thread_ir(out)
 
 
-def measure(paths: list[str], jobs: int) -> dict[str, int]:
+def measure(paths: list[str], jobs: int, child_timeout_s: float = CHILD_TIMEOUT_MIN * 60) -> dict[str, int]:
     """Per-op main-thread Ir for each path. Runs are independent processes, so they parallelise.
 
     A first import compiles and writes ``.pyc`` files, and concurrent runs race to do it, which
@@ -136,6 +196,11 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
     The process environment is fixed, not inherited: its size moves the stack and heap layout,
     which moved a small path by up to 0.4% per op. No shell setting (CACHEKIT_* included) reaches
     the measured process; the two CACHEKIT_* settings below keep cachekit's background threads asleep.
+
+    Each run is killed after ``child_timeout_s``. The first failed run kills every live run before the
+    error propagates, so no callgrind process outlives this call. SIGINT or SIGTERM kills them at once and
+    is raised, as KeyboardInterrupt or SystemExit(128 + signal), once they are dead. Call it from the main
+    thread: it handles SIGINT and SIGTERM while it runs.
     """
     env = {
         "PATH": "/usr/bin:/bin",
@@ -151,16 +216,39 @@ def measure(paths: list[str], jobs: int) -> dict[str, int]:
         "CACHEKIT_LOG_FLUSH_INTERVAL": "86400",
         "CACHEKIT_L1_CLEANUP_INTERVAL_SECONDS": "86400",
     }
-    for path in paths:
-        _run([], path, 1, env)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
-    with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
-        futures = {
-            (p, n, shift): pool.submit(_measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)})
-            for p, n, shift in runs
-        }
-        ir = {key: future.result() for key, future in futures.items()}
+    global _stopped
+    with _children_lock:
+        _stopped = False
+    _signals.clear()
+    previous = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for path in paths:
+            _run([], path, 1, env, child_timeout_s)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        runs = [(p, n, shift) for p in paths for shift in LAYOUTS for n in (N_LO, N_HI)]
+        with tempfile.TemporaryDirectory(prefix="cachekit-ir-") as tmp, ThreadPoolExecutor(jobs) as pool:
+            try:
+                futures = {
+                    (p, n, shift): pool.submit(
+                        _measure_one, p, n, Path(tmp) / str(shift), env | {"IR_BUDGET_LAYOUT": str(shift)}, child_timeout_s
+                    )
+                    for p, n, shift in runs
+                }
+                # A run that fails behind a long earlier one is seen now, not once that one finishes.
+                for future in wait(futures.values(), return_when=FIRST_EXCEPTION).done:
+                    future.result()
+                ir = {key: future.result() for key, future in futures.items()}
+            finally:
+                # Leaving the pool waits for its live runs, so they are killed first, from the first submit on.
+                pool.shutdown(wait=False, cancel_futures=True)
+                _kill_children()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if _signals:  # every run is dead now, so the signal ends the gate in place of the failures it caused
+            if _signals[0] == signal.SIGINT:
+                raise KeyboardInterrupt from None
+            raise SystemExit(128 + _signals[0]) from None
     return {p: round(statistics.median(per_op(ir[(p, N_LO, s)], ir[(p, N_HI, s)]) for s in LAYOUTS)) for p in paths}
 
 
@@ -196,12 +284,33 @@ def ratchet(budgets: dict[str, int], measured: dict[str, int], allow_increase: b
     return out
 
 
+def _positive_minutes(text: str) -> float:
+    """``--child-timeout``: 0 or less times out every run, and inf or nan crash the first one."""
+    minutes = float(text)
+    if not 0 < minutes < math.inf:  # false for nan as well
+        raise argparse.ArgumentTypeError(f"must be a positive number of minutes, not {text}")
+    return minutes
+
+
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--path", action="append", choices=PATHS, help="measure only this path (repeatable)")
     parser.add_argument("--update", action="store_true", help="write lower measured figures back as budgets")
     parser.add_argument("--allow-increase", action="store_true", help="with --update, also raise budgets")
-    parser.add_argument("--jobs", type=int, default=JOBS, help=f"callgrind runs at a time (default {JOBS}; each holds ~0.5 GB)")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=JOBS,
+        help=f"callgrind runs at a time (default {JOBS}); each path peaks at 0.5-1.0 GiB per run, but a FileBackend set() "
+        "workload passed 9 GiB in four minutes, so cap memory from outside (see the module docstring)",
+    )
+    parser.add_argument(
+        "--child-timeout",
+        type=_positive_minutes,
+        default=CHILD_TIMEOUT_MIN,
+        metavar="MIN",
+        help=f"kill a callgrind run after this many minutes and fail the gate (default {CHILD_TIMEOUT_MIN:g})",
+    )
     args = parser.parse_args()
 
     if shutil.which("valgrind") is None:
@@ -213,7 +322,7 @@ def _main() -> int:
     if entry.get("python") not in (None, platform.python_version()):
         print(f"note: budgets for {key} were recorded on {entry['python']}, this is {platform.python_version()}")
 
-    measured = measure(args.path or list(PATHS), args.jobs)
+    measured = measure(args.path or list(PATHS), args.jobs, args.child_timeout * 60)
     lines, ok = compare(entry["budgets"], measured)
     print(f"main-thread Ir/op on {key} ({platform.python_version()}), (Ir[{N_HI}] - Ir[{N_LO}]) / {N_HI - N_LO}")
     print("\n".join(lines))

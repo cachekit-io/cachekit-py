@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .validation import ConfigurationError
+from .validation import ConfigurationError, hide_any_secret, refuse_bytes_key
 
 if TYPE_CHECKING:
     from cachekit.decorators.tenant_context import TenantContextExtractor
@@ -301,7 +301,8 @@ class EncryptionConfig:
     Attributes:
         enabled: Tri-state encryption flag (default: None = unset).
                  True = force-on, False = explicit opt-out.
-        master_key: Hex-encoded master key for key derivation (required if enabled=True)
+        master_key: Hex-encoded master key for key derivation (required if enabled=True). A bytes key
+                 raises TypeError: pass ``key.hex()``.
         tenant_extractor: Optional extractor with .extract(args, kwargs) for per-tenant key derivation (default: None)
         single_tenant_mode: Explicitly enable single-tenant mode (default: False)
         deployment_uuid: Optional explicit tenant_id override for single-tenant mode (default: None →
@@ -348,6 +349,13 @@ class EncryptionConfig:
         Traceback (most recent call last):
             ...
         cachekit.config.validation.ConfigurationError: Encryption requires explicit tenant mode...
+
+        The key is hex, never bytes:
+
+        >>> EncryptionConfig(enabled=True, master_key=bytes(32), single_tenant_mode=True)
+        Traceback (most recent call last):
+            ...
+        TypeError: master_key takes a hex string, not bytes: pass key.hex(). Only EncryptionWrapper takes raw key bytes.
     """
 
     enabled: bool | None = None
@@ -356,6 +364,17 @@ class EncryptionConfig:
     single_tenant_mode: bool = False
     deployment_uuid: str | None = None
     fail_closed: bool | None = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> EncryptionConfig:
+        # A bytes key is refused here, not in __post_init__: that would raise beneath the generated __init__, whose
+        # frame holds the key raw in a local (CWE-532). This frame holds it only wrapped. master_key is the second
+        # field, so the second positional argument when not passed by keyword.
+        if len(args) > 1:
+            args = (args[0], hide_any_secret(args[1]), *args[2:])
+        if "master_key" in kwargs:
+            kwargs["master_key"] = hide_any_secret(kwargs["master_key"])
+        refuse_bytes_key(args[1] if len(args) > 1 else kwargs.get("master_key"))
+        return super().__new__(cls)
 
     def validate(self) -> None:
         """Validate encryption configuration.

@@ -104,7 +104,8 @@ def _connection_pool(config: CachekitIOBackendConfig) -> HTTPSConnectionPool:
         proxy_auth = parse_url(proxy).auth
         proxy_headers = make_headers(proxy_basic_auth=unquote(proxy_auth)) if proxy_auth else None
         manager = urllib3.ProxyManager(proxy, proxy_headers=proxy_headers, **pool_kw)
-    # The config only accepts https:// URLs.
+    # The config only accepts https:// URLs. config._parse_api_url validated the host parse_url reads from api_url;
+    # connection_from_url reads the same host.
     return manager.connection_from_url(config.api_url)  # type: ignore[return-value]
 
 

@@ -176,7 +176,7 @@ def explicit_backend():
 
 `@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` (from `api_key=` or `CACHEKIT_API_KEY`) and passes it as an explicit `backend` kwarg. No magic, just convenience. Because the preset owns its backend, `@cache.io(backend=...)` raises `ConfigurationError` rather than silently ignoring the argument.
 
-A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it.
+A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it, except beside `config=DecoratorConfig.io(...)`, which raises `ConfigurationError` from 0.23.0, as `@cache.io(backend=...)` does. A config's `backend=None` is explicit too: from 0.23.0 it selects [L1-only mode](none.md#in-a-decoratorconfig), and no lower tier fills it. A config that omits `backend` holds `UNSET` and resolves through the tiers below.
 
 ### 2. Module-Level Default Backend (Middle Priority)
 
@@ -267,8 +267,8 @@ the function's circuit breaker, which every tenant of that function shares.
 
 The check needs the function's backend. A function whose backend is resolved at its first call
 (see the resolution order below) skips the check until then. That covers a call made while the
-circuit breaker is open before the backend was ever resolved, which runs the function uncached,
-and an L1 hit on an async function before its first L1 miss. The check is on the id's type only. L1 is shared by every tenant (see
+circuit breaker is open before the backend was ever resolved, which runs the function uncached.
+The check is on the id's type only. L1 is shared by every tenant (see
 above), so do not rely on the `TypeError` to keep tenants apart.
 
 **Resolution order**:
@@ -359,7 +359,7 @@ Other changes you may notice:
 | Backend | Latency | Use Case | Notes |
 |---------|---------|----------|-------|
 | **L1 (In-Memory)** | ~50ns | Repeated calls in same process | Process-local only |
-| **File** | set = fsync + per-entry scan; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
+| **File** | set = fsync, flat in cache size, except eviction, rejection and the 30 s rescan, which scan the directory; get waits on a concurrent set | Single-process local caching | Development, scripts, CLI tools |
 | **Redis** | 1-7ms | Shared cache across pods | Production default |
 | **CachekitIO** | 42–45ms p50 hit, measured from MEL | Managed SaaS, zero-ops | HTTPS (HTTP/1.1, async calls on a worker thread); depends on vantage, store region and edge hits ([measured](cachekitio.md#characteristics)); closed beta |
 | **HTTP API** | 10-100ms | Custom cloud services | Network dependent |

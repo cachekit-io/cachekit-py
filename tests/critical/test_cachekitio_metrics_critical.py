@@ -57,14 +57,14 @@ class TestSyncRequestHeaderInjection:
         assert pool.requests[0].headers.get("X-CacheKit-L1-Status") == "disabled"
 
     def test_headers_merged_with_existing(self, backend_and_pool: tuple[CachekitIOBackend, FakePool]) -> None:
-        """Metrics headers merge with (not replace) existing headers like X-TTL."""
+        """Metrics headers merge with (not replace) existing headers like X-CacheKit-TTL."""
         backend, pool = backend_and_pool
 
         backend.set("test-key", b"data", ttl=60)
 
         headers = pool.requests[0].headers
-        # Both X-TTL (from set) and L1-Status (from metrics) present
-        assert "X-TTL" in headers
+        # Both X-CacheKit-TTL (from set) and L1-Status (from metrics) present
+        assert "X-CacheKit-TTL" in headers
         assert "X-CacheKit-L1-Status" in headers
 
 
@@ -85,11 +85,11 @@ class TestAsyncRequestHeaderInjection:
 
     @pytest.mark.asyncio
     async def test_async_headers_merged_with_existing(self, backend_and_pool: tuple[CachekitIOBackend, FakePool]) -> None:
-        """Async path: metrics headers merge with existing headers like X-TTL."""
+        """Async path: metrics headers merge with existing headers like X-CacheKit-TTL."""
         backend, pool = backend_and_pool
 
         await backend.set_async("test-key", b"data", ttl=60)
 
         headers = pool.requests[0].headers
-        assert "X-TTL" in headers
+        assert "X-CacheKit-TTL" in headers
         assert "X-CacheKit-L1-Status" in headers

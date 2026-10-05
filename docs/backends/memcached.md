@@ -70,6 +70,10 @@ config = MemcachedBackendConfig(
 backend = MemcachedBackend(config)
 ```
 
+An encrypted cache (`@cache.secure`) binds `key_prefix` into each entry's AAD along with the
+cache key, so an entry moved under another prefix fails authentication. See
+[Cache Key Binding](../features/zero-knowledge-encryption.md#cache-key-binding).
+
 ## When to Use
 
 **Use MemcachedBackend when**:

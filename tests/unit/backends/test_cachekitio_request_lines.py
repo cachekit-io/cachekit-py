@@ -190,7 +190,7 @@ def test_headers_that_carry_meaning(backend: CachekitIOBackend, server: _Capture
         "content-type": "application/octet-stream",
         "content-length": "6",
         "x-cachekit-ttl": "60",
-        "x-ttl": "60",
+        "x-ttl": None,
         "x-cachekit-stale-ttl": "30",
     }
     assert "content-length" not in delete and "content-length" not in head

@@ -11,9 +11,13 @@ Usage, as ``ir_budget.py`` runs it: ``python ir_workload.py <path> <n>``.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from collections.abc import Callable
 from typing import Any
+
+FILE_SET_ENTRIES = 1000
+_scratch_dirs: list[str] = []  # removed before exit; the removal costs the same at both loop sizes
 
 
 def build_workload(path: str) -> Callable[[], object]:
@@ -122,6 +126,22 @@ def build_workload(path: str) -> Callable[[], object]:
         fn = decorated[path]()
         return lambda: fn(42, "user-profile")
 
+    if path == "file_set":
+        # FileBackend.set() overwriting one key in a cache of FILE_SET_ENTRIES entries: the entry
+        # count stays flat, so no eviction runs, and anything set() does per cached entry shows.
+        import tempfile
+
+        from cachekit.backends.file import FileBackend
+        from cachekit.backends.file.config import FileBackendConfig
+
+        cache_dir = tempfile.mkdtemp(prefix="cachekit-ir-file-")
+        _scratch_dirs.append(cache_dir)
+        backend = FileBackend(FileBackendConfig(cache_dir=cache_dir))
+        payload = b"x" * 512
+        for i in range(FILE_SET_ENTRIES):
+            backend.set(f"entry:{i}", payload)
+        return lambda: backend.set("entry:0", payload)
+
     def roundtrip(serializer: Any, obj: object, **key: str) -> Callable[[], object]:
         def op() -> object:
             data, meta = serializer.serialize(obj, **key)
@@ -188,6 +208,8 @@ def run_workload(path: str, n: int) -> None:
         op()
     for _ in range(n):
         op()
+    for scratch in _scratch_dirs:
+        shutil.rmtree(scratch, ignore_errors=True)
     # Skip interpreter teardown: it is not part of a call, and anything it frees that grew with n
     # would leak into the per-op difference.
     os._exit(0)

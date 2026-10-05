@@ -32,7 +32,8 @@ data = get_sensitive_data(123)  # Encrypted in Redis
 ```
 
 Later examples pass the key explicitly as `master_key=secret_key`: your 64-hex-char key string,
-loaded from a secret store. Never a literal in source.
+loaded from a secret store. Never a literal in source. A bytes key raises `TypeError`: pass
+`key.hex()` ([details](../error-codes.md#bytes-key-where-a-hex-string-is-taken)).
 
 > **`@cache.secure` needs a backend.** `backend=None` (L1-only) stores raw Python objects,
 > which cannot be ciphertext, so the combination is refused at decoration time with a
@@ -43,7 +44,7 @@ loaded from a secret store. Never a literal in source.
 
 ## What It Does
 
-**Encryption pipeline** (works with ANY serializer):
+**Encryption pipeline** (works with any cross-SDK serializer, see [Serializer requirement](#serializer-requirement)):
 ```
 Python object (plaintext)
     ↓
@@ -280,7 +281,7 @@ if it supplies the key.
 @cache.secure(ttl=300, master_key=secret_key)  # Encryption + L1 cache (stores encrypted bytes)
 def get_sensitive_data():
     # L1 cache enabled: stores encrypted bytes (~50ns hits vs 2-7ms Redis)
-    # Encryption is orthogonal: wraps any serializer, applies to both L1 and L2
+    # Encryption is orthogonal: wraps any cross-SDK serializer, applies to both L1 and L2
     # Both layers store encrypted bytes (encrypt-at-rest everywhere)
     return fetch_sensitive_data()  # illustrative - fetch_sensitive_data not defined
 ```
@@ -344,6 +345,12 @@ df = get_patient_records(42)
 # DataFrame encrypted client-side, zero-knowledge storage
 ```
 
+### Serializer Requirement
+Encryption takes only a serializer whose class declares `cross_sdk_compatible = True`: `StandardSerializer`
+(the default), `OrjsonSerializer`, `ArrowSerializer`, or a custom serializer that sets the flag. Anything
+else, `AutoSerializer` included, raises `ConfigurationError` in the decorators and in a directly built
+`EncryptionWrapper` ([details](../error-codes.md#single-sdk-serializer-under-encryption)).
+
 ### Multi-Tenant Isolation
 
 > [!CAUTION]
@@ -367,9 +374,8 @@ overwrites the entry, so tenants that share a key keep evicting each other. With
 `fail_closed=True` the read raises `DecryptionAuthenticationError` (its subclass
 `TenantMismatchError`) instead, until the entry expires or is invalidated. That lets
 whichever tenant calls a shared-key function first block every other tenant for the
-entry's TTL, and seed it again once it expires. An L1 copy encrypted for another tenant is
-only an L1 miss, since L1 holds this process's own reads and writes: the read goes on to
-the backend. A read whose tenant cannot be resolved decrypts nothing and is a plain miss
+entry's TTL, and seed it again once it expires. In L1 such an entry is only a miss (see
+[Cache Key Binding](#cache-key-binding)). A read whose tenant cannot be resolved decrypts nothing and is a plain miss
 that keeps the entry. Either way, keep tenants on separate keys as the caution above says.
 
 ### Key Rotation Pattern
@@ -478,12 +484,52 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
            Prevents nonce reuse even across reboots
 ```
 
+### Cache Key Binding
+
+The AAD binds the cache key, so ciphertext moved to another key fails authentication: a
+backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
+the one the backend is handed, with the backend's `key_prefix` in front of it: the namespace is
+already part of the key, a `MemcachedBackend` reports its configured `key_prefix`, and the
+tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`; `t:default:` with no
+tenant set) reports the calling tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
+`t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
+`key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
+name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
+scoping the CachekitIO server applies.
+
+There is one AAD per read. A read never retries with another form of the key, such as the key
+without its prefix, so a failed authentication is final.
+
+L1 is shared by every function in a namespace and keyed by the bare cache key, so it can hold
+an entry bound to another prefix: another tenant's behind the tenant-scoped Redis backend, or
+another function's behind a different Memcached `key_prefix`. On a
+backend with a key prefix that read is an L1 miss and goes on to the backend, never an
+`auth_tamper`. An L1 entry encrypted for another tenant (`tenant_extractor`) is a miss on any
+backend. Two encrypted functions that share a namespace and a cache key but not a backend
+prefix (one on a prefixing backend, one on an unprefixed one) read each other's L1 entries as
+failed authentication on the unprefixed side; give them separate namespaces.
+
+**Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
+encrypted entries written through a prefixing backend fail authentication after the upgrade:
+`MemcachedBackend` with a `key_prefix`, the tenant-scoped Redis backend, which includes the
+default Redis backend env auto-detection builds (`t:default:` with no tenant set), and any custom
+backend with a non-empty `key_prefix`. By default each such
+entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
+overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
+until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
+(a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. During a
+rolling upgrade, processes on the earlier release and on this one each read the other's writes
+as failed authentication, and deleting entries does not help while both run. Give the upgraded
+release a fresh key space, or stop every earlier-release process first. Unaffected: a
+`RedisBackend` you construct yourself, `FileBackend`, `CachekitIOBackend`, and interop mode.
+
 ### Encryption Downgrade Protection (Read Path)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext, so a reader can parse it before it has a key.
 Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
-the AAD. AAD v0x03 is built from the tenant, the cache key, and the header's wire format,
+the AAD. AAD v0x03 is built from the tenant, the cache key (with any
+[key prefix the backend adds](#cache-key-binding)), and the header's wire format,
 compression flag and (when set) original type, so a change to one of those header
 values that alters the AAD fails authentication. The `encrypted` flag is **not** an
 AAD input: nothing authenticates it.
@@ -554,9 +600,11 @@ them (cachekit-py#170):
 
 - **`auth_tamper`** — the entry failed authentication: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or, on a cache with a `tenant_extractor`, a backend entry was
-  encrypted for a tenant other than the caller's (`TenantMismatchError`, refused before
-  any decrypt attempt; in L1 the same collision is a plain miss). The
+  between cache keys or [key prefixes](#cache-key-binding)), or, on a cache with a
+  `tenant_extractor`, a backend entry was encrypted for a tenant other than the caller's
+  (`TenantMismatchError`, refused before any decrypt attempt). In L1, another tenant's entry,
+  or behind a prefixing backend one bound to another prefix, is a plain miss instead
+  ([Cache Key Binding](#cache-key-binding)). The
   plaintext frame header fields built into the AAD
   (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
   them is authenticated by the tag: a header change that produces different AAD bytes
@@ -621,8 +669,8 @@ config = EncryptionConfig(enabled=True, master_key=secret_key,
 **Keyring configuration faults are not a decrypt-failure class.** `EncryptionWrapper`
 raises `KeyringConfigurationError` (a `ValueError` subclass, exported from
 `cachekit.serializers`) when the decrypt-only keyring is unusable: a previous master key
-shorter than 32 bytes, more than three previous keys, or the current key repeated among
-them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
+passed directly that is not exactly 32 bytes, more than three previous keys, or the current
+key repeated among them. `CACHEKIT_PREVIOUS_MASTER_KEYS` is checked against `CACHEKIT_MASTER_KEY` when
 settings load, so this surfaces only when keys bypass that check: passed to
 `EncryptionWrapper` directly, or a programmatic `master_key` that also appears in the
 environment's previous keys. Outside config-drift reads (below), the fault never
@@ -633,8 +681,8 @@ from the re-read after a distributed-lock wait, so the function does not run and
 circuit-breaker failure is counted. A key with no entry yet reads as a miss before the keyring
 is built, so the fault surfaces at the write instead, and the write raises it too, sync or async:
 the function has already run, but its result is neither cached nor returned, and no
-circuit-breaker failure is counted. Two cases take other paths: a missing or short *current*
-master key raises `EncryptionError`, and an encryption-disabled handler reading an entry that
+circuit-breaker failure is counted. Two cases take other paths: a missing *current* master key,
+or one of the wrong length, raises `EncryptionError`, and an encryption-disabled handler reading an entry that
 claims encryption treats the fault as corruption (miss + evict), because only the
 unauthenticated header sent it down the decrypt path.
 

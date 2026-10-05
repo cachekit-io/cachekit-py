@@ -7,6 +7,7 @@ import copy
 import functools
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -588,8 +589,6 @@ def create_cache_wrapper(
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
-    # L1-only mode flag
-    _l1_only_mode: bool = False,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -606,7 +605,7 @@ def create_cache_wrapper(
                    An EncryptionWrapper instance or the "encrypted" name raises ConfigurationError:
                    encrypt with encryption=True (@cache.secure) and pass the inner serializer here.
         encryption: Tri-state zero-knowledge encryption control (AES-256-GCM), orthogonal
-                   to serializer - wraps ANY serializer with encryption.
+                   to serializer - wraps any cross-SDK serializer (cross_sdk_compatible=True) with encryption.
                    - None (default): no intent stated. Plaintext when no master key is present;
                      ConfigurationError at construction when one is, from master_key= or
                      CACHEKIT_MASTER_KEY (see the activation table in
@@ -663,12 +662,14 @@ def create_cache_wrapper(
         function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
+    # L1-only (in-process, no backend) is chosen only by config.backend None, below: one switch for every caller.
+    _l1_only_mode = False
 
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values
     if config is not None:
         # Import here to avoid circular dependency
-        from ..config.decorator import DecoratorConfig
+        from ..config.decorator import UNSET, DecoratorConfig
 
         if not isinstance(config, DecoratorConfig):
             raise TypeError(f"config must be DecoratorConfig instance, got {type(config)}")
@@ -684,7 +685,11 @@ def create_cache_wrapper(
         integrity_checking = config.integrity_checking
         refresh_ttl_on_get = config.refresh_ttl_on_get
         ttl_refresh_threshold = config.ttl_refresh_threshold
-        backend = config.backend if backend is None else backend
+        # config.backend None is an explicit L1-only request; UNSET leaves the backend to resolve at first call.
+        if backend is None and config.backend is None:
+            _l1_only_mode = True
+        elif backend is None and config.backend is not UNSET:
+            backend = config.backend
 
         # L1 cache settings
         l1_enabled = config.l1.enabled
@@ -879,13 +884,20 @@ def create_cache_wrapper(
         # Preset default (io()): stale window = ttl, capped so the total stays
         # within the 30-day bound. stale_ttl=0 opts out explicitly. A ttl at or
         # above the cap leaves no window headroom -> no default (never negative).
-        _default_window = min(ttl, _max_total_ttl - ttl)
+        # Derived from the TTL as the wire sends it (whole seconds, ceiled), so a
+        # fractional ttl near the cap cannot round the sum past it into a 400.
+        _wire_ttl = math.ceil(ttl)
+        _default_window = min(_wire_ttl, _max_total_ttl - _wire_ttl)
         _stale_ttl = _default_window if _default_window > 0 else None
 
     _l2_swr_active = _stale_ttl is not None
 
     # Initialize key generator (uses Blake2b + pickle)
     key_generator = CacheKeyGenerator()
+
+    def _l2_scope() -> str:
+        """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
+        return getattr(_backend, "key_prefix", None) or ""
 
     # Initialize serialization handler with encryption layer if requested
     # Serializer defines HOW to serialize (default=msgpack), encryption defines WHETHER to encrypt
@@ -899,6 +911,9 @@ def create_cache_wrapper(
         enable_integrity_checking=integrity_checking,
         encryption_fail_closed=encryption_fail_closed,
         interop_mode=interop is not None,
+        # The AAD binds the resolved backend's prefix with the cache key; read per call, since
+        # _backend may resolve lazily and a tenant-scoped prefix follows the calling context.
+        backend_key_prefix=_l2_scope,
     )
 
     # Create cache handler strategy (initialized with actual Redis client when first used)
@@ -1442,9 +1457,17 @@ def create_cache_wrapper(
     # tracking — only the calling tenant's (LAB-4773).
     _cached_keys: set[tuple[str, str]] = set()
 
-    def _l2_scope() -> str:
-        """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
-        return getattr(_backend, "key_prefix", None) or ""
+    def _foreign_l1_entry(error: SerializationError) -> bool:
+        """Whether an L1 decrypt failure is a keying collision rather than tamper evidence.
+
+        L1 is keyed by the bare cache key, and it holds only this process's own authenticated
+        writes and backfills. So the envelope it returns can be another tenant's: one encrypted
+        for another tenant, or, behind a key-prefixing backend, one whose AAD binds another
+        prefix (a tenant-scoped backend binds each tenant's ``t:{tenant}:``). Either is an L1
+        miss, with no auth_tamper and no raise; L2, which may hold this caller's own entry,
+        applies the policy.
+        """
+        return isinstance(error, TenantMismatchError) or (isinstance(error, DecryptionAuthenticationError) and bool(_l2_scope()))
 
     def _evict(key: str | None) -> None:
         """Another process's invalidation, from the listener thread: evict ``key``, or every key
@@ -1718,8 +1741,10 @@ def create_cache_wrapper(
         # Guard clause: L1 cache check first - early return eliminates network latency.
         # It runs before the breaker's admission check and records no breaker outcome:
         # the breaker tracks backend health, and an L1 hit never reaches the backend,
-        # so it is served whatever the breaker state (LAB-5351).
-        if _l1_cache and cache_key and (interop is None or interop_checked):
+        # so it is served whatever the breaker state (LAB-5351). It waits for the backend:
+        # an encrypted entry's AAD binds the backend's key prefix, which is unknown until
+        # then, so an entry another wrapper wrote here would read as tampered.
+        if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
             l1_found, l1_bytes = _l1_cache.get(cache_key)
             if l1_found and l1_bytes:
                 # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
@@ -1758,12 +1783,6 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
-                except TenantMismatchError:
-                    # L1 is keyed by the bare cache key and holds only this process's own
-                    # authenticated writes and backfills, so another tenant's envelope here is
-                    # a keying collision, not tamper evidence: an L1 miss, no auth_tamper and no
-                    # raise. L2, which may hold this tenant's own entry, applies the policy.
-                    _l1_cache.invalidate(cache_key)
                 except TenantResolutionError:
                     # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
                     # with the entry, which stays. The L2 read below misses for the same reason.
@@ -1774,15 +1793,16 @@ def create_cache_wrapper(
                     # otherwise keep re-raising from stale process-local L1 after the
                     # operator fixes L2). L2 remains the retained evidence.
                     _l1_cache.invalidate(cache_key)
-                    try:
-                        # Single policy point (cachekit-py#170): metric + fail policy.
-                        handle_decrypt_failure(
-                            e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                        )
-                    except DecryptionAuthenticationError:
-                        reset_current_function_stats(token)
-                        raise
-                    # Fail open: fall through to L2
+                    if not _foreign_l1_entry(e):
+                        try:
+                            # Single policy point (cachekit-py#170): metric + fail policy.
+                            handle_decrypt_failure(
+                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                            )
+                        except DecryptionAuthenticationError:
+                            reset_current_function_stats(token)
+                            raise
+                    # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
                 except KeyringConfigurationError:
                     # LOCAL keyring config fault — not a poisoned L1 entry, so
                     # neither the invalidate nor the "deserialization failed"
@@ -2138,8 +2158,9 @@ def create_cache_wrapper(
                 interop_checked = True
 
             # Guard clause: L1 cache check first - early return eliminates network latency.
-            # Before admission and recording no breaker outcome, as in sync_wrapper (LAB-5351).
-            if _l1_cache and cache_key and (interop is None or interop_checked):
+            # Before admission and recording no breaker outcome, and only once the backend is
+            # resolved, as in sync_wrapper (LAB-5351).
+            if _l1_cache and cache_key and _backend is not None and (interop is None or interop_checked):
                 l1_found, l1_bytes = _l1_cache.get(cache_key)
                 if l1_found and l1_bytes:
                     # L1 cache hit (~50ns vs ~1000μs for Redis) - deserialize bytes
@@ -2163,9 +2184,6 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
-                    except TenantMismatchError:
-                        # Another tenant's envelope in L1: an L1 miss — see the sync L1 guard above.
-                        _l1_cache.invalidate(cache_key)
                     except TenantResolutionError:
                         # Caller's tenant unresolved: the entry stays — see the sync L1 guard above.
                         logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
@@ -2182,13 +2200,14 @@ def create_cache_wrapper(
                         # if a future edit wraps this read path in a broad `except
                         # Exception` (defense-in-depth, LAB-108). No manual stats reset —
                         # the async wrapper's outer `finally` covers every exit path.
-                        try:
-                            handle_decrypt_failure(
-                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                            )
-                        except DecryptionAuthenticationError:
-                            raise
-                        # Fail open: fall through to L2
+                        if not _foreign_l1_entry(e):
+                            try:
+                                handle_decrypt_failure(
+                                    e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                                )
+                            except DecryptionAuthenticationError:
+                                raise
+                        # Fail open, or an L1 keying collision (_foreign_l1_entry): fall through to L2
                     except KeyringConfigurationError:
                         # LOCAL keyring config fault — see the sync L1 guard above.
                         raise
