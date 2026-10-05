@@ -483,10 +483,8 @@ The AAD binds the cache key, so ciphertext moved to another key fails authentica
 backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
 the one the backend is handed, with the backend's `key_prefix` in front of it: the namespace is
 already part of the key, a `MemcachedBackend` reports its configured `key_prefix`, and the
-tenant-scoped Redis backend reports the calling tenant's `t:{tenant}:`. That tenant-scoped
-backend is what zero-config Redis gives you: env auto-detection (`REDIS_URL`,
-`CACHEKIT_REDIS_URL`) and `RedisBackendProvider` both build it, with `t:default:` when no
-tenant is set. Only a `RedisBackend` you construct yourself is unprefixed. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
+tenant-scoped Redis backend (env auto-detection, `RedisBackendProvider`; `t:default:` with no
+tenant set) reports the calling tenant's `t:{tenant}:`. An entry copied from `app-a:` to `app-b:`, or from `t:acme:` to
 `t:globex:`, is refused. A custom backend that prefixes keys must expose that prefix as
 `key_prefix` for it to be bound. Backend encodings of the key (the File backend's hashed file
 name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the tenant
@@ -499,14 +497,16 @@ L1 is shared by every function in a namespace and keyed by the bare cache key, s
 an entry bound to another prefix: another tenant's behind the tenant-scoped Redis backend, or
 another function's behind a different Memcached `key_prefix`. On a
 backend with a key prefix that read is an L1 miss and goes on to the backend, never an
-`auth_tamper`. Two encrypted functions that share a namespace and a cache key but not a backend
+`auth_tamper`. An L1 entry encrypted for another tenant (`tenant_extractor`) is a miss on any
+backend. Two encrypted functions that share a namespace and a cache key but not a backend
 prefix (one on a prefixing backend, one on an unprefixed one) read each other's L1 entries as
 failed authentication on the unprefixed side; give them separate namespaces.
 
 **Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
 encrypted entries written through a prefixing backend fail authentication after the upgrade:
-`MemcachedBackend` with a `key_prefix`, and the tenant-scoped Redis backend, which includes the
-default Redis backend env auto-detection builds (`t:default:` with no tenant set). By default each such
+`MemcachedBackend` with a `key_prefix`, the tenant-scoped Redis backend, which includes the
+default Redis backend env auto-detection builds (`t:default:` with no tenant set), and any custom
+backend with a non-empty `key_prefix`. By default each such
 entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
 overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
 until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
@@ -514,8 +514,7 @@ until it expires or is deleted. So delete those entries, or move the cache to a 
 rolling upgrade, processes on the earlier release and on this one each read the other's writes
 as failed authentication, and deleting entries does not help while both run. Give the upgraded
 release a fresh key space, or stop every earlier-release process first. Unaffected: a
-`RedisBackend` you construct and pass as `backend=`, `FileBackend`, `CachekitIOBackend`, and
-interop mode.
+`RedisBackend` you construct yourself, `FileBackend`, `CachekitIOBackend`, and interop mode.
 
 ### Encryption Downgrade Protection (Read Path)
 
@@ -596,8 +595,9 @@ them (cachekit-py#170):
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
   between cache keys or [key prefixes](#cache-key-binding)), or, on a cache with a
   `tenant_extractor`, a backend entry was encrypted for a tenant other than the caller's
-  (`TenantMismatchError`, refused before any decrypt attempt). In L1 a collision is a plain
-  miss instead ([Cache Key Binding](#cache-key-binding)). The
+  (`TenantMismatchError`, refused before any decrypt attempt). In L1, another tenant's entry,
+  or behind a prefixing backend one bound to another prefix, is a plain miss instead
+  ([Cache Key Binding](#cache-key-binding)). The
   plaintext frame header fields built into the AAD
   (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
   them is authenticated by the tag: a header change that produces different AAD bytes

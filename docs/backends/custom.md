@@ -82,8 +82,8 @@ If your backend adds a prefix to every key before it reaches the store, expose t
 refuses a backend with a non-empty `key_prefix`, because other SDKs would not find its keys. An
 encrypted cache binds it into each entry's AAD ahead of the cache key, so an entry moved under
 another prefix fails authentication ([Cache Key Binding](../features/zero-knowledge-encryption.md#cache-key-binding)).
-A prefix the backend adds without exposing it gets neither: interop cannot refuse it and the AAD
-does not bind it. Encodings of the whole key (hashing it into a file name, percent-encoding it into
+A prefix the backend adds without exposing it as `key_prefix` is not bound into the AAD, and
+interop mode may not refuse it. Encodings of the whole key (hashing it into a file name, percent-encoding it into
 a URL) are not prefixes and stay out of `key_prefix`.
 
 ---
