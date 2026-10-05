@@ -90,6 +90,27 @@ EncryptionWrapper works with **any** serializer:
 
 EncryptionWrapper defaults to StandardSerializer, which uses MessagePack for cross-language compatibility. The `@cache.secure` preset uses this default.
 
+## Direct Use
+
+Built directly, `EncryptionWrapper` takes the raw key: exactly 32 bytes for `master_key=` and for each
+of `previous_master_keys=`, not the hex string the decorators and `CACHEKIT_MASTER_KEY` take. Decode a
+hex key with `bytes.fromhex()`. Any other length raises when the wrapper is built, from 0.23.0
+([details](../error-codes.md#raw-key-is-not-32-bytes)):
+
+```python
+from cachekit.serializers import EncryptionError, EncryptionWrapper
+
+# secret_key: the 64-character hex key from your secret store, as @cache.secure takes it
+wrapper = EncryptionWrapper(master_key=bytes.fromhex(secret_key), previous_master_keys=[])
+
+try:
+    EncryptionWrapper(master_key=secret_key.encode(), previous_master_keys=[])  # the hex string's own 64 bytes
+except EncryptionError:
+    pass
+else:
+    raise AssertionError("a 64-byte raw key must be refused")
+```
+
 ## Zero-Knowledge Caching
 
 ```python notest

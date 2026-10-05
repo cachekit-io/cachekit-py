@@ -14,7 +14,12 @@ import pytest
 from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config.validation import ConfigurationError
 from cachekit.serializers.base import SerializationError
-from cachekit.serializers.encryption_wrapper import DecryptionAuthenticationError, EncryptionError, EncryptionWrapper
+from cachekit.serializers.encryption_wrapper import (
+    DecryptionAuthenticationError,
+    EncryptionError,
+    EncryptionWrapper,
+    KeyringConfigurationError,
+)
 from cachekit.serializers.standard_serializer import StandardSerializer
 from cachekit.serializers.wrapper import SerializationWrapper
 
@@ -66,8 +71,60 @@ class TestEncryptionWrapperSetupErrors:
 
     def test_short_master_key_raises(self):
         """EncryptionError when master_key is shorter than 32 bytes."""
-        with pytest.raises(EncryptionError, match="at least 32 bytes"):
+        with pytest.raises(EncryptionError, match="exactly 32 bytes"):
             EncryptionWrapper(master_key=b"too_short")
+
+
+# A raw key of any length but 32 is refused, the 64 ASCII bytes of a hex key above all: they pass a
+# length floor and derive a key no other SDK derives (protocol intent-presets.md, Master Key Input rule 4).
+_WRONG_LENGTH_RAW_KEYS = {"31-bytes": b"\x01" * 31, "33-bytes": b"\x01" * 33, "hex-string-ascii": ("ab" * 32).encode()}
+
+
+class TestEncryptionWrapperRawKeyLength:
+    """master_key= and previous_master_keys= take raw bytes, exactly 32 of them (LAB-8223)."""
+
+    @pytest.mark.parametrize("key", _WRONG_LENGTH_RAW_KEYS.values(), ids=list(_WRONG_LENGTH_RAW_KEYS))
+    def test_master_key_must_be_exactly_32_bytes(self, key: bytes) -> None:
+        with pytest.raises(EncryptionError, match=f"exactly 32 bytes .*got {len(key)}"):
+            EncryptionWrapper(master_key=key, previous_master_keys=[])
+
+    @pytest.mark.parametrize("key", _WRONG_LENGTH_RAW_KEYS.values(), ids=list(_WRONG_LENGTH_RAW_KEYS))
+    def test_previous_master_key_must_be_exactly_32_bytes(self, key: bytes) -> None:
+        with pytest.raises(KeyringConfigurationError, match=f"position 1 must be exactly 32 bytes .*got {len(key)}"):
+            EncryptionWrapper(master_key=b"\x02" * 32, previous_master_keys=[b"\x03" * 32, key])
+
+    def test_hex_string_bytes_never_reach_the_keyring(self) -> None:
+        """The ASCII bytes of a hex key are refused, and their decoded bytes are the 32-byte key that is accepted."""
+        hex_key = "ab" * 32  # pragma: allowlist secret
+        with pytest.raises(EncryptionError, match="bytes.fromhex"):
+            EncryptionWrapper(master_key=hex_key.encode(), previous_master_keys=[])
+        assert EncryptionWrapper(master_key=bytes.fromhex(hex_key), previous_master_keys=[]).is_encryption_enabled
+
+    @pytest.mark.parametrize("env", ["CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"])
+    def test_hex_keys_from_the_environment_may_be_longer(self, monkeypatch: pytest.MonkeyPatch, env: str) -> None:
+        """A hex key keeps the hex rule, at least 32 bytes (Master Key Input rule 3): only raw bytes must be 32."""
+        from cachekit.config.singleton import reset_settings
+
+        monkeypatch.setenv(env, "cd" * 48)
+        reset_settings()
+        wrapper = EncryptionWrapper(master_key=None if env == "CACHEKIT_MASTER_KEY" else b"\x02" * 32)
+        encrypted, metadata = wrapper.serialize({"v": 1}, cache_key="k")
+        assert wrapper.deserialize(encrypted, metadata, cache_key="k") == {"v": 1}
+
+    def test_decorator_hex_key_may_be_longer(self, tmp_path) -> None:
+        """@cache.secure decodes its hex key and hands the bytes to EncryptionWrapper: a 48-byte key still caches."""
+        from cachekit import cache
+        from cachekit.backends.file import FileBackend, FileBackendConfig
+
+        calls = []
+
+        @cache.secure(master_key="cd" * 48, backend=FileBackend(FileBackendConfig(cache_dir=str(tmp_path))))
+        def secret(n: int) -> dict[str, int]:
+            calls.append(n)
+            return {"pin": n}
+
+        assert secret(7) == secret(7) == {"pin": 7}
+        assert calls == [7]
 
 
 class TestEncryptionWrapperExplicitSerializer:

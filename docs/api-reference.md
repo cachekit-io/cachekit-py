@@ -116,7 +116,9 @@ def your_function(args):
 
 #### Encryption Parameters
 
-- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` (`@cache.local` takes no `encryption=` and never raises) ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling
+- **`encryption`** (`EncryptionConfig | bool`, default: unset) - Client-side encryption. `False` stores plaintext; `True` (with `single_tenant_mode=True`, or `EncryptionConfig(enabled=True, single_tenant_mode=True)` on a preset) encrypts. Unset (no `encryption=`, or an `EncryptionConfig` without `enabled=`) is plaintext when no master key is present and raises `ConfigurationError` when one is (`master_key=` or `CACHEKIT_MASTER_KEY`), so with the variable set every plaintext cache states `encryption=False` (`@cache.local` takes no `encryption=` and never raises) ([activation table](features/zero-knowledge-encryption.md#activation-the-master-key-is-a-source-not-a-switch)). `@cache.secure` is the preset spelling; it sets its own encryption, so `encryption=` raises `ConfigurationError` there and beside any encrypted `config=` ([details](error-codes.md#keyword-overrides-a-presets-encryption-or-backend))
+
+A keyword that none of these parameters names raises `ConfigurationError` when the decorator is applied, on `@cache`, on every preset but `@cache.local` and beside `config=` ([details](error-codes.md#unsupported-keyword-argument)).
 
 #### Returns
 - Cached function result or fresh computation result
@@ -209,7 +211,7 @@ def get_exchange_rates():
 
 #### Raises
 
-- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed
+- **`ConfigurationError`**: If no API key is available (argument or `CACHEKIT_API_KEY`), the key is not an RFC 6750 bearer token ([rules](backends/cachekitio.md#convenience-shorthand-via-cacheio)), `CACHEKIT_API_URL` fails validation, or `backend=` / `config=` is passed. `@cache(config=DecoratorConfig.io(...))` refuses `backend=` too
 
 #### Notes
 

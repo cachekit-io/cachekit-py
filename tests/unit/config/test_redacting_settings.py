@@ -33,7 +33,7 @@ from cachekit.cache_handler import CacheSerializationHandler
 from cachekit.config import ConfigurationError, singleton, validate_encryption_config
 from cachekit.config.nested import EncryptionConfig
 from cachekit.config.settings import CachekitConfig
-from cachekit.serializers.encryption_wrapper import EncryptionWrapper
+from cachekit.serializers.encryption_wrapper import EncryptionError, EncryptionWrapper
 
 _KEY_HEX = "ab" * 32
 
@@ -719,8 +719,34 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
     ),
     "io-backend-bad-token": ({}, lambda: CachekitIOBackend(api_key=_API_KEY + "\n"), ConfigurationError, _API_KEY),
     "io-backend-with-timeout": ({}, lambda: CachekitIOBackend(api_key=_API_KEY).with_timeout(-1), ConfigurationError, _API_KEY),
-    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), TypeError, _API_KEY),
-    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), TypeError, _API_KEY),
+    "io-config-typo": ({}, lambda: DecoratorConfig.io(api_key=_API_KEY, timeout=-1), ConfigurationError, _API_KEY),
+    "io-intent-typo": ({}, lambda: cache.io(api_key=_API_KEY, timeout=-1)(_cached), ConfigurationError, _API_KEY),
+    # A key passed where no form takes one is still a key (LAB-8223).
+    "minimal-config-misplaced-key": ({}, lambda: DecoratorConfig.minimal(master_key=_KEY_HEX), ConfigurationError, _KEY_HEX),
+    "io-config-misplaced-key": (
+        {},
+        lambda: DecoratorConfig.io(api_key=_API_KEY, master_key=_KEY_HEX),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "secure-config-misplaced-api-key": (
+        {},
+        lambda: DecoratorConfig.secure(master_key=_KEY_HEX, api_key=_API_KEY),
+        ConfigurationError,
+        _API_KEY,
+    ),
+    "config-form-misplaced-key": (
+        {},
+        lambda: cache(config=DecoratorConfig.minimal(), master_key=_KEY_HEX)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
+    "config-form-encryption-override": (
+        {},
+        lambda: cache(config=DecoratorConfig.secure(master_key=_KEY_HEX), encryption=False)(_cached),
+        ConfigurationError,
+        _KEY_HEX,
+    ),
     "io-intent-env-timeout": (
         {"CACHEKIT_TIMEOUT": "-1"},
         lambda: cache.io(api_key=_API_KEY)(_cached),
@@ -777,6 +803,18 @@ _ENTRY_POINT_ROWS: dict[str, tuple[dict[str, str], Callable[[], object], type[Ba
         b"\x01" * 32,
     ),
     "wrapper-str-key": ({}, lambda: EncryptionWrapper(master_key=_KEY_HEX), TypeError, _KEY_HEX),  # type: ignore[arg-type]
+    "wrapper-long-raw-key": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX) + b"\x01"),
+        EncryptionError,
+        _KEY_HEX,
+    ),
+    "wrapper-long-raw-previous": (
+        {},
+        lambda: EncryptionWrapper(master_key=bytes.fromhex(_KEY_HEX), previous_master_keys=[b"\x01" * 33]),
+        KeyringConfigurationError,
+        _KEY_HEX,
+    ),
     "redis-backend-env-pool": (
         {"CACHEKIT_CONNECTION_POOL_SIZE": "notint"},
         lambda: RedisBackend(redis_url=f"redis://:{_REDIS_PASSWORD}@localhost:6379/0"),

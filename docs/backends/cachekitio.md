@@ -73,6 +73,7 @@ error never quotes it.
 
 The RORO form `@cache(config=DecoratorConfig.io(api_key=...))` keeps its own key even when
 `set_default_backend()` is set: a backend already in `config=` wins over the module default.
+A `backend=` beside it raises `ConfigurationError` from 0.23.0, as `@cache.io(backend=...)` does.
 
 ## Health Check
 

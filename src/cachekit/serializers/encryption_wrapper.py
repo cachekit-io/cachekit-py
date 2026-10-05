@@ -187,13 +187,17 @@ class EncryptionWrapper:
         tenant_id: str = "default",
         fail_closed: bool = False,
         previous_master_keys: list[bytes] | list[SecretBytes] | None = None,
+        *,
+        _master_key_from_hex: bool = False,
     ):
         """Initialize encryption wrapper.
 
         Args:
             serializer: Any SerializerProtocol implementation to wrap with encryption.
                            Defaults to StandardSerializer (cross-language MessagePack).
-            master_key: 256-bit master key for encryption. If None, reads from environment.
+            master_key: The raw 256-bit master key: exactly 32 bytes, else EncryptionError. Not the hex
+                string the decorators' master_key= takes; decode one with bytes.fromhex(). If None, reads
+                CACHEKIT_MASTER_KEY (hex) from the environment.
             tenant_id: Tenant identifier for per-tenant key derivation
             fail_closed: Treat key-fingerprint mismatch as a hard authentication
                 failure (raise DecryptionAuthenticationError before attempting
@@ -210,6 +214,9 @@ class EncryptionWrapper:
                 keys. Pass [] to opt out. Entries written under a listed key
                 stay readable — selected by exact derived-key fingerprint
                 match, never by trial decryption. Writes always use master_key.
+                Each key passed is raw bytes, exactly 32 of them, as master_key.
+            _master_key_from_hex: Internal, for CacheSerializationHandler: master_key holds the bytes of a
+                hex key the caller gave a decorator, which the hex rule lets run past 32 bytes.
         """
         master_key = None if master_key is None else _hide_key(master_key)
         if previous_master_keys is not None:
@@ -217,6 +224,21 @@ class EncryptionWrapper:
         for key in [master_key, *(previous_master_keys or ())]:
             if key is not None:
                 _require_bytes(key)
+        # A raw key is exactly 32 bytes: the 64 ASCII bytes of a hex key pass a length floor and derive a key
+        # no other SDK derives (protocol intent-presets.md, Master Key Input rule 4). A key decoded from hex,
+        # the handler's or CACHEKIT_MASTER_KEY's, keeps the hex rule, at least 32 bytes (rule 3), which
+        # _setup_encryption checks.
+        if master_key is not None and not _master_key_from_hex and len(master_key) != 32:
+            raise EncryptionError(
+                f"master_key must be exactly 32 bytes (256 bits), got {len(master_key)}. It takes the raw key: "
+                "decode a hex key with bytes.fromhex()."
+            )
+        for position, previous_key in enumerate(previous_master_keys or ()):
+            if len(previous_key) != 32:
+                raise KeyringConfigurationError(
+                    f"Previous master key at position {position} must be exactly 32 bytes (256 bits), "
+                    f"got {len(previous_key)} — per-key requirements are identical to master_key."
+                )
         self.tenant_id = tenant_id
         self.fail_closed = fail_closed
 
@@ -250,6 +272,7 @@ class EncryptionWrapper:
             except ValueError as e:
                 raise EncryptionError(f"Invalid master key format in configuration: {e}") from e
 
+        # The hex rule; __init__ held a raw key to exactly 32 bytes already.
         if len(master_key) < 32:
             raise EncryptionError("Master key must be at least 32 bytes (256 bits)")
 

@@ -10,6 +10,7 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import fields, replace
 
 import pytest
@@ -25,6 +26,7 @@ from cachekit.config.nested import (
     L1CacheConfig,
     MonitoringConfig,
 )
+from cachekit.config.singleton import reset_settings
 from cachekit.config.validation import ConfigurationError
 
 
@@ -616,9 +618,9 @@ class TestPresetFieldOverrides:
 
     def test_secure_rejects_encryption_override(self, _resolved: list[DecoratorConfig]) -> None:
         plaintext = EncryptionConfig(enabled=False)
-        with pytest.raises(TypeError, match="multiple values for keyword argument 'encryption'"):
+        with pytest.raises(ConfigurationError, match="sets its own encryption"):
             DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=plaintext)
-        with pytest.raises(TypeError, match="multiple values for keyword argument 'encryption'"):
+        with pytest.raises(ConfigurationError, match="sets its own encryption"):
 
             @cache.secure(master_key=_SECURE_KEY, encryption=plaintext)
             def fn() -> int:
@@ -633,3 +635,211 @@ class TestPresetFieldOverrides:
 
         assert _resolved[0].l1.enabled is False
         assert _resolved[0].l1.max_size_mb == 200
+
+
+_OTHER_KEY = "b" * 64  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+class TestConfigFormGuards:
+    """A keyword beside config= cannot change what the config fixes, as the preset's own keywords cannot (LAB-8223).
+
+    An encrypted config keeps its encryption: its key, its tenant mode and its being on. An io config keeps the
+    CachekitIOBackend it built. Each override is a ConfigurationError when the decorator is applied (protocol
+    intent-presets.md § Explicit Configuration rule 2).
+    """
+
+    @pytest.fixture
+    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
+        seen: list[DecoratorConfig] = []
+
+        def spy(f, config, **_kwargs):
+            seen.append(config)
+            return f
+
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
+        return seen
+
+    ENCRYPTED_CONFIGS = {
+        "secure": lambda: DecoratorConfig.secure(master_key=_SECURE_KEY),
+        "production-encrypted": lambda: DecoratorConfig.production(
+            encryption=EncryptionConfig(enabled=True, single_tenant_mode=True, master_key=_SECURE_KEY)
+        ),
+    }
+    # Each would replace the config's whole EncryptionConfig.
+    ENCRYPTION_OVERRIDES = {
+        "fail-closed": EncryptionConfig(fail_closed=True),
+        "enabled-no-key": EncryptionConfig(enabled=True, single_tenant_mode=True),
+        "other-key": EncryptionConfig(enabled=True, single_tenant_mode=True, master_key=_OTHER_KEY),
+        "disabled": EncryptionConfig(enabled=False),
+        "false": False,
+        "true": True,
+    }
+
+    @pytest.mark.parametrize("env_key", [False, True], ids=["no-env-key", "env-key"])
+    @pytest.mark.parametrize("override", ENCRYPTION_OVERRIDES.values(), ids=list(ENCRYPTION_OVERRIDES))
+    @pytest.mark.parametrize("config", ENCRYPTED_CONFIGS.values(), ids=list(ENCRYPTED_CONFIGS))
+    def test_encryption_override_rejected(
+        self,
+        resolved: list[DecoratorConfig],
+        monkeypatch: pytest.MonkeyPatch,
+        config: Callable[[], DecoratorConfig],
+        override: object,
+        env_key: bool,
+    ) -> None:
+        if env_key:
+            monkeypatch.setenv("CACHEKIT_MASTER_KEY", _OTHER_KEY)
+            reset_settings()
+        decorator = cache(config=config(), encryption=override)
+        with pytest.raises(ConfigurationError, match="cannot override an encrypted config="):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    @pytest.mark.parametrize("config", ENCRYPTED_CONFIGS.values(), ids=list(ENCRYPTED_CONFIGS))
+    def test_other_overrides_keep_the_encryption(
+        self, resolved: list[DecoratorConfig], config: Callable[[], DecoratorConfig]
+    ) -> None:
+        built = config()
+
+        @cache(config=built, ttl=5, namespace="guarded")
+        def fn() -> int:
+            return 1
+
+        assert (resolved[0].ttl, resolved[0].namespace) == (5, "guarded")
+        assert resolved[0].encryption == built.encryption
+
+    def test_unencrypted_config_takes_an_encryption_override(self, resolved: list[DecoratorConfig]) -> None:
+        """The guard keys on an encrypted config: opting an unencrypted one in through an override still works."""
+        on = EncryptionConfig(enabled=True, single_tenant_mode=True, master_key=_SECURE_KEY)
+
+        @cache(config=DecoratorConfig.production(), encryption=on)
+        def fn() -> int:
+            return 1
+
+        assert resolved[0].encryption is on
+
+    @pytest.mark.parametrize("backend", [None, object()], ids=["none", "instance"])
+    @pytest.mark.parametrize(
+        "derive", [lambda config: config, lambda config: replace(config, ttl=5)], ids=["io", "derived-from-io"]
+    )
+    def test_io_config_rejects_backend(
+        self, resolved: list[DecoratorConfig], derive: Callable[[DecoratorConfig], DecoratorConfig], backend: object
+    ) -> None:
+        config = derive(DecoratorConfig.io(api_key="ck_test_key"))  # pragma: allowlist secret
+        with pytest.raises(ConfigurationError, match="does not accept backend="):
+
+            @cache(config=config, backend=backend)
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    def test_cachekitio_backend_in_another_preset_stays_overridable(self, resolved: list[DecoratorConfig]) -> None:
+        """The io rule follows the preset, not the backend's type: a production config holding a CachekitIOBackend
+        keeps the rule that a backend= keyword beats the config's backend."""
+        other = object()
+        config = DecoratorConfig.production(backend=CachekitIOBackend(api_key="ck_test_key"))  # pragma: allowlist secret
+
+        @cache(config=config, backend=other)
+        def fn() -> int:
+            return 1
+
+        assert resolved[0].backend is other
+
+
+@pytest.mark.unit
+class TestUnsupportedKeywords:
+    """A keyword the form does not accept is a ConfigurationError at construction: never the dataclass's TypeError,
+    never a silent drop (protocol intent-presets.md § Explicit Configuration rule 2, LAB-8223)."""
+
+    @pytest.fixture
+    def resolved(self, monkeypatch: pytest.MonkeyPatch) -> list[DecoratorConfig]:
+        """Capture the DecoratorConfig the decorator resolves, instead of building a wrapper."""
+        seen: list[DecoratorConfig] = []
+
+        def spy(f, config, **_kwargs):
+            seen.append(config)
+            return f
+
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
+        return seen
+
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
+    def test_classmethod_rejects_unknown_keyword(self, preset: str) -> None:
+        with pytest.raises(ConfigurationError, match="does not accept bogus"):
+            getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], bogus=1)
+
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
+    def test_decorator_rejects_unknown_keyword(self, resolved: list[DecoratorConfig], preset: str) -> None:
+        decorator = getattr(cache, preset)(**_PRESET_KWARGS[preset], bogus=1)
+        with pytest.raises(ConfigurationError, match="does not accept bogus"):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    def test_bare_decorator_rejects_unknown_keyword(self, resolved: list[DecoratorConfig]) -> None:
+        with pytest.raises(ConfigurationError, match="does not accept bogus"):
+
+            @cache(bogus=1)
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
+    def test_config_form_rejects_unknown_keyword(self, resolved: list[DecoratorConfig], preset: str) -> None:
+        decorator = cache(config=getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset]), bogus=1)
+        with pytest.raises(ConfigurationError, match="does not accept bogus"):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    # Bare @cache folds the encryption ones into its EncryptionConfig and @cache.io takes api_key; beside config=
+    # each names nothing.
+    @pytest.mark.parametrize(
+        "name", ["master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed", "api_key"]
+    )
+    def test_config_form_rejects_a_keyword_only_another_form_takes(self, resolved: list[DecoratorConfig], name: str) -> None:
+        decorator = cache(config=DecoratorConfig.minimal(), **{name: object()})
+        with pytest.raises(ConfigurationError, match=f"does not accept {name}"):
+
+            @decorator
+            def fn() -> int:
+                return 1
+
+        assert resolved == []
+
+    @pytest.mark.parametrize("preset", list(_PRESET_KWARGS))
+    def test_every_field_the_preset_does_not_fix_is_accepted(self, preset: str) -> None:
+        fixed = {"secure": {"encryption"}, "io": {"backend"}}.get(preset, set())
+        defaults = DecoratorConfig()
+        for f in fields(DecoratorConfig):
+            if f.name.startswith("_") or f.name in fixed:
+                continue
+            getattr(DecoratorConfig, preset)(**_PRESET_KWARGS[preset], **{f.name: getattr(defaults, f.name)})
+
+    def test_every_unknown_keyword_is_named(self) -> None:
+        with pytest.raises(ConfigurationError, match="does not accept bogus, tll"):
+            DecoratorConfig.minimal(tll=300, bogus=1)
+
+    def test_io_rejects_before_building_its_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No API key anywhere, so a check after the backend was built would report the missing key instead."""
+        monkeypatch.delenv("CACHEKIT_API_KEY", raising=False)
+        with pytest.raises(ConfigurationError, match="does not accept bogus"):
+            DecoratorConfig.io(bogus=1)
+
+    def test_misplaced_key_is_named_not_quoted(self) -> None:
+        with pytest.raises(ConfigurationError, match="does not accept master_key") as exc_info:
+            DecoratorConfig.minimal(master_key=_OTHER_KEY)
+        assert _OTHER_KEY not in str(exc_info.value)
