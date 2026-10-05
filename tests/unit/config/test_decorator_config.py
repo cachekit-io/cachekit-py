@@ -46,9 +46,11 @@ class TestDecoratorConfigDefaults:
         assert config.ttl_refresh_threshold == 0.5
 
     def test_backend_default(self) -> None:
-        """Test backend field default."""
+        """The default is UNSET (resolve at first call), not None (L1-only)."""
+        from cachekit.config.decorator import UNSET
+
         config = DecoratorConfig()
-        assert config.backend is None
+        assert config.backend is UNSET
 
     def test_nested_config_defaults(self) -> None:
         """Test nested config groups use default factory."""
@@ -416,7 +418,7 @@ class TestSecureIntegrityChecking:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @pytest.mark.parametrize("form", FORMS, ids=list(FORMS))
@@ -506,7 +508,7 @@ class TestL1EnabledFlag:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @staticmethod
@@ -572,7 +574,7 @@ class TestPresetFieldOverrides:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         return seen
 
     @staticmethod

@@ -588,8 +588,6 @@ def create_cache_wrapper(
     enable_structured_logging: bool = True,
     # Interop mode (interop/v1): explicit cross-SDK operation name (None = auto mode)
     interop: str | None = None,
-    # L1-only mode flag
-    _l1_only_mode: bool = False,
 ) -> F:
     """Create cache wrapper for a function with specified configuration.
 
@@ -663,12 +661,14 @@ def create_cache_wrapper(
         function so it is part of the args hash. See docs/features/zero-knowledge-encryption.md.
     """
     circuit_breaker_config: CircuitBreakerConfig | None = None  # None = reliability defaults
+    # L1-only (in-process, no backend) is chosen only by config.backend None, below: one switch for every caller.
+    _l1_only_mode = False
 
     # Handle DecoratorConfig object (Task 5: config simplification)
     # If config is provided, override all parameters with config values
     if config is not None:
         # Import here to avoid circular dependency
-        from ..config.decorator import DecoratorConfig
+        from ..config.decorator import UNSET, DecoratorConfig
 
         if not isinstance(config, DecoratorConfig):
             raise TypeError(f"config must be DecoratorConfig instance, got {type(config)}")
@@ -684,7 +684,11 @@ def create_cache_wrapper(
         integrity_checking = config.integrity_checking
         refresh_ttl_on_get = config.refresh_ttl_on_get
         ttl_refresh_threshold = config.ttl_refresh_threshold
-        backend = config.backend if backend is None else backend
+        # config.backend None is an explicit L1-only request; UNSET leaves the backend to resolve at first call.
+        if backend is None and config.backend is None:
+            _l1_only_mode = True
+        elif backend is None and config.backend is not UNSET:
+            backend = config.backend
 
         # L1 cache settings
         l1_enabled = config.l1.enabled

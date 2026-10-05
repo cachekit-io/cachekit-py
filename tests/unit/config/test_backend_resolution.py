@@ -30,7 +30,7 @@ class TestRoroConfigBackend:
             seen.append(config)
             return f
 
-        monkeypatch.setattr("cachekit.decorators.intent._apply_cache_logic", spy)
+        monkeypatch.setattr("cachekit.decorators.intent.create_cache_wrapper", spy)
         yield seen
         set_default_backend(None)
 
@@ -53,12 +53,12 @@ class TestRoroConfigBackend:
 
     @pytest.mark.parametrize("default", [MagicMock(), None], ids=["default-set", "no-default"])
     def test_default_fills_a_config_without_backend(self, _resolved: list, default: object) -> None:
-        """No default leaves None at decoration; the wrapper resolves it at first call."""
-        from cachekit.config.decorator import DecoratorConfig
+        """No default leaves UNSET at decoration; the wrapper resolves it at first call."""
+        from cachekit.config.decorator import UNSET, DecoratorConfig
 
         set_default_backend(default)  # type: ignore[arg-type]
         self._decorate(config=DecoratorConfig.production())
-        assert _resolved[0].backend is default
+        assert _resolved[0].backend is (UNSET if default is None else default)
 
     def test_explicit_kwarg_still_beats_config_backend(self, _resolved: list) -> None:
         from cachekit.config.decorator import DecoratorConfig

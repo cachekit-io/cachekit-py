@@ -253,7 +253,7 @@ class TestDecoratorEncryptionFlattening:
 
         captured: dict[str, Any] = {}
 
-        def _fake_wrapper(func: Any, *, config: Any, _l1_only_mode: bool = False, **_kwargs: Any) -> Any:
+        def _fake_wrapper(func: Any, *, config: Any, **_kwargs: Any) -> Any:
             captured["config"] = config
             return func
 

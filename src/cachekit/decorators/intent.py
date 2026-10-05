@@ -12,28 +12,11 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from ..config import ConfigurationError, DecoratorConfig
+from ..config.decorator import UNSET
 from ..config.validation import hide_secret, reveal_secret
 from .wrapper import _ENCRYPTING_SERIALIZER_REFUSAL, _is_encrypting_serializer, create_cache_wrapper
 
 F = TypeVar("F", bound=Callable[..., Any])
-
-
-def _apply_cache_logic(
-    func: Callable[..., Any], decorator_config: DecoratorConfig, _l1_only_mode: bool = False
-) -> Callable[..., Any]:
-    """Apply resolved configuration using the wrapper factory.
-
-    Args:
-        func: Function to wrap
-        decorator_config: DecoratorConfig instance with all settings
-        _l1_only_mode: If True, backend=None was explicitly passed (L1-only mode).
-                       This prevents the wrapper from trying to get a backend from the provider.
-
-    Returns:
-        Wrapped function
-    """
-    # Use the wrapper factory with DecoratorConfig
-    return create_cache_wrapper(func, config=decorator_config, _l1_only_mode=_l1_only_mode)
 
 
 def cache(
@@ -83,12 +66,16 @@ def cache(
                 ...
             cachekit.config.validation.ConfigurationError: encryption requires a backend
 
-        RORO configuration (clean and type-safe):
+        RORO configuration (clean and type-safe); backend=None in a config is L1-only too:
+            >>> runs = []
             >>> @cache(config=DecoratorConfig.minimal(ttl=300, backend=None))
             ... def optimized() -> str:
+            ...     runs.append(1)
             ...     return "cached"
-            >>> optimized()
-            'cached'
+            >>> optimized(), optimized()
+            ('cached', 'cached')
+            >>> len(runs)  # the second call is an L1 hit
+            1
 
         Manual override with namespace:
             >>> @cache(ttl=1800, namespace="custom", backend=None)
@@ -129,6 +116,11 @@ def cache(
             manual_overrides[_secret] = hide_secret(manual_overrides[_secret])
 
     def decorator(f: F) -> F:
+        # Every application works on its own copy: the pops and rewrites below would otherwise empty the dict
+        # this decorator object shares with every function it wraps, and the next one would silently lose
+        # backend=None, l1_enabled, or cache.secure's master_key and tenant_extractor.
+        overrides = dict(manual_overrides)
+
         # LOCAL INTENT: short-circuit before any DecoratorConfig resolution.
         # Must be first — backend pop and l1_enabled mapping below would
         # silently consume kwargs that create_local_wrapper must reject.
@@ -142,7 +134,7 @@ def cache(
                 )
             from .local_wrapper import create_local_wrapper
 
-            return create_local_wrapper(f, **manual_overrides)  # type: ignore[return-value]
+            return create_local_wrapper(f, **overrides)  # type: ignore[return-value]
 
         # config= would replace the io/secure preset wholesale, silently: io would take any backend,
         # secure would take an unencrypted config and cache plaintext. The factory already IS the config.
@@ -152,27 +144,24 @@ def cache(
                 f"{_intent} config. For the RORO form use @cache(config=DecoratorConfig.{_intent}(...))."
             )
 
-        # Resolve backend at decorator application time
-        # Track if backend=None was explicitly passed (L1-only mode)
-        # This is a sentinel problem: we need to distinguish between:
-        # 1. User passed @cache(backend=None) explicitly -> L1-only mode
-        # 2. User didn't pass backend at all -> should try provider
-        _explicit_backend = "backend" in manual_overrides
-        _explicit_l1_only = _explicit_backend and manual_overrides["backend"] is None
-        backend = manual_overrides.pop("backend", None)
-
-        # Refuse an encrypting serializer= before the preset resolves, ahead of the presets' own key checks: a
-        # caller who put the key inside the EncryptionWrapper would otherwise be told the decorator has no key.
-        # backend=None skips this check, so create_cache_wrapper's L1-only refusal keeps its message. That refusal runs
-        # after the preset's own checks, so one of those (a missing key or tenant mode, say) can still fire first.
-        if not _explicit_l1_only and _is_encrypting_serializer(manual_overrides.get("serializer")):
-            raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
-
         if config is not None and not isinstance(config, DecoratorConfig):
             raise TypeError(
                 f"config parameter must be DecoratorConfig instance, got {type(config).__name__}. "
                 f"Use DecoratorConfig.minimal(), .production(), .secure(), .dev(), or .test()"
             )
+
+        # backend=None is L1-only; an omitted backend is UNSET and resolves per "Backend Resolution Priority".
+        _explicit_backend = "backend" in overrides
+        backend = overrides.pop("backend", UNSET)
+        _explicit_l1_only = backend is None or (backend is UNSET and config is not None and config.backend is None)
+
+        # Refuse an encrypting serializer= before the preset resolves, ahead of the presets' own key checks: a
+        # caller who put the key inside the EncryptionWrapper would otherwise be told the decorator has no key.
+        # backend=None, as keyword or in config=, skips this check, so create_cache_wrapper's L1-only refusal keeps
+        # its message. That refusal runs after the preset's own checks, so one of those (a missing key or tenant
+        # mode, say) can still fire first.
+        if not _explicit_l1_only and _is_encrypting_serializer(overrides.get("serializer")):
+            raise ConfigurationError(_ENCRYPTING_SERIALIZER_REFUSAL)
 
         # Tier 2 resolution: if no explicit backend and not L1-only mode,
         # check module-level default set via set_default_backend(). Kept here
@@ -183,16 +172,19 @@ def cache(
         # A backend already in config= is explicit and beats the default: fetched here, the
         # default would replace it below — DecoratorConfig.io(api_key=B) under a key-A default
         # would send tenant B's traffic under key A.
-        if backend is None and not _explicit_l1_only and (config is None or config.backend is None):
+        # A config's backend=None is L1-only and stays so: the default fills only an UNSET backend.
+        if backend is UNSET and (config is None or config.backend is UNSET):
             from ..config.decorator import get_default_backend
 
-            backend = get_default_backend()
+            default_backend = get_default_backend()
+            if default_backend is not None:
+                backend = default_backend
 
         # Flattened l1_enabled flips only l1.enabled, applied AFTER resolution (LAB-4828): every
         # preset factory already passes its own l1=, so forwarding it collides, and building it here
         # from L1CacheConfig() would drop the preset's / config='s L1 tuning (minimal swr_enabled=False).
-        _has_l1_enabled = "l1_enabled" in manual_overrides
-        l1_enabled = manual_overrides.pop("l1_enabled", None)
+        _has_l1_enabled = "l1_enabled" in overrides
+        l1_enabled = overrides.pop("l1_enabled", None)
 
         # Map flattened tri-state encryption flag + related kwargs to nested EncryptionConfig.
         # Tri-state (issue #128): @cache(encryption=False) is a DELIBERATE opt-out that must
@@ -205,18 +197,16 @@ def cache(
         if config is None and _intent is None:
             from cachekit.config.nested import EncryptionConfig
 
-            _enc_passthrough = isinstance(manual_overrides.get("encryption"), EncryptionConfig)
+            _enc_passthrough = isinstance(overrides.get("encryption"), EncryptionConfig)
             _enc_keys = {"encryption", "master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"}
-            if not _enc_passthrough and (_enc_keys & manual_overrides.keys()):
+            if not _enc_passthrough and (_enc_keys & overrides.keys()):
                 enc_overrides: dict[str, Any] = {}
-                if "encryption" in manual_overrides:
-                    enc_overrides["enabled"] = manual_overrides.pop("encryption")
+                if "encryption" in overrides:
+                    enc_overrides["enabled"] = overrides.pop("encryption")
                 for _k in ("master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"):
-                    if _k in manual_overrides:
-                        enc_overrides[_k] = manual_overrides.pop(_k)
-                manual_overrides["encryption"] = replace(
-                    EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()}
-                )
+                    if _k in overrides:
+                        enc_overrides[_k] = overrides.pop(_k)
+                overrides["encryption"] = replace(EncryptionConfig(), **{k: reveal_secret(v) for k, v in enc_overrides.items()})
 
         # RORO config takes highest precedence
         if config is not None:
@@ -224,27 +214,27 @@ def cache(
             resolved_config = config
             # An override may not disable integrity on an encrypted config= — the rule
             # DecoratorConfig.secure() enforces on its own kwargs.
-            integrity_override = manual_overrides.get("integrity_checking", True)
+            integrity_override = overrides.get("integrity_checking", True)
             if config.encryption.enabled is True and not integrity_override:
                 raise ConfigurationError(
                     f"integrity_checking={integrity_override!r} cannot override an encrypted config= "
                     "(e.g. DecoratorConfig.secure()). Omit integrity_checking."
                 )
-            if manual_overrides or backend is not None:
+            if overrides or backend is not UNSET:
                 # Apply overrides by creating new DecoratorConfig with merged settings
-                override_dict = manual_overrides.copy()
-                if backend is not None:
+                override_dict = overrides.copy()
+                if backend is not UNSET:
                     override_dict["backend"] = backend
                 resolved_config = replace(config, **override_dict)
         # Intent-based presets (renamed per Task 6)
         elif _intent == "minimal":  # Renamed from "fast"
-            resolved_config = DecoratorConfig.minimal(backend=backend, **manual_overrides)
+            resolved_config = DecoratorConfig.minimal(backend=backend, **overrides)
         elif _intent == "production":  # Renamed from "safe"
-            resolved_config = DecoratorConfig.production(backend=backend, **manual_overrides)
+            resolved_config = DecoratorConfig.production(backend=backend, **overrides)
         elif _intent == "secure":
-            # Extract master_key from manual_overrides, fall back to env var via settings
-            master_key = manual_overrides.pop("master_key", None)
-            tenant_extractor = manual_overrides.pop("tenant_extractor", None) or None
+            # Extract master_key from overrides, fall back to env var via settings
+            master_key = overrides.pop("master_key", None)
+            tenant_extractor = overrides.pop("tenant_extractor", None) or None
             if not master_key:
                 from cachekit.config.singleton import get_settings
 
@@ -252,32 +242,30 @@ def cache(
             if not master_key:
                 raise ValueError("cache.secure requires master_key parameter or CACHEKIT_MASTER_KEY environment variable")
             resolved_config = DecoratorConfig.secure(
-                master_key=master_key, tenant_extractor=tenant_extractor, backend=backend, **manual_overrides
+                master_key=master_key, tenant_extractor=tenant_extractor, backend=backend, **overrides
             )
         elif _intent == "dev":
-            resolved_config = DecoratorConfig.dev(backend=backend, **manual_overrides)
+            resolved_config = DecoratorConfig.dev(backend=backend, **overrides)
         elif _intent == "test":
-            resolved_config = DecoratorConfig.test(backend=backend, **manual_overrides)
+            resolved_config = DecoratorConfig.test(backend=backend, **overrides)
         elif _intent == "io":
             # io owns its backend. Hand an explicit backend= back so DecoratorConfig.io
             # rejects it — one error site for both the decorator and the classmethod.
             # `backend` is still the caller's value here: the default lookup above only
             # runs when no backend= was passed.
             if _explicit_backend:
-                manual_overrides["backend"] = backend
-            resolved_config = DecoratorConfig.io(**manual_overrides)
+                overrides["backend"] = backend
+            resolved_config = DecoratorConfig.io(**overrides)
         else:
             # No intent specified - use default DecoratorConfig with overrides
-            resolved_config = DecoratorConfig(backend=backend, **manual_overrides)
+            resolved_config = DecoratorConfig(backend=backend, **overrides)
 
         if _has_l1_enabled:
             resolved_config = replace(resolved_config, l1=replace(resolved_config.l1, enabled=l1_enabled))
 
-        # Delegate to wrapper factory with L1-only mode flag
-        # Note: _explicit_l1_only is ONLY set when backend=None was explicitly passed
-        # via manual_overrides. DecoratorConfig.backend defaults to None, but that
-        # should NOT trigger L1-only mode - it should fall back to the provider.
-        return _apply_cache_logic(f, resolved_config, _l1_only_mode=_explicit_l1_only)  # type: ignore[return-value]
+        # resolved_config.backend is None exactly when the caller asked for L1-only, by keyword or in config=;
+        # create_cache_wrapper reads it from there.
+        return create_cache_wrapper(f, config=resolved_config)  # type: ignore[return-value]
 
     # Handle both @cache and @cache() syntax
     if func is None:
@@ -294,4 +282,4 @@ cache.dev = functools.partial(cache, _intent="dev")  # type: ignore[attr-defined
 cache.test = functools.partial(cache, _intent="test")  # type: ignore[attr-defined]
 cache.io = functools.partial(cache, _intent="io")  # type: ignore[attr-defined]  # SaaS backend
 cache.local = functools.partial(cache, _intent="local")  # type: ignore[attr-defined]
-# Note: L1-only mode requires explicit backend=None parameter (no preset decorator)
+# Note: L1-only mode is backend=None, as a keyword or inside config=

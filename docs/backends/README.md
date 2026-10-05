@@ -176,7 +176,7 @@ def explicit_backend():
 
 `@cache.io()` uses this same mechanism — it calls `DecoratorConfig.io()` which constructs a `CachekitIOBackend` (from `api_key=` or `CACHEKIT_API_KEY`) and passes it as an explicit `backend` kwarg. No magic, just convenience. Because the preset owns its backend, `@cache.io(backend=...)` raises `ConfigurationError` rather than silently ignoring the argument.
 
-A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it.
+A backend inside `config=` counts as explicit too: `@cache(config=DecoratorConfig.production(backend=b))` uses `b` even when `set_default_backend()` is set. Only a `backend=` kwarg beats it. A config's `backend=None` is explicit too: from 0.23.0 it selects [L1-only mode](none.md#in-a-decoratorconfig), and no lower tier fills it. A config that omits `backend` holds `UNSET` and resolves through the tiers below.
 
 ### 2. Module-Level Default Backend (Middle Priority)
 
