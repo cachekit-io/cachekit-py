@@ -2432,6 +2432,9 @@ def create_cache_wrapper(
                         # the lock is released: a Redis lock wraps whatever leaves its body in
                         # a BackendError, and the clause below would take a function's own
                         # BackendError for a lock failure and run the function again (LAB-5360).
+                        # A miss is a call that runs the function: a double-check hit above returned
+                        # before here, so it is never counted as one (LAB-8298).
+                        _stats.record_miss()
                         try:
                             result = await func(*args, **kwargs)
                         except Exception as e:
@@ -2551,6 +2554,7 @@ def create_cache_wrapper(
                 )
 
             # The function's exception propagates unrecorded, as on the lock path (see the sync wrapper).
+            _stats.record_miss()
             try:
                 result = await func(*args, **kwargs)
             except Exception:

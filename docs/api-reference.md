@@ -741,7 +741,7 @@ scrape or external dependency required. `CacheInfo` is exported from the top-lev
 | Field | Type | Meaning |
 |:------|:-----|:--------|
 | `hits` | `int` | Total cache hits (L1 + L2) |
-| `misses` | `int` | Total cache misses |
+| `misses` | `int` | Calls that ran the function because no cached value was found, sync or async. An async caller that waited on the distributed lock and then found the value counts as an L2 hit |
 | `l1_hits` | `int` | L1 (in-memory) hits only |
 | `l2_hits` | `int` | L2 (backend) hits only |
 | `maxsize` | `int \| None` | Always `None` for external caches |
