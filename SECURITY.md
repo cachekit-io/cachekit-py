@@ -199,7 +199,7 @@ All sensitive values are automatically masked:
 
 ### SSRF Protection
 
-When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Side Request Forgery (SSRF) protection. Custom API URLs are blocked by default - only `api.cachekit.io` and its subdomains are permitted.
+When using `@cache.io` (CachekitIOBackend), the SDK includes built-in Server-Side Request Forgery (SSRF) protection. Custom API URLs are blocked by default - only `api.cachekit.io` and `api.staging.cachekit.io` are permitted, matched exactly (a subdomain is not).
 
 See [SSRF Protection](docs/features/ssrf-protection.md) for full details, including custom host configuration for development environments.
 
