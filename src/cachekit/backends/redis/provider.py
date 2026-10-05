@@ -217,7 +217,9 @@ class PerRequestRedisBackend:
         Every key this wrapper touches is rewritten to ``t:{tenant}:{key}`` —
         invisible to other SDKs reading the same Redis, so interop mode MUST
         reject this backend (see cachekit.interop.ensure_interop_backend_compatible).
-        Backends that rewrite keys on the wire MUST expose the prefix here.
+        Backends that rewrite keys on the wire MUST expose the prefix here. An encrypted
+        cache binds it into the AAD ahead of the cache key, so one tenant's entry copied
+        under another tenant's prefix fails authentication.
 
         With follow_context, resolved per access from ``tenant_context`` (see class docstring).
         """

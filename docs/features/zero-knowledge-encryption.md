@@ -367,9 +367,9 @@ overwrites the entry, so tenants that share a key keep evicting each other. With
 `fail_closed=True` the read raises `DecryptionAuthenticationError` (its subclass
 `TenantMismatchError`) instead, until the entry expires or is invalidated. That lets
 whichever tenant calls a shared-key function first block every other tenant for the
-entry's TTL, and seed it again once it expires. An L1 copy encrypted for another tenant is
-only an L1 miss, since L1 holds this process's own reads and writes: the read goes on to
-the backend. A read whose tenant cannot be resolved decrypts nothing and is a plain miss
+entry's TTL, and seed it again once it expires. An L1 copy encrypted for another tenant, or
+bound to another tenant's `t:{tenant}:` key prefix, is only an L1 miss, since L1 holds this
+process's own reads and writes: the read goes on to the backend. A read whose tenant cannot be resolved decrypts nothing and is a plain miss
 that keeps the entry. Either way, keep tenants on separate keys as the caution above says.
 
 ### Key Rotation Pattern
@@ -478,12 +478,36 @@ Nonce = [counter_high_64bits][counter_low_32bits][random_32bits]
            Prevents nonce reuse even across reboots
 ```
 
+### Cache Key Binding
+
+The AAD binds the cache key, so ciphertext moved to another key fails authentication: a
+backend-write attacker cannot serve one entry's value at another entry's key. The key bound is
+the one the backend is handed, after every prefix added in front of it on the client: the
+namespace, a `MemcachedBackend` `key_prefix`, and the `t:{tenant}:` prefix of the tenant-scoped
+Redis backend (env auto-detection, `RedisBackendProvider`). An entry copied from `app-a:` to
+`app-b:`, or from `t:acme:` to `t:globex:`, is refused. Backend encodings of the key (the File backend's
+hashed file name, CachekitIO's percent-encoded URL path) are not part of it, and neither is the
+tenant scoping the CachekitIO server applies.
+
+There is one AAD per read. A read never retries with another form of the key, such as the key
+without its prefix, so a failed authentication is final.
+
+**Upgrading.** Releases before this binding left the backend's prefix out of the AAD. Their
+encrypted entries written through a prefixing backend (`MemcachedBackend` with a `key_prefix`,
+the tenant-scoped Redis backend) fail authentication after the upgrade. By default each such
+entry is read once as a miss, counted as `auth_tamper` with a WARNING, recomputed and
+overwritten. With `fail_closed=True`, every read of one raises `DecryptionAuthenticationError`
+until it expires or is deleted. So delete those entries, or move the cache to a fresh key space
+(a new `namespace`, or a new Memcached `key_prefix`), rather than wait out the TTL. Unprefixed
+backends (`RedisBackend`, `FileBackend`, `CachekitIOBackend`) and interop mode are unaffected.
+
 ### Encryption Downgrade Protection (Read Path)
 
 The CK frame header — the JSON envelope carrying `encrypted`, `tenant_id`, `format`,
 and the serializer name — is plaintext, so a reader can parse it before it has a key.
 Its JSON bytes are not what the AES-GCM tag covers; the tag covers the ciphertext and
-the AAD. AAD v0x03 is built from the tenant, the cache key, and the header's wire format,
+the AAD. AAD v0x03 is built from the tenant, the cache key (with any
+[key prefix the backend adds](#cache-key-binding)), and the header's wire format,
 compression flag and (when set) original type, so a change to one of those header
 values that alters the AAD fails authentication. The `encrypted` flag is **not** an
 AAD input: nothing authenticates it.
@@ -554,9 +578,12 @@ them (cachekit-py#170):
 
 - **`auth_tamper`** — the entry failed authentication: the ciphertext was modified,
   the key is wrong (rotation/misconfiguration), the AAD didn't match (ciphertext moved
-  between cache keys), or, on a cache with a `tenant_extractor`, a backend entry was
-  encrypted for a tenant other than the caller's (`TenantMismatchError`, refused before
-  any decrypt attempt; in L1 the same collision is a plain miss). The
+  between cache keys or [key prefixes](#cache-key-binding)), or, on a cache with a
+  `tenant_extractor`, a backend entry was encrypted for a tenant other than the caller's
+  (`TenantMismatchError`, refused before any decrypt attempt). In L1 these collisions are a
+  plain miss: another tenant's entry, and on a prefixing backend any authentication failure,
+  since L1 holds only this process's own entries, each bound to the prefix it was written
+  under. The
   plaintext frame header fields built into the AAD
   (`format`, `compressed`, `original_type`) are unencrypted, but the AAD built from
   them is authenticated by the tag: a header change that produces different AAD bytes

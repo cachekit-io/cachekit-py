@@ -1446,6 +1446,21 @@ def create_cache_wrapper(
         """Key prefix the resolved backend applies in THIS context ("" when it applies none)."""
         return getattr(_backend, "key_prefix", None) or ""
 
+    # The AAD binds this prefix with the cache key (CacheSerializationHandler._aad_key).
+    serialization_handler.backend_key_prefix = _l2_scope
+
+    def _foreign_l1_entry(error: SerializationError) -> bool:
+        """Whether an L1 decrypt failure is a keying collision rather than tamper evidence.
+
+        L1 is keyed by the bare cache key, and it holds only this process's own authenticated
+        writes and backfills. So the envelope it returns can be another tenant's: one encrypted
+        for another tenant, or, behind a key-prefixing backend, one whose AAD binds another
+        prefix (a tenant-scoped backend binds each tenant's ``t:{tenant}:``). Either is an L1
+        miss, with no auth_tamper and no raise; L2, which may hold this caller's own entry,
+        applies the policy.
+        """
+        return isinstance(error, TenantMismatchError) or (isinstance(error, DecryptionAuthenticationError) and bool(_l2_scope()))
+
     def _evict(key: str | None) -> None:
         """Another process's invalidation, from the listener thread: evict ``key``, or every key
         this wrapper recorded (``None``), from L1.
@@ -1758,12 +1773,6 @@ def create_cache_wrapper(
                     # ~34ns overhead, but required for correctness. See test_context_leak_regression.py
                     reset_current_function_stats(token)
                     return l1_value
-                except TenantMismatchError:
-                    # L1 is keyed by the bare cache key and holds only this process's own
-                    # authenticated writes and backfills, so another tenant's envelope here is
-                    # a keying collision, not tamper evidence: an L1 miss, no auth_tamper and no
-                    # raise. L2, which may hold this tenant's own entry, applies the policy.
-                    _l1_cache.invalidate(cache_key)
                 except TenantResolutionError:
                     # No tenant in the caller's context: nothing to decrypt as, and nothing wrong
                     # with the entry, which stays. The L2 read below misses for the same reason.
@@ -1774,15 +1783,16 @@ def create_cache_wrapper(
                     # otherwise keep re-raising from stale process-local L1 after the
                     # operator fixes L2). L2 remains the retained evidence.
                     _l1_cache.invalidate(cache_key)
-                    try:
-                        # Single policy point (cachekit-py#170): metric + fail policy.
-                        handle_decrypt_failure(
-                            e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                        )
-                    except DecryptionAuthenticationError:
-                        reset_current_function_stats(token)
-                        raise
-                    # Fail open: fall through to L2
+                    if not _foreign_l1_entry(e):
+                        try:
+                            # Single policy point (cachekit-py#170): metric + fail policy.
+                            handle_decrypt_failure(
+                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                            )
+                        except DecryptionAuthenticationError:
+                            reset_current_function_stats(token)
+                            raise
+                    # Fail open, or another tenant's entry: fall through to L2
                 except KeyringConfigurationError:
                     # LOCAL keyring config fault — not a poisoned L1 entry, so
                     # neither the invalidate nor the "deserialization failed"
@@ -2163,9 +2173,6 @@ def create_cache_wrapper(
                         _stats.record_l1_hit()
 
                         return l1_value
-                    except TenantMismatchError:
-                        # Another tenant's envelope in L1: an L1 miss — see the sync L1 guard above.
-                        _l1_cache.invalidate(cache_key)
                     except TenantResolutionError:
                         # Caller's tenant unresolved: the entry stays — see the sync L1 guard above.
                         logger().debug(f"L1 read skipped for {redact_cache_key(cache_key)}: caller's tenant unresolved")
@@ -2182,13 +2189,14 @@ def create_cache_wrapper(
                         # if a future edit wraps this read path in a broad `except
                         # Exception` (defense-in-depth, LAB-108). No manual stats reset —
                         # the async wrapper's outer `finally` covers every exit path.
-                        try:
-                            handle_decrypt_failure(
-                                e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
-                            )
-                        except DecryptionAuthenticationError:
-                            raise
-                        # Fail open: fall through to L2
+                        if not _foreign_l1_entry(e):
+                            try:
+                                handle_decrypt_failure(
+                                    e, tier="l1", cache_key=cache_key, fail_closed=serialization_handler.encryption_fail_closed
+                                )
+                            except DecryptionAuthenticationError:
+                                raise
+                        # Fail open, or another tenant's entry (_foreign_l1_entry): fall through to L2
                     except KeyringConfigurationError:
                         # LOCAL keyring config fault — see the sync L1 guard above.
                         raise
