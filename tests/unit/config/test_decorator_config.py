@@ -10,9 +10,9 @@ Tests DecoratorConfig:
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable
 from dataclasses import fields, replace
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
@@ -30,7 +30,6 @@ from cachekit.config.nested import (
 )
 from cachekit.config.singleton import reset_settings
 from cachekit.config.validation import ConfigurationError
-from cachekit.decorators import intent
 
 
 @pytest.fixture
@@ -609,17 +608,32 @@ class TestPresetFieldOverrides:
 
         assert resolved == []
 
-    def test_bare_and_secure_take_the_same_encryption_keywords(self) -> None:
-        # Bare @cache folds these into its EncryptionConfig; secure() takes each as a named parameter or through
-        # **kwargs. A keyword one form takes and the other refuses is a setting that silently works on only one.
-        bare = intent._ENCRYPTION_KWARGS - {"encryption"}
-        named = set(inspect.signature(DecoratorConfig.secure).parameters) & bare
-        secure = named | decorator._SECURE_ENCRYPTION_KWARGS
-        assert bare == secure
-        assert decorator._PRESET_EXTRA_KWARGS["secure"] == secure
+    def test_bare_and_secure_fold_every_flat_encryption_keyword(self, resolved: list[DecoratorConfig]) -> None:
+        # One sample per flat keyword: a keyword added to the shared list fails here until both forms carry it.
+        class Extractor:
+            def extract(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+                return "tenant"
+
+        samples: dict[str, Any] = {
+            "master_key": _SECURE_KEY,
+            "tenant_extractor": Extractor(),
+            "single_tenant_mode": True,
+            "deployment_uuid": "00000000-0000-4000-8000-000000000001",
+            "fail_closed": True,
+        }
+        assert samples.keys() == decorator._ENCRYPTION_FLAT_KWARGS
+        for name, value in samples.items():
+            secure_kwargs = {"master_key": _SECURE_KEY, name: value}
+
+            @cache(**{name: value})
+            def fn() -> int:
+                return 1
+
+            for config in (resolved.pop(), DecoratorConfig.secure(**secure_kwargs)):
+                assert getattr(config.encryption, name) == value, (name, config)
         with pytest.raises(ConfigurationError) as excinfo:
             DecoratorConfig.secure(master_key=_SECURE_KEY, encryption=EncryptionConfig())
-        assert all(f"{k}=" in str(excinfo.value) for k in secure - {"master_key"})
+        assert all(f"{k}=" in str(excinfo.value) for k in samples.keys() - {"master_key"})
 
     def test_l1_enabled_applies_on_top_of_l1_override(self, resolved: list[DecoratorConfig]) -> None:
         @cache.production(l1=L1CacheConfig(max_size_mb=200), l1_enabled=False)

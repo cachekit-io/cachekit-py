@@ -466,11 +466,9 @@ class DecoratorConfig:
                 "The secure preset sets its own encryption; encryption= cannot override it. Pass any of "
                 f"{_SECURE_ENCRYPTION_OPTIONS} to it directly."
             )
-        # Extract encryption-specific params from kwargs
-        explicit_single_tenant = kwargs.pop("single_tenant_mode", None)
-        deployment_uuid = kwargs.pop("deployment_uuid", None)
-        # Tri-state: None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED (default False = fail open)
-        fail_closed = kwargs.pop("fail_closed", None)
+        # Every EncryptionConfig setting this preset takes as a keyword, passed through by name. An omitted one keeps
+        # EncryptionConfig's default (fail_closed=None defers to CACHEKIT_ENCRYPTION_FAIL_CLOSED, default fail open).
+        encryption_kwargs = {k: kwargs.pop(k) for k in _SECURE_ENCRYPTION_KWARGS if k in kwargs}
 
         # SECURITY INVARIANT: integrity_checking is forced to True. A request to turn it off is
         # rejected, never silently dropped (protocol intent-presets.md § Explicit Configuration).
@@ -485,10 +483,8 @@ class DecoratorConfig:
         tenant_extractor = tenant_extractor or None
 
         # Determine tenant mode: explicit param > tenant_extractor check
-        if explicit_single_tenant is not None:
-            single_tenant_mode = explicit_single_tenant
-        else:
-            single_tenant_mode = tenant_extractor is None
+        if encryption_kwargs.get("single_tenant_mode") is None:
+            encryption_kwargs["single_tenant_mode"] = tenant_extractor is None
 
         defaults: dict[str, Any] = {
             "ttl": 600,
@@ -512,9 +508,7 @@ class DecoratorConfig:
                 enabled=True,
                 master_key=reveal_secret(master_key),
                 tenant_extractor=tenant_extractor,
-                single_tenant_mode=single_tenant_mode,
-                deployment_uuid=deployment_uuid,
-                fail_closed=fail_closed,
+                **encryption_kwargs,
             ),
             **(defaults | kwargs),
         )
@@ -702,8 +696,8 @@ class DecoratorConfig:
 
 # The keywords a preset or a config= override may name: DecoratorConfig's fields, less the private ones.
 _FIELD_NAMES = frozenset(f.name for f in fields(DecoratorConfig) if not f.name.startswith("_"))
-# The EncryptionConfig settings bare @cache and @cache.secure take as flat keywords. The single list: add an option
-# here and both forms take it, so one cannot accept a setting the other refuses.
+# The EncryptionConfig settings bare @cache and @cache.secure take as flat keywords. The single list: each form folds
+# every name here into its EncryptionConfig, so an option added here reaches both.
 _ENCRYPTION_FLAT_KWARGS = frozenset({"master_key", "tenant_extractor", "single_tenant_mode", "deployment_uuid", "fail_closed"})
 # The EncryptionConfig settings DecoratorConfig.secure() takes through **kwargs: all but its named parameters.
 _SECURE_ENCRYPTION_KWARGS = _ENCRYPTION_FLAT_KWARGS - {"master_key", "tenant_extractor"}
